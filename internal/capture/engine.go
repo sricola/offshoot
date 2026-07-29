@@ -293,9 +293,12 @@ func (e *Engine) takeover(ctx context.Context) error {
 	// Run()'s poll loop treats the eventual ErrWALRestarted as a
 	// continuation (fresh reader, no rebase, not counted) rather than a
 	// detected loss.
-	e.expectRestart = true
 	e.captured = 0
-	return e.beginReadRetry(ctx, 5*time.Second)
+	if err := e.beginReadRetry(ctx, 5*time.Second); err != nil {
+		return err
+	}
+	e.expectRestart = true
+	return nil
 }
 
 // beginReadRetry retries beginRead with backoff until it succeeds, ctx is
