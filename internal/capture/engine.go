@@ -39,6 +39,16 @@ type Engine struct {
 	pageSize uint32
 	rebased  int
 	captured int // txns since last takeover
+
+	// expectRestart is true immediately after a verified-clean takeover
+	// (checkpoint RESTART folded exactly what we'd already consumed, no
+	// more). It means the WAL's lazy header/salt reset — which lands on the
+	// *next* writer's commit, not at RESTART time itself — is anticipated:
+	// when it lands, our replica state already equals the main DB content at
+	// the restart point, so the new WAL generation is a continuation, not a
+	// continuity loss. See takeover() and Run()'s wal.ErrWALRestarted
+	// handling.
+	expectRestart bool
 }
 
 func NewEngine(o Options) *Engine {
@@ -96,8 +106,21 @@ func (e *Engine) Run(ctx context.Context) error {
 		}
 		n, err := e.drain(ctx)
 		if err == wal.ErrWALRestarted {
-			// Our lock lapsed (or an external RESTART happened): continuity
-			// lost — detected. Re-establish from a fresh snapshot.
+			if e.expectRestart {
+				// The WAL's lazy reset (armed by our own verified-clean
+				// takeover) has now physically landed: a new WAL generation
+				// with fresh salts. Our replica already reflects every frame
+				// up to the restart point, so the new generation's frames
+				// apply cleanly on top — this is a continuation, not lost
+				// continuity. No rebase, no snapshot, not counted.
+				e.expectRestart = false
+				e.reader = wal.NewReader(e.o.DBPath + "-wal")
+				e.captured = 0
+				continue
+			}
+			// Our lock lapsed (or an external RESTART happened) without a
+			// preceding verified-clean takeover: continuity lost —
+			// detected. Re-establish from a fresh snapshot.
 			if err := e.rebase(ctx); err != nil {
 				return err
 			}
@@ -169,6 +192,11 @@ func (e *Engine) endRead(ctx context.Context) {
 
 // rebase: checkpoint, snapshot the main file, reset reader + sink + state.
 func (e *Engine) rebase(ctx context.Context) error {
+	// Any rebase supersedes a prior takeover's expectation of a clean
+	// continuation — full re-establishment from a snapshot is happening
+	// instead, so the eventual WAL restart (if any) must not be treated as
+	// an already-accounted-for continuation.
+	e.expectRestart = false
 	e.endRead(ctx)
 	if _, err := e.checkpoint(ctx, "TRUNCATE"); err != nil {
 		// Fall back to VACUUM INTO — needs no exclusive checkpoint lock.
@@ -218,6 +246,15 @@ func (e *Engine) takeover(ctx context.Context) error {
 		consumed = (off - wal.HeaderSize) / frameSize
 	}
 
+	// Default to "no expectation" for every path except the verified-clean
+	// one below. A second takeover firing while a prior one's expectation
+	// is still pending (the lazy reset hasn't physically landed yet) will
+	// recompute log==consumed against an unchanged, already-checkpointed
+	// WAL and land back on the clean path, re-arming it — so the flag stays
+	// effectively true across repeated clean takeovers until the restart
+	// actually lands or a fold forces a rebase.
+	e.expectRestart = false
+
 	e.endRead(ctx)
 	logN, err := e.checkpoint(ctx, "RESTART")
 	if err != nil {
@@ -247,8 +284,16 @@ func (e *Engine) takeover(ctx context.Context) error {
 	// existing reader is already correctly positioned at `off` with valid
 	// running-checksum state: it will either keep consuming new frames from
 	// the same generation, or — once the physical reset actually lands —
-	// detect the salt change itself and return wal.ErrWALRestarted, which
-	// the poll loop already handles via a counted rebase.
+	// detect the salt change itself and return wal.ErrWALRestarted.
+	//
+	// That eventual restart is expected, not a loss: at this instant replica
+	// state == base snapshot + all applied frames == main DB content at the
+	// restart point (that's exactly what log==consumed just verified), so
+	// the next WAL generation's frames apply cleanly on top. Mark it so
+	// Run()'s poll loop treats the eventual ErrWALRestarted as a
+	// continuation (fresh reader, no rebase, not counted) rather than a
+	// detected loss.
+	e.expectRestart = true
 	e.captured = 0
 	return e.beginReadRetry(ctx, 5*time.Second)
 }
