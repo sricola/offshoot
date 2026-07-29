@@ -47,6 +47,15 @@ func TestTortureWriterKill(t *testing.T) {
 
 	deadline := time.Now().Add(5 * time.Minute)
 	round := 0
+	// totalRebases accumulates Rebased() across every engine instance this
+	// test creates (the initial one plus one per bounce below) — Finding 2
+	// of the task-7 review: a bare `e = NewEngine(...)` discards the outgoing
+	// engine's Rebased() count, so the torture run never actually measured
+	// its own resume claim. bounceCount tracks how many capturer bounces
+	// (round%10==0 below) occurred, so the aggregate can be checked against
+	// it after the loop.
+	var totalRebases int
+	bounceCount := 0
 	for time.Now().Before(deadline) {
 		round++
 		cmd := exec.Command("sqlite3", src, writerSQL)
@@ -73,6 +82,10 @@ func TestTortureWriterKill(t *testing.T) {
 			if err := <-engDone; err != nil {
 				t.Fatalf("round %d: engine.Run returned error on capturer bounce: %v", round, err)
 			}
+			// Accumulate BEFORE reassigning e — this is the value Finding 2
+			// said was being silently discarded.
+			totalRebases += e.Rebased()
+			bounceCount++
 			e = NewEngine(Options{DBPath: src, StateDir: dir, Sink: tortureSink{rep}})
 			ctx, cancel = context.WithCancel(context.Background())
 			engDone = make(chan error, 1)
@@ -98,7 +111,30 @@ func TestTortureWriterKill(t *testing.T) {
 	if err := <-engDone; err != nil {
 		t.Fatalf("engine.Run returned error on shutdown: %v", err)
 	}
-	t.Logf("torture complete: %d rounds, %d rebases", round, e.Rebased())
+	// Add the final engine's count — the same accumulation step applied at
+	// every bounce above, just for the session that's still live when the
+	// deadline hits.
+	totalRebases += e.Rebased()
+
+	t.Logf("torture complete: %d rounds, %d bounces, %d aggregate rebases across %d session-starts",
+		round, bounceCount, totalRebases, 1+bounceCount)
+
+	// The very first session always rebases once (no prior state to resume
+	// from), so the aggregate can never be zero.
+	if totalRebases < 1 {
+		t.Fatalf("aggregate rebases = %d, want >= 1 (the initial session's startup rebase)", totalRebases)
+	}
+	// Every bounce here goes through cancel() — the engine's ctx.Done()
+	// clean-shutdown path — so at least some of them should be eligible to
+	// resume rather than rebase. If every one of the 1+bounceCount
+	// session-starts rebased at least once, totalRebases would be >=
+	// 1+bounceCount; a strictly smaller aggregate is only possible if at
+	// least one session-start contributed 0, i.e. resumed cleanly. Skip when
+	// no bounce occurred (short/slow run) — there's nothing to have resumed.
+	if bounceCount > 0 && totalRebases >= 1+bounceCount {
+		t.Errorf("aggregate rebases (%d) >= session-starts (%d): no bounce ever resumed cleanly — resume path went unexercised this run",
+			totalRebases, 1+bounceCount)
+	}
 }
 
 func converged(t *testing.T, src string, rep *replay.Replica, d time.Duration) bool {
