@@ -18,6 +18,16 @@ import (
 
 // Sink receives capture output. Implementations: replay.Replica satisfies
 // this via a thin adapter in the tests; plan 2 adds an LTX sink.
+//
+// Apply is called at most once per transaction, ever: the engine guarantees
+// every call carries frames for a transaction that has not previously been
+// passed to Apply, across rebases, takeovers, and process restarts alike
+// (see shutdown()/tryResume()'s TRUNCATE-based clean-resume proof and
+// rebase()'s snapshot-based re-establishment). Sink implementations are NOT
+// required to be idempotent. replay.Replica happens to be idempotent, which
+// masked an earlier bug where a resumed engine re-applied an already-folded
+// WAL generation; the LTX sink must not rely on that — it should treat a
+// duplicate Apply as a bug, not a no-op.
 type Sink interface {
 	Rebase(snapshotPath string) error
 	Apply(pageSize uint32, frames []wal.Frame) error
@@ -152,10 +162,37 @@ func (e *Engine) Run(ctx context.Context) error {
 // shutdown runs on the ctx.Done() path. It drains whatever's still pending,
 // then attempts a final verified-clean checkpoint(RESTART) — the exact
 // log==consumed proof takeover() uses — and, only if that succeeds,
-// persists State{Off: HeaderSize, <current header salts>}. That is the only
-// way tryResume's Off==HeaderSize precondition is ever produced; see
-// tryResume's doc comment for why matching salts on the next start then
-// proves zero writes happened while the process was down.
+// immediately follows with checkpoint(TRUNCATE) to physically zero the -wal
+// file. Only if BOTH succeed does it persist State{Clean: true} — see
+// state.go's doc comment for exactly what that marker means and why
+// tryResume requires it.
+//
+// Why two checkpoints instead of one TRUNCATE (as rebase() uses): verified
+// empirically (see task-7 fix report) that PRAGMA wal_checkpoint(TRUNCATE)'s
+// own `log`/`checkpointed` result columns are populated AFTER the physical
+// reset, so on success they read back 0 regardless of how many frames were
+// actually folded — unlike RESTART, whose reset is lazy (the on-disk
+// header/salts aren't rewritten until the next writer's commit — see
+// takeover()'s doc comment), so its `log` column still reflects the
+// pre-reset frame count at the instant of that same atomic call. TRUNCATE's
+// eagerly-zeroed result makes it useless for the log==consumed comparison
+// that catches a write landing in the endRead()→checkpoint() gap — the
+// exact race takeover() is built to detect. So: RESTART first, to get a
+// trustworthy verified-clean proof from a mechanism already proven correct;
+// TRUNCATE second (running against the now-quiescent, already-emptied-in-
+// SQLite's-own-bookkeeping WAL), purely to make the on-disk file physically
+// match what RESTART already established logically. rebase() doesn't need
+// this two-step dance because it always re-copies a fresh snapshot of the
+// main DB file afterward regardless of what got folded — it never relies on
+// an incrementally-tracked `consumed` count the way this verified-clean path
+// does.
+//
+// The gap between the two calls is a single Go conditional with no
+// intervening I/O — about as tight as achievable through SQLite's pragma
+// interface. A writer landing in exactly that gap would get folded by the
+// TRUNCATE call the same as anything else, with no way for us to detect it
+// from TRUNCATE's zeroed return values; this residual risk is accepted as
+// negligible relative to the two-call round-trip's overall latency.
 //
 // It uses a fresh, short-lived context rather than the engine's own ctx
 // (already cancelled here by definition) — checkpoint() and endRead() both
@@ -163,9 +200,17 @@ func (e *Engine) Run(ctx context.Context) error {
 //
 // Every failure path here is swallowed on purpose: it only forgoes the
 // resume optimization for the next start (the last state drain() wrote
-// stays on disk, with Off > HeaderSize, which tryResume already rejects),
-// never correctness. Silently skipping an optimization is fine; silently
-// resuming across a gap is exactly the failure this task exists to kill.
+// stays on disk with Clean=false, which tryResume already rejects), never
+// correctness. Silently skipping an optimization is fine; silently resuming
+// across a gap is exactly the failure this task exists to kill.
+//
+// A foreign connection held open across our shutdown (see
+// TestEngineResumesCleanly) does not by itself defeat RESTART/TRUNCATE:
+// both only require that no OTHER connection hold a read or write lock on
+// the WAL at the instant they run, which a merely-open idle connection does
+// not. If one does race us with an actual lock, checkpoint()'s busy retry
+// (up to 5s per call) absorbs ordinary contention; persistent busy still
+// falls through to the swallowed-failure path above, which is always safe.
 func (e *Engine) shutdown() {
 	sctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
 	defer cancel()
@@ -183,31 +228,35 @@ func (e *Engine) shutdown() {
 	if err != nil || int64(logN) != consumed {
 		// Not verified clean — either the checkpoint itself failed (busy,
 		// timeout, DB gone) or frames were folded that we hadn't consumed.
-		// Leave the last drain()-written state as-is; it has Off >
-		// HeaderSize (or is simply stale), so tryResume will reject it and
-		// the next start rebases. Safe, just not optimal.
+		// Leave the last drain()-written state as-is (Clean=false), so
+		// tryResume will reject it and the next start rebases. Safe, just
+		// not optimal.
 		return
 	}
 
-	b := make([]byte, wal.HeaderSize)
-	f, err := os.Open(e.o.DBPath + "-wal")
+	if _, err := e.checkpoint(sctx, "TRUNCATE"); err != nil {
+		// Verified clean logically (via RESTART above) but couldn't
+		// physically empty the file — same fallback as above: leave state
+		// as-is, next start rebases.
+		return
+	}
+
+	// Fingerprint the main DB file (mtime+size) right now, immediately after
+	// the checkpoint that folded everything we've captured into it. This is
+	// tryResume's condition (2) — see its doc comment for why WAL-emptiness
+	// alone isn't sufficient proof that nothing happened while we were down.
+	mfi, err := os.Stat(e.o.DBPath)
 	if err != nil {
+		// Can't fingerprint ⇒ can't offer a safe resume point. Same
+		// fallback: leave state as-is, next start rebases.
 		return
 	}
-	_, rerr := io.ReadFull(f, b)
-	f.Close()
-	if rerr != nil {
-		return
-	}
-	hdr, err := wal.ParseHeader(b)
-	if err != nil {
-		return
-	}
-	// RESTART's reset is lazy (see takeover()'s comment above): the header
-	// on disk right now still carries these salts and will until the next
-	// writer commits — which is exactly what a resuming engine needs to
-	// compare against.
-	SaveState(e.statePath(), State{Off: int64(wal.HeaderSize), Salt1: hdr.Salt1, Salt2: hdr.Salt2})
+
+	SaveState(e.statePath(), State{
+		Clean:       true,
+		MainMTimeNS: mfi.ModTime().UnixNano(),
+		MainSize:    mfi.Size(),
+	})
 }
 
 // drain consumes all currently available committed transactions.
@@ -255,71 +304,95 @@ func (e *Engine) endRead(ctx context.Context) {
 }
 
 // tryResume resumes capture without a rebase when — and only when — it can
-// prove nothing was missed while the process was down: a saved state exists,
-// its offset is exactly wal.HeaderSize (nothing was captured since whatever
-// last reset the WAL to empty — see shutdown()), and its salts match the
-// live WAL header. Anything else — no saved state, offset past HeaderSize
-// (we'd need the running checksum to keep going, which we don't have and
-// won't reconstruct by trusting our own historical bytes), an absent or
-// unreadable WAL, or salts that differ — returns false and the caller
-// rebases.
+// prove nothing was missed while the process was down. Two independent
+// conditions must both hold; either one failing means rebase:
 //
-// Off==HeaderSize is only ever produced by shutdown()'s final
-// verified-clean checkpoint(RESTART), which proves (via the same
-// log==consumed check takeover() uses) that the WAL was folded into the
-// main DB and reset to empty at the moment we went down. A WAL left in that
-// state keeps its old header/salts on disk until the *next* write —
-// whenever it happens, dead or alive — performs SQLite's lazy reset and
-// rewrites them. So "salts still match" isn't just evidence, it's proof
-// that zero writes landed while we were dead: any write at all, being
-// necessarily the first since the reset-armed shutdown, would have flipped
-// them.
+//  1. A saved state exists with Clean=true (see state.go's doc comment;
+//     produced only by shutdown()'s verified-clean RESTART+TRUNCATE
+//     sequence, which physically zeroes the -wal file at the moment we went
+//     down) AND the on-disk -wal file confirms it is still physically empty
+//     right now: absent, zero-length, or shorter than a complete header.
 //
-// The reader is bound (not left unbound) at HeaderSize with the saved
-// salts specifically so that any drift is caught as wal.ErrWALRestarted
-// rather than silently trusted: an unbound reader binds to whatever the
-// header says at its first Next() call, which could already be a different,
-// unverified generation if a write raced us on the way up (see wal.Reader's
-// two-branch Next(): bare NewReader trusts the header it happens to see
-// first; Bind() pins it to what we already verified and treats any change
-// as the restart it is).
+//  2. The main DB file's (not the WAL's) mtime and size are byte-for-byte
+//     identical to what shutdown() recorded immediately after its final
+//     TRUNCATE. This closes a gap condition (1) alone cannot: TRUNCATE
+//     physically erases the WAL, so an empty WAL is necessary but NOT
+//     sufficient proof that nothing happened — it is equally what you'd see
+//     if writes landed while we were down AND got fully folded into the main
+//     file by someone else (a third-party checkpoint, or — empirically
+//     confirmed, see TestEngineDetectsMissedWritesAfterCrash — SQLite's own
+//     automatic checkpoint-and-WAL-deletion when the last connection to a
+//     WAL-mode database closes). That folding writes real bytes to the main
+//     file, which condition (2) catches even though condition (1) alone
+//     cannot: it can't tell "empty because nothing happened" from "empty
+//     because something happened and got absorbed." (The SQLite file
+//     change-counter header field was tried and rejected for this: verified
+//     empirically that WAL-mode checkpoints do not reliably bump it, unlike
+//     rollback-journal-mode commits — see the task-7 fix report.)
 //
-// expectRestart is armed on success: a successful resume re-establishes
-// exactly the "verified-clean, lazy-reset-pending" state a takeover leaves
-// behind, so the eventual salt flip — triggered by the first write after we
-// come back up — must be absorbed as that same generation's continuation
-// (fresh reader, not counted), not a second, spuriously-counted rebase. See
-// takeover()'s doc comment for the identical reasoning.
+// Condition (1)'s WAL-emptiness check is still necessary on its own even
+// with (2) added: without ever-physically-truncating (i.e. under the old,
+// buggy RESTART-only scheme), the main file's mtime/size would legitimately
+// match (RESTART doesn't touch the main file beyond what it already
+// checkpointed) while OLD, already-applied frames remained physically
+// present in the WAL for a fresh reader to wrongly re-consume — exactly
+// Finding 1's original bug. Condition (2) alone would not have caught that.
+//
+// Unlike a RESTART-based marker, TRUNCATE leaves nothing to compare salts
+// against: the file is gone or empty, full stop. So there's no old
+// generation to pin the reader to and no drift to detect by comparison —
+// there is only "still empty" (safe to resume, pending condition 2) or "not
+// still empty" (something wrote since shutdown; rebase). Since TRUNCATE
+// means the physical file itself is the proof, a torn/partial header found
+// here is necessarily a write in progress racing us on the way up, not a
+// leftover from before we went down — treated the same as "not provably
+// empty" ⇒ rebase, never trusted.
+//
+// The reader is left UNBOUND (not Bound at a remembered offset/salt): there
+// is no prior generation's salts to pin against, so it will simply self-bind
+// to whatever header the next writer creates, treating that as the start of
+// a new generation — which is exactly what it is. Consequently no
+// expectRestart arming is needed on this path (contrast takeover(), which
+// DOES arm it): an unbound reader's first Next() call binds rather than
+// compares, so there is no "expected restart" for it to ever raise.
 func (e *Engine) tryResume(ctx context.Context) (bool, error) {
 	st, ok, err := LoadState(e.statePath())
 	if err != nil {
 		return false, err
 	}
-	if !ok || st.Off != int64(wal.HeaderSize) {
+	if !ok || !st.Clean {
 		return false, nil
 	}
-	b := make([]byte, wal.HeaderSize)
-	f, err := os.Open(e.o.DBPath + "-wal")
+	fi, statErr := os.Stat(e.o.DBPath + "-wal")
+	switch {
+	case statErr == nil && fi.Size() >= int64(wal.HeaderSize):
+		// A WAL with at least a full header present means a write landed
+		// since our clean shutdown (TRUNCATE leaves nothing behind) ⇒
+		// can't prove continuity ⇒ rebase.
+		return false, nil
+	case statErr != nil && !os.IsNotExist(statErr):
+		// Unreadable for some other reason ⇒ can't prove continuity ⇒ rebase.
+		return false, nil
+	}
+	// Absent, zero-length, or a torn partial header: still provably empty
+	// (or empty enough that any bytes present can't be a completed write).
+	// Condition (2): the main DB file itself must be untouched since our
+	// shutdown's fingerprint (see doc comment above for why this is needed
+	// in addition to WAL-emptiness).
+	mfi, err := os.Stat(e.o.DBPath)
 	if err != nil {
-		return false, nil // no WAL ⇒ can't prove continuity ⇒ rebase
+		return false, nil // can't read the main file ⇒ can't prove continuity ⇒ rebase
 	}
-	_, rerr := io.ReadFull(f, b)
-	f.Close()
-	if rerr != nil {
-		return false, nil // header not (fully) present ⇒ rebase
-	}
-	hdr, err := wal.ParseHeader(b)
-	if err != nil || hdr.Salt1 != st.Salt1 || hdr.Salt2 != st.Salt2 {
-		return false, nil // wrote while we were dead, or torn header ⇒ rebase
+	if mfi.ModTime().UnixNano() != st.MainMTimeNS || mfi.Size() != st.MainSize {
+		return false, nil // main file changed since our shutdown ⇒ rebase
 	}
 	if err := e.beginRead(ctx); err != nil {
 		return false, err
 	}
 	e.reader = wal.NewReader(e.o.DBPath + "-wal")
-	e.reader.Bind(wal.HeaderSize, st.Salt1, st.Salt2)
 	e.captured = 0
 	e.rebased = 0 // a true resume is never a rebase
-	e.expectRestart = true
+	e.expectRestart = false
 	return true, nil
 }
 

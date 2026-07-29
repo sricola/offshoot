@@ -5,6 +5,7 @@ import (
 	"database/sql"
 	"os/exec"
 	"path/filepath"
+	"sync/atomic"
 	"testing"
 	"time"
 
@@ -17,6 +18,20 @@ type replicaSink struct{ r *replay.Replica }
 
 func (s replicaSink) Rebase(p string) error                 { return s.r.Rebase(p) }
 func (s replicaSink) Apply(ps uint32, fr []wal.Frame) error { return s.r.Apply(ps, fr) }
+
+// countingSink wraps replicaSink and counts Apply calls, independent of
+// replay.Replica's (accidental) idempotency — see
+// TestEngineResumeAppliesNothingBeforeNewWrite, the regression test for
+// Finding 1 of the task-7 review.
+type countingSink struct {
+	replicaSink
+	applyCount *int32
+}
+
+func (s countingSink) Apply(ps uint32, fr []wal.Frame) error {
+	atomic.AddInt32(s.applyCount, 1)
+	return s.replicaSink.Apply(ps, fr)
+}
 
 func startEngine(t *testing.T, dbPath string) (*Engine, *replay.Replica, context.CancelFunc, chan error) {
 	t.Helper()
@@ -380,6 +395,110 @@ func TestEngineResumesCleanly(t *testing.T) {
 		t.Fatalf("%v: %s", err, out)
 	}
 	waitEqual(t, src, rep, 10*time.Second)
+	if e2.Rebased() != 0 {
+		t.Errorf("clean restart should resume, not rebase (rebased=%d)", e2.Rebased())
+	}
+}
+
+// TestEngineResumeAppliesNothingBeforeNewWrite is the regression test for
+// Finding 1 of the task-7 review: "clean resume silently re-applies the
+// whole prior session". It uses countingSink so the assertion is on the raw
+// number of Sink.Apply calls, not on replica content — replay.Replica
+// happens to be idempotent, which is exactly what let the bug through
+// undetected before (empirically: 3 re-applies before any new write, per
+// the review). The Sink doc comment in engine.go now states Apply must never
+// be called twice for the same transaction; this test enforces the stronger,
+// directly-observable form of that: zero Apply calls between a clean resume
+// and the first genuinely new write.
+//
+// Against the pre-fix code (shutdown() checkpointing RESTART instead of
+// TRUNCATE, tryResume Bind-ing at wal.HeaderSize with matching salts and
+// re-parsing whatever checksum-valid frames are still physically present in
+// the -wal file) this test fails: session 2's Apply count is >0 —
+// empirically 1, matching the single transaction captured in session 1 —
+// before any new write ever lands. Verified by running this test against a
+// stashed pre-fix engine.go/state.go: it failed with exactly that shape
+// ("session 2 resumed but re-applied 1 already-captured transaction(s)
+// before any new write").
+func TestEngineResumeAppliesNothingBeforeNewWrite(t *testing.T) {
+	if _, err := exec.LookPath("sqlite3"); err != nil {
+		t.Skip("sqlite3 CLI not on PATH")
+	}
+	dir := t.TempDir()
+	src := filepath.Join(dir, "src.db")
+	if out, err := exec.Command("sqlite3", src,
+		"PRAGMA journal_mode=WAL; CREATE TABLE t (id INTEGER PRIMARY KEY, v BLOB);").CombinedOutput(); err != nil {
+		t.Fatalf("init: %v: %s", err, out)
+	}
+
+	// Foreign application connection kept open across the whole test — see
+	// TestEngineResumesCleanly's comment for why: without it, the
+	// capturer's own close would be the last connection to src, and
+	// SQLite's last-close WAL deletion in WAL mode would make this test
+	// pass for the wrong reason (no WAL left to re-apply from, rather than
+	// the fix actually preventing re-application).
+	fdb, err := sql.Open("sqlite3", src+"?_busy_timeout=5000")
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer fdb.Close()
+	if _, err := fdb.Exec("PRAGMA journal_mode=WAL"); err != nil {
+		t.Fatal(err)
+	}
+	if err := fdb.Ping(); err != nil {
+		t.Fatal(err)
+	}
+
+	rep := replay.New(filepath.Join(dir, "replica.db"))
+
+	var count1 int32
+	e1 := NewEngine(Options{DBPath: src, StateDir: dir, Sink: countingSink{replicaSink{rep}, &count1}})
+	ctx1, cancel1 := context.WithCancel(context.Background())
+	done1 := make(chan error, 1)
+	go func() { done1 <- e1.Run(ctx1) }()
+	if out, err := exec.Command("sqlite3", src,
+		"PRAGMA busy_timeout=5000; INSERT INTO t (v) VALUES (randomblob(64));").CombinedOutput(); err != nil {
+		t.Fatalf("%v: %s", err, out)
+	}
+	waitEqual(t, src, rep, 10*time.Second)
+	if got := atomic.LoadInt32(&count1); got != 1 {
+		t.Fatalf("session 1: expected exactly 1 Apply call for the one write, got %d", got)
+	}
+	cancel1()
+	<-done1
+
+	// No writes while dead. Second engine must resume cleanly.
+	var count2 int32
+	e2 := NewEngine(Options{DBPath: src, StateDir: dir, Sink: countingSink{replicaSink{rep}, &count2}})
+	ctx2, cancel2 := context.WithCancel(context.Background())
+	done2 := make(chan error, 1)
+	go func() { done2 <- e2.Run(ctx2) }()
+	defer func() { cancel2(); <-done2 }()
+
+	// Give the engine time to run tryResume/rebase and settle into its poll
+	// loop, well before any new write arrives. This is the crux of the
+	// regression: on the pre-fix code, still-present WAL frames from
+	// session 1 get re-parsed and re-applied right here, with no new write
+	// having happened at all.
+	time.Sleep(300 * time.Millisecond)
+	if got := atomic.LoadInt32(&count2); got != 0 {
+		t.Fatalf("session 2 resumed but re-applied %d already-captured transaction(s) before any new write — Finding 1 regression", got)
+	}
+
+	// Now a genuinely new write arrives; exactly it must be applied.
+	if out, err := exec.Command("sqlite3", src,
+		"PRAGMA busy_timeout=5000; INSERT INTO t (v) VALUES (randomblob(64));").CombinedOutput(); err != nil {
+		t.Fatalf("%v: %s", err, out)
+	}
+	waitEqual(t, src, rep, 10*time.Second)
+	if got := atomic.LoadInt32(&count2); got != 1 {
+		t.Fatalf("session 2: expected exactly 1 Apply call for the new write, got %d", got)
+	}
+	// Rebased() is only safe to read here, after waitEqual() has established
+	// a happens-before with the engine goroutine's tryResume()/rebase() —
+	// reading it right after the earlier 300ms sleep (before any
+	// synchronizing event) raced Engine.rebased under -race, since that
+	// field isn't synchronized and the sleep is not a real happens-before.
 	if e2.Rebased() != 0 {
 		t.Errorf("clean restart should resume, not rebase (rebased=%d)", e2.Rebased())
 	}
