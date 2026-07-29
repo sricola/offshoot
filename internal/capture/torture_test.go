@@ -59,6 +59,26 @@ func TestTortureWriterKill(t *testing.T) {
 		}
 		cmd.Wait() // reap either way; exit status irrelevant
 
+		// every 10th round: bounce the capturer itself mid-traffic — cancel
+		// its context (a capturer crash/restart, distinct from the
+		// foreign-writer kills above), wait for Run to return, then start a
+		// fresh Engine on the same StateDir/replica and keep going. This is
+		// Task 7's tryResume/rebase decision exercised under real
+		// torture-level concurrency: a bounce can land the capturer in a
+		// dirty (resume-ineligible ⇒ rebase) or clean (resume-eligible)
+		// state depending on what raced it, and both must converge with
+		// zero silent divergence.
+		if round%10 == 0 {
+			cancel()
+			if err := <-engDone; err != nil {
+				t.Fatalf("round %d: engine.Run returned error on capturer bounce: %v", round, err)
+			}
+			e = NewEngine(Options{DBPath: src, StateDir: dir, Sink: tortureSink{rep}})
+			ctx, cancel = context.WithCancel(context.Background())
+			engDone = make(chan error, 1)
+			go func() { engDone <- e.Run(ctx) }()
+		}
+
 		// The engine's Run can fail loudly (e.g. it could not reacquire its
 		// read lock) — surface that immediately rather than let the round
 		// loop spin against a dead engine and report a misleading divergence.

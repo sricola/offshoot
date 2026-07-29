@@ -89,8 +89,12 @@ func (e *Engine) Run(ctx context.Context) error {
 		return err
 	}
 
-	if err := e.rebase(ctx); err != nil {
+	if resumed, err := e.tryResume(ctx); err != nil {
 		return err
+	} else if !resumed {
+		if err := e.rebase(ctx); err != nil {
+			return err
+		}
 	}
 
 	idle := time.Now()
@@ -99,8 +103,7 @@ func (e *Engine) Run(ctx context.Context) error {
 	for {
 		select {
 		case <-ctx.Done():
-			e.drain(ctx)
-			e.endRead(ctx)
+			e.shutdown()
 			return nil
 		case <-tick.C:
 		}
@@ -146,6 +149,67 @@ func (e *Engine) Run(ctx context.Context) error {
 	}
 }
 
+// shutdown runs on the ctx.Done() path. It drains whatever's still pending,
+// then attempts a final verified-clean checkpoint(RESTART) — the exact
+// log==consumed proof takeover() uses — and, only if that succeeds,
+// persists State{Off: HeaderSize, <current header salts>}. That is the only
+// way tryResume's Off==HeaderSize precondition is ever produced; see
+// tryResume's doc comment for why matching salts on the next start then
+// proves zero writes happened while the process was down.
+//
+// It uses a fresh, short-lived context rather than the engine's own ctx
+// (already cancelled here by definition) — checkpoint() and endRead() both
+// bail out immediately on a done context and would otherwise never run.
+//
+// Every failure path here is swallowed on purpose: it only forgoes the
+// resume optimization for the next start (the last state drain() wrote
+// stays on disk, with Off > HeaderSize, which tryResume already rejects),
+// never correctness. Silently skipping an optimization is fine; silently
+// resuming across a gap is exactly the failure this task exists to kill.
+func (e *Engine) shutdown() {
+	sctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	defer cancel()
+
+	e.drain(sctx)
+	off, _, _ := e.reader.Offset()
+	var consumed int64
+	if off != 0 {
+		frameSize := int64(wal.FrameHeaderSize) + int64(e.pageSize)
+		consumed = (off - wal.HeaderSize) / frameSize
+	}
+	e.endRead(sctx)
+
+	logN, err := e.checkpoint(sctx, "RESTART")
+	if err != nil || int64(logN) != consumed {
+		// Not verified clean — either the checkpoint itself failed (busy,
+		// timeout, DB gone) or frames were folded that we hadn't consumed.
+		// Leave the last drain()-written state as-is; it has Off >
+		// HeaderSize (or is simply stale), so tryResume will reject it and
+		// the next start rebases. Safe, just not optimal.
+		return
+	}
+
+	b := make([]byte, wal.HeaderSize)
+	f, err := os.Open(e.o.DBPath + "-wal")
+	if err != nil {
+		return
+	}
+	_, rerr := io.ReadFull(f, b)
+	f.Close()
+	if rerr != nil {
+		return
+	}
+	hdr, err := wal.ParseHeader(b)
+	if err != nil {
+		return
+	}
+	// RESTART's reset is lazy (see takeover()'s comment above): the header
+	// on disk right now still carries these salts and will until the next
+	// writer commits — which is exactly what a resuming engine needs to
+	// compare against.
+	SaveState(e.statePath(), State{Off: int64(wal.HeaderSize), Salt1: hdr.Salt1, Salt2: hdr.Salt2})
+}
+
 // drain consumes all currently available committed transactions.
 func (e *Engine) drain(ctx context.Context) (int, error) {
 	n := 0
@@ -188,6 +252,75 @@ func (e *Engine) endRead(ctx context.Context) {
 		e.conn.ExecContext(ctx, "COMMIT")
 		e.inTx = false
 	}
+}
+
+// tryResume resumes capture without a rebase when — and only when — it can
+// prove nothing was missed while the process was down: a saved state exists,
+// its offset is exactly wal.HeaderSize (nothing was captured since whatever
+// last reset the WAL to empty — see shutdown()), and its salts match the
+// live WAL header. Anything else — no saved state, offset past HeaderSize
+// (we'd need the running checksum to keep going, which we don't have and
+// won't reconstruct by trusting our own historical bytes), an absent or
+// unreadable WAL, or salts that differ — returns false and the caller
+// rebases.
+//
+// Off==HeaderSize is only ever produced by shutdown()'s final
+// verified-clean checkpoint(RESTART), which proves (via the same
+// log==consumed check takeover() uses) that the WAL was folded into the
+// main DB and reset to empty at the moment we went down. A WAL left in that
+// state keeps its old header/salts on disk until the *next* write —
+// whenever it happens, dead or alive — performs SQLite's lazy reset and
+// rewrites them. So "salts still match" isn't just evidence, it's proof
+// that zero writes landed while we were dead: any write at all, being
+// necessarily the first since the reset-armed shutdown, would have flipped
+// them.
+//
+// The reader is bound (not left unbound) at HeaderSize with the saved
+// salts specifically so that any drift is caught as wal.ErrWALRestarted
+// rather than silently trusted: an unbound reader binds to whatever the
+// header says at its first Next() call, which could already be a different,
+// unverified generation if a write raced us on the way up (see wal.Reader's
+// two-branch Next(): bare NewReader trusts the header it happens to see
+// first; Bind() pins it to what we already verified and treats any change
+// as the restart it is).
+//
+// expectRestart is armed on success: a successful resume re-establishes
+// exactly the "verified-clean, lazy-reset-pending" state a takeover leaves
+// behind, so the eventual salt flip — triggered by the first write after we
+// come back up — must be absorbed as that same generation's continuation
+// (fresh reader, not counted), not a second, spuriously-counted rebase. See
+// takeover()'s doc comment for the identical reasoning.
+func (e *Engine) tryResume(ctx context.Context) (bool, error) {
+	st, ok, err := LoadState(e.statePath())
+	if err != nil {
+		return false, err
+	}
+	if !ok || st.Off != int64(wal.HeaderSize) {
+		return false, nil
+	}
+	b := make([]byte, wal.HeaderSize)
+	f, err := os.Open(e.o.DBPath + "-wal")
+	if err != nil {
+		return false, nil // no WAL ⇒ can't prove continuity ⇒ rebase
+	}
+	_, rerr := io.ReadFull(f, b)
+	f.Close()
+	if rerr != nil {
+		return false, nil // header not (fully) present ⇒ rebase
+	}
+	hdr, err := wal.ParseHeader(b)
+	if err != nil || hdr.Salt1 != st.Salt1 || hdr.Salt2 != st.Salt2 {
+		return false, nil // wrote while we were dead, or torn header ⇒ rebase
+	}
+	if err := e.beginRead(ctx); err != nil {
+		return false, err
+	}
+	e.reader = wal.NewReader(e.o.DBPath + "-wal")
+	e.reader.Bind(wal.HeaderSize, st.Salt1, st.Salt2)
+	e.captured = 0
+	e.rebased = 0 // a true resume is never a rebase
+	e.expectRestart = true
+	return true, nil
 }
 
 // rebase: checkpoint, snapshot the main file, reset reader + sink + state.

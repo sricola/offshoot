@@ -251,6 +251,140 @@ func TestEngineTakeoverExpectedRestartIsNotRebase(t *testing.T) {
 	}
 }
 
+// TestEngineDetectsMissedWritesAfterCrash is Task 7's core safety test:
+// after the engine is "crashed" (context cancelled — its lock and in-memory
+// state vanish, like kill -9), writes land AND get checkpointed+restarted
+// (new WAL salts) while it's dead, so frames pass through unseen. On
+// restart, the engine must NOT silently resume: it must detect the
+// divergence and rebase, and Rebased() must report it.
+func TestEngineDetectsMissedWritesAfterCrash(t *testing.T) {
+	if _, err := exec.LookPath("sqlite3"); err != nil {
+		t.Skip("sqlite3 CLI not on PATH")
+	}
+	dir := t.TempDir()
+	src := filepath.Join(dir, "src.db")
+	if out, err := exec.Command("sqlite3", src,
+		"PRAGMA journal_mode=WAL; CREATE TABLE t (id INTEGER PRIMARY KEY, v BLOB);").CombinedOutput(); err != nil {
+		t.Fatalf("init: %v: %s", err, out)
+	}
+
+	rep := replay.New(filepath.Join(dir, "replica.db"))
+	e1 := NewEngine(Options{DBPath: src, StateDir: dir, Sink: replicaSink{rep}})
+	ctx1, cancel1 := context.WithCancel(context.Background())
+	done1 := make(chan error, 1)
+	go func() { done1 <- e1.Run(ctx1) }()
+
+	if out, err := exec.Command("sqlite3", src,
+		"PRAGMA busy_timeout=5000; INSERT INTO t (v) VALUES (randomblob(64));").CombinedOutput(); err != nil {
+		t.Fatalf("%v: %s", err, out)
+	}
+	waitEqual(t, src, rep, 10*time.Second)
+
+	// "Crash" the engine (cancel = its lock vanishes, like kill -9 would).
+	cancel1()
+	<-done1
+
+	// While the engine is dead: write AND checkpoint+restart the WAL, so
+	// frames pass through the WAL unseen and the salts change.
+	if out, err := exec.Command("sqlite3", src, "PRAGMA busy_timeout=5000;"+
+		"INSERT INTO t (v) VALUES (randomblob(64));"+
+		"PRAGMA wal_checkpoint(RESTART);"+
+		"INSERT INTO t (v) VALUES (randomblob(64));").CombinedOutput(); err != nil {
+		t.Fatalf("%v: %s", err, out)
+	}
+
+	// Restart the engine on the same StateDir.
+	e2 := NewEngine(Options{DBPath: src, StateDir: dir, Sink: replicaSink{rep}})
+	ctx2, cancel2 := context.WithCancel(context.Background())
+	done2 := make(chan error, 1)
+	go func() { done2 <- e2.Run(ctx2) }()
+	defer func() { cancel2(); <-done2 }()
+
+	// It must converge (via rebase), and it must KNOW it rebased.
+	waitEqual(t, src, rep, 10*time.Second)
+	if e2.Rebased() < 1 {
+		t.Fatal("engine resumed silently across missed writes — undetected divergence")
+	}
+}
+
+// TestEngineResumesCleanly is the positive companion: a clean stop (no
+// writes while dead) must let the restarted engine resume without a rebase.
+// A clean stop relies on Engine.shutdown()'s final verified-clean
+// checkpoint(RESTART), which leaves Off==HeaderSize + matching salts in the
+// saved state — the only state tryResume ever accepts.
+//
+// Adaptation vs the brief: a foreign *sql.DB connection to src is opened
+// before e1 starts and kept open across the whole test (closed via defer at
+// the very end). This models the real topology — the application holds its
+// own long-lived connection to the SQLite file; the capturer is a separate
+// side process that can be bounced independently. Without it, e1's own
+// connection is the *only* connection to src when it closes at the end of
+// Run(), and SQLite's documented last-connection-close behavior in WAL mode
+// (checkpoint + delete the -wal/-shm files once it can get an exclusive
+// lock) wipes out the very salts tryResume needs to compare against —
+// deterministically forcing a rebase and failing this test, independent of
+// any capture-engine logic. That deletion is real SQLite behavior, not a
+// test artifact: verified directly (WAL file present immediately after
+// Engine.shutdown() saves state, gone by the time Run() returns) before
+// adding the foreign connection fixed it.
+func TestEngineResumesCleanly(t *testing.T) {
+	if _, err := exec.LookPath("sqlite3"); err != nil {
+		t.Skip("sqlite3 CLI not on PATH")
+	}
+	dir := t.TempDir()
+	src := filepath.Join(dir, "src.db")
+	if out, err := exec.Command("sqlite3", src,
+		"PRAGMA journal_mode=WAL; CREATE TABLE t (id INTEGER PRIMARY KEY, v BLOB);").CombinedOutput(); err != nil {
+		t.Fatalf("init: %v: %s", err, out)
+	}
+
+	// Foreign application connection: stays open across the capturer bounce
+	// so the capturer's own close is never the *last* connection to src.
+	fdb, err := sql.Open("sqlite3", src+"?_busy_timeout=5000")
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer fdb.Close()
+	if _, err := fdb.Exec("PRAGMA journal_mode=WAL"); err != nil {
+		t.Fatal(err)
+	}
+	if err := fdb.Ping(); err != nil {
+		t.Fatal(err)
+	}
+
+	rep := replay.New(filepath.Join(dir, "replica.db"))
+
+	// First engine: capture, then a clean stop (drain + verified-clean
+	// checkpoint RESTART happens inside Run()'s ctx.Done() shutdown path).
+	e1 := NewEngine(Options{DBPath: src, StateDir: dir, Sink: replicaSink{rep}})
+	ctx1, cancel1 := context.WithCancel(context.Background())
+	done1 := make(chan error, 1)
+	go func() { done1 <- e1.Run(ctx1) }()
+	if out, err := exec.Command("sqlite3", src,
+		"PRAGMA busy_timeout=5000; INSERT INTO t (v) VALUES (randomblob(64));").CombinedOutput(); err != nil {
+		t.Fatalf("%v: %s", err, out)
+	}
+	waitEqual(t, src, rep, 10*time.Second)
+	cancel1()
+	<-done1
+
+	// No writes while dead. Second engine must resume without rebase.
+	e2 := NewEngine(Options{DBPath: src, StateDir: dir, Sink: replicaSink{rep}})
+	ctx2, cancel2 := context.WithCancel(context.Background())
+	done2 := make(chan error, 1)
+	go func() { done2 <- e2.Run(ctx2) }()
+	defer func() { cancel2(); <-done2 }()
+
+	if out, err := exec.Command("sqlite3", src,
+		"PRAGMA busy_timeout=5000; INSERT INTO t (v) VALUES (randomblob(64));").CombinedOutput(); err != nil {
+		t.Fatalf("%v: %s", err, out)
+	}
+	waitEqual(t, src, rep, 10*time.Second)
+	if e2.Rebased() != 0 {
+		t.Errorf("clean restart should resume, not rebase (rebased=%d)", e2.Rebased())
+	}
+}
+
 func TestEngineSurvivesForeignPassiveCheckpoint(t *testing.T) {
 	if _, err := exec.LookPath("sqlite3"); err != nil {
 		t.Skip("sqlite3 CLI not on PATH")
