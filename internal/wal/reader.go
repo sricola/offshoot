@@ -9,13 +9,14 @@ import (
 var ErrWALRestarted = errors.New("wal: salt changed — WAL was restarted")
 
 type Reader struct {
-	path       string
-	bound      bool
-	off        int64
-	salt1      uint32
-	salt2      uint32
-	s1, s2     uint32 // running checksum at off
-	hdr        Header
+	path     string
+	bound    bool
+	needSeed bool
+	off      int64
+	salt1    uint32
+	salt2    uint32
+	s1, s2   uint32 // running checksum at off
+	hdr      Header
 }
 
 func NewReader(walPath string) *Reader { return &Reader{path: walPath} }
@@ -25,8 +26,11 @@ func (r *Reader) Offset() (int64, uint32, uint32) { return r.off, r.salt1, r.sal
 func (r *Reader) Bind(off int64, salt1, salt2 uint32) {
 	// Rebinding at an offset requires the checksum seed at that offset; for
 	// crash recovery we only ever Bind at HeaderSize with the header seed —
-	// the engine rebases in all other cases (see capture.State).
+	// the engine rebases in all other cases (see capture.State). We don't
+	// have the header's checksum words here, so mark the seed as pending
+	// and derive it from the on-disk header on the next Next() call.
 	r.bound, r.off, r.salt1, r.salt2 = true, off, salt1, salt2
+	r.needSeed = true
 }
 
 func (r *Reader) Next() ([]Frame, error) {
@@ -55,6 +59,9 @@ func (r *Reader) Next() ([]Frame, error) {
 		r.hdr = hdr
 	} else if hdr.Salt1 != r.salt1 || hdr.Salt2 != r.salt2 {
 		return nil, ErrWALRestarted
+	} else if r.needSeed {
+		r.s1, r.s2 = hdr.Cksum1, hdr.Cksum2
+		r.needSeed = false
 	}
 	r.hdr = hdr
 
