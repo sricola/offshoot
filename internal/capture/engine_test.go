@@ -97,6 +97,47 @@ func TestEngineCapturesStockCLIWriter(t *testing.T) {
 	waitEqual(t, src, rep, 10*time.Second)
 }
 
+// TestEngineTakeoverUnderConcurrentWrites hammers the engine with a foreign
+// writer committing continuously while the engine repeatedly crosses the
+// 64-txn takeover threshold. This exercises the endRead()→checkpoint(RESTART)
+// window where a foreign commit can land between our last consumed offset
+// and the checkpoint that folds the WAL into the main DB. Any frames folded
+// in that window that we never saw must be detected (via a counted rebase),
+// never silently dropped — so convergence must be reached deterministically.
+func TestEngineTakeoverUnderConcurrentWrites(t *testing.T) {
+	if _, err := exec.LookPath("sqlite3"); err != nil {
+		t.Skip("sqlite3 CLI not on PATH")
+	}
+	src := filepath.Join(t.TempDir(), "src.db")
+	db, err := sql.Open("sqlite3", src+"?_busy_timeout=5000")
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer db.Close()
+	if _, err := db.Exec("PRAGMA journal_mode=WAL"); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := db.Exec("CREATE TABLE t (id INTEGER PRIMARY KEY, v BLOB)"); err != nil {
+		t.Fatal(err)
+	}
+
+	e, rep, cancel, done := startEngine(t, src)
+	defer func() { cancel(); <-done }()
+
+	// ~200 single-INSERT transactions with small sleeps: enough to cross the
+	// 64-txn takeover threshold several times while writes are in flight.
+	const n = 200
+	for i := 0; i < n; i++ {
+		if _, err := db.Exec("INSERT INTO t (v) VALUES (randomblob(128))"); err != nil {
+			t.Fatal(err)
+		}
+		time.Sleep(time.Millisecond)
+	}
+
+	waitEqual(t, src, rep, 15*time.Second)
+	t.Logf("rebased=%d", e.Rebased())
+}
+
 func TestEngineSurvivesForeignPassiveCheckpoint(t *testing.T) {
 	if _, err := exec.LookPath("sqlite3"); err != nil {
 		t.Skip("sqlite3 CLI not on PATH")
