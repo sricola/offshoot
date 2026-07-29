@@ -504,6 +504,99 @@ func TestEngineResumeAppliesNothingBeforeNewWrite(t *testing.T) {
 	}
 }
 
+// TestEngineDetectsInPlaceUpdateAfterCleanShutdown is the regression test
+// for Finding 1 of the task-7 hardening-pass review: "replace mtime+size
+// with a content hash." mtime+size cannot see an in-place UPDATE that keeps
+// the row count and blob width fixed — the main file's size never changes,
+// and a fast enough bounce can land inside a single filesystem mtime tick.
+// Under the pre-fix (mtime+size) fingerprint this exact scenario is a
+// silent false match: tryResume would trust a main file whose content had
+// actually diverged, and the replica would go permanently stale with no
+// detectable signal. Forging the mtime back isn't needed to prove this with
+// a content hash — the test simply asserts the hash catches a content
+// change even when size is identical, which mtime+size structurally cannot.
+//
+// Sequence: e1 captures one row, shuts down cleanly (verified-clean
+// RESTART+TRUNCATE, hash fingerprint saved). While the engine is down, a
+// foreign connection performs an in-place UPDATE — same blob width as the
+// original insert, so the main file's size is unchanged — and its own
+// close (it is the sole connection at that point) triggers SQLite's
+// last-connection-close auto-checkpoint, which folds the UPDATE into the
+// main file and deletes the WAL. e2 must detect this (hash mismatch, WAL
+// still provably empty) and rebase rather than silently resume, and the
+// replica must converge to include the UPDATE.
+func TestEngineDetectsInPlaceUpdateAfterCleanShutdown(t *testing.T) {
+	if _, err := exec.LookPath("sqlite3"); err != nil {
+		t.Skip("sqlite3 CLI not on PATH")
+	}
+	dir := t.TempDir()
+	src := filepath.Join(dir, "src.db")
+	if out, err := exec.Command("sqlite3", src,
+		"PRAGMA journal_mode=WAL; CREATE TABLE t (id INTEGER PRIMARY KEY, v BLOB);").CombinedOutput(); err != nil {
+		t.Fatalf("init: %v: %s", err, out)
+	}
+
+	// Foreign application connection kept open across e1's lifetime, same
+	// pattern as TestEngineResumesCleanly: without it, e1's own close would
+	// be the last connection to src, entangling SQLite's last-close
+	// auto-checkpoint with e1's own shutdown instead of the foreign UPDATE
+	// below, which is what this test needs to isolate and control.
+	fdb, err := sql.Open("sqlite3", src+"?_busy_timeout=5000")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := fdb.Exec("PRAGMA journal_mode=WAL"); err != nil {
+		t.Fatal(err)
+	}
+	if err := fdb.Ping(); err != nil {
+		t.Fatal(err)
+	}
+
+	rep := replay.New(filepath.Join(dir, "replica.db"))
+
+	e1 := NewEngine(Options{DBPath: src, StateDir: dir, Sink: replicaSink{rep}})
+	ctx1, cancel1 := context.WithCancel(context.Background())
+	done1 := make(chan error, 1)
+	go func() { done1 <- e1.Run(ctx1) }()
+	if out, err := exec.Command("sqlite3", src,
+		"PRAGMA busy_timeout=5000; INSERT INTO t (v) VALUES (randomblob(64));").CombinedOutput(); err != nil {
+		t.Fatalf("%v: %s", err, out)
+	}
+	waitEqual(t, src, rep, 10*time.Second)
+	cancel1()
+	<-done1 // clean shutdown: verified-clean RESTART+TRUNCATE, hash fingerprint saved
+
+	// Close the foreign connection now, as a controlled step of its own:
+	// this is the last connection at this instant, so it triggers SQLite's
+	// last-close auto-checkpoint over the already-TRUNCATE-emptied WAL —
+	// nothing to fold, harmless to the fingerprint we just saved.
+	if err := fdb.Close(); err != nil {
+		t.Fatal(err)
+	}
+
+	// While the engine is down: a fresh single connection performs an
+	// in-place UPDATE (same blob width as the original INSERT, so the main
+	// file's size is unchanged) and then closes. That close is the sole/last
+	// connection close, which triggers SQLite's own checkpoint-and-delete:
+	// the UPDATE gets folded into the main file and the -wal file is
+	// removed — exactly the "close-checkpoint" attack this test targets.
+	if out, err := exec.Command("sqlite3", src,
+		"PRAGMA busy_timeout=5000; UPDATE t SET v = randomblob(64) WHERE id = 1;").CombinedOutput(); err != nil {
+		t.Fatalf("update: %v: %s", err, out)
+	}
+
+	e2 := NewEngine(Options{DBPath: src, StateDir: dir, Sink: replicaSink{rep}})
+	ctx2, cancel2 := context.WithCancel(context.Background())
+	done2 := make(chan error, 1)
+	go func() { done2 <- e2.Run(ctx2) }()
+	defer func() { cancel2(); <-done2 }()
+
+	waitEqual(t, src, rep, 10*time.Second)
+	if got := e2.Rebased(); got < 1 {
+		t.Fatalf("engine resumed silently across an in-place UPDATE that changed content but not size — Finding 1 regression; Rebased() = %d, want >= 1", got)
+	}
+}
+
 func TestEngineSurvivesForeignPassiveCheckpoint(t *testing.T) {
 	if _, err := exec.LookPath("sqlite3"); err != nil {
 		t.Skip("sqlite3 CLI not on PATH")

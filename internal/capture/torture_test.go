@@ -54,7 +54,23 @@ func TestTortureWriterKill(t *testing.T) {
 	// its own resume claim. bounceCount tracks how many capturer bounces
 	// (round%10==0 below) occurred, so the aggregate can be checked against
 	// it after the loop.
+	//
+	// resumedCount is a direct proof of resume, added in the task-7
+	// hardening pass (Finding 3): totalRebases < 1+bounceCount only *infers*
+	// that some bounce resumed, by process of elimination against the
+	// aggregate rebase count — it can't distinguish "resumed cleanly" from
+	// other ways a bounce could avoid contributing a rebase, and conflates
+	// mid-session takeover rebases with resume/no-resume at startup.
+	// resumedCount instead reads Engine.Resumed() directly off each engine
+	// instance right after it's known to have started (the same
+	// happens-before points totalRebases already relies on: a channel
+	// receive from engDone, or — for the still-live final engine — after
+	// the loop's cancel()/<-engDone below), so it reports exactly how many
+	// of the 1+bounceCount session-starts actually took the tryResume
+	// success path, independent of whatever rebases (if any) that session
+	// went on to accumulate later in its own lifetime.
 	var totalRebases int
+	var resumedCount int
 	bounceCount := 0
 	for time.Now().Before(deadline) {
 		round++
@@ -86,6 +102,12 @@ func TestTortureWriterKill(t *testing.T) {
 			// said was being silently discarded.
 			totalRebases += e.Rebased()
 			bounceCount++
+			// The channel receive above (<-engDone) is a real happens-before
+			// with the engine goroutine's tryResume() call, so reading
+			// Resumed() here is race-safe — same reasoning as Rebased().
+			if e.Resumed() {
+				resumedCount++
+			}
 			e = NewEngine(Options{DBPath: src, StateDir: dir, Sink: tortureSink{rep}})
 			ctx, cancel = context.WithCancel(context.Background())
 			engDone = make(chan error, 1)
@@ -115,9 +137,12 @@ func TestTortureWriterKill(t *testing.T) {
 	// every bounce above, just for the session that's still live when the
 	// deadline hits.
 	totalRebases += e.Rebased()
+	if e.Resumed() {
+		resumedCount++
+	}
 
-	t.Logf("torture complete: %d rounds, %d bounces, %d aggregate rebases across %d session-starts",
-		round, bounceCount, totalRebases, 1+bounceCount)
+	t.Logf("torture complete: %d rounds, %d bounces, %d aggregate rebases across %d session-starts, %d resumed cleanly (resumed/bounce ratio: %.2f)",
+		round, bounceCount, totalRebases, 1+bounceCount, resumedCount, resumedRatio(resumedCount, bounceCount))
 
 	// The very first session always rebases once (no prior state to resume
 	// from), so the aggregate can never be zero.
@@ -135,6 +160,28 @@ func TestTortureWriterKill(t *testing.T) {
 		t.Errorf("aggregate rebases (%d) >= session-starts (%d): no bounce ever resumed cleanly — resume path went unexercised this run",
 			totalRebases, 1+bounceCount)
 	}
+
+	// Direct resume proof (task-7 hardening pass, Finding 3), independent of
+	// the inference above: the inequality check on totalRebases only infers
+	// that *some* bounce resumed, and conflates a mid-session takeover
+	// rebase with a startup resume/rebase decision. resumedCount is read
+	// straight off Engine.Resumed() in each session's success branch, so
+	// this assertion has no such ambiguity. Skip when no bounce occurred,
+	// same rationale as the inference check above: nothing could have
+	// resumed if the capturer was never bounced.
+	if bounceCount > 0 && resumedCount < 1 {
+		t.Fatalf("resumedCount = %d, want >= 1: not one of the %d capturer bounces resumed cleanly (direct proof via Engine.Resumed())",
+			resumedCount, bounceCount)
+	}
+}
+
+// resumedRatio returns resumedCount/bounceCount, or 0 when there were no
+// bounces to divide by (avoids a NaN in the log line for short/skipped runs).
+func resumedRatio(resumedCount, bounceCount int) float64 {
+	if bounceCount == 0 {
+		return 0
+	}
+	return float64(resumedCount) / float64(bounceCount)
 }
 
 func converged(t *testing.T, src string, rep *replay.Replica, d time.Duration) bool {

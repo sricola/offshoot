@@ -22,18 +22,34 @@ import (
 //     unused. This is produced ONLY by shutdown()'s successful
 //     RESTART-then-TRUNCATE checkpoint sequence, which physically zeroes the
 //     -wal file — it means "every captured-so-far frame is folded into the
-//     main DB and the WAL is empty; nothing is pending". MainMTimeNS and
-//     MainSize fingerprint the MAIN db file (not the WAL) at that same
-//     instant: SQLite mtime (nanoseconds) and byte size, read right after
-//     the TRUNCATE that folded everything in. tryResume treats Clean==true
-//     as necessary but NOT sufficient to skip a rebase — it additionally
+//     main DB and the WAL is empty; nothing is pending". MainHash
+//     fingerprints the MAIN db file (not the WAL) at that same instant: the
+//     lowercase-hex SHA-256 of its entire contents, read right after the
+//     TRUNCATE that folded everything in. tryResume treats Clean==true as
+//     necessary but NOT sufficient to skip a rebase — it additionally
 //     requires BOTH the on-disk -wal file being still physically empty AND
-//     the main file's current mtime/size still matching this fingerprint
+//     the main file's current content hash still matching this fingerprint
 //     (see tryResume's doc comment for why both checks are independently
 //     needed: an empty WAL alone cannot distinguish "nothing happened" from
 //     "something happened and a third party — including SQLite's own
 //     last-connection-close auto-checkpoint — folded it into the main file
 //     and erased the WAL evidence in the process").
+//
+//     A content hash, not mtime+size (task-7 hardening pass, Finding 1):
+//     mtime+size was tried first and rejected. An in-place UPDATE (fixed row
+//     count, fixed-width columns) folds into the main file without changing
+//     its size at all, and filesystem mtime granularity is 1s on several
+//     common setups (HFS+, FAT, NFS with client-side caching) — a resume
+//     cycle fast enough to land inside that 1s window plus such an UPDATE
+//     is a silent false match: tryResume would trust a main file that
+//     actually diverged, and the replica would go permanently stale with no
+//     detectable signal. SHA-256 over the full file content has no such
+//     blind spot: any byte difference, regardless of file size or write
+//     timing, changes the hash. Cost: a full-file read at every clean
+//     shutdown and every resume attempt. Acceptable for this spike's target
+//     session sizes (MBs to low-single-digit GBs) — see hashFile's doc
+//     comment in engine.go for the Plan-2 note (LTX's cumulative checksums
+//     subsume this and should replace it).
 //
 // rebase() saves State{} (Clean=false, Off=0), so an unqualified zero value
 // continues to mean "no usable resume point" exactly as before this field
@@ -44,11 +60,11 @@ type State struct {
 	Salt2 uint32 `json:"salt2"`
 	Clean bool   `json:"clean"`
 
-	// MainMTimeNS and MainSize are the main DB file's mtime (UnixNano) and
-	// size at the moment of a verified-clean shutdown. Meaningful only when
-	// Clean is true. See the type doc comment and tryResume's doc comment.
-	MainMTimeNS int64 `json:"main_mtime_ns"`
-	MainSize    int64 `json:"main_size"`
+	// MainHash is the lowercase-hex SHA-256 of the main DB file's entire
+	// contents at the moment of a verified-clean shutdown. Meaningful only
+	// when Clean is true. See the type doc comment and tryResume's doc
+	// comment.
+	MainHash string `json:"main_hash"`
 }
 
 func LoadState(path string) (State, bool, error) {
