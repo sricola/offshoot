@@ -85,14 +85,19 @@ func TestTortureWriterKill(t *testing.T) {
 		cmd.Wait() // reap either way; exit status irrelevant
 
 		// every 10th round: bounce the capturer itself mid-traffic — cancel
-		// its context (a capturer crash/restart, distinct from the
-		// foreign-writer kills above), wait for Run to return, then start a
-		// fresh Engine on the same StateDir/replica and keep going. This is
-		// Task 7's tryResume/rebase decision exercised under real
-		// torture-level concurrency: a bounce can land the capturer in a
-		// dirty (resume-ineligible ⇒ rebase) or clean (resume-eligible)
-		// state depending on what raced it, and both must converge with
-		// zero silent divergence.
+		// its context, which exercises Run's graceful ctx.Done()/shutdown()
+		// path (final drain, verified-clean checkpoint attempt), NOT a
+		// process SIGKILL of the capturer — distinct from the real
+		// foreign-writer SIGKILLs above. A true capturer SIGKILL is
+		// argued-safe (see engine.go's shutdown()/tryResume() doc comments)
+		// but untested by this harness; see the spike report's "What was NOT
+		// proven" section. Wait for Run to return, then start a fresh Engine
+		// on the same StateDir/replica and keep going. This is Task 7's
+		// tryResume/rebase decision exercised under real torture-level
+		// concurrency: a bounce can land the capturer in a dirty
+		// (resume-ineligible ⇒ rebase) or clean (resume-eligible) state
+		// depending on what raced it, and both must converge with zero
+		// silent divergence.
 		if round%10 == 0 {
 			cancel()
 			if err := <-engDone; err != nil {

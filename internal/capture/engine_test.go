@@ -267,11 +267,13 @@ func TestEngineTakeoverExpectedRestartIsNotRebase(t *testing.T) {
 }
 
 // TestEngineDetectsMissedWritesAfterCrash is Task 7's core safety test:
-// after the engine is "crashed" (context cancelled — its lock and in-memory
-// state vanish, like kill -9), writes land AND get checkpointed+restarted
-// (new WAL salts) while it's dead, so frames pass through unseen. On
-// restart, the engine must NOT silently resume: it must detect the
-// divergence and rebase, and Rebased() must report it.
+// after the engine is stopped (context cancelled, which exercises Run's
+// graceful ctx.Done()/shutdown() path — drain, lock release — strictly
+// gentler than an actual SIGKILL of the capturer process; see the spike
+// report's "What was NOT proven" section), writes land AND get
+// checkpointed+restarted (new WAL salts) while it's down, so frames pass
+// through unseen. On restart, the engine must NOT silently resume: it must
+// detect the divergence and rebase, and Rebased() must report it.
 func TestEngineDetectsMissedWritesAfterCrash(t *testing.T) {
 	if _, err := exec.LookPath("sqlite3"); err != nil {
 		t.Skip("sqlite3 CLI not on PATH")
@@ -295,7 +297,10 @@ func TestEngineDetectsMissedWritesAfterCrash(t *testing.T) {
 	}
 	waitEqual(t, src, rep, 10*time.Second)
 
-	// "Crash" the engine (cancel = its lock vanishes, like kill -9 would).
+	// Stop the engine via context cancellation. This exercises Run's
+	// graceful ctx.Done()/shutdown() path (final drain, lock release), NOT a
+	// process SIGKILL — a real capturer-SIGKILL harness is still open work,
+	// see the spike report.
 	cancel1()
 	<-done1
 
@@ -494,11 +499,13 @@ func TestEngineResumeAppliesNothingBeforeNewWrite(t *testing.T) {
 	if got := atomic.LoadInt32(&count2); got != 1 {
 		t.Fatalf("session 2: expected exactly 1 Apply call for the new write, got %d", got)
 	}
-	// Rebased() is only safe to read here, after waitEqual() has established
-	// a happens-before with the engine goroutine's tryResume()/rebase() —
-	// reading it right after the earlier 300ms sleep (before any
-	// synchronizing event) raced Engine.rebased under -race, since that
-	// field isn't synchronized and the sleep is not a real happens-before.
+	// Engine.rebased/resumed are atomic, so reading Rebased() is race-safe
+	// from any goroutine at any time — but it's still checked here, after
+	// waitEqual() has established a happens-before with the engine
+	// goroutine's tryResume()/rebase(), rather than right after the earlier
+	// 300ms sleep: a sleep is not a real happens-before, so reading here
+	// guarantees the value reflects this session's actual startup decision
+	// rather than a not-yet-updated snapshot.
 	if e2.Rebased() != 0 {
 		t.Errorf("clean restart should resume, not rebase (rebased=%d)", e2.Rebased())
 	}

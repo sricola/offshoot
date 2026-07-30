@@ -23,6 +23,15 @@ func NewReader(walPath string) *Reader { return &Reader{path: walPath} }
 
 func (r *Reader) Offset() (int64, uint32, uint32) { return r.off, r.salt1, r.salt2 }
 
+// PageSize returns the page size recorded in the most recently parsed WAL
+// header (zero until the reader has observed a header at least once, i.e.
+// before its first successful Next() call). SQLite cannot change a
+// database's page size while in WAL mode, so callers that captured a page
+// size once (e.g. at startup via PRAGMA page_size) can use this to assert
+// that assumption stays true for the lifetime of a WAL generation rather
+// than carry it as an unstated invariant.
+func (r *Reader) PageSize() uint32 { return r.hdr.PageSize }
+
 func (r *Reader) Bind(off int64, salt1, salt2 uint32) {
 	// Rebinding at an offset requires the checksum seed at that offset; for
 	// crash recovery we only ever Bind at HeaderSize with the header seed —
