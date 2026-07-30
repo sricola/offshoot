@@ -12,6 +12,7 @@ import (
 	"io"
 	"os"
 	"path/filepath"
+	"sync/atomic"
 	"time"
 
 	_ "github.com/mattn/go-sqlite3"
@@ -30,6 +31,21 @@ import (
 // masked an earlier bug where a resumed engine re-applied an already-folded
 // WAL generation; the LTX sink must not rely on that — it should treat a
 // duplicate Apply as a bug, not a no-op.
+//
+// A Rebase snapshot is not guaranteed to partition cleanly against the
+// Apply calls around it, though. The new base a Rebase call hands the sink
+// can already physically reflect transactions whose frames will still
+// arrive via Apply afterward — rebase()'s post-TRUNCATE snapshot copy runs
+// without a read lock held, so a foreign write can land and get folded into
+// the copied file while the WAL, independently, still carries (and the
+// reader still re-delivers) those same frames as well; see rebase()'s doc
+// comment for why replaying them again heals rather than corrupts. The
+// no-duplicate-Apply guarantee above still holds unconditionally — but the
+// snapshot a Rebase hands over and the Apply stream that follows it may
+// overlap in what they each already reflect. Plan 2's LTX sink must handle
+// that overlap explicitly (e.g. by checking its own cumulative state before
+// trusting a rebase snapshot at face value), not assume Rebase output and
+// Apply calls together partition the transaction history exactly once each.
 type Sink interface {
 	Rebase(snapshotPath string) error
 	Apply(pageSize uint32, frames []wal.Frame) error
@@ -49,13 +65,20 @@ type Engine struct {
 	inTx     bool
 	reader   *wal.Reader
 	pageSize uint32
-	rebased  int
+
+	// rebased and resumed are read from outside the engine goroutine (see
+	// Rebased()/Resumed()) — by test code polling for progress, and by
+	// cmd/torture's round loop, which reads them concurrently with Run()
+	// still executing. They are atomic so those reads are race-safe from any
+	// goroutine at any time, not just after an established happens-before.
+	rebased atomic.Int64
+
 	captured int // txns since last takeover
 
 	// resumed is set true exactly once, in tryResume's success branch, when
 	// this Engine instance skipped the initial rebase because it proved
 	// continuity across a restart. See Resumed().
-	resumed bool
+	resumed atomic.Bool
 
 	// expectRestart is true immediately after a verified-clean takeover
 	// (checkpoint RESTART folded exactly what we'd already consumed, no
@@ -75,10 +98,16 @@ func NewEngine(o Options) *Engine {
 	return &Engine{o: o}
 }
 
-// Rebased reports how many times the engine rebased (1 = initial only).
-// Every rebase beyond the first means continuity was lost and re-established
-// — detected, never silent.
-func (e *Engine) Rebased() int { return e.rebased }
+// Rebased reports how many times this Engine instance rebased. This
+// predates resume support, when a startup rebase was unconditional and 1
+// meant "just the initial one, nothing else went wrong" — that's no longer
+// the baseline: a cleanly resumed session (see Resumed()) skips the startup
+// rebase entirely and reports 0, while a session that rebases at startup
+// (no eligible resume) still reports 1 with nothing else having gone wrong.
+// Any count beyond what startup alone accounts for — above 0 after a clean
+// resume, or above 1 after a startup rebase — means continuity was lost and
+// re-established later in the session: detected, never silent.
+func (e *Engine) Rebased() int { return int(e.rebased.Load()) }
 
 // Resumed reports whether this Engine instance skipped the initial rebase
 // on startup because tryResume proved continuity across a restart (clean
@@ -87,12 +116,7 @@ func (e *Engine) Rebased() int { return e.rebased }
 // never cleared afterward — it answers "did THIS session's startup resume
 // cleanly," not "has this session ever rebased since." A later in-session
 // rebase (e.g. a takeover fold-race) does not un-set it.
-//
-// Like Rebased(), this field is not synchronized: read it only after a
-// happens-before with the engine goroutine has been established (e.g. a
-// channel receive from Run's return, or convergence via waitEqual — see
-// engine_test.go's TestEngineResumeAppliesNothingBeforeNewWrite for why).
-func (e *Engine) Resumed() bool { return e.resumed }
+func (e *Engine) Resumed() bool { return e.resumed.Load() }
 
 func (e *Engine) statePath() string    { return filepath.Join(e.o.StateDir, "capture-state.json") }
 func (e *Engine) snapshotPath() string { return filepath.Join(e.o.StateDir, "snapshot.db") }
@@ -260,7 +284,21 @@ func (e *Engine) shutdown() {
 	sctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
 	defer cancel()
 
-	e.drain(sctx)
+	if _, err := e.drain(sctx); err != nil {
+		// Reader.Next() advances the reader's own offset the moment it
+		// returns a transaction's frames — BEFORE Sink.Apply ever runs (see
+		// drain() and wal.Reader.Next()). So a failed Apply right here, in
+		// the final drain, would otherwise leave that transaction counted as
+		// consumed while the sink never actually received it: silently
+		// excluding it from the replica forever, at the exact moment we're
+		// about to persist a Clean=true marker asserting nothing is pending.
+		// Abort the entire clean-state save — end the read tx and return,
+		// leaving the last successfully drain()-written state (Clean=false)
+		// on disk, so tryResume rejects it and the next start rebases
+		// instead of silently dropping this transaction.
+		e.endRead(sctx)
+		return
+	}
 	off, _, _ := e.reader.Offset()
 	var consumed int64
 	if off != 0 {
@@ -378,6 +416,15 @@ func (e *Engine) drain(ctx context.Context) (int, error) {
 		if frames == nil {
 			return n, nil
 		}
+		// SQLite cannot change a database's page size while in WAL mode, so
+		// e.pageSize (captured once via PRAGMA page_size at startup — see
+		// Run()) is assumed to hold for the process's entire lifetime and is
+		// what every consumed-offset/frame-size computation in this file
+		// relies on. Make that assumption explicit and fail loudly rather
+		// than silently mis-slice frame data if it's ever violated.
+		if ps := e.reader.PageSize(); ps != e.pageSize {
+			return n, fmt.Errorf("drain: WAL page size %d does not match engine page size %d recorded at startup", ps, e.pageSize)
+		}
 		if err := e.o.Sink.Apply(e.pageSize, frames); err != nil {
 			return n, err
 		}
@@ -480,6 +527,14 @@ func (e *Engine) endRead(ctx context.Context) {
 // expectRestart arming is needed on this path (contrast takeover(), which
 // DOES arm it): an unbound reader's first Next() call binds rather than
 // compares, so there is no "expected restart" for it to ever raise.
+//
+// Lock ordering: the read lock (beginRead) is acquired FIRST, before either
+// condition is checked, not after both pass. Checking-then-locking leaves a
+// TOCTOU gap — a foreign commit+checkpoint(TRUNCATE) landing between "checks
+// passed" and "lock acquired" would satisfy both conditions as observed yet
+// still be exactly the missed-write scenario they exist to catch. Locking
+// first closes that gap structurally: our view of the database is
+// established before either check runs, so nothing can land in between.
 func (e *Engine) tryResume(ctx context.Context) (bool, error) {
 	st, ok, err := LoadState(e.statePath())
 	if err != nil {
@@ -488,15 +543,35 @@ func (e *Engine) tryResume(ctx context.Context) (bool, error) {
 	if !ok || !st.Clean {
 		return false, nil
 	}
+
+	// Acquire the read lock BEFORE either verification check below, not
+	// after. Checking first and locking second leaves a TOCTOU window: a
+	// foreign commit followed by a checkpoint(TRUNCATE) landing between "WAL
+	// confirmed empty"/"hash confirmed match" and "lock acquired" would
+	// pass both checks yet still represent exactly the missed-write scenario
+	// they exist to catch. Locking first closes it — beginRead's BEGIN
+	// (deferred, but the SELECT immediately after actually opens the read
+	// transaction — see beginRead) establishes our view of the database
+	// before either check runs, so nothing can land in the gap the checks
+	// are trying to detect. Any verification failure past this point ends
+	// the read transaction before returning, so the caller's subsequent
+	// rebase() (which starts with its own endRead()) begins from the
+	// engine's normal not-in-a-transaction state — no double-BEGIN.
+	if err := e.beginRead(ctx); err != nil {
+		return false, err
+	}
+
 	fi, statErr := os.Stat(e.o.DBPath + "-wal")
 	switch {
 	case statErr == nil && fi.Size() >= int64(wal.HeaderSize):
 		// A WAL with at least a full header present means a write landed
 		// since our clean shutdown (TRUNCATE leaves nothing behind) ⇒
 		// can't prove continuity ⇒ rebase.
+		e.endRead(ctx)
 		return false, nil
 	case statErr != nil && !os.IsNotExist(statErr):
 		// Unreadable for some other reason ⇒ can't prove continuity ⇒ rebase.
+		e.endRead(ctx)
 		return false, nil
 	}
 	// Absent, zero-length, or a torn partial header: still provably empty
@@ -507,19 +582,18 @@ func (e *Engine) tryResume(ctx context.Context) (bool, error) {
 	// mtime+size).
 	hash, err := hashFile(e.o.DBPath)
 	if err != nil {
+		e.endRead(ctx)
 		return false, nil // can't hash the main file ⇒ can't prove continuity ⇒ rebase
 	}
 	if hash != st.MainHash {
+		e.endRead(ctx)
 		return false, nil // main file content changed since our shutdown ⇒ rebase
-	}
-	if err := e.beginRead(ctx); err != nil {
-		return false, err
 	}
 	e.reader = wal.NewReader(e.o.DBPath + "-wal")
 	e.captured = 0
-	e.rebased = 0 // a true resume is never a rebase
+	e.rebased.Store(0) // a true resume is never a rebase
 	e.expectRestart = false
-	e.resumed = true
+	e.resumed.Store(true)
 	return true, nil
 }
 
@@ -532,16 +606,40 @@ func (e *Engine) rebase(ctx context.Context) error {
 	e.expectRestart = false
 	e.endRead(ctx)
 	if _, err := e.checkpoint(ctx, "TRUNCATE"); err != nil {
-		// Fall back to VACUUM INTO — needs no exclusive checkpoint lock.
-		os.Remove(e.snapshotPath())
-		if _, verr := e.conn.ExecContext(ctx,
-			fmt.Sprintf("VACUUM INTO %q", e.snapshotPath())); verr != nil {
-			return fmt.Errorf("rebase: checkpoint %v; vacuum %v", err, verr)
-		}
-	} else {
-		if err := copyFile(e.o.DBPath, e.snapshotPath()); err != nil {
-			return err
-		}
+		// Loud failure, not a fallback. This used to fall back to VACUUM
+		// INTO (which needs no exclusive checkpoint lock) on the theory that
+		// some snapshot beats none. It doesn't: VACUUM re-pages the
+		// database from scratch, so its output is physically incompatible
+		// with raw frame replay at fixed page numbers — frames captured
+		// afterward would be applied at pgnos that no longer mean what they
+		// used to in the snapshot. Worse, the un-truncated WAL (TRUNCATE
+		// having failed) would then be replayed on top of that
+		// already-incompatible snapshot. Returning the error instead is
+		// exactly the loud-failure-as-detection posture this spike is built
+		// around: Run's caller already treats any rebase error as fatal, so
+		// this surfaces immediately instead of silently producing a replica
+		// that can never converge.
+		return fmt.Errorf("rebase: checkpoint TRUNCATE: %w", err)
+	}
+	// Copy-window note: from here until copyFile below returns, no read lock
+	// is held — endRead() already ran above, and beginRead() doesn't run
+	// again until after the copy. A foreign writer can commit in that
+	// window, and a passive checkpoint (its own, or SQLite's automatic one)
+	// can fold those new frames into the main DB file while copyFile is
+	// mid-read, so the snapshot produced here may include bytes this
+	// session's WAL reader never saw pass through Apply.
+	//
+	// This is convergent, not a correctness gap. Folded frames stay
+	// physically present in the WAL regardless of whether they made it into
+	// the copied snapshot — the fresh reader bound just below picks up the
+	// new generation from its start, and Sink.Apply re-applies those same
+	// frames as full-page images at their original page numbers. Writing
+	// the same bytes to the same pgno a second time heals any torn or
+	// half-copied page the race could have produced, rather than
+	// compounding it. See the Sink interface doc comment above for the
+	// consequence this has for a sink's Apply/Rebase overlap contract.
+	if err := copyFile(e.o.DBPath, e.snapshotPath()); err != nil {
+		return err
 	}
 	if err := e.beginRead(ctx); err != nil {
 		return err
@@ -550,7 +648,7 @@ func (e *Engine) rebase(ctx context.Context) error {
 		return err
 	}
 	e.reader = wal.NewReader(e.o.DBPath + "-wal")
-	e.rebased++
+	e.rebased.Add(1)
 	e.captured = 0
 	return SaveState(e.statePath(), State{})
 }

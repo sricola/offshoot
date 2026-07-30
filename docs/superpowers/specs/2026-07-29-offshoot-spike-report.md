@@ -43,6 +43,24 @@
 - Sustained-throughput capture lag under continuous write load (not
   measured; the spike's torture harnesses drive bursty single-writer traffic
   with idle gaps, not a saturated pipeline).
+- **Capturer-SIGKILL honesty:** every capturer bounce behind the numbers
+  above (216/216 in `make test-torture`, and every bounce in the
+  deterministic unit tests, e.g. `TestEngineDetectsMissedWritesAfterCrash`,
+  `TestEngineResumesCleanly`) used context cancellation, never an actual
+  `SIGKILL` of the capturer process. That exercises Run's graceful
+  `ctx.Done()`/`shutdown()` path every time — final drain, lock release, a
+  verified-clean checkpoint attempt — not a hard stop mid-syscall with no
+  chance to run any of that. True capturer `SIGKILL` is argued-safe by
+  construction, not by measurement: a non-clean on-disk state (no `Clean`
+  marker, or one that fails `tryResume`'s WAL-emptiness/hash checks) forces
+  `rebase()` to re-establish from a fresh snapshot; `SaveState` writes are
+  atomic (write, fsync, rename) so a torn write during the kill is never
+  observed as valid; and `LoadState` treats a corrupt or unreadable state
+  file as absent, the same conservative rebase fallback. None of that has
+  been exercised by an actual `SIGKILL`. A subprocess-capturer harness —
+  running the engine as its own OS process specifically so it can be sent a
+  real `SIGKILL` instead of cancelling an in-process context — belongs to
+  Plan 2, alongside Linux torture validation below.
 - macOS AND Linux both torture-tested: **macOS only.** All torture evidence
   in this report and in the task-5/task-7 reports was collected on
   macOS/APFS (`Darwin 27.0.0`, arm64, confirmed via `uname -a` at
