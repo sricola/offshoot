@@ -230,3 +230,83 @@ func TestCheckpointFailsCleanlyUnderLiveWriter(t *testing.T) {
 	}
 	tx.Rollback()
 }
+
+func TestForkIsIndependentOfParent(t *testing.T) {
+	if _, err := exec.LookPath("sqlite3"); err != nil {
+		t.Skip("sqlite3 CLI not on PATH")
+	}
+	w := newWS(t)
+	if err := w.Create("app"); err != nil {
+		t.Fatal(err)
+	}
+	path, _ := w.Checkout("app", "main")
+	exec.Command("sqlite3", path, "CREATE TABLE t (v); INSERT INTO t VALUES (1);").Run()
+	if _, err := w.Checkpoint("app", "main", "v1"); err != nil {
+		t.Fatal(err)
+	}
+
+	txid, err := w.Fork("app", "main", "attempt-1", "")
+	if err != nil || txid != 2 {
+		t.Fatalf("fork: txid=%d err=%v", txid, err)
+	}
+	// Child materializes and matches the parent's checkpointed state.
+	cpath, err := w.Checkout("app", "attempt-1")
+	if err != nil {
+		t.Fatal(err)
+	}
+	got, _ := exec.Command("sqlite3", cpath, "SELECT v FROM t;").Output()
+	if string(got) != "1\n" {
+		t.Fatalf("child content: %q", got)
+	}
+
+	// Storage independence: delete the ENTIRE parent lineage; child must
+	// still materialize (spec: children never reference parent segments).
+	parentRef, _, _ := w.Store.GetRef("app", "main")
+	keys, _ := w.Store.B.List(store.LineagePrefix(parentRef.Lineage))
+	for _, k := range keys {
+		if err := w.Store.B.Delete(k); err != nil {
+			t.Fatal(err)
+		}
+	}
+	if _, err := w.Checkout("app", "attempt-1"); err != nil {
+		t.Fatalf("child not independent of parent lineage: %v", err)
+	}
+
+	// Child ref shape.
+	cref, _, _ := w.Store.GetRef("app", "attempt-1")
+	if cref.Parent != "app@main@2" || cref.Protected ||
+		cref.Checkpoints["fork"] != 2 || len(cref.Checkpoints) != 1 {
+		t.Fatalf("child ref: %+v", cref)
+	}
+	if cref.Lineage == parentRef.Lineage {
+		t.Fatal("child must have its own lineage")
+	}
+}
+
+func TestForkAtCheckpoint(t *testing.T) {
+	if _, err := exec.LookPath("sqlite3"); err != nil {
+		t.Skip("sqlite3 CLI not on PATH")
+	}
+	w := newWS(t)
+	w.Create("app")
+	path, _ := w.Checkout("app", "main")
+	exec.Command("sqlite3", path, "CREATE TABLE t (v); INSERT INTO t VALUES (1);").Run()
+	w.Checkpoint("app", "main", "v1")
+	exec.Command("sqlite3", path, "INSERT INTO t VALUES (2);").Run()
+	w.Checkpoint("app", "main", "v2")
+
+	if _, err := w.Fork("app", "main", "old", "v1"); err != nil {
+		t.Fatal(err)
+	}
+	p, _ := w.Checkout("app", "old")
+	got, _ := exec.Command("sqlite3", p, "SELECT count(*) FROM t;").Output()
+	if string(got) != "1\n" {
+		t.Fatalf("fork --at v1 content: %q", got)
+	}
+	if _, err := w.Fork("app", "main", "bad", "nope"); err == nil {
+		t.Fatal("unknown checkpoint must fail")
+	}
+	if _, err := w.Fork("app", "main", "old", ""); err == nil {
+		t.Fatal("existing branch name must fail")
+	}
+}

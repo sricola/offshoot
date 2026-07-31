@@ -273,3 +273,43 @@ func quiesce(path string) error {
 	}
 	return nil
 }
+
+// Fork creates newBranch from db@srcBranch at head or a named checkpoint.
+func (w *Workspace) Fork(db, srcBranch, newBranch, at string) (uint64, error) {
+	if err := store.ValidateName(newBranch); err != nil {
+		return 0, err
+	}
+	src, _, err := w.Store.GetRef(db, srcBranch)
+	if err != nil {
+		return 0, err
+	}
+	txid := src.HeadTXID
+	if at != "" {
+		t, ok := src.Checkpoints[at]
+		if !ok {
+			return 0, fmt.Errorf("ops: no checkpoint %q on %s@%s", at, db, srcBranch)
+		}
+		txid = t
+	}
+	// Materialized fork point: copy the source snapshot into the child's own
+	// lineage so the child never references parent storage.
+	data, _, err := w.Store.B.Get(store.SnapshotKey(src.Lineage, src.Epoch, txid))
+	if err != nil {
+		return 0, fmt.Errorf("ops: source snapshot txid %d: %w", txid, err)
+	}
+	childLineage := store.NewLineageID()
+	if _, err := w.Store.B.PutIf(store.SnapshotKey(childLineage, 1, txid), data, ""); err != nil {
+		return 0, err
+	}
+	child := store.Ref{
+		Schema: 1, Lineage: childLineage, Epoch: 1, HeadTXID: txid,
+		Checkpoints: map[string]uint64{"fork": txid},
+		Parent:      fmt.Sprintf("%s@%s@%d", db, srcBranch, txid),
+	}
+	if _, err := w.Store.PutRef(db, newBranch, child, ""); err != nil {
+		// Branch already exists (or lost a race): remove the orphan snapshot.
+		w.Store.B.Delete(store.SnapshotKey(childLineage, 1, txid))
+		return 0, fmt.Errorf("ops: fork %s@%s: %w", db, newBranch, err)
+	}
+	return txid, nil
+}
