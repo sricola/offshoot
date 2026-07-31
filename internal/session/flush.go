@@ -53,7 +53,18 @@ func (s *Session) Flush(name string) (uint64, error) {
 	// stale replica, advance the branch head to reference a snapshot that
 	// silently omits that write, and still report success. See
 	// capture.Engine.DrainNow's doc comment.
-	dctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	// This timeout must comfortably exceed DrainNow's own worst case, not
+	// just approximate it: a single pollOnce triggered by DrainNow can, under
+	// write contention, spend up to ~10s inside the capture engine alone —
+	// checkpoint() retries busy for up to 5s, and a takeover that completes
+	// its checkpoint but then needs beginReadRetry to reacquire the read
+	// lock retries for up to another 5s (see internal/capture/engine.go's
+	// checkpoint and beginReadRetry). A 5s flush-side timeout could then
+	// spuriously fire under exactly the contention DrainNow exists to ride
+	// out. 30s leaves generous headroom above that ~10s budget; if the
+	// engine's own retry budgets ever grow, this constant should be
+	// revisited rather than left silently coupled to them.
+	dctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
 	err := s.captured.DrainNow(dctx)
 	cancel()
 	if err != nil {
