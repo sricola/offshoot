@@ -398,3 +398,85 @@ func TestForkWarnsOnUncheckpointedChanges(t *testing.T) {
 		t.Fatalf("fork content: %q, want only the checkpointed row", got)
 	}
 }
+
+func TestRollback(t *testing.T) {
+	if _, err := exec.LookPath("sqlite3"); err != nil {
+		t.Skip("sqlite3 CLI not on PATH")
+	}
+	w := newWS(t)
+	w.Create("app")
+	path, _ := w.Checkout("app", "main")
+	exec.Command("sqlite3", path, "CREATE TABLE t (v); INSERT INTO t VALUES (1);").Run()
+	w.Checkpoint("app", "main", "good")
+	exec.Command("sqlite3", path, "DROP TABLE t;").Run()
+	w.Checkpoint("app", "main", "bad")
+
+	before, _, _ := w.Store.GetRef("app", "main")
+	p, err := w.Rollback("app", "main", "good")
+	if err != nil {
+		t.Fatal(err)
+	}
+	got, _ := exec.Command("sqlite3", p, "SELECT v FROM t;").Output()
+	if string(got) != "1\n" {
+		t.Fatalf("rolled-back content: %q", got)
+	}
+	after, _, _ := w.Store.GetRef("app", "main")
+	if after.Lineage == before.Lineage {
+		t.Fatal("rollback must move to a new lineage")
+	}
+	if _, ok := after.Checkpoints["bad"]; ok {
+		t.Fatal("later checkpoint must be dropped")
+	}
+	if after.Checkpoints["good"] != before.Checkpoints["good"] {
+		t.Fatal("earlier checkpoint must be kept")
+	}
+	if !after.Protected {
+		t.Fatal("protected flag must survive rollback")
+	}
+}
+
+func TestPromote(t *testing.T) {
+	if _, err := exec.LookPath("sqlite3"); err != nil {
+		t.Skip("sqlite3 CLI not on PATH")
+	}
+	w := newWS(t)
+	w.Create("app")
+	path, _ := w.Checkout("app", "main")
+	exec.Command("sqlite3", path, "CREATE TABLE t (v); INSERT INTO t VALUES (1);").Run()
+	w.Checkpoint("app", "main", "v1")
+	w.Fork("app", "main", "attempt-1", "")
+
+	ap, _ := w.Checkout("app", "attempt-1")
+	exec.Command("sqlite3", ap, "INSERT INTO t VALUES (99);").Run()
+	w.Checkpoint("app", "attempt-1", "winner")
+
+	// Protected target requires force.
+	if _, err := w.Promote("app", "attempt-1", "main", false); err == nil {
+		t.Fatal("promote onto protected main without force must fail")
+	}
+	txid, err := w.Promote("app", "attempt-1", "main", true)
+	if err != nil {
+		t.Fatal(err)
+	}
+	mp, _ := w.Checkout("app", "main")
+	got, _ := exec.Command("sqlite3", mp, "SELECT count(*) FROM t;").Output()
+	if string(got) != "2\n" {
+		t.Fatalf("promoted main content: %q", got)
+	}
+	mref, _, _ := w.Store.GetRef("app", "main")
+	aref, _, _ := w.Store.GetRef("app", "attempt-1")
+	if mref.Lineage == aref.Lineage {
+		t.Fatal("promote must seed a NEW lineage (one writer per lineage)")
+	}
+	if mref.Checkpoints["promote"] != txid || !mref.Protected {
+		t.Fatalf("target ref: %+v", mref)
+	}
+	// Source survives; destroying it later must not affect main (independence).
+	keys, _ := w.Store.B.List(store.LineagePrefix(aref.Lineage))
+	for _, k := range keys {
+		w.Store.B.Delete(k)
+	}
+	if _, err := w.Checkout("app", "main"); err != nil {
+		t.Fatalf("promoted main not independent of source lineage: %v", err)
+	}
+}
