@@ -39,6 +39,8 @@ func (s replicaSink) Apply(ps uint32, f []wal.Frame) error { return s.r.Apply(ps
 
 // Session binds a leased branch to a live checkout, a shadow replica kept in
 // lockstep by the capture engine, and the lease that authorizes its writes.
+// Cancelling the parent context stops capture but does not release the lease
+// or remove the scratch directory — callers must call Close to clean up.
 type Session struct {
 	ws           *ops.Workspace
 	db, branch   string
@@ -100,8 +102,11 @@ func Open(ctx context.Context, o Options) (*Session, error) {
 
 	checkoutPath, err := o.WS.Checkout(o.DB, o.Branch)
 	if err != nil {
-		o.WS.ReleaseLease(lease)
+		relErr := o.WS.ReleaseLease(lease)
 		cleanup()
+		if relErr != nil {
+			return nil, errors.Join(err, fmt.Errorf("session: also failed to release the lease after checkout failed: %w", relErr))
+		}
 		return nil, err
 	}
 
@@ -155,7 +160,8 @@ func (s *Session) Lease() store.Lease {
 }
 
 // Err returns the terminal error that ended the session (lease loss, capture
-// failure), or nil while it is healthy.
+// failure), or nil while it is healthy. Lease-loss detection is wired in the
+// renewal loop and surfaces here as errors are recorded.
 func (s *Session) Err() error {
 	s.mu.Lock()
 	defer s.mu.Unlock()

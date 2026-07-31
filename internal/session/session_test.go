@@ -128,3 +128,29 @@ func TestCloseReleasesLeaseAndCleansUp(t *testing.T) {
 		t.Fatalf("branch not acquirable after Close: %v", err)
 	}
 }
+
+func TestOpenReleasesLeaseWhenCheckoutFails(t *testing.T) {
+	w := newWS(t)
+	if err := w.Create("app"); err != nil {
+		t.Fatal(err)
+	}
+	// Create a directory at the exact checkout path to make the rename fail.
+	checkoutPath := w.CheckoutPath("app", "main")
+	if err := os.MkdirAll(filepath.Dir(checkoutPath), 0755); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.Mkdir(checkoutPath, 0755); err != nil {
+		t.Fatal(err)
+	}
+
+	// Open should fail due to checkout failure.
+	_, err := Open(context.Background(), Options{WS: w, DB: "app", Branch: "main"})
+	if err == nil {
+		t.Fatal("Open must fail when checkout path already exists as a directory")
+	}
+
+	// The branch must be immediately acquirable, proving the lease was released.
+	if _, err := w.AcquireLease("app", "main", "next", ops.DefaultLeaseTTL); err != nil {
+		t.Fatalf("branch not acquirable after Open failure: %v", err)
+	}
+}
