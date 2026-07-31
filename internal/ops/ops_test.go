@@ -15,6 +15,7 @@ import (
 
 	_ "github.com/mattn/go-sqlite3"
 	"github.com/offshoot-db/offshoot/internal/store"
+	"github.com/offshoot-db/offshoot/internal/store/storetest"
 )
 
 // captureStderr redirects os.Stderr for the duration of fn and returns
@@ -37,6 +38,31 @@ func captureStderr(t *testing.T, fn func()) string {
 func newWS(t *testing.T) *Workspace {
 	t.Helper()
 	w, err := Init(filepath.Join(t.TempDir(), "store"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	return w
+}
+
+// newWSOnFakeS3 mirrors newWS but backs the Workspace with an in-process
+// fake S3 server instead of a local directory. It exists so the SAME test
+// bodies that exercise ops invariants against the local backend (see
+// TestConcurrentCheckpointsOnlyOneWinsOnS3, TestDestroyAndGCOnS3) can be
+// run again against S3, proving those invariants hold across backends
+// rather than being accidents of the local filesystem's Put/rename
+// semantics. Each call gets its own fake server and a unique key prefix.
+func newWSOnFakeS3(t *testing.T) *Workspace {
+	t.Helper()
+	f := storetest.NewFakeS3(t)
+	t.Setenv("AWS_ACCESS_KEY_ID", "test")
+	t.Setenv("AWS_SECRET_ACCESS_KEY", "test")
+	t.Setenv("OFFSHOOT_S3_ENDPOINT", f.URL())
+	t.Setenv("OFFSHOOT_S3_REGION", "us-east-1")
+	t.Setenv("OFFSHOOT_S3_PATH_STYLE", "1")
+	t.Setenv("OFFSHOOT_CHECKOUTS", t.TempDir())
+
+	spec := "s3://" + f.Bucket() + "/" + strings.ReplaceAll(t.Name(), "/", "-")
+	w, err := Init(spec)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -967,6 +993,152 @@ func TestConcurrentCheckpointsOnlyOneWins(t *testing.T) {
 		if _, _, err := w.Store.B.Get(store.SnapshotKey(r.Lineage, r.Epoch, txid)); err != nil {
 			t.Fatalf("recorded checkpoint %s has no snapshot object: %v", name, err)
 		}
+	}
+}
+
+// TestConcurrentCheckpointsOnlyOneWinsOnS3 is TestConcurrentCheckpointsOnlyOneWins
+// run against the S3 backend instead of Local. It matters specifically
+// because losing racers in Checkpoint fall through to an UNCONDITIONAL
+// Store.B.Put to overwrite an orphaned/rival snapshot object at the
+// deterministic snapshot key (see the comment in ops.go's Checkpoint) —
+// a code path RunConformance never exercised before PutOverwritesExistingKey
+// was added, and Local's Put (rename-over-existing-file) could silently
+// diverge from S3's Put (PutObject, unconditional overwrite) without any
+// test noticing. Same assertions as the Local version: at least one
+// checkpoint wins, the ref stays internally consistent, and every recorded
+// checkpoint's snapshot object is actually present.
+func TestConcurrentCheckpointsOnlyOneWinsOnS3(t *testing.T) {
+	if _, err := exec.LookPath("sqlite3"); err != nil {
+		t.Skip("sqlite3 CLI not on PATH")
+	}
+	w := newWSOnFakeS3(t)
+	w.Create("app")
+	path, _ := w.Checkout("app", "main")
+	exec.Command("sqlite3", path, "CREATE TABLE t (v);").Run()
+
+	var wg sync.WaitGroup
+	okCount := 0
+	var mu sync.Mutex
+	var loserErrs []error
+	for i := 0; i < 4; i++ {
+		wg.Add(1)
+		go func(n int) {
+			defer wg.Done()
+			if _, err := w.Checkpoint("app", "main", fmt.Sprintf("cp-%d", n)); err == nil {
+				mu.Lock()
+				okCount++
+				mu.Unlock()
+			} else {
+				mu.Lock()
+				loserErrs = append(loserErrs, err)
+				mu.Unlock()
+			}
+		}(i)
+	}
+	wg.Wait()
+	// At least one wins; losers fail loudly with the CAS-race error, and the
+	// ref must remain internally consistent (head >= every recorded checkpoint).
+	if okCount == 0 {
+		t.Fatal("no checkpoint succeeded")
+	}
+	for _, e := range loserErrs {
+		t.Logf("loser error: %v", e)
+	}
+	r, _, err := w.Store.GetRef("app", "main")
+	if err != nil {
+		t.Fatal(err)
+	}
+	for name, txid := range r.Checkpoints {
+		if txid > r.HeadTXID {
+			t.Fatalf("checkpoint %s@txid %d beyond head %d", name, txid, r.HeadTXID)
+		}
+		if _, _, err := w.Store.B.Get(store.SnapshotKey(r.Lineage, r.Epoch, txid)); err != nil {
+			t.Fatalf("recorded checkpoint %s has no snapshot object: %v", name, err)
+		}
+	}
+}
+
+func TestInitAndOpenAgainstS3Spec(t *testing.T) {
+	f := storetest.NewFakeS3(t)
+	t.Setenv("AWS_ACCESS_KEY_ID", "test")
+	t.Setenv("AWS_SECRET_ACCESS_KEY", "test")
+	t.Setenv("OFFSHOOT_S3_ENDPOINT", f.URL())
+	t.Setenv("OFFSHOOT_S3_REGION", "us-east-1")
+	t.Setenv("OFFSHOOT_S3_PATH_STYLE", "1")
+	t.Setenv("OFFSHOOT_CHECKOUTS", t.TempDir())
+
+	spec := "s3://" + f.Bucket() + "/p"
+	w, err := Init(spec)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := w.Create("app"); err != nil {
+		t.Fatal(err)
+	}
+	path, err := w.Checkout("app", "main")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !strings.HasPrefix(path, os.Getenv("OFFSHOOT_CHECKOUTS")) {
+		t.Fatalf("remote-store checkout must live under OFFSHOOT_CHECKOUTS, got %s", path)
+	}
+	// Re-open the same store and see the database.
+	w2, err := Open(spec)
+	if err != nil {
+		t.Fatal(err)
+	}
+	sts, err := w2.Status()
+	if err != nil || len(sts) != 1 || sts[0].DB != "app" {
+		t.Fatalf("status=%v err=%v", sts, err)
+	}
+}
+
+// TestCheckoutRootSeparatesDistinctEndpoints guards the fix for the checkout
+// cache collision: checkoutRoot must key off the RESOLVED store identity
+// (store.StoreIdentity), not the raw spec string. For one fixed
+// "s3://bucket/p" spec, two different OFFSHOOT_S3_ENDPOINT values must
+// produce two different checkout roots (otherwise a session against MinIO
+// and a later session against real AWS, using the identical spec string,
+// would land in the same local checkout cache dir and silently discard
+// un-checkpointed edits). The trailing-slash spelling of the same spec under
+// the same endpoint must land on the SAME checkout root.
+func TestCheckoutRootSeparatesDistinctEndpoints(t *testing.T) {
+	// OFFSHOOT_CHECKOUTS must be unset for this test: checkoutRoot only
+	// consults StoreIdentity when it falls through to the hashed-cache-dir
+	// path, i.e. when OFFSHOOT_CHECKOUTS isn't overriding it.
+	prevCheckouts, hadCheckouts := os.LookupEnv("OFFSHOOT_CHECKOUTS")
+	os.Unsetenv("OFFSHOOT_CHECKOUTS")
+	t.Cleanup(func() {
+		if hadCheckouts {
+			os.Setenv("OFFSHOOT_CHECKOUTS", prevCheckouts)
+		} else {
+			os.Unsetenv("OFFSHOOT_CHECKOUTS")
+		}
+	})
+
+	t.Setenv("OFFSHOOT_S3_ENDPOINT", "http://minio.local:9000")
+	t.Setenv("OFFSHOOT_S3_REGION", "us-east-1")
+	t.Setenv("OFFSHOOT_S3_PATH_STYLE", "1")
+
+	rootMinio, err := checkoutRoot("s3://bucket/p")
+	if err != nil {
+		t.Fatal(err)
+	}
+	rootMinioTrailingSlash, err := checkoutRoot("s3://bucket/p/")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if rootMinio != rootMinioTrailingSlash {
+		t.Fatalf("s3://bucket/p and s3://bucket/p/ under the same endpoint must share a checkout root: %q vs %q", rootMinio, rootMinioTrailingSlash)
+	}
+
+	t.Setenv("OFFSHOOT_S3_ENDPOINT", "http://real-aws.example.com")
+	rootAWS, err := checkoutRoot("s3://bucket/p")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if rootAWS == rootMinio {
+		t.Fatalf("the same spec string under different OFFSHOOT_S3_ENDPOINT values must NOT share a checkout root, got %q for both", rootMinio)
 	}
 }
 
