@@ -103,8 +103,20 @@ func (l *Local) lock(p string) (release func(), err error) {
 		if !os.IsExist(err) {
 			return nil, err
 		}
+		// A healthy CAS holds the lock for milliseconds. If it's been sitting
+		// here for a while, assume the process that created it was killed and
+		// break it. Stat/remove races are benign: the file may vanish between
+		// stat and remove (fine, someone else broke it), or another process
+		// may concurrently break the same stale lock (also fine — both then
+		// race O_EXCL normally).
+		if info, statErr := os.Stat(lockPath); statErr == nil {
+			if time.Since(info.ModTime()) > 30*time.Second {
+				os.Remove(lockPath)
+				continue
+			}
+		}
 		if time.Now().After(deadline) {
-			return nil, fmt.Errorf("store: lock timeout on %s", lockPath)
+			return nil, fmt.Errorf("store: lock timeout on %s (if no offshoot process is running, delete this file)", lockPath)
 		}
 		time.Sleep(2 * time.Millisecond)
 	}
