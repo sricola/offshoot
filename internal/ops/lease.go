@@ -43,6 +43,12 @@ type LeaseInfo struct {
 }
 
 // Leases lists every branch carrying a lease record, sorted by db then branch.
+// If a LeaseExpiry value is present but unparseable (corrupt), it is included
+// in the output with Expired: true and Expiry set to zero. This mirrors the
+// store layer's fail-open policy (see store.AcquireLease): treating corrupt
+// expiries as reclaimable prevents a single corrupt ref from bricking the
+// branch permanently with no recovery path. A warning is emitted to stderr
+// for any corrupt expiry encountered.
 func (w *Workspace) Leases() ([]LeaseInfo, error) {
 	refs, err := w.Store.ListRefs()
 	if err != nil {
@@ -66,7 +72,13 @@ func (w *Workspace) Leases() ([]LeaseInfo, error) {
 			}
 			exp, err := time.Parse(time.RFC3339Nano, ref.LeaseExpiry)
 			if err != nil {
-				return nil, fmt.Errorf("ops: bad lease expiry on %s@%s: %w", db, br, err)
+				// Corrupt expiry: treat as expired and reclaimable, matching the
+				// store layer's fail-open policy. Emit a warning so corruption
+				// doesn't pass silently.
+				fmt.Fprintf(os.Stderr,
+					"offshoot: warning: %s@%s has a corrupt lease_expiry %q\n",
+					db, br, ref.LeaseExpiry)
+				exp = time.Time{}
 			}
 			out = append(out, LeaseInfo{
 				DB: db, Branch: br, Holder: ref.LeaseHolder, Epoch: ref.Epoch,
