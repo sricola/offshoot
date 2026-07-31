@@ -32,10 +32,36 @@ type Options struct {
 // a fresh scratch dir) it always performs an initial rebase, which snapshots
 // the checkout's current content and hands it to Sink.Rebase before any
 // Apply call — so Open does not need to seed the replica separately.
-type replicaSink struct{ r *replay.Replica }
+//
+// Both Rebase and Apply mutate the replica file in place (Rebase can recur
+// mid-session on divergence, not just at startup — see capture.Engine's
+// rebase-on-divergence path), while Flush concurrently reads that same file
+// page-by-page via ltxio.EncodeSnapshot with no locking of its own. Apply
+// writes pages with separate WriteAt calls and then Truncates, and Rebase
+// truncates-and-rewrites the whole file via os.Create; neither is atomic
+// with respect to a concurrent reader, so an Encode running at the same
+// time could observe a torn mix of pre- and post-mutation bytes (or a
+// nPages read from the header that no longer matches the pages on disk
+// after a concurrent Truncate). mu — Session.replicaMu, shared with
+// Session.Flush — serializes replica-file mutation against replica-file
+// encoding so Flush always reads a replica frozen at a single transaction
+// boundary.
+type replicaSink struct {
+	r  *replay.Replica
+	mu *sync.Mutex
+}
 
-func (s replicaSink) Rebase(path string) error             { return s.r.Rebase(path) }
-func (s replicaSink) Apply(ps uint32, f []wal.Frame) error { return s.r.Apply(ps, f) }
+func (s replicaSink) Rebase(path string) error {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	return s.r.Rebase(path)
+}
+
+func (s replicaSink) Apply(ps uint32, f []wal.Frame) error {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	return s.r.Apply(ps, f)
+}
 
 // Session binds a leased branch to a live checkout, a shadow replica kept in
 // lockstep by the capture engine, and the lease that authorizes its writes.
@@ -61,10 +87,17 @@ type Session struct {
 	engDone  chan struct{}
 	captured *capture.Engine
 
-	mu     sync.Mutex
-	lease  store.Lease
-	err    error
-	closed bool
+	// replicaMu serializes writes to the replica file (capture's Rebase and
+	// Apply, via replicaSink) against Flush's read of that same file, so
+	// Flush never encodes a torn mix of pre- and post-mutation bytes. See
+	// replicaSink's doc comment for why the race is real.
+	replicaMu sync.Mutex
+
+	mu      sync.Mutex
+	lease   store.Lease
+	err     error
+	closed  bool
+	durable uint64
 }
 
 // Open acquires the lease, materializes the checkout, seeds the replica from
@@ -120,7 +153,7 @@ func Open(ctx context.Context, o Options) (*Session, error) {
 	cctx, cancel := context.WithCancel(ctx)
 	s.cancel = cancel
 	s.captured = capture.NewEngine(capture.Options{
-		DBPath: checkoutPath, StateDir: dir, Sink: replicaSink{s.replica},
+		DBPath: checkoutPath, StateDir: dir, Sink: replicaSink{s.replica, &s.replicaMu},
 	})
 	s.engDone = make(chan struct{})
 	go s.runEngine(cctx)
