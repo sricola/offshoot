@@ -20,6 +20,9 @@ type FakeS3 struct {
 	mu     sync.Mutex
 	objs   map[string][]byte
 	ignore bool
+
+	// fault, when set and returning ok, replaces the response with status.
+	fault func(method, key string) (int, bool)
 }
 
 func NewFakeS3(t *testing.T) *FakeS3 {
@@ -37,6 +40,14 @@ func (f *FakeS3) IgnorePreconditions(v bool) {
 	f.mu.Lock()
 	defer f.mu.Unlock()
 	f.ignore = v
+}
+
+// SetFault installs a fault-injection hook. fn is called for every request;
+// returning ok replaces the response with the given HTTP status.
+func (f *FakeS3) SetFault(fn func(method, key string) (int, bool)) {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	f.fault = fn
 }
 
 func etagOf(b []byte) string {
@@ -68,6 +79,15 @@ func (f *FakeS3) handle(w http.ResponseWriter, r *http.Request) {
 	key := keyOf(r.URL.Path)
 	f.mu.Lock()
 	defer f.mu.Unlock()
+
+	if f.fault != nil {
+		if status, ok := f.fault(r.Method, key); ok {
+			w.Header().Set("Content-Type", "application/xml")
+			w.WriteHeader(status)
+			io.WriteString(w, `<Error><Code>InternalError</Code></Error>`)
+			return
+		}
+	}
 
 	switch r.Method {
 	case http.MethodGet:
@@ -132,11 +152,15 @@ type listResult struct {
 	Contents []struct {
 		Key string `xml:"Key"`
 	} `xml:"Contents"`
-	IsTruncated bool `xml:"IsTruncated"`
+	IsTruncated           bool   `xml:"IsTruncated"`
+	NextContinuationToken string `xml:"NextContinuationToken"`
 }
 
 func (f *FakeS3) list(w http.ResponseWriter, r *http.Request) {
-	prefix := r.URL.Query().Get("prefix")
+	q := r.URL.Query()
+	prefix := q.Get("prefix")
+	token := q.Get("continuation-token")
+
 	var keys []string
 	for k := range f.objs {
 		if strings.HasPrefix(k, prefix) {
@@ -144,6 +168,18 @@ func (f *FakeS3) list(w http.ResponseWriter, r *http.Request) {
 		}
 	}
 	sort.Strings(keys)
+	if token != "" {
+		i := sort.SearchStrings(keys, token)
+		keys = keys[i:]
+	}
+	const maxKeys = 1000
+	truncated := false
+	var next string
+	if len(keys) > maxKeys {
+		next = keys[maxKeys]
+		keys = keys[:maxKeys]
+		truncated = true
+	}
 
 	var res listResult
 	for _, k := range keys {
@@ -151,6 +187,8 @@ func (f *FakeS3) list(w http.ResponseWriter, r *http.Request) {
 			Key string `xml:"Key"`
 		}{Key: k})
 	}
+	res.IsTruncated = truncated
+	res.NextContinuationToken = next
 	w.Header().Set("Content-Type", "application/xml")
 	xml.NewEncoder(w).Encode(res)
 }

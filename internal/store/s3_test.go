@@ -3,6 +3,7 @@ package store_test
 import (
 	"context"
 	"errors"
+	"fmt"
 	"strings"
 	"testing"
 
@@ -121,5 +122,67 @@ func TestS3WrongBucketPutIfCreateOnlyIsLoud(t *testing.T) {
 	}
 	if errors.Is(err, store.ErrCAS) {
 		t.Fatalf("bucket-level failure must not be reported as ErrCAS, got %v", err)
+	}
+}
+
+func TestS3ServerErrorsAreNotSwallowed(t *testing.T) {
+	f := storetest.NewFakeS3(t)
+	t.Setenv("AWS_ACCESS_KEY_ID", "test")
+	t.Setenv("AWS_SECRET_ACCESS_KEY", "test")
+	b, err := store.NewS3(context.Background(), store.S3Config{
+		Bucket: f.Bucket(), Endpoint: f.URL(), Region: "us-east-1", UsePathStyle: true,
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := b.Put("k", []byte("v")); err != nil {
+		t.Fatal(err)
+	}
+
+	f.SetFault(func(method, key string) (int, bool) { return 500, true })
+
+	if err := b.Put("k2", []byte("v")); err == nil {
+		t.Error("a 500 on Put must surface as an error")
+	}
+	if _, err := b.PutIf("k3", []byte("v"), ""); err == nil {
+		t.Error("a 500 on conditional Put must surface as an error")
+	} else if errors.Is(err, store.ErrCAS) {
+		t.Error("a 500 must not be reported as a CAS conflict")
+	}
+	if _, _, err := b.Get("k"); err == nil {
+		t.Error("a 500 on Get must surface as an error")
+	} else if errors.Is(err, store.ErrNotFound) {
+		t.Error("a 500 must not be reported as ErrNotFound")
+	}
+	if _, err := b.List("k"); err == nil {
+		t.Error("a 500 on List must surface as an error")
+	}
+}
+
+func TestS3ListPaginates(t *testing.T) {
+	f := storetest.NewFakeS3(t)
+	t.Setenv("AWS_ACCESS_KEY_ID", "test")
+	t.Setenv("AWS_SECRET_ACCESS_KEY", "test")
+	b, err := store.NewS3(context.Background(), store.S3Config{
+		Bucket: f.Bucket(), Endpoint: f.URL(), Region: "us-east-1", UsePathStyle: true,
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	const n = 1500
+	for i := 0; i < n; i++ {
+		if err := b.Put(fmt.Sprintf("data/lin/%05d.ltx", i), []byte("x")); err != nil {
+			t.Fatal(err)
+		}
+	}
+	keys, err := b.List("data/lin/")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(keys) != n {
+		t.Fatalf("got %d keys across pages, want %d", len(keys), n)
+	}
+	if keys[0] != "data/lin/00000.ltx" || keys[n-1] != fmt.Sprintf("data/lin/%05d.ltx", n-1) {
+		t.Fatalf("pagination lost ordering: first=%s last=%s", keys[0], keys[n-1])
 	}
 }
