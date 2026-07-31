@@ -179,7 +179,78 @@ func TestLeasesTolerateCorruptExpiry(t *testing.T) {
 	}
 }
 
-func TestFencedHolderCannotCheckpoint(t *testing.T) {
+// TestRepointClearsLease proves that a repoint (Rollback or Promote) is
+// itself a lease revocation: the old holder's epoch is already dead, but
+// carrying its LeaseHolder/LeaseExpiry forward into the new lineage/epoch
+// would leave the branch stuck — a fresh acquirer refused ErrLeaseHeld by a
+// holder that can never renew — until the stale TTL happens to lapse.
+func TestRepointClearsLease(t *testing.T) {
+	t.Run("Rollback", func(t *testing.T) {
+		w := newWS(t)
+		if err := w.Create("app"); err != nil {
+			t.Fatal(err)
+		}
+		if _, err := w.Checkout("app", "main"); err != nil {
+			t.Fatal(err)
+		}
+		if _, err := w.AcquireLease("app", "main", "holder-a", DefaultLeaseTTL); err != nil {
+			t.Fatal(err)
+		}
+		if _, err := w.Checkpoint("app", "main", "v1"); err != nil {
+			t.Fatal(err)
+		}
+		// Roll back to the "init" checkpoint laid down by Create, which
+		// predates "v1" — a genuine repoint to an earlier state.
+		if _, err := w.Rollback("app", "main", "init"); err != nil {
+			t.Fatal(err)
+		}
+		ref, _, err := w.Store.GetRef("app", "main")
+		if err != nil {
+			t.Fatal(err)
+		}
+		if ref.LeaseHolder != "" || ref.LeaseExpiry != "" {
+			t.Fatalf("rollback must clear the lease: %+v", ref)
+		}
+		if _, err := w.AcquireLease("app", "main", "holder-b", DefaultLeaseTTL); err != nil {
+			t.Fatalf("branch must be immediately acquirable by a different holder after repoint: %v", err)
+		}
+	})
+
+	t.Run("Promote", func(t *testing.T) {
+		w := newWS(t)
+		if err := w.Create("app"); err != nil {
+			t.Fatal(err)
+		}
+		if _, err := w.Fork("app", "main", "feature", ""); err != nil {
+			t.Fatal(err)
+		}
+		if _, err := w.Checkout("app", "feature"); err != nil {
+			t.Fatal(err)
+		}
+		if _, err := w.Checkpoint("app", "feature", "v1"); err != nil {
+			t.Fatal(err)
+		}
+		// Acquire a lease on the PROMOTE TARGET (main), not the source.
+		if _, err := w.AcquireLease("app", "main", "holder-a", DefaultLeaseTTL); err != nil {
+			t.Fatal(err)
+		}
+		if _, err := w.Promote("app", "feature", "main", true); err != nil {
+			t.Fatal(err)
+		}
+		ref, _, err := w.Store.GetRef("app", "main")
+		if err != nil {
+			t.Fatal(err)
+		}
+		if ref.LeaseHolder != "" || ref.LeaseExpiry != "" {
+			t.Fatalf("promote must clear the target's lease: %+v", ref)
+		}
+		if _, err := w.AcquireLease("app", "main", "holder-b", DefaultLeaseTTL); err != nil {
+			t.Fatalf("branch must be immediately acquirable by a different holder after repoint: %v", err)
+		}
+	})
+}
+
+func TestFencedHolderLeaseOpsFailAfterReclaim(t *testing.T) {
 	if _, err := exec.LookPath("sqlite3"); err != nil {
 		t.Skip("sqlite3 CLI not on PATH")
 	}
@@ -210,7 +281,12 @@ func TestFencedHolderCannotCheckpoint(t *testing.T) {
 	if err := w.ReleaseLease(a); !errors.Is(err, store.ErrLeaseLost) {
 		t.Fatalf("fenced release: want ErrLeaseLost, got %v", err)
 	}
-	// The branch itself is still usable by whoever holds it.
+	// Checkpoint itself is lease-unaware by design — it never checks
+	// LeaseHolder/LeaseExpiry — so it stays callable by anyone with a
+	// checkout regardless of fencing. It's the ref CAS underneath that
+	// protects it: a fenced writer's stale checkout still checkpoints
+	// successfully here because nothing about this call path consults the
+	// lease at all.
 	if _, err := w.Checkpoint("app", "main", "v1"); err != nil {
 		t.Fatalf("branch unusable after fencing: %v", err)
 	}

@@ -160,7 +160,7 @@ func (w *Workspace) createFromQuiesced(db, quiescedPath string) error {
 		return err
 	}
 	ref := store.Ref{
-		Schema: 1, Lineage: lineage, Epoch: 1, HeadTXID: 1,
+		Lineage: lineage, Epoch: 1, HeadTXID: 1,
 		Protected: true, // main is protected by default (spec § Security posture)
 	}
 	ref.SetCheckpoint("init", 1, 1)
@@ -542,7 +542,7 @@ func (w *Workspace) Fork(db, srcBranch, newBranch, at string) (uint64, error) {
 		return 0, err
 	}
 	child := store.Ref{
-		Schema: 1, Lineage: childLineage, Epoch: 1, HeadTXID: txid, HeadEpoch: 1,
+		Lineage: childLineage, Epoch: 1, HeadTXID: txid, HeadEpoch: 1,
 		Parent: fmt.Sprintf("%s@%s@%d", db, srcBranch, txid),
 	}
 	child.SetCheckpoint("fork", txid, 1)
@@ -627,6 +627,12 @@ func (w *Workspace) Rollback(db, branch, to string) (string, error) {
 
 	next := ref
 	next.Lineage, next.Epoch, next.HeadTXID, next.HeadEpoch, next.Checkpoints = lineage, 1, txid, 1, kept
+	// A repoint is itself a revocation: the old holder is already fenced (its
+	// epoch no longer matches), but carrying its lease forward would leave a
+	// fresh acquirer refused ErrLeaseHeld by a holder that can never renew —
+	// stuck until the stale TTL lapses. Clear the lease so the branch is
+	// immediately acquirable post-repoint.
+	next.LeaseHolder, next.LeaseExpiry = "", ""
 	if _, err := w.Store.PutRef(db, branch, next, etag); err != nil {
 		cleanup()
 		return "", fmt.Errorf("ops: rollback lost a race (retry): %w", err)
@@ -702,6 +708,12 @@ func (w *Workspace) Promote(db, source, target string, force bool) (uint64, erro
 	next.Checkpoints = nil
 	next.SetCheckpoint("promote", txid, 1)
 	next.Parent = fmt.Sprintf("%s@%s@%d", db, source, txid)
+	// A repoint is itself a revocation: the old holder is already fenced (its
+	// epoch no longer matches), but carrying its lease forward would leave a
+	// fresh acquirer refused ErrLeaseHeld by a holder that can never renew —
+	// stuck until the stale TTL lapses. Clear the lease so the branch is
+	// immediately acquirable post-repoint.
+	next.LeaseHolder, next.LeaseExpiry = "", ""
 	if _, err := w.Store.PutRef(db, target, next, tgtEtag); err != nil {
 		w.Store.B.Delete(store.SnapshotKey(lineage, 1, txid))
 		return 0, fmt.Errorf("ops: promote lost a race (retry): %w", err)

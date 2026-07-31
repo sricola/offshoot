@@ -157,6 +157,20 @@ func TestGetRefRejectsNewerSchema(t *testing.T) {
 	}
 }
 
+func TestGetRefRejectsNullCheckpoint(t *testing.T) {
+	s := newStore(t)
+	// A checkpoint value of JSON null decodes as a no-op into both the
+	// Checkpoint struct and the bare uint64 fallback, silently producing
+	// {TXID:0} instead of surfacing the malformed ref.
+	bad := `{"schema":2,"lineage":"abc","epoch":1,"head_txid":1,"checkpoints":{"v1":null}}`
+	if _, err := s.B.PutIf(RefKey("app", "main"), []byte(bad), ""); err != nil {
+		t.Fatal(err)
+	}
+	if _, _, err := s.GetRef("app", "main"); err == nil {
+		t.Fatal("a null checkpoint value must error, not silently decode as {TXID:0}")
+	}
+}
+
 func TestSetCheckpointAllocates(t *testing.T) {
 	var r Ref
 	r.SetCheckpoint("a", 4, 2)

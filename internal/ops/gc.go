@@ -21,6 +21,18 @@ func (w *Workspace) Destroy(db, branch string, force bool) error {
 	if ref.Protected && !force {
 		return fmt.Errorf("ops: %s@%s is protected; use --force", db, branch)
 	}
+	// Per the fault matrix, destroying a branch under an active lease
+	// requires --force: a live holder may still be mid-write. An expired (or
+	// unparseable — fail open, matching the store layer's reclaim policy for
+	// corrupt expiries) lease does not block; it's already reclaimable by
+	// anyone.
+	if ref.LeaseHolder != "" && !force {
+		exp, perr := time.Parse(time.RFC3339Nano, ref.LeaseExpiry)
+		if perr == nil && time.Now().Before(exp) {
+			return fmt.Errorf("ops: %s@%s has a live lease held by %q until %s; use --force",
+				db, branch, ref.LeaseHolder, ref.LeaseExpiry)
+		}
+	}
 	path := w.CheckoutPath(db, branch)
 	if _, err := os.Stat(path); err == nil {
 		if err := quiesce(path); err != nil {
