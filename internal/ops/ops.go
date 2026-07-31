@@ -229,7 +229,7 @@ func (w *Workspace) Checkout(db, branch string) (string, error) {
 	if err := os.MkdirAll(filepath.Dir(path), 0o755); err != nil {
 		return "", err
 	}
-	if err := w.materialize(ref, ref.HeadTXID, path); err != nil {
+	if err := w.materializeAt(ref, headCheckpoint(ref), path); err != nil {
 		return "", err
 	}
 	if err := writeSum(path, ref.Lineage, ref.HeadTXID); err != nil {
@@ -316,15 +316,25 @@ func fileSum(path string) (string, error) {
 	return hex.EncodeToString(h.Sum(nil)), nil
 }
 
-func (w *Workspace) materialize(ref store.Ref, txid uint64, dst string) error {
-	data, _, err := w.Store.B.Get(store.SnapshotKey(ref.Lineage, ref.Epoch, txid))
+// materializeAt writes the snapshot identified by cp into dst. The epoch
+// comes from the checkpoint, not from the ref: acquiring or reclaiming a
+// branch bumps the ref's epoch, but objects stay in the prefix they were
+// written under.
+func (w *Workspace) materializeAt(ref store.Ref, cp store.Checkpoint, dst string) error {
+	data, _, err := w.Store.B.Get(store.SnapshotKey(ref.Lineage, cp.Epoch, cp.TXID))
 	if err != nil {
-		return fmt.Errorf("ops: snapshot txid %d not found in lineage %s: %w", txid, ref.Lineage, err)
+		return fmt.Errorf("ops: snapshot txid %d (epoch %d) in lineage %s: %w",
+			cp.TXID, cp.Epoch, ref.Lineage, err)
 	}
 	if _, err := ltxio.Materialize(bytes.NewReader(data), dst); err != nil {
 		return err
 	}
 	return nil
+}
+
+// headCheckpoint is the ref's current head as a Checkpoint.
+func headCheckpoint(ref store.Ref) store.Checkpoint {
+	return store.Checkpoint{TXID: ref.HeadTXID, Epoch: ref.HeadEpoch}
 }
 
 func copyFile(from, to string) error {
@@ -475,28 +485,30 @@ func (w *Workspace) warnIfUncheckpointed(db, branch string, ref store.Ref) {
 	}
 }
 
-// copySnapshotIntoLineage copies the snapshot at (src.Lineage, src.Epoch,
-// txid) into lineage (epoch 1) via a create-only put and returns the key it
-// was written under. This is the primitive behind fork, rollback, and
-// promote: every branch repoint gets a fresh lineage, preserving
+// copySnapshotIntoLineage copies the snapshot identified by cp (in src's
+// lineage, at cp's own recorded epoch — not src.Epoch) into lineage at epoch
+// 1 via a create-only put and returns the key it was written under.
+// Destinations are always freshly-minted lineages, and a fresh lineage
+// always starts at epoch 1: this is the primitive behind fork, rollback, and
+// promote, every branch repoint gets a fresh lineage, preserving
 // one-writer-per-lineage.
-func (w *Workspace) copySnapshotIntoLineage(src store.Ref, txid uint64, lineage string) (string, error) {
-	data, _, err := w.Store.B.Get(store.SnapshotKey(src.Lineage, src.Epoch, txid))
+func (w *Workspace) copySnapshotIntoLineage(src store.Ref, cp store.Checkpoint, lineage string) (string, error) {
+	data, _, err := w.Store.B.Get(store.SnapshotKey(src.Lineage, cp.Epoch, cp.TXID))
 	if err != nil {
-		return "", fmt.Errorf("ops: snapshot txid %d in lineage %s: %w", txid, src.Lineage, err)
+		return "", fmt.Errorf("ops: snapshot txid %d (epoch %d) in lineage %s: %w", cp.TXID, cp.Epoch, src.Lineage, err)
 	}
-	key := store.SnapshotKey(lineage, 1, txid)
+	key := store.SnapshotKey(lineage, 1, cp.TXID)
 	if _, err := w.Store.B.PutIf(key, data, ""); err != nil {
 		return "", err
 	}
 	return key, nil
 }
 
-// copySnapshotToNewLineage copies the snapshot at (src.Lineage, src.Epoch,
-// txid) into a brand-new lineage (epoch 1) and returns the lineage id.
-func (w *Workspace) copySnapshotToNewLineage(src store.Ref, txid uint64) (string, error) {
+// copySnapshotToNewLineage copies the snapshot identified by cp (in src's
+// lineage) into a brand-new lineage (epoch 1) and returns the lineage id.
+func (w *Workspace) copySnapshotToNewLineage(src store.Ref, cp store.Checkpoint) (string, error) {
 	lineage := store.NewLineageID()
-	if _, err := w.copySnapshotIntoLineage(src, txid, lineage); err != nil {
+	if _, err := w.copySnapshotIntoLineage(src, cp, lineage); err != nil {
 		return "", err
 	}
 	return lineage, nil
@@ -511,27 +523,28 @@ func (w *Workspace) Fork(db, srcBranch, newBranch, at string) (uint64, error) {
 	if err != nil {
 		return 0, err
 	}
-	txid := src.HeadTXID
+	cp := headCheckpoint(src)
 	if at != "" {
-		cp, ok := src.Checkpoints[at]
+		c, ok := src.Checkpoints[at]
 		if !ok {
 			return 0, fmt.Errorf("ops: no checkpoint %q on %s@%s", at, db, srcBranch)
 		}
-		txid = cp.TXID
+		cp = c
 	} else {
 		w.warnIfUncheckpointed(db, srcBranch, src)
 	}
+	txid := cp.TXID
 	// Materialized fork point: copy the source snapshot into the child's own
 	// lineage so the child never references parent storage.
-	childLineage, err := w.copySnapshotToNewLineage(src, txid)
+	childLineage, err := w.copySnapshotToNewLineage(src, cp)
 	if err != nil {
 		return 0, err
 	}
 	child := store.Ref{
-		Schema: 1, Lineage: childLineage, Epoch: 1, HeadTXID: txid,
+		Schema: 1, Lineage: childLineage, Epoch: 1, HeadTXID: txid, HeadEpoch: 1,
 		Parent: fmt.Sprintf("%s@%s@%d", db, srcBranch, txid),
 	}
-	child.SetCheckpoint("fork", txid, child.Epoch)
+	child.SetCheckpoint("fork", txid, 1)
 	if _, err := w.Store.PutRef(db, newBranch, child, ""); err != nil {
 		// Branch already exists (or lost a race): remove the orphan snapshot.
 		w.Store.B.Delete(store.SnapshotKey(childLineage, 1, txid))
@@ -570,7 +583,7 @@ func (w *Workspace) Rollback(db, branch, to string) (string, error) {
 		return "", fmt.Errorf("ops: no checkpoint %q on %s@%s", to, db, branch)
 	}
 	txid := cp.TXID
-	lineage, err := w.copySnapshotToNewLineage(ref, txid)
+	lineage, err := w.copySnapshotToNewLineage(ref, cp)
 	if err != nil {
 		return "", err
 	}
@@ -590,24 +603,29 @@ func (w *Workspace) Rollback(db, branch, to string) (string, error) {
 
 	// `to`'s own snapshot is already copied above. Copy every OTHER kept
 	// checkpoint's snapshot into the new lineage too, so it survives the old
-	// lineage being orphaned and later reaped by GC. Abort and clean up
-	// anything already copied before touching the ref if any copy fails.
+	// lineage being orphaned and later reaped by GC. Every copy (including
+	// `to`'s, above) lands at epoch 1 in the new lineage — a fresh lineage
+	// always starts there — so once copied, kept's checkpoints no longer
+	// live at whatever epoch they were recorded under in the old lineage;
+	// rewrite each one to epoch 1 to match where its object now actually
+	// is. Abort and clean up anything already copied before touching the
+	// ref if any copy fails.
 	done := map[uint64]bool{txid: true}
-	for _, c := range kept {
-		if done[c.TXID] {
-			continue
+	for name, c := range kept {
+		if !done[c.TXID] {
+			done[c.TXID] = true
+			key, err := w.copySnapshotIntoLineage(ref, c, lineage)
+			if err != nil {
+				cleanup()
+				return "", fmt.Errorf("ops: rollback: copying checkpoint snapshot for txid %d: %w", c.TXID, err)
+			}
+			copiedKeys = append(copiedKeys, key)
 		}
-		done[c.TXID] = true
-		key, err := w.copySnapshotIntoLineage(ref, c.TXID, lineage)
-		if err != nil {
-			cleanup()
-			return "", fmt.Errorf("ops: rollback: copying checkpoint snapshot for txid %d: %w", c.TXID, err)
-		}
-		copiedKeys = append(copiedKeys, key)
+		kept[name] = store.Checkpoint{TXID: c.TXID, Epoch: 1}
 	}
 
 	next := ref
-	next.Lineage, next.Epoch, next.HeadTXID, next.Checkpoints = lineage, 1, txid, kept
+	next.Lineage, next.Epoch, next.HeadTXID, next.HeadEpoch, next.Checkpoints = lineage, 1, txid, 1, kept
 	if _, err := w.Store.PutRef(db, branch, next, etag); err != nil {
 		cleanup()
 		return "", fmt.Errorf("ops: rollback lost a race (retry): %w", err)
@@ -626,7 +644,7 @@ func (w *Workspace) Rollback(db, branch, to string) (string, error) {
 		if err := os.MkdirAll(filepath.Dir(path), 0o755); err != nil {
 			return err
 		}
-		if err := w.materialize(next, txid, path); err != nil {
+		if err := w.materializeAt(next, headCheckpoint(next), path); err != nil {
 			return err
 		}
 		// The checkout now equals committed state: refresh the fingerprint
@@ -672,15 +690,16 @@ func (w *Workspace) Promote(db, source, target string, force bool) (uint64, erro
 	if tgt.Protected && !force {
 		return 0, fmt.Errorf("ops: %s@%s is protected; use --force", db, target)
 	}
-	txid := src.HeadTXID
-	lineage, err := w.copySnapshotToNewLineage(src, txid)
+	cp := headCheckpoint(src)
+	txid := cp.TXID
+	lineage, err := w.copySnapshotToNewLineage(src, cp)
 	if err != nil {
 		return 0, err
 	}
 	next := tgt
-	next.Lineage, next.Epoch, next.HeadTXID = lineage, 1, txid
+	next.Lineage, next.Epoch, next.HeadTXID, next.HeadEpoch = lineage, 1, txid, 1
 	next.Checkpoints = nil
-	next.SetCheckpoint("promote", txid, next.Epoch)
+	next.SetCheckpoint("promote", txid, 1)
 	next.Parent = fmt.Sprintf("%s@%s@%d", db, source, txid)
 	if _, err := w.Store.PutRef(db, target, next, tgtEtag); err != nil {
 		w.Store.B.Delete(store.SnapshotKey(lineage, 1, txid))
@@ -692,7 +711,7 @@ func (w *Workspace) Promote(db, source, target string, force bool) (uint64, erro
 		if err := quiesce(path); err != nil {
 			return txid, fmt.Errorf("ops: promoted, but checkout %s is in use and was NOT refreshed: %w", path, err)
 		}
-		if err := w.materialize(next, txid, path); err != nil {
+		if err := w.materializeAt(next, headCheckpoint(next), path); err != nil {
 			return txid, fmt.Errorf("ops: promoted, but checkout %s could not be refreshed: %w", path, err)
 		}
 		// The checkout now equals committed state: refresh the fingerprint
