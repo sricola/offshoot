@@ -24,6 +24,7 @@ type Options struct {
 	DB, Branch string
 	Holder     string        // defaults to ops.LocalHolder()
 	LeaseTTL   time.Duration // defaults to ops.DefaultLeaseTTL
+	RenewEvery time.Duration // defaults to LeaseTTL/3
 	Dir        string        // scratch dir for the replica and capture state; defaults to a temp dir
 }
 
@@ -131,6 +132,12 @@ func Open(ctx context.Context, o Options) (*Session, error) {
 	if o.LeaseTTL == 0 {
 		o.LeaseTTL = ops.DefaultLeaseTTL
 	}
+	if o.RenewEvery == 0 {
+		o.RenewEvery = o.LeaseTTL / 3
+		if o.RenewEvery <= 0 {
+			o.RenewEvery = time.Second
+		}
+	}
 	dir, ownsDir := o.Dir, false
 	if dir == "" {
 		d, err := os.MkdirTemp("", "offshoot-session-*")
@@ -175,6 +182,7 @@ func Open(ctx context.Context, o Options) (*Session, error) {
 	})
 	s.engDone = make(chan struct{})
 	go s.runEngine(cctx)
+	go s.renewLoop(cctx, o.RenewEvery, o.LeaseTTL)
 	return s, nil
 }
 
