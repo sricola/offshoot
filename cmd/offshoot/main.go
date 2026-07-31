@@ -2,11 +2,15 @@
 package main
 
 import (
+	"context"
 	"fmt"
 	"os"
+	"os/signal"
 	"strings"
+	"syscall"
 	"time"
 
+	"github.com/offshoot-db/offshoot/internal/daemon"
 	"github.com/offshoot-db/offshoot/internal/ops"
 	"github.com/offshoot-db/offshoot/internal/store"
 )
@@ -28,6 +32,16 @@ Usage:
   offshoot lease list                       list every branch's lease
   offshoot lease acquire <db>[@branch] [--ttl 30s]   claim or renew a lease
   offshoot lease release <db>[@branch]      release a lease
+  offshoot serve [-socket PATH]             run the daemon until SIGINT/SIGTERM
+  offshoot session open <db>[@branch] [-socket PATH]      open a session; prints the checkout path
+  offshoot session flush <db>[@branch] [name] [-socket PATH]   flush to a durable snapshot; prints the txid
+  offshoot session status [-socket PATH]                  list open sessions and their durable txid
+  offshoot session close <db>[@branch] [-socket PATH]     close a session, releasing its lease
+  offshoot session shutdown [-socket PATH]                ask the daemon to shut down gracefully
+
+  -socket PATH on a session subcommand must match the -socket PATH (if any)
+  given to the serve that's running, or OFFSHOOT_SOCKET; otherwise it is
+  derived from the store spec the same way on both sides.
 
 Store location: -store SPEC or OFFSHOOT_STORE, default ./.offshoot
   SPEC is a directory path, file:///abs/path, or s3://bucket/prefix
@@ -51,6 +65,38 @@ func storeSpec(args []string) (string, []string) {
 		out = append(out, args[i])
 	}
 	return spec, out
+}
+
+// socketOverride extracts a "-socket PATH" flag from args (in any position),
+// mirroring storeSpec's parsing so -store and -socket compose the same way.
+// It returns the socket path (empty if none was given) and the remaining
+// args with that flag removed. `serve` and `session` share this so that a
+// daemon started with `-socket PATH` and the `session` subcommands that talk
+// to it always agree on where the socket is.
+//
+// A trailing "-socket" with no PATH following it is a malformed flag, not a
+// positional argument: it is rejected here with an error rather than being
+// silently passed through in the remaining args. Without this check, `serve`
+// happened to reject it too, but only by accident — its caller separately
+// rejects any nonempty leftover args — while `session` has no such leftover
+// check and would silently swallow the flag, e.g. treating `session flush
+// app -socket` as an ordinary flush with `-socket` ignored instead of an
+// error.
+func socketOverride(args []string) (string, []string, error) {
+	sock := ""
+	out := args[:0]
+	for i := 0; i < len(args); i++ {
+		if args[i] == "-socket" {
+			if i+1 >= len(args) {
+				return "", nil, fmt.Errorf("-socket requires a PATH argument")
+			}
+			sock = args[i+1]
+			i++
+			continue
+		}
+		out = append(out, args[i])
+	}
+	return sock, out, nil
 }
 
 func main() {
@@ -298,6 +344,115 @@ func run(args []string) error {
 			return fmt.Errorf("offshoot: no lease on %s@%s", db, branch)
 		default:
 			return fmt.Errorf("unknown lease subcommand %q", rest[0])
+		}
+	case "serve":
+		sock, rest, err := socketOverride(rest)
+		if err != nil {
+			return fmt.Errorf("usage: offshoot serve [-socket PATH]: %w", err)
+		}
+		if len(rest) != 0 {
+			return fmt.Errorf("usage: offshoot serve [-socket PATH]")
+		}
+		if sock == "" {
+			p, err := daemon.DefaultSocketPath(spec)
+			if err != nil {
+				return err
+			}
+			sock = p
+		}
+		srv, err := daemon.NewServer(w, sock)
+		if err != nil {
+			return err
+		}
+		fmt.Println("offshoot serving on", sock)
+		sigc := make(chan os.Signal, 1)
+		signal.Notify(sigc, os.Interrupt, syscall.SIGTERM)
+		errc := make(chan error, 1)
+		go func() { errc <- srv.Serve() }()
+		select {
+		case <-sigc:
+			fmt.Println("offshoot: shutting down, releasing leases")
+			ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
+			defer cancel()
+			return srv.Shutdown(ctx)
+		case err := <-errc:
+			return err
+		}
+	case "session":
+		sock, rest, err := socketOverride(rest)
+		if err != nil {
+			return fmt.Errorf("usage: offshoot session open|flush|status|close|shutdown ... [-socket PATH]: %w", err)
+		}
+		if len(rest) == 0 {
+			return fmt.Errorf("usage: offshoot session open|flush|status|close|shutdown ... [-socket PATH]")
+		}
+		if sock == "" {
+			p, err := daemon.DefaultSocketPath(spec)
+			if err != nil {
+				return err
+			}
+			sock = p
+		}
+		sub, args := rest[0], rest[1:]
+		target := func() (string, string, error) {
+			if len(args) < 1 {
+				return "", "", fmt.Errorf("usage: offshoot session %s <db>[@branch]", sub)
+			}
+			return ops.ParseTarget(args[0])
+		}
+		switch sub {
+		case "open":
+			db, branch, err := target()
+			if err != nil {
+				return err
+			}
+			resp, err := daemon.Call(sock, daemon.Request{Op: "open", DB: db, Branch: branch})
+			if err != nil {
+				return err
+			}
+			fmt.Println(resp.Checkout)
+			return nil
+		case "flush":
+			db, branch, err := target()
+			if err != nil {
+				return err
+			}
+			name := ""
+			if len(args) == 2 {
+				name = args[1]
+			}
+			resp, err := daemon.Call(sock, daemon.Request{Op: "flush", DB: db, Branch: branch, Name: name})
+			if err != nil {
+				return err
+			}
+			fmt.Printf("durable through txid %d\n", resp.TXID)
+			return nil
+		case "status":
+			resp, err := daemon.Call(sock, daemon.Request{Op: "status"})
+			if err != nil {
+				return err
+			}
+			for _, in := range resp.Sessions {
+				line := fmt.Sprintf("%s@%s durable=%d epoch=%d holder=%s checkout=%s",
+					in.DB, in.Branch, in.DurableTXID, in.Epoch, in.Holder, in.Checkout)
+				if in.Error != "" {
+					line += " ERROR=" + in.Error
+				}
+				fmt.Println(line)
+			}
+			return nil
+		case "close":
+			db, branch, err := target()
+			if err != nil {
+				return err
+			}
+			_, err = daemon.Call(sock, daemon.Request{Op: "close", DB: db, Branch: branch})
+			return err
+		case "shutdown":
+			_, err := daemon.Call(sock, daemon.Request{Op: "shutdown"})
+			return err
+		default:
+			return fmt.Errorf("unknown session subcommand %q", sub)
 		}
 	default:
 		return fmt.Errorf("unknown command %q\n%s", cmd, usage)

@@ -6,6 +6,9 @@ import (
 	"path/filepath"
 	"strings"
 	"testing"
+	"time"
+
+	"github.com/offshoot-db/offshoot/internal/daemon"
 )
 
 // call runs the CLI's run() with -store pointing at dir, capturing stdout.
@@ -86,5 +89,115 @@ func TestQuickstartTranscript(t *testing.T) {
 	status := call(t, store, "status")
 	if !strings.Contains(status, "app@main") || strings.Contains(status, "attempt-1") {
 		t.Fatalf("status:\n%s", status)
+	}
+}
+
+// TestBareTrailingSocketFlagIsRejected guards a parsing gap: socketOverride
+// used to only consume "-socket PATH" when a value followed it, silently
+// leaving a bare trailing "-socket" in the remaining args otherwise. `serve`
+// happened to reject that leftover anyway (it errors on any nonempty rest),
+// but `session` has no such check — a trailing "-socket" there fell through
+// to target(), which just treated it as an ordinary positional argument (or
+// an unknown subcommand, depending on position) instead of reporting the
+// malformed flag. Both paths must now reject it explicitly and identically.
+func TestBareTrailingSocketFlagIsRejected(t *testing.T) {
+	dir := filepath.Join(t.TempDir(), "s")
+	if err := run([]string{"-store", dir, "init"}); err != nil {
+		t.Fatal(err)
+	}
+	if err := run([]string{"-store", dir, "create", "app"}); err != nil {
+		t.Fatal(err)
+	}
+
+	if err := run([]string{"-store", dir, "serve", "-socket"}); err == nil {
+		t.Fatal("serve -socket with no PATH must error")
+	}
+	if err := run([]string{"-store", dir, "session", "open", "app", "-socket"}); err == nil {
+		t.Fatal("session open app -socket with no PATH must error, not silently ignore -socket")
+	}
+	if err := run([]string{"-store", dir, "session", "-socket"}); err == nil {
+		t.Fatal("session -socket with no PATH and no subcommand must error")
+	}
+}
+
+// TestSessionHonorsServeSocketOverride guards the fix for `serve -socket`
+// and `session` disagreeing on where the socket lives: `serve -socket PATH`
+// used to be unreachable by `session` subcommands because they only ever
+// computed DefaultSocketPath(spec)/OFFSHOOT_SOCKET, never looking at a
+// `-socket` flag of their own. This drives the CLI exactly as a user would:
+// start a daemon with an explicit -socket, confirm session commands without
+// -socket cannot reach it (they'd otherwise silently hit some other
+// daemon's default socket and mask this bug), then confirm the matching
+// -socket makes them agree.
+func TestSessionHonorsServeSocketOverride(t *testing.T) {
+	if _, err := exec.LookPath("sqlite3"); err != nil {
+		t.Skip("sqlite3 CLI not on PATH")
+	}
+	store := filepath.Join(t.TempDir(), "s")
+	if err := run([]string{"-store", store, "init"}); err != nil {
+		t.Fatal(err)
+	}
+	if err := run([]string{"-store", store, "create", "app"}); err != nil {
+		t.Fatal(err)
+	}
+
+	// Unix socket paths are capped around 104-108 bytes on several
+	// platforms (notably macOS); keep this one short and independent of
+	// t.TempDir(), which nests under the test's full name.
+	sockDir, err := os.MkdirTemp("", "offshoot-cli-test-*")
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { os.RemoveAll(sockDir) })
+	sock := filepath.Join(sockDir, "custom.sock")
+
+	serveDone := make(chan error, 1)
+	go func() { serveDone <- run([]string{"-store", store, "serve", "-socket", sock}) }()
+	// Best-effort safety net: if the test fails before reaching its own
+	// shutdown call below, this stops the daemon goroutine from outliving
+	// the test. If the test already shut the daemon down, this fails
+	// harmlessly (no listener) and is ignored.
+	t.Cleanup(func() {
+		run([]string{"-store", store, "session", "shutdown", "-socket", sock})
+	})
+
+	deadline := time.Now().Add(5 * time.Second)
+	for !daemon.Running(sock) {
+		if time.Now().After(deadline) {
+			t.Fatal("daemon never came up on the -socket override")
+		}
+		time.Sleep(50 * time.Millisecond)
+	}
+
+	// Without a matching -socket, session commands derive the default
+	// (store-hash) socket path, which is not where this daemon is
+	// listening: they must fail, not silently succeed against nothing.
+	if err := run([]string{"-store", store, "session", "status"}); err == nil {
+		t.Fatal("session status without -socket must not reach a daemon started with -socket override")
+	}
+
+	out := call(t, store, "session", "open", "app", "-socket", sock)
+	checkout := strings.TrimSpace(out)
+	if checkout == "" {
+		t.Fatalf("session open -socket printed no checkout path, got %q", out)
+	}
+	if _, err := os.Stat(checkout); err != nil {
+		t.Fatalf("checkout path from session open -socket does not exist: %v", err)
+	}
+
+	if err := run([]string{"-store", store, "session", "close", "app", "-socket", sock}); err != nil {
+		t.Fatalf("session close -socket: %v", err)
+	}
+	if err := run([]string{"-store", store, "session", "shutdown", "-socket", sock}); err != nil {
+		t.Fatalf("session shutdown -socket: %v", err)
+	}
+
+	select {
+	case err := <-serveDone:
+		if err != nil {
+			t.Fatalf("serve -socket returned: %v", err)
+		}
+	case <-time.After(10 * time.Second):
+		t.Fatal("serve -socket did not exit after session shutdown -socket")
 	}
 }

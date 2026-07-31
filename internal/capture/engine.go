@@ -8,6 +8,7 @@ import (
 	"crypto/sha256"
 	"database/sql"
 	"encoding/hex"
+	"errors"
 	"fmt"
 	"io"
 	"os"
@@ -89,13 +90,31 @@ type Engine struct {
 	// continuity loss. See takeover() and Run()'s wal.ErrWALRestarted
 	// handling.
 	expectRestart bool
+
+	// reqs carries DrainNow requests into Run's select loop, so an immediate
+	// catch-up poll is serviced by the same goroutine that owns e.reader and
+	// e.conn — never concurrently with the ticker-driven path. See DrainNow
+	// and pollOnce.
+	reqs chan drainRequest
+	// done is closed once, when Run returns, so a DrainNow call racing the
+	// engine's own shutdown does not block forever with nobody left to
+	// service e.reqs.
+	done chan struct{}
 }
+
+// drainRequest is one DrainNow call's handoff to Run's loop: done carries
+// back pollOnce's result (nil on an ordinary successful catch-up, or the
+// same fatal error Run itself returns and stops on — Run's reqs case sends
+// the result to done and THEN returns it, exactly as the ticker path below
+// does, so a DrainNow-triggered failure stops the engine just as promptly
+// as one the ticker happened to hit first).
+type drainRequest struct{ done chan error }
 
 func NewEngine(o Options) *Engine {
 	if o.Poll == 0 {
 		o.Poll = 10 * time.Millisecond
 	}
-	return &Engine{o: o}
+	return &Engine{o: o, reqs: make(chan drainRequest), done: make(chan struct{})}
 }
 
 // Rebased reports how many times this Engine instance rebased. This
@@ -121,10 +140,97 @@ func (e *Engine) Resumed() bool { return e.resumed.Load() }
 func (e *Engine) statePath() string    { return filepath.Join(e.o.StateDir, "capture-state.json") }
 func (e *Engine) snapshotPath() string { return filepath.Join(e.o.StateDir, "snapshot.db") }
 
+// DrainNow requests an immediate, out-of-band poll and blocks until it has
+// been serviced: every transaction already committed to the checkout's WAL
+// as of the moment this call is issued is captured (applied to the Sink)
+// before it returns, instead of waiting for the next tick of Engine.Poll
+// (default 10ms). This is the guarantee Session.Flush needs: without it,
+// Flush would encode whatever the replica happens to hold at that instant,
+// which can lag a write a caller just committed to the checkout by up to
+// one poll interval — Flush would then advance the branch head to
+// reference a snapshot that silently omits it, while still reporting
+// success.
+//
+// That guarantee is enforced by draining to a real target (the WAL's
+// on-disk size at the moment the request is serviced), not by a wall-clock
+// budget — see drainUntil's doc comment. A nil return from DrainNow is
+// therefore proof the target was reached, never a "ran out of time" guess;
+// if the target genuinely cannot be reached in a sane window (see
+// drainSafetyDeadline), DrainNow returns ErrDrainIncomplete instead of a
+// misleading nil, and the caller (Flush) must treat that as a failed flush
+// rather than commit a possibly-short snapshot.
+//
+// The request is handed to Run's own select loop (see pollOnce/pollOnceTo),
+// so it is serviced by the single goroutine that owns e.reader/e.conn —
+// never concurrently with the regular ticker path. If ctx is cancelled
+// first, or the engine has already stopped (Run returned, e.done closed)
+// with nothing left to service the request, DrainNow returns promptly
+// rather than blocking forever; a caller that needs to know about a
+// terminal engine failure should check that some other way (Session.Err),
+// not through DrainNow's return value in that case.
+func (e *Engine) DrainNow(ctx context.Context) error {
+	req := drainRequest{done: make(chan error, 1)}
+	select {
+	case e.reqs <- req:
+	case <-ctx.Done():
+		return ctx.Err()
+	case <-e.done:
+		return nil
+	}
+	select {
+	case err := <-req.done:
+		return err
+	case <-ctx.Done():
+		return ctx.Err()
+	case <-e.done:
+		// Run's reqs case sends to req.done (buffered, cap 1) strictly
+		// before it can return and trigger the deferred close(e.done) — but
+		// that program-order guarantee inside Run doesn't make select
+		// prefer one ready case over another here: if both req.done and
+		// e.done are ready by the time this select runs, Go picks between
+		// them pseudo-randomly. Since close(e.done) happens-after the send
+		// (same goroutine, sequenced before the return that unwinds into
+		// it), a pending value on req.done is always already visible by the
+		// time e.done's close is observed — so check it once more,
+		// non-blockingly, rather than risk reporting a spurious nil success
+		// for what was actually a fatal DrainNow-triggered error.
+		select {
+		case err := <-req.done:
+			return err
+		default:
+			return nil
+		}
+	}
+}
+
 // Run blocks, capturing until ctx is cancelled. It performs the initial
 // rebase (checkpoint + snapshot copy), holds the read-lock dance, polls for
 // committed transactions, and periodically performs checkpoint takeover.
+//
+// Every fallible step between here and the first point where ctx.Done() is
+// actually selected on (the main loop below) is guarded with the same
+// ctx.Err() check the startup rebase, pollOnce/pollOnceTo's rebase branches,
+// and afterDrain's takeover call already use: Close() cancels ctx, and
+// Session.Open starts this goroutine asynchronously and returns immediately
+// (see session.go's Open), so a Close() landing before — or while — Run's
+// own DB setup (sql.Open/Conn/PRAGMAs) or tryResume runs is a completely
+// ordinary, if early, race, not a special case. database/sql surfaces that
+// as ctx.Err() (typically context.Canceled, unwrapped) from whichever
+// ExecContext/QueryRowContext/Conn call happened to be in flight — and
+// without a guard, that flows straight out as Run's own fatal return value,
+// which runEngine (session.go) records as "session: capture stopped:
+// context canceled" on what was actually a clean Close. Nothing has been
+// set up yet at any of these points for shutdown()'s final drain/checkpoint
+// dance to safely run against, so — exactly like the startup rebase guard
+// below — the right response is simply to stop, not to attempt a graceful
+// shutdown() that has nothing valid to act on. Reproduced empirically
+// (TestCloseDoesNotMarkSessionFenced failing under whole-suite contention,
+// pinned via temporary logging to the PRAGMA page_size QueryRowContext call
+// specifically, though Conn and the wal_autocheckpoint PRAGMA are exactly
+// as capable of losing the same race and are guarded for the same reason,
+// not because either was separately observed to fail).
 func (e *Engine) Run(ctx context.Context) error {
+	defer close(e.done)
 	var err error
 	e.db, err = sql.Open("sqlite3",
 		e.o.DBPath+"?_busy_timeout=5000&_journal_mode=WAL")
@@ -134,20 +240,46 @@ func (e *Engine) Run(ctx context.Context) error {
 	defer e.db.Close()
 	e.conn, err = e.db.Conn(ctx)
 	if err != nil {
+		if ctx.Err() != nil {
+			return nil
+		}
 		return err
 	}
 	defer e.conn.Close()
 	if _, err := e.conn.ExecContext(ctx, "PRAGMA wal_autocheckpoint=0"); err != nil {
+		if ctx.Err() != nil {
+			return nil
+		}
 		return err
 	}
 	if err := e.conn.QueryRowContext(ctx, "PRAGMA page_size").Scan(&e.pageSize); err != nil {
+		if ctx.Err() != nil {
+			return nil
+		}
 		return err
 	}
 
 	if resumed, err := e.tryResume(ctx); err != nil {
+		if ctx.Err() != nil {
+			return nil
+		}
 		return err
 	} else if !resumed {
 		if err := e.rebase(ctx); err != nil {
+			if ctx.Err() != nil {
+				// Close() landed while the startup rebase was still
+				// running: an ordinary, if early, shutdown — not a real
+				// capture failure. Nothing has been set up yet for
+				// shutdown()'s final drain/checkpoint dance to safely run
+				// against (e.reader isn't even bound on every failure path
+				// through rebase()), so there is nothing more to do than
+				// stop cleanly; the next start simply rebases again. See
+				// the identical guard on pollOnce's own rebase call below,
+				// and the existing guard around the takeover() call, for
+				// the same reasoning applied at the other two rebase call
+				// sites reachable from Run's goroutine.
+				return nil
+			}
 			return err
 		}
 	}
@@ -156,52 +288,229 @@ func (e *Engine) Run(ctx context.Context) error {
 	tick := time.NewTicker(e.o.Poll)
 	defer tick.Stop()
 	for {
+		// Check for a pending DrainNow request non-blockingly, before ever
+		// entering the blocking select below. Without this, a request that
+		// is already waiting on e.reqs by the time this loop comes back
+		// around competes on equal footing with an already-fired tick — Go's
+		// select picks pseudo-randomly between two simultaneously-ready
+		// cases — so under sustained write load (drain's per-call time
+		// budget, see drain's doc comment, forces this loop back here
+		// roughly every drainBudget) a DrainNow caller could keep losing
+		// that coin flip. Session.Flush's DrainNow call is exactly the
+		// caller this would starve. Servicing e.reqs first, unconditionally,
+		// whenever it's ready guarantees a queued request is serviced on the
+		// very next iteration rather than merely being more likely to be.
+		select {
+		case req := <-e.reqs:
+			if err := e.serviceReq(ctx, req, &idle); err != nil {
+				return err
+			}
+			continue
+		default:
+		}
 		select {
 		case <-ctx.Done():
 			e.shutdown()
 			return nil
-		case <-tick.C:
-		}
-		n, err := e.drain(ctx)
-		if err == wal.ErrWALRestarted {
-			if e.expectRestart {
-				// The WAL's lazy reset (armed by our own verified-clean
-				// takeover) has now physically landed: a new WAL generation
-				// with fresh salts. Our replica already reflects every frame
-				// up to the restart point, so the new generation's frames
-				// apply cleanly on top — this is a continuation, not lost
-				// continuity. No rebase, no snapshot, not counted.
-				e.expectRestart = false
-				e.reader = wal.NewReader(e.o.DBPath + "-wal")
-				e.captured = 0
-				continue
-			}
-			// Our lock lapsed (or an external RESTART happened) without a
-			// preceding verified-clean takeover: continuity lost —
-			// detected. Re-establish from a fresh snapshot.
-			if err := e.rebase(ctx); err != nil {
+		case req := <-e.reqs:
+			if err := e.serviceReq(ctx, req, &idle); err != nil {
 				return err
 			}
 			continue
+		case <-tick.C:
+		}
+		if err := e.pollOnce(ctx, &idle); err != nil {
+			return err
+		}
+	}
+}
+
+// serviceReq runs one DrainNow caller's poll and reports the result back to
+// it. Send the result to the requester FIRST, then — on a fatal error — stop
+// the loop exactly as the ticker path does. A poll triggered by DrainNow is
+// not a lesser failure than one triggered by the ticker: if it were treated
+// as one, Run would keep looping looking healthy while capture is actually
+// broken, and nothing would ever call session.runEngine's failure path.
+// Sending before returning means the requester still gets the error even
+// though Run is about to exit and close e.done right after.
+//
+// The drain target — the WAL's on-disk size as of right now — is read here,
+// in Run's own goroutine at the moment the request is actually serviced, not
+// inside DrainNow itself (which runs on the caller's goroutine and must not
+// touch e.reader/e.conn/the WAL file's stat outside this goroutine's
+// ownership). See drainUntil's doc comment for why a fixed target, decided
+// once up front, is what makes DrainNow's contract satisfiable at all under
+// a nonstop writer. A failure to even establish the target (e.g. a stat
+// error other than the WAL not existing yet) is reported the same way any
+// other fatal poll failure is: sent to the requester and then treated as
+// fatal for Run itself, never silently skipped.
+func (e *Engine) serviceReq(ctx context.Context, req drainRequest, idle *time.Time) error {
+	target, terr := e.drainTarget()
+	if terr != nil {
+		req.done <- terr
+		return terr
+	}
+	err := e.pollOnceTo(ctx, idle, target, time.Now().Add(drainSafetyDeadline))
+	req.done <- err
+	return err
+}
+
+// drainTarget reads the WAL's current on-disk size — the completion target
+// a DrainNow-triggered drain must reach (see drainUntil). A missing WAL file
+// (nothing has ever been written to it, or it was just truncated) means
+// there is nothing to catch up to, so target 0 is trivially already met by
+// any reader offset.
+func (e *Engine) drainTarget() (int64, error) {
+	fi, err := os.Stat(e.o.DBPath + "-wal")
+	if err != nil {
+		if os.IsNotExist(err) {
+			return 0, nil
+		}
+		return 0, fmt.Errorf("drain target: stat WAL: %w", err)
+	}
+	return fi.Size(), nil
+}
+
+// pollOnce runs one capture pass using the ticker's own drain(), which is
+// bounded by drainBudget and may return having only partially caught up
+// (see drain's doc comment) — harmless here since Run's next tick simply
+// continues. It is Run's regular, liveness-only poll path; DrainNow uses
+// pollOnceTo instead, which drains to a real completion target rather than a
+// clock. idle is Run's loop-local idle timestamp, threaded through by
+// pointer so pollOnce can update it exactly as the inline code used to.
+//
+// On a WAL restart, this returns after handling (at most) one restart —
+// exactly the original inline behavior this was factored out of. That is
+// deliberately weaker than pollOnceTo's guarantee (see its doc comment for
+// why the two must differ here): it is fine for the ticker path because
+// Run's loop comes back around every e.o.Poll regardless, so anything left
+// after a restart is simply picked up by the next tick.
+func (e *Engine) pollOnce(ctx context.Context, idle *time.Time) error {
+	n, err := e.drain(ctx)
+	if err == wal.ErrWALRestarted {
+		if e.expectRestart {
+			// The WAL's lazy reset (armed by our own verified-clean
+			// takeover) has now physically landed: a new WAL generation
+			// with fresh salts. Our replica already reflects every frame
+			// up to the restart point, so the new generation's frames
+			// apply cleanly on top — this is a continuation, not lost
+			// continuity. No rebase, no snapshot, not counted.
+			e.expectRestart = false
+			e.reader = wal.NewReader(e.o.DBPath + "-wal")
+			e.captured = 0
+			return nil
+		}
+		// Our lock lapsed (or an external RESTART happened) without a
+		// preceding verified-clean takeover: continuity lost —
+		// detected. Re-establish from a fresh snapshot.
+		if err := e.rebase(ctx); err != nil {
+			if ctx.Err() != nil {
+				// Close() landed mid-rebase: an ordinary shutdown, not a
+				// real capture failure — let Run's ctx.Done() branch
+				// perform the final drain/endRead and return nil. See the
+				// identical guard on Run's own startup rebase, and the
+				// guard on the takeover() call below, for the same
+				// reasoning at the other two rebase call sites.
+				return nil
+			}
+			return err
+		}
+		return nil
+	}
+	if err != nil {
+		return err
+	}
+	return e.afterDrain(ctx, idle, n)
+}
+
+// pollOnceTo runs one capture pass servicing a DrainNow request: it drains
+// to target (see drainUntil) instead of drain()'s time budget, so — unlike
+// pollOnce — it either reaches everything committed as of the request or
+// returns a loud error (ErrDrainIncomplete), never a silent partial catch-up.
+// deadline is the single, absolute cutoff for the WHOLE call — computed once
+// by serviceReq — not just one drainUntil attempt; see the loop below for
+// why that distinction matters.
+//
+// Unlike pollOnce, this MUST NOT return after handling just one WAL
+// restart the way the original inline code (and pollOnce, above) did: a
+// restart's expectRestart-continuation branch only proves the reader had
+// consumed everything in the OLD generation as of the takeover that armed
+// expectRestart — which can be earlier than, and so weaker than, "as of
+// target" when target was computed by a LATER DrainNow request (e.g. one
+// whose caller committed new data, in the old generation, after that
+// takeover ran but before the lazy reset physically landed). Returning nil
+// right there — as an earlier version of this function did — would report
+// success while silently leaving that newer data, now sitting in the fresh
+// generation, completely undrained. Reproduced directly: with a foreign
+// reader pinned open (blocking every checkpoint, so takeover's own
+// safety-net rebase can never mask this), a marker row committed
+// immediately before Flush was absent from the flushed snapshot even
+// though DrainNow reported success — see the task-7 hardening report for
+// the captured run.
+//
+// The fix is to treat target as scoped to "whatever WAL generation is
+// current" rather than a fixed byte count: after a clean-continuation
+// restart, re-derive target fresh (via drainTarget, against the NOW-current
+// generation) and keep draining toward it, rather than trusting the
+// pre-restart number in a generation it no longer describes. A rebase, by
+// contrast, needs no such re-derivation and no loop — rebase()'s snapshot
+// copy happens strictly after any target was computed, so it already
+// supersedes it by construction (see the rebase branch below).
+func (e *Engine) pollOnceTo(ctx context.Context, idle *time.Time, target int64, deadline time.Time) error {
+	for {
+		n, err := e.drainUntil(ctx, target, deadline)
+		if err == wal.ErrWALRestarted {
+			if e.expectRestart {
+				e.expectRestart = false
+				e.reader = wal.NewReader(e.o.DBPath + "-wal")
+				e.captured = 0
+				newTarget, terr := e.drainTarget()
+				if terr != nil {
+					return terr
+				}
+				target = newTarget
+				continue
+			}
+			// Continuity lost — detected. rebase() copies the live main DB
+			// file, which reflects everything checkpointed as of that
+			// copy — strictly later than target — so this alone already
+			// satisfies the DrainNow request in flight; no need to keep
+			// draining toward target afterward.
+			if err := e.rebase(ctx); err != nil {
+				if ctx.Err() != nil {
+					return nil
+				}
+				return err
+			}
+			return nil
 		}
 		if err != nil {
 			return err
 		}
-		if n > 0 {
-			idle = time.Now()
-			e.captured += n
-		}
-		if e.captured >= 64 || (e.captured > 0 && time.Since(idle) > 5*time.Second) {
-			if err := e.takeover(ctx); err != nil {
-				if ctx.Err() != nil {
-					// Shutting down: let the ctx.Done() branch above
-					// perform the final drain/endRead and return nil.
-					continue
-				}
-				return err
+		return e.afterDrain(ctx, idle, n)
+	}
+}
+
+// afterDrain runs the bookkeeping shared by pollOnce and pollOnceTo once a
+// drain phase has completed without error: update the idle timestamp and
+// cumulative captured count, and perform checkpoint takeover once enough has
+// accumulated.
+func (e *Engine) afterDrain(ctx context.Context, idle *time.Time, n int) error {
+	if n > 0 {
+		*idle = time.Now()
+		e.captured += n
+	}
+	if e.captured >= 64 || (e.captured > 0 && time.Since(*idle) > 5*time.Second) {
+		if err := e.takeover(ctx); err != nil {
+			if ctx.Err() != nil {
+				// Shutting down: let Run's ctx.Done() branch perform the
+				// final drain/endRead and return nil.
+				return nil
 			}
+			return err
 		}
 	}
+	return nil
 }
 
 // shutdown runs on the ctx.Done() path. It drains whatever's still pending,
@@ -405,34 +714,265 @@ func (e *Engine) walRacedSinceRestart(consumed int64) (bool, error) {
 	return available > consumed, nil
 }
 
-// drain consumes all currently available committed transactions.
+// drainBudget bounds how long a single ticker-driven drain call may keep
+// consuming before it yields control back to Run's loop, even if more
+// committed transactions are still arriving. See drain's doc comment for why
+// this exists and why a partial catch-up here is harmless; the value is
+// generous relative to everything it needs to absorb (see the comment).
+const drainBudget = 2 * time.Second
+
+// ErrDrainIncomplete is returned by drainUntil — and therefore can surface
+// from DrainNow and, in turn, Session.Flush — when a DrainNow-triggered
+// drain could not reach its target offset (see drainUntil) within
+// drainSafetyDeadline. This is a loud, terminal-for-the-call signal that
+// something is deeply wrong (e.g. sustained I/O stalls, or a target that
+// somehow never becomes reachable) — never a silent "close enough". Flush
+// must fail on this, not durably commit a snapshot that might be short.
+var ErrDrainIncomplete = errors.New("capture: drain did not reach its target before the safety deadline")
+
+// drainSafetyDeadline backstops drainUntil against pathological cases (see
+// its doc comment) — deliberately generous, well above any observed real
+// drain latency, because exceeding it is a loud failure (ErrDrainIncomplete)
+// rather than a silent partial return. Session.Flush's own 30s DrainNow
+// context (see flush.go) is the bound that actually governs day-to-day
+// behavior; this is only the backstop that turns "ran out of time" into an
+// observable error instead of a snapshot that silently omits committed work.
+//
+// 15s, not something closer to the full 30s Flush budget: a single
+// DrainNow-triggered poll can spend this deadline on drainUntil AND,
+// afterward, up to ~10s more on takeover's own checkpoint/beginReadRetry
+// busy-retries (see poll and flush.go's comment on its 30s timeout) —
+// 15+10=25s leaves Flush's context a real margin instead of racing its own
+// backstop to expiry.
+const drainSafetyDeadline = 15 * time.Second
+
+// drainStep reads and applies exactly one committed transaction, if one is
+// immediately available: it is the unit of work shared by drain (ticker,
+// time-budgeted) and drainUntil (DrainNow, target-budgeted). Returns
+// frames == nil, err == nil when nothing further is immediately available
+// (including wal.ErrWALRestarted passed through unmodified, for the callers'
+// shared restart handling in poll).
+func (e *Engine) drainStep() ([]wal.Frame, error) {
+	frames, err := e.reader.Next()
+	if err != nil {
+		return nil, err
+	}
+	if frames == nil {
+		return nil, nil
+	}
+	// SQLite cannot change a database's page size while in WAL mode, so
+	// e.pageSize (captured once via PRAGMA page_size at startup — see Run())
+	// is assumed to hold for the process's entire lifetime and is what every
+	// consumed-offset/frame-size computation in this file relies on. Make
+	// that assumption explicit and fail loudly rather than silently mis-slice
+	// frame data if it's ever violated.
+	if ps := e.reader.PageSize(); ps != e.pageSize {
+		return nil, fmt.Errorf("drain: WAL page size %d does not match engine page size %d recorded at startup", ps, e.pageSize)
+	}
+	if err := e.o.Sink.Apply(e.pageSize, frames); err != nil {
+		return nil, err
+	}
+	off, s1, s2 := e.reader.Offset()
+	if err := SaveState(e.statePath(), State{Off: off, Salt1: s1, Salt2: s2}); err != nil {
+		return nil, err
+	}
+	return frames, nil
+}
+
+// drain consumes committed transactions until none are immediately available
+// or drainBudget elapses, whichever comes first — it chases newly-landed
+// transactions within that budget (matching a plain "loop until nothing's
+// left" loop for any ordinary, finite burst) but is guaranteed to return
+// control to its caller within bounded time regardless of how long the
+// writer keeps writing.
+//
+// Ticker-driven only — see pollOnce. A budget-exhausted return here is (n,
+// nil), indistinguishable from a return caused by genuinely catching up, and
+// that is fine for this caller specifically: pollOnce's caller is Run's own
+// ticker loop, which comes back around every e.o.Poll (default 10ms)
+// regardless, so a partial catch-up this call is simply completed by the
+// next one — liveness, not a promise that every committed transaction has
+// been reached. This must NEVER be reused to service a DrainNow request:
+// DrainNow's contract requires a real proof of completion, which is exactly
+// what drainUntil (with a fixed target and a loud ErrDrainIncomplete on
+// failure, rather than a silent nil) provides instead. See drainUntil's doc
+// comment for the full contrast, including the review finding that led to
+// splitting these two into separate functions.
+//
+// The budget is load-bearing, not cosmetic. e.reader.Next() re-reads the WAL
+// file from disk on every call; under a foreign writer that never leaves a
+// gap (see TestFlushesUnderContinuousWritesAreConsistent, which drives
+// exactly this via a tight loop of single-row inserts with no pause), a
+// plain "loop until Next() returns nil" never actually sees nil — a new
+// commit is always landing just as the previous one finishes. That would
+// starve Run's own ticker loop of a chance to notice anything else pending
+// (a ctx cancellation, a DrainNow request) — empirically reproduced before
+// this budget existed: drain() consumed 7500+ transactions over 60+ seconds
+// without ever returning, until the writer stopped.
+//
+// A per-call time budget was chosen over bounding by the WAL's on-disk size
+// snapshotted at entry (the first fix attempted here, now what drainUntil
+// does instead — but only for the DrainNow path, where the resulting
+// precision is load-bearing, not merely nice-to-have): a size snapshot stops
+// drain from absorbing anything that lands after it starts, even when doing
+// so would be perfectly safe — which measurably slowed down ordinary,
+// finite-burst catch-up in TestEngineTakeoverExpectedRestartIsNotRebase and
+// TestEngineTakeoverUnderConcurrentWrites (each extra chunk boundary costs a
+// wait for Run's next 10ms tick; under those tests' per-transaction fsync
+// cost in SaveState, that was enough to blow through the tests' own timing
+// margins and turn a benign fold-then-resync race into an observed extra
+// rebase). A time budget instead keeps this ticker path's old
+// chase-everything-currently-available behavior intact for any burst that
+// finishes within the budget — which every legitimate burst does, by a wide
+// margin — and only kicks in as a backstop against a writer that truly never
+// stops. 2 seconds leaves ample headroom above the slowest observed real
+// burst (~400ms for ~75 fsync'd transactions).
+//
+// Deliberately does NOT also check ctx.Err() and bail out early: an earlier
+// version of this fix did, and it broke clean shutdown. Run's ticker-path
+// case treats any non-nil pollOnce error as fatal and returns it directly —
+// correct for a real capture failure, but ctx cancellation via Close() is
+// not one; it is the ordinary shutdown signal, meant to be observed only at
+// Run's own top-level select and handled via shutdown() (which drains one
+// last time on a fresh, uncancelled context — see its doc comment). If
+// Close() cancels ctx while a ticker-triggered drain() happens to be
+// mid-flight, an early ctx-aware return would surface context.Canceled as
+// pollOnce's error, which Run's ticker branch would then return as ITS OWN
+// result — skipping shutdown() entirely: no final checkpoint, no clean-state
+// marker, and runEngine (see session.go) records it as a genuine failure
+// ("session: capture stopped: context canceled") even though nothing went
+// wrong. Empirically reproduced via TestCloseDoesNotMarkSessionFenced and
+// TestEngineResumesCleanly failing intermittently under load (contention
+// makes the cancel-lands-mid-drain race far more likely to be hit) once this
+// check was added, and gone once it was removed. The drainBudget deadline
+// above is sufficient on its own to bound this call; ctx cancellation is
+// still honored, just one loop iteration later than it could be in the
+// absolute worst case, at Run's own select.
 func (e *Engine) drain(ctx context.Context) (int, error) {
+	deadline := time.Now().Add(drainBudget)
 	n := 0
 	for {
-		frames, err := e.reader.Next()
+		if time.Now().After(deadline) {
+			return n, nil
+		}
+		frames, err := e.drainStep()
 		if err != nil {
 			return n, err
 		}
 		if frames == nil {
 			return n, nil
 		}
-		// SQLite cannot change a database's page size while in WAL mode, so
-		// e.pageSize (captured once via PRAGMA page_size at startup — see
-		// Run()) is assumed to hold for the process's entire lifetime and is
-		// what every consumed-offset/frame-size computation in this file
-		// relies on. Make that assumption explicit and fail loudly rather
-		// than silently mis-slice frame data if it's ever violated.
-		if ps := e.reader.PageSize(); ps != e.pageSize {
-			return n, fmt.Errorf("drain: WAL page size %d does not match engine page size %d recorded at startup", ps, e.pageSize)
-		}
-		if err := e.o.Sink.Apply(e.pageSize, frames); err != nil {
-			return n, err
-		}
-		off, s1, s2 := e.reader.Offset()
-		if err := SaveState(e.statePath(), State{Off: off, Salt1: s1, Salt2: s2}); err != nil {
-			return n, err
-		}
 		n++
+	}
+}
+
+// drainUntil services one attempt within a DrainNow request: it drains until
+// the reader's consumed offset reaches or passes target, or until nothing
+// further is immediately available, whichever comes first. target is the
+// WAL's on-disk size read once, up front, by serviceReq/drainTarget at the
+// moment Run's goroutine actually picks up the request — see drainTarget's
+// doc comment for why it must be read there and not inside DrainNow itself.
+// deadline is an absolute cutoff, not a duration relative to this call:
+// pollOnceTo computes it once and threads it through every attempt of a
+// single DrainNow request, including any re-attempts after a WAL restart
+// forces target to be re-derived (see pollOnceTo's doc comment) — so a
+// request that hits several restarts in a row still cannot run past a
+// single drainSafetyDeadline in aggregate, only per restart.
+//
+// Why this — a fixed target — and not drain()'s time budget, for DrainNow:
+// DrainNow's documented contract is "every transaction already committed to
+// the checkout's WAL as of the moment this call is issued is captured
+// before it returns" — Session.Flush depends on that unconditionally (see
+// flush.go). drain()'s wall-clock budget cannot make that promise: under
+// sustained writes it can (and, per the review that motivated this
+// function, empirically does — hitting its deadline mid-stream on nearly
+// every call) return having only partially caught up, and a
+// budget-exhausted drain() returns (n, nil) — indistinguishable, from the
+// return value alone, from a drain that genuinely reached everything
+// available. A caller cannot tell "reached the target" from "ran out of
+// time" from that, which reopens exactly the hazard a prior task fixed:
+// Flush durably committing a snapshot that omits a write already committed
+// to the checkout before Flush was even called.
+//
+// A target — a fixed offset decided once, up front — rather than a moving
+// deadline is what makes this terminate under a nonstop writer while still
+// honoring the contract: new transactions committed AFTER the request was
+// made are explicitly not required, and the target does not move to chase
+// them. The loop below stops as soon as either becomes true:
+//
+//   - the reader's consumed offset has reached or passed target: everything
+//     that was on disk at request time has been read and applied (and
+//     possibly a bit more, if the transaction straddling target extended
+//     past it — harmless, that's still committed data), or
+//   - drainStep reports nothing further is immediately available. Since the
+//     WAL only ever grows (never shrinks except via checkpoint/rebase,
+//     handled separately — see below) and target was read from its on-disk
+//     size, any gap between the current offset and target at this point can
+//     only be the tail of a transaction that had not yet finished
+//     committing as of the moment target was read — which means it had not
+//     committed as of the request either, and so is outside DrainNow's
+//     contract by definition, not a shortfall.
+//
+// A wal.ErrWALRestarted from drainStep is returned as-is to pollOnceTo's
+// restart handling — see its doc comment for why a restart requires
+// re-deriving target and looping (expectRestart) or is already subsumed by
+// a rebase, rather than being handled by comparing offsets against the
+// stale target directly.
+//
+// deadline backstops this against pathological cases (e.g. an I/O stall or
+// a target that somehow never becomes reachable within a sane window) — but
+// exceeding it surfaces as ErrDrainIncomplete, a loud error, never a silent
+// nil: see drainSafetyDeadline's doc comment.
+//
+// CRITICAL ordering, found the hard way: drainStep MUST run at least once
+// per iteration BEFORE off is ever compared against target — never check
+// off >= target first and only call drainStep if it's false. An earlier
+// version did check first, on the reasoning that off only ever grows and
+// target was read from the same file, so off >= target should mean "already
+// there." That reasoning silently breaks across a WAL restart the reader
+// hasn't observed yet: e.reader.Offset() is a byte count WITHIN WHATEVER
+// GENERATION the reader last bound to, but a checkpoint(RESTART) that lands
+// between one DrainNow call and the next causes the WAL file to be reused
+// from HeaderSize, not grown — so the file's on-disk size after the new
+// generation accumulates its own commits is in no way guaranteed to exceed
+// (or even relate to) the OLD generation's final consumed offset. Reproduced
+// directly: two rounds of ~301 identically-shaped transactions each,
+// separated by a clean takeover+restart (armed by round N-1, landing on
+// round N's first write) — round N's fresh generation happened to reach
+// almost exactly the same on-disk size as round N-1's old generation had,
+// so off (stale, still positioned in the old generation) >= target (the new
+// generation's current size) was true from the very first loop iteration,
+// short-circuiting before drainStep — and therefore Next()'s own salt
+// check, the only thing that actually notices a restart happened — ever
+// ran. drainUntil returned (0, nil) claiming completion while an entire
+// round's backlog and marker row, already sitting in the new generation,
+// went completely undrained. Calling drainStep unconditionally first
+// forces Next() to validate the reader's binding against whatever's
+// CURRENTLY on disk before off is ever trusted for a target comparison: on
+// a restart it returns wal.ErrWALRestarted (caught below, handled by
+// pollOnceTo), never a stale offset masquerading as "caught up."
+func (e *Engine) drainUntil(ctx context.Context, target int64, deadline time.Time) (int, error) {
+	n := 0
+	for {
+		if time.Now().After(deadline) {
+			off, _, _ := e.reader.Offset()
+			return n, fmt.Errorf("%w: consumed offset %d has not reached target %d after %s",
+				ErrDrainIncomplete, off, target, drainSafetyDeadline)
+		}
+		frames, err := e.drainStep()
+		if err != nil {
+			return n, err
+		}
+		if frames != nil {
+			n++
+		}
+		off, _, _ := e.reader.Offset()
+		if off >= target {
+			return n, nil
+		}
+		if frames == nil {
+			return n, nil
+		}
 	}
 }
 

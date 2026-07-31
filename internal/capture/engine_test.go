@@ -3,6 +3,7 @@ package capture
 import (
 	"context"
 	"database/sql"
+	"errors"
 	"os/exec"
 	"path/filepath"
 	"sync/atomic"
@@ -32,6 +33,18 @@ func (s countingSink) Apply(ps uint32, fr []wal.Frame) error {
 	atomic.AddInt32(s.applyCount, 1)
 	return s.replicaSink.Apply(ps, fr)
 }
+
+// applyErrSink always fails Apply with a fixed error while leaving Rebase
+// intact (delegated to the embedded replicaSink), so the engine's initial
+// startup rebase still succeeds and only the drain/Apply path fails — used
+// by TestDrainNowFatalErrorStopsRun to force pollOnce into its fatal-error
+// return.
+type applyErrSink struct {
+	replicaSink
+	err error
+}
+
+func (s applyErrSink) Apply(ps uint32, fr []wal.Frame) error { return s.err }
 
 func startEngine(t *testing.T, dbPath string) (*Engine, *replay.Replica, context.CancelFunc, chan error) {
 	t.Helper()
@@ -175,7 +188,16 @@ func TestEngineTakeoverUnderConcurrentWrites(t *testing.T) {
 	insert(60)
 	time.Sleep(300 * time.Millisecond)
 	insert(8)
-	time.Sleep(300 * time.Millisecond) // let the takeover fire and settle
+	// Let the takeover fire and settle. Generous relative to the ~10ms poll
+	// interval: under concurrent system load (e.g. the full suite's other
+	// packages running in parallel, or this repo's continuous-write stress
+	// test churning CPU/subprocesses elsewhere), a per-transaction fsync
+	// inside drain's SaveState can push a single poll's catch-up well past a
+	// tight margin — empirically, 300ms was occasionally too little,
+	// producing a benign (safe, just non-optimal) extra rebase when phase 2's
+	// writes below landed before takeover's checkpoint got a chance to run;
+	// see drain's doc comment in engine.go for the full mechanism.
+	time.Sleep(2 * time.Second)
 
 	// Phase 2: writes CONTINUE after takeover — this is what forces the
 	// WAL's deferred (lazy) restart to actually land. Stay under the next
@@ -246,8 +268,11 @@ func TestEngineTakeoverExpectedRestartIsNotRebase(t *testing.T) {
 
 	// Let the poll loop notice captured >= 64 and run takeover against the
 	// now-quiet WAL: checkpoint(RESTART)'s log count should equal exactly
-	// what we'd already consumed, taking the verified-clean path.
-	time.Sleep(300 * time.Millisecond)
+	// what we'd already consumed, taking the verified-clean path. Generous
+	// relative to the ~10ms poll interval for the same reason as the
+	// analogous wait in TestEngineTakeoverUnderConcurrentWrites above — see
+	// that comment.
+	time.Sleep(2 * time.Second)
 
 	// A few more commits force SQLite to actually rewrite the WAL header
 	// with new salts (the lazy part of RESTART), which is what makes the
@@ -625,5 +650,137 @@ func TestEngineSurvivesForeignPassiveCheckpoint(t *testing.T) {
 	waitEqual(t, src, rep, 10*time.Second)
 	if e.Rebased() != 1 {
 		t.Errorf("passive checkpoints must not force rebase; rebased = %d", e.Rebased())
+	}
+}
+
+// TestDrainNowCapturesPendingTransaction is the DrainNow happy-path test:
+// with Poll set long enough that background ticking cannot be what captures
+// the write, a single DrainNow call must itself drive the poll that applies
+// a pending transaction to the Sink, and a second DrainNow with nothing left
+// pending must return quickly (it should not block for anywhere near Poll).
+func TestDrainNowCapturesPendingTransaction(t *testing.T) {
+	if _, err := exec.LookPath("sqlite3"); err != nil {
+		t.Skip("sqlite3 CLI not on PATH")
+	}
+	dir := t.TempDir()
+	src := filepath.Join(dir, "src.db")
+	if out, err := exec.Command("sqlite3", src,
+		"PRAGMA journal_mode=WAL; CREATE TABLE t (id INTEGER PRIMARY KEY, v BLOB);").CombinedOutput(); err != nil {
+		t.Fatalf("init: %v: %s", err, out)
+	}
+
+	rep := replay.New(filepath.Join(dir, "replica.db"))
+	var applyCount int32
+	e := NewEngine(Options{
+		DBPath:   src,
+		StateDir: dir,
+		Sink:     countingSink{replicaSink{rep}, &applyCount},
+		Poll:     time.Hour, // long enough that only DrainNow can trigger a poll here
+	})
+	ctx, cancel := context.WithCancel(context.Background())
+	done := make(chan error, 1)
+	go func() { done <- e.Run(ctx) }()
+	defer func() { cancel(); <-done }()
+
+	// Let the engine's initial rebase (checkpoint + snapshot + reader bind)
+	// finish before writing — same ordering every other test in this file
+	// relies on.
+	time.Sleep(300 * time.Millisecond)
+
+	if out, err := exec.Command("sqlite3", src,
+		"PRAGMA busy_timeout=5000; INSERT INTO t (v) VALUES (randomblob(64));").CombinedOutput(); err != nil {
+		t.Fatalf("insert: %v: %s", err, out)
+	}
+
+	dctx, dcancel := context.WithTimeout(context.Background(), 10*time.Second)
+	defer dcancel()
+	if err := e.DrainNow(dctx); err != nil {
+		t.Fatalf("DrainNow() = %v, want nil", err)
+	}
+	if got := atomic.LoadInt32(&applyCount); got != 1 {
+		t.Fatalf("DrainNow did not capture the pending transaction: Apply called %d time(s), want 1", got)
+	}
+	waitEqual(t, src, rep, 2*time.Second)
+
+	// A second DrainNow with nothing pending must return quickly — nowhere
+	// near the 1h Poll interval — since there's no ticker to fall back on
+	// within this test's timeframe.
+	start := time.Now()
+	dctx2, dcancel2 := context.WithTimeout(context.Background(), 10*time.Second)
+	defer dcancel2()
+	if err := e.DrainNow(dctx2); err != nil {
+		t.Fatalf("second DrainNow() = %v, want nil", err)
+	}
+	if elapsed := time.Since(start); elapsed > 2*time.Second {
+		t.Fatalf("second DrainNow (nothing pending) took %s, want quick", elapsed)
+	}
+	if got := atomic.LoadInt32(&applyCount); got != 1 {
+		t.Fatalf("second DrainNow applied something with nothing pending: Apply called %d time(s), want still 1", got)
+	}
+}
+
+// TestDrainNowFatalErrorStopsRun is the regression test for the review
+// finding that Run's reqs branch swallowed a fatal pollOnce error: DrainNow
+// got it back, but Run just kept looping as if nothing had happened, so
+// Session.Err() would keep reporting healthy while capture was actually
+// dead. Poll is set to an hour so only DrainNow can trigger a poll within
+// this test, and the Sink's Apply always fails, so the write below can only
+// be discovered — and only fail — via the DrainNow call.
+//
+// Verified to fail against the pre-fix engine.go: DrainNow returned the
+// injected error correctly (that part was never broken), but Run's done
+// channel did not deliver anything within the 5s wait — Run kept running
+// the ticker loop instead of stopping, exactly the swallowed-error bug this
+// test exists to catch. See task-6-report.md for the captured failure
+// output.
+func TestDrainNowFatalErrorStopsRun(t *testing.T) {
+	if _, err := exec.LookPath("sqlite3"); err != nil {
+		t.Skip("sqlite3 CLI not on PATH")
+	}
+	dir := t.TempDir()
+	src := filepath.Join(dir, "src.db")
+	if out, err := exec.Command("sqlite3", src,
+		"PRAGMA journal_mode=WAL; CREATE TABLE t (id INTEGER PRIMARY KEY, v BLOB);").CombinedOutput(); err != nil {
+		t.Fatalf("init: %v: %s", err, out)
+	}
+
+	rep := replay.New(filepath.Join(dir, "replica.db"))
+	wantErr := errors.New("applyErrSink: refusing to apply")
+	e := NewEngine(Options{
+		DBPath:   src,
+		StateDir: dir,
+		Sink:     applyErrSink{replicaSink{rep}, wantErr},
+		Poll:     time.Hour, // long enough that only DrainNow can trigger a poll here
+	})
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	done := make(chan error, 1)
+	go func() { done <- e.Run(ctx) }()
+
+	// Let the engine's initial rebase finish (Rebase succeeds; only Apply is
+	// rigged to fail) before writing.
+	time.Sleep(300 * time.Millisecond)
+
+	if out, err := exec.Command("sqlite3", src,
+		"PRAGMA busy_timeout=5000; INSERT INTO t (v) VALUES (randomblob(64));").CombinedOutput(); err != nil {
+		t.Fatalf("insert: %v: %s", err, out)
+	}
+
+	dctx, dcancel := context.WithTimeout(context.Background(), 10*time.Second)
+	defer dcancel()
+	gotErr := e.DrainNow(dctx)
+	if !errors.Is(gotErr, wantErr) {
+		t.Fatalf("DrainNow() = %v, want %v", gotErr, wantErr)
+	}
+
+	// Run must stop promptly on its own, carrying the same fatal error —
+	// not just eventually via the deferred ctx cancel below.
+	select {
+	case runErr := <-done:
+		if !errors.Is(runErr, wantErr) {
+			t.Fatalf("Run() returned %v, want %v", runErr, wantErr)
+		}
+	case <-time.After(5 * time.Second):
+		t.Fatal("Run did not stop after DrainNow's fatal error — fatal error was swallowed")
 	}
 }

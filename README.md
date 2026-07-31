@@ -87,5 +87,33 @@ from the clock.
 long-running process renews it. It exists for inspection and for breaking a
 stuck lease.
 
+## Daemon mode
+
+At rest, every offshoot command opens the store, does its work, and exits — so
+a checkpoint has to quiesce the database. The daemon removes that constraint:
+it holds the branch under lease and captures every committed transaction while
+your agent keeps writing.
+
+    offshoot serve &                       # holds leases, captures continuously
+    sleep 1                                # let the listener come up
+    P=$(offshoot session open app)         # capture the checkout path once
+    sqlite3 "$P" "CREATE TABLE t (v); INSERT INTO t VALUES ('agent wrote this');"
+    offshoot session flush app v1          # durable in the store, writer never paused
+    offshoot session status                # durable txid per session
+    offshoot session close app             # releases the lease
+
+**Durability is explicit.** Between flushes, writes are committed to SQLite but
+not yet in the store; `session status` reports the txid each session is durable
+through. A session that loses its lease is fenced and stops — it will not write
+under a dead epoch — and `session status` shows the error.
+
+The daemon serves a unix socket (mode 0600) under your cache directory, one per
+store; override with `OFFSHOOT_SOCKET`, or pass `-socket PATH` to `offshoot
+serve`. If you use `-socket PATH` on `serve`, pass the same `-socket PATH` to
+every `offshoot session ...` command too (or export `OFFSHOOT_SOCKET`
+instead) — the CLI has no other way to find a non-default socket. Daemon and
+agent must share a kernel and a local filesystem: the checkout is a real
+SQLite file both processes open.
+
 Design: docs/superpowers/specs/2026-07-29-offshoot-design.md
 Capture-spike evidence: docs/superpowers/specs/2026-07-29-offshoot-spike-report.md
