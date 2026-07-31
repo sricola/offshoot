@@ -89,13 +89,28 @@ type Engine struct {
 	// continuity loss. See takeover() and Run()'s wal.ErrWALRestarted
 	// handling.
 	expectRestart bool
+
+	// reqs carries DrainNow requests into Run's select loop, so an immediate
+	// catch-up poll is serviced by the same goroutine that owns e.reader and
+	// e.conn — never concurrently with the ticker-driven path. See DrainNow
+	// and pollOnce.
+	reqs chan drainRequest
+	// done is closed once, when Run returns, so a DrainNow call racing the
+	// engine's own shutdown does not block forever with nobody left to
+	// service e.reqs.
+	done chan struct{}
 }
+
+// drainRequest is one DrainNow call's handoff to Run's loop: done carries
+// back pollOnce's result (nil on an ordinary successful catch-up, or the
+// same fatal error Run itself would return and stop on).
+type drainRequest struct{ done chan error }
 
 func NewEngine(o Options) *Engine {
 	if o.Poll == 0 {
 		o.Poll = 10 * time.Millisecond
 	}
-	return &Engine{o: o}
+	return &Engine{o: o, reqs: make(chan drainRequest), done: make(chan struct{})}
 }
 
 // Rebased reports how many times this Engine instance rebased. This
@@ -121,10 +136,49 @@ func (e *Engine) Resumed() bool { return e.resumed.Load() }
 func (e *Engine) statePath() string    { return filepath.Join(e.o.StateDir, "capture-state.json") }
 func (e *Engine) snapshotPath() string { return filepath.Join(e.o.StateDir, "snapshot.db") }
 
+// DrainNow requests an immediate, out-of-band poll and blocks until it has
+// been serviced: every transaction already committed to the checkout's WAL
+// as of the moment this call is issued is captured (applied to the Sink)
+// before it returns, instead of waiting for the next tick of Engine.Poll
+// (default 10ms). This is the guarantee Session.Flush needs: without it,
+// Flush would encode whatever the replica happens to hold at that instant,
+// which can lag a write a caller just committed to the checkout by up to
+// one poll interval — Flush would then advance the branch head to
+// reference a snapshot that silently omits it, while still reporting
+// success.
+//
+// The request is handed to Run's own select loop (see pollOnce), so it is
+// serviced by the single goroutine that owns e.reader/e.conn — never
+// concurrently with the regular ticker path. If ctx is cancelled first, or
+// the engine has already stopped (Run returned, e.done closed) with
+// nothing left to service the request, DrainNow returns promptly rather
+// than blocking forever; a caller that needs to know about a terminal
+// engine failure should check that some other way (Session.Err), not
+// through DrainNow's return value in that case.
+func (e *Engine) DrainNow(ctx context.Context) error {
+	req := drainRequest{done: make(chan error, 1)}
+	select {
+	case e.reqs <- req:
+	case <-ctx.Done():
+		return ctx.Err()
+	case <-e.done:
+		return nil
+	}
+	select {
+	case err := <-req.done:
+		return err
+	case <-ctx.Done():
+		return ctx.Err()
+	case <-e.done:
+		return nil
+	}
+}
+
 // Run blocks, capturing until ctx is cancelled. It performs the initial
 // rebase (checkpoint + snapshot copy), holds the read-lock dance, polls for
 // committed transactions, and periodically performs checkpoint takeover.
 func (e *Engine) Run(ctx context.Context) error {
+	defer close(e.done)
 	var err error
 	e.db, err = sql.Open("sqlite3",
 		e.o.DBPath+"?_busy_timeout=5000&_journal_mode=WAL")
@@ -160,48 +214,68 @@ func (e *Engine) Run(ctx context.Context) error {
 		case <-ctx.Done():
 			e.shutdown()
 			return nil
+		case req := <-e.reqs:
+			// Service a DrainNow caller's request inline, immediately,
+			// instead of waiting for the next tick — that's the entire
+			// point of DrainNow. Serviced by this same goroutine via
+			// pollOnce, so it can never run concurrently with the
+			// tick-driven path below.
+			req.done <- e.pollOnce(ctx, &idle)
+			continue
 		case <-tick.C:
 		}
-		n, err := e.drain(ctx)
-		if err == wal.ErrWALRestarted {
-			if e.expectRestart {
-				// The WAL's lazy reset (armed by our own verified-clean
-				// takeover) has now physically landed: a new WAL generation
-				// with fresh salts. Our replica already reflects every frame
-				// up to the restart point, so the new generation's frames
-				// apply cleanly on top — this is a continuation, not lost
-				// continuity. No rebase, no snapshot, not counted.
-				e.expectRestart = false
-				e.reader = wal.NewReader(e.o.DBPath + "-wal")
-				e.captured = 0
-				continue
-			}
-			// Our lock lapsed (or an external RESTART happened) without a
-			// preceding verified-clean takeover: continuity lost —
-			// detected. Re-establish from a fresh snapshot.
-			if err := e.rebase(ctx); err != nil {
-				return err
-			}
-			continue
-		}
-		if err != nil {
+		if err := e.pollOnce(ctx, &idle); err != nil {
 			return err
 		}
-		if n > 0 {
-			idle = time.Now()
-			e.captured += n
+	}
+}
+
+// pollOnce runs one capture pass: drain whatever's currently available,
+// handle a WAL restart (continuation or rebase) exactly as Run's loop
+// always has, and perform checkpoint takeover once enough has accumulated.
+// It is called both from Run's regular ticker path and, via DrainNow, on
+// demand — factored out so both paths share identical behavior and neither
+// can run concurrently with the other (both execute on Run's own
+// goroutine). idle is Run's loop-local idle timestamp, threaded through by
+// pointer so pollOnce can update it exactly as the inline code used to.
+func (e *Engine) pollOnce(ctx context.Context, idle *time.Time) error {
+	n, err := e.drain(ctx)
+	if err == wal.ErrWALRestarted {
+		if e.expectRestart {
+			// The WAL's lazy reset (armed by our own verified-clean
+			// takeover) has now physically landed: a new WAL generation
+			// with fresh salts. Our replica already reflects every frame
+			// up to the restart point, so the new generation's frames
+			// apply cleanly on top — this is a continuation, not lost
+			// continuity. No rebase, no snapshot, not counted.
+			e.expectRestart = false
+			e.reader = wal.NewReader(e.o.DBPath + "-wal")
+			e.captured = 0
+			return nil
 		}
-		if e.captured >= 64 || (e.captured > 0 && time.Since(idle) > 5*time.Second) {
-			if err := e.takeover(ctx); err != nil {
-				if ctx.Err() != nil {
-					// Shutting down: let the ctx.Done() branch above
-					// perform the final drain/endRead and return nil.
-					continue
-				}
-				return err
+		// Our lock lapsed (or an external RESTART happened) without a
+		// preceding verified-clean takeover: continuity lost —
+		// detected. Re-establish from a fresh snapshot.
+		return e.rebase(ctx)
+	}
+	if err != nil {
+		return err
+	}
+	if n > 0 {
+		*idle = time.Now()
+		e.captured += n
+	}
+	if e.captured >= 64 || (e.captured > 0 && time.Since(*idle) > 5*time.Second) {
+		if err := e.takeover(ctx); err != nil {
+			if ctx.Err() != nil {
+				// Shutting down: let Run's ctx.Done() branch perform the
+				// final drain/endRead and return nil.
+				return nil
 			}
+			return err
 		}
 	}
+	return nil
 }
 
 // shutdown runs on the ctx.Done() path. It drains whatever's still pending,

@@ -2,8 +2,10 @@ package session
 
 import (
 	"bytes"
+	"context"
 	"errors"
 	"fmt"
+	"time"
 
 	"github.com/offshoot-db/offshoot/internal/ltxio"
 	"github.com/offshoot-db/offshoot/internal/store"
@@ -22,8 +24,10 @@ var ErrFenced = errors.New("session: fenced — lease lost")
 // lets a name collision fail fast with a clear message instead of surfacing
 // as an opaque ref-CAS retry.
 //
-// Flush never touches the agent's checkout: it encodes the replica, which the
-// capture engine keeps at a transaction boundary.
+// Flush never touches the agent's checkout directly: it asks the capture
+// engine to catch up to whatever is currently committed there (see
+// capture.Engine.DrainNow) and then encodes the replica, which the capture
+// engine keeps at a transaction boundary.
 //
 // The whole call runs under flushMu, so concurrent Flush calls on the same
 // Session are serialized rather than racing to compute and write the same
@@ -41,6 +45,21 @@ func (s *Session) Flush(name string) (uint64, error) {
 			return 0, err
 		}
 	}
+
+	// Catch the replica up to whatever is already committed in the checkout
+	// before encoding it. Without this, the capture engine's own poll
+	// interval (default 10ms) can leave the replica lagging a write the
+	// caller already committed to the checkout: Flush would then encode a
+	// stale replica, advance the branch head to reference a snapshot that
+	// silently omits that write, and still report success. See
+	// capture.Engine.DrainNow's doc comment.
+	dctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	err := s.captured.DrainNow(dctx)
+	cancel()
+	if err != nil {
+		return 0, fmt.Errorf("session: catch up before flush: %w", err)
+	}
+
 	lease := s.Lease()
 	st := s.ws.Store
 
