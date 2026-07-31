@@ -9,6 +9,7 @@ import (
 	"crypto/sha256"
 	"database/sql"
 	"encoding/hex"
+	"encoding/json"
 	"errors"
 	"fmt"
 	"io"
@@ -169,42 +170,75 @@ func (w *Workspace) Checkout(db, branch string) (string, error) {
 	if err := w.materialize(ref, ref.HeadTXID, path); err != nil {
 		return "", err
 	}
-	if err := writeSum(path); err != nil {
+	if err := writeSum(path, ref.Lineage, ref.HeadTXID); err != nil {
 		return "", err
 	}
 	return path, nil
 }
 
-// writeSum computes the hex SHA-256 of the file at path and writes it to
+// sumRecord is the on-disk shape of a checkout's .sum sidecar: a content hash
+// plus the ref identity (lineage + txid) the checkout embodied at the moment
+// the sidecar was written. Recording identity (not just a bare hash) is what
+// lets checkoutState tell apart a checkout with local edits from one whose
+// branch ref moved out from under it without a refresh.
+type sumRecord struct {
+	Hash    string `json:"hash"`
+	Lineage string `json:"lineage"`
+	TXID    uint64 `json:"txid"`
+}
+
+// writeSum computes the hex SHA-256 of the file at path and writes it, along
+// with the (lineage, txid) ref identity the checkout currently embodies, to
 // path + ".sum". This is the checkout fingerprint: it records what the
-// checkout file looked like at the moment it was last known to equal a
-// committed state (fresh materialize, or a successful checkpoint encode).
-func writeSum(path string) error {
+// checkout file looked like, and which branch state it was, at the moment it
+// was last known to equal a committed state (fresh materialize, a successful
+// checkpoint encode, or a post-repoint refresh).
+func writeSum(path string, lineage string, txid uint64) error {
 	sum, err := fileSum(path)
 	if err != nil {
 		return err
 	}
-	return os.WriteFile(path+".sum", []byte(sum), 0o644)
+	data, err := json.Marshal(sumRecord{Hash: sum, Lineage: lineage, TXID: txid})
+	if err != nil {
+		return err
+	}
+	return os.WriteFile(path+".sum", data, 0o644)
 }
 
-// sumMatches reports whether the file at path still matches its recorded
-// .sum fingerprint. A missing .sum file means unknown provenance (e.g. a
-// checkout materialized before this fingerprint existed, or a manually
-// dropped-in file) and is treated as a match so callers don't warn
-// spuriously.
-func sumMatches(path string) (bool, error) {
-	want, err := os.ReadFile(path + ".sum")
+// checkoutState reports how the checkout at path relates to ref:
+//
+//   - "clean": the sidecar's recorded identity (lineage, txid) matches ref,
+//     and the file's content still matches the recorded hash.
+//   - "modified": the sidecar's recorded identity matches ref, but the
+//     file's content has changed since it was last fingerprinted — local,
+//     un-checkpointed edits.
+//   - "stale": the sidecar's recorded identity no longer matches ref — the
+//     branch was repointed (rollback/promote with a skipped refresh) since
+//     this checkout was last materialized or checkpointed.
+//   - "unknown": no sidecar, or one that isn't a valid current-format
+//     record (including legacy bare-hash sidecars predating this fix, and
+//     corrupt files). Provenance can't be determined, so callers should
+//     stay silent rather than warn spuriously.
+func checkoutState(path string, ref store.Ref) string {
+	raw, err := os.ReadFile(path + ".sum")
 	if err != nil {
-		if os.IsNotExist(err) {
-			return true, nil
-		}
-		return false, err
+		return "unknown"
+	}
+	var rec sumRecord
+	if err := json.Unmarshal(raw, &rec); err != nil || rec.Hash == "" {
+		return "unknown"
+	}
+	if rec.Lineage != ref.Lineage || rec.TXID != ref.HeadTXID {
+		return "stale"
 	}
 	got, err := fileSum(path)
 	if err != nil {
-		return false, err
+		return "unknown"
 	}
-	return string(want) == got, nil
+	if got != rec.Hash {
+		return "modified"
+	}
+	return "clean"
 }
 
 func fileSum(path string) (string, error) {
@@ -274,12 +308,6 @@ func (w *Workspace) Checkpoint(db, branch, name string) (uint64, error) {
 	if err := ltxio.EncodeSnapshot(path, txid, &buf); err != nil {
 		return 0, err
 	}
-	// The checkout now equals the state being committed (quiesce merged the
-	// WAL, encode captured it): refresh the fingerprint so a later Fork
-	// doesn't see stale writes as un-checkpointed.
-	if err := writeSum(path); err != nil {
-		return 0, err
-	}
 	snapKey := store.SnapshotKey(ref.Lineage, ref.Epoch, txid)
 	if _, err := w.Store.B.PutIf(snapKey, buf.Bytes(), ""); err != nil {
 		if !errors.Is(err, store.ErrCAS) {
@@ -310,6 +338,15 @@ func (w *Workspace) Checkpoint(db, branch, name string) (uint64, error) {
 		}
 		return 0, fmt.Errorf("ops: ref update for checkpoint %q on %s@%s: %w", name, db, branch, err)
 	}
+	// The ref CAS is the point of no return: only now does the checkout truly
+	// equal committed state (lineage unchanged, head advanced to txid).
+	// Writing the sidecar here, after the CAS, means an interrupt between the
+	// encode above and this point leaves the OLD sidecar in place — which
+	// still correctly describes the checkout's actual (pre-checkpoint)
+	// identity, rather than claiming a commit that never landed.
+	if err := writeSum(path, ref.Lineage, txid); err != nil {
+		return 0, fmt.Errorf("ops: checkpoint %q committed (txid %d), but the checkout fingerprint could not be refreshed: %w", name, txid, err)
+	}
 	return txid, nil
 }
 
@@ -330,25 +367,28 @@ func quiesce(path string) error {
 	return nil
 }
 
-// warnIfUncheckpointed checks db@branch's checkout (if one exists) for
-// un-checkpointed changes and, if any are found, prints a warning to
-// os.Stderr noting that the caller (Fork) is proceeding from the last
-// committed state at headTXID. It never fails the caller's operation: any
-// error along the way is treated as "nothing to warn about".
-func (w *Workspace) warnIfUncheckpointed(db, branch string, headTXID uint64) {
+// warnIfUncheckpointed checks db@branch's checkout (if one exists) against
+// ref and, if it diverges, prints a warning to os.Stderr explaining what the
+// caller (Fork) is about to do about it: proceed from ref.HeadTXID either
+// way. It never fails the caller's operation: any error along the way is
+// treated as "nothing to warn about". ref is the same ref the caller already
+// fetched to decide the fork point, so this reuses it rather than issuing a
+// second (potentially inconsistent) GetRef.
+func (w *Workspace) warnIfUncheckpointed(db, branch string, ref store.Ref) {
 	path := w.CheckoutPath(db, branch)
 	if _, err := os.Stat(path); err != nil {
 		return
 	}
 	if err := quiesce(path); err != nil {
-		fmt.Fprintf(os.Stderr, "offshoot: warning: checkout of %s@%s is busy; forking last committed state (txid %d)\n", db, branch, headTXID)
+		fmt.Fprintf(os.Stderr, "offshoot: warning: checkout of %s@%s is busy; forking last committed state (txid %d)\n", db, branch, ref.HeadTXID)
 		return
 	}
-	match, err := sumMatches(path)
-	if err != nil || match {
-		return
+	switch checkoutState(path, ref) {
+	case "modified":
+		fmt.Fprintf(os.Stderr, "offshoot: warning: checkout of %s@%s has un-checkpointed changes; forking last committed state (txid %d)\n", db, branch, ref.HeadTXID)
+	case "stale":
+		fmt.Fprintf(os.Stderr, "offshoot: warning: checkout of %s@%s is stale (branch was repointed since it was materialized); forking branch head (txid %d) — run 'offshoot checkout' to refresh\n", db, branch, ref.HeadTXID)
 	}
-	fmt.Fprintf(os.Stderr, "offshoot: warning: checkout of %s@%s has un-checkpointed changes; forking last committed state (txid %d)\n", db, branch, headTXID)
 }
 
 // copySnapshotToNewLineage copies the snapshot at (src.Lineage, src.Epoch,
@@ -384,7 +424,7 @@ func (w *Workspace) Fork(db, srcBranch, newBranch, at string) (uint64, error) {
 		}
 		txid = t
 	} else {
-		w.warnIfUncheckpointed(db, srcBranch, txid)
+		w.warnIfUncheckpointed(db, srcBranch, src)
 	}
 	// Materialized fork point: copy the source snapshot into the child's own
 	// lineage so the child never references parent storage.
@@ -462,9 +502,10 @@ func (w *Workspace) Rollback(db, branch, to string) (string, error) {
 		if err := w.materialize(next, txid, path); err != nil {
 			return err
 		}
-		// The checkout now equals committed state: refresh the fingerprint so
-		// a later Fork doesn't spuriously warn about "un-checkpointed changes".
-		return writeSum(path)
+		// The checkout now equals committed state: refresh the fingerprint
+		// (identity too, since this repointed to a new lineage) so a later
+		// Fork sees it as clean rather than stale.
+		return writeSum(path, next.Lineage, txid)
 	}
 	if err := refresh(); err != nil {
 		return "", fmt.Errorf("ops: branch repointed to checkpoint %q (txid %d), but the checkout could not be refreshed (run 'offshoot checkout' to re-materialize): %w", to, txid, err)
@@ -519,9 +560,10 @@ func (w *Workspace) Promote(db, source, target string, force bool) (uint64, erro
 		if err := w.materialize(next, txid, path); err != nil {
 			return txid, fmt.Errorf("ops: promoted, but checkout %s could not be refreshed: %w", path, err)
 		}
-		// The checkout now equals committed state: refresh the fingerprint so
-		// a later Fork doesn't spuriously warn about "un-checkpointed changes".
-		if err := writeSum(path); err != nil {
+		// The checkout now equals committed state: refresh the fingerprint
+		// (identity too, since this repointed to a new lineage) so a later
+		// Fork sees it as clean rather than stale.
+		if err := writeSum(path, next.Lineage, txid); err != nil {
 			return txid, fmt.Errorf("ops: promoted, but checkout %s could not be refreshed: %w", path, err)
 		}
 	}
