@@ -88,6 +88,16 @@ type Session struct {
 	engDone  chan struct{}
 	captured *capture.Engine
 
+	// renewDone mirrors engDone: closed exactly once, by renewLoop itself
+	// after its loop exits (ctx cancelled, or a terminal renewal failure
+	// called fail(), which itself cancels ctx). Close joins this before
+	// releasing the lease so a straggler renewal — one that had already
+	// fired its ticker case in the same instant Close cancelled ctx — cannot
+	// run after the lease is released, observe the resulting holder
+	// mismatch, and mark a cleanly-closed session as fenced. See Close's
+	// comment for the required shutdown order.
+	renewDone chan struct{}
+
 	// replicaMu serializes writes to the replica file (capture's Rebase and
 	// Apply, via replicaSink) against Flush's read of that same file, so
 	// Flush never encodes a torn mix of pre- and post-mutation bytes. See
@@ -181,6 +191,7 @@ func Open(ctx context.Context, o Options) (*Session, error) {
 		DBPath: checkoutPath, StateDir: dir, Sink: replicaSink{s.replica, &s.replicaMu},
 	})
 	s.engDone = make(chan struct{})
+	s.renewDone = make(chan struct{})
 	go s.runEngine(cctx)
 	go s.renewLoop(cctx, o.RenewEvery, o.LeaseTTL)
 	return s, nil
@@ -229,6 +240,14 @@ func (s *Session) Err() error {
 
 // Close stops capture, releases the lease, and removes the scratch dir. It is
 // safe to call twice.
+//
+// Shutdown order matters: cancel the context, join the capture goroutine,
+// THEN join the renewal goroutine, THEN release the lease, THEN remove the
+// scratch dir. Joining renewLoop before ReleaseLease is what closes the race
+// where a renewal tick fires in the same instant Close cancels ctx: without
+// the join, that straggler could run after the lease is released, see the
+// holder cleared out from under it, and call fail(ErrFenced) — marking a
+// cleanly-closed session as fenced even though nothing actually went wrong.
 func (s *Session) Close() error {
 	s.mu.Lock()
 	if s.closed {
@@ -241,6 +260,7 @@ func (s *Session) Close() error {
 
 	s.cancel()
 	<-s.engDone
+	<-s.renewDone
 
 	var relErr error
 	if err := s.ws.ReleaseLease(lease); err != nil && !errors.Is(err, store.ErrLeaseLost) {
