@@ -27,7 +27,17 @@ func newServer(t *testing.T) (*Server, *ops.Workspace) {
 	if err := w.Create("app"); err != nil {
 		t.Fatal(err)
 	}
-	srv, err := NewServer(w, filepath.Join(dir, "sock"))
+	// The socket path lives in its own short-named temp dir, independent of
+	// t.TempDir() (which nests under the test's, and any subtest's, full
+	// name): unix domain socket paths are capped at ~104-108 bytes on
+	// several platforms (notably macOS), and a t.TempDir() path can exceed
+	// that once the test name is long.
+	sockDir, err := os.MkdirTemp("", "offshoot-daemon-test-*")
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { os.RemoveAll(sockDir) })
+	srv, err := NewServer(w, filepath.Join(sockDir, "sock"))
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -155,5 +165,114 @@ func TestShutdownReleasesEveryLease(t *testing.T) {
 	}
 	if _, err := os.Stat(srv.SocketPath()); !os.IsNotExist(err) {
 		t.Fatalf("shutdown must remove the socket, stat err = %v", err)
+	}
+}
+
+// rawCall is like call but reports errors to the caller instead of failing
+// the test directly, so it is safe to use from a goroutine other than the
+// test's own (t.Fatal et al. must only be called from the test goroutine).
+func rawCall(sock string, req Request) (Response, error) {
+	c, err := net.Dial("unix", sock)
+	if err != nil {
+		return Response{}, err
+	}
+	defer c.Close()
+	if err := json.NewEncoder(c).Encode(req); err != nil {
+		return Response{}, err
+	}
+	var resp Response
+	if err := json.NewDecoder(bufio.NewReader(c)).Decode(&resp); err != nil {
+		return Response{}, err
+	}
+	return resp, nil
+}
+
+// TestShutdownDuringInFlightOpenLeavesNoLease exercises the fix for a race
+// where Shutdown's drain loop used to delete every map entry, including a
+// nil placeholder reserved by an opOpen still running session.Open. That let
+// Shutdown return (and remove the socket) while a lease acquisition and a
+// capture-engine startup were still in progress, unsupervised: if the
+// process exited right after Shutdown returned, that lease would leak for
+// real; even if it didn't, a second opOpen for the same branch could reuse
+// the wiped key and start a second, concurrent session.Open against the same
+// checkout file.
+//
+// Reproducing the original interleaving through real socket timing is not
+// reliable (session.Open on a fresh temp dir is typically fast enough that
+// Shutdown racing it is a narrow, flaky window). Instead this test uses the
+// package-level openDelay hook to deterministically hold an open in flight
+// — reserved in the map, blocked before session.Open runs — and starts
+// Shutdown while it is stuck there. The core assertion is timing-based but
+// coarse and reliable: with the fix, Shutdown must not return while that
+// open is still held open by the hook (it is blocked on s.openWG.Wait), so a
+// generous grace period with nothing arriving on shutdownDone is a reliable
+// negative signal. Pre-fix, Shutdown drains and returns almost immediately
+// regardless of the in-flight open, so this assertion fails reliably against
+// the old code (verified by re-running this test against a checkout of the
+// pre-fix server.go: it fails on the first iteration, Shutdown returning in
+// well under a millisecond instead of waiting).
+func TestShutdownDuringInFlightOpenLeavesNoLease(t *testing.T) {
+	for i := 0; i < 5; i++ {
+		srv, w := newServer(t)
+		sock := srv.SocketPath()
+
+		entered := make(chan struct{})
+		proceed := make(chan struct{})
+		openDelay = func() {
+			close(entered)
+			<-proceed
+		}
+
+		openDone := make(chan struct{})
+		go func() {
+			defer close(openDone)
+			rawCall(sock, Request{Op: "open", DB: "app", Branch: "main"})
+		}()
+		<-entered // opOpen has reserved app@main and is blocked before session.Open
+
+		shutdownDone := make(chan error, 1)
+		go func() {
+			ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+			defer cancel()
+			shutdownDone <- srv.Shutdown(ctx)
+		}()
+
+		select {
+		case <-shutdownDone:
+			openDelay = nil
+			close(proceed)
+			<-openDone
+			t.Fatalf("iteration %d: Shutdown returned while an open was still in flight for the same branch", i)
+		case <-time.After(200 * time.Millisecond):
+			// Expected: Shutdown is waiting on the in-flight open.
+		}
+
+		openDelay = nil
+		close(proceed) // let the blocked open finish
+		<-openDone
+
+		select {
+		case err := <-shutdownDone:
+			if err != nil {
+				t.Fatalf("iteration %d: shutdown = %v", i, err)
+			}
+		case <-time.After(10 * time.Second):
+			t.Fatalf("iteration %d: shutdown did not return after the in-flight open resolved", i)
+		}
+
+		ref, _, err := w.Store.GetRef("app", "main")
+		if err != nil {
+			t.Fatal(err)
+		}
+		if ref.LeaseHolder != "" {
+			t.Fatalf("iteration %d: lease leaked, holder = %q", i, ref.LeaseHolder)
+		}
+
+		srv.mu.Lock()
+		n := len(srv.sessions)
+		srv.mu.Unlock()
+		if n != 0 {
+			t.Fatalf("iteration %d: %d session(s) still tracked after shutdown", i, n)
+		}
 	}
 }
