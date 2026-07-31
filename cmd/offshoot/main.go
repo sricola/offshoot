@@ -33,11 +33,15 @@ Usage:
   offshoot lease acquire <db>[@branch] [--ttl 30s]   claim or renew a lease
   offshoot lease release <db>[@branch]      release a lease
   offshoot serve [-socket PATH]             run the daemon until SIGINT/SIGTERM
-  offshoot session open <db>[@branch]       open a session; prints the checkout path
-  offshoot session flush <db>[@branch] [name]   flush to a durable snapshot; prints the txid
-  offshoot session status                   list open sessions and their durable txid
-  offshoot session close <db>[@branch]      close a session, releasing its lease
-  offshoot session shutdown                 ask the daemon to shut down gracefully
+  offshoot session open <db>[@branch] [-socket PATH]      open a session; prints the checkout path
+  offshoot session flush <db>[@branch] [name] [-socket PATH]   flush to a durable snapshot; prints the txid
+  offshoot session status [-socket PATH]                  list open sessions and their durable txid
+  offshoot session close <db>[@branch] [-socket PATH]     close a session, releasing its lease
+  offshoot session shutdown [-socket PATH]                ask the daemon to shut down gracefully
+
+  -socket PATH on a session subcommand must match the -socket PATH (if any)
+  given to the serve that's running, or OFFSHOOT_SOCKET; otherwise it is
+  derived from the store spec the same way on both sides.
 
 Store location: -store SPEC or OFFSHOOT_STORE, default ./.offshoot
   SPEC is a directory path, file:///abs/path, or s3://bucket/prefix
@@ -61,6 +65,26 @@ func storeSpec(args []string) (string, []string) {
 		out = append(out, args[i])
 	}
 	return spec, out
+}
+
+// socketOverride extracts a "-socket PATH" flag from args (in any position),
+// mirroring storeSpec's parsing so -store and -socket compose the same way.
+// It returns the socket path (empty if none was given) and the remaining
+// args with that flag removed. `serve` and `session` share this so that a
+// daemon started with `-socket PATH` and the `session` subcommands that talk
+// to it always agree on where the socket is.
+func socketOverride(args []string) (string, []string) {
+	sock := ""
+	out := args[:0]
+	for i := 0; i < len(args); i++ {
+		if args[i] == "-socket" && i+1 < len(args) {
+			sock = args[i+1]
+			i++
+			continue
+		}
+		out = append(out, args[i])
+	}
+	return sock, out
 }
 
 func main() {
@@ -310,10 +334,8 @@ func run(args []string) error {
 			return fmt.Errorf("unknown lease subcommand %q", rest[0])
 		}
 	case "serve":
-		sock := ""
-		if len(rest) == 2 && rest[0] == "-socket" {
-			sock = rest[1]
-		} else if len(rest) != 0 {
+		sock, rest := socketOverride(rest)
+		if len(rest) != 0 {
 			return fmt.Errorf("usage: offshoot serve [-socket PATH]")
 		}
 		if sock == "" {
@@ -342,12 +364,16 @@ func run(args []string) error {
 			return err
 		}
 	case "session":
+		sock, rest := socketOverride(rest)
 		if len(rest) == 0 {
-			return fmt.Errorf("usage: offshoot session open|flush|status|close|shutdown ...")
+			return fmt.Errorf("usage: offshoot session open|flush|status|close|shutdown ... [-socket PATH]")
 		}
-		sock, err := daemon.DefaultSocketPath(spec)
-		if err != nil {
-			return err
+		if sock == "" {
+			p, err := daemon.DefaultSocketPath(spec)
+			if err != nil {
+				return err
+			}
+			sock = p
 		}
 		sub, args := rest[0], rest[1:]
 		target := func() (string, string, error) {
