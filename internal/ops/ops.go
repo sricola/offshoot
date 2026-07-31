@@ -1,0 +1,703 @@
+// Package ops implements offshoot's branch lifecycle operations over a
+// store.Backend: create, checkout, checkpoint, fork, rollback, promote,
+// destroy, and GC. Plan-2 scope is CLI/at-rest mode: full-snapshot
+// checkpoints, fixed checkout paths, no daemon.
+package ops
+
+import (
+	"bytes"
+	"crypto/sha256"
+	"database/sql"
+	"encoding/hex"
+	"encoding/json"
+	"errors"
+	"fmt"
+	"io"
+	"os"
+	"path/filepath"
+	"sort"
+	"strings"
+
+	_ "github.com/mattn/go-sqlite3"
+	"github.com/offshoot-db/offshoot/internal/ltxio"
+	"github.com/offshoot-db/offshoot/internal/store"
+)
+
+type Workspace struct {
+	Store *store.Store
+	Root  string
+}
+
+func Init(root string) (*Workspace, error) {
+	b, err := store.NewLocal(root)
+	if err != nil {
+		return nil, err
+	}
+	s := &store.Store{B: b}
+	if err := s.InitManifest(); err != nil {
+		return nil, err
+	}
+	return &Workspace{Store: s, Root: root}, nil
+}
+
+func Open(root string) (*Workspace, error) {
+	b, err := store.NewLocal(root)
+	if err != nil {
+		return nil, err
+	}
+	s := &store.Store{B: b}
+	if err := s.CheckManifest(); err != nil {
+		return nil, err
+	}
+	return &Workspace{Store: s, Root: root}, nil
+}
+
+func ParseTarget(s string) (string, string, error) {
+	parts := strings.Split(s, "@")
+	db, branch := parts[0], "main"
+	switch len(parts) {
+	case 1:
+	case 2:
+		branch = parts[1]
+	default:
+		return "", "", fmt.Errorf("ops: invalid target %q (want db or db@branch)", s)
+	}
+	if err := store.ValidateName(db); err != nil {
+		return "", "", err
+	}
+	if err := store.ValidateName(branch); err != nil {
+		return "", "", err
+	}
+	return db, branch, nil
+}
+
+func (w *Workspace) CheckoutPath(db, branch string) string {
+	return filepath.Join(w.Root, "checkouts", db, branch+".db")
+}
+
+// snapshotTo encodes dbPath (a quiesced SQLite file) as snapshot txid into a
+// fresh lineage at epoch and returns the lineage id.
+func (w *Workspace) snapshotTo(dbPath string, txid uint64) (string, error) {
+	lineage := store.NewLineageID()
+	var buf bytes.Buffer
+	if err := ltxio.EncodeSnapshot(dbPath, txid, &buf); err != nil {
+		return "", err
+	}
+	// Immutable data object: create-only put under a fresh lineage/epoch.
+	if _, err := w.Store.B.PutIf(store.SnapshotKey(lineage, 1, txid), buf.Bytes(), ""); err != nil {
+		return "", err
+	}
+	return lineage, nil
+}
+
+func (w *Workspace) Create(db string) error {
+	if err := store.ValidateName(db); err != nil {
+		return err
+	}
+	// Build an empty SQLite DB in a temp dir, snapshot it as TXID 1.
+	tmp := filepath.Join(os.TempDir(), "offshoot-create-"+store.NewLineageID()+".db")
+	defer func() { os.Remove(tmp); os.Remove(tmp + "-wal"); os.Remove(tmp + "-shm") }()
+	conn, err := sql.Open("sqlite3", tmp)
+	if err != nil {
+		return err
+	}
+	if _, err := conn.Exec("PRAGMA journal_mode=WAL; PRAGMA user_version=0; PRAGMA wal_checkpoint(TRUNCATE)"); err != nil {
+		conn.Close()
+		return err
+	}
+	conn.Close()
+	return w.createFromQuiesced(db, tmp)
+}
+
+func (w *Workspace) createFromQuiesced(db, quiescedPath string) error {
+	lineage, err := w.snapshotTo(quiescedPath, 1)
+	if err != nil {
+		return err
+	}
+	ref := store.Ref{
+		Schema: 1, Lineage: lineage, Epoch: 1, HeadTXID: 1,
+		Checkpoints: map[string]uint64{"init": 1},
+		Protected:   true, // main is protected by default (spec § Security posture)
+	}
+	if _, err := w.Store.PutRef(db, "main", ref, ""); err != nil {
+		// Freshly-minted lineage no rival can reference: safe to delete the
+		// orphaned snapshot (mirrors Fork's cleanup on the same failure).
+		w.Store.B.Delete(store.SnapshotKey(lineage, 1, 1))
+		return fmt.Errorf("ops: create %s: %w", db, err)
+	}
+	return nil
+}
+
+// CreateFrom imports an existing SQLite file. The source is never modified:
+// the file (plus -wal/-shm if present) is copied to a temp dir, the COPY is
+// checkpointed to quiesce it, and the copy is snapshotted.
+func (w *Workspace) CreateFrom(db, srcPath string) error {
+	if err := store.ValidateName(db); err != nil {
+		return err
+	}
+	dir, err := os.MkdirTemp("", "offshoot-import-*")
+	if err != nil {
+		return err
+	}
+	defer os.RemoveAll(dir)
+	cp := filepath.Join(dir, "import.db")
+	for _, suffix := range []string{"", "-wal", "-shm"} {
+		if err := copyFile(srcPath+suffix, cp+suffix); err != nil {
+			if suffix != "" && os.IsNotExist(err) {
+				continue
+			}
+			return err
+		}
+	}
+	conn, err := sql.Open("sqlite3", cp)
+	if err != nil {
+		return err
+	}
+	if _, err := conn.Exec("PRAGMA wal_checkpoint(TRUNCATE)"); err != nil {
+		conn.Close()
+		return err
+	}
+	conn.Close()
+	return w.createFromQuiesced(db, cp)
+}
+
+// Checkout materializes db@branch's head snapshot to its fixed path. If a
+// checkout already lives at that path, it must be quiesced first (busy ->
+// clean failure, like Checkpoint): re-materializing renames over the file,
+// which would delete a live writer's WAL out from under it. If the existing
+// checkout has un-checkpointed local edits, Checkout proceeds (head always
+// wins) but warns first, since those edits are about to be discarded.
+func (w *Workspace) Checkout(db, branch string) (string, error) {
+	ref, _, err := w.Store.GetRef(db, branch)
+	if err != nil {
+		return "", err
+	}
+	path := w.CheckoutPath(db, branch)
+	if _, err := os.Stat(path); err == nil {
+		if err := quiesce(path); err != nil {
+			return "", err
+		}
+		if checkoutState(path, ref) == "modified" {
+			fmt.Fprintf(os.Stderr, "offshoot: warning: overwriting un-checkpointed changes in %s@%s checkout\n", db, branch)
+		}
+	}
+	if err := os.MkdirAll(filepath.Dir(path), 0o755); err != nil {
+		return "", err
+	}
+	if err := w.materialize(ref, ref.HeadTXID, path); err != nil {
+		return "", err
+	}
+	if err := writeSum(path, ref.Lineage, ref.HeadTXID); err != nil {
+		return "", err
+	}
+	return path, nil
+}
+
+// sumRecord is the on-disk shape of a checkout's .sum sidecar: a content hash
+// plus the ref identity (lineage + txid) the checkout embodied at the moment
+// the sidecar was written. Recording identity (not just a bare hash) is what
+// lets checkoutState tell apart a checkout with local edits from one whose
+// branch ref moved out from under it without a refresh.
+type sumRecord struct {
+	Hash    string `json:"hash"`
+	Lineage string `json:"lineage"`
+	TXID    uint64 `json:"txid"`
+}
+
+// writeSum computes the hex SHA-256 of the file at path and writes it, along
+// with the (lineage, txid) ref identity the checkout currently embodies, to
+// path + ".sum". This is the checkout fingerprint: it records what the
+// checkout file looked like, and which branch state it was, at the moment it
+// was last known to equal a committed state (fresh materialize, a successful
+// checkpoint encode, or a post-repoint refresh).
+func writeSum(path string, lineage string, txid uint64) error {
+	sum, err := fileSum(path)
+	if err != nil {
+		return err
+	}
+	data, err := json.Marshal(sumRecord{Hash: sum, Lineage: lineage, TXID: txid})
+	if err != nil {
+		return err
+	}
+	return os.WriteFile(path+".sum", data, 0o644)
+}
+
+// checkoutState reports how the checkout at path relates to ref:
+//
+//   - "clean": the sidecar's recorded identity (lineage, txid) matches ref,
+//     and the file's content still matches the recorded hash.
+//   - "modified": the sidecar's recorded identity matches ref, but the
+//     file's content has changed since it was last fingerprinted — local,
+//     un-checkpointed edits.
+//   - "stale": the sidecar's recorded identity no longer matches ref — the
+//     branch was repointed (rollback/promote with a skipped refresh) since
+//     this checkout was last materialized or checkpointed.
+//   - "unknown": no sidecar, or one that isn't a valid current-format
+//     record (including legacy bare-hash sidecars predating this fix, and
+//     corrupt files). Provenance can't be determined, so callers should
+//     stay silent rather than warn spuriously.
+func checkoutState(path string, ref store.Ref) string {
+	raw, err := os.ReadFile(path + ".sum")
+	if err != nil {
+		return "unknown"
+	}
+	var rec sumRecord
+	if err := json.Unmarshal(raw, &rec); err != nil || rec.Hash == "" {
+		return "unknown"
+	}
+	if rec.Lineage != ref.Lineage || rec.TXID != ref.HeadTXID {
+		return "stale"
+	}
+	got, err := fileSum(path)
+	if err != nil {
+		return "unknown"
+	}
+	if got != rec.Hash {
+		return "modified"
+	}
+	return "clean"
+}
+
+func fileSum(path string) (string, error) {
+	f, err := os.Open(path)
+	if err != nil {
+		return "", err
+	}
+	defer f.Close()
+	h := sha256.New()
+	if _, err := io.Copy(h, f); err != nil {
+		return "", err
+	}
+	return hex.EncodeToString(h.Sum(nil)), nil
+}
+
+func (w *Workspace) materialize(ref store.Ref, txid uint64, dst string) error {
+	data, _, err := w.Store.B.Get(store.SnapshotKey(ref.Lineage, ref.Epoch, txid))
+	if err != nil {
+		return fmt.Errorf("ops: snapshot txid %d not found in lineage %s: %w", txid, ref.Lineage, err)
+	}
+	if _, err := ltxio.Materialize(bytes.NewReader(data), dst); err != nil {
+		return err
+	}
+	return nil
+}
+
+func copyFile(from, to string) error {
+	in, err := os.Open(from)
+	if err != nil {
+		return err
+	}
+	defer in.Close()
+	out, err := os.Create(to)
+	if err != nil {
+		return err
+	}
+	if _, err := io.Copy(out, in); err != nil {
+		out.Close()
+		return err
+	}
+	return out.Close()
+}
+
+// Checkpoint snapshots the current checkout state as a named checkpoint.
+// Plan-2 (CLI/at-rest) semantics: full-snapshot encode; requires the
+// checkout to be quiescible (busy timeout 3s, then clean failure).
+func (w *Workspace) Checkpoint(db, branch, name string) (uint64, error) {
+	if err := store.ValidateName(name); err != nil {
+		return 0, err
+	}
+	ref, etag, err := w.Store.GetRef(db, branch)
+	if err != nil {
+		return 0, err
+	}
+	if _, exists := ref.Checkpoints[name]; exists {
+		return 0, fmt.Errorf("ops: checkpoint %q already exists on %s@%s", name, db, branch)
+	}
+	path := w.CheckoutPath(db, branch)
+	if _, err := os.Stat(path); err != nil {
+		return 0, fmt.Errorf("ops: no checkout for %s@%s (run checkout first): %w", db, branch, err)
+	}
+	if err := quiesce(path); err != nil {
+		return 0, err
+	}
+	txid := ref.HeadTXID + 1
+	var buf bytes.Buffer
+	if err := ltxio.EncodeSnapshot(path, txid, &buf); err != nil {
+		return 0, err
+	}
+	snapKey := store.SnapshotKey(ref.Lineage, ref.Epoch, txid)
+	if _, err := w.Store.B.PutIf(snapKey, buf.Bytes(), ""); err != nil {
+		if !errors.Is(err, store.ErrCAS) {
+			return 0, err
+		}
+		// An object already lives at this deterministic key. HeadTXID only
+		// ever advances via a successful ref write, and nothing is written
+		// under a txid beyond HeadTXID+1 until that happens, so nothing can
+		// legitimately reference this key yet: it can only be (a) an orphan
+		// left by a crashed prior Checkpoint attempt (snapshot uploaded, ref
+		// write never landed), or (b) a rival Checkpoint call racing on this
+		// same branch right now, which computed the identical HeadTXID+1 and
+		// simply lost the write here. Overwriting is benign under either
+		// cause: both writers quiesced and encoded the SAME checkout file at
+		// the SAME pre-checkpoint state, so whichever encoding ends up
+		// stored is content-equivalent, and only one of the two racers can
+		// possibly win the PutRef CAS below to ever reference this key by
+		// name — there is no rival ref left dangling by the overwrite. Safe
+		// to overwrite unconditionally and proceed.
+		if err := w.Store.B.Put(snapKey, buf.Bytes()); err != nil {
+			return 0, err
+		}
+	}
+	ref.HeadTXID = txid
+	if ref.Checkpoints == nil {
+		ref.Checkpoints = map[string]uint64{}
+	}
+	ref.Checkpoints[name] = txid
+	if _, err := w.Store.PutRef(db, branch, ref, etag); err != nil {
+		// Decide whether to clean up the snapshot after PutRef failure.
+		// Unlike Fork/Rollback/Promote (which delete keys in freshly-minted
+		// lineages no rival can reference), we must gate cleanup on the error
+		// type: under concurrent Checkpoint calls on the same branch, every
+		// racer computes the same deterministic txid (HeadTXID+1) and snapKey.
+		//
+		// On ErrCAS (lost the CAS race): serialization via PutIf means the
+		// winner's ref is already visible, so the snapshot is confirmed an
+		// orphan left by a crashed prior Checkpoint — safe to delete so a
+		// retry's create-only put doesn't wedge behind our orphan.
+		//
+		// On non-CAS errors (lock timeout, I/O error): deletion is UNSAFE.
+		// A concurrent checkpointer may already be mid-write, and we can't
+		// tell from here whether they've landed their ref yet. Deleting would
+		// rip the snapshot out from under them, leaving a checkpoint recorded
+		// in their ref with no backing object — silent corruption for them.
+		// Leave the object alone; worst case it's a harmless orphan for a
+		// later GC pass.
+		if errors.Is(err, store.ErrCAS) {
+			if cur, _, gerr := w.Store.GetRef(db, branch); gerr == nil && (cur.Lineage != ref.Lineage || cur.HeadTXID < txid) {
+				w.Store.B.Delete(snapKey)
+			}
+			return 0, fmt.Errorf("ops: ref update lost a race (retry): %w", err)
+		}
+		return 0, fmt.Errorf("ops: ref update for checkpoint %q on %s@%s: %w", name, db, branch, err)
+	}
+	// The ref CAS is the point of no return: only now does the checkout truly
+	// equal committed state (lineage unchanged, head advanced to txid).
+	// Writing the sidecar here, after the CAS, means an interrupt between the
+	// encode above and this point leaves the OLD sidecar in place — which
+	// still correctly describes the checkout's actual (pre-checkpoint)
+	// identity, rather than claiming a commit that never landed.
+	if err := writeSum(path, ref.Lineage, txid); err != nil {
+		return 0, fmt.Errorf("ops: checkpoint %q committed (txid %d), but the checkout fingerprint could not be refreshed: %w", name, txid, err)
+	}
+	return txid, nil
+}
+
+// quiesce checkpoints the WAL fully, failing cleanly on a busy database.
+func quiesce(path string) error {
+	conn, err := sql.Open("sqlite3", path+"?_busy_timeout=3000")
+	if err != nil {
+		return err
+	}
+	defer conn.Close()
+	var busy, logN, ckptN int
+	if err := conn.QueryRow("PRAGMA wal_checkpoint(TRUNCATE)").Scan(&busy, &logN, &ckptN); err != nil {
+		return fmt.Errorf("ops: checkpoint: %w", err)
+	}
+	if busy != 0 {
+		return fmt.Errorf("ops: database is busy (live writer or reader); close connections and retry")
+	}
+	return nil
+}
+
+// warnIfUncheckpointed checks db@branch's checkout (if one exists) against
+// ref and, if it diverges, prints a warning to os.Stderr explaining what the
+// caller (Fork) is about to do about it: proceed from ref.HeadTXID either
+// way. It never fails the caller's operation: any error along the way is
+// treated as "nothing to warn about". ref is the same ref the caller already
+// fetched to decide the fork point, so this reuses it rather than issuing a
+// second (potentially inconsistent) GetRef.
+func (w *Workspace) warnIfUncheckpointed(db, branch string, ref store.Ref) {
+	path := w.CheckoutPath(db, branch)
+	if _, err := os.Stat(path); err != nil {
+		return
+	}
+	if err := quiesce(path); err != nil {
+		fmt.Fprintf(os.Stderr, "offshoot: warning: checkout of %s@%s is busy; forking last committed state (txid %d)\n", db, branch, ref.HeadTXID)
+		return
+	}
+	switch checkoutState(path, ref) {
+	case "modified":
+		fmt.Fprintf(os.Stderr, "offshoot: warning: checkout of %s@%s has un-checkpointed changes; forking last committed state (txid %d)\n", db, branch, ref.HeadTXID)
+	case "stale":
+		fmt.Fprintf(os.Stderr, "offshoot: warning: checkout of %s@%s is stale (branch was repointed since it was materialized); forking branch head (txid %d) — run 'offshoot checkout' to refresh\n", db, branch, ref.HeadTXID)
+	}
+}
+
+// copySnapshotIntoLineage copies the snapshot at (src.Lineage, src.Epoch,
+// txid) into lineage (epoch 1) via a create-only put and returns the key it
+// was written under. This is the primitive behind fork, rollback, and
+// promote: every branch repoint gets a fresh lineage, preserving
+// one-writer-per-lineage.
+func (w *Workspace) copySnapshotIntoLineage(src store.Ref, txid uint64, lineage string) (string, error) {
+	data, _, err := w.Store.B.Get(store.SnapshotKey(src.Lineage, src.Epoch, txid))
+	if err != nil {
+		return "", fmt.Errorf("ops: snapshot txid %d in lineage %s: %w", txid, src.Lineage, err)
+	}
+	key := store.SnapshotKey(lineage, 1, txid)
+	if _, err := w.Store.B.PutIf(key, data, ""); err != nil {
+		return "", err
+	}
+	return key, nil
+}
+
+// copySnapshotToNewLineage copies the snapshot at (src.Lineage, src.Epoch,
+// txid) into a brand-new lineage (epoch 1) and returns the lineage id.
+func (w *Workspace) copySnapshotToNewLineage(src store.Ref, txid uint64) (string, error) {
+	lineage := store.NewLineageID()
+	if _, err := w.copySnapshotIntoLineage(src, txid, lineage); err != nil {
+		return "", err
+	}
+	return lineage, nil
+}
+
+// Fork creates newBranch from db@srcBranch at head or a named checkpoint.
+func (w *Workspace) Fork(db, srcBranch, newBranch, at string) (uint64, error) {
+	if err := store.ValidateName(newBranch); err != nil {
+		return 0, err
+	}
+	src, _, err := w.Store.GetRef(db, srcBranch)
+	if err != nil {
+		return 0, err
+	}
+	txid := src.HeadTXID
+	if at != "" {
+		t, ok := src.Checkpoints[at]
+		if !ok {
+			return 0, fmt.Errorf("ops: no checkpoint %q on %s@%s", at, db, srcBranch)
+		}
+		txid = t
+	} else {
+		w.warnIfUncheckpointed(db, srcBranch, src)
+	}
+	// Materialized fork point: copy the source snapshot into the child's own
+	// lineage so the child never references parent storage.
+	childLineage, err := w.copySnapshotToNewLineage(src, txid)
+	if err != nil {
+		return 0, err
+	}
+	child := store.Ref{
+		Schema: 1, Lineage: childLineage, Epoch: 1, HeadTXID: txid,
+		Checkpoints: map[string]uint64{"fork": txid},
+		Parent:      fmt.Sprintf("%s@%s@%d", db, srcBranch, txid),
+	}
+	if _, err := w.Store.PutRef(db, newBranch, child, ""); err != nil {
+		// Branch already exists (or lost a race): remove the orphan snapshot.
+		w.Store.B.Delete(store.SnapshotKey(childLineage, 1, txid))
+		return 0, fmt.Errorf("ops: fork %s@%s: %w", db, newBranch, err)
+	}
+	return txid, nil
+}
+
+// Rollback repoints db@branch at a NEW lineage seeded from checkpoint `to`
+// and re-materializes the fixed checkout path, returning the checkout path.
+// The old lineage is orphaned (collected later by GC). Checkpoints at or
+// before `to` are kept, and EVERY kept checkpoint's snapshot is copied into
+// the new lineage (not just `to`'s) so a later rollback or fork to an
+// earlier kept checkpoint still finds its snapshot object once the old
+// lineage is gone — otherwise it fails "not found" once GC reaps the old
+// lineage, since the ref itself no longer references it after this repoint.
+// Later checkpoints are dropped.
+//
+// The ref CAS is the point of no return: once it lands, the branch has
+// repointed. The checkout refresh that follows (busy probe, materialize,
+// fingerprint) is best-effort — a failure there is reported as a partial
+// success (repointed, checkout stale) rather than losing that state in a
+// plain error.
+//
+// The busy probe itself is a point-in-time check, not a lock: a connection
+// opened between the probe and the materialize rename still holds a stale
+// file descriptor. Acceptable for the single-operator local CLI; daemon
+// mode (Plan 3) will own the data path and close this gap.
+func (w *Workspace) Rollback(db, branch, to string) (string, error) {
+	ref, etag, err := w.Store.GetRef(db, branch)
+	if err != nil {
+		return "", err
+	}
+	txid, ok := ref.Checkpoints[to]
+	if !ok {
+		return "", fmt.Errorf("ops: no checkpoint %q on %s@%s", to, db, branch)
+	}
+	lineage, err := w.copySnapshotToNewLineage(ref, txid)
+	if err != nil {
+		return "", err
+	}
+	copiedKeys := []string{store.SnapshotKey(lineage, 1, txid)}
+	cleanup := func() {
+		for _, k := range copiedKeys {
+			w.Store.B.Delete(k)
+		}
+	}
+
+	kept := map[string]uint64{}
+	for name, t := range ref.Checkpoints {
+		if t <= txid {
+			kept[name] = t
+		}
+	}
+
+	// `to`'s own snapshot is already copied above. Copy every OTHER kept
+	// checkpoint's snapshot into the new lineage too, so it survives the old
+	// lineage being orphaned and later reaped by GC. Abort and clean up
+	// anything already copied before touching the ref if any copy fails.
+	done := map[uint64]bool{txid: true}
+	for _, t := range kept {
+		if done[t] {
+			continue
+		}
+		done[t] = true
+		key, err := w.copySnapshotIntoLineage(ref, t, lineage)
+		if err != nil {
+			cleanup()
+			return "", fmt.Errorf("ops: rollback: copying checkpoint snapshot for txid %d: %w", t, err)
+		}
+		copiedKeys = append(copiedKeys, key)
+	}
+
+	next := ref
+	next.Lineage, next.Epoch, next.HeadTXID, next.Checkpoints = lineage, 1, txid, kept
+	if _, err := w.Store.PutRef(db, branch, next, etag); err != nil {
+		cleanup()
+		return "", fmt.Errorf("ops: rollback lost a race (retry): %w", err)
+	}
+
+	// The branch has repointed. Everything below is a best-effort refresh of
+	// the local checkout; any failure here must not read as if the rollback
+	// itself failed.
+	path := w.CheckoutPath(db, branch)
+	refresh := func() error {
+		if _, err := os.Stat(path); err == nil {
+			if err := quiesce(path); err != nil {
+				return err
+			}
+		}
+		if err := os.MkdirAll(filepath.Dir(path), 0o755); err != nil {
+			return err
+		}
+		if err := w.materialize(next, txid, path); err != nil {
+			return err
+		}
+		// The checkout now equals committed state: refresh the fingerprint
+		// (identity too, since this repointed to a new lineage) so a later
+		// Fork sees it as clean rather than stale.
+		return writeSum(path, next.Lineage, txid)
+	}
+	if err := refresh(); err != nil {
+		return "", fmt.Errorf("ops: branch repointed to checkpoint %q (txid %d), but the checkout could not be refreshed (run 'offshoot checkout' to re-materialize): %w", to, txid, err)
+	}
+	return path, nil
+}
+
+// Promote repoints db@target at a NEW lineage seeded from db@source's head
+// (promote-as-fork, spec § Promote). Requires --force for protected targets
+// (force param). Source branch survives unchanged. Target's old lineage is
+// orphaned. Target's checkout (if any) is re-materialized after a busy
+// probe. Target's checkpoint map is reset to {"promote": txid}.
+//
+// The busy probe is a point-in-time check, not a lock: a connection opened
+// between the probe and the materialize rename still holds a stale file
+// descriptor. Acceptable for the single-operator local CLI; daemon mode
+// (Plan 3) will own the data path and close this gap.
+func (w *Workspace) Promote(db, source, target string, force bool) (uint64, error) {
+	if source == target {
+		return 0, fmt.Errorf("ops: cannot promote a branch onto itself")
+	}
+	if err := store.ValidateName(source); err != nil {
+		return 0, err
+	}
+	if err := store.ValidateName(target); err != nil {
+		return 0, err
+	}
+	src, _, err := w.Store.GetRef(db, source)
+	if err != nil {
+		return 0, err
+	}
+	w.warnIfUncheckpointed(db, source, src)
+	tgt, tgtEtag, err := w.Store.GetRef(db, target)
+	if err != nil {
+		return 0, err
+	}
+	if tgt.Protected && !force {
+		return 0, fmt.Errorf("ops: %s@%s is protected; use --force", db, target)
+	}
+	txid := src.HeadTXID
+	lineage, err := w.copySnapshotToNewLineage(src, txid)
+	if err != nil {
+		return 0, err
+	}
+	next := tgt
+	next.Lineage, next.Epoch, next.HeadTXID = lineage, 1, txid
+	next.Checkpoints = map[string]uint64{"promote": txid}
+	next.Parent = fmt.Sprintf("%s@%s@%d", db, source, txid)
+	if _, err := w.Store.PutRef(db, target, next, tgtEtag); err != nil {
+		w.Store.B.Delete(store.SnapshotKey(lineage, 1, txid))
+		return 0, fmt.Errorf("ops: promote lost a race (retry): %w", err)
+	}
+	// Refresh the target checkout if one exists and is quiescible.
+	path := w.CheckoutPath(db, target)
+	if _, err := os.Stat(path); err == nil {
+		if err := quiesce(path); err != nil {
+			return txid, fmt.Errorf("ops: promoted, but checkout %s is in use and was NOT refreshed: %w", path, err)
+		}
+		if err := w.materialize(next, txid, path); err != nil {
+			return txid, fmt.Errorf("ops: promoted, but checkout %s could not be refreshed: %w", path, err)
+		}
+		// The checkout now equals committed state: refresh the fingerprint
+		// (identity too, since this repointed to a new lineage) so a later
+		// Fork sees it as clean rather than stale.
+		if err := writeSum(path, next.Lineage, txid); err != nil {
+			return txid, fmt.Errorf("ops: promoted, but checkout %s could not be refreshed: %w", path, err)
+		}
+	}
+	return txid, nil
+}
+
+type BranchStatus struct {
+	DB, Branch  string
+	HeadTXID    uint64
+	Checkpoints []string
+	Protected   bool
+	Parent      string
+	CheckedOut  bool
+}
+
+func (w *Workspace) Status() ([]BranchStatus, error) {
+	refs, err := w.Store.ListRefs()
+	if err != nil {
+		return nil, err
+	}
+	var dbs []string
+	for db := range refs {
+		dbs = append(dbs, db)
+	}
+	sort.Strings(dbs)
+	var out []BranchStatus
+	for _, db := range dbs {
+		for _, br := range refs[db] {
+			r, _, err := w.Store.GetRef(db, br)
+			if err != nil {
+				return nil, err
+			}
+			var cps []string
+			for name := range r.Checkpoints {
+				cps = append(cps, name)
+			}
+			sort.Strings(cps)
+			_, coErr := os.Stat(w.CheckoutPath(db, br))
+			out = append(out, BranchStatus{
+				DB: db, Branch: br, HeadTXID: r.HeadTXID, Checkpoints: cps,
+				Protected: r.Protected, Parent: r.Parent, CheckedOut: coErr == nil,
+			})
+		}
+	}
+	return out, nil
+}
