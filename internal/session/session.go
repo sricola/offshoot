@@ -114,12 +114,16 @@ type Session struct {
 	// on this same Session.
 	//
 	// Lock ordering across this package, when more than one of these is held
-	// at once, is flushMu -> replicaMu -> mu, and never the reverse. In the
-	// current code no two of these are ever held simultaneously (Flush locks
-	// and releases replicaMu before later locking mu), so this is documented
-	// as a standing invariant for future changes rather than a live nesting
-	// today: violating it — e.g. taking flushMu while holding mu — is a
-	// deadlock waiting for a caller that holds them in the other order.
+	// at once, is flushMu -> replicaMu -> mu, and never the reverse: flushMu
+	// nests around both replicaMu (Flush holds flushMu across its replicaMu
+	// section that encodes the replica) and mu (Flush's Lease() call and its
+	// final durable-txid update both happen while flushMu is held; Close
+	// likewise takes flushMu, after already having released mu, before it
+	// removes the scratch dir — see Close and Flush). replicaMu and mu,
+	// though, are never held at the same time by anything in this package.
+	// Violating the flushMu-outermost rule — e.g. taking flushMu while
+	// already holding mu — is a deadlock waiting for a caller that holds
+	// them in the other order.
 	flushMu sync.Mutex
 
 	mu      sync.Mutex
@@ -238,6 +242,16 @@ func (s *Session) Err() error {
 	return s.err
 }
 
+// ErrClosed reports that Flush was called on a session that Close has
+// already started closing (or finished closing). Close sets the closed flag
+// as the very first thing it does, before any of its own slow work (joining
+// goroutines, releasing the lease, removing the scratch dir); Flush checks
+// it immediately after acquiring flushMu, so a Flush that observes it false
+// is guaranteed to run to completion — including its encode of the replica
+// file — before Close can reach the flushMu section that removes that file's
+// directory. See Close and flushMu's doc comment.
+var ErrClosed = errors.New("session: closed")
+
 // Close stops capture, releases the lease, and removes the scratch dir. It is
 // safe to call twice.
 //
@@ -248,6 +262,20 @@ func (s *Session) Err() error {
 // the join, that straggler could run after the lease is released, see the
 // holder cleared out from under it, and call fail(ErrFenced) — marking a
 // cleanly-closed session as fenced even though nothing actually went wrong.
+//
+// Removing the scratch dir is additionally serialized against flushMu: Flush
+// holds flushMu for its whole body, including the point where it reads the
+// replica file (under this same dir) via ltxio.EncodeSnapshot. Without that
+// serialization, RemoveAll here could run concurrently with that read —
+// pulling the directory out from under a Flush that is mid-encode. Taking
+// flushMu only around the RemoveAll itself, rather than around this entire
+// function, keeps Close from ever holding flushMu while blocked on the
+// engDone/renewDone joins above: those joins do not depend on flushMu being
+// free, so nesting them the other way would gain nothing and would make a
+// future change that adds a flushMu dependency to shutdown much easier to
+// deadlock by accident. A Flush that hasn't yet acquired flushMu when Close
+// begins observes s.closed (set below, first) once it does and fails fast
+// with ErrClosed instead of racing this removal at all.
 func (s *Session) Close() error {
 	s.mu.Lock()
 	if s.closed {
@@ -267,7 +295,9 @@ func (s *Session) Close() error {
 		relErr = err
 	}
 	if s.ownsDir {
+		s.flushMu.Lock()
 		os.RemoveAll(s.dir)
+		s.flushMu.Unlock()
 	}
 	return relErr
 }

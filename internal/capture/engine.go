@@ -206,6 +206,29 @@ func (e *Engine) DrainNow(ctx context.Context) error {
 // Run blocks, capturing until ctx is cancelled. It performs the initial
 // rebase (checkpoint + snapshot copy), holds the read-lock dance, polls for
 // committed transactions, and periodically performs checkpoint takeover.
+//
+// Every fallible step between here and the first point where ctx.Done() is
+// actually selected on (the main loop below) is guarded with the same
+// ctx.Err() check the startup rebase, pollOnce/pollOnceTo's rebase branches,
+// and afterDrain's takeover call already use: Close() cancels ctx, and
+// Session.Open starts this goroutine asynchronously and returns immediately
+// (see session.go's Open), so a Close() landing before — or while — Run's
+// own DB setup (sql.Open/Conn/PRAGMAs) or tryResume runs is a completely
+// ordinary, if early, race, not a special case. database/sql surfaces that
+// as ctx.Err() (typically context.Canceled, unwrapped) from whichever
+// ExecContext/QueryRowContext/Conn call happened to be in flight — and
+// without a guard, that flows straight out as Run's own fatal return value,
+// which runEngine (session.go) records as "session: capture stopped:
+// context canceled" on what was actually a clean Close. Nothing has been
+// set up yet at any of these points for shutdown()'s final drain/checkpoint
+// dance to safely run against, so — exactly like the startup rebase guard
+// below — the right response is simply to stop, not to attempt a graceful
+// shutdown() that has nothing valid to act on. Reproduced empirically
+// (TestCloseDoesNotMarkSessionFenced failing under whole-suite contention,
+// pinned via temporary logging to the PRAGMA page_size QueryRowContext call
+// specifically, though Conn and the wal_autocheckpoint PRAGMA are exactly
+// as capable of losing the same race and are guarded for the same reason,
+// not because either was separately observed to fail).
 func (e *Engine) Run(ctx context.Context) error {
 	defer close(e.done)
 	var err error
@@ -217,17 +240,29 @@ func (e *Engine) Run(ctx context.Context) error {
 	defer e.db.Close()
 	e.conn, err = e.db.Conn(ctx)
 	if err != nil {
+		if ctx.Err() != nil {
+			return nil
+		}
 		return err
 	}
 	defer e.conn.Close()
 	if _, err := e.conn.ExecContext(ctx, "PRAGMA wal_autocheckpoint=0"); err != nil {
+		if ctx.Err() != nil {
+			return nil
+		}
 		return err
 	}
 	if err := e.conn.QueryRowContext(ctx, "PRAGMA page_size").Scan(&e.pageSize); err != nil {
+		if ctx.Err() != nil {
+			return nil
+		}
 		return err
 	}
 
 	if resumed, err := e.tryResume(ctx); err != nil {
+		if ctx.Err() != nil {
+			return nil
+		}
 		return err
 	} else if !resumed {
 		if err := e.rebase(ctx); err != nil {
