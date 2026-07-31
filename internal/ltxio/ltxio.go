@@ -1,0 +1,122 @@
+// Package ltxio encodes SQLite databases as full-snapshot LTX files and
+// materializes them back, wrapping github.com/superfly/ltx behind a stable
+// interface (the ltx Go API carries no stability promise; the format spec is
+// the contract).
+package ltxio
+
+import (
+	"encoding/binary"
+	"fmt"
+	"io"
+	"os"
+	"path/filepath"
+	"time"
+
+	"github.com/superfly/ltx"
+)
+
+const dbHeaderSize = 100
+
+// EncodeSnapshot writes a full-snapshot LTX of the SQLite main database at
+// dbPath, covering TXIDs [1, txid]. Caller must have fully checkpointed the
+// WAL (TRUNCATE) first; EncodeSnapshot returns an error if a non-empty -wal
+// file exists next to dbPath.
+func EncodeSnapshot(dbPath string, txid uint64, w io.Writer) error {
+	if fi, err := os.Stat(dbPath + "-wal"); err == nil && fi.Size() > 0 {
+		return fmt.Errorf("ltxio: %s has a non-empty WAL; checkpoint(TRUNCATE) first", dbPath)
+	}
+	f, err := os.Open(dbPath)
+	if err != nil {
+		return err
+	}
+	defer f.Close()
+
+	hdr := make([]byte, dbHeaderSize)
+	if _, err := io.ReadFull(f, hdr); err != nil {
+		return fmt.Errorf("ltxio: read db header: %w", err)
+	}
+	pageSize := uint32(binary.BigEndian.Uint16(hdr[16:18]))
+	if pageSize == 1 {
+		pageSize = 65536
+	}
+	nPages := binary.BigEndian.Uint32(hdr[28:32]) // database size in pages
+
+	enc, err := ltx.NewEncoder(w)
+	if err != nil {
+		return fmt.Errorf("ltxio: new encoder: %w", err)
+	}
+	lhdr := ltx.Header{
+		Version:   ltx.Version,
+		PageSize:  pageSize,
+		Commit:    nPages,
+		MinTXID:   1,
+		MaxTXID:   ltx.TXID(txid),
+		Timestamp: time.Now().UnixMilli(),
+	}
+	if err := enc.EncodeHeader(lhdr); err != nil {
+		return fmt.Errorf("ltxio: encode header: %w", err)
+	}
+
+	lockPgno := lhdr.LockPgno()
+	buf := make([]byte, pageSize)
+	chksum := ltx.ChecksumFlag
+	for pgno := uint32(1); pgno <= nPages; pgno++ {
+		if pgno == lockPgno {
+			// The lock page carries no real data and the encoder rejects it.
+			continue
+		}
+		if _, err := f.ReadAt(buf, int64(pgno-1)*int64(pageSize)); err != nil {
+			return fmt.Errorf("ltxio: read page %d: %w", pgno, err)
+		}
+		if err := enc.EncodePage(ltx.PageHeader{Pgno: pgno}, buf); err != nil {
+			return fmt.Errorf("ltxio: encode page %d: %w", pgno, err)
+		}
+		chksum = ltx.ChecksumFlag | (chksum ^ ltx.ChecksumPage(pgno, buf))
+	}
+	enc.SetPostApplyChecksum(chksum)
+	return enc.Close()
+}
+
+// Materialize decodes a full-snapshot LTX from r into dbPath, verifying the
+// trailer checksum. On any error the destination is left untouched (write to
+// temp file + rename). Returns the snapshot's MaxTXID.
+func Materialize(r io.Reader, dbPath string) (txid uint64, err error) {
+	dec := ltx.NewDecoder(r)
+
+	dir := filepath.Dir(dbPath)
+	tmp, err := os.CreateTemp(dir, filepath.Base(dbPath)+".tmp-*")
+	if err != nil {
+		return 0, fmt.Errorf("ltxio: create temp file: %w", err)
+	}
+	tmpPath := tmp.Name()
+	defer func() {
+		if err != nil {
+			tmp.Close()
+			os.Remove(tmpPath)
+		}
+	}()
+
+	// DecodeDatabaseTo decodes the header, streams every page (verifying the
+	// per-page checksum as it goes for snapshot files), and calls Close(),
+	// which verifies both the whole-file CRC64 checksum and the trailer's
+	// post-apply checksum. Any mismatch — including a mid-file bit flip —
+	// surfaces here before we ever touch dbPath.
+	if err = dec.DecodeDatabaseTo(tmp); err != nil {
+		return 0, fmt.Errorf("ltxio: decode snapshot: %w", err)
+	}
+
+	if err = tmp.Sync(); err != nil {
+		return 0, err
+	}
+	if err = tmp.Close(); err != nil {
+		return 0, err
+	}
+	if err = os.Rename(tmpPath, dbPath); err != nil {
+		return 0, err
+	}
+	os.Remove(dbPath + "-wal")
+	os.Remove(dbPath + "-shm")
+
+	h := dec.Header()
+	return uint64(h.MaxTXID), nil
+}
