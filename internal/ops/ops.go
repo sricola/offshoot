@@ -7,6 +7,7 @@ package ops
 import (
 	"bytes"
 	"database/sql"
+	"errors"
 	"fmt"
 	"io"
 	"os"
@@ -223,8 +224,20 @@ func (w *Workspace) Checkpoint(db, branch, name string) (uint64, error) {
 	if err := ltxio.EncodeSnapshot(path, txid, &buf); err != nil {
 		return 0, err
 	}
-	if _, err := w.Store.B.PutIf(store.SnapshotKey(ref.Lineage, ref.Epoch, txid), buf.Bytes(), ""); err != nil {
-		return 0, err
+	snapKey := store.SnapshotKey(ref.Lineage, ref.Epoch, txid)
+	if _, err := w.Store.B.PutIf(snapKey, buf.Bytes(), ""); err != nil {
+		if !errors.Is(err, store.ErrCAS) {
+			return 0, err
+		}
+		// An object already lives at this deterministic key. HeadTXID only
+		// ever advances via a successful ref write, and nothing is written
+		// under a txid beyond HeadTXID+1 until that happens, so nothing can
+		// legitimately reference this key yet: it can only be an orphan left
+		// by a crashed prior Checkpoint attempt (snapshot uploaded, ref write
+		// never landed). Safe to overwrite unconditionally and proceed.
+		if err := w.Store.B.Put(snapKey, buf.Bytes()); err != nil {
+			return 0, err
+		}
 	}
 	ref.HeadTXID = txid
 	if ref.Checkpoints == nil {
@@ -232,9 +245,14 @@ func (w *Workspace) Checkpoint(db, branch, name string) (uint64, error) {
 	}
 	ref.Checkpoints[name] = txid
 	if _, err := w.Store.PutRef(db, branch, ref, etag); err != nil {
-		// The snapshot object is orphaned inside a still-live lineage; GC
-		// ignores live lineages, so it is retained harmlessly. Loud error.
-		return 0, fmt.Errorf("ops: ref update lost a race (retry): %w", err)
+		// Roll back the snapshot upload so a retry's create-only put at this
+		// same deterministic key doesn't get wedged behind this attempt's
+		// orphan (mirrors Fork's cleanup-on-ref-failure pattern).
+		w.Store.B.Delete(snapKey)
+		if errors.Is(err, store.ErrCAS) {
+			return 0, fmt.Errorf("ops: ref update lost a race (retry): %w", err)
+		}
+		return 0, fmt.Errorf("ops: ref update for checkpoint %q on %s@%s: %w", name, db, branch, err)
 	}
 	return txid, nil
 }
