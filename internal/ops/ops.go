@@ -332,8 +332,22 @@ func (w *Workspace) Checkpoint(db, branch, name string) (uint64, error) {
 	if _, err := w.Store.PutRef(db, branch, ref, etag); err != nil {
 		// Roll back the snapshot upload so a retry's create-only put at this
 		// same deterministic key doesn't get wedged behind this attempt's
-		// orphan (mirrors Fork's cleanup-on-ref-failure pattern).
-		w.Store.B.Delete(snapKey)
+		// orphan (mirrors Fork's cleanup-on-ref-failure pattern) -- BUT only
+		// if it's actually still an orphan. Under concurrent Checkpoint calls
+		// on the same branch, every racer computes the same deterministic
+		// txid (HeadTXID+1) and therefore the same snapKey. By the time our
+		// own PutRef loses the CAS race, another attempt may have ALREADY
+		// landed its ref pointing at this exact key. Deleting unconditionally
+		// would rip the snapshot object out from under the winner, leaving a
+		// checkpoint recorded in the ref with no backing object -- silent
+		// corruption dressed up as a loud failure for the loser only. Re-read
+		// the ref and only clean up if we can positively confirm nothing
+		// committed currently references this txid in this lineage; on any
+		// doubt (including a failed re-read), leave the object alone --
+		// worst case it's a harmless orphan for a later GC pass.
+		if cur, _, gerr := w.Store.GetRef(db, branch); gerr == nil && (cur.Lineage != ref.Lineage || cur.HeadTXID < txid) {
+			w.Store.B.Delete(snapKey)
+		}
 		if errors.Is(err, store.ErrCAS) {
 			return 0, fmt.Errorf("ops: ref update lost a race (retry): %w", err)
 		}

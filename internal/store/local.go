@@ -54,15 +54,29 @@ func (l *Local) Get(key string) ([]byte, string, error) {
 	return data, etagOf(data), nil
 }
 
+// write does a write-to-temp-then-rename. The temp file gets a unique name
+// per call (via os.CreateTemp) rather than a fixed p+".tmp": Put has no
+// per-key lock (PutIf's lock guards its own read-then-write, but Put is used
+// standalone wherever last-write-wins is intentional, e.g. Checkpoint's
+// orphan-snapshot overwrite and GC's tombstone-list write), so two
+// goroutines can legitimately call write() on the same p concurrently. A
+// shared fixed temp name means one goroutine's os.Create (O_TRUNC) or
+// os.Rename can clobber or disappear out from under the other mid-write,
+// surfacing as a spurious "rename ... no such file or directory" — a real
+// bug, not a benign race, since it aborts a write that should have quietly
+// lost or won. A unique temp name per call makes each writer self-contained;
+// the final os.Rename is still atomic, so the last one to rename wins
+// cleanly with no torn or missing file in between.
 func (l *Local) write(p string, data []byte) error {
-	if err := os.MkdirAll(filepath.Dir(p), 0o755); err != nil {
+	dir := filepath.Dir(p)
+	if err := os.MkdirAll(dir, 0o755); err != nil {
 		return err
 	}
-	tmp := p + ".tmp"
-	f, err := os.Create(tmp)
+	f, err := os.CreateTemp(dir, filepath.Base(p)+".tmp-*")
 	if err != nil {
 		return err
 	}
+	tmp := f.Name()
 	if _, err := f.Write(data); err != nil {
 		f.Close()
 		os.Remove(tmp)
@@ -77,7 +91,11 @@ func (l *Local) write(p string, data []byte) error {
 		os.Remove(tmp)
 		return err
 	}
-	return os.Rename(tmp, p)
+	if err := os.Rename(tmp, p); err != nil {
+		os.Remove(tmp)
+		return err
+	}
+	return nil
 }
 
 func (l *Local) Put(key string, data []byte) error {
@@ -162,7 +180,7 @@ func (l *Local) List(prefix string) ([]string, error) {
 		if err != nil || d.IsDir() {
 			return err
 		}
-		if strings.HasSuffix(p, ".lock") || strings.HasSuffix(p, ".tmp") {
+		if strings.HasSuffix(p, ".lock") || strings.Contains(filepath.Base(p), ".tmp-") {
 			return nil
 		}
 		rel, err := filepath.Rel(root, p)
