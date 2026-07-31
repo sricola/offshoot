@@ -1006,6 +1006,55 @@ func TestInitAndOpenAgainstS3Spec(t *testing.T) {
 	}
 }
 
+// TestCheckoutRootSeparatesDistinctEndpoints guards the fix for the checkout
+// cache collision: checkoutRoot must key off the RESOLVED store identity
+// (store.StoreIdentity), not the raw spec string. For one fixed
+// "s3://bucket/p" spec, two different OFFSHOOT_S3_ENDPOINT values must
+// produce two different checkout roots (otherwise a session against MinIO
+// and a later session against real AWS, using the identical spec string,
+// would land in the same local checkout cache dir and silently discard
+// un-checkpointed edits). The trailing-slash spelling of the same spec under
+// the same endpoint must land on the SAME checkout root.
+func TestCheckoutRootSeparatesDistinctEndpoints(t *testing.T) {
+	// OFFSHOOT_CHECKOUTS must be unset for this test: checkoutRoot only
+	// consults StoreIdentity when it falls through to the hashed-cache-dir
+	// path, i.e. when OFFSHOOT_CHECKOUTS isn't overriding it.
+	prevCheckouts, hadCheckouts := os.LookupEnv("OFFSHOOT_CHECKOUTS")
+	os.Unsetenv("OFFSHOOT_CHECKOUTS")
+	t.Cleanup(func() {
+		if hadCheckouts {
+			os.Setenv("OFFSHOOT_CHECKOUTS", prevCheckouts)
+		} else {
+			os.Unsetenv("OFFSHOOT_CHECKOUTS")
+		}
+	})
+
+	t.Setenv("OFFSHOOT_S3_ENDPOINT", "http://minio.local:9000")
+	t.Setenv("OFFSHOOT_S3_REGION", "us-east-1")
+	t.Setenv("OFFSHOOT_S3_PATH_STYLE", "1")
+
+	rootMinio, err := checkoutRoot("s3://bucket/p")
+	if err != nil {
+		t.Fatal(err)
+	}
+	rootMinioTrailingSlash, err := checkoutRoot("s3://bucket/p/")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if rootMinio != rootMinioTrailingSlash {
+		t.Fatalf("s3://bucket/p and s3://bucket/p/ under the same endpoint must share a checkout root: %q vs %q", rootMinio, rootMinioTrailingSlash)
+	}
+
+	t.Setenv("OFFSHOOT_S3_ENDPOINT", "http://real-aws.example.com")
+	rootAWS, err := checkoutRoot("s3://bucket/p")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if rootAWS == rootMinio {
+		t.Fatalf("the same spec string under different OFFSHOOT_S3_ENDPOINT values must NOT share a checkout root, got %q for both", rootMinio)
+	}
+}
+
 func TestCorruptSnapshotFailsClosedEndToEnd(t *testing.T) {
 	if _, err := exec.LookPath("sqlite3"); err != nil {
 		t.Skip("sqlite3 CLI not on PATH")
