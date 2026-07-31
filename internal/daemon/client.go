@@ -8,6 +8,7 @@ import (
 	"net"
 	"os"
 	"path/filepath"
+	"strings"
 	"time"
 )
 
@@ -48,14 +49,20 @@ func Call(socketPath string, req Request) (Response, error) {
 	}
 	defer c.Close()
 	if err := json.NewEncoder(c).Encode(req); err != nil {
-		return Response{}, err
+		return Response{}, fmt.Errorf("daemon: encoding request: %w", err)
 	}
 	var resp Response
 	if err := json.NewDecoder(c).Decode(&resp); err != nil {
 		return Response{}, fmt.Errorf("daemon: reading response: %w", err)
 	}
 	if !resp.OK && resp.Error != "" {
-		return resp, fmt.Errorf("daemon: %s", resp.Error)
+		// The server's error is already prefixed with "daemon: " (see
+		// errResp in server.go); strip that before adding our own so a
+		// refusal reads as "daemon: <message>", not "daemon: daemon: ...".
+		// Errors that bubble up from other packages (e.g. "session: ...")
+		// keep their own prefix, still distinguishable from a dial or
+		// decode failure above.
+		return resp, fmt.Errorf("daemon: %s", strings.TrimPrefix(resp.Error, "daemon: "))
 	}
 	return resp, nil
 }
