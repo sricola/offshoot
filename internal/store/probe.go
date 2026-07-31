@@ -6,9 +6,13 @@ import (
 	"encoding/hex"
 	"errors"
 	"fmt"
+	"os"
 )
 
 // ErrNoCAS reports a backend that does not enforce conditional writes.
+// offshoot's single-writer-per-ref guarantee rests entirely on these
+// semantics, so a store that fails the probe is refused outright rather than
+// used with silently weaker safety.
 var ErrNoCAS = errors.New("store: backend does not enforce conditional writes")
 
 // ProbeCAS verifies create-only and compare-and-swap enforcement. offshoot's
@@ -18,10 +22,14 @@ var ErrNoCAS = errors.New("store: backend does not enforce conditional writes")
 func ProbeCAS(b Backend) error {
 	buf := make([]byte, 8)
 	if _, err := rand.Read(buf); err != nil {
-		return err
+		return fmt.Errorf("store: probe: generate key: %w", err)
 	}
 	key := "probe/cas-" + hex.EncodeToString(buf)
-	defer b.Delete(key)
+	defer func() {
+		if err := b.Delete(key); err != nil {
+			fmt.Fprintf(os.Stderr, "offshoot: warning: probe cleanup failed for key %s; safe to delete manually\n", key)
+		}
+	}()
 
 	first := []byte("offshoot-probe-1")
 	etag, err := b.PutIf(key, first, "")

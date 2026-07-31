@@ -24,8 +24,13 @@ func TestProbeCASPassesLocal(t *testing.T) {
 }
 
 func TestProbeCASPassesFakeS3(t *testing.T) {
-	if err := store.ProbeCAS(newFakeBacked(t)); err != nil {
+	b := newFakeBacked(t)
+	if err := store.ProbeCAS(b); err != nil {
 		t.Fatalf("fake honoring preconditions must pass: %v", err)
+	}
+	keys, _ := b.List("probe/")
+	if len(keys) != 0 {
+		t.Fatalf("probe must clean up after itself, left: %v", keys)
 	}
 }
 
