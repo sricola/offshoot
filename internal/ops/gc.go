@@ -183,6 +183,8 @@ func (w *Workspace) GC(grace time.Duration) (tombstoned, deleted int, err error)
 	// its eventual sweep by one grace period. It can never cause a live or
 	// still-within-grace lineage to be deleted early.
 	data, _ := json.Marshal(stones)
-	w.Store.B.Put(tombstoneKey, data)
+	if err := w.Store.B.Put(tombstoneKey, data); err != nil {
+		return tombstoned, deleted, err
+	}
 	return tombstoned, deleted, nil
 }

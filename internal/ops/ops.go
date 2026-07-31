@@ -611,6 +611,12 @@ func (w *Workspace) Promote(db, source, target string, force bool) (uint64, erro
 	if source == target {
 		return 0, fmt.Errorf("ops: cannot promote a branch onto itself")
 	}
+	if err := store.ValidateName(source); err != nil {
+		return 0, err
+	}
+	if err := store.ValidateName(target); err != nil {
+		return 0, err
+	}
 	src, _, err := w.Store.GetRef(db, source)
 	if err != nil {
 		return 0, err
