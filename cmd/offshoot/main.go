@@ -4,6 +4,7 @@ package main
 import (
 	"fmt"
 	"os"
+	"strings"
 	"time"
 
 	"github.com/offshoot-db/offshoot/internal/ops"
@@ -22,6 +23,7 @@ Usage:
   offshoot destroy <db>[@branch] [--force]   delete a branch (requires --force for protected)
   offshoot gc [--grace duration]     garbage collect unreachable lineages (default grace: 1h)
   offshoot path <db>[@branch]        print the checkout path
+  offshoot status                    print all branches and their state
 
 Store location: -store DIR or OFFSHOOT_STORE, default ./.offshoot
 `
@@ -200,6 +202,23 @@ func run(args []string) error {
 			return err
 		}
 		fmt.Printf("gc: tombstoned %d, deleted %d lineages\n", tombstoned, deleted)
+		return nil
+	case "status":
+		sts, err := w.Status()
+		if err != nil {
+			return err
+		}
+		for _, s := range sts {
+			flags := ""
+			if s.Protected {
+				flags += " protected"
+			}
+			if s.CheckedOut {
+				flags += " checked-out"
+			}
+			fmt.Printf("%s@%s txid=%d checkpoints=[%s]%s\n",
+				s.DB, s.Branch, s.HeadTXID, strings.Join(s.Checkpoints, ","), flags)
+		}
 		return nil
 	default:
 		return fmt.Errorf("unknown command %q\n%s", cmd, usage)
