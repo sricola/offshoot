@@ -1157,3 +1157,48 @@ func TestCorruptSnapshotFailsClosedEndToEnd(t *testing.T) {
 		t.Fatal("checkout of corrupt snapshot must fail closed")
 	}
 }
+
+func TestMaterializeUsesCheckpointEpochNotRefEpoch(t *testing.T) {
+	if _, err := exec.LookPath("sqlite3"); err != nil {
+		t.Skip("sqlite3 CLI not on PATH")
+	}
+	w := newWS(t)
+	if err := w.Create("app"); err != nil {
+		t.Fatal(err)
+	}
+	path, err := w.Checkout("app", "main")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if out, err := exec.Command("sqlite3", path,
+		"CREATE TABLE t (v); INSERT INTO t VALUES (1);").CombinedOutput(); err != nil {
+		t.Fatalf("%v: %s", err, out)
+	}
+	if _, err := w.Checkpoint("app", "main", "v1"); err != nil {
+		t.Fatal(err)
+	}
+
+	// Simulate a later epoch bump: the ref advances, but the objects written
+	// under the old epoch stay exactly where they are.
+	ref, etag, err := w.Store.GetRef("app", "main")
+	if err != nil {
+		t.Fatal(err)
+	}
+	ref.Epoch++
+	if _, err := w.Store.PutRef("app", "main", ref, etag); err != nil {
+		t.Fatal(err)
+	}
+
+	// Checkout and fork --at must both still find the old-epoch objects.
+	p2, err := w.Checkout("app", "main")
+	if err != nil {
+		t.Fatalf("checkout after epoch bump: %v", err)
+	}
+	got, _ := exec.Command("sqlite3", p2, "SELECT v FROM t;").Output()
+	if string(got) != "1\n" {
+		t.Fatalf("content after epoch bump: %q", got)
+	}
+	if _, err := w.Fork("app", "main", "child", "v1"); err != nil {
+		t.Fatalf("fork --at across an epoch bump: %v", err)
+	}
+}
