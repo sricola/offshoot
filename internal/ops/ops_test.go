@@ -145,6 +145,61 @@ func TestCheckpointAndRematerialize(t *testing.T) {
 	}
 }
 
+// TestCheckpointRecoversFromOrphanedSnapshot simulates a crashed prior
+// Checkpoint attempt: the snapshot object at the deterministic key
+// (lineage, epoch, HeadTXID+1) was uploaded but the ref update never landed
+// (process died, CAS lost, I/O error). A subsequent Checkpoint's create-only
+// put at that same key must not wedge forever behind the orphan; it must
+// recover and succeed with the real (non-garbage) data.
+func TestCheckpointRecoversFromOrphanedSnapshot(t *testing.T) {
+	if _, err := exec.LookPath("sqlite3"); err != nil {
+		t.Skip("sqlite3 CLI not on PATH")
+	}
+	w := newWS(t)
+	if err := w.Create("app"); err != nil {
+		t.Fatal(err)
+	}
+	path, err := w.Checkout("app", "main")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if out, err := exec.Command("sqlite3", path,
+		"CREATE TABLE t (v); INSERT INTO t VALUES (1),(2),(3);").CombinedOutput(); err != nil {
+		t.Fatalf("%v: %s", err, out)
+	}
+
+	ref, _, err := w.Store.GetRef("app", "main")
+	if err != nil {
+		t.Fatal(err)
+	}
+	// Pre-seed the snapshot key Checkpoint is about to write, with garbage
+	// bytes, simulating a crashed prior attempt whose ref write never landed.
+	orphanKey := store.SnapshotKey(ref.Lineage, ref.Epoch, ref.HeadTXID+1)
+	if err := w.Store.B.Put(orphanKey, []byte("garbage-not-a-valid-ltx-snapshot")); err != nil {
+		t.Fatal(err)
+	}
+
+	txid, err := w.Checkpoint("app", "main", "v1")
+	if err != nil {
+		t.Fatalf("Checkpoint must recover from an orphaned snapshot object, got: %v", err)
+	}
+	if txid != ref.HeadTXID+1 {
+		t.Errorf("txid = %d, want %d", txid, ref.HeadTXID+1)
+	}
+
+	// A fresh checkout must contain the real data, not the garbage that was
+	// squatting on the snapshot key.
+	want, _ := exec.Command("sqlite3", path, ".dump").Output()
+	path2, err := w.Checkout("app", "main")
+	if err != nil {
+		t.Fatal(err)
+	}
+	got, _ := exec.Command("sqlite3", path2, ".dump").Output()
+	if string(want) != string(got) {
+		t.Fatal("checkout after recovered checkpoint does not match real data")
+	}
+}
+
 func TestCheckpointFailsCleanlyUnderLiveWriter(t *testing.T) {
 	w := newWS(t)
 	if err := w.Create("app"); err != nil {
