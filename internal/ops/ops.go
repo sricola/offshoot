@@ -351,6 +351,22 @@ func (w *Workspace) warnIfUncheckpointed(db, branch string, headTXID uint64) {
 	fmt.Fprintf(os.Stderr, "offshoot: warning: checkout of %s@%s has un-checkpointed changes; forking last committed state (txid %d)\n", db, branch, headTXID)
 }
 
+// copySnapshotToNewLineage copies the snapshot at (src.Lineage, src.Epoch,
+// txid) into a brand-new lineage (epoch 1) and returns the lineage id.
+// This is the primitive behind fork, rollback, and promote: every branch
+// repoint gets a fresh lineage, preserving one-writer-per-lineage.
+func (w *Workspace) copySnapshotToNewLineage(src store.Ref, txid uint64) (string, error) {
+	data, _, err := w.Store.B.Get(store.SnapshotKey(src.Lineage, src.Epoch, txid))
+	if err != nil {
+		return "", fmt.Errorf("ops: snapshot txid %d in lineage %s: %w", txid, src.Lineage, err)
+	}
+	lineage := store.NewLineageID()
+	if _, err := w.Store.B.PutIf(store.SnapshotKey(lineage, 1, txid), data, ""); err != nil {
+		return "", err
+	}
+	return lineage, nil
+}
+
 // Fork creates newBranch from db@srcBranch at head or a named checkpoint.
 func (w *Workspace) Fork(db, srcBranch, newBranch, at string) (uint64, error) {
 	if err := store.ValidateName(newBranch); err != nil {
@@ -372,13 +388,9 @@ func (w *Workspace) Fork(db, srcBranch, newBranch, at string) (uint64, error) {
 	}
 	// Materialized fork point: copy the source snapshot into the child's own
 	// lineage so the child never references parent storage.
-	data, _, err := w.Store.B.Get(store.SnapshotKey(src.Lineage, src.Epoch, txid))
+	childLineage, err := w.copySnapshotToNewLineage(src, txid)
 	if err != nil {
 		return 0, fmt.Errorf("ops: source snapshot txid %d: %w", txid, err)
-	}
-	childLineage := store.NewLineageID()
-	if _, err := w.Store.B.PutIf(store.SnapshotKey(childLineage, 1, txid), data, ""); err != nil {
-		return 0, err
 	}
 	child := store.Ref{
 		Schema: 1, Lineage: childLineage, Epoch: 1, HeadTXID: txid,
@@ -389,6 +401,104 @@ func (w *Workspace) Fork(db, srcBranch, newBranch, at string) (uint64, error) {
 		// Branch already exists (or lost a race): remove the orphan snapshot.
 		w.Store.B.Delete(store.SnapshotKey(childLineage, 1, txid))
 		return 0, fmt.Errorf("ops: fork %s@%s: %w", db, newBranch, err)
+	}
+	return txid, nil
+}
+
+// Rollback repoints db@branch at a NEW lineage seeded from checkpoint `to`,
+// re-materializes the fixed checkout path (after a lock probe — fails
+// cleanly if the checkout is held open), and returns the checkout path.
+// The old lineage is orphaned (collected later by GC). Checkpoints at or
+// before `to` are kept; later ones are dropped.
+func (w *Workspace) Rollback(db, branch, to string) (string, error) {
+	ref, etag, err := w.Store.GetRef(db, branch)
+	if err != nil {
+		return "", err
+	}
+	txid, ok := ref.Checkpoints[to]
+	if !ok {
+		return "", fmt.Errorf("ops: no checkpoint %q on %s@%s", to, db, branch)
+	}
+	path := w.CheckoutPath(db, branch)
+	if _, err := os.Stat(path); err == nil {
+		if err := quiesce(path); err != nil {
+			return "", fmt.Errorf("ops: checkout in use; close connections before rollback: %w", err)
+		}
+	}
+	lineage, err := w.copySnapshotToNewLineage(ref, txid)
+	if err != nil {
+		return "", err
+	}
+	kept := map[string]uint64{}
+	for name, t := range ref.Checkpoints {
+		if t <= txid {
+			kept[name] = t
+		}
+	}
+	next := ref
+	next.Lineage, next.Epoch, next.HeadTXID, next.Checkpoints = lineage, 1, txid, kept
+	if _, err := w.Store.PutRef(db, branch, next, etag); err != nil {
+		w.Store.B.Delete(store.SnapshotKey(lineage, 1, txid))
+		return "", fmt.Errorf("ops: rollback lost a race (retry): %w", err)
+	}
+	if err := os.MkdirAll(filepath.Dir(path), 0o755); err != nil {
+		return "", err
+	}
+	if err := w.materialize(next, txid, path); err != nil {
+		return "", err
+	}
+	// The checkout now equals committed state: refresh the fingerprint so a
+	// later Fork doesn't spuriously warn about "un-checkpointed changes".
+	if err := writeSum(path); err != nil {
+		return "", err
+	}
+	return path, nil
+}
+
+// Promote repoints db@target at a NEW lineage seeded from db@source's head
+// (promote-as-fork, spec § Promote). Requires --force for protected targets
+// (force param). Source branch survives unchanged. Target's old lineage is
+// orphaned. Target's checkout (if any) is re-materialized after a lock probe.
+// Target's checkpoint map is reset to {"promote": txid}.
+func (w *Workspace) Promote(db, source, target string, force bool) (uint64, error) {
+	src, _, err := w.Store.GetRef(db, source)
+	if err != nil {
+		return 0, err
+	}
+	tgt, tgtEtag, err := w.Store.GetRef(db, target)
+	if err != nil {
+		return 0, err
+	}
+	if tgt.Protected && !force {
+		return 0, fmt.Errorf("ops: %s@%s is protected; use --force", db, target)
+	}
+	txid := src.HeadTXID
+	lineage, err := w.copySnapshotToNewLineage(src, txid)
+	if err != nil {
+		return 0, err
+	}
+	next := tgt
+	next.Lineage, next.Epoch, next.HeadTXID = lineage, 1, txid
+	next.Checkpoints = map[string]uint64{"promote": txid}
+	next.Parent = fmt.Sprintf("%s@%s@%d", db, source, txid)
+	if _, err := w.Store.PutRef(db, target, next, tgtEtag); err != nil {
+		w.Store.B.Delete(store.SnapshotKey(lineage, 1, txid))
+		return 0, fmt.Errorf("ops: promote lost a race (retry): %w", err)
+	}
+	// Refresh the target checkout if one exists and is quiescible.
+	path := w.CheckoutPath(db, target)
+	if _, err := os.Stat(path); err == nil {
+		if err := quiesce(path); err != nil {
+			return txid, fmt.Errorf("ops: promoted, but checkout %s is in use and was NOT refreshed: %w", path, err)
+		}
+		if err := w.materialize(next, txid, path); err != nil {
+			return txid, err
+		}
+		// The checkout now equals committed state: refresh the fingerprint so
+		// a later Fork doesn't spuriously warn about "un-checkpointed changes".
+		if err := writeSum(path); err != nil {
+			return txid, err
+		}
 	}
 	return txid, nil
 }
