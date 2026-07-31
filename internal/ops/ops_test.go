@@ -3,14 +3,33 @@ package ops
 import (
 	"database/sql"
 	"errors"
+	"io"
 	"os"
 	"os/exec"
 	"path/filepath"
+	"strings"
 	"testing"
 
 	_ "github.com/mattn/go-sqlite3"
 	"github.com/offshoot-db/offshoot/internal/store"
 )
+
+// captureStderr redirects os.Stderr for the duration of fn and returns
+// everything written to it.
+func captureStderr(t *testing.T, fn func()) string {
+	t.Helper()
+	orig := os.Stderr
+	r, wr, err := os.Pipe()
+	if err != nil {
+		t.Fatal(err)
+	}
+	os.Stderr = wr
+	fn()
+	wr.Close()
+	os.Stderr = orig
+	out, _ := io.ReadAll(r)
+	return string(out)
+}
 
 func newWS(t *testing.T) *Workspace {
 	t.Helper()
@@ -308,5 +327,74 @@ func TestForkAtCheckpoint(t *testing.T) {
 	}
 	if _, err := w.Fork("app", "main", "old", ""); err == nil {
 		t.Fatal("existing branch name must fail")
+	}
+}
+
+// TestForkWarnsOnUncheckpointedChanges verifies the plan promise: forking a
+// branch whose checkout has un-checkpointed changes proceeds from the last
+// committed state and prints a warning naming the txid used. Forking right
+// after a fresh checkpoint (no drift) must stay silent.
+func TestForkWarnsOnUncheckpointedChanges(t *testing.T) {
+	if _, err := exec.LookPath("sqlite3"); err != nil {
+		t.Skip("sqlite3 CLI not on PATH")
+	}
+	w := newWS(t)
+	if err := w.Create("app"); err != nil {
+		t.Fatal(err)
+	}
+	path, err := w.Checkout("app", "main")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if out, err := exec.Command("sqlite3", path,
+		"CREATE TABLE t (v); INSERT INTO t VALUES (1);").CombinedOutput(); err != nil {
+		t.Fatalf("%v: %s", err, out)
+	}
+	if _, err := w.Checkpoint("app", "main", "v1"); err != nil {
+		t.Fatal(err)
+	}
+
+	// No-warning case: fork immediately after a fresh checkpoint (checkout
+	// matches the committed state exactly).
+	stderr := captureStderr(t, func() {
+		if _, err := w.Fork("app", "main", "clean", ""); err != nil {
+			t.Fatal(err)
+		}
+	})
+	if stderr != "" {
+		t.Fatalf("unexpected warning forking a freshly-checkpointed branch: %q", stderr)
+	}
+
+	// Write MORE data without checkpointing.
+	if out, err := exec.Command("sqlite3", path, "INSERT INTO t VALUES (2);").CombinedOutput(); err != nil {
+		t.Fatalf("%v: %s", err, out)
+	}
+
+	var txid uint64
+	stderr = captureStderr(t, func() {
+		txid, err = w.Fork("app", "main", "dirty", "")
+		if err != nil {
+			t.Fatal(err)
+		}
+	})
+	if !strings.Contains(stderr, "un-checkpointed changes") {
+		t.Fatalf("warning missing expected text: %q", stderr)
+	}
+	if !strings.Contains(stderr, "txid 2") {
+		t.Fatalf("warning does not name the txid used: %q", stderr)
+	}
+	if txid != 2 {
+		t.Fatalf("fork txid = %d, want 2 (last committed, not the dirty write)", txid)
+	}
+
+	// The fork's content must be the v1 (committed) state, not the
+	// uncommitted second insert.
+	cpath, err := w.Checkout("app", "dirty")
+	if err != nil {
+		t.Fatal(err)
+	}
+	got, _ := exec.Command("sqlite3", cpath, "SELECT v FROM t ORDER BY v;").Output()
+	if string(got) != "1\n" {
+		t.Fatalf("fork content: %q, want only the checkpointed row", got)
 	}
 }

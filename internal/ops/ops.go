@@ -6,7 +6,9 @@ package ops
 
 import (
 	"bytes"
+	"crypto/sha256"
 	"database/sql"
+	"encoding/hex"
 	"errors"
 	"fmt"
 	"io"
@@ -167,7 +169,55 @@ func (w *Workspace) Checkout(db, branch string) (string, error) {
 	if err := w.materialize(ref, ref.HeadTXID, path); err != nil {
 		return "", err
 	}
+	if err := writeSum(path); err != nil {
+		return "", err
+	}
 	return path, nil
+}
+
+// writeSum computes the hex SHA-256 of the file at path and writes it to
+// path + ".sum". This is the checkout fingerprint: it records what the
+// checkout file looked like at the moment it was last known to equal a
+// committed state (fresh materialize, or a successful checkpoint encode).
+func writeSum(path string) error {
+	sum, err := fileSum(path)
+	if err != nil {
+		return err
+	}
+	return os.WriteFile(path+".sum", []byte(sum), 0o644)
+}
+
+// sumMatches reports whether the file at path still matches its recorded
+// .sum fingerprint. A missing .sum file means unknown provenance (e.g. a
+// checkout materialized before this fingerprint existed, or a manually
+// dropped-in file) and is treated as a match so callers don't warn
+// spuriously.
+func sumMatches(path string) (bool, error) {
+	want, err := os.ReadFile(path + ".sum")
+	if err != nil {
+		if os.IsNotExist(err) {
+			return true, nil
+		}
+		return false, err
+	}
+	got, err := fileSum(path)
+	if err != nil {
+		return false, err
+	}
+	return string(want) == got, nil
+}
+
+func fileSum(path string) (string, error) {
+	f, err := os.Open(path)
+	if err != nil {
+		return "", err
+	}
+	defer f.Close()
+	h := sha256.New()
+	if _, err := io.Copy(h, f); err != nil {
+		return "", err
+	}
+	return hex.EncodeToString(h.Sum(nil)), nil
 }
 
 func (w *Workspace) materialize(ref store.Ref, txid uint64, dst string) error {
@@ -224,6 +274,12 @@ func (w *Workspace) Checkpoint(db, branch, name string) (uint64, error) {
 	if err := ltxio.EncodeSnapshot(path, txid, &buf); err != nil {
 		return 0, err
 	}
+	// The checkout now equals the state being committed (quiesce merged the
+	// WAL, encode captured it): refresh the fingerprint so a later Fork
+	// doesn't see stale writes as un-checkpointed.
+	if err := writeSum(path); err != nil {
+		return 0, err
+	}
 	snapKey := store.SnapshotKey(ref.Lineage, ref.Epoch, txid)
 	if _, err := w.Store.B.PutIf(snapKey, buf.Bytes(), ""); err != nil {
 		if !errors.Is(err, store.ErrCAS) {
@@ -274,6 +330,27 @@ func quiesce(path string) error {
 	return nil
 }
 
+// warnIfUncheckpointed checks db@branch's checkout (if one exists) for
+// un-checkpointed changes and, if any are found, prints a warning to
+// os.Stderr noting that the caller (Fork) is proceeding from the last
+// committed state at headTXID. It never fails the caller's operation: any
+// error along the way is treated as "nothing to warn about".
+func (w *Workspace) warnIfUncheckpointed(db, branch string, headTXID uint64) {
+	path := w.CheckoutPath(db, branch)
+	if _, err := os.Stat(path); err != nil {
+		return
+	}
+	if err := quiesce(path); err != nil {
+		fmt.Fprintf(os.Stderr, "offshoot: warning: checkout of %s@%s is busy; forking last committed state (txid %d)\n", db, branch, headTXID)
+		return
+	}
+	match, err := sumMatches(path)
+	if err != nil || match {
+		return
+	}
+	fmt.Fprintf(os.Stderr, "offshoot: warning: checkout of %s@%s has un-checkpointed changes; forking last committed state (txid %d)\n", db, branch, headTXID)
+}
+
 // Fork creates newBranch from db@srcBranch at head or a named checkpoint.
 func (w *Workspace) Fork(db, srcBranch, newBranch, at string) (uint64, error) {
 	if err := store.ValidateName(newBranch); err != nil {
@@ -290,6 +367,8 @@ func (w *Workspace) Fork(db, srcBranch, newBranch, at string) (uint64, error) {
 			return 0, fmt.Errorf("ops: no checkpoint %q on %s@%s", at, db, srcBranch)
 		}
 		txid = t
+	} else {
+		w.warnIfUncheckpointed(db, srcBranch, txid)
 	}
 	// Materialized fork point: copy the source snapshot into the child's own
 	// lineage so the child never references parent storage.
