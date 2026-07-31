@@ -55,15 +55,18 @@ func (s *Session) Flush(name string) (uint64, error) {
 	// capture.Engine.DrainNow's doc comment.
 	// This timeout must comfortably exceed DrainNow's own worst case, not
 	// just approximate it: a single pollOnce triggered by DrainNow can, under
-	// write contention, spend up to ~10s inside the capture engine alone —
+	// write contention, spend up to ~25s inside the capture engine alone —
+	// drainUntil's own drainSafetyDeadline (15s) backstopping the drain-to-
+	// target phase itself, plus up to ~10s more if a takeover follows:
 	// checkpoint() retries busy for up to 5s, and a takeover that completes
 	// its checkpoint but then needs beginReadRetry to reacquire the read
 	// lock retries for up to another 5s (see internal/capture/engine.go's
-	// checkpoint and beginReadRetry). A 5s flush-side timeout could then
-	// spuriously fire under exactly the contention DrainNow exists to ride
-	// out. 30s leaves generous headroom above that ~10s budget; if the
-	// engine's own retry budgets ever grow, this constant should be
-	// revisited rather than left silently coupled to them.
+	// drainSafetyDeadline, checkpoint, and beginReadRetry). A tighter
+	// flush-side timeout could then spuriously fire under exactly the
+	// contention DrainNow exists to ride out. 30s leaves a real (if not
+	// huge) margin above that ~25s budget; if the engine's own retry or
+	// drain-safety budgets ever grow, this constant should be revisited
+	// rather than left silently coupled to them.
 	dctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
 	err := s.captured.DrainNow(dctx)
 	cancel()
