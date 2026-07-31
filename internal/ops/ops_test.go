@@ -15,6 +15,7 @@ import (
 
 	_ "github.com/mattn/go-sqlite3"
 	"github.com/offshoot-db/offshoot/internal/store"
+	"github.com/offshoot-db/offshoot/internal/store/storetest"
 )
 
 // captureStderr redirects os.Stderr for the duration of fn and returns
@@ -967,6 +968,41 @@ func TestConcurrentCheckpointsOnlyOneWins(t *testing.T) {
 		if _, _, err := w.Store.B.Get(store.SnapshotKey(r.Lineage, r.Epoch, txid)); err != nil {
 			t.Fatalf("recorded checkpoint %s has no snapshot object: %v", name, err)
 		}
+	}
+}
+
+func TestInitAndOpenAgainstS3Spec(t *testing.T) {
+	f := storetest.NewFakeS3(t)
+	t.Setenv("AWS_ACCESS_KEY_ID", "test")
+	t.Setenv("AWS_SECRET_ACCESS_KEY", "test")
+	t.Setenv("OFFSHOOT_S3_ENDPOINT", f.URL())
+	t.Setenv("OFFSHOOT_S3_REGION", "us-east-1")
+	t.Setenv("OFFSHOOT_S3_PATH_STYLE", "1")
+	t.Setenv("OFFSHOOT_CHECKOUTS", t.TempDir())
+
+	spec := "s3://" + f.Bucket() + "/p"
+	w, err := Init(spec)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := w.Create("app"); err != nil {
+		t.Fatal(err)
+	}
+	path, err := w.Checkout("app", "main")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !strings.HasPrefix(path, os.Getenv("OFFSHOOT_CHECKOUTS")) {
+		t.Fatalf("remote-store checkout must live under OFFSHOOT_CHECKOUTS, got %s", path)
+	}
+	// Re-open the same store and see the database.
+	w2, err := Open(spec)
+	if err != nil {
+		t.Fatal(err)
+	}
+	sts, err := w2.Status()
+	if err != nil || len(sts) != 1 || sts[0].DB != "app" {
+		t.Fatalf("status=%v err=%v", sts, err)
 	}
 }
 

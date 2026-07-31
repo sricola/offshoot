@@ -25,7 +25,11 @@ Usage:
   offshoot path <db>[@branch]        print the checkout path
   offshoot status                    print all branches and their state
 
-Store location: -store DIR or OFFSHOOT_STORE, default ./.offshoot
+Store location: -store SPEC or OFFSHOOT_STORE, default ./.offshoot
+  SPEC is a directory path, file:///abs/path, or s3://bucket/prefix
+  S3: OFFSHOOT_S3_ENDPOINT, OFFSHOOT_S3_REGION, OFFSHOOT_S3_PATH_STYLE;
+      credentials from the AWS SDK default chain (env, shared config, IAM role)
+  Remote stores keep checkouts in OFFSHOOT_CHECKOUTS (default: user cache dir)
 `
 
 func storeRoot(args []string) (string, []string) {
