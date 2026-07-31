@@ -7,6 +7,7 @@ import (
 	"os"
 	"os/exec"
 	"path/filepath"
+	"reflect"
 	"strings"
 	"testing"
 
@@ -478,5 +479,104 @@ func TestPromote(t *testing.T) {
 	}
 	if _, err := w.Checkout("app", "main"); err != nil {
 		t.Fatalf("promoted main not independent of source lineage: %v", err)
+	}
+}
+
+// TestPromoteOntoSelfRejected verifies that promoting a branch onto itself
+// is rejected outright: doing so would reset the branch's own checkpoint
+// map to {"promote": txid} against its own head, silently wiping its
+// checkpoint history.
+func TestPromoteOntoSelfRejected(t *testing.T) {
+	w := newWS(t)
+	if err := w.Create("app"); err != nil {
+		t.Fatal(err)
+	}
+	before, _, err := w.Store.GetRef("app", "main")
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	if _, err := w.Promote("app", "main", "main", true); err == nil {
+		t.Fatal("promote onto self must fail")
+	}
+
+	after, _, err := w.Store.GetRef("app", "main")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !reflect.DeepEqual(before, after) {
+		t.Fatalf("ref must be unchanged after a rejected self-promote: before=%+v after=%+v", before, after)
+	}
+}
+
+// TestRollbackReportsRepointOnRefreshFailure verifies that when Rollback's
+// ref CAS succeeds but the subsequent checkout refresh fails, the branch's
+// repointed state is not silently lost behind a plain error: the error
+// names the partial success, and the ref itself really has moved.
+func TestRollbackReportsRepointOnRefreshFailure(t *testing.T) {
+	if _, err := exec.LookPath("sqlite3"); err != nil {
+		t.Skip("sqlite3 CLI not on PATH")
+	}
+	w := newWS(t)
+	if err := w.Create("app"); err != nil {
+		t.Fatal(err)
+	}
+	path, err := w.Checkout("app", "main")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if out, err := exec.Command("sqlite3", path,
+		"CREATE TABLE t (v); INSERT INTO t VALUES (1);").CombinedOutput(); err != nil {
+		t.Fatalf("%v: %s", err, out)
+	}
+	if _, err := w.Checkpoint("app", "main", "good"); err != nil {
+		t.Fatal(err)
+	}
+	if out, err := exec.Command("sqlite3", path, "DROP TABLE t;").CombinedOutput(); err != nil {
+		t.Fatalf("%v: %s", err, out)
+	}
+	if _, err := w.Checkpoint("app", "main", "bad"); err != nil {
+		t.Fatal(err)
+	}
+
+	before, _, err := w.Store.GetRef("app", "main")
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	// Replace the checkout file with a directory at the exact same path, so
+	// the post-CAS refresh (busy probe / materialize rename) cannot succeed.
+	if err := os.Remove(path); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.Mkdir(path, 0o755); err != nil {
+		t.Fatal(err)
+	}
+
+	_, err = w.Rollback("app", "main", "good")
+	if err == nil {
+		t.Fatal("rollback must report the refresh failure")
+	}
+	if !strings.Contains(err.Error(), "repointed") {
+		t.Fatalf("error must mention the repoint: %v", err)
+	}
+	if !strings.Contains(err.Error(), "checkout could not be refreshed") {
+		t.Fatalf("error must mention the refresh failure: %v", err)
+	}
+
+	// Partial success is real: the ref must have actually moved, even though
+	// the checkout refresh failed.
+	after, _, err := w.Store.GetRef("app", "main")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if after.Lineage == before.Lineage {
+		t.Fatal("ref must have repointed to a new lineage despite the refresh failure")
+	}
+	if after.HeadTXID != before.Checkpoints["good"] {
+		t.Fatalf("ref HeadTXID = %d, want checkpoint %q's txid %d", after.HeadTXID, "good", before.Checkpoints["good"])
+	}
+	if _, ok := after.Checkpoints["bad"]; ok {
+		t.Fatal("later checkpoint must still be dropped")
 	}
 }

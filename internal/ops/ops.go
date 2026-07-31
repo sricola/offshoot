@@ -390,7 +390,7 @@ func (w *Workspace) Fork(db, srcBranch, newBranch, at string) (uint64, error) {
 	// lineage so the child never references parent storage.
 	childLineage, err := w.copySnapshotToNewLineage(src, txid)
 	if err != nil {
-		return 0, fmt.Errorf("ops: source snapshot txid %d: %w", txid, err)
+		return 0, err
 	}
 	child := store.Ref{
 		Schema: 1, Lineage: childLineage, Epoch: 1, HeadTXID: txid,
@@ -405,11 +405,21 @@ func (w *Workspace) Fork(db, srcBranch, newBranch, at string) (uint64, error) {
 	return txid, nil
 }
 
-// Rollback repoints db@branch at a NEW lineage seeded from checkpoint `to`,
-// re-materializes the fixed checkout path (after a lock probe — fails
-// cleanly if the checkout is held open), and returns the checkout path.
+// Rollback repoints db@branch at a NEW lineage seeded from checkpoint `to`
+// and re-materializes the fixed checkout path, returning the checkout path.
 // The old lineage is orphaned (collected later by GC). Checkpoints at or
 // before `to` are kept; later ones are dropped.
+//
+// The ref CAS is the point of no return: once it lands, the branch has
+// repointed. The checkout refresh that follows (busy probe, materialize,
+// fingerprint) is best-effort — a failure there is reported as a partial
+// success (repointed, checkout stale) rather than losing that state in a
+// plain error.
+//
+// The busy probe itself is a point-in-time check, not a lock: a connection
+// opened between the probe and the materialize rename still holds a stale
+// file descriptor. Acceptable for the single-operator local CLI; daemon
+// mode (Plan 3) will own the data path and close this gap.
 func (w *Workspace) Rollback(db, branch, to string) (string, error) {
 	ref, etag, err := w.Store.GetRef(db, branch)
 	if err != nil {
@@ -418,12 +428,6 @@ func (w *Workspace) Rollback(db, branch, to string) (string, error) {
 	txid, ok := ref.Checkpoints[to]
 	if !ok {
 		return "", fmt.Errorf("ops: no checkpoint %q on %s@%s", to, db, branch)
-	}
-	path := w.CheckoutPath(db, branch)
-	if _, err := os.Stat(path); err == nil {
-		if err := quiesce(path); err != nil {
-			return "", fmt.Errorf("ops: checkout in use; close connections before rollback: %w", err)
-		}
 	}
 	lineage, err := w.copySnapshotToNewLineage(ref, txid)
 	if err != nil {
@@ -441,16 +445,29 @@ func (w *Workspace) Rollback(db, branch, to string) (string, error) {
 		w.Store.B.Delete(store.SnapshotKey(lineage, 1, txid))
 		return "", fmt.Errorf("ops: rollback lost a race (retry): %w", err)
 	}
-	if err := os.MkdirAll(filepath.Dir(path), 0o755); err != nil {
-		return "", err
+
+	// The branch has repointed. Everything below is a best-effort refresh of
+	// the local checkout; any failure here must not read as if the rollback
+	// itself failed.
+	path := w.CheckoutPath(db, branch)
+	refresh := func() error {
+		if _, err := os.Stat(path); err == nil {
+			if err := quiesce(path); err != nil {
+				return err
+			}
+		}
+		if err := os.MkdirAll(filepath.Dir(path), 0o755); err != nil {
+			return err
+		}
+		if err := w.materialize(next, txid, path); err != nil {
+			return err
+		}
+		// The checkout now equals committed state: refresh the fingerprint so
+		// a later Fork doesn't spuriously warn about "un-checkpointed changes".
+		return writeSum(path)
 	}
-	if err := w.materialize(next, txid, path); err != nil {
-		return "", err
-	}
-	// The checkout now equals committed state: refresh the fingerprint so a
-	// later Fork doesn't spuriously warn about "un-checkpointed changes".
-	if err := writeSum(path); err != nil {
-		return "", err
+	if err := refresh(); err != nil {
+		return "", fmt.Errorf("ops: branch repointed to checkpoint %q (txid %d), but the checkout could not be refreshed (run 'offshoot checkout' to re-materialize): %w", to, txid, err)
 	}
 	return path, nil
 }
@@ -458,9 +475,17 @@ func (w *Workspace) Rollback(db, branch, to string) (string, error) {
 // Promote repoints db@target at a NEW lineage seeded from db@source's head
 // (promote-as-fork, spec § Promote). Requires --force for protected targets
 // (force param). Source branch survives unchanged. Target's old lineage is
-// orphaned. Target's checkout (if any) is re-materialized after a lock probe.
-// Target's checkpoint map is reset to {"promote": txid}.
+// orphaned. Target's checkout (if any) is re-materialized after a busy
+// probe. Target's checkpoint map is reset to {"promote": txid}.
+//
+// The busy probe is a point-in-time check, not a lock: a connection opened
+// between the probe and the materialize rename still holds a stale file
+// descriptor. Acceptable for the single-operator local CLI; daemon mode
+// (Plan 3) will own the data path and close this gap.
 func (w *Workspace) Promote(db, source, target string, force bool) (uint64, error) {
+	if source == target {
+		return 0, fmt.Errorf("ops: cannot promote a branch onto itself")
+	}
 	src, _, err := w.Store.GetRef(db, source)
 	if err != nil {
 		return 0, err
@@ -492,12 +517,12 @@ func (w *Workspace) Promote(db, source, target string, force bool) (uint64, erro
 			return txid, fmt.Errorf("ops: promoted, but checkout %s is in use and was NOT refreshed: %w", path, err)
 		}
 		if err := w.materialize(next, txid, path); err != nil {
-			return txid, err
+			return txid, fmt.Errorf("ops: promoted, but checkout %s could not be refreshed: %w", path, err)
 		}
 		// The checkout now equals committed state: refresh the fingerprint so
 		// a later Fork doesn't spuriously warn about "un-checkpointed changes".
 		if err := writeSum(path); err != nil {
-			return txid, err
+			return txid, fmt.Errorf("ops: promoted, but checkout %s could not be refreshed: %w", path, err)
 		}
 	}
 	return txid, nil
