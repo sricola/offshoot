@@ -15,6 +15,7 @@ import (
 	"io"
 	"os"
 	"path/filepath"
+	"sort"
 	"strings"
 
 	_ "github.com/mattn/go-sqlite3"
@@ -568,4 +569,45 @@ func (w *Workspace) Promote(db, source, target string, force bool) (uint64, erro
 		}
 	}
 	return txid, nil
+}
+
+type BranchStatus struct {
+	DB, Branch  string
+	HeadTXID    uint64
+	Checkpoints []string
+	Protected   bool
+	Parent      string
+	CheckedOut  bool
+}
+
+func (w *Workspace) Status() ([]BranchStatus, error) {
+	refs, err := w.Store.ListRefs()
+	if err != nil {
+		return nil, err
+	}
+	var dbs []string
+	for db := range refs {
+		dbs = append(dbs, db)
+	}
+	sort.Strings(dbs)
+	var out []BranchStatus
+	for _, db := range dbs {
+		for _, br := range refs[db] {
+			r, _, err := w.Store.GetRef(db, br)
+			if err != nil {
+				return nil, err
+			}
+			var cps []string
+			for name := range r.Checkpoints {
+				cps = append(cps, name)
+			}
+			sort.Strings(cps)
+			_, coErr := os.Stat(w.CheckoutPath(db, br))
+			out = append(out, BranchStatus{
+				DB: db, Branch: br, HeadTXID: r.HeadTXID, Checkpoints: cps,
+				Protected: r.Protected, Parent: r.Parent, CheckedOut: coErr == nil,
+			})
+		}
+	}
+	return out, nil
 }
