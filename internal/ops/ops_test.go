@@ -1202,3 +1202,71 @@ func TestMaterializeUsesCheckpointEpochNotRefEpoch(t *testing.T) {
 		t.Fatalf("fork --at across an epoch bump: %v", err)
 	}
 }
+
+// TestCheckpointAfterEpochBumpIsMaterializable guards against a checkpoint
+// taken after an epoch bump leaving the ref's HeadEpoch stale. Checkpoint
+// advances HeadTXID and records the new checkpoint at ref.Epoch (the
+// current epoch), but if it doesn't also advance ref.HeadEpoch to match,
+// headCheckpoint(ref) — used by Checkout — points at (stale epoch, new
+// txid): an object that was never written. A fresh Checkout would then
+// fail "not found" even though the checkpoint just succeeded.
+func TestCheckpointAfterEpochBumpIsMaterializable(t *testing.T) {
+	if _, err := exec.LookPath("sqlite3"); err != nil {
+		t.Skip("sqlite3 CLI not on PATH")
+	}
+	w := newWS(t)
+	if err := w.Create("app"); err != nil {
+		t.Fatal(err)
+	}
+	path, err := w.Checkout("app", "main")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if out, err := exec.Command("sqlite3", path,
+		"CREATE TABLE t (v); INSERT INTO t VALUES (1);").CombinedOutput(); err != nil {
+		t.Fatalf("%v: %s", err, out)
+	}
+	if _, err := w.Checkpoint("app", "main", "v1"); err != nil {
+		t.Fatal(err)
+	}
+
+	// Simulate an epoch bump (e.g. a lease reclaim): the ref advances, but
+	// objects written under the old epoch stay exactly where they are.
+	// This mirrors TestMaterializeUsesCheckpointEpochNotRefEpoch.
+	ref, etag, err := w.Store.GetRef("app", "main")
+	if err != nil {
+		t.Fatal(err)
+	}
+	ref.Epoch++
+	if _, err := w.Store.PutRef("app", "main", ref, etag); err != nil {
+		t.Fatal(err)
+	}
+
+	// Write more data under the new epoch and take a second checkpoint.
+	if out, err := exec.Command("sqlite3", path, "INSERT INTO t VALUES (2);").CombinedOutput(); err != nil {
+		t.Fatalf("%v: %s", err, out)
+	}
+	if _, err := w.Checkpoint("app", "main", "v2"); err != nil {
+		t.Fatal(err)
+	}
+
+	// A fresh checkout must succeed and contain the v2 data — this fails
+	// with "not found" if HeadEpoch was left stale at the pre-bump epoch.
+	p2, err := w.Checkout("app", "main")
+	if err != nil {
+		t.Fatalf("checkout after checkpoint following epoch bump: %v", err)
+	}
+	got, err := exec.Command("sqlite3", p2, "SELECT v FROM t ORDER BY v;").Output()
+	if err != nil {
+		t.Fatalf("%v", err)
+	}
+	if string(got) != "1\n2\n" {
+		t.Fatalf("content after checkpoint following epoch bump: %q", got)
+	}
+
+	// The pre-bump checkpoint must still be reachable: its object lives
+	// under the old epoch and was never touched by the bump or by v2.
+	if _, err := w.Fork("app", "main", "child", "v1"); err != nil {
+		t.Fatalf("fork --at v1 (pre-bump checkpoint) after later checkpoint: %v", err)
+	}
+}
