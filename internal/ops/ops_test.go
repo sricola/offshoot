@@ -103,7 +103,7 @@ func TestCreateAndCheckout(t *testing.T) {
 		t.Fatalf("checkout not writable: %v", err)
 	}
 	r, _, err := w.Store.GetRef("app", "main")
-	if err != nil || !r.Protected || r.Checkpoints["init"] != 1 || r.HeadTXID != 1 {
+	if err != nil || !r.Protected || r.Checkpoints["init"].TXID != 1 || r.HeadTXID != 1 {
 		t.Fatalf("ref: %+v err=%v", r, err)
 	}
 }
@@ -323,7 +323,7 @@ func TestForkIsIndependentOfParent(t *testing.T) {
 	// Child ref shape.
 	cref, _, _ := w.Store.GetRef("app", "attempt-1")
 	if cref.Parent != "app@main@2" || cref.Protected ||
-		cref.Checkpoints["fork"] != 2 || len(cref.Checkpoints) != 1 {
+		cref.Checkpoints["fork"].TXID != 2 || len(cref.Checkpoints) != 1 {
 		t.Fatalf("child ref: %+v", cref)
 	}
 	if cref.Lineage == parentRef.Lineage {
@@ -794,7 +794,7 @@ func TestPromote(t *testing.T) {
 	if mref.Lineage == aref.Lineage {
 		t.Fatal("promote must seed a NEW lineage (one writer per lineage)")
 	}
-	if mref.Checkpoints["promote"] != txid || !mref.Protected {
+	if mref.Checkpoints["promote"].TXID != txid || !mref.Protected {
 		t.Fatalf("target ref: %+v", mref)
 	}
 	// Source survives; destroying it later must not affect main (independence).
@@ -898,8 +898,8 @@ func TestRollbackReportsRepointOnRefreshFailure(t *testing.T) {
 	if after.Lineage == before.Lineage {
 		t.Fatal("ref must have repointed to a new lineage despite the refresh failure")
 	}
-	if after.HeadTXID != before.Checkpoints["good"] {
-		t.Fatalf("ref HeadTXID = %d, want checkpoint %q's txid %d", after.HeadTXID, "good", before.Checkpoints["good"])
+	if after.HeadTXID != before.Checkpoints["good"].TXID {
+		t.Fatalf("ref HeadTXID = %d, want checkpoint %q's txid %d", after.HeadTXID, "good", before.Checkpoints["good"].TXID)
 	}
 	if _, ok := after.Checkpoints["bad"]; ok {
 		t.Fatal("later checkpoint must still be dropped")
@@ -986,11 +986,11 @@ func TestConcurrentCheckpointsOnlyOneWins(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	for name, txid := range r.Checkpoints {
-		if txid > r.HeadTXID {
-			t.Fatalf("checkpoint %s@txid %d beyond head %d", name, txid, r.HeadTXID)
+	for name, cp := range r.Checkpoints {
+		if cp.TXID > r.HeadTXID {
+			t.Fatalf("checkpoint %s@txid %d beyond head %d", name, cp.TXID, r.HeadTXID)
 		}
-		if _, _, err := w.Store.B.Get(store.SnapshotKey(r.Lineage, r.Epoch, txid)); err != nil {
+		if _, _, err := w.Store.B.Get(store.SnapshotKey(r.Lineage, r.Epoch, cp.TXID)); err != nil {
 			t.Fatalf("recorded checkpoint %s has no snapshot object: %v", name, err)
 		}
 	}
@@ -1048,11 +1048,11 @@ func TestConcurrentCheckpointsOnlyOneWinsOnS3(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	for name, txid := range r.Checkpoints {
-		if txid > r.HeadTXID {
-			t.Fatalf("checkpoint %s@txid %d beyond head %d", name, txid, r.HeadTXID)
+	for name, cp := range r.Checkpoints {
+		if cp.TXID > r.HeadTXID {
+			t.Fatalf("checkpoint %s@txid %d beyond head %d", name, cp.TXID, r.HeadTXID)
 		}
-		if _, _, err := w.Store.B.Get(store.SnapshotKey(r.Lineage, r.Epoch, txid)); err != nil {
+		if _, _, err := w.Store.B.Get(store.SnapshotKey(r.Lineage, r.Epoch, cp.TXID)); err != nil {
 			t.Fatalf("recorded checkpoint %s has no snapshot object: %v", name, err)
 		}
 	}
