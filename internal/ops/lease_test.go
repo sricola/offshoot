@@ -2,6 +2,7 @@ package ops
 
 import (
 	"errors"
+	"os/exec"
 	"strings"
 	"testing"
 	"time"
@@ -175,5 +176,42 @@ func TestLeasesTolerateCorruptExpiry(t *testing.T) {
 	}
 	if len(infos) != 1 || infos[0].DB != "app1" {
 		t.Fatalf("after releasing corrupt lease, should only have app1; got %+v", infos)
+	}
+}
+
+func TestFencedHolderCannotCheckpoint(t *testing.T) {
+	if _, err := exec.LookPath("sqlite3"); err != nil {
+		t.Skip("sqlite3 CLI not on PATH")
+	}
+	w := newWS(t)
+	if err := w.Create("app"); err != nil {
+		t.Fatal(err)
+	}
+	path, err := w.Checkout("app", "main")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if out, err := exec.Command("sqlite3", path,
+		"CREATE TABLE t (v); INSERT INTO t VALUES (1);").CombinedOutput(); err != nil {
+		t.Fatalf("%v: %s", err, out)
+	}
+	a, err := w.AcquireLease("app", "main", "writer-a", time.Nanosecond)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := w.AcquireLease("app", "main", "writer-b", DefaultLeaseTTL); err != nil {
+		t.Fatal(err)
+	}
+	// A is fenced. Its lease operations must fail loudly rather than silently
+	// succeeding against the new epoch.
+	if _, err := w.RenewLease(a, DefaultLeaseTTL); !errors.Is(err, store.ErrLeaseLost) {
+		t.Fatalf("fenced renew: want ErrLeaseLost, got %v", err)
+	}
+	if err := w.ReleaseLease(a); !errors.Is(err, store.ErrLeaseLost) {
+		t.Fatalf("fenced release: want ErrLeaseLost, got %v", err)
+	}
+	// The branch itself is still usable by whoever holds it.
+	if _, err := w.Checkpoint("app", "main", "v1"); err != nil {
+		t.Fatalf("branch unusable after fencing: %v", err)
 	}
 }

@@ -2,9 +2,11 @@ package store
 
 import (
 	"errors"
+	"fmt"
 	"io"
 	"os"
 	"strings"
+	"sync"
 	"testing"
 	"time"
 )
@@ -278,5 +280,75 @@ func TestAcquireRaceLossIsErrLeaseHeld(t *testing.T) {
 	}
 	if !errors.Is(err, ErrCAS) {
 		t.Fatalf("want ErrCAS, got %v", err)
+	}
+}
+
+func TestConcurrentAcquireHasOneWinner(t *testing.T) {
+	s := newStore(t)
+	seedBranch(t, s)
+	now := time.Date(2026, 8, 1, 12, 0, 0, 0, time.UTC)
+
+	const n = 12
+	var wg sync.WaitGroup
+	wins := make(chan Lease, n)
+	for i := 0; i < n; i++ {
+		wg.Add(1)
+		go func(idx int) {
+			defer wg.Done()
+			l, err := s.AcquireLease("app", "main", fmt.Sprintf("holder-%d", idx), time.Minute, now)
+			if err == nil {
+				wins <- l
+			}
+		}(i)
+	}
+	wg.Wait()
+	close(wins)
+	var won []Lease
+	for l := range wins {
+		won = append(won, l)
+	}
+	if len(won) != 1 {
+		t.Fatalf("exactly one acquirer must win an unleased branch, got %d", len(won))
+	}
+	ref, _, _ := s.GetRef("app", "main")
+	if ref.LeaseHolder != won[0].Holder || ref.Epoch != won[0].Epoch {
+		t.Fatalf("ref %+v disagrees with the winning lease %+v", ref, won[0])
+	}
+}
+
+func TestEpochNeverDecreasesAcrossReclaims(t *testing.T) {
+	s := newStore(t)
+	seedBranch(t, s)
+	now := time.Date(2026, 8, 1, 12, 0, 0, 0, time.UTC)
+	last := uint64(0)
+	for i := 0; i < 5; i++ {
+		l, err := s.AcquireLease("app", "main", fmt.Sprintf("h%d", i), time.Second, now)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if l.Epoch <= last {
+			t.Fatalf("epoch went backwards: %d after %d", l.Epoch, last)
+		}
+		last = l.Epoch
+		now = now.Add(2 * time.Second) // let it expire so the next holder reclaims
+	}
+}
+
+func TestRenewAfterExpiryButBeforeReclaimStillWorks(t *testing.T) {
+	// A holder whose lease lapsed but whom nobody has displaced may renew:
+	// expiry alone does not fence, only another acquisition does.
+	s := newStore(t)
+	seedBranch(t, s)
+	now := time.Date(2026, 8, 1, 12, 0, 0, 0, time.UTC)
+	l, err := s.AcquireLease("app", "main", "slow", time.Second, now)
+	if err != nil {
+		t.Fatal(err)
+	}
+	l2, err := s.RenewLease(l, time.Minute, now.Add(10*time.Second))
+	if err != nil {
+		t.Fatalf("uncontested lapsed holder must be able to renew: %v", err)
+	}
+	if l2.Epoch != l.Epoch {
+		t.Errorf("renew bumped the epoch: %d -> %d", l.Epoch, l2.Epoch)
 	}
 }
