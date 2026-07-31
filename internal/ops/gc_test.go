@@ -2,6 +2,7 @@ package ops
 
 import (
 	"os/exec"
+	"strings"
 	"testing"
 	"time"
 
@@ -49,6 +50,45 @@ func TestDestroyAndGC(t *testing.T) {
 	// Live lineages untouched.
 	if _, err := w.Checkout("app", "main"); err != nil {
 		t.Fatalf("live branch damaged by GC: %v", err)
+	}
+}
+
+// TestDestroyRefusesLiveLeaseWithoutForce proves Destroy gates on an active
+// lease per the design spec's fault matrix: a live holder may still be
+// mid-write, so destroying under it without --force must be refused (naming
+// the holder), while --force overrides it and an already-expired lease
+// never blocks at all.
+func TestDestroyRefusesLiveLeaseWithoutForce(t *testing.T) {
+	w := newWS(t)
+	if err := w.Create("app"); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := w.Fork("app", "main", "b1", ""); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := w.AcquireLease("app", "b1", "holder-a", DefaultLeaseTTL); err != nil {
+		t.Fatal(err)
+	}
+	err := w.Destroy("app", "b1", false)
+	if err == nil || !strings.Contains(err.Error(), "holder-a") {
+		t.Fatalf("destroy under a live lease without force must fail and name the holder, got: %v", err)
+	}
+	if err := w.Destroy("app", "b1", true); err != nil {
+		t.Fatalf("destroy with force must override a live lease: %v", err)
+	}
+	if _, _, err := w.Store.GetRef("app", "b1"); err == nil {
+		t.Fatal("ref must be gone after forced destroy")
+	}
+
+	// A branch whose lease has already expired is destroyable without force.
+	if _, err := w.Fork("app", "main", "b2", ""); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := w.AcquireLease("app", "b2", "holder-b", time.Nanosecond); err != nil {
+		t.Fatal(err)
+	}
+	if err := w.Destroy("app", "b2", false); err != nil {
+		t.Fatalf("destroy of a branch with an expired lease must succeed without force: %v", err)
 	}
 }
 

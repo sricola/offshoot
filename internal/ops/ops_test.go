@@ -103,7 +103,7 @@ func TestCreateAndCheckout(t *testing.T) {
 		t.Fatalf("checkout not writable: %v", err)
 	}
 	r, _, err := w.Store.GetRef("app", "main")
-	if err != nil || !r.Protected || r.Checkpoints["init"] != 1 || r.HeadTXID != 1 {
+	if err != nil || !r.Protected || r.Checkpoints["init"].TXID != 1 || r.HeadTXID != 1 {
 		t.Fatalf("ref: %+v err=%v", r, err)
 	}
 }
@@ -323,7 +323,7 @@ func TestForkIsIndependentOfParent(t *testing.T) {
 	// Child ref shape.
 	cref, _, _ := w.Store.GetRef("app", "attempt-1")
 	if cref.Parent != "app@main@2" || cref.Protected ||
-		cref.Checkpoints["fork"] != 2 || len(cref.Checkpoints) != 1 {
+		cref.Checkpoints["fork"].TXID != 2 || len(cref.Checkpoints) != 1 {
 		t.Fatalf("child ref: %+v", cref)
 	}
 	if cref.Lineage == parentRef.Lineage {
@@ -794,7 +794,7 @@ func TestPromote(t *testing.T) {
 	if mref.Lineage == aref.Lineage {
 		t.Fatal("promote must seed a NEW lineage (one writer per lineage)")
 	}
-	if mref.Checkpoints["promote"] != txid || !mref.Protected {
+	if mref.Checkpoints["promote"].TXID != txid || !mref.Protected {
 		t.Fatalf("target ref: %+v", mref)
 	}
 	// Source survives; destroying it later must not affect main (independence).
@@ -898,8 +898,8 @@ func TestRollbackReportsRepointOnRefreshFailure(t *testing.T) {
 	if after.Lineage == before.Lineage {
 		t.Fatal("ref must have repointed to a new lineage despite the refresh failure")
 	}
-	if after.HeadTXID != before.Checkpoints["good"] {
-		t.Fatalf("ref HeadTXID = %d, want checkpoint %q's txid %d", after.HeadTXID, "good", before.Checkpoints["good"])
+	if after.HeadTXID != before.Checkpoints["good"].TXID {
+		t.Fatalf("ref HeadTXID = %d, want checkpoint %q's txid %d", after.HeadTXID, "good", before.Checkpoints["good"].TXID)
 	}
 	if _, ok := after.Checkpoints["bad"]; ok {
 		t.Fatal("later checkpoint must still be dropped")
@@ -986,11 +986,11 @@ func TestConcurrentCheckpointsOnlyOneWins(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	for name, txid := range r.Checkpoints {
-		if txid > r.HeadTXID {
-			t.Fatalf("checkpoint %s@txid %d beyond head %d", name, txid, r.HeadTXID)
+	for name, cp := range r.Checkpoints {
+		if cp.TXID > r.HeadTXID {
+			t.Fatalf("checkpoint %s@txid %d beyond head %d", name, cp.TXID, r.HeadTXID)
 		}
-		if _, _, err := w.Store.B.Get(store.SnapshotKey(r.Lineage, r.Epoch, txid)); err != nil {
+		if _, _, err := w.Store.B.Get(store.SnapshotKey(r.Lineage, r.Epoch, cp.TXID)); err != nil {
 			t.Fatalf("recorded checkpoint %s has no snapshot object: %v", name, err)
 		}
 	}
@@ -1048,11 +1048,11 @@ func TestConcurrentCheckpointsOnlyOneWinsOnS3(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	for name, txid := range r.Checkpoints {
-		if txid > r.HeadTXID {
-			t.Fatalf("checkpoint %s@txid %d beyond head %d", name, txid, r.HeadTXID)
+	for name, cp := range r.Checkpoints {
+		if cp.TXID > r.HeadTXID {
+			t.Fatalf("checkpoint %s@txid %d beyond head %d", name, cp.TXID, r.HeadTXID)
 		}
-		if _, _, err := w.Store.B.Get(store.SnapshotKey(r.Lineage, r.Epoch, txid)); err != nil {
+		if _, _, err := w.Store.B.Get(store.SnapshotKey(r.Lineage, r.Epoch, cp.TXID)); err != nil {
 			t.Fatalf("recorded checkpoint %s has no snapshot object: %v", name, err)
 		}
 	}
@@ -1155,5 +1155,118 @@ func TestCorruptSnapshotFailsClosedEndToEnd(t *testing.T) {
 	w.Store.B.Put(key, data)
 	if _, err := w.Checkout("app", "main"); err == nil {
 		t.Fatal("checkout of corrupt snapshot must fail closed")
+	}
+}
+
+func TestMaterializeUsesCheckpointEpochNotRefEpoch(t *testing.T) {
+	if _, err := exec.LookPath("sqlite3"); err != nil {
+		t.Skip("sqlite3 CLI not on PATH")
+	}
+	w := newWS(t)
+	if err := w.Create("app"); err != nil {
+		t.Fatal(err)
+	}
+	path, err := w.Checkout("app", "main")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if out, err := exec.Command("sqlite3", path,
+		"CREATE TABLE t (v); INSERT INTO t VALUES (1);").CombinedOutput(); err != nil {
+		t.Fatalf("%v: %s", err, out)
+	}
+	if _, err := w.Checkpoint("app", "main", "v1"); err != nil {
+		t.Fatal(err)
+	}
+
+	// Simulate a later epoch bump: the ref advances, but the objects written
+	// under the old epoch stay exactly where they are.
+	ref, etag, err := w.Store.GetRef("app", "main")
+	if err != nil {
+		t.Fatal(err)
+	}
+	ref.Epoch++
+	if _, err := w.Store.PutRef("app", "main", ref, etag); err != nil {
+		t.Fatal(err)
+	}
+
+	// Checkout and fork --at must both still find the old-epoch objects.
+	p2, err := w.Checkout("app", "main")
+	if err != nil {
+		t.Fatalf("checkout after epoch bump: %v", err)
+	}
+	got, _ := exec.Command("sqlite3", p2, "SELECT v FROM t;").Output()
+	if string(got) != "1\n" {
+		t.Fatalf("content after epoch bump: %q", got)
+	}
+	if _, err := w.Fork("app", "main", "child", "v1"); err != nil {
+		t.Fatalf("fork --at across an epoch bump: %v", err)
+	}
+}
+
+// TestCheckpointAfterEpochBumpIsMaterializable guards against a checkpoint
+// taken after an epoch bump leaving the ref's HeadEpoch stale. Checkpoint
+// advances HeadTXID and records the new checkpoint at ref.Epoch (the
+// current epoch), but if it doesn't also advance ref.HeadEpoch to match,
+// headCheckpoint(ref) — used by Checkout — points at (stale epoch, new
+// txid): an object that was never written. A fresh Checkout would then
+// fail "not found" even though the checkpoint just succeeded.
+func TestCheckpointAfterEpochBumpIsMaterializable(t *testing.T) {
+	if _, err := exec.LookPath("sqlite3"); err != nil {
+		t.Skip("sqlite3 CLI not on PATH")
+	}
+	w := newWS(t)
+	if err := w.Create("app"); err != nil {
+		t.Fatal(err)
+	}
+	path, err := w.Checkout("app", "main")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if out, err := exec.Command("sqlite3", path,
+		"CREATE TABLE t (v); INSERT INTO t VALUES (1);").CombinedOutput(); err != nil {
+		t.Fatalf("%v: %s", err, out)
+	}
+	if _, err := w.Checkpoint("app", "main", "v1"); err != nil {
+		t.Fatal(err)
+	}
+
+	// Simulate an epoch bump (e.g. a lease reclaim): the ref advances, but
+	// objects written under the old epoch stay exactly where they are.
+	// This mirrors TestMaterializeUsesCheckpointEpochNotRefEpoch.
+	ref, etag, err := w.Store.GetRef("app", "main")
+	if err != nil {
+		t.Fatal(err)
+	}
+	ref.Epoch++
+	if _, err := w.Store.PutRef("app", "main", ref, etag); err != nil {
+		t.Fatal(err)
+	}
+
+	// Write more data under the new epoch and take a second checkpoint.
+	if out, err := exec.Command("sqlite3", path, "INSERT INTO t VALUES (2);").CombinedOutput(); err != nil {
+		t.Fatalf("%v: %s", err, out)
+	}
+	if _, err := w.Checkpoint("app", "main", "v2"); err != nil {
+		t.Fatal(err)
+	}
+
+	// A fresh checkout must succeed and contain the v2 data — this fails
+	// with "not found" if HeadEpoch was left stale at the pre-bump epoch.
+	p2, err := w.Checkout("app", "main")
+	if err != nil {
+		t.Fatalf("checkout after checkpoint following epoch bump: %v", err)
+	}
+	got, err := exec.Command("sqlite3", p2, "SELECT v FROM t ORDER BY v;").Output()
+	if err != nil {
+		t.Fatalf("%v", err)
+	}
+	if string(got) != "1\n2\n" {
+		t.Fatalf("content after checkpoint following epoch bump: %q", got)
+	}
+
+	// The pre-bump checkpoint must still be reachable: its object lives
+	// under the old epoch and was never touched by the bump or by v2.
+	if _, err := w.Fork("app", "main", "child", "v1"); err != nil {
+		t.Fatalf("fork --at v1 (pre-bump checkpoint) after later checkpoint: %v", err)
 	}
 }
