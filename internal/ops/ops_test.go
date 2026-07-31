@@ -44,6 +44,31 @@ func newWS(t *testing.T) *Workspace {
 	return w
 }
 
+// newWSOnFakeS3 mirrors newWS but backs the Workspace with an in-process
+// fake S3 server instead of a local directory. It exists so the SAME test
+// bodies that exercise ops invariants against the local backend (see
+// TestConcurrentCheckpointsOnlyOneWinsOnS3, TestDestroyAndGCOnS3) can be
+// run again against S3, proving those invariants hold across backends
+// rather than being accidents of the local filesystem's Put/rename
+// semantics. Each call gets its own fake server and a unique key prefix.
+func newWSOnFakeS3(t *testing.T) *Workspace {
+	t.Helper()
+	f := storetest.NewFakeS3(t)
+	t.Setenv("AWS_ACCESS_KEY_ID", "test")
+	t.Setenv("AWS_SECRET_ACCESS_KEY", "test")
+	t.Setenv("OFFSHOOT_S3_ENDPOINT", f.URL())
+	t.Setenv("OFFSHOOT_S3_REGION", "us-east-1")
+	t.Setenv("OFFSHOOT_S3_PATH_STYLE", "1")
+	t.Setenv("OFFSHOOT_CHECKOUTS", t.TempDir())
+
+	spec := "s3://" + f.Bucket() + "/" + strings.ReplaceAll(t.Name(), "/", "-")
+	w, err := Init(spec)
+	if err != nil {
+		t.Fatal(err)
+	}
+	return w
+}
+
 func TestInitAndOpen(t *testing.T) {
 	root := filepath.Join(t.TempDir(), "s")
 	if _, err := Open(root); !errors.Is(err, store.ErrNotFound) {
@@ -925,6 +950,68 @@ func TestConcurrentCheckpointsOnlyOneWins(t *testing.T) {
 		t.Skip("sqlite3 CLI not on PATH")
 	}
 	w := newWS(t)
+	w.Create("app")
+	path, _ := w.Checkout("app", "main")
+	exec.Command("sqlite3", path, "CREATE TABLE t (v);").Run()
+
+	var wg sync.WaitGroup
+	okCount := 0
+	var mu sync.Mutex
+	var loserErrs []error
+	for i := 0; i < 4; i++ {
+		wg.Add(1)
+		go func(n int) {
+			defer wg.Done()
+			if _, err := w.Checkpoint("app", "main", fmt.Sprintf("cp-%d", n)); err == nil {
+				mu.Lock()
+				okCount++
+				mu.Unlock()
+			} else {
+				mu.Lock()
+				loserErrs = append(loserErrs, err)
+				mu.Unlock()
+			}
+		}(i)
+	}
+	wg.Wait()
+	// At least one wins; losers fail loudly with the CAS-race error, and the
+	// ref must remain internally consistent (head >= every recorded checkpoint).
+	if okCount == 0 {
+		t.Fatal("no checkpoint succeeded")
+	}
+	for _, e := range loserErrs {
+		t.Logf("loser error: %v", e)
+	}
+	r, _, err := w.Store.GetRef("app", "main")
+	if err != nil {
+		t.Fatal(err)
+	}
+	for name, txid := range r.Checkpoints {
+		if txid > r.HeadTXID {
+			t.Fatalf("checkpoint %s@txid %d beyond head %d", name, txid, r.HeadTXID)
+		}
+		if _, _, err := w.Store.B.Get(store.SnapshotKey(r.Lineage, r.Epoch, txid)); err != nil {
+			t.Fatalf("recorded checkpoint %s has no snapshot object: %v", name, err)
+		}
+	}
+}
+
+// TestConcurrentCheckpointsOnlyOneWinsOnS3 is TestConcurrentCheckpointsOnlyOneWins
+// run against the S3 backend instead of Local. It matters specifically
+// because losing racers in Checkpoint fall through to an UNCONDITIONAL
+// Store.B.Put to overwrite an orphaned/rival snapshot object at the
+// deterministic snapshot key (see the comment in ops.go's Checkpoint) —
+// a code path RunConformance never exercised before PutOverwritesExistingKey
+// was added, and Local's Put (rename-over-existing-file) could silently
+// diverge from S3's Put (PutObject, unconditional overwrite) without any
+// test noticing. Same assertions as the Local version: at least one
+// checkpoint wins, the ref stays internally consistent, and every recorded
+// checkpoint's snapshot object is actually present.
+func TestConcurrentCheckpointsOnlyOneWinsOnS3(t *testing.T) {
+	if _, err := exec.LookPath("sqlite3"); err != nil {
+		t.Skip("sqlite3 CLI not on PATH")
+	}
+	w := newWSOnFakeS3(t)
 	w.Create("app")
 	path, _ := w.Checkout("app", "main")
 	exec.Command("sqlite3", path, "CREATE TABLE t (v);").Run()

@@ -66,6 +66,9 @@ func freshSegment(t *testing.T) string {
 
 func deleteAll(t *testing.T, b store.Backend) {
 	t.Helper()
+	// Best-effort and deliberately non-fatal: this runs in t.Cleanup after
+	// the test body has already reported pass/fail, so a cleanup hiccup here
+	// must only be logged, never fail or mask the real test result.
 	keys, err := b.List("")
 	if err != nil {
 		t.Logf("cleanup list failed: %v", err)

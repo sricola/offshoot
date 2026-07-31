@@ -34,6 +34,36 @@ func RunConformance(t *testing.T, keyPrefix string, newBackend func(t *testing.T
 		}
 	})
 
+	t.Run("PutOverwritesExistingKey", func(t *testing.T) {
+		// ops relies on this: Checkpoint's orphan-recovery path (see the
+		// comment in ops.Checkpoint) falls back to an UNCONDITIONAL Put to
+		// overwrite a snapshot object left by a crashed or racing prior
+		// attempt at the same deterministic key. Every backend must agree
+		// that a second Put to an existing key wins outright, not merge,
+		// append, or silently no-op.
+		b := newBackend(t)
+		if err := b.Put(k("data/overwrite"), []byte("first")); err != nil {
+			t.Fatal(err)
+		}
+		_, etag1, err := b.Get(k("data/overwrite"))
+		if err != nil {
+			t.Fatal(err)
+		}
+		if err := b.Put(k("data/overwrite"), []byte("second")); err != nil {
+			t.Fatal(err)
+		}
+		data, etag2, err := b.Get(k("data/overwrite"))
+		if err != nil {
+			t.Fatal(err)
+		}
+		if string(data) != "second" {
+			t.Fatalf("content = %q, want %q (second Put must win)", data, "second")
+		}
+		if etag2 == etag1 {
+			t.Error("etag must change when Put overwrites existing content")
+		}
+	})
+
 	t.Run("GetMissingIsErrNotFound", func(t *testing.T) {
 		b := newBackend(t)
 		if _, _, err := b.Get(k("nope")); !errors.Is(err, store.ErrNotFound) {
