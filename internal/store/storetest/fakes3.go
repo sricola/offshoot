@@ -97,6 +97,7 @@ func (f *FakeS3) handle(w http.ResponseWriter, r *http.Request) {
 		}
 		data, ok := f.objs[key]
 		if !ok {
+			w.Header().Set("Content-Type", "application/xml")
 			w.WriteHeader(http.StatusNotFound)
 			io.WriteString(w, `<Error><Code>NoSuchKey</Code></Error>`)
 			return
@@ -113,12 +114,14 @@ func (f *FakeS3) handle(w http.ResponseWriter, r *http.Request) {
 		if !f.ignore {
 			cur, exists := f.objs[key]
 			if inm := r.Header.Get("If-None-Match"); inm == "*" && exists {
+				w.Header().Set("Content-Type", "application/xml")
 				w.WriteHeader(http.StatusPreconditionFailed)
 				io.WriteString(w, `<Error><Code>PreconditionFailed</Code></Error>`)
 				return
 			}
 			if im := r.Header.Get("If-Match"); im != "" {
 				if !exists || etagOf(cur) != im {
+					w.Header().Set("Content-Type", "application/xml")
 					w.WriteHeader(http.StatusPreconditionFailed)
 					io.WriteString(w, `<Error><Code>PreconditionFailed</Code></Error>`)
 					return

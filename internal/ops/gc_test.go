@@ -52,6 +52,59 @@ func TestDestroyAndGC(t *testing.T) {
 	}
 }
 
+// TestDestroyAndGCOnS3 is TestDestroyAndGC run against the S3 backend
+// instead of Local. GC's sweep phase deletes every object under a
+// tombstoned lineage's prefix (Store.B.Delete in a loop) and its earlier
+// phase persists the tombstone map via an unconditional Store.B.Put — both
+// paths that, like Checkpoint's orphan-overwrite path, depend on ops's
+// object-storage semantics matching across backends rather than being
+// accidents of Local's filesystem behavior. Same assertions as the Local
+// version: phase 1 tombstones without deleting, phase 2 with zero grace
+// sweeps the data, and live lineages are left untouched throughout.
+func TestDestroyAndGCOnS3(t *testing.T) {
+	if _, err := exec.LookPath("sqlite3"); err != nil {
+		t.Skip("sqlite3 CLI not on PATH")
+	}
+	w := newWSOnFakeS3(t)
+	w.Create("app")
+	path, _ := w.Checkout("app", "main")
+	exec.Command("sqlite3", path, "CREATE TABLE t (v); INSERT INTO t VALUES (1);").Run()
+	w.Checkpoint("app", "main", "v1")
+	w.Fork("app", "main", "attempt-1", "")
+	aref, _, _ := w.Store.GetRef("app", "attempt-1")
+
+	// Protected destroy requires force.
+	if err := w.Destroy("app", "main", false); err == nil {
+		t.Fatal("destroying protected main without force must fail")
+	}
+	if err := w.Destroy("app", "attempt-1", false); err != nil {
+		t.Fatal(err)
+	}
+	if _, _, err := w.Store.GetRef("app", "attempt-1"); err == nil {
+		t.Fatal("ref must be gone")
+	}
+
+	// Phase 1: tombstone the now-unreachable lineage; nothing deleted yet.
+	tombstoned, deleted, err := w.GC(time.Hour)
+	if err != nil || tombstoned != 1 || deleted != 0 {
+		t.Fatalf("gc1: %d %d %v", tombstoned, deleted, err)
+	}
+	if keys, _ := w.Store.B.List(store.LineagePrefix(aref.Lineage)); len(keys) == 0 {
+		t.Fatal("phase 1 must not delete data")
+	}
+	// Phase 2 with zero grace: swept.
+	if _, deleted, err = w.GC(0); err != nil || deleted != 1 {
+		t.Fatalf("gc2: deleted=%d err=%v", deleted, err)
+	}
+	if keys, _ := w.Store.B.List(store.LineagePrefix(aref.Lineage)); len(keys) != 0 {
+		t.Fatalf("lineage not swept: %v", keys)
+	}
+	// Live lineages untouched.
+	if _, err := w.Checkout("app", "main"); err != nil {
+		t.Fatalf("live branch damaged by GC: %v", err)
+	}
+}
+
 // TestGCSingleRunDoesNotSweepStonesMintedThisRun guards against a
 // mark-and-sweep race: with grace=0, phase 2's cutoff is `time.Now()`
 // computed within the same GC call, which every stone phase 1 just minted

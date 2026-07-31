@@ -31,7 +31,12 @@ incremental segments, and S3/R2/Tigris backends is Plan 3.
 
 offshoot's safety rests on compare-and-swap: every branch ref update is a
 conditional write. At attach time it **probes the store** and refuses to run
-if conditional writes are not enforced, rather than silently degrading.
+if conditional writes are not enforced, rather than silently degrading. That
+probe re-runs on every command (every CLI invocation attaches fresh) — a
+handful of sequential round trips against a remote store, paid every time by
+design (fail-closed beats a cached "it was fine last time"); a long-lived
+daemon in Plan 4 will amortize it across a session instead of paying it per
+command.
 
 Configuration for `s3://` specs — credentials come from the AWS SDK default
 chain (environment, shared config, IAM role):
@@ -51,11 +56,13 @@ unit tests proves nothing about a real provider.
 
 | Provider | Status |
 |---|---|
-| MinIO | verified — `minio/minio:latest` (digest `sha256:14cea493d9a34af32f524e538b8346cf79f3321eff8e708c1e2960462bd8936e`), run 2026-07-31; `make test-s3` PASS |
+| MinIO | verified — `minio/minio:latest` [1], run 2026-07-31; `make test-s3` PASS |
 | AWS S3 | expected to pass (conditional writes GA since Nov 2024); not yet run |
 | Cloudflare R2 | expected to pass; not yet run |
 | Tigris | expected to pass; not yet run |
 | Google Cloud Storage (S3 interop) | **unsupported** — no conditional writes on the S3 API; the probe refuses it |
+
+[1] `minio/minio:latest` digest: `sha256:14cea493d9a34af32f524e538b8346cf79f3321eff8e708c1e2960462bd8936e`
 
 Checkouts are always real local SQLite files; only the snapshots and refs
 live in the store.

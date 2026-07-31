@@ -21,6 +21,13 @@ import (
 // S3 endpoint, region and addressing style come from OFFSHOOT_S3_ENDPOINT,
 // OFFSHOOT_S3_REGION and OFFSHOOT_S3_PATH_STYLE; credentials come from the
 // AWS SDK default chain.
+//
+// OpenBackend runs unconditionally on every call, i.e. every CLI invocation:
+// ProbeCAS's ~8 sequential round trips (see probe.go) are re-paid each time
+// against a remote store, not cached across invocations. That is deliberate
+// fail-closed behavior, not an oversight — a long-lived daemon (Plan 4) is
+// the intended way to amortize the probe across many operations instead of
+// weakening or skipping it here.
 func OpenBackend(ctx context.Context, spec string) (Backend, error) {
 	b, err := newBackend(ctx, spec)
 	if err != nil {
