@@ -538,6 +538,203 @@ func TestRollback(t *testing.T) {
 	}
 }
 
+// TestRollbackToEarlierCheckpointTwice guards against dangling checkpoints:
+// Rollback used to copy only the `to` checkpoint's snapshot into the new
+// lineage, dropping every OTHER kept (earlier) checkpoint's snapshot on the
+// floor in the old, now-orphaned lineage. A second rollback to one of those
+// earlier checkpoints would then fail "not found" (and GC would eventually
+// delete the data for good). Rolling back to v2 then to v1 must both
+// succeed, with v1's content correct.
+func TestRollbackToEarlierCheckpointTwice(t *testing.T) {
+	if _, err := exec.LookPath("sqlite3"); err != nil {
+		t.Skip("sqlite3 CLI not on PATH")
+	}
+	w := newWS(t)
+	w.Create("app")
+	path, _ := w.Checkout("app", "main")
+	exec.Command("sqlite3", path, "CREATE TABLE t (v); INSERT INTO t VALUES (1);").Run()
+	if _, err := w.Checkpoint("app", "main", "v1"); err != nil {
+		t.Fatal(err)
+	}
+	exec.Command("sqlite3", path, "INSERT INTO t VALUES (2);").Run()
+	if _, err := w.Checkpoint("app", "main", "v2"); err != nil {
+		t.Fatal(err)
+	}
+
+	if _, err := w.Rollback("app", "main", "v2"); err != nil {
+		t.Fatalf("rollback --to v2: %v", err)
+	}
+	p, err := w.Rollback("app", "main", "v1")
+	if err != nil {
+		t.Fatalf("rollback --to v1 after rollback --to v2: %v", err)
+	}
+	got, _ := exec.Command("sqlite3", p, "SELECT v FROM t;").Output()
+	if string(got) != "1\n" {
+		t.Fatalf("content after second rollback: %q, want just the v1 row", got)
+	}
+}
+
+// TestForkAtCheckpointAfterRollback is the fork-side counterpart of
+// TestRollbackToEarlierCheckpointTwice: after a rollback, `fork --at` an
+// earlier checkpoint that rollback kept must still find its snapshot object
+// (not "not found") and must produce the correct (earlier) content.
+func TestForkAtCheckpointAfterRollback(t *testing.T) {
+	if _, err := exec.LookPath("sqlite3"); err != nil {
+		t.Skip("sqlite3 CLI not on PATH")
+	}
+	w := newWS(t)
+	w.Create("app")
+	path, _ := w.Checkout("app", "main")
+	exec.Command("sqlite3", path, "CREATE TABLE t (v); INSERT INTO t VALUES (1);").Run()
+	if _, err := w.Checkpoint("app", "main", "v1"); err != nil {
+		t.Fatal(err)
+	}
+	exec.Command("sqlite3", path, "INSERT INTO t VALUES (2);").Run()
+	if _, err := w.Checkpoint("app", "main", "v2"); err != nil {
+		t.Fatal(err)
+	}
+
+	if _, err := w.Rollback("app", "main", "v2"); err != nil {
+		t.Fatalf("rollback --to v2: %v", err)
+	}
+	if _, err := w.Fork("app", "main", "old", "v1"); err != nil {
+		t.Fatalf("fork --at v1 after rollback --to v2: %v", err)
+	}
+	p, err := w.Checkout("app", "old")
+	if err != nil {
+		t.Fatal(err)
+	}
+	got, _ := exec.Command("sqlite3", p, "SELECT v FROM t;").Output()
+	if string(got) != "1\n" {
+		t.Fatalf("fork --at v1 content: %q, want just the v1 row", got)
+	}
+}
+
+// TestCheckoutQuiescesAndWarnsOnDirtyOverwrite verifies the fix for
+// Checkout's missing busy probe and dirty-overwrite warning: re-checking-out
+// a branch whose checkout has un-checkpointed local edits must warn on
+// stderr before silently discarding them, and the resulting file must equal
+// the branch's actual committed head, not the discarded local edit.
+func TestCheckoutQuiescesAndWarnsOnDirtyOverwrite(t *testing.T) {
+	if _, err := exec.LookPath("sqlite3"); err != nil {
+		t.Skip("sqlite3 CLI not on PATH")
+	}
+	w := newWS(t)
+	if err := w.Create("app"); err != nil {
+		t.Fatal(err)
+	}
+	path, err := w.Checkout("app", "main")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if out, err := exec.Command("sqlite3", path,
+		"CREATE TABLE t (v); INSERT INTO t VALUES (1);").CombinedOutput(); err != nil {
+		t.Fatalf("%v: %s", err, out)
+	}
+	if _, err := w.Checkpoint("app", "main", "v1"); err != nil {
+		t.Fatal(err)
+	}
+
+	// No-warning case: re-checkout right after a fresh checkpoint (checkout
+	// matches committed state exactly).
+	stderr := captureStderr(t, func() {
+		if _, err := w.Checkout("app", "main"); err != nil {
+			t.Fatal(err)
+		}
+	})
+	if stderr != "" {
+		t.Fatalf("unexpected warning re-checking-out a clean checkout: %q", stderr)
+	}
+
+	// Modify the checkout WITHOUT checkpointing.
+	if out, err := exec.Command("sqlite3", path, "INSERT INTO t VALUES (2);").CombinedOutput(); err != nil {
+		t.Fatalf("%v: %s", err, out)
+	}
+
+	var newPath string
+	stderr = captureStderr(t, func() {
+		newPath, err = w.Checkout("app", "main")
+		if err != nil {
+			t.Fatal(err)
+		}
+	})
+	if !strings.Contains(stderr, "un-checkpointed changes") {
+		t.Fatalf("warning missing expected text: %q", stderr)
+	}
+	if !strings.Contains(stderr, "app@main") {
+		t.Fatalf("warning does not name the checkout: %q", stderr)
+	}
+
+	got, _ := exec.Command("sqlite3", newPath, "SELECT v FROM t ORDER BY v;").Output()
+	if string(got) != "1\n" {
+		t.Fatalf("checkout content = %q, want reset to head (just the checkpointed row)", got)
+	}
+}
+
+// TestPromoteWarnsOnUncheckpointedSourceChanges verifies Promote warns (like
+// Fork) when the source branch's checkout has un-checkpointed local edits:
+// promote always proceeds from the source's last committed head, and the
+// operator should be told their dirty edits weren't included.
+func TestPromoteWarnsOnUncheckpointedSourceChanges(t *testing.T) {
+	if _, err := exec.LookPath("sqlite3"); err != nil {
+		t.Skip("sqlite3 CLI not on PATH")
+	}
+	w := newWS(t)
+	if err := w.Create("app"); err != nil {
+		t.Fatal(err)
+	}
+	path, err := w.Checkout("app", "main")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if out, err := exec.Command("sqlite3", path,
+		"CREATE TABLE t (v); INSERT INTO t VALUES (1);").CombinedOutput(); err != nil {
+		t.Fatalf("%v: %s", err, out)
+	}
+	if _, err := w.Checkpoint("app", "main", "v1"); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := w.Fork("app", "main", "attempt-1", ""); err != nil {
+		t.Fatal(err)
+	}
+	ap, err := w.Checkout("app", "attempt-1")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if out, err := exec.Command("sqlite3", ap, "INSERT INTO t VALUES (99);").CombinedOutput(); err != nil {
+		t.Fatalf("%v: %s", err, out)
+	}
+	if _, err := w.Checkpoint("app", "attempt-1", "winner"); err != nil {
+		t.Fatal(err)
+	}
+	// Dirty edit on the SOURCE after its last checkpoint, without
+	// checkpointing it.
+	if out, err := exec.Command("sqlite3", ap, "INSERT INTO t VALUES (100);").CombinedOutput(); err != nil {
+		t.Fatalf("%v: %s", err, out)
+	}
+
+	stderr := captureStderr(t, func() {
+		if _, err := w.Promote("app", "attempt-1", "main", true); err != nil {
+			t.Fatal(err)
+		}
+	})
+	if !strings.Contains(stderr, "un-checkpointed changes") {
+		t.Fatalf("warning missing expected text: %q", stderr)
+	}
+	if !strings.Contains(stderr, "app@attempt-1") {
+		t.Fatalf("warning does not name the source: %q", stderr)
+	}
+
+	mp, err := w.Checkout("app", "main")
+	if err != nil {
+		t.Fatal(err)
+	}
+	got, _ := exec.Command("sqlite3", mp, "SELECT count(*) FROM t;").Output()
+	if string(got) != "2\n" {
+		t.Fatalf("promoted content = %q, want the checkpointed count only (2 rows)", got)
+	}
+}
+
 func TestPromote(t *testing.T) {
 	if _, err := exec.LookPath("sqlite3"); err != nil {
 		t.Skip("sqlite3 CLI not on PATH")

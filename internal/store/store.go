@@ -22,8 +22,11 @@ type Manifest struct {
 }
 
 type Ref struct {
-	Schema      int               `json:"schema"`
-	Lineage     string            `json:"lineage"`
+	Schema  int    `json:"schema"`
+	Lineage string `json:"lineage"`
+	// Epoch identifies a lineage's current writer generation. Local (Plan-2)
+	// mode never re-acquires a lineage, so Epoch stays 1 for the lifetime of
+	// every ref this binary writes; bumping it is a Plan-3 daemon concern.
 	Epoch       uint64            `json:"epoch"`
 	HeadTXID    uint64            `json:"head_txid"`
 	Checkpoints map[string]uint64 `json:"checkpoints"`
@@ -62,6 +65,14 @@ func (s *Store) CheckManifest() error {
 func ValidateName(name string) error {
 	if name == "" || len(name) > maxNameLen {
 		return fmt.Errorf("store: invalid name %q (1-%d chars)", name, maxNameLen)
+	}
+	// "." and ".." are directory-traversal segments once a name is joined
+	// into a key path (e.g. refs/./main collapses to refs/main on the local
+	// backend, silently dropping the db path component into an invisible
+	// ref that GC then reaps the data for). Reject them, and any name
+	// containing ".." as a substring, outright.
+	if name == "." || name == ".." || strings.Contains(name, "..") {
+		return fmt.Errorf("store: invalid name %q (must not be \".\" or \"..\", or contain \"..\")", name)
 	}
 	for _, c := range name {
 		if !(c >= 'a' && c <= 'z' || c >= '0' && c <= '9' || c == '-' || c == '_' || c == '.') {

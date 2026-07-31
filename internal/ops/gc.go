@@ -61,12 +61,10 @@ func (w *Workspace) tombstone(m map[string]string) error {
 		cur[k] = v
 	}
 	data, _ := json.Marshal(cur)
-	if etag == "" {
-		_, err = w.Store.B.PutIf(tombstoneKey, data, "")
-	} else {
-		_, err = w.Store.B.PutIf(tombstoneKey, data, etag)
+	if _, err := w.Store.B.PutIf(tombstoneKey, data, etag); err != nil {
+		return fmt.Errorf("ops: gc tombstone update lost a race (retry): %w", err)
 	}
-	return err
+	return nil
 }
 
 // liveLineages returns every lineage referenced by any ref.
@@ -143,6 +141,16 @@ func (w *Workspace) GC(grace time.Duration) (tombstoned, deleted int, err error)
 	// (re-list refs after the grace check — a fork could have re-referenced).
 	cutoff := time.Now().Add(-grace)
 	for lineage, markedAt := range stones {
+		if _, mintedThisRun := newStones[lineage]; mintedThisRun {
+			// A stone minted in phase 1 above is timestamped `time.Now()`,
+			// which trivially satisfies a grace=0 cutoff computed moments
+			// later in this same call. Without this skip, one gc(0) call
+			// could tombstone AND sweep a lineage in a single run — e.g. one
+			// a fork is mid-flight copying a snapshot out of, in the narrow
+			// window between the fork's read and its own ref landing. Sweeps
+			// must always wait for a later, independent GC run.
+			continue
+		}
 		ts, perr := time.Parse(time.RFC3339Nano, markedAt)
 		if perr != nil || !ts.Before(cutoff) {
 			continue
@@ -166,8 +174,14 @@ func (w *Workspace) GC(grace time.Duration) (tombstoned, deleted int, err error)
 		deleted++
 		delete(stones, lineage)
 	}
-	// Persist the pruned stone list (best-effort CAS; conflict = another GC
-	// ran concurrently, which is safe — stones are re-derived each run).
+	// Persist the pruned stone list. This is an unconditional Put, not a
+	// CAS: it can clobber phase-1 additions from a concurrent GC run that
+	// landed after we loaded `stones` above. That's safe in only one
+	// direction — the clobbered lineage isn't lost, it just isn't tombstoned
+	// yet; the next GC run's phase 1 re-derives it from liveLineages/
+	// allLineages and re-marks it with a fresh timestamp, at worst delaying
+	// its eventual sweep by one grace period. It can never cause a live or
+	// still-within-grace lineage to be deleted early.
 	data, _ := json.Marshal(stones)
 	w.Store.B.Put(tombstoneKey, data)
 	return tombstoned, deleted, nil
