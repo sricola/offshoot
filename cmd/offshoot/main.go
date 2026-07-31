@@ -15,6 +15,7 @@ Usage:
   offshoot create <db> [--from f]    new database (branch main), or import file f
   offshoot checkout <db>[@branch]    materialize a working copy; prints its path
   offshoot checkpoint <db>[@branch] <name>   snapshot the checkout as a named checkpoint
+  offshoot fork <db>[@branch] <new> [--at cp]   branch from head or a checkpoint
   offshoot path <db>[@branch]        print the checkout path
 
 Store location: -store DIR or OFFSHOOT_STORE, default ./.offshoot
@@ -86,6 +87,26 @@ func run(args []string) error {
 			return err
 		}
 		fmt.Printf("checkpoint %q at txid %d\n", rest[1], txid)
+		return nil
+	case "fork":
+		fs := rest
+		at := ""
+		if len(fs) == 4 && fs[2] == "--at" {
+			at = fs[3]
+			fs = fs[:2]
+		}
+		if len(fs) != 2 {
+			return fmt.Errorf("usage: offshoot fork <db>[@branch] <new-branch> [--at checkpoint]")
+		}
+		db, branch, err := ops.ParseTarget(fs[0])
+		if err != nil {
+			return err
+		}
+		txid, err := w.Fork(db, branch, fs[1], at)
+		if err != nil {
+			return err
+		}
+		fmt.Printf("forked %s@%s -> %s@%s at txid %d\n", db, branch, db, fs[1], txid)
 		return nil
 	case "checkout", "path":
 		if len(rest) != 1 {
