@@ -14,6 +14,7 @@ Usage:
   offshoot init                      create a store in ./.offshoot
   offshoot create <db> [--from f]    new database (branch main), or import file f
   offshoot checkout <db>[@branch]    materialize a working copy; prints its path
+  offshoot checkpoint <db>[@branch] <name>   snapshot the checkout as a named checkpoint
   offshoot path <db>[@branch]        print the checkout path
 
 Store location: -store DIR or OFFSHOOT_STORE, default ./.offshoot
@@ -72,6 +73,20 @@ func run(args []string) error {
 			return w.CreateFrom(rest[0], rest[2])
 		}
 		return w.Create(rest[0])
+	case "checkpoint":
+		if len(rest) != 2 {
+			return fmt.Errorf("usage: offshoot checkpoint <db>[@branch] <name>")
+		}
+		db, branch, err := ops.ParseTarget(rest[0])
+		if err != nil {
+			return err
+		}
+		txid, err := w.Checkpoint(db, branch, rest[1])
+		if err != nil {
+			return err
+		}
+		fmt.Printf("checkpoint %q at txid %d\n", rest[1], txid)
+		return nil
 	case "checkout", "path":
 		if len(rest) != 1 {
 			return fmt.Errorf("usage: offshoot %s <db>[@branch]", cmd)

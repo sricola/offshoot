@@ -105,3 +105,73 @@ func TestParseTarget(t *testing.T) {
 		t.Fatal("want name validation error")
 	}
 }
+
+func TestCheckpointAndRematerialize(t *testing.T) {
+	if _, err := exec.LookPath("sqlite3"); err != nil {
+		t.Skip("sqlite3 CLI not on PATH")
+	}
+	w := newWS(t)
+	if err := w.Create("app"); err != nil {
+		t.Fatal(err)
+	}
+	path, err := w.Checkout("app", "main")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if out, err := exec.Command("sqlite3", path,
+		"CREATE TABLE t (v); INSERT INTO t VALUES (1),(2),(3);").CombinedOutput(); err != nil {
+		t.Fatalf("%v: %s", err, out)
+	}
+	txid, err := w.Checkpoint("app", "main", "v1")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if txid != 2 {
+		t.Errorf("txid = %d, want 2", txid)
+	}
+	if _, err := w.Checkpoint("app", "main", "v1"); err == nil {
+		t.Fatal("duplicate checkpoint name must fail")
+	}
+
+	// A fresh checkout must contain the checkpointed data.
+	want, _ := exec.Command("sqlite3", path, ".dump").Output()
+	path2, err := w.Checkout("app", "main")
+	if err != nil {
+		t.Fatal(err)
+	}
+	got, _ := exec.Command("sqlite3", path2, ".dump").Output()
+	if string(want) != string(got) {
+		t.Fatal("re-checkout does not match checkpointed state")
+	}
+}
+
+func TestCheckpointFailsCleanlyUnderLiveWriter(t *testing.T) {
+	w := newWS(t)
+	if err := w.Create("app"); err != nil {
+		t.Fatal(err)
+	}
+	path, err := w.Checkout("app", "main")
+	if err != nil {
+		t.Fatal(err)
+	}
+	conn, err := sql.Open("sqlite3", path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer conn.Close()
+	if _, err := conn.Exec("PRAGMA journal_mode=WAL; CREATE TABLE t (v)"); err != nil {
+		t.Fatal(err)
+	}
+	tx, err := conn.Begin()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := tx.Exec("INSERT INTO t VALUES (1)"); err != nil {
+		t.Fatal(err)
+	}
+	// Open write transaction -> checkpoint must fail cleanly, not hang forever.
+	if _, err := w.Checkpoint("app", "main", "x"); err == nil {
+		t.Fatal("checkpoint under live write txn must fail")
+	}
+	tx.Rollback()
+}

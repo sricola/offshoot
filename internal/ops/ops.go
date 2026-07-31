@@ -196,3 +196,62 @@ func copyFile(from, to string) error {
 	}
 	return out.Close()
 }
+
+// Checkpoint snapshots the current checkout state as a named checkpoint.
+// Plan-2 (CLI/at-rest) semantics: full-snapshot encode; requires the
+// checkout to be quiescible (busy timeout 3s, then clean failure).
+func (w *Workspace) Checkpoint(db, branch, name string) (uint64, error) {
+	if err := store.ValidateName(name); err != nil {
+		return 0, err
+	}
+	ref, etag, err := w.Store.GetRef(db, branch)
+	if err != nil {
+		return 0, err
+	}
+	if _, exists := ref.Checkpoints[name]; exists {
+		return 0, fmt.Errorf("ops: checkpoint %q already exists on %s@%s", name, db, branch)
+	}
+	path := w.CheckoutPath(db, branch)
+	if _, err := os.Stat(path); err != nil {
+		return 0, fmt.Errorf("ops: no checkout for %s@%s (run checkout first): %w", db, branch, err)
+	}
+	if err := quiesce(path); err != nil {
+		return 0, err
+	}
+	txid := ref.HeadTXID + 1
+	var buf bytes.Buffer
+	if err := ltxio.EncodeSnapshot(path, txid, &buf); err != nil {
+		return 0, err
+	}
+	if _, err := w.Store.B.PutIf(store.SnapshotKey(ref.Lineage, ref.Epoch, txid), buf.Bytes(), ""); err != nil {
+		return 0, err
+	}
+	ref.HeadTXID = txid
+	if ref.Checkpoints == nil {
+		ref.Checkpoints = map[string]uint64{}
+	}
+	ref.Checkpoints[name] = txid
+	if _, err := w.Store.PutRef(db, branch, ref, etag); err != nil {
+		// The snapshot object is orphaned inside a still-live lineage; GC
+		// ignores live lineages, so it is retained harmlessly. Loud error.
+		return 0, fmt.Errorf("ops: ref update lost a race (retry): %w", err)
+	}
+	return txid, nil
+}
+
+// quiesce checkpoints the WAL fully, failing cleanly on a busy database.
+func quiesce(path string) error {
+	conn, err := sql.Open("sqlite3", path+"?_busy_timeout=3000")
+	if err != nil {
+		return err
+	}
+	defer conn.Close()
+	var busy, logN, ckptN int
+	if err := conn.QueryRow("PRAGMA wal_checkpoint(TRUNCATE)").Scan(&busy, &logN, &ckptN); err != nil {
+		return fmt.Errorf("ops: checkpoint: %w", err)
+	}
+	if busy != 0 {
+		return fmt.Errorf("ops: database is busy (live writer or reader); close connections and retry")
+	}
+	return nil
+}
