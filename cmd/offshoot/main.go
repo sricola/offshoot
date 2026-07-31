@@ -4,6 +4,7 @@ package main
 import (
 	"fmt"
 	"os"
+	"time"
 
 	"github.com/offshoot-db/offshoot/internal/ops"
 )
@@ -18,6 +19,8 @@ Usage:
   offshoot fork <db>[@branch] <new> [--at cp]   branch from head or a checkpoint
   offshoot rollback <db>[@branch] --to <cp>       repoint a branch at a checkpoint
   offshoot promote <db>@<src> --onto <target> [--force]   repoint target at src's head
+  offshoot destroy <db>[@branch] [--force]   delete a branch (requires --force for protected)
+  offshoot gc [--grace duration]     garbage collect unreachable lineages (default grace: 1h)
   offshoot path <db>[@branch]        print the checkout path
 
 Store location: -store DIR or OFFSHOOT_STORE, default ./.offshoot
@@ -164,6 +167,39 @@ func run(args []string) error {
 			return err
 		}
 		fmt.Println(path)
+		return nil
+	case "destroy":
+		force := false
+		fs := rest[:0]
+		for _, a := range rest {
+			if a == "--force" {
+				force = true
+				continue
+			}
+			fs = append(fs, a)
+		}
+		if len(fs) != 1 {
+			return fmt.Errorf("usage: offshoot destroy <db>[@branch] [--force]")
+		}
+		db, branch, err := ops.ParseTarget(fs[0])
+		if err != nil {
+			return err
+		}
+		return w.Destroy(db, branch, force)
+	case "gc":
+		grace := time.Hour
+		if len(rest) == 2 && rest[0] == "--grace" {
+			d, err := time.ParseDuration(rest[1])
+			if err != nil {
+				return err
+			}
+			grace = d
+		}
+		tombstoned, deleted, err := w.GC(grace)
+		if err != nil {
+			return err
+		}
+		fmt.Printf("gc: tombstoned %d, deleted %d lineages\n", tombstoned, deleted)
 		return nil
 	default:
 		return fmt.Errorf("unknown command %q\n%s", cmd, usage)
