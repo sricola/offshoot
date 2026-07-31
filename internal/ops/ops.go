@@ -161,9 +161,9 @@ func (w *Workspace) createFromQuiesced(db, quiescedPath string) error {
 	}
 	ref := store.Ref{
 		Schema: 1, Lineage: lineage, Epoch: 1, HeadTXID: 1,
-		Checkpoints: map[string]uint64{"init": 1},
-		Protected:   true, // main is protected by default (spec § Security posture)
+		Protected: true, // main is protected by default (spec § Security posture)
 	}
+	ref.SetCheckpoint("init", 1, 1)
 	if _, err := w.Store.PutRef(db, "main", ref, ""); err != nil {
 		// Freshly-minted lineage no rival can reference: safe to delete the
 		// orphaned snapshot (mirrors Fork's cleanup on the same failure).
@@ -394,10 +394,7 @@ func (w *Workspace) Checkpoint(db, branch, name string) (uint64, error) {
 		}
 	}
 	ref.HeadTXID = txid
-	if ref.Checkpoints == nil {
-		ref.Checkpoints = map[string]uint64{}
-	}
-	ref.Checkpoints[name] = txid
+	ref.SetCheckpoint(name, txid, ref.Epoch)
 	if _, err := w.Store.PutRef(db, branch, ref, etag); err != nil {
 		// Decide whether to clean up the snapshot after PutRef failure.
 		// Unlike Fork/Rollback/Promote (which delete keys in freshly-minted
@@ -516,11 +513,11 @@ func (w *Workspace) Fork(db, srcBranch, newBranch, at string) (uint64, error) {
 	}
 	txid := src.HeadTXID
 	if at != "" {
-		t, ok := src.Checkpoints[at]
+		cp, ok := src.Checkpoints[at]
 		if !ok {
 			return 0, fmt.Errorf("ops: no checkpoint %q on %s@%s", at, db, srcBranch)
 		}
-		txid = t
+		txid = cp.TXID
 	} else {
 		w.warnIfUncheckpointed(db, srcBranch, src)
 	}
@@ -532,9 +529,9 @@ func (w *Workspace) Fork(db, srcBranch, newBranch, at string) (uint64, error) {
 	}
 	child := store.Ref{
 		Schema: 1, Lineage: childLineage, Epoch: 1, HeadTXID: txid,
-		Checkpoints: map[string]uint64{"fork": txid},
-		Parent:      fmt.Sprintf("%s@%s@%d", db, srcBranch, txid),
+		Parent: fmt.Sprintf("%s@%s@%d", db, srcBranch, txid),
 	}
+	child.SetCheckpoint("fork", txid, child.Epoch)
 	if _, err := w.Store.PutRef(db, newBranch, child, ""); err != nil {
 		// Branch already exists (or lost a race): remove the orphan snapshot.
 		w.Store.B.Delete(store.SnapshotKey(childLineage, 1, txid))
@@ -568,10 +565,11 @@ func (w *Workspace) Rollback(db, branch, to string) (string, error) {
 	if err != nil {
 		return "", err
 	}
-	txid, ok := ref.Checkpoints[to]
+	cp, ok := ref.Checkpoints[to]
 	if !ok {
 		return "", fmt.Errorf("ops: no checkpoint %q on %s@%s", to, db, branch)
 	}
+	txid := cp.TXID
 	lineage, err := w.copySnapshotToNewLineage(ref, txid)
 	if err != nil {
 		return "", err
@@ -583,10 +581,10 @@ func (w *Workspace) Rollback(db, branch, to string) (string, error) {
 		}
 	}
 
-	kept := map[string]uint64{}
-	for name, t := range ref.Checkpoints {
-		if t <= txid {
-			kept[name] = t
+	kept := map[string]store.Checkpoint{}
+	for name, c := range ref.Checkpoints {
+		if c.TXID <= txid {
+			kept[name] = c
 		}
 	}
 
@@ -595,15 +593,15 @@ func (w *Workspace) Rollback(db, branch, to string) (string, error) {
 	// lineage being orphaned and later reaped by GC. Abort and clean up
 	// anything already copied before touching the ref if any copy fails.
 	done := map[uint64]bool{txid: true}
-	for _, t := range kept {
-		if done[t] {
+	for _, c := range kept {
+		if done[c.TXID] {
 			continue
 		}
-		done[t] = true
-		key, err := w.copySnapshotIntoLineage(ref, t, lineage)
+		done[c.TXID] = true
+		key, err := w.copySnapshotIntoLineage(ref, c.TXID, lineage)
 		if err != nil {
 			cleanup()
-			return "", fmt.Errorf("ops: rollback: copying checkpoint snapshot for txid %d: %w", t, err)
+			return "", fmt.Errorf("ops: rollback: copying checkpoint snapshot for txid %d: %w", c.TXID, err)
 		}
 		copiedKeys = append(copiedKeys, key)
 	}
@@ -681,7 +679,8 @@ func (w *Workspace) Promote(db, source, target string, force bool) (uint64, erro
 	}
 	next := tgt
 	next.Lineage, next.Epoch, next.HeadTXID = lineage, 1, txid
-	next.Checkpoints = map[string]uint64{"promote": txid}
+	next.Checkpoints = nil
+	next.SetCheckpoint("promote", txid, next.Epoch)
 	next.Parent = fmt.Sprintf("%s@%s@%d", db, source, txid)
 	if _, err := w.Store.PutRef(db, target, next, tgtEtag); err != nil {
 		w.Store.B.Delete(store.SnapshotKey(lineage, 1, txid))

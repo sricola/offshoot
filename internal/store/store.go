@@ -12,6 +12,7 @@ import (
 
 const (
 	LayoutVersion = 1
+	RefSchema     = 2
 	manifestKey   = "offshoot.json"
 	maxNameLen    = 128
 )
@@ -21,17 +22,93 @@ type Manifest struct {
 	CreatedAt     string `json:"created_at"`
 }
 
+// Checkpoint locates a snapshot object: its transaction id and the epoch of
+// the prefix it was written under. Epoch matters because acquiring or
+// reclaiming a branch bumps the epoch, and objects stay where they were
+// written.
+type Checkpoint struct {
+	TXID  uint64 `json:"txid"`
+	Epoch uint64 `json:"epoch"`
+}
+
 type Ref struct {
 	Schema  int    `json:"schema"`
 	Lineage string `json:"lineage"`
 	// Epoch identifies a lineage's current writer generation. Local (Plan-2)
 	// mode never re-acquires a lineage, so Epoch stays 1 for the lifetime of
 	// every ref this binary writes; bumping it is a Plan-3 daemon concern.
-	Epoch       uint64            `json:"epoch"`
-	HeadTXID    uint64            `json:"head_txid"`
-	Checkpoints map[string]uint64 `json:"checkpoints"`
-	Parent      string            `json:"parent,omitempty"`
-	Protected   bool              `json:"protected"`
+	Epoch       uint64                `json:"epoch"`
+	HeadTXID    uint64                `json:"head_txid"`
+	HeadEpoch   uint64                `json:"head_epoch"`
+	Checkpoints map[string]Checkpoint `json:"checkpoints"`
+	Parent      string                `json:"parent,omitempty"`
+	Protected   bool                  `json:"protected"`
+	// Lease fields are empty when no writer holds the branch.
+	LeaseHolder string `json:"lease_holder,omitempty"`
+	LeaseExpiry string `json:"lease_expiry,omitempty"` // RFC3339Nano UTC
+}
+
+// SetCheckpoint records name at (txid, epoch), allocating the map if needed.
+func (r *Ref) SetCheckpoint(name string, txid, epoch uint64) {
+	if r.Checkpoints == nil {
+		r.Checkpoints = map[string]Checkpoint{}
+	}
+	r.Checkpoints[name] = Checkpoint{TXID: txid, Epoch: epoch}
+}
+
+// refWire is the tolerant on-disk shape: checkpoints are either v1 numbers or
+// v2 objects, so one decode handles both schemas.
+type refWire struct {
+	Schema      int                        `json:"schema"`
+	Lineage     string                     `json:"lineage"`
+	Epoch       uint64                     `json:"epoch"`
+	HeadTXID    uint64                     `json:"head_txid"`
+	HeadEpoch   uint64                     `json:"head_epoch"`
+	Checkpoints map[string]json.RawMessage `json:"checkpoints"`
+	Parent      string                     `json:"parent,omitempty"`
+	Protected   bool                       `json:"protected"`
+	LeaseHolder string                     `json:"lease_holder,omitempty"`
+	LeaseExpiry string                     `json:"lease_expiry,omitempty"`
+}
+
+// decodeRef parses the on-disk ref shape, upgrading a v1 ref (schema 1,
+// checkpoints as name -> number) to v2 in memory: every checkpoint's epoch
+// becomes the ref's own epoch (that is where everything a v1 binary wrote
+// actually lived), and so does HeadEpoch. A schema newer than this binary
+// understands is refused rather than guessed at.
+func decodeRef(data []byte) (Ref, error) {
+	var w refWire
+	if err := json.Unmarshal(data, &w); err != nil {
+		return Ref{}, err
+	}
+	if w.Schema > RefSchema {
+		return Ref{}, fmt.Errorf(
+			"store: ref schema %d is newer than this binary supports (%d)", w.Schema, RefSchema)
+	}
+	r := Ref{
+		Schema: RefSchema, Lineage: w.Lineage, Epoch: w.Epoch,
+		HeadTXID: w.HeadTXID, HeadEpoch: w.HeadEpoch,
+		Parent: w.Parent, Protected: w.Protected,
+		LeaseHolder: w.LeaseHolder, LeaseExpiry: w.LeaseExpiry,
+	}
+	// A v1 ref predates per-checkpoint epochs: everything it references was
+	// written under the ref's own epoch.
+	if r.HeadEpoch == 0 {
+		r.HeadEpoch = w.Epoch
+	}
+	for name, raw := range w.Checkpoints {
+		var cp Checkpoint
+		if err := json.Unmarshal(raw, &cp); err == nil && cp.TXID != 0 {
+			r.SetCheckpoint(name, cp.TXID, cp.Epoch)
+			continue
+		}
+		var txid uint64
+		if err := json.Unmarshal(raw, &txid); err != nil {
+			return Ref{}, fmt.Errorf("store: bad checkpoint %q: %w", name, err)
+		}
+		r.SetCheckpoint(name, txid, w.Epoch)
+	}
+	return r, nil
 }
 
 type Store struct{ B Backend }
@@ -103,9 +180,9 @@ func (s *Store) GetRef(db, branch string) (Ref, string, error) {
 	if err != nil {
 		return Ref{}, "", err
 	}
-	var r Ref
-	if err := json.Unmarshal(data, &r); err != nil {
-		return Ref{}, "", fmt.Errorf("store: corrupt ref %s@%s: %w", db, branch, err)
+	r, err := decodeRef(data)
+	if err != nil {
+		return Ref{}, "", fmt.Errorf("store: ref %s@%s: %w", db, branch, err)
 	}
 	return r, etag, nil
 }
@@ -116,6 +193,10 @@ func (s *Store) PutRef(db, branch string, r Ref, ifMatch string) (string, error)
 	}
 	if err := ValidateName(branch); err != nil {
 		return "", err
+	}
+	r.Schema = RefSchema
+	if r.HeadEpoch == 0 {
+		r.HeadEpoch = r.Epoch
 	}
 	data, err := json.Marshal(r)
 	if err != nil {
