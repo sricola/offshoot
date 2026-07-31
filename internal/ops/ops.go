@@ -330,25 +330,28 @@ func (w *Workspace) Checkpoint(db, branch, name string) (uint64, error) {
 	}
 	ref.Checkpoints[name] = txid
 	if _, err := w.Store.PutRef(db, branch, ref, etag); err != nil {
-		// Roll back the snapshot upload so a retry's create-only put at this
-		// same deterministic key doesn't get wedged behind this attempt's
-		// orphan (mirrors Fork's cleanup-on-ref-failure pattern) -- BUT only
-		// if it's actually still an orphan. Under concurrent Checkpoint calls
-		// on the same branch, every racer computes the same deterministic
-		// txid (HeadTXID+1) and therefore the same snapKey. By the time our
-		// own PutRef loses the CAS race, another attempt may have ALREADY
-		// landed its ref pointing at this exact key. Deleting unconditionally
-		// would rip the snapshot object out from under the winner, leaving a
-		// checkpoint recorded in the ref with no backing object -- silent
-		// corruption dressed up as a loud failure for the loser only. Re-read
-		// the ref and only clean up if we can positively confirm nothing
-		// committed currently references this txid in this lineage; on any
-		// doubt (including a failed re-read), leave the object alone --
-		// worst case it's a harmless orphan for a later GC pass.
-		if cur, _, gerr := w.Store.GetRef(db, branch); gerr == nil && (cur.Lineage != ref.Lineage || cur.HeadTXID < txid) {
-			w.Store.B.Delete(snapKey)
-		}
+		// Decide whether to clean up the snapshot after PutRef failure.
+		// Unlike Fork/Rollback/Promote (which delete keys in freshly-minted
+		// lineages no rival can reference), we must gate cleanup on the error
+		// type: under concurrent Checkpoint calls on the same branch, every
+		// racer computes the same deterministic txid (HeadTXID+1) and snapKey.
+		//
+		// On ErrCAS (lost the CAS race): serialization via PutIf means the
+		// winner's ref is already visible, so the snapshot is confirmed an
+		// orphan left by a crashed prior Checkpoint — safe to delete so a
+		// retry's create-only put doesn't wedge behind our orphan.
+		//
+		// On non-CAS errors (lock timeout, I/O error): deletion is UNSAFE.
+		// A concurrent checkpointer may already be mid-write, and we can't
+		// tell from here whether they've landed their ref yet. Deleting would
+		// rip the snapshot out from under them, leaving a checkpoint recorded
+		// in their ref with no backing object — silent corruption for them.
+		// Leave the object alone; worst case it's a harmless orphan for a
+		// later GC pass.
 		if errors.Is(err, store.ErrCAS) {
+			if cur, _, gerr := w.Store.GetRef(db, branch); gerr == nil && (cur.Lineage != ref.Lineage || cur.HeadTXID < txid) {
+				w.Store.B.Delete(snapKey)
+			}
 			return 0, fmt.Errorf("ops: ref update lost a race (retry): %w", err)
 		}
 		return 0, fmt.Errorf("ops: ref update for checkpoint %q on %s@%s: %w", name, db, branch, err)
