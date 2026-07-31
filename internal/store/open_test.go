@@ -69,3 +69,56 @@ func TestOpenBackendRejectsUnknownScheme(t *testing.T) {
 		t.Fatal("unknown scheme must be refused")
 	}
 }
+
+// TestStoreIdentityCanonicalizesS3Specs guards the cache-key fix: a store
+// identity must reflect the RESOLVED backend (bucket + prefix + env-derived
+// endpoint/region/path-style), not just the literal spec text. Two spellings
+// of the same spec (with/without a trailing slash on the prefix) must
+// collapse to one identity, while the same spec string under a different
+// resolved endpoint, region, or path-style must NOT collide.
+func TestStoreIdentityCanonicalizesS3Specs(t *testing.T) {
+	t.Setenv("OFFSHOOT_S3_ENDPOINT", "http://minio.local:9000")
+	t.Setenv("OFFSHOOT_S3_REGION", "us-east-1")
+	t.Setenv("OFFSHOOT_S3_PATH_STYLE", "1")
+
+	base, err := store.StoreIdentity("s3://b/p")
+	if err != nil {
+		t.Fatal(err)
+	}
+	trailingSlash, err := store.StoreIdentity("s3://b/p/")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if base != trailingSlash {
+		t.Fatalf("s3://b/p and s3://b/p/ must share an identity: %q vs %q", base, trailingSlash)
+	}
+
+	t.Setenv("OFFSHOOT_S3_ENDPOINT", "http://real-aws.example.com")
+	differentEndpoint, err := store.StoreIdentity("s3://b/p")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if differentEndpoint == base {
+		t.Fatalf("changing OFFSHOOT_S3_ENDPOINT must change identity for the same spec, got %q both times", base)
+	}
+	t.Setenv("OFFSHOOT_S3_ENDPOINT", "http://minio.local:9000")
+
+	t.Setenv("OFFSHOOT_S3_REGION", "eu-west-1")
+	differentRegion, err := store.StoreIdentity("s3://b/p")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if differentRegion == base {
+		t.Fatalf("changing OFFSHOOT_S3_REGION must change identity for the same spec, got %q both times", base)
+	}
+	t.Setenv("OFFSHOOT_S3_REGION", "us-east-1")
+
+	t.Setenv("OFFSHOOT_S3_PATH_STYLE", "0")
+	differentPathStyle, err := store.StoreIdentity("s3://b/p")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if differentPathStyle == base {
+		t.Fatalf("changing OFFSHOOT_S3_PATH_STYLE must change identity for the same spec, got %q both times", base)
+	}
+}

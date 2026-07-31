@@ -83,7 +83,17 @@ func checkoutRoot(spec string) (string, error) {
 	if err != nil {
 		return "", fmt.Errorf("ops: no checkout directory (set OFFSHOOT_CHECKOUTS): %w", err)
 	}
-	sum := sha256.Sum256([]byte(spec))
+	// Hash the RESOLVED store identity, not the raw spec string: two
+	// sessions can use the identical spec string (e.g. "s3://bucket/prefix")
+	// while OFFSHOOT_S3_ENDPOINT resolves it to different backends (MinIO
+	// one session, real AWS the next). Hashing the raw spec would collide
+	// both onto the same local checkout cache dir, silently discarding
+	// un-checkpointed edits from whichever backend wrote there last.
+	id, err := store.StoreIdentity(spec)
+	if err != nil {
+		return "", err
+	}
+	sum := sha256.Sum256([]byte(id))
 	return filepath.Join(cache, "offshoot", hex.EncodeToString(sum[:8])), nil
 }
 

@@ -32,21 +32,21 @@ Store location: -store SPEC or OFFSHOOT_STORE, default ./.offshoot
   Remote stores keep checkouts in OFFSHOOT_CHECKOUTS (default: user cache dir)
 `
 
-func storeRoot(args []string) (string, []string) {
-	root := os.Getenv("OFFSHOOT_STORE")
-	if root == "" {
-		root = ".offshoot"
+func storeSpec(args []string) (string, []string) {
+	spec := os.Getenv("OFFSHOOT_STORE")
+	if spec == "" {
+		spec = ".offshoot"
 	}
 	out := args[:0]
 	for i := 0; i < len(args); i++ {
 		if args[i] == "-store" && i+1 < len(args) {
-			root = args[i+1]
+			spec = args[i+1]
 			i++
 			continue
 		}
 		out = append(out, args[i])
 	}
-	return root, out
+	return spec, out
 }
 
 func main() {
@@ -57,7 +57,7 @@ func main() {
 }
 
 func run(args []string) error {
-	root, args := storeRoot(args)
+	spec, args := storeSpec(args)
 	if len(args) == 0 {
 		fmt.Print(usage)
 		return nil
@@ -65,16 +65,16 @@ func run(args []string) error {
 	cmd, rest := args[0], args[1:]
 
 	if cmd == "init" {
-		_, err := ops.Init(root)
+		_, err := ops.Init(spec)
 		if err == nil {
-			fmt.Println("initialized store at", root)
+			fmt.Println("initialized store at", spec)
 		}
 		return err
 	}
 
-	w, err := ops.Open(root)
+	w, err := ops.Open(spec)
 	if err != nil {
-		return fmt.Errorf("open store %s: %w (run 'offshoot init'?)", root, err)
+		return fmt.Errorf("open store %s: %w (run 'offshoot init'?)", spec, err)
 	}
 	switch cmd {
 	case "create":
