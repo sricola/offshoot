@@ -44,14 +44,27 @@ func etagOf(b []byte) string {
 	return `"` + hex.EncodeToString(sum[:]) + `"`
 }
 
-// keyOf strips the leading "/bucket/" from the request path.
+// bucketOf and keyOf split a request path on its first path-segment
+// boundary — the bucket, then the key — rather than stripping a bare string
+// prefix, so a bucket name that happens to prefix another string can't be
+// confused for a segment match.
+func bucketOf(p string) string {
+	bucket, _, _ := strings.Cut(strings.TrimPrefix(p, "/"), "/")
+	return bucket
+}
+
 func keyOf(p string) string {
-	p = strings.TrimPrefix(p, "/")
-	p = strings.TrimPrefix(p, fakeBucket)
-	return strings.TrimPrefix(p, "/")
+	_, key, _ := strings.Cut(strings.TrimPrefix(p, "/"), "/")
+	return key
 }
 
 func (f *FakeS3) handle(w http.ResponseWriter, r *http.Request) {
+	if bucketOf(r.URL.Path) != fakeBucket {
+		w.Header().Set("Content-Type", "application/xml")
+		w.WriteHeader(http.StatusNotFound)
+		io.WriteString(w, `<Error><Code>NoSuchBucket</Code></Error>`)
+		return
+	}
 	key := keyOf(r.URL.Path)
 	f.mu.Lock()
 	defer f.mu.Unlock()

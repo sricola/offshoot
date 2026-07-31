@@ -91,35 +91,42 @@ func statusOf(err error) int {
 	return 0
 }
 
+// isNotFound reports whether err means "the key is absent" — never "the
+// bucket is absent" (NoSuchBucket must surface loud, not look like an empty
+// store). The typed API error code is authoritative when present; the raw
+// HTTP status is only a fallback for errors that carry no API error code at
+// all (e.g. transport-level responses the SDK couldn't parse into one).
 func isNotFound(err error) bool {
-	if statusOf(err) == http.StatusNotFound {
-		return true
-	}
 	var ae smithy.APIError
 	if errors.As(err, &ae) {
 		switch ae.ErrorCode() {
 		case "NoSuchKey", "NotFound":
 			return true
 		}
+		return false
 	}
-	return false
+	return statusOf(err) == http.StatusNotFound
 }
 
 // isPreconditionFailed reports whether err is a conditional-write rejection.
 // S3 returns 412 PreconditionFailed for a failed condition and 409
 // ConditionalRequestConflict when a concurrent write raced ours; both mean
-// "your compare failed, retry".
+// "your compare failed, retry". The typed API error code is authoritative
+// when present; a bare HTTP 409 can also mean an unrelated conflict (Object
+// Lock/retention, OperationAborted), so status is only a fallback when no
+// API error code is available.
 func isPreconditionFailed(err error) bool {
-	switch statusOf(err) {
-	case http.StatusPreconditionFailed, http.StatusConflict:
-		return true
-	}
 	var ae smithy.APIError
 	if errors.As(err, &ae) {
 		switch ae.ErrorCode() {
 		case "PreconditionFailed", "ConditionalRequestConflict":
 			return true
 		}
+		return false
+	}
+	switch statusOf(err) {
+	case http.StatusPreconditionFailed, http.StatusConflict:
+		return true
 	}
 	return false
 }
