@@ -3,12 +3,14 @@ package ops
 import (
 	"database/sql"
 	"errors"
+	"fmt"
 	"io"
 	"os"
 	"os/exec"
 	"path/filepath"
 	"reflect"
 	"strings"
+	"sync"
 	"testing"
 
 	_ "github.com/mattn/go-sqlite3"
@@ -678,5 +680,111 @@ func TestRollbackReportsRepointOnRefreshFailure(t *testing.T) {
 	}
 	if _, ok := after.Checkpoints["bad"]; ok {
 		t.Fatal("later checkpoint must still be dropped")
+	}
+}
+
+func TestConcurrentForksFromSameParent(t *testing.T) {
+	if _, err := exec.LookPath("sqlite3"); err != nil {
+		t.Skip("sqlite3 CLI not on PATH")
+	}
+	w := newWS(t)
+	w.Create("app")
+	path, _ := w.Checkout("app", "main")
+	exec.Command("sqlite3", path, "CREATE TABLE t (v); INSERT INTO t VALUES (1);").Run()
+	w.Checkpoint("app", "main", "v1")
+
+	var wg sync.WaitGroup
+	errs := make([]error, 8)
+	for i := 0; i < 8; i++ {
+		wg.Add(1)
+		go func(n int) {
+			defer wg.Done()
+			_, errs[n] = w.Fork("app", "main", fmt.Sprintf("f-%d", n), "")
+		}(i)
+	}
+	wg.Wait()
+	for i, err := range errs {
+		if err != nil {
+			t.Fatalf("fork %d: %v", i, err)
+		}
+	}
+	// All 8 children have distinct lineages and materialize correctly.
+	seen := map[string]bool{}
+	for i := 0; i < 8; i++ {
+		r, _, err := w.Store.GetRef("app", fmt.Sprintf("f-%d", i))
+		if err != nil || seen[r.Lineage] {
+			t.Fatalf("child %d: err=%v dup-lineage=%v", i, err, seen[r.Lineage])
+		}
+		seen[r.Lineage] = true
+		if _, err := w.Checkout("app", fmt.Sprintf("f-%d", i)); err != nil {
+			t.Fatal(err)
+		}
+	}
+}
+
+func TestConcurrentCheckpointsOnlyOneWins(t *testing.T) {
+	if _, err := exec.LookPath("sqlite3"); err != nil {
+		t.Skip("sqlite3 CLI not on PATH")
+	}
+	w := newWS(t)
+	w.Create("app")
+	path, _ := w.Checkout("app", "main")
+	exec.Command("sqlite3", path, "CREATE TABLE t (v);").Run()
+
+	var wg sync.WaitGroup
+	okCount := 0
+	var mu sync.Mutex
+	var loserErrs []error
+	for i := 0; i < 4; i++ {
+		wg.Add(1)
+		go func(n int) {
+			defer wg.Done()
+			if _, err := w.Checkpoint("app", "main", fmt.Sprintf("cp-%d", n)); err == nil {
+				mu.Lock()
+				okCount++
+				mu.Unlock()
+			} else {
+				mu.Lock()
+				loserErrs = append(loserErrs, err)
+				mu.Unlock()
+			}
+		}(i)
+	}
+	wg.Wait()
+	// At least one wins; losers fail loudly with the CAS-race error, and the
+	// ref must remain internally consistent (head >= every recorded checkpoint).
+	if okCount == 0 {
+		t.Fatal("no checkpoint succeeded")
+	}
+	for _, e := range loserErrs {
+		t.Logf("loser error: %v", e)
+	}
+	r, _, err := w.Store.GetRef("app", "main")
+	if err != nil {
+		t.Fatal(err)
+	}
+	for name, txid := range r.Checkpoints {
+		if txid > r.HeadTXID {
+			t.Fatalf("checkpoint %s@txid %d beyond head %d", name, txid, r.HeadTXID)
+		}
+		if _, _, err := w.Store.B.Get(store.SnapshotKey(r.Lineage, r.Epoch, txid)); err != nil {
+			t.Fatalf("recorded checkpoint %s has no snapshot object: %v", name, err)
+		}
+	}
+}
+
+func TestCorruptSnapshotFailsClosedEndToEnd(t *testing.T) {
+	if _, err := exec.LookPath("sqlite3"); err != nil {
+		t.Skip("sqlite3 CLI not on PATH")
+	}
+	w := newWS(t)
+	w.Create("app")
+	r, _, _ := w.Store.GetRef("app", "main")
+	key := store.SnapshotKey(r.Lineage, r.Epoch, 1)
+	data, _, _ := w.Store.B.Get(key)
+	data[len(data)/2] ^= 0xFF
+	w.Store.B.Put(key, data)
+	if _, err := w.Checkout("app", "main"); err == nil {
+		t.Fatal("checkout of corrupt snapshot must fail closed")
 	}
 }

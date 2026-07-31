@@ -175,6 +175,60 @@ func TestLocalFreshLockNotBroken(t *testing.T) {
 	}
 }
 
+// TestLocalConcurrentPutSameKey guards against a regression found while
+// hardening internal/ops's Checkpoint against concurrent callers: Put has no
+// per-key lock (by design -- callers like Checkpoint's orphan-snapshot
+// overwrite and GC's tombstone-list write use it exactly because
+// last-write-wins is intentional there), so multiple goroutines can call
+// Put on the identical key at the same time. The old write() used a fixed
+// shared temp filename (key+".tmp"): one goroutine's os.Create (O_TRUNC) or
+// os.Rename could clobber or disappear another's temp file mid-write,
+// surfacing as a spurious "rename ... no such file or directory" instead of
+// either goroutine cleanly succeeding. Every concurrent Put here must
+// return a nil error, and the key must end up holding exactly one of the
+// written payloads (not truncated, not torn).
+func TestLocalConcurrentPutSameKey(t *testing.T) {
+	b, _ := NewLocal(t.TempDir())
+	const n = 32
+	var wg sync.WaitGroup
+	errs := make([]error, n)
+	for i := 0; i < n; i++ {
+		wg.Add(1)
+		go func(i int) {
+			defer wg.Done()
+			errs[i] = b.Put("data/x/1.ltx", []byte(fmt.Sprintf("payload-%d", i)))
+		}(i)
+	}
+	wg.Wait()
+	for i, err := range errs {
+		if err != nil {
+			t.Fatalf("concurrent Put %d: %v", i, err)
+		}
+	}
+	data, _, err := b.Get("data/x/1.ltx")
+	if err != nil {
+		t.Fatalf("Get after concurrent Put: %v", err)
+	}
+	matched := false
+	for i := 0; i < n; i++ {
+		if string(data) == fmt.Sprintf("payload-%d", i) {
+			matched = true
+			break
+		}
+	}
+	if !matched {
+		t.Fatalf("final content %q is not any single writer's payload (torn write)", data)
+	}
+	// No leaked temp files should show up in List.
+	keys, err := b.List("data/")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(keys) != 1 || keys[0] != "data/x/1.ltx" {
+		t.Fatalf("List after concurrent Put = %v, want exactly [data/x/1.ltx]", keys)
+	}
+}
+
 func TestLocalRejectsTraversal(t *testing.T) {
 	b, _ := NewLocal(t.TempDir())
 	if err := b.Put("../evil", []byte("x")); err == nil {
