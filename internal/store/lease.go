@@ -3,6 +3,7 @@ package store
 import (
 	"errors"
 	"fmt"
+	"os"
 	"time"
 )
 
@@ -23,6 +24,11 @@ type Lease struct {
 	Expiry     time.Time
 }
 
+// parseExpiry parses a LeaseExpiry string. The second return distinguishes
+// "empty" (no lease held; the zero value is fine to treat as expired) from
+// "corrupt" (a non-empty value that doesn't parse) — callers that care about
+// the difference check s == "" themselves, since parseExpiry's bool alone
+// collapses both to false.
 func parseExpiry(s string) (time.Time, bool) {
 	if s == "" {
 		return time.Time{}, false
@@ -34,8 +40,27 @@ func parseExpiry(s string) (time.Time, bool) {
 	return t, true
 }
 
-// AcquireLease claims db@branch for holder until now+ttl, bumping the epoch
-// so any previous holder's subsequent writes are fenced into a dead prefix.
+// AcquireLease claims db@branch for holder until now+ttl.
+//
+// A fresh acquisition, or a reclaim of an expired (or corrupt, see below)
+// lease, bumps the epoch so any previous holder's subsequent writes are
+// fenced into a dead prefix. But if the caller already holds a live lease
+// (same holder, not yet expired), AcquireLease is instead an idempotent
+// renew: it extends the expiry and returns the SAME epoch, exactly like
+// RenewLease. Bumping in that case would fence the holder's own in-flight
+// writes, which is never what a re-acquiring holder wants; a caller that
+// genuinely wants a fresh epoch must ReleaseLease then AcquireLease again.
+//
+// A LeaseExpiry that is present but fails to parse is corruption, not an
+// available lease — but it is still treated as fail-open (reclaimable) here
+// rather than fail-closed, because fail-closed would brick the branch
+// permanently with no recovery path. The reclaim is logged to stderr so the
+// corruption doesn't pass silently.
+//
+// If PutRef loses a concurrent-acquire race (ErrCAS), that is reported as
+// an error wrapping BOTH ErrLeaseHeld and ErrCAS: a caller that only checks
+// ErrLeaseHeld still sees "someone else holds it," while a caller that
+// wants the low-level detail can still find ErrCAS via errors.Is.
 func (s *Store) AcquireLease(db, branch, holder string, ttl time.Duration, now time.Time) (Lease, error) {
 	if holder == "" {
 		return Lease{}, errors.New("store: lease holder must be named")
@@ -44,16 +69,33 @@ func (s *Store) AcquireLease(db, branch, holder string, ttl time.Duration, now t
 	if err != nil {
 		return Lease{}, err
 	}
-	if exp, ok := parseExpiry(ref.LeaseExpiry); ok && ref.LeaseHolder != "" &&
-		ref.LeaseHolder != holder && now.Before(exp) {
+	exp, parseOK := parseExpiry(ref.LeaseExpiry)
+	if ref.LeaseExpiry != "" && !parseOK {
+		fmt.Fprintf(os.Stderr,
+			"offshoot: warning: %s@%s has a corrupt lease_expiry %q; treating as expired and reclaiming\n",
+			db, branch, ref.LeaseExpiry)
+	}
+	live := parseOK && ref.LeaseHolder != "" && now.Before(exp)
+	if live && ref.LeaseHolder != holder {
 		return Lease{}, fmt.Errorf("%w by %q until %s",
 			ErrLeaseHeld, ref.LeaseHolder, ref.LeaseExpiry)
 	}
+
 	expiry := now.Add(ttl).UTC()
-	ref.Epoch++
+	if !live {
+		// Fresh acquisition, or reclaim of a dead/corrupt lease: bump the
+		// epoch to fence out whatever the previous holder might still write.
+		ref.Epoch++
+	}
+	// live && same holder falls through here without bumping: an idempotent
+	// self-renew (see doc comment above).
 	ref.LeaseHolder = holder
 	ref.LeaseExpiry = expiry.Format(time.RFC3339Nano)
 	if _, err := s.PutRef(db, branch, ref, etag); err != nil {
+		if errors.Is(err, ErrCAS) {
+			return Lease{}, fmt.Errorf("%w: lost an acquisition race on %s@%s: %w",
+				ErrLeaseHeld, db, branch, err)
+		}
 		return Lease{}, fmt.Errorf("store: acquire lease on %s@%s: %w", db, branch, err)
 	}
 	return Lease{DB: db, Branch: branch, Holder: holder, Epoch: ref.Epoch, Expiry: expiry}, nil
