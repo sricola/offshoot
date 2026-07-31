@@ -15,12 +15,24 @@ var ErrFenced = errors.New("session: fenced — lease lost")
 
 // Flush uploads the replica's current state as a snapshot under the session's
 // lease epoch and advances the branch head. name is optional: when non-empty
-// the flushed state is also recorded as a named checkpoint. Returns the txid
-// the branch is now durable through.
+// the flushed state is also recorded as a named checkpoint; Flush checks
+// up front that no checkpoint of that name already exists on the branch and
+// fails without touching anything if it does — a courtesy beyond the minimal
+// requirement (PutRef's CAS alone would eventually catch a stale ref) that
+// lets a name collision fail fast with a clear message instead of surfacing
+// as an opaque ref-CAS retry.
 //
 // Flush never touches the agent's checkout: it encodes the replica, which the
 // capture engine keeps at a transaction boundary.
+//
+// The whole call runs under flushMu, so concurrent Flush calls on the same
+// Session are serialized rather than racing to compute and write the same
+// txid. See flushMu's doc comment for the lock-ordering invariant this
+// implies.
 func (s *Session) Flush(name string) (uint64, error) {
+	s.flushMu.Lock()
+	defer s.flushMu.Unlock()
+
 	if err := s.Err(); err != nil {
 		return 0, err
 	}
@@ -79,10 +91,36 @@ func (s *Session) Flush(name string) (uint64, error) {
 		ref.SetCheckpoint(name, txid, lease.Epoch)
 	}
 	if _, err := st.PutRef(s.db, s.branch, ref, etag); err != nil {
-		if delErr := st.B.Delete(snapKey); delErr != nil {
-			return 0, fmt.Errorf("session: ref update failed (%v) and cleanup failed: %w", err, delErr)
-		}
+		// Decide whether to clean up the uploaded snapshot after a failed ref
+		// update. This mirrors ops.Checkpoint's identical decision exactly
+		// (see its comment for the full reasoning) — flushMu serializes
+		// concurrent Flush calls on THIS Session, but a rival can still win
+		// the ref CAS out from under us: another holder that reclaimed the
+		// lease between our GetRef above and this PutRef, or a crashed prior
+		// Flush attempt that already occupies snapKey.
+		//
+		// On ErrCAS (lost the CAS race): PutIf's serialization means the
+		// winner's ref, if any, is already visible. Re-read it and delete the
+		// snapshot ONLY when it's confirmed unreferenced — the current ref is
+		// on a different lineage, or its HeadTXID hasn't reached txid. If the
+		// current ref DOES already reference (lineage, txid), some other
+		// actor already committed exactly what we tried to commit, and
+		// deleting would rip a live snapshot out from under it.
+		//
+		// On any non-CAS error (lock timeout, I/O error, network blip): the
+		// write may have actually landed server-side while the client only
+		// saw an error — this is the ambiguous case a failure here MUST NOT
+		// guess through. Deleting unconditionally, as this code used to,
+		// would risk leaving a live ref pointing at SnapshotKey with no
+		// object behind it: silent, unrecoverable data loss in the one
+		// primitive whose job is preventing exactly that. Leave the object
+		// alone; at worst it's a harmless orphan a future flush's overwrite
+		// path (above) or GC reclaims.
 		if errors.Is(err, store.ErrCAS) {
+			if cur, _, gerr := st.GetRef(s.db, s.branch); gerr == nil &&
+				(cur.Lineage != ref.Lineage || cur.HeadTXID < txid) {
+				st.B.Delete(snapKey)
+			}
 			return 0, fmt.Errorf("session: flush lost a race (retry): %w", err)
 		}
 		return 0, fmt.Errorf("session: advance ref: %w", err)

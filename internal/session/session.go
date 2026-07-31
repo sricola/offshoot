@@ -42,10 +42,10 @@ type Options struct {
 // with respect to a concurrent reader, so an Encode running at the same
 // time could observe a torn mix of pre- and post-mutation bytes (or a
 // nPages read from the header that no longer matches the pages on disk
-// after a concurrent Truncate). mu — Session.replicaMu, shared with
-// Session.Flush — serializes replica-file mutation against replica-file
-// encoding so Flush always reads a replica frozen at a single transaction
-// boundary.
+// after a concurrent Truncate). replicaSink's mu field is Session.replicaMu,
+// shared with Session.Flush: it serializes replica-file mutation against
+// replica-file encoding so Flush always reads a replica frozen at a single
+// transaction boundary.
 type replicaSink struct {
 	r  *replay.Replica
 	mu *sync.Mutex
@@ -92,6 +92,24 @@ type Session struct {
 	// Flush never encodes a torn mix of pre- and post-mutation bytes. See
 	// replicaSink's doc comment for why the race is real.
 	replicaMu sync.Mutex
+
+	// flushMu serializes the entire body of Flush: two goroutines calling
+	// Flush concurrently would otherwise both read the same ref (same etag,
+	// same HeadTXID), compute the identical next txid, and race to write it —
+	// one loses the ref CAS and, worse, both raced encoding the replica out
+	// from under each other's assumptions about what txid they were
+	// producing. Holding flushMu for the whole call makes one Flush's read
+	// (GetRef) through write (PutRef) atomic with respect to any other Flush
+	// on this same Session.
+	//
+	// Lock ordering across this package, when more than one of these is held
+	// at once, is flushMu -> replicaMu -> mu, and never the reverse. In the
+	// current code no two of these are ever held simultaneously (Flush locks
+	// and releases replicaMu before later locking mu), so this is documented
+	// as a standing invariant for future changes rather than a live nesting
+	// today: violating it — e.g. taking flushMu while holding mu — is a
+	// deadlock waiting for a caller that holds them in the other order.
+	flushMu sync.Mutex
 
 	mu      sync.Mutex
 	lease   store.Lease

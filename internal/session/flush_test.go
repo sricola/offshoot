@@ -3,7 +3,10 @@ package session
 import (
 	"context"
 	"errors"
+	"fmt"
 	"os/exec"
+	"strings"
+	"sync"
 	"testing"
 	"time"
 
@@ -135,4 +138,154 @@ func TestFlushAfterFencingIsRefused(t *testing.T) {
 		t.Fatal("fenced session advanced the branch")
 	}
 	_ = store.Lease{}
+}
+
+// failRefPutIf wraps a store.Backend and turns any PutIf on a "refs/" key
+// into a non-CAS failure, simulating an ambiguous transient error (e.g. an
+// S3 timeout) on the ref write specifically — the snapshot upload (a
+// "data/" key) is left untouched, so this reproduces a flush that
+// successfully uploaded its snapshot but then hit an inconclusive error
+// trying to advance the ref.
+type failRefPutIf struct {
+	store.Backend
+}
+
+func (f failRefPutIf) PutIf(key string, data []byte, ifMatch string) (string, error) {
+	if strings.HasPrefix(key, "refs/") {
+		return "", fmt.Errorf("test: injected non-CAS ref failure on %s", key)
+	}
+	return f.Backend.PutIf(key, data, ifMatch)
+}
+
+// TestFlushDoesNotDeleteSnapshotOnNonCASRefFailure guards the critical fix:
+// a non-CAS PutRef failure is ambiguous (the write may have landed
+// server-side even though the client saw an error), so Flush must not
+// delete the snapshot it just uploaded. Deleting would leave a possibly-live
+// ref pointing at a missing object — silent, unrecoverable data loss.
+func TestFlushDoesNotDeleteSnapshotOnNonCASRefFailure(t *testing.T) {
+	requireSQLite(t)
+	w := newWS(t)
+	if err := w.Create("app"); err != nil {
+		t.Fatal(err)
+	}
+	s, err := Open(context.Background(), Options{WS: w, DB: "app", Branch: "main"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer s.Close()
+
+	if out, err := exec.Command("sqlite3", s.CheckoutPath(),
+		"CREATE TABLE t (v); INSERT INTO t VALUES (1);").CombinedOutput(); err != nil {
+		t.Fatalf("%v: %s", err, out)
+	}
+	waitFor(t, 10*time.Second, "capture", func() bool {
+		out, err := exec.Command("sqlite3", s.ReplicaPath(), "SELECT count(*) FROM t;").Output()
+		return err == nil && string(out) == "1\n"
+	})
+
+	ref, _, err := w.Store.GetRef("app", "main")
+	if err != nil {
+		t.Fatal(err)
+	}
+	wantTxid := ref.HeadTXID + 1
+	wantKey := store.SnapshotKey(ref.Lineage, s.Lease().Epoch, wantTxid)
+
+	// Inject a non-CAS failure on the ref write. w.Store and s.ws.Store are
+	// the same *store.Store, so mutating w.Store.B is visible to Flush.
+	orig := w.Store.B
+	w.Store.B = failRefPutIf{orig}
+
+	_, err = s.Flush("")
+	if err == nil {
+		t.Fatal("Flush must fail when the ref write fails")
+	}
+	if errors.Is(err, store.ErrCAS) {
+		t.Fatalf("injected failure must NOT be reported as ErrCAS, got: %v", err)
+	}
+
+	// Restore the real backend to inspect what's actually in the store.
+	w.Store.B = orig
+	if data, _, err := w.Store.B.Get(wantKey); err != nil || len(data) == 0 {
+		t.Fatalf("snapshot at %s must still exist after an ambiguous non-CAS ref failure: data=%d err=%v",
+			wantKey, len(data), err)
+	}
+}
+
+// TestConcurrentFlushIsSerialized guards the flushMu fix: without
+// serialization, concurrent Flush calls on one Session compute the same
+// txid/key and race. With flushMu, every call's GetRef-through-PutRef is
+// atomic with respect to the others on this Session, so every call should
+// succeed with its own distinct txid (a retryable error is tolerated too,
+// in case of external contention, but must never be ErrFenced or a
+// duplicated txid).
+func TestConcurrentFlushIsSerialized(t *testing.T) {
+	requireSQLite(t)
+	w := newWS(t)
+	if err := w.Create("app"); err != nil {
+		t.Fatal(err)
+	}
+	s, err := Open(context.Background(), Options{WS: w, DB: "app", Branch: "main"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer s.Close()
+
+	if out, err := exec.Command("sqlite3", s.CheckoutPath(),
+		"CREATE TABLE t (v); INSERT INTO t VALUES (1);").CombinedOutput(); err != nil {
+		t.Fatalf("%v: %s", err, out)
+	}
+	waitFor(t, 10*time.Second, "capture", func() bool {
+		out, err := exec.Command("sqlite3", s.ReplicaPath(), "SELECT count(*) FROM t;").Output()
+		return err == nil && string(out) == "1\n"
+	})
+
+	const n = 4
+	var wg sync.WaitGroup
+	txids := make([]uint64, n)
+	errs := make([]error, n)
+	for i := 0; i < n; i++ {
+		wg.Add(1)
+		go func(i int) {
+			defer wg.Done()
+			txids[i], errs[i] = s.Flush("")
+		}(i)
+	}
+	wg.Wait()
+
+	seen := map[uint64]int{}
+	for i := 0; i < n; i++ {
+		if errs[i] != nil {
+			if errors.Is(errs[i], ErrFenced) {
+				t.Fatalf("call %d: fencing must not happen from self-contention: %v", i, errs[i])
+			}
+			if !strings.Contains(errs[i].Error(), "retry") {
+				t.Fatalf("call %d: failure must be retryable, got: %v", i, errs[i])
+			}
+			continue
+		}
+		if txids[i] == 0 {
+			t.Fatalf("call %d: succeeded but returned txid 0", i)
+		}
+		seen[txids[i]]++
+	}
+	for txid, count := range seen {
+		if count > 1 {
+			t.Fatalf("txid %d was returned by %d successful calls (must be unique per success)", txid, count)
+		}
+	}
+	if len(seen) == 0 {
+		t.Fatal("no call succeeded")
+	}
+
+	// The ref's head afterwards must reference an object that actually
+	// exists in the backend.
+	ref, _, err := w.Store.GetRef("app", "main")
+	if err != nil {
+		t.Fatal(err)
+	}
+	headKey := store.SnapshotKey(ref.Lineage, ref.HeadEpoch, ref.HeadTXID)
+	if data, _, err := w.Store.B.Get(headKey); err != nil || len(data) == 0 {
+		t.Fatalf("ref head %s must reference an existing snapshot: data=%d err=%v",
+			headKey, len(data), err)
+	}
 }
