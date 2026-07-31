@@ -97,6 +97,9 @@ func decodeRef(data []byte) (Ref, error) {
 		r.HeadEpoch = w.Epoch
 	}
 	for name, raw := range w.Checkpoints {
+		if string(raw) == "null" {
+			return Ref{}, fmt.Errorf("store: bad checkpoint %q: null", name)
+		}
 		var cp Checkpoint
 		if err := json.Unmarshal(raw, &cp); err == nil && cp.TXID != 0 {
 			r.SetCheckpoint(name, cp.TXID, cp.Epoch)

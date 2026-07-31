@@ -65,7 +65,11 @@ func (w *Workspace) Leases() ([]LeaseInfo, error) {
 		for _, br := range refs[db] {
 			ref, _, err := w.Store.GetRef(db, br)
 			if err != nil {
-				return nil, err
+				// A concurrent Destroy (or other ref removal/corruption)
+				// shouldn't take down the whole listing: skip this branch and
+				// keep going, warning so the gap doesn't pass silently.
+				fmt.Fprintf(os.Stderr, "offshoot: warning: skipping %s@%s: %v\n", db, br, err)
+				continue
 			}
 			if ref.LeaseHolder == "" {
 				continue
