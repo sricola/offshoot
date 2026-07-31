@@ -74,13 +74,14 @@ func run(args []string) error {
 	}
 	switch cmd {
 	case "create":
-		if len(rest) < 1 {
+		switch {
+		case len(rest) == 1:
+			return w.Create(rest[0])
+		case len(rest) == 3 && rest[1] == "--from":
+			return w.CreateFrom(rest[0], rest[2])
+		default:
 			return fmt.Errorf("usage: offshoot create <db> [--from file]")
 		}
-		if len(rest) == 3 && rest[1] == "--from" {
-			return w.CreateFrom(rest[0], rest[2])
-		}
-		return w.Create(rest[0])
 	case "checkpoint":
 		if len(rest) != 2 {
 			return fmt.Errorf("usage: offshoot checkpoint <db>[@branch] <name>")

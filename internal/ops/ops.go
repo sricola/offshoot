@@ -120,6 +120,9 @@ func (w *Workspace) createFromQuiesced(db, quiescedPath string) error {
 		Protected:   true, // main is protected by default (spec § Security posture)
 	}
 	if _, err := w.Store.PutRef(db, "main", ref, ""); err != nil {
+		// Freshly-minted lineage no rival can reference: safe to delete the
+		// orphaned snapshot (mirrors Fork's cleanup on the same failure).
+		w.Store.B.Delete(store.SnapshotKey(lineage, 1, 1))
 		return fmt.Errorf("ops: create %s: %w", db, err)
 	}
 	return nil
@@ -158,13 +161,26 @@ func (w *Workspace) CreateFrom(db, srcPath string) error {
 	return w.createFromQuiesced(db, cp)
 }
 
-// Checkout materializes db@branch's head snapshot to its fixed path.
+// Checkout materializes db@branch's head snapshot to its fixed path. If a
+// checkout already lives at that path, it must be quiesced first (busy ->
+// clean failure, like Checkpoint): re-materializing renames over the file,
+// which would delete a live writer's WAL out from under it. If the existing
+// checkout has un-checkpointed local edits, Checkout proceeds (head always
+// wins) but warns first, since those edits are about to be discarded.
 func (w *Workspace) Checkout(db, branch string) (string, error) {
 	ref, _, err := w.Store.GetRef(db, branch)
 	if err != nil {
 		return "", err
 	}
 	path := w.CheckoutPath(db, branch)
+	if _, err := os.Stat(path); err == nil {
+		if err := quiesce(path); err != nil {
+			return "", err
+		}
+		if checkoutState(path, ref) == "modified" {
+			fmt.Fprintf(os.Stderr, "offshoot: warning: overwriting un-checkpointed changes in %s@%s checkout\n", db, branch)
+		}
+	}
 	if err := os.MkdirAll(filepath.Dir(path), 0o755); err != nil {
 		return "", err
 	}
@@ -317,9 +333,17 @@ func (w *Workspace) Checkpoint(db, branch, name string) (uint64, error) {
 		// An object already lives at this deterministic key. HeadTXID only
 		// ever advances via a successful ref write, and nothing is written
 		// under a txid beyond HeadTXID+1 until that happens, so nothing can
-		// legitimately reference this key yet: it can only be an orphan left
-		// by a crashed prior Checkpoint attempt (snapshot uploaded, ref write
-		// never landed). Safe to overwrite unconditionally and proceed.
+		// legitimately reference this key yet: it can only be (a) an orphan
+		// left by a crashed prior Checkpoint attempt (snapshot uploaded, ref
+		// write never landed), or (b) a rival Checkpoint call racing on this
+		// same branch right now, which computed the identical HeadTXID+1 and
+		// simply lost the write here. Overwriting is benign under either
+		// cause: both writers quiesced and encoded the SAME checkout file at
+		// the SAME pre-checkpoint state, so whichever encoding ends up
+		// stored is content-equivalent, and only one of the two racers can
+		// possibly win the PutRef CAS below to ever reference this key by
+		// name — there is no rival ref left dangling by the overwrite. Safe
+		// to overwrite unconditionally and proceed.
 		if err := w.Store.B.Put(snapKey, buf.Bytes()); err != nil {
 			return 0, err
 		}
@@ -409,17 +433,28 @@ func (w *Workspace) warnIfUncheckpointed(db, branch string, ref store.Ref) {
 	}
 }
 
-// copySnapshotToNewLineage copies the snapshot at (src.Lineage, src.Epoch,
-// txid) into a brand-new lineage (epoch 1) and returns the lineage id.
-// This is the primitive behind fork, rollback, and promote: every branch
-// repoint gets a fresh lineage, preserving one-writer-per-lineage.
-func (w *Workspace) copySnapshotToNewLineage(src store.Ref, txid uint64) (string, error) {
+// copySnapshotIntoLineage copies the snapshot at (src.Lineage, src.Epoch,
+// txid) into lineage (epoch 1) via a create-only put and returns the key it
+// was written under. This is the primitive behind fork, rollback, and
+// promote: every branch repoint gets a fresh lineage, preserving
+// one-writer-per-lineage.
+func (w *Workspace) copySnapshotIntoLineage(src store.Ref, txid uint64, lineage string) (string, error) {
 	data, _, err := w.Store.B.Get(store.SnapshotKey(src.Lineage, src.Epoch, txid))
 	if err != nil {
 		return "", fmt.Errorf("ops: snapshot txid %d in lineage %s: %w", txid, src.Lineage, err)
 	}
+	key := store.SnapshotKey(lineage, 1, txid)
+	if _, err := w.Store.B.PutIf(key, data, ""); err != nil {
+		return "", err
+	}
+	return key, nil
+}
+
+// copySnapshotToNewLineage copies the snapshot at (src.Lineage, src.Epoch,
+// txid) into a brand-new lineage (epoch 1) and returns the lineage id.
+func (w *Workspace) copySnapshotToNewLineage(src store.Ref, txid uint64) (string, error) {
 	lineage := store.NewLineageID()
-	if _, err := w.Store.B.PutIf(store.SnapshotKey(lineage, 1, txid), data, ""); err != nil {
+	if _, err := w.copySnapshotIntoLineage(src, txid, lineage); err != nil {
 		return "", err
 	}
 	return lineage, nil
@@ -466,7 +501,12 @@ func (w *Workspace) Fork(db, srcBranch, newBranch, at string) (uint64, error) {
 // Rollback repoints db@branch at a NEW lineage seeded from checkpoint `to`
 // and re-materializes the fixed checkout path, returning the checkout path.
 // The old lineage is orphaned (collected later by GC). Checkpoints at or
-// before `to` are kept; later ones are dropped.
+// before `to` are kept, and EVERY kept checkpoint's snapshot is copied into
+// the new lineage (not just `to`'s) so a later rollback or fork to an
+// earlier kept checkpoint still finds its snapshot object once the old
+// lineage is gone — otherwise it fails "not found" once GC reaps the old
+// lineage, since the ref itself no longer references it after this repoint.
+// Later checkpoints are dropped.
 //
 // The ref CAS is the point of no return: once it lands, the branch has
 // repointed. The checkout refresh that follows (busy probe, materialize,
@@ -491,16 +531,42 @@ func (w *Workspace) Rollback(db, branch, to string) (string, error) {
 	if err != nil {
 		return "", err
 	}
+	copiedKeys := []string{store.SnapshotKey(lineage, 1, txid)}
+	cleanup := func() {
+		for _, k := range copiedKeys {
+			w.Store.B.Delete(k)
+		}
+	}
+
 	kept := map[string]uint64{}
 	for name, t := range ref.Checkpoints {
 		if t <= txid {
 			kept[name] = t
 		}
 	}
+
+	// `to`'s own snapshot is already copied above. Copy every OTHER kept
+	// checkpoint's snapshot into the new lineage too, so it survives the old
+	// lineage being orphaned and later reaped by GC. Abort and clean up
+	// anything already copied before touching the ref if any copy fails.
+	done := map[uint64]bool{txid: true}
+	for _, t := range kept {
+		if done[t] {
+			continue
+		}
+		done[t] = true
+		key, err := w.copySnapshotIntoLineage(ref, t, lineage)
+		if err != nil {
+			cleanup()
+			return "", fmt.Errorf("ops: rollback: copying checkpoint snapshot for txid %d: %w", t, err)
+		}
+		copiedKeys = append(copiedKeys, key)
+	}
+
 	next := ref
 	next.Lineage, next.Epoch, next.HeadTXID, next.Checkpoints = lineage, 1, txid, kept
 	if _, err := w.Store.PutRef(db, branch, next, etag); err != nil {
-		w.Store.B.Delete(store.SnapshotKey(lineage, 1, txid))
+		cleanup()
 		return "", fmt.Errorf("ops: rollback lost a race (retry): %w", err)
 	}
 
@@ -549,6 +615,7 @@ func (w *Workspace) Promote(db, source, target string, force bool) (uint64, erro
 	if err != nil {
 		return 0, err
 	}
+	w.warnIfUncheckpointed(db, source, src)
 	tgt, tgtEtag, err := w.Store.GetRef(db, target)
 	if err != nil {
 		return 0, err

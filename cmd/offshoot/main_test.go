@@ -25,6 +25,24 @@ func call(t *testing.T, dir string, args ...string) string {
 	return string(buf[:n])
 }
 
+// TestCreateFromMissingFileArgErrors guards against a silent fallthrough:
+// `create <db> --from` with the file argument omitted (len(rest)==2) used to
+// fall through to the plain-create branch, silently creating an empty
+// database instead of reporting the malformed command. Only exact arities
+// (plain create: 1 arg; import: 3 args with rest[1]=="--from") are accepted.
+func TestCreateFromMissingFileArgErrors(t *testing.T) {
+	dir := filepath.Join(t.TempDir(), "s")
+	if err := run([]string{"-store", dir, "init"}); err != nil {
+		t.Fatal(err)
+	}
+	if err := run([]string{"-store", dir, "create", "app", "--from"}); err == nil {
+		t.Fatal("create <db> --from with a missing file arg must error, not silently create an empty db")
+	}
+	if _, err := os.Stat(filepath.Join(dir, "refs", "app", "main")); err == nil {
+		t.Fatal("no ref should have been created for the malformed command")
+	}
+}
+
 func TestQuickstartTranscript(t *testing.T) {
 	if _, err := exec.LookPath("sqlite3"); err != nil {
 		t.Skip("sqlite3 CLI not on PATH")
