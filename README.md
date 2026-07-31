@@ -67,5 +67,25 @@ unit tests proves nothing about a real provider.
 Checkouts are always real local SQLite files; only the snapshots and refs
 live in the store.
 
+## Leases and fencing
+
+A long-running writer (Plan 5's daemon) claims a branch with a lease:
+
+    offshoot lease list
+    offshoot lease acquire app@main --ttl 60s
+    offshoot lease release app@main
+
+Acquiring or reclaiming a branch **bumps its epoch**, and every object is
+written under the epoch current at the time. A writer that pauses, loses its
+lease, and later resumes therefore writes into a superseded prefix that no ref
+points at — it cannot corrupt the branch, and its garbage is collected with the
+lineage. Expiry is wall-clock and advisory; the guarantee against an
+uncooperative writer comes from the epoch fence and ref compare-and-swap, not
+from the clock.
+
+`offshoot lease acquire` exits immediately, so its lease expires unless a
+long-running process renews it. It exists for inspection and for breaking a
+stuck lease.
+
 Design: docs/superpowers/specs/2026-07-29-offshoot-design.md
 Capture-spike evidence: docs/superpowers/specs/2026-07-29-offshoot-spike-report.md
