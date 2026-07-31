@@ -50,9 +50,19 @@ func TestRenewalDetectsFencingAndEndsSession(t *testing.T) {
 	if err := w.Create("app"); err != nil {
 		t.Fatal(err)
 	}
+	// RenewEvery is deliberately set well beyond LeaseTTL. If it were shorter
+	// (e.g. the "natural"-looking TTL=100ms/RenewEvery=20ms pairing), the
+	// renewLoop would renew the lease several times before this test ever
+	// gets a chance to steal it, so the lease would never actually lapse and
+	// the "thief" AcquireLease below would fail with ErrLeaseHeld instead of
+	// succeeding — which is not what this test is trying to exercise. By
+	// making the lease expire (100ms) well before the first renewal tick
+	// (400ms), the thief can genuinely reclaim the branch while our session
+	// is between ticks, and the *next* tick is what discovers ErrLeaseLost.
+	// Do not "fix" this back to RenewEvery < LeaseTTL.
 	s, err := Open(context.Background(), Options{
 		WS: w, DB: "app", Branch: "main", Holder: "session-a",
-		LeaseTTL: 100 * time.Millisecond, RenewEvery: 20 * time.Millisecond,
+		LeaseTTL: 100 * time.Millisecond, RenewEvery: 400 * time.Millisecond,
 	})
 	if err != nil {
 		t.Fatal(err)
