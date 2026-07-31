@@ -33,8 +33,8 @@ func TestManifestLifecycle(t *testing.T) {
 
 func TestRefRoundTripAndCAS(t *testing.T) {
 	s := newStore(t)
-	r := Ref{Schema: 1, Lineage: NewLineageID(), Epoch: 1, HeadTXID: 1,
-		Checkpoints: map[string]uint64{"init": 1}}
+	r := Ref{Schema: 1, Lineage: NewLineageID(), Epoch: 1, HeadTXID: 1}
+	r.SetCheckpoint("init", 1, 1)
 	etag, err := s.PutRef("app", "main", r, "")
 	if err != nil {
 		t.Fatal(err)
@@ -43,7 +43,7 @@ func TestRefRoundTripAndCAS(t *testing.T) {
 	if err != nil || gotEtag != etag {
 		t.Fatalf("get: %v", err)
 	}
-	if got.Lineage != r.Lineage || got.Checkpoints["init"] != 1 {
+	if got.Lineage != r.Lineage || got.Checkpoints["init"] != (Checkpoint{TXID: 1, Epoch: 1}) {
 		t.Fatalf("round trip mismatch: %+v", got)
 	}
 	got.HeadTXID = 2
@@ -89,5 +89,92 @@ func TestKeys(t *testing.T) {
 	}
 	if id := NewLineageID(); len(id) != 32 || id == NewLineageID() {
 		t.Fatalf("lineage id: %s", id)
+	}
+}
+
+func TestRefV2RoundTrip(t *testing.T) {
+	s := newStore(t)
+	r := Ref{Schema: RefSchema, Lineage: NewLineageID(), Epoch: 3, HeadTXID: 9, HeadEpoch: 3}
+	r.SetCheckpoint("init", 1, 1)
+	r.SetCheckpoint("v1", 9, 3)
+	etag, err := s.PutRef("app", "main", r, "")
+	if err != nil {
+		t.Fatal(err)
+	}
+	got, gotEtag, err := s.GetRef("app", "main")
+	if err != nil || gotEtag != etag {
+		t.Fatalf("get: %v", err)
+	}
+	if got.Checkpoints["init"] != (Checkpoint{TXID: 1, Epoch: 1}) {
+		t.Errorf("init checkpoint = %+v", got.Checkpoints["init"])
+	}
+	if got.Checkpoints["v1"] != (Checkpoint{TXID: 9, Epoch: 3}) {
+		t.Errorf("v1 checkpoint = %+v", got.Checkpoints["v1"])
+	}
+	if got.HeadEpoch != 3 {
+		t.Errorf("head epoch = %d", got.HeadEpoch)
+	}
+}
+
+func TestGetRefUpgradesV1(t *testing.T) {
+	s := newStore(t)
+	// Hand-write a v1 ref exactly as Plan 2 wrote them.
+	v1 := `{"schema":1,"lineage":"abc","epoch":2,"head_txid":7,` +
+		`"checkpoints":{"init":1,"v1":7},"protected":true}`
+	if _, err := s.B.PutIf(RefKey("app", "main"), []byte(v1), ""); err != nil {
+		t.Fatal(err)
+	}
+	got, _, err := s.GetRef("app", "main")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got.Schema != RefSchema {
+		t.Errorf("schema = %d, want %d", got.Schema, RefSchema)
+	}
+	// Every v1 checkpoint lived under the ref's epoch.
+	if got.Checkpoints["init"] != (Checkpoint{TXID: 1, Epoch: 2}) {
+		t.Errorf("init = %+v, want txid 1 epoch 2", got.Checkpoints["init"])
+	}
+	if got.Checkpoints["v1"] != (Checkpoint{TXID: 7, Epoch: 2}) {
+		t.Errorf("v1 = %+v, want txid 7 epoch 2", got.Checkpoints["v1"])
+	}
+	if got.HeadEpoch != 2 {
+		t.Errorf("head epoch = %d, want 2", got.HeadEpoch)
+	}
+	if !got.Protected || got.Lineage != "abc" || got.HeadTXID != 7 {
+		t.Errorf("other fields lost: %+v", got)
+	}
+}
+
+func TestGetRefRejectsNewerSchema(t *testing.T) {
+	s := newStore(t)
+	future := `{"schema":99,"lineage":"abc","epoch":1,"head_txid":1}`
+	if _, err := s.B.PutIf(RefKey("app", "main"), []byte(future), ""); err != nil {
+		t.Fatal(err)
+	}
+	if _, _, err := s.GetRef("app", "main"); err == nil {
+		t.Fatal("a ref from a newer binary must be refused, not guessed at")
+	}
+}
+
+func TestGetRefRejectsNullCheckpoint(t *testing.T) {
+	s := newStore(t)
+	// A checkpoint value of JSON null decodes as a no-op into both the
+	// Checkpoint struct and the bare uint64 fallback, silently producing
+	// {TXID:0} instead of surfacing the malformed ref.
+	bad := `{"schema":2,"lineage":"abc","epoch":1,"head_txid":1,"checkpoints":{"v1":null}}`
+	if _, err := s.B.PutIf(RefKey("app", "main"), []byte(bad), ""); err != nil {
+		t.Fatal(err)
+	}
+	if _, _, err := s.GetRef("app", "main"); err == nil {
+		t.Fatal("a null checkpoint value must error, not silently decode as {TXID:0}")
+	}
+}
+
+func TestSetCheckpointAllocates(t *testing.T) {
+	var r Ref
+	r.SetCheckpoint("a", 4, 2)
+	if r.Checkpoints["a"] != (Checkpoint{TXID: 4, Epoch: 2}) {
+		t.Fatalf("checkpoints = %+v", r.Checkpoints)
 	}
 }

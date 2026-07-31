@@ -8,6 +8,7 @@ import (
 	"time"
 
 	"github.com/offshoot-db/offshoot/internal/ops"
+	"github.com/offshoot-db/offshoot/internal/store"
 )
 
 const usage = `offshoot — branch SQLite like git (local mode)
@@ -24,6 +25,9 @@ Usage:
   offshoot gc [--grace duration]     garbage collect unreachable lineages (default grace: 1h)
   offshoot path <db>[@branch]        print the checkout path
   offshoot status                    print all branches and their state
+  offshoot lease list                       list every branch's lease
+  offshoot lease acquire <db>[@branch] [--ttl 30s]   claim or renew a lease
+  offshoot lease release <db>[@branch]      release a lease
 
 Store location: -store SPEC or OFFSHOOT_STORE, default ./.offshoot
   SPEC is a directory path, file:///abs/path, or s3://bucket/prefix
@@ -225,6 +229,76 @@ func run(args []string) error {
 				s.DB, s.Branch, s.HeadTXID, strings.Join(s.Checkpoints, ","), flags)
 		}
 		return nil
+	case "lease":
+		if len(rest) == 0 {
+			return fmt.Errorf("usage: offshoot lease list|acquire|release ...")
+		}
+		switch rest[0] {
+		case "list":
+			infos, err := w.Leases()
+			if err != nil {
+				return err
+			}
+			for _, in := range infos {
+				state := "held"
+				if in.Expired {
+					state = "expired"
+				}
+				fmt.Printf("%s@%s %s by %s epoch=%d until %s\n",
+					in.DB, in.Branch, state, in.Holder, in.Epoch,
+					in.Expiry.Format(time.RFC3339))
+			}
+			return nil
+		case "acquire":
+			args := rest[1:]
+			ttl := ops.DefaultLeaseTTL
+			if len(args) == 3 && args[1] == "--ttl" {
+				d, err := time.ParseDuration(args[2])
+				if err != nil {
+					return err
+				}
+				ttl = d
+				args = args[:1]
+			}
+			if len(args) != 1 {
+				return fmt.Errorf("usage: offshoot lease acquire <db>[@branch] [--ttl 30s]")
+			}
+			db, branch, err := ops.ParseTarget(args[0])
+			if err != nil {
+				return err
+			}
+			l, err := w.AcquireLease(db, branch, ops.LocalHolder(), ttl)
+			if err != nil {
+				return err
+			}
+			fmt.Printf("acquired %s@%s as %s (epoch %d) until %s\n",
+				db, branch, l.Holder, l.Epoch, l.Expiry.Format(time.RFC3339))
+			fmt.Println("note: this command exits immediately; the lease expires unless a" +
+				" long-running holder renews it")
+			return nil
+		case "release":
+			if len(rest) != 2 {
+				return fmt.Errorf("usage: offshoot lease release <db>[@branch]")
+			}
+			db, branch, err := ops.ParseTarget(rest[1])
+			if err != nil {
+				return err
+			}
+			infos, err := w.Leases()
+			if err != nil {
+				return err
+			}
+			for _, in := range infos {
+				if in.DB == db && in.Branch == branch {
+					return w.ReleaseLease(store.Lease{
+						DB: db, Branch: branch, Holder: in.Holder, Epoch: in.Epoch,
+					})
+				}
+			}
+			return fmt.Errorf("offshoot: no lease on %s@%s", db, branch)
+		default:
+			return fmt.Errorf("unknown lease subcommand %q", rest[0])
+		}
 	default:
 		return fmt.Errorf("unknown command %q\n%s", cmd, usage)
 	}
