@@ -6,6 +6,7 @@ package ops
 
 import (
 	"bytes"
+	"context"
 	"crypto/sha256"
 	"database/sql"
 	"encoding/hex"
@@ -13,6 +14,7 @@ import (
 	"errors"
 	"fmt"
 	"io"
+	"net/url"
 	"os"
 	"path/filepath"
 	"sort"
@@ -26,10 +28,12 @@ import (
 type Workspace struct {
 	Store *store.Store
 	Root  string
+	Spec  string
 }
 
-func Init(root string) (*Workspace, error) {
-	b, err := store.NewLocal(root)
+// Init creates a new store at spec and returns a workspace for it.
+func Init(spec string) (*Workspace, error) {
+	b, err := store.OpenBackend(context.Background(), spec)
 	if err != nil {
 		return nil, err
 	}
@@ -37,11 +41,16 @@ func Init(root string) (*Workspace, error) {
 	if err := s.InitManifest(); err != nil {
 		return nil, err
 	}
-	return &Workspace{Store: s, Root: root}, nil
+	root, err := checkoutRoot(spec)
+	if err != nil {
+		return nil, err
+	}
+	return &Workspace{Store: s, Root: root, Spec: spec}, nil
 }
 
-func Open(root string) (*Workspace, error) {
-	b, err := store.NewLocal(root)
+// Open attaches to an existing store at spec.
+func Open(spec string) (*Workspace, error) {
+	b, err := store.OpenBackend(context.Background(), spec)
 	if err != nil {
 		return nil, err
 	}
@@ -49,7 +58,33 @@ func Open(root string) (*Workspace, error) {
 	if err := s.CheckManifest(); err != nil {
 		return nil, err
 	}
-	return &Workspace{Store: s, Root: root}, nil
+	root, err := checkoutRoot(spec)
+	if err != nil {
+		return nil, err
+	}
+	return &Workspace{Store: s, Root: root, Spec: spec}, nil
+}
+
+// checkoutRoot decides where materialized checkouts live. For a local store
+// they sit inside the store directory (unchanged from local mode). For a
+// remote store they go to OFFSHOOT_CHECKOUTS, or a per-store directory under
+// the user cache dir — checkouts are real SQLite files and must be local.
+func checkoutRoot(spec string) (string, error) {
+	if !strings.Contains(spec, "://") {
+		return spec, nil
+	}
+	if u, err := url.Parse(spec); err == nil && u.Scheme == "file" {
+		return u.Path, nil
+	}
+	if dir := os.Getenv("OFFSHOOT_CHECKOUTS"); dir != "" {
+		return dir, nil
+	}
+	cache, err := os.UserCacheDir()
+	if err != nil {
+		return "", fmt.Errorf("ops: no checkout directory (set OFFSHOOT_CHECKOUTS): %w", err)
+	}
+	sum := sha256.Sum256([]byte(spec))
+	return filepath.Join(cache, "offshoot", hex.EncodeToString(sum[:8])), nil
 }
 
 func ParseTarget(s string) (string, string, error) {
