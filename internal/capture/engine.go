@@ -229,28 +229,32 @@ func (e *Engine) Run(ctx context.Context) error {
 	tick := time.NewTicker(e.o.Poll)
 	defer tick.Stop()
 	for {
+		// Check for a pending DrainNow request non-blockingly, before ever
+		// entering the blocking select below. Without this, a request that
+		// is already waiting on e.reqs by the time this loop comes back
+		// around competes on equal footing with an already-fired tick — Go's
+		// select picks pseudo-randomly between two simultaneously-ready
+		// cases — so under sustained write load (drain's per-call time
+		// budget, see drain's doc comment, forces this loop back here
+		// roughly every drainBudget) a DrainNow caller could keep losing
+		// that coin flip. Session.Flush's DrainNow call is exactly the
+		// caller this would starve. Servicing e.reqs first, unconditionally,
+		// whenever it's ready guarantees a queued request is serviced on the
+		// very next iteration rather than merely being more likely to be.
+		select {
+		case req := <-e.reqs:
+			if err := e.serviceReq(ctx, req, &idle); err != nil {
+				return err
+			}
+			continue
+		default:
+		}
 		select {
 		case <-ctx.Done():
 			e.shutdown()
 			return nil
 		case req := <-e.reqs:
-			// Service a DrainNow caller's request inline, immediately,
-			// instead of waiting for the next tick — that's the entire
-			// point of DrainNow. Serviced by this same goroutine via
-			// pollOnce, so it can never run concurrently with the
-			// tick-driven path below.
-			//
-			// Send the result to the requester FIRST, then — on a fatal
-			// error — stop the loop exactly as the ticker path below does.
-			// A poll triggered by DrainNow is not a lesser failure than one
-			// triggered by the ticker: if it doesn't, Run keeps looping
-			// looking healthy while capture is actually broken, and nothing
-			// ever calls session.runEngine's failure path. Sending before
-			// returning means the requester still gets the error even
-			// though Run is about to exit and close e.done right after.
-			err := e.pollOnce(ctx, &idle)
-			req.done <- err
-			if err != nil {
+			if err := e.serviceReq(ctx, req, &idle); err != nil {
 				return err
 			}
 			continue
@@ -260,6 +264,20 @@ func (e *Engine) Run(ctx context.Context) error {
 			return err
 		}
 	}
+}
+
+// serviceReq runs one DrainNow caller's poll and reports the result back to
+// it. Send the result to the requester FIRST, then — on a fatal error — stop
+// the loop exactly as the ticker path does. A poll triggered by DrainNow is
+// not a lesser failure than one triggered by the ticker: if it were treated
+// as one, Run would keep looping looking healthy while capture is actually
+// broken, and nothing would ever call session.runEngine's failure path.
+// Sending before returning means the requester still gets the error even
+// though Run is about to exit and close e.done right after.
+func (e *Engine) serviceReq(ctx context.Context, req drainRequest, idle *time.Time) error {
+	err := e.pollOnce(ctx, idle)
+	req.done <- err
+	return err
 }
 
 // pollOnce runs one capture pass: drain whatever's currently available,
@@ -511,10 +529,82 @@ func (e *Engine) walRacedSinceRestart(consumed int64) (bool, error) {
 	return available > consumed, nil
 }
 
-// drain consumes all currently available committed transactions.
+// drainBudget bounds how long a single drain call may keep consuming before
+// it yields control back to its caller, even if more committed transactions
+// are still arriving. See drain's doc comment for why this exists; the value
+// is generous relative to everything it needs to absorb (see the comment).
+const drainBudget = 2 * time.Second
+
+// drain consumes committed transactions until none are immediately available
+// or drainBudget elapses, whichever comes first — it chases newly-landed
+// transactions within that budget (matching a plain "loop until nothing's
+// left" loop for any ordinary, finite burst) but is guaranteed to return
+// control to its caller within bounded time regardless of how long the
+// writer keeps writing.
+//
+// The budget is load-bearing, not cosmetic. e.reader.Next() re-reads the WAL
+// file from disk on every call; under a foreign writer that never leaves a
+// gap (see TestFlushesUnderContinuousWritesAreConsistent, which drives
+// exactly this via a tight loop of single-row inserts with no pause), a
+// plain "loop until Next() returns nil" never actually sees nil — a new
+// commit is always landing just as the previous one finishes. That starves
+// every caller of pollOnce, both the regular ticker in Run's loop and, far
+// worse, DrainNow: pollOnce (and therefore drain) is the only thing running
+// on Run's goroutine, so Run's select never gets back around to notice a
+// pending DrainNow request while drain is stuck chasing. Session.Flush's
+// DrainNow call is bounded by a 30s context specifically to survive
+// contention (see flush.go's comment on that timeout), but an unbounded
+// drain can run for as long as the writer keeps writing, blowing straight
+// through it — empirically reproduced: drain() consumed 7500+ transactions
+// over 60+ seconds without ever returning, until the writer stopped.
+//
+// A per-call time budget was chosen over bounding by the WAL's on-disk size
+// snapshotted at entry (the first fix attempted here): a size snapshot stops
+// drain from absorbing anything that lands after it starts, even when doing
+// so would be perfectly safe — which measurably slowed down ordinary,
+// finite-burst catch-up in TestEngineTakeoverExpectedRestartIsNotRebase and
+// TestEngineTakeoverUnderConcurrentWrites (each extra chunk boundary costs a
+// wait for Run's next 10ms tick; under those tests' per-transaction fsync
+// cost in SaveState, that was enough to blow through the tests' own timing
+// margins and turn a benign fold-then-resync race into an observed extra
+// rebase). A time budget instead keeps drain's old chase-everything-
+// currently-available behavior intact for any burst that finishes within
+// the budget — which every legitimate burst does, by a wide margin — and
+// only kicks in as a backstop against a writer that truly never stops.
+// 2 seconds leaves ample headroom above the slowest observed real burst
+// (~400ms for ~75 fsync'd transactions) while still bounding a single
+// pollOnce's drain phase to a small fraction of Flush's 30s DrainNow budget
+// (see flush.go's comment on that timeout for the rest of that budget:
+// checkpoint/beginReadRetry can separately cost up to ~10s in the same
+// pollOnce call).
+//
+// Deliberately does NOT also check ctx.Err() and bail out early: an earlier
+// version of this fix did, and it broke clean shutdown. Run's ticker-path
+// case treats any non-nil pollOnce error as fatal and returns it directly —
+// correct for a real capture failure, but ctx cancellation via Close() is
+// not one; it is the ordinary shutdown signal, meant to be observed only at
+// Run's own top-level select and handled via shutdown() (which drains one
+// last time on a fresh, uncancelled context — see its doc comment). If
+// Close() cancels ctx while a ticker-triggered drain() happens to be
+// mid-flight, an early ctx-aware return would surface context.Canceled as
+// pollOnce's error, which Run's ticker branch would then return as ITS OWN
+// result — skipping shutdown() entirely: no final checkpoint, no clean-state
+// marker, and runEngine (see session.go) records it as a genuine failure
+// ("session: capture stopped: context canceled") even though nothing went
+// wrong. Empirically reproduced via TestCloseDoesNotMarkSessionFenced and
+// TestEngineResumesCleanly failing intermittently under load (contention
+// makes the cancel-lands-mid-drain race far more likely to be hit) once this
+// check was added, and gone once it was removed. The drainBudget deadline
+// above is sufficient on its own to bound this call; ctx cancellation is
+// still honored, just one loop iteration later than it could be in the
+// absolute worst case, at Run's own select.
 func (e *Engine) drain(ctx context.Context) (int, error) {
+	deadline := time.Now().Add(drainBudget)
 	n := 0
 	for {
+		if time.Now().After(deadline) {
+			return n, nil
+		}
 		frames, err := e.reader.Next()
 		if err != nil {
 			return n, err

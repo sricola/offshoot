@@ -188,7 +188,16 @@ func TestEngineTakeoverUnderConcurrentWrites(t *testing.T) {
 	insert(60)
 	time.Sleep(300 * time.Millisecond)
 	insert(8)
-	time.Sleep(300 * time.Millisecond) // let the takeover fire and settle
+	// Let the takeover fire and settle. Generous relative to the ~10ms poll
+	// interval: under concurrent system load (e.g. the full suite's other
+	// packages running in parallel, or this repo's continuous-write stress
+	// test churning CPU/subprocesses elsewhere), a per-transaction fsync
+	// inside drain's SaveState can push a single poll's catch-up well past a
+	// tight margin — empirically, 300ms was occasionally too little,
+	// producing a benign (safe, just non-optimal) extra rebase when phase 2's
+	// writes below landed before takeover's checkpoint got a chance to run;
+	// see drain's doc comment in engine.go for the full mechanism.
+	time.Sleep(2 * time.Second)
 
 	// Phase 2: writes CONTINUE after takeover — this is what forces the
 	// WAL's deferred (lazy) restart to actually land. Stay under the next
@@ -259,8 +268,11 @@ func TestEngineTakeoverExpectedRestartIsNotRebase(t *testing.T) {
 
 	// Let the poll loop notice captured >= 64 and run takeover against the
 	// now-quiet WAL: checkpoint(RESTART)'s log count should equal exactly
-	// what we'd already consumed, taking the verified-clean path.
-	time.Sleep(300 * time.Millisecond)
+	// what we'd already consumed, taking the verified-clean path. Generous
+	// relative to the ~10ms poll interval for the same reason as the
+	// analogous wait in TestEngineTakeoverUnderConcurrentWrites above — see
+	// that comment.
+	time.Sleep(2 * time.Second)
 
 	// A few more commits force SQLite to actually rewrite the WAL header
 	// with new salts (the lazy part of RESTART), which is what makes the
