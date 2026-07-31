@@ -73,18 +73,30 @@ func storeSpec(args []string) (string, []string) {
 // args with that flag removed. `serve` and `session` share this so that a
 // daemon started with `-socket PATH` and the `session` subcommands that talk
 // to it always agree on where the socket is.
-func socketOverride(args []string) (string, []string) {
+//
+// A trailing "-socket" with no PATH following it is a malformed flag, not a
+// positional argument: it is rejected here with an error rather than being
+// silently passed through in the remaining args. Without this check, `serve`
+// happened to reject it too, but only by accident — its caller separately
+// rejects any nonempty leftover args — while `session` has no such leftover
+// check and would silently swallow the flag, e.g. treating `session flush
+// app -socket` as an ordinary flush with `-socket` ignored instead of an
+// error.
+func socketOverride(args []string) (string, []string, error) {
 	sock := ""
 	out := args[:0]
 	for i := 0; i < len(args); i++ {
-		if args[i] == "-socket" && i+1 < len(args) {
+		if args[i] == "-socket" {
+			if i+1 >= len(args) {
+				return "", nil, fmt.Errorf("-socket requires a PATH argument")
+			}
 			sock = args[i+1]
 			i++
 			continue
 		}
 		out = append(out, args[i])
 	}
-	return sock, out
+	return sock, out, nil
 }
 
 func main() {
@@ -334,7 +346,10 @@ func run(args []string) error {
 			return fmt.Errorf("unknown lease subcommand %q", rest[0])
 		}
 	case "serve":
-		sock, rest := socketOverride(rest)
+		sock, rest, err := socketOverride(rest)
+		if err != nil {
+			return fmt.Errorf("usage: offshoot serve [-socket PATH]: %w", err)
+		}
 		if len(rest) != 0 {
 			return fmt.Errorf("usage: offshoot serve [-socket PATH]")
 		}
@@ -364,7 +379,10 @@ func run(args []string) error {
 			return err
 		}
 	case "session":
-		sock, rest := socketOverride(rest)
+		sock, rest, err := socketOverride(rest)
+		if err != nil {
+			return fmt.Errorf("usage: offshoot session open|flush|status|close|shutdown ... [-socket PATH]: %w", err)
+		}
 		if len(rest) == 0 {
 			return fmt.Errorf("usage: offshoot session open|flush|status|close|shutdown ... [-socket PATH]")
 		}

@@ -37,6 +37,12 @@ func (s *Session) Flush(name string) (uint64, error) {
 	s.flushMu.Lock()
 	defer s.flushMu.Unlock()
 
+	s.mu.Lock()
+	closed := s.closed
+	s.mu.Unlock()
+	if closed {
+		return 0, ErrClosed
+	}
 	if err := s.Err(); err != nil {
 		return 0, err
 	}
@@ -100,6 +106,9 @@ func (s *Session) Flush(name string) (uint64, error) {
 	// of the read, so the replica file is frozen at a single transaction
 	// boundary while it is encoded — see replicaSink's doc comment.
 	s.replicaMu.Lock()
+	if FlushEncodeHook != nil {
+		FlushEncodeHook() // test hook; nil (a no-op) in production
+	}
 	err = ltxio.EncodeSnapshot(s.replica.Path(), txid, &buf)
 	s.replicaMu.Unlock()
 	if err != nil {
@@ -147,8 +156,13 @@ func (s *Session) Flush(name string) (uint64, error) {
 		// would risk leaving a live ref pointing at SnapshotKey with no
 		// object behind it: silent, unrecoverable data loss in the one
 		// primitive whose job is preventing exactly that. Leave the object
-		// alone; at worst it's a harmless orphan a future flush's overwrite
-		// path (above) or GC reclaims.
+		// alone; at worst it's a harmless orphan that a future flush's
+		// overwrite path (above) reclaims, if and when it computes this same
+		// txid again. GC does NOT help here: it only tombstones and sweeps
+		// whole lineages once they become entirely unreachable (see
+		// ops.Workspace.GC) — it has no per-object sweep for an orphaned
+		// snapshot sitting inside a still-live lineage. Reclaiming those is
+		// future work.
 		if errors.Is(err, store.ErrCAS) {
 			if cur, _, gerr := st.GetRef(s.db, s.branch); gerr == nil &&
 				(cur.Lineage != ref.Lineage || cur.HeadTXID < txid) {
@@ -164,6 +178,14 @@ func (s *Session) Flush(name string) (uint64, error) {
 	s.mu.Unlock()
 	return txid, nil
 }
+
+// FlushEncodeHook, when non-nil, is invoked by Flush immediately before it
+// calls ltxio.EncodeSnapshot, while still holding both flushMu and
+// replicaMu. It exists purely for tests exercising Close/Flush concurrency
+// (holding a Flush paused mid-encode so a concurrent Close can be observed
+// waiting on flushMu); nil (the default) is a no-op and imposes no cost in
+// production.
+var FlushEncodeHook func()
 
 // DurableTXID is the txid the store is durable through for this session, or
 // 0 before the first flush.

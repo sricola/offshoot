@@ -12,6 +12,8 @@ import (
 	"time"
 
 	"github.com/offshoot-db/offshoot/internal/ops"
+	"github.com/offshoot-db/offshoot/internal/session"
+	"github.com/offshoot-db/offshoot/internal/store"
 )
 
 func newServer(t *testing.T) (*Server, *ops.Workspace) {
@@ -273,6 +275,137 @@ func TestShutdownDuringInFlightOpenLeavesNoLease(t *testing.T) {
 		srv.mu.Unlock()
 		if n != 0 {
 			t.Fatalf("iteration %d: %d session(s) still tracked after shutdown", i, n)
+		}
+	}
+}
+
+// TestConcurrentFlushAndCloseIsSafe exercises the fix for a race between
+// Close and a concurrent Flush on the same session: Close's os.RemoveAll of
+// the scratch dir used to run with no coordination against Flush's read of
+// the replica file (under that same dir) via ltxio.EncodeSnapshot — so a
+// close could delete the directory out from under an in-flight flush's
+// encode. This is reachable through the daemon precisely because lookup()
+// hands out the same *session.Session to concurrent "flush" and "close"
+// requests for one branch; nothing in the daemon serializes them itself.
+//
+// Like TestShutdownDuringInFlightOpenLeavesNoLease, reproducing the original
+// interleaving through real timing is unreliable (the race window is a few
+// syscalls wide). Instead this test uses session.FlushEncodeHook to
+// deterministically pause a flush immediately before its EncodeSnapshot
+// call — inside the exact window the race lived in — while a concurrent
+// "close" request runs. The core assertion is timing-based but coarse and
+// reliable: with the fix, Close acquires flushMu before it removes the
+// scratch dir, so "close" must not return while the flush is paused there;
+// a generous grace period with nothing arriving on closeDone is a reliable
+// negative signal.
+//
+// Verified against the pre-fix session.go (Close not taking flushMu around
+// its RemoveAll): temporarily reverting that one change made this test's
+// blocking assertion fail immediately — "close" returned in a few hundred
+// microseconds instead of waiting out the paused flush, would-be evidence of
+// exactly the unguarded race this test exists to catch (RemoveAll running
+// while EncodeSnapshot was still reading files under the same directory).
+func TestConcurrentFlushAndCloseIsSafe(t *testing.T) {
+	srv, w := newServer(t)
+	sock := srv.SocketPath()
+
+	open := call(t, sock, Request{Op: "open", DB: "app", Branch: "main"})
+	if !open.OK {
+		t.Fatalf("open = %+v", open)
+	}
+	if out, err := exec.Command("sqlite3", open.Checkout,
+		"CREATE TABLE t (v); INSERT INTO t VALUES (1);").CombinedOutput(); err != nil {
+		t.Fatalf("%v: %s", err, out)
+	}
+
+	entered := make(chan struct{})
+	proceed := make(chan struct{})
+	session.FlushEncodeHook = func() {
+		close(entered)
+		<-proceed
+	}
+	defer func() { session.FlushEncodeHook = nil }()
+
+	flushDone := make(chan Response, 1)
+	go func() {
+		resp, err := rawCall(sock, Request{Op: "flush", DB: "app", Branch: "main"})
+		if err != nil {
+			resp = errResp(err)
+		}
+		flushDone <- resp
+	}()
+	select {
+	case <-entered:
+		// The flush is now paused inside Flush, holding flushMu, immediately
+		// before its EncodeSnapshot call.
+	case <-time.After(10 * time.Second):
+		t.Fatal("flush never reached its encode hook")
+	}
+
+	closeDone := make(chan Response, 1)
+	go func() {
+		resp, err := rawCall(sock, Request{Op: "close", DB: "app", Branch: "main"})
+		if err != nil {
+			resp = errResp(err)
+		}
+		closeDone <- resp
+	}()
+
+	select {
+	case r := <-closeDone:
+		session.FlushEncodeHook = nil
+		close(proceed)
+		<-flushDone
+		t.Fatalf("close returned (%+v) while a flush was paused mid-encode on the same session", r)
+	case <-time.After(200 * time.Millisecond):
+		// Expected: close is blocked behind the paused flush's flushMu.
+	}
+
+	close(proceed) // let the paused flush finish its encode
+
+	var flushResp, closeResp Response
+	select {
+	case flushResp = <-flushDone:
+	case <-time.After(10 * time.Second):
+		t.Fatal("flush never returned after being released")
+	}
+	select {
+	case closeResp = <-closeDone:
+	case <-time.After(10 * time.Second):
+		t.Fatal("close never returned after the paused flush finished")
+	}
+
+	if !closeResp.OK {
+		t.Fatalf("close must succeed: %+v", closeResp)
+	}
+
+	// Whichever way the race between Close's ReleaseLease and Flush's own
+	// PutRef fell, the outcome must be reported honestly: a flush reporting
+	// success must have an actual snapshot behind the ref it claims — never
+	// a success whose snapshot is missing.
+	if flushResp.OK {
+		ref, _, err := w.Store.GetRef("app", "main")
+		if err != nil {
+			t.Fatal(err)
+		}
+		if ref.HeadTXID != flushResp.TXID {
+			t.Fatalf("flush reported success at txid %d but ref head is %d", flushResp.TXID, ref.HeadTXID)
+		}
+		key := store.SnapshotKey(ref.Lineage, ref.HeadEpoch, ref.HeadTXID)
+		if data, _, err := w.Store.B.Get(key); err != nil || len(data) == 0 {
+			t.Fatalf("flush reported success but its snapshot is missing: key=%s err=%v len=%d",
+				key, err, len(data))
+		}
+	} else if flushResp.Error == "" {
+		t.Fatal("a failed flush must carry an error message")
+	}
+
+	// No panic occurred (the test would already have crashed if one had),
+	// and the session is gone from the daemon afterward.
+	st := call(t, sock, Request{Op: "status"})
+	for _, in := range st.Sessions {
+		if in.DB == "app" && in.Branch == "main" {
+			t.Fatalf("session still listed after close: %+v", in)
 		}
 	}
 }

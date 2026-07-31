@@ -92,6 +92,34 @@ func TestQuickstartTranscript(t *testing.T) {
 	}
 }
 
+// TestBareTrailingSocketFlagIsRejected guards a parsing gap: socketOverride
+// used to only consume "-socket PATH" when a value followed it, silently
+// leaving a bare trailing "-socket" in the remaining args otherwise. `serve`
+// happened to reject that leftover anyway (it errors on any nonempty rest),
+// but `session` has no such check — a trailing "-socket" there fell through
+// to target(), which just treated it as an ordinary positional argument (or
+// an unknown subcommand, depending on position) instead of reporting the
+// malformed flag. Both paths must now reject it explicitly and identically.
+func TestBareTrailingSocketFlagIsRejected(t *testing.T) {
+	dir := filepath.Join(t.TempDir(), "s")
+	if err := run([]string{"-store", dir, "init"}); err != nil {
+		t.Fatal(err)
+	}
+	if err := run([]string{"-store", dir, "create", "app"}); err != nil {
+		t.Fatal(err)
+	}
+
+	if err := run([]string{"-store", dir, "serve", "-socket"}); err == nil {
+		t.Fatal("serve -socket with no PATH must error")
+	}
+	if err := run([]string{"-store", dir, "session", "open", "app", "-socket"}); err == nil {
+		t.Fatal("session open app -socket with no PATH must error, not silently ignore -socket")
+	}
+	if err := run([]string{"-store", dir, "session", "-socket"}); err == nil {
+		t.Fatal("session -socket with no PATH and no subcommand must error")
+	}
+}
+
 // TestSessionHonorsServeSocketOverride guards the fix for `serve -socket`
 // and `session` disagreeing on where the socket lives: `serve -socket PATH`
 // used to be unreachable by `session` subcommands because they only ever
