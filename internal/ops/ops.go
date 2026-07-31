@@ -323,7 +323,7 @@ func fileSum(path string) (string, error) {
 func (w *Workspace) materializeAt(ref store.Ref, cp store.Checkpoint, dst string) error {
 	data, _, err := w.Store.B.Get(store.SnapshotKey(ref.Lineage, cp.Epoch, cp.TXID))
 	if err != nil {
-		return fmt.Errorf("ops: snapshot txid %d (epoch %d) in lineage %s: %w",
+		return fmt.Errorf("ops: snapshot txid %d (epoch %d) not found in lineage %s: %w",
 			cp.TXID, cp.Epoch, ref.Lineage, err)
 	}
 	if _, err := ltxio.Materialize(bytes.NewReader(data), dst); err != nil {
@@ -404,6 +404,7 @@ func (w *Workspace) Checkpoint(db, branch, name string) (uint64, error) {
 		}
 	}
 	ref.HeadTXID = txid
+	ref.HeadEpoch = ref.Epoch
 	ref.SetCheckpoint(name, txid, ref.Epoch)
 	if _, err := w.Store.PutRef(db, branch, ref, etag); err != nil {
 		// Decide whether to clean up the snapshot after PutRef failure.
@@ -495,7 +496,7 @@ func (w *Workspace) warnIfUncheckpointed(db, branch string, ref store.Ref) {
 func (w *Workspace) copySnapshotIntoLineage(src store.Ref, cp store.Checkpoint, lineage string) (string, error) {
 	data, _, err := w.Store.B.Get(store.SnapshotKey(src.Lineage, cp.Epoch, cp.TXID))
 	if err != nil {
-		return "", fmt.Errorf("ops: snapshot txid %d (epoch %d) in lineage %s: %w", cp.TXID, cp.Epoch, src.Lineage, err)
+		return "", fmt.Errorf("ops: snapshot txid %d (epoch %d) not found in lineage %s: %w", cp.TXID, cp.Epoch, src.Lineage, err)
 	}
 	key := store.SnapshotKey(lineage, 1, cp.TXID)
 	if _, err := w.Store.B.PutIf(key, data, ""); err != nil {
