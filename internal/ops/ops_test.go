@@ -400,6 +400,106 @@ func TestForkWarnsOnUncheckpointedChanges(t *testing.T) {
 	}
 }
 
+// TestForkWarnsOnStaleCheckout verifies the fix for a checkout sidecar that
+// used to be a bare content hash: it couldn't detect a STALE checkout, one
+// whose branch ref was repointed (e.g. rollback/promote with a skipped
+// refresh on a busy checkout) after the checkout was last materialized. We
+// simulate that "repoint without refresh" directly at the store layer (the
+// same end state Rollback/Promote leave behind when their best-effort
+// checkout refresh is skipped or fails): fork a scratch branch, advance it,
+// then CAS main's ref to point at the scratch branch's new state without
+// touching main's checkout file or its .sum sidecar. Forking main afterward
+// must warn that the checkout is stale (not silently treat it as clean) and
+// must still fork from the branch's actual (new) head.
+func TestForkWarnsOnStaleCheckout(t *testing.T) {
+	if _, err := exec.LookPath("sqlite3"); err != nil {
+		t.Skip("sqlite3 CLI not on PATH")
+	}
+	w := newWS(t)
+	if err := w.Create("app"); err != nil {
+		t.Fatal(err)
+	}
+	path, err := w.Checkout("app", "main")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if out, err := exec.Command("sqlite3", path,
+		"CREATE TABLE t (v); INSERT INTO t VALUES (1);").CombinedOutput(); err != nil {
+		t.Fatalf("%v: %s", err, out)
+	}
+	if _, err := w.Checkpoint("app", "main", "v1"); err != nil {
+		t.Fatal(err)
+	}
+
+	// Build a "new state" for main to be silently repointed to: fork a
+	// scratch branch off main, add more data, and checkpoint it there.
+	if _, err := w.Fork("app", "main", "scratch", ""); err != nil {
+		t.Fatal(err)
+	}
+	scratchPath, err := w.Checkout("app", "scratch")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if out, err := exec.Command("sqlite3", scratchPath, "INSERT INTO t VALUES (2);").CombinedOutput(); err != nil {
+		t.Fatalf("%v: %s", err, out)
+	}
+	newTXID, err := w.Checkpoint("app", "scratch", "v2")
+	if err != nil {
+		t.Fatal(err)
+	}
+	scratchRef, _, err := w.Store.GetRef("app", "scratch")
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	// Simulate a repoint-without-refresh: CAS main's ref directly at the
+	// store layer to the scratch branch's new (lineage, txid), exactly as
+	// Rollback/Promote would, but WITHOUT touching main's checkout file or
+	// its .sum sidecar (as if the refresh had been skipped because the
+	// checkout was busy).
+	mainRef, mainEtag, err := w.Store.GetRef("app", "main")
+	if err != nil {
+		t.Fatal(err)
+	}
+	mainRef.Lineage = scratchRef.Lineage
+	mainRef.Epoch = scratchRef.Epoch
+	mainRef.HeadTXID = newTXID
+	if _, err := w.Store.PutRef("app", "main", mainRef, mainEtag); err != nil {
+		t.Fatal(err)
+	}
+
+	var forkTXID uint64
+	stderr := captureStderr(t, func() {
+		forkTXID, err = w.Fork("app", "main", "child", "")
+		if err != nil {
+			t.Fatal(err)
+		}
+	})
+	if !strings.Contains(stderr, "stale") {
+		t.Fatalf("warning missing expected text: %q", stderr)
+	}
+	if !strings.Contains(stderr, "repointed") {
+		t.Fatalf("warning missing expected text: %q", stderr)
+	}
+	if !strings.Contains(stderr, "offshoot checkout") {
+		t.Fatalf("warning missing refresh hint: %q", stderr)
+	}
+	if forkTXID != newTXID {
+		t.Fatalf("fork txid = %d, want %d (the repointed-to branch head, not the stale checkout's txid)", forkTXID, newTXID)
+	}
+
+	// The fork's content must be the NEW (repointed-to) branch head, not
+	// whatever the stale checkout file on disk happened to contain.
+	cpath, err := w.Checkout("app", "child")
+	if err != nil {
+		t.Fatal(err)
+	}
+	got, _ := exec.Command("sqlite3", cpath, "SELECT v FROM t ORDER BY v;").Output()
+	if string(got) != "1\n2\n" {
+		t.Fatalf("fork content: %q, want the new branch head content", got)
+	}
+}
+
 func TestRollback(t *testing.T) {
 	if _, err := exec.LookPath("sqlite3"); err != nil {
 		t.Skip("sqlite3 CLI not on PATH")
