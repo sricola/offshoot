@@ -103,7 +103,10 @@ type Engine struct {
 
 // drainRequest is one DrainNow call's handoff to Run's loop: done carries
 // back pollOnce's result (nil on an ordinary successful catch-up, or the
-// same fatal error Run itself would return and stop on).
+// same fatal error Run itself returns and stops on — Run's reqs case sends
+// the result to done and THEN returns it, exactly as the ticker path below
+// does, so a DrainNow-triggered failure stops the engine just as promptly
+// as one the ticker happened to hit first).
 type drainRequest struct{ done chan error }
 
 func NewEngine(o Options) *Engine {
@@ -170,7 +173,23 @@ func (e *Engine) DrainNow(ctx context.Context) error {
 	case <-ctx.Done():
 		return ctx.Err()
 	case <-e.done:
-		return nil
+		// Run's reqs case sends to req.done (buffered, cap 1) strictly
+		// before it can return and trigger the deferred close(e.done) — but
+		// that program-order guarantee inside Run doesn't make select
+		// prefer one ready case over another here: if both req.done and
+		// e.done are ready by the time this select runs, Go picks between
+		// them pseudo-randomly. Since close(e.done) happens-after the send
+		// (same goroutine, sequenced before the return that unwinds into
+		// it), a pending value on req.done is always already visible by the
+		// time e.done's close is observed — so check it once more,
+		// non-blockingly, rather than risk reporting a spurious nil success
+		// for what was actually a fatal DrainNow-triggered error.
+		select {
+		case err := <-req.done:
+			return err
+		default:
+			return nil
+		}
 	}
 }
 
@@ -220,7 +239,20 @@ func (e *Engine) Run(ctx context.Context) error {
 			// point of DrainNow. Serviced by this same goroutine via
 			// pollOnce, so it can never run concurrently with the
 			// tick-driven path below.
-			req.done <- e.pollOnce(ctx, &idle)
+			//
+			// Send the result to the requester FIRST, then — on a fatal
+			// error — stop the loop exactly as the ticker path below does.
+			// A poll triggered by DrainNow is not a lesser failure than one
+			// triggered by the ticker: if it doesn't, Run keeps looping
+			// looking healthy while capture is actually broken, and nothing
+			// ever calls session.runEngine's failure path. Sending before
+			// returning means the requester still gets the error even
+			// though Run is about to exit and close e.done right after.
+			err := e.pollOnce(ctx, &idle)
+			req.done <- err
+			if err != nil {
+				return err
+			}
 			continue
 		case <-tick.C:
 		}
