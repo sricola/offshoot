@@ -206,6 +206,16 @@ func (s *Server) dispatch(ctx context.Context, req Request) (Response, bool) {
 		return Response{}, true
 
 	case "ping":
+		meta, rpcErr := requestEra(req.Params)
+		if rpcErr != nil {
+			return reply(nil, rpcErr)
+		}
+		if meta != nil {
+			return reply(modernPingResult{
+				ResultType: "complete",
+				Meta:       newResponseMeta(),
+			}, nil)
+		}
 		return reply(struct{}{}, nil)
 
 	case "server/discover":

@@ -678,3 +678,86 @@ func TestUnknownMethodWithBadProtocolVersionPrefersVersionError(t *testing.T) {
 			e["code"], CodeUnsupportedProtocolVersion)
 	}
 }
+
+// --- ping era classification ---
+//
+// ping used to bypass requestEra entirely and answer `{}` unconditionally,
+// unlike every other verb (tools/list, tools/call, and the default case all
+// classify by era first). That meant a modern ping naming an unsupported
+// protocol version got silent success instead of the version error every
+// other path produces. These three tests pin the fix: a legacy ping still
+// gets the bare `{}` legacy result, a modern ping gets the modern envelope,
+// and a modern ping with a bad version gets CodeUnsupportedProtocolVersion
+// exactly like tools/list does in TestUnsupportedProtocolVersionErrors.
+
+// TestLegacyPing pins the pre-existing behavior: a ping with no _meta block
+// gets a bare `{}` result, no envelope.
+func TestLegacyPing(t *testing.T) {
+	got := run(t, `{"jsonrpc":"2.0","id":1,"method":"ping"}`)
+	if len(got) != 1 || got[0]["error"] != nil {
+		t.Fatalf("ping: %v", got)
+	}
+	res, ok := got[0]["result"].(map[string]any)
+	if !ok {
+		t.Fatalf("result missing: %v", got[0])
+	}
+	if len(res) != 0 {
+		t.Errorf("legacy ping result = %v, want empty object", res)
+	}
+}
+
+// TestModernPing covers a ping made under the modern (2026-07-28) era: the
+// result must carry resultType and serverInfo _meta, same as every other
+// modern result, but — like tools/call, and unlike tools/list — no
+// ttlMs/cacheScope: ping is a liveness check, not a cacheable value.
+func TestModernPing(t *testing.T) {
+	meta := `"_meta":{"io.modelcontextprotocol/protocolVersion":"2026-07-28","io.modelcontextprotocol/clientCapabilities":{}}`
+	got := run(t, `{"jsonrpc":"2.0","id":1,"method":"ping","params":{`+meta+`}}`)
+	if len(got) != 1 || got[0]["error"] != nil {
+		t.Fatalf("ping: %v", got)
+	}
+	res := got[0]["result"].(map[string]any)
+	if res["resultType"] != "complete" {
+		t.Errorf("ping resultType = %v, want complete", res["resultType"])
+	}
+	if _, ok := res["ttlMs"]; ok {
+		t.Errorf("ping is not cacheable; must not carry ttlMs: %v", res)
+	}
+	if _, ok := res["cacheScope"]; ok {
+		t.Errorf("ping is not cacheable; must not carry cacheScope: %v", res)
+	}
+	rmeta, ok := res["_meta"].(map[string]any)
+	if !ok {
+		t.Fatalf("ping result missing _meta: %v", res)
+	}
+	if si, ok := rmeta["io.modelcontextprotocol/serverInfo"].(map[string]any); !ok || si["name"] != "offshoot" {
+		t.Errorf("serverInfo = %v", rmeta["io.modelcontextprotocol/serverInfo"])
+	}
+}
+
+// TestModernPingWithUnsupportedVersionErrors is the regression test for the
+// actual bug: before this fix, ping never called requestEra at all, so a
+// modern ping naming a protocol version this server doesn't implement got
+// silent success (`{}`) instead of the version error every other verb
+// produces for the identical _meta. This must fail exactly the way
+// TestUnsupportedProtocolVersionErrors does for tools/list.
+func TestModernPingWithUnsupportedVersionErrors(t *testing.T) {
+	got := run(t, `{"jsonrpc":"2.0","id":1,"method":"ping","params":{"_meta":{"io.modelcontextprotocol/protocolVersion":"1900-01-01","io.modelcontextprotocol/clientCapabilities":{}}}}`)
+	if len(got) != 1 {
+		t.Fatalf("want 1 response, got %v", got)
+	}
+	e, ok := got[0]["error"].(map[string]any)
+	if !ok {
+		t.Fatalf("ping with an unsupported protocol version must error, got a result: %v", got[0])
+	}
+	if int(e["code"].(float64)) != CodeUnsupportedProtocolVersion {
+		t.Errorf("code = %v, want %d", e["code"], CodeUnsupportedProtocolVersion)
+	}
+	data, ok := e["data"].(map[string]any)
+	if !ok {
+		t.Fatalf("error missing data: %v", e)
+	}
+	if data["requested"] != "1900-01-01" {
+		t.Errorf("data.requested = %v", data["requested"])
+	}
+}

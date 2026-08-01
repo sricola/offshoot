@@ -55,14 +55,24 @@ clean up (it runs entirely out of a temp directory).
 
       offshoot checkout shop@pre-migration
 
-  `Promote` is "promote-as-fork": it repoints the target branch (`main`) at a
-  new lineage seeded from the source's head, and **resets the target's
-  checkpoint map** to just the new `promote` checkpoint. That's what makes
-  promote safe to force onto a protected branch — it can't leave the branch
-  half-updated — but it also means any checkpoint that lived on `main` before
-  the promote (`before-migration` included) is gone from `main` the instant
-  the promote lands. `offshoot rollback shop --to before-migration` will fail
-  with "no checkpoint" once that's happened.
+  `Promote` repoints the target branch (`main`) at a brand-new lineage seeded
+  from the *source*'s head, and **resets the target's checkpoint map** to
+  just the new `promote` checkpoint. That reset isn't what makes promote safe
+  to force onto a protected branch — it's a side effect of where the new
+  lineage comes from: `main`'s old checkpoints recorded TXIDs in `main`'s own
+  prior lineage, and once `main` points at a lineage seeded from
+  `attempt-3`'s history instead, those TXIDs identify a lineage `main` no
+  longer has any relationship to, so they can't be carried forward. (Contrast
+  `offshoot rollback`, which seeds its new lineage from the *same* branch's
+  own prior lineage, so it both can and does copy every still-valid
+  checkpoint forward — see the `kept` map and copy loop in `ops.Rollback`.)
+  What actually makes promote safe to force onto a protected branch is that
+  the whole repoint lands as a single compare-and-swap write of the branch's
+  ref — there is no partially-updated state to land in, independent of
+  what happens to checkpoints. Either way, any checkpoint that lived on
+  `main` before the promote (`before-migration` included) is gone from
+  `main` the instant the promote lands. `offshoot rollback shop --to
+  before-migration` will fail with "no checkpoint" once that's happened.
 
   If you want to keep a state around after a promote, it needs to live on a
   branch of its own — which is exactly what step 2 above does, forking
