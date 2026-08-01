@@ -3,8 +3,10 @@ package mcp
 import (
 	"context"
 	"encoding/json"
+	"os"
 	"os/exec"
 	"path/filepath"
+	"reflect"
 	"strings"
 	"testing"
 
@@ -167,4 +169,168 @@ func lastPath(s string) string {
 		}
 	}
 	return ""
+}
+
+// --- Critical 1: agent-supplied names must be validated before ops ---
+
+// TestToolsRejectEscapingNames pins the fix for the path-traversal finding:
+// every MCP tool handler that takes a name-shaped argument (database,
+// branch, new_branch, source, target, checkpoint names) must reject a
+// malformed one — most importantly one that escapes the workspace via ".."
+// — as a clean tool ErrorResult naming the offending argument, rather than
+// letting it flow into ops (and from there into Workspace.CheckoutPath's
+// bare filepath.Join).
+func TestToolsRejectEscapingNames(t *testing.T) {
+	const escaping = "../../../../tmp/offshoot-mcp-escape-poc"
+
+	cases := []struct {
+		tool string
+		args map[string]any
+	}{
+		{"offshoot_checkout", map[string]any{"database": "app", "branch": escaping}},
+		{"offshoot_checkout", map[string]any{"database": escaping}},
+		{"offshoot_checkpoint", map[string]any{"database": "app", "branch": escaping, "name": "v1"}},
+		{"offshoot_checkpoint", map[string]any{"database": "app", "name": escaping}},
+		{"offshoot_fork", map[string]any{"database": "app", "new_branch": escaping}},
+		{"offshoot_fork", map[string]any{"database": "app", "new_branch": "attempt-1", "branch": escaping}},
+		{"offshoot_rollback", map[string]any{"database": "app", "to": escaping}},
+		{"offshoot_rollback", map[string]any{"database": "app", "branch": escaping, "to": "init"}},
+		{"offshoot_promote", map[string]any{"database": escaping, "source": "main", "target": "main"}},
+		{"offshoot_promote", map[string]any{"database": "app", "source": escaping, "target": "main"}},
+		{"offshoot_promote", map[string]any{"database": "app", "source": "main", "target": escaping}},
+		{"offshoot_destroy", map[string]any{"database": "app", "branch": escaping}},
+		{"offshoot_destroy", map[string]any{"database": escaping, "branch": "main"}},
+	}
+
+	for _, tc := range cases {
+		t.Run(tc.tool+"/"+strings.ReplaceAll(escaping, "/", "_"), func(t *testing.T) {
+			ts, _ := newTools(t)
+			r := call(t, ts, tc.tool, tc.args)
+			if !r.IsError {
+				t.Fatalf("%s with args %v: want a tool error rejecting the escaping name, got success: %s",
+					tc.tool, tc.args, text(r))
+			}
+			// The victim path must never be materialized outside the
+			// workspace: confirm no file landed at what the traversal target
+			// resolves to.
+			victim := filepath.Join(os.TempDir(), "offshoot-mcp-escape-poc.db")
+			if fi, statErr := os.Stat(victim); statErr == nil {
+				t.Fatalf("%s: traversal file materialized outside the workspace: %s (%v)", tc.tool, victim, fi)
+			}
+		})
+	}
+}
+
+// --- Critical 2: the schema helper must advertise each property's real type ---
+
+// toolArgStructs maps every tool name to the Go struct its handler unmarshals
+// `arguments` into (or nil for a tool that takes none), so
+// TestToolSchemaTypesMatchArgStructs can compare declared JSON Schema types
+// against what the handler actually accepts without hardcoding per-field
+// checks.
+var toolArgStructs = map[string]any{
+	"offshoot_list":       nil,
+	"offshoot_checkout":   checkoutArgs{},
+	"offshoot_checkpoint": checkpointArgs{},
+	"offshoot_fork":       forkArgs{},
+	"offshoot_rollback":   rollbackArgs{},
+	"offshoot_promote":    promoteArgs{},
+	"offshoot_destroy":    destroyArgs{},
+}
+
+// jsonSchemaTypeForKind maps a Go reflect.Kind to the JSON Schema "type"
+// value a field of that kind should be advertised as.
+func jsonSchemaTypeForKind(k reflect.Kind) string {
+	switch k {
+	case reflect.String:
+		return "string"
+	case reflect.Bool:
+		return "boolean"
+	case reflect.Int, reflect.Int8, reflect.Int16, reflect.Int32, reflect.Int64,
+		reflect.Uint, reflect.Uint8, reflect.Uint16, reflect.Uint32, reflect.Uint64:
+		return "integer"
+	case reflect.Float32, reflect.Float64:
+		return "number"
+	default:
+		return "unsupported:" + k.String()
+	}
+}
+
+// jsonFieldName extracts the field name from a `json:"name,omitempty"` tag.
+func jsonFieldName(tag string) string {
+	if i := strings.IndexByte(tag, ','); i >= 0 {
+		return tag[:i]
+	}
+	return tag
+}
+
+// TestToolSchemaTypesMatchArgStructs pins the fix for the `force` schema-type
+// finding: every tool's advertised InputSchema property type must match the
+// Go type its handler's argument struct actually accepts, checked
+// generically by reflection over every JSON-tagged field of every tool's arg
+// struct (not a hardcoded check of `force` alone) — so a model that follows
+// the schema literally (e.g. `"force":"true"` if the schema wrongly said
+// "string") never hits a confusing unmarshal error, and the next
+// schema/struct mismatch (of any field, any tool) gets caught here too.
+func TestToolSchemaTypesMatchArgStructs(t *testing.T) {
+	ts, _ := newTools(t)
+	for _, tl := range ts.Tools() {
+		argStruct, known := toolArgStructs[tl.Name]
+		if !known {
+			t.Fatalf("test does not know the argument struct for tool %q; add it to toolArgStructs", tl.Name)
+		}
+
+		schemaMap, ok := tl.InputSchema.(map[string]any)
+		if !ok {
+			t.Fatalf("%s: InputSchema is not a map[string]any: %T", tl.Name, tl.InputSchema)
+		}
+		props, _ := schemaMap["properties"].(map[string]any)
+
+		if argStruct == nil {
+			if len(props) != 0 {
+				t.Errorf("%s: takes no arguments but schema advertises properties: %v", tl.Name, props)
+			}
+			continue
+		}
+
+		typ := reflect.TypeOf(argStruct)
+		fieldKindByJSONName := map[string]reflect.Kind{}
+		for i := 0; i < typ.NumField(); i++ {
+			f := typ.Field(i)
+			name := jsonFieldName(f.Tag.Get("json"))
+			if name == "" || name == "-" {
+				continue
+			}
+			fieldKindByJSONName[name] = f.Type.Kind()
+		}
+
+		for propName, propSchemaAny := range props {
+			propSchema, ok := propSchemaAny.(map[string]any)
+			if !ok {
+				t.Errorf("%s: property %q schema is not a map[string]any: %T", tl.Name, propName, propSchemaAny)
+				continue
+			}
+			declaredType, _ := propSchema["type"].(string)
+			kind, ok := fieldKindByJSONName[propName]
+			if !ok {
+				t.Errorf("%s: schema advertises property %q, but %s has no matching json-tagged field",
+					tl.Name, propName, typ)
+				continue
+			}
+			wantType := jsonSchemaTypeForKind(kind)
+			if declaredType != wantType {
+				t.Errorf("%s: property %q is declared %q in the schema but the handler's %s field is %s (want type %q)",
+					tl.Name, propName, declaredType, typ, kind, wantType)
+			}
+		}
+
+		// The inverse direction: every JSON-tagged struct field the handler
+		// reads should be advertised in the schema too, so an agent following
+		// the schema alone can discover every argument the handler accepts.
+		for jsonName := range fieldKindByJSONName {
+			if _, ok := props[jsonName]; !ok {
+				t.Errorf("%s: %s field %q has no matching schema property", tl.Name, typ, jsonName)
+			}
+		}
+	}
 }

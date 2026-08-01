@@ -7,6 +7,7 @@ import (
 
 	"github.com/offshoot-db/offshoot/internal/daemon"
 	"github.com/offshoot-db/offshoot/internal/ops"
+	"github.com/offshoot-db/offshoot/internal/store"
 )
 
 // OffshootTools exposes offshoot's branch lifecycle to an agent over MCP:
@@ -25,19 +26,52 @@ func NewOffshootTools(ws *ops.Workspace, spec string) *OffshootTools {
 	return &OffshootTools{ws: ws, spec: spec}
 }
 
-// schema is a shorthand for a JSON Schema object describing a tool's
-// arguments: required string properties plus optional string properties.
-func schema(required []string, optional ...string) map[string]any {
-	props := map[string]any{}
-	for _, name := range required {
-		props[name] = map[string]any{"type": "string"}
-	}
-	for _, name := range optional {
-		props[name] = map[string]any{"type": "string"}
+// prop describes one property of a tool's JSON Schema input: its argument
+// name, its real JSON Schema type (so a bool-typed Go field like `force`
+// is advertised as "boolean", not "string" — a model that follows the
+// schema and sends `"force":"true"` should not get a confusing unmarshal
+// error), whether it's required, and — for an optional property whose
+// handler applies a default when absent — the default value to advertise.
+type prop struct {
+	name     string
+	jsonType string
+	required bool
+	def      any
+}
+
+// reqStr and optStr build required/optional string properties, the common
+// case (database, branch names, checkpoint names).
+func reqStr(name string) prop { return prop{name: name, jsonType: "string", required: true} }
+func optStr(name string) prop { return prop{name: name, jsonType: "string"} }
+
+// optStrDefault builds an optional string property that documents the
+// value the handler substitutes when the argument is omitted (e.g. `branch`
+// defaults to "main" — see branchOr).
+func optStrDefault(name string, def string) prop {
+	return prop{name: name, jsonType: "string", def: def}
+}
+
+// optBool builds an optional boolean property (e.g. `force`).
+func optBool(name string) prop { return prop{name: name, jsonType: "boolean"} }
+
+// schema builds a JSON Schema object describing a tool's arguments from a
+// list of properties, each carrying its own type/required/default.
+func schema(props ...prop) map[string]any {
+	properties := map[string]any{}
+	var required []string
+	for _, p := range props {
+		def := map[string]any{"type": p.jsonType}
+		if p.def != nil {
+			def["default"] = p.def
+		}
+		properties[p.name] = def
+		if p.required {
+			required = append(required, p.name)
+		}
 	}
 	s := map[string]any{
 		"type":       "object",
-		"properties": props,
+		"properties": properties,
 	}
 	if len(required) > 0 {
 		s["required"] = required
@@ -57,7 +91,7 @@ func (t *OffshootTools) Tools() []Tool {
 				"protected. Call this first to orient yourself: to see what databases " +
 				"exist, what branches an attempt could fork from, or which checkpoints " +
 				"are available to roll back to or fork from.",
-			InputSchema: schema(nil),
+			InputSchema: schema(),
 		},
 		{
 			Name: "offshoot_checkout",
@@ -66,8 +100,9 @@ func (t *OffshootTools) Tools() []Tool {
 				"directly with a SQL client. If a daemon is running for this store, the " +
 				"result says so — prefer a session-based connection over repeated " +
 				"one-shot checkouts when one is available, since it holds a lease and " +
-				"streams writes incrementally instead of full-snapshotting.",
-			InputSchema: schema([]string{"database"}, "branch"),
+				"streams writes incrementally instead of full-snapshotting. `branch` " +
+				"defaults to \"main\" if omitted.",
+			InputSchema: schema(reqStr("database"), optStrDefault("branch", "main")),
 		},
 		{
 			Name: "offshoot_checkpoint",
@@ -75,8 +110,9 @@ func (t *OffshootTools) Tools() []Tool {
 				"returned to later. Call this after a batch of changes you might want " +
 				"to keep or roll back to individually — e.g. after a migration step " +
 				"succeeds, or before starting a riskier change on the same branch. " +
-				"Cheap: only the diff since the last checkpoint is stored.",
-			InputSchema: schema([]string{"database", "name"}, "branch"),
+				"Cheap: only the diff since the last checkpoint is stored. `branch` " +
+				"defaults to \"main\" if omitted.",
+			InputSchema: schema(reqStr("database"), reqStr("name"), optStrDefault("branch", "main")),
 		},
 		{
 			Name: "offshoot_fork",
@@ -84,8 +120,10 @@ func (t *OffshootTools) Tools() []Tool {
 				"risky or destructive work (schema migrations, bulk deletes, " +
 				"experiments). Forking is instant and costs nothing until you write. " +
 				"Prefer forking over backing up by hand. Forks from the branch's " +
-				"current head by default, or from a named checkpoint via `at`.",
-			InputSchema: schema([]string{"database", "new_branch"}, "branch", "at"),
+				"current head by default, or from a named checkpoint via `at`. " +
+				"`branch` (the source) defaults to \"main\" if omitted.",
+			InputSchema: schema(reqStr("database"), reqStr("new_branch"),
+				optStrDefault("branch", "main"), optStr("at")),
 		},
 		{
 			Name: "offshoot_rollback",
@@ -93,8 +131,8 @@ func (t *OffshootTools) Tools() []Tool {
 				"everything written since. Call this when an attempt on a branch has " +
 				"gone wrong and you want to restore known-good state rather than " +
 				"manually undoing changes. Reports the checkout path to reopen after " +
-				"the rollback.",
-			InputSchema: schema([]string{"database", "to"}, "branch"),
+				"the rollback. `branch` defaults to \"main\" if omitted.",
+			InputSchema: schema(reqStr("database"), reqStr("to"), optStrDefault("branch", "main")),
 		},
 		{
 			Name: "offshoot_promote",
@@ -104,7 +142,7 @@ func (t *OffshootTools) Tools() []Tool {
 				"Protected branches (main is protected by default) refuse promotion " +
 				"unless `force` is set — treat that refusal as confirmation you need, " +
 				"not a bug.",
-			InputSchema: schema([]string{"database", "source", "target"}, "force"),
+			InputSchema: schema(reqStr("database"), reqStr("source"), reqStr("target"), optBool("force")),
 		},
 		{
 			Name: "offshoot_destroy",
@@ -112,7 +150,7 @@ func (t *OffshootTools) Tools() []Tool {
 				"clean up a failed or abandoned attempt once you're done with it. " +
 				"Protected branches refuse destruction unless `force` is set — treat " +
 				"that refusal as confirmation you need, not a bug.",
-			InputSchema: schema([]string{"database", "branch"}, "force"),
+			InputSchema: schema(reqStr("database"), reqStr("branch"), optBool("force")),
 		},
 	}
 }
@@ -124,6 +162,35 @@ func branchOr(branch string) string {
 		return "main"
 	}
 	return branch
+}
+
+// named pairs an argument's label (as it should read in an error message,
+// e.g. "database" or "new_branch") with its value, for validateNames.
+type named struct{ label, value string }
+
+// namedArg builds a named for validateNames.
+func namedArg(label, value string) named { return named{label: label, value: value} }
+
+// validateNames is the single gate every MCP tool handler runs each
+// name-shaped argument (database, branch, new_branch, source, target, to,
+// checkpoint name, ...) through before calling into ops. The MCP tool
+// handlers take database/branch straight from agent-supplied JSON with no
+// ops.ParseTarget in between (unlike the CLI, which always derives db/branch
+// through ParseTarget), so this is the surface's only gate against a
+// traversal- or otherwise malformed name reaching ops. ops itself validates
+// too (defense in depth, for any future non-MCP caller), but this handler-
+// side check is what turns a bad name into a clear ErrorResult naming the
+// offending argument and value, rather than an ops-internal error.
+//
+// It returns the ErrorResult to return immediately and ok=true on the first
+// invalid argument, or ok=false once every argument has passed.
+func validateNames(args ...named) (result ToolResult, ok bool) {
+	for _, a := range args {
+		if err := store.ValidateName(a.value); err != nil {
+			return ErrorResult("invalid %s %q: %v", a.label, a.value, err), true
+		}
+	}
+	return ToolResult{}, false
 }
 
 // Call dispatches name to its handler. The returned error is reserved for
@@ -189,6 +256,9 @@ func (t *OffshootTools) checkout(args json.RawMessage) (ToolResult, error) {
 		return ErrorResult("database is required"), nil
 	}
 	branch := branchOr(a.Branch)
+	if r, bad := validateNames(namedArg("database", a.Database), namedArg("branch", branch)); bad {
+		return r, nil
+	}
 	path, err := t.ws.Checkout(a.Database, branch)
 	if err != nil {
 		return ErrorResult("%v", err), nil
@@ -216,6 +286,10 @@ func (t *OffshootTools) checkpoint(args json.RawMessage) (ToolResult, error) {
 		return ErrorResult("database and name are required"), nil
 	}
 	branch := branchOr(a.Branch)
+	if r, bad := validateNames(namedArg("database", a.Database), namedArg("branch", branch),
+		namedArg("name", a.Name)); bad {
+		return r, nil
+	}
 	txid, err := t.ws.Checkpoint(a.Database, branch, a.Name)
 	if err != nil {
 		return ErrorResult("%v", err), nil
@@ -239,6 +313,14 @@ func (t *OffshootTools) fork(args json.RawMessage) (ToolResult, error) {
 		return ErrorResult("database and new_branch are required"), nil
 	}
 	branch := branchOr(a.Branch)
+	toValidate := []named{namedArg("database", a.Database), namedArg("branch", branch),
+		namedArg("new_branch", a.NewBranch)}
+	if a.At != "" {
+		toValidate = append(toValidate, namedArg("at", a.At))
+	}
+	if r, bad := validateNames(toValidate...); bad {
+		return r, nil
+	}
 	txid, err := t.ws.Fork(a.Database, branch, a.NewBranch, a.At)
 	if err != nil {
 		return ErrorResult("%v", err), nil
@@ -261,6 +343,10 @@ func (t *OffshootTools) rollback(args json.RawMessage) (ToolResult, error) {
 		return ErrorResult("database and to are required"), nil
 	}
 	branch := branchOr(a.Branch)
+	if r, bad := validateNames(namedArg("database", a.Database), namedArg("branch", branch),
+		namedArg("to", a.To)); bad {
+		return r, nil
+	}
 	path, err := t.ws.Rollback(a.Database, branch, a.To)
 	if err != nil {
 		return ErrorResult("%v", err), nil
@@ -283,6 +369,10 @@ func (t *OffshootTools) promote(args json.RawMessage) (ToolResult, error) {
 	if a.Database == "" || a.Source == "" || a.Target == "" {
 		return ErrorResult("database, source, and target are required"), nil
 	}
+	if r, bad := validateNames(namedArg("database", a.Database), namedArg("source", a.Source),
+		namedArg("target", a.Target)); bad {
+		return r, nil
+	}
 	txid, err := t.ws.Promote(a.Database, a.Source, a.Target, a.Force)
 	if err != nil {
 		return ErrorResult("%v", err), nil
@@ -303,6 +393,9 @@ func (t *OffshootTools) destroy(args json.RawMessage) (ToolResult, error) {
 	}
 	if a.Database == "" || a.Branch == "" {
 		return ErrorResult("database and branch are required"), nil
+	}
+	if r, bad := validateNames(namedArg("database", a.Database), namedArg("branch", a.Branch)); bad {
+		return r, nil
 	}
 	if err := t.ws.Destroy(a.Database, a.Branch, a.Force); err != nil {
 		return ErrorResult("%v", err), nil

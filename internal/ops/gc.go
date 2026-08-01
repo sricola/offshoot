@@ -14,6 +14,12 @@ import (
 const tombstoneKey = "gc/tombstones"
 
 func (w *Workspace) Destroy(db, branch string, force bool) error {
+	if err := store.ValidateName(db); err != nil {
+		return err
+	}
+	if err := store.ValidateName(branch); err != nil {
+		return err
+	}
 	ref, _, err := w.Store.GetRef(db, branch)
 	if err != nil {
 		return err
