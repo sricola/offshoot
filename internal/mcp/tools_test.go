@@ -3,6 +3,7 @@ package mcp
 import (
 	"context"
 	"encoding/json"
+	"fmt"
 	"os"
 	"os/exec"
 	"path/filepath"
@@ -341,12 +342,25 @@ func TestToolSchemaTypesMatchArgStructs(t *testing.T) {
 // TestToolsRejectEscapingNames above: a broader sweep of malformed names
 // (traversal, embedded slash, bare "." / "..", uppercase, and empty)
 // across offshoot_checkout's database and offshoot_fork's new_branch.
-// Every case except the empty string is caught by store.ValidateName inside
-// validateNames (the empty database is caught one line earlier, by
-// checkout's own `a.Database == ""` guard) — see the note in the report
-// about that one incidental pass, and
-// TestToolsRejectPathEscapingNamesViaHandlerNotPreCheck below for the
-// strengthened version that removes it.
+//
+// r.IsError alone doesn't prove validateNames is what rejected the name:
+// ops and store.ValidateName independently reject the same traversal (see
+// validateNames's own doc comment — "defense in depth"), so even with
+// validateNames deleted from checkout()/fork() entirely, every case here
+// would still come back as a tool error, just via ops's generic
+// `store: invalid name %q ...` message instead of the handler's own
+// `invalid database %q: ...` / `invalid new_branch %q: ...` message. That
+// handler-added wording — the argument's label, spelled out — is the one
+// thing only validateNames contributes; ops has no idea whether the name it
+// rejected was a "database" or a "branch". So beyond r.IsError, each
+// non-empty case here also asserts the message contains that handler-level
+// wording, which is what actually pins validateNames (not just "some layer
+// somewhere") as the thing doing the rejecting.
+//
+// The empty-database case can't make that assertion: it's caught by
+// checkout's own `a.Database == ""` guard before validateNames ever runs
+// (see TestToolsRejectPathEscapingNamesViaHandlerNotPreCheck below, which
+// sidesteps that guard by using only non-empty bad names).
 func TestToolsRejectPathEscapingNames(t *testing.T) {
 	ts, _ := newTools(t)
 	for _, bad := range []string{"../etc", "a/b", "..", ".", "UPPER", ""} {
@@ -354,12 +368,27 @@ func TestToolsRejectPathEscapingNames(t *testing.T) {
 		if !r.IsError {
 			t.Errorf("database %q must be refused", bad)
 		}
+		if bad == "" {
+			continue // caught by checkout's pre-validateNames empty-string guard.
+		}
+		want := fmt.Sprintf("invalid database %q", bad)
+		if !strings.Contains(text(r), want) {
+			t.Errorf("database %q: message = %q, want it to contain the handler's own %q "+
+				"(a bare ops/store error here would mean validateNames, not just some layer, stopped catching it)",
+				bad, text(r), want)
+		}
 	}
 	for _, bad := range []string{"../x", "a/b", ".."} {
 		r := call(t, ts, "offshoot_fork", map[string]any{
 			"database": "app", "new_branch": bad})
 		if !r.IsError {
 			t.Errorf("branch %q must be refused", bad)
+		}
+		want := fmt.Sprintf("invalid new_branch %q", bad)
+		if !strings.Contains(text(r), want) {
+			t.Errorf("new_branch %q: message = %q, want it to contain the handler's own %q "+
+				"(a bare ops/store error here would mean validateNames, not just some layer, stopped catching it)",
+				bad, text(r), want)
 		}
 	}
 }
@@ -401,6 +430,16 @@ func TestDestroyProtectedMainRequiresForce(t *testing.T) {
 	}
 }
 
+// TestToolResultNeverClaimsUndeliveredDurability originally only checked
+// that checkout's result avoided the literal words "durable" and "saved".
+// That's keyword-only: a message reading "permanently committed and will
+// never be lost" contains neither word and would have sailed through while
+// making exactly the false claim this test exists to catch. Absence of two
+// words isn't evidence of anything; an agent needs to be told what to do,
+// not just spared a lie. So this asserts the positive: the result must
+// affirmatively tell the agent the checkout isn't checkpointed yet and name
+// the tool (offshoot_checkpoint) that makes it so — see the checkout()
+// handler in tools.go, which was changed to say exactly that.
 func TestToolResultNeverClaimsUndeliveredDurability(t *testing.T) {
 	ts, _ := newTools(t)
 	co := call(t, ts, "offshoot_checkout", map[string]any{"database": "app"})
@@ -409,10 +448,20 @@ func TestToolResultNeverClaimsUndeliveredDurability(t *testing.T) {
 		"CREATE TABLE t (v); INSERT INTO t VALUES (1);").CombinedOutput(); err != nil {
 		t.Fatalf("%v: %s", err, out)
 	}
+	msg := text(co)
+	low := strings.ToLower(msg)
 	// checkout's result must not tell the agent the write is saved — nothing
 	// has been checkpointed yet.
-	low := strings.ToLower(text(co))
 	if strings.Contains(low, "durable") || strings.Contains(low, "saved") {
-		t.Fatalf("checkout must not imply durability: %s", text(co))
+		t.Fatalf("checkout must not imply durability: %s", msg)
+	}
+	// And it must do more than avoid a false claim: it must affirmatively
+	// guide the agent toward the action (checkpointing) that this state
+	// needs before it's safe from being lost.
+	if !strings.Contains(low, "checkpoint") {
+		t.Fatalf("checkout result must tell the agent a checkpoint is needed before this state is durable: %s", msg)
+	}
+	if !strings.Contains(msg, "offshoot_checkpoint") {
+		t.Fatalf("checkout result must name the tool (offshoot_checkpoint) the agent needs to call: %s", msg)
 	}
 }

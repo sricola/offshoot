@@ -264,6 +264,8 @@ func (t *OffshootTools) checkout(args json.RawMessage) (ToolResult, error) {
 		return ErrorResult("%v", err), nil
 	}
 	msg := fmt.Sprintf("checked out %s@%s at %s", a.Database, branch, path)
+	msg += "\nthis checkout is not yet checkpointed: nothing written here can be rolled " +
+		"back to or forked from until you call offshoot_checkpoint"
 	if socket, serr := daemon.DefaultSocketPath(t.spec); serr == nil && daemon.Running(socket) {
 		msg += "\na daemon is running for this store; prefer a session-based connection " +
 			"over repeated checkouts if your client supports one"
