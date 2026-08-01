@@ -213,6 +213,12 @@ func (w *Workspace) CreateFrom(db, srcPath string) error {
 // checkout has un-checkpointed local edits, Checkout proceeds (head always
 // wins) but warns first, since those edits are about to be discarded.
 func (w *Workspace) Checkout(db, branch string) (string, error) {
+	if err := store.ValidateName(db); err != nil {
+		return "", err
+	}
+	if err := store.ValidateName(branch); err != nil {
+		return "", err
+	}
 	ref, _, err := w.Store.GetRef(db, branch)
 	if err != nil {
 		return "", err
@@ -358,6 +364,12 @@ func copyFile(from, to string) error {
 // Plan-2 (CLI/at-rest) semantics: full-snapshot encode; requires the
 // checkout to be quiescible (busy timeout 3s, then clean failure).
 func (w *Workspace) Checkpoint(db, branch, name string) (uint64, error) {
+	if err := store.ValidateName(db); err != nil {
+		return 0, err
+	}
+	if err := store.ValidateName(branch); err != nil {
+		return 0, err
+	}
 	if err := store.ValidateName(name); err != nil {
 		return 0, err
 	}
@@ -575,6 +587,15 @@ func (w *Workspace) Fork(db, srcBranch, newBranch, at string) (uint64, error) {
 // file descriptor. Acceptable for the single-operator local CLI; daemon
 // mode (Plan 3) will own the data path and close this gap.
 func (w *Workspace) Rollback(db, branch, to string) (string, error) {
+	if err := store.ValidateName(db); err != nil {
+		return "", err
+	}
+	if err := store.ValidateName(branch); err != nil {
+		return "", err
+	}
+	if err := store.ValidateName(to); err != nil {
+		return "", err
+	}
 	ref, etag, err := w.Store.GetRef(db, branch)
 	if err != nil {
 		return "", err
@@ -678,6 +699,9 @@ func (w *Workspace) Rollback(db, branch, to string) (string, error) {
 func (w *Workspace) Promote(db, source, target string, force bool) (uint64, error) {
 	if source == target {
 		return 0, fmt.Errorf("ops: cannot promote a branch onto itself")
+	}
+	if err := store.ValidateName(db); err != nil {
+		return 0, err
 	}
 	if err := store.ValidateName(source); err != nil {
 		return 0, err
