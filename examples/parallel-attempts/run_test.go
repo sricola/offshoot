@@ -27,4 +27,16 @@ func TestDemoRunsEndToEnd(t *testing.T) {
 	if strings.Contains(strings.ToLower(s), "error") {
 		t.Errorf("demo printed an error:\n%s", s)
 	}
+	// The substring/no-"error" checks above would still pass if the demo
+	// promoted the wrong attempt (e.g. attempt-1's unrounded floats, or
+	// nothing at all): the winner line and the final table must agree that
+	// attempt-3 — the only migration that actually rounds correctly — won.
+	if !strings.Contains(s, "winner: attempt-3") {
+		t.Errorf("demo did not report attempt-3 as the winner:\n%s", s)
+	}
+	for _, want := range []string{"1999", "870", "435"} {
+		if !strings.Contains(s, want) {
+			t.Errorf("demo's final table missing correctly-rounded value %q\n%s", want, s)
+		}
+	}
 }
