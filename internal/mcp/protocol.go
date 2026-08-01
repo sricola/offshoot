@@ -203,11 +203,14 @@ type unsupportedVersionData struct {
 // https://modelcontextprotocol.io/specification/2026-07-28/server/discover,
 // servers MUST implement server/discover and it is era-agnostic: it always
 // answers with what this server supports, regardless of what (if anything)
-// the caller's own _meta requested.
+// the caller's own _meta requested. When resultType is "complete", the
+// 2026-07-28 spec's caching page requires ttlMs and cacheScope.
 type discoverResult struct {
 	ResultType        string             `json:"resultType"`
 	SupportedVersions []string           `json:"supportedVersions"`
 	Capabilities      serverCapabilities `json:"capabilities"`
+	TTLMs             int64              `json:"ttlMs"`
+	CacheScope        string             `json:"cacheScope"`
 	Meta              responseMeta       `json:"_meta"`
 	Instructions      string             `json:"instructions,omitempty"`
 }
