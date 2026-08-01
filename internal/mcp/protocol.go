@@ -6,14 +6,25 @@ import (
 	"fmt"
 )
 
-// protocolVersion is the MCP protocol revision this server implements, per
-// https://modelcontextprotocol.io/specification/2025-11-25 (the current
-// stable release as of writing; a 2026-07-28 revision existed only as a
-// release candidate). initialize always answers with this version: per the
-// spec's version-negotiation rules, a server that supports only one
-// revision responds with that revision regardless of what the client
-// requested.
-const protocolVersion = "2025-11-25"
+// This server is dual-era: it speaks both the legacy, handshake-based
+// 2025-11-25 revision and the modern, stateless 2026-07-28 revision (final
+// as of 2026-07-28; see https://blog.modelcontextprotocol.io/posts/2026-07-28/
+// and https://modelcontextprotocol.io/specification/2026-07-28/changelog).
+// Neither is "current" in the sense of being the only supported revision —
+// that is the point of dual-era support. See server.go's requestEra for how
+// a given request is routed to one era or the other.
+//
+// legacyProtocolVersion is the revision initialize always answers with: a
+// legacy client that supports only one prior revision has no fall-forward
+// mechanism, so per the 2026-07-28 spec's backward-compatibility guidance a
+// server names the revision it supports regardless of what the client
+// requested in initialize's params.
+const legacyProtocolVersion = "2025-11-25"
+
+// modernProtocolVersion is the one 2026-07-28-family revision this server
+// speaks on the stateless, per-request path (server/discover, and any
+// request whose params carry a modern `_meta` block).
+const modernProtocolVersion = "2026-07-28"
 
 // serverVersion is this package's own implementation version, reported in
 // initialize's serverInfo.version. The offshoot binary does not otherwise
@@ -29,10 +40,18 @@ type Request struct {
 }
 
 type Response struct {
-	JSONRPC string          `json:"jsonrpc"`
-	ID      json.RawMessage `json:"id,omitempty"`
-	Result  any             `json:"result,omitempty"`
-	Error   *RPCError       `json:"error,omitempty"`
+	JSONRPC string `json:"jsonrpc"`
+	// ID deliberately has no `omitempty`: json.RawMessage is a []byte slice,
+	// and omitempty on a slice drops the field whenever it is nil/empty —
+	// which is exactly the parse-error case where we could not read a
+	// request id. JSON-RPC 2.0 requires "id":null in that situation, not an
+	// absent id key. json.RawMessage's own MarshalJSON already renders a nil
+	// RawMessage as the literal `null`, so leaving omitempty off is
+	// sufficient: a real id round-trips unchanged, and a nil id serializes
+	// as `null` instead of disappearing.
+	ID     json.RawMessage `json:"id"`
+	Result any             `json:"result,omitempty"`
+	Error  *RPCError       `json:"error,omitempty"`
 }
 
 type RPCError struct {
@@ -49,6 +68,15 @@ const (
 	CodeInvalidParams  = -32602
 	CodeInternalError  = -32603
 )
+
+// CodeUnsupportedProtocolVersion is MCP-specific, not standard JSON-RPC: it
+// lives in the sub-range -32020..-32099 that the 2026-07-28 spec reserves
+// for the MCP specification itself (see
+// https://modelcontextprotocol.io/specification/2026-07-28/basic#error-codes
+// and https://modelcontextprotocol.io/specification/2026-07-28/schema#unsupportedprotocolversionerror).
+// A server emits it when a request's `_meta` names a protocol version the
+// server does not implement.
+const CodeUnsupportedProtocolVersion = -32022
 
 // Tool describes one callable tool, as returned from tools/list.
 type Tool struct {
@@ -110,7 +138,96 @@ type serverCapabilities struct {
 
 type toolsCapability struct{}
 
-// toolsListResult is the result of a tools/list request.
+// toolsListResult is the result of a legacy (2025-11-25) tools/list request.
 type toolsListResult struct {
 	Tools []Tool `json:"tools"`
 }
+
+// --- 2026-07-28 (modern, stateless) protocol types ---
+//
+// The modern revision drops the initialize handshake: every request carries
+// its own protocol version, capabilities, and (optionally) identity in
+// params._meta, under keys reserved by the spec
+// (https://modelcontextprotocol.io/specification/2026-07-28/basic#meta).
+// Results, in turn, carry a required `resultType` and MAY carry a
+// `_meta.io.modelcontextprotocol/serverInfo`. See server.go's requestEra for
+// how an incoming request is classified as modern vs. legacy.
+
+// Reserved `_meta` keys used for per-request protocol negotiation and
+// per-response server identification in the 2026-07-28 revision.
+const (
+	metaKeyProtocolVersion    = "io.modelcontextprotocol/protocolVersion"
+	metaKeyClientInfo         = "io.modelcontextprotocol/clientInfo"
+	metaKeyClientCapabilities = "io.modelcontextprotocol/clientCapabilities"
+	metaKeyServerInfo         = "io.modelcontextprotocol/serverInfo"
+)
+
+// requestMeta is params._meta on a modern request. ProtocolVersion and
+// ClientCapabilities are required by spec; a request missing either is
+// malformed. ClientCapabilities is left as json.RawMessage (rather than a
+// typed ClientCapabilities struct) because this server only needs to know
+// the field was present, not interpret it — the tools capability the
+// client offers is not currently gated on anything.
+type requestMeta struct {
+	ProtocolVersion    string              `json:"io.modelcontextprotocol/protocolVersion"`
+	ClientInfo         *implementationInfo `json:"io.modelcontextprotocol/clientInfo,omitempty"`
+	ClientCapabilities json.RawMessage     `json:"io.modelcontextprotocol/clientCapabilities"`
+}
+
+// requestParamsMeta unwraps the `_meta` envelope from a request's params
+// without needing to know the rest of that method's param shape.
+type requestParamsMeta struct {
+	Meta *requestMeta `json:"_meta"`
+}
+
+// responseMeta is the `_meta` object modern results attach to identify this
+// server, per the spec's "servers SHOULD include serverInfo in every
+// result's _meta" guidance.
+type responseMeta struct {
+	ServerInfo *implementationInfo `json:"io.modelcontextprotocol/serverInfo,omitempty"`
+}
+
+func newResponseMeta() responseMeta {
+	return responseMeta{ServerInfo: &implementationInfo{Name: "offshoot", Version: serverVersion}}
+}
+
+// unsupportedVersionData is the `error.data` payload of a modern
+// UnsupportedProtocolVersionError, per
+// https://modelcontextprotocol.io/specification/2026-07-28/schema#unsupportedprotocolversionerror.
+type unsupportedVersionData struct {
+	Supported []string `json:"supported"`
+	Requested string   `json:"requested"`
+}
+
+// discoverResult is the result of a server/discover request. Per
+// https://modelcontextprotocol.io/specification/2026-07-28/server/discover,
+// servers MUST implement server/discover and it is era-agnostic: it always
+// answers with what this server supports, regardless of what (if anything)
+// the caller's own _meta requested.
+type discoverResult struct {
+	ResultType        string             `json:"resultType"`
+	SupportedVersions []string           `json:"supportedVersions"`
+	Capabilities      serverCapabilities `json:"capabilities"`
+	Meta              responseMeta       `json:"_meta"`
+	Instructions      string             `json:"instructions,omitempty"`
+}
+
+// modernToolsListResult is the result of a tools/list request made under
+// the modern revision: same tool data as the legacy toolsListResult, but
+// wrapped in the modern envelope (resultType, and the ttlMs/cacheScope pair
+// the 2026-07-28 CacheableResult interface requires on tools/list results).
+// This server's tool list never varies per caller, so cacheScope is always
+// "public".
+type modernToolsListResult struct {
+	ResultType string       `json:"resultType"`
+	Tools      []Tool       `json:"tools"`
+	TTLMs      int64        `json:"ttlMs"`
+	CacheScope string       `json:"cacheScope"`
+	Meta       responseMeta `json:"_meta"`
+}
+
+// toolsListTTLMs is how long a client may cache a tools/list response
+// before re-fetching. This server's tool list is fixed for the process
+// lifetime, so this is a generous, arbitrary freshness hint rather than a
+// measured value.
+const toolsListTTLMs = 5 * 60 * 1000
