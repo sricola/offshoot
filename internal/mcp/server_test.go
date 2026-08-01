@@ -467,6 +467,50 @@ func TestOversizedAndWeirdInputDoesNotBreakTheStreamModernEra(t *testing.T) {
 	}
 }
 
+// TestOversizedMultiFragmentLineResyncs exercises readBoundedLine's drain
+// loop across many fragments, not just the one where tooLong first flips to
+// true. TestOversizedLineGetsErrorAndServerContinues above only pushes the
+// line maxLineSize+10 bytes over the cap; with the 64KB buffered reader this
+// server uses, that overage lands entirely within bufio.Reader's very last
+// fragment for the line (isPrefix already false there), so the loop's
+// break-on-!isPrefix path fires on the very same iteration tooLong is set —
+// the custom drain logic that justifies readBoundedLine over bufio.Scanner
+// never actually iterates past that point. A line multiple megabytes over
+// the cap forces many more ReadLine fragments after tooLong flips true, so
+// the drain loop has to keep discarding fragments (not just skip appending)
+// across several iterations before it finds the line's real end and
+// resyncs. This asserts both that the oversized line still produces exactly
+// one error response, and that the very next request lands as its own
+// correctly answered response — not a corrupted read of leftover line
+// bytes.
+func TestOversizedMultiFragmentLineResyncs(t *testing.T) {
+	huge := strings.Repeat("x", maxLineSize+2_000_000)
+	got := run(t, huge, `{"jsonrpc":"2.0","id":42,"method":"tools/list"}`)
+	if len(got) != 2 {
+		t.Fatalf("want an oversized-line error then exactly one normal response, got %d: %v", len(got), got)
+	}
+	e, ok := got[0]["error"].(map[string]any)
+	if !ok {
+		t.Fatalf("want an error response for the oversized line, got %v", got[0])
+	}
+	if int(e["code"].(float64)) != CodeInvalidRequest {
+		t.Errorf("code = %v, want %d", e["code"], CodeInvalidRequest)
+	}
+	if got[1]["error"] != nil {
+		t.Fatalf("server must resync after a multi-fragment oversized line, not corrupt the next response: %v", got[1])
+	}
+	if id, ok := got[1]["id"].(float64); !ok || id != 42 {
+		t.Fatalf("response after the oversized line is out of sync: got id %v, want 42: %v", got[1]["id"], got[1])
+	}
+	res, ok := got[1]["result"].(map[string]any)
+	if !ok {
+		t.Fatalf("response after the oversized line has no result: %v", got[1])
+	}
+	if _, ok := res["tools"]; !ok {
+		t.Fatalf("response after the oversized line is not a valid tools/list result: %v", res)
+	}
+}
+
 func TestBatchOfRequestsEachGetsExactlyOneResponse(t *testing.T) {
 	var lines []string
 	for i := 0; i < 50; i++ {
@@ -532,16 +576,33 @@ func TestBatchMixingErasEachGetsExactlyOneCorrectlyShapedResponse(t *testing.T) 
 	}
 }
 
+// TestMissingParamsIsHandledNotPanicked covers dispatch's tools/call param
+// handling under three kinds of malformed request: no params object at all,
+// a params object with no name field, and — the case that actually exercises
+// the `params.Name == ""` guard in dispatch — a params object with name
+// present but empty. Without that third case, removing the guard is
+// invisible here: an empty name would flow straight into ts.Call, and
+// fakeTools.Call happily answers any name that isn't literally
+// "unknown_tool", so the call would "succeed" instead of panicking or
+// erroring, and this test would stay green.
 func TestMissingParamsIsHandledNotPanicked(t *testing.T) {
 	got := run(t,
 		`{"jsonrpc":"2.0","id":1,"method":"tools/call"}`,
 		`{"jsonrpc":"2.0","id":2,"method":"tools/call","params":{"name":"ping_tool"}}`,
-		`{"jsonrpc":"2.0","id":3,"method":"tools/list"}`)
-	if len(got) != 3 {
-		t.Fatalf("want 3 responses, got %d: %v", len(got), got)
+		`{"jsonrpc":"2.0","id":3,"method":"tools/call","params":{"name":""}}`,
+		`{"jsonrpc":"2.0","id":4,"method":"tools/list"}`)
+	if len(got) != 4 {
+		t.Fatalf("want 4 responses, got %d: %v", len(got), got)
 	}
-	if got[2]["error"] != nil {
-		t.Fatalf("server must survive malformed calls: %v", got[2])
+	e, ok := got[2]["error"].(map[string]any)
+	if !ok {
+		t.Fatalf("a present-but-empty tool name must be a params error, not silently accepted: %v", got[2])
+	}
+	if int(e["code"].(float64)) != CodeInvalidParams {
+		t.Errorf("code = %v, want %d", e["code"], CodeInvalidParams)
+	}
+	if got[3]["error"] != nil {
+		t.Fatalf("server must survive malformed calls: %v", got[3])
 	}
 }
 
@@ -550,6 +611,17 @@ func TestMissingParamsIsHandledNotPanicked(t *testing.T) {
 // present and valid (so it takes the modern branch through dispatch) but
 // whose name is absent must not panic, and the connection must remain
 // usable for a subsequent legitimate modern request.
+//
+// The "ModernEra" in this test's name has to be earned by actually checking
+// something only the modern path produces — otherwise a requestEra
+// regression that stops recognizing anything as modern (so every request
+// here quietly falls back to the legacy branch) leaves this test green: the
+// missing-name request still errors either way (dispatch's
+// `params.Name == ""` check runs before the era ever branches), and a bare
+// "no error" check on the ping_tool call passes on the legacy envelope too.
+// So this also pins the modern envelope itself (resultType + _meta) on the
+// id-2 ping_tool call and the id-3 tools/list call, the same shape
+// TestModernToolsCallDispatch and TestModernClientFullFlow check elsewhere.
 func TestMissingParamsIsHandledNotPanickedModernEra(t *testing.T) {
 	meta := `"_meta":{"io.modelcontextprotocol/protocolVersion":"2026-07-28","io.modelcontextprotocol/clientCapabilities":{}}`
 	got := run(t,
@@ -564,6 +636,25 @@ func TestMissingParamsIsHandledNotPanickedModernEra(t *testing.T) {
 	}
 	if got[2]["error"] != nil {
 		t.Fatalf("server must survive malformed modern calls: %v", got[2])
+	}
+
+	callRes, ok := got[1]["result"].(map[string]any)
+	if !ok {
+		t.Fatalf("id 2: missing result: %v", got[1])
+	}
+	if callRes["resultType"] != "complete" {
+		t.Errorf("modern tools/call result must carry resultType=complete (era not recognized as modern?): %v", callRes)
+	}
+	if _, ok := callRes["_meta"].(map[string]any); !ok {
+		t.Errorf("modern tools/call result missing _meta (era not recognized as modern?): %v", callRes)
+	}
+
+	listRes, ok := got[2]["result"].(map[string]any)
+	if !ok {
+		t.Fatalf("id 3: missing result: %v", got[2])
+	}
+	if listRes["resultType"] != "complete" {
+		t.Errorf("modern tools/list result must carry resultType=complete (era not recognized as modern?): %v", listRes)
 	}
 }
 
