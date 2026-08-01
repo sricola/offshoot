@@ -234,3 +234,29 @@ type modernToolsListResult struct {
 // lifetime, so this is a generous, arbitrary freshness hint rather than a
 // measured value.
 const toolsListTTLMs = 5 * 60 * 1000
+
+// toolCallParams is tools/call's params, same on both eras (per Task 1's
+// verified spec reading: "tools/call's params/result shapes are otherwise
+// unchanged from 2025-11-25 (arguments, content, isError)"). A modern
+// request additionally carries `_meta`, unwrapped separately by requestEra
+// via requestParamsMeta — Params here only needs the tool-call-specific
+// fields.
+type toolCallParams struct {
+	Name      string          `json:"name"`
+	Arguments json.RawMessage `json:"arguments"`
+}
+
+// modernToolCallResult is the result of a tools/call request made under the
+// modern revision: same content/isError data as the legacy ToolResult, but
+// wrapped in the modern envelope. Unlike modernToolsListResult, this does
+// NOT carry ttlMs/cacheScope: a tool call is an action with side effects,
+// not a value the 2026-07-28 CacheableResult interface applies to — that
+// interface (and its required caching fields) is opt-in per result type,
+// and tools/call's result never opted in. resultType alone is what every
+// modern result carries.
+type modernToolCallResult struct {
+	ResultType string       `json:"resultType"`
+	Content    []Content    `json:"content"`
+	IsError    bool         `json:"isError,omitempty"`
+	Meta       responseMeta `json:"_meta"`
+}
