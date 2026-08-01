@@ -240,6 +240,45 @@ func (s *Server) dispatch(ctx context.Context, req Request) (Response, bool) {
 		}
 		return reply(toolsListResult{Tools: s.ts.Tools()}, nil)
 
+	case "tools/call":
+		meta, rpcErr := requestEra(req.Params)
+		if rpcErr != nil {
+			return reply(nil, rpcErr)
+		}
+		var params toolCallParams
+		if err := json.Unmarshal(req.Params, &params); err != nil {
+			return reply(nil, &RPCError{
+				Code:    CodeInvalidParams,
+				Message: fmt.Sprintf("invalid params: %v", err),
+			})
+		}
+		if params.Name == "" {
+			return reply(nil, &RPCError{
+				Code:    CodeInvalidParams,
+				Message: "missing required param: name",
+			})
+		}
+		result, err := s.ts.Call(ctx, params.Name, params.Arguments)
+		if err != nil {
+			// A non-nil error from Call is reserved for "this is not a real
+			// tool" (or another protocol-level fault) — never a user-level
+			// operational failure, which comes back as an ErrorResult
+			// instead and is handled below like any other tool result.
+			return reply(nil, &RPCError{
+				Code:    CodeInvalidParams,
+				Message: err.Error(),
+			})
+		}
+		if meta != nil {
+			return reply(modernToolCallResult{
+				ResultType: "complete",
+				Content:    result.Content,
+				IsError:    result.IsError,
+				Meta:       newResponseMeta(),
+			}, nil)
+		}
+		return reply(result, nil)
+
 	default:
 		// Still classify unrecognized methods by era: a modern request
 		// naming an unsupported protocol version gets

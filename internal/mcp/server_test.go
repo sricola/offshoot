@@ -4,6 +4,7 @@ import (
 	"bytes"
 	"context"
 	"encoding/json"
+	"fmt"
 	"io"
 	"strings"
 	"testing"
@@ -23,6 +24,9 @@ func (f *fakeTools) Tools() []Tool {
 
 func (f *fakeTools) Call(ctx context.Context, name string, args json.RawMessage) (ToolResult, error) {
 	f.called = name
+	if name == "unknown_tool" {
+		return ToolResult{}, fmt.Errorf("mcp: unknown tool %q", name)
+	}
 	return TextResult("called %s", name), nil
 }
 
@@ -221,6 +225,79 @@ func TestModernClientFullFlow(t *testing.T) {
 	tools, ok := lres["tools"].([]any)
 	if !ok || len(tools) != 1 {
 		t.Fatalf("tools = %v", lres["tools"])
+	}
+}
+
+// TestLegacyToolsCallDispatch pins tools/call under the legacy (2025-11-25)
+// era: the result is the bare ToolResult envelope (content/isError), with
+// none of the modern era's resultType/_meta wrapper.
+func TestLegacyToolsCallDispatch(t *testing.T) {
+	got := run(t, `{"jsonrpc":"2.0","id":1,"method":"tools/call","params":{"name":"ping_tool","arguments":{}}}`)
+	if len(got) != 1 || got[0]["error"] != nil {
+		t.Fatalf("tools/call: %v", got)
+	}
+	res := got[0]["result"].(map[string]any)
+	if _, ok := res["resultType"]; ok {
+		t.Errorf("legacy tools/call result must not carry the modern resultType envelope: %v", res)
+	}
+	content, ok := res["content"].([]any)
+	if !ok || len(content) != 1 {
+		t.Fatalf("content = %v", res["content"])
+	}
+	block := content[0].(map[string]any)
+	if block["text"] != "called ping_tool" {
+		t.Errorf("content text = %v", block["text"])
+	}
+}
+
+// TestModernToolsCallDispatch covers tools/call under the modern
+// (2026-07-28) era: the result must carry resultType and serverInfo _meta,
+// same as every other modern result, but — unlike tools/list — no
+// ttlMs/cacheScope: a tool call is an action, not a cacheable value.
+func TestModernToolsCallDispatch(t *testing.T) {
+	req := `{"jsonrpc":"2.0","id":1,"method":"tools/call","params":{"name":"ping_tool","arguments":{},"_meta":{"io.modelcontextprotocol/protocolVersion":"2026-07-28","io.modelcontextprotocol/clientCapabilities":{}}}}`
+	got := run(t, req)
+	if len(got) != 1 || got[0]["error"] != nil {
+		t.Fatalf("tools/call: %v", got)
+	}
+	res := got[0]["result"].(map[string]any)
+	if res["resultType"] != "complete" {
+		t.Errorf("tools/call resultType = %v, want complete", res["resultType"])
+	}
+	if _, ok := res["ttlMs"]; ok {
+		t.Errorf("tools/call is not cacheable; must not carry ttlMs: %v", res)
+	}
+	if _, ok := res["cacheScope"]; ok {
+		t.Errorf("tools/call is not cacheable; must not carry cacheScope: %v", res)
+	}
+	meta, ok := res["_meta"].(map[string]any)
+	if !ok {
+		t.Fatalf("tools/call result missing _meta: %v", res)
+	}
+	if si, ok := meta["io.modelcontextprotocol/serverInfo"].(map[string]any); !ok || si["name"] != "offshoot" {
+		t.Errorf("serverInfo = %v", meta["io.modelcontextprotocol/serverInfo"])
+	}
+	content, ok := res["content"].([]any)
+	if !ok || len(content) != 1 {
+		t.Fatalf("content = %v", res["content"])
+	}
+}
+
+// TestUnknownToolIsInvalidParamsRPCError covers the boundary the brief
+// draws: a user-level tool failure (bad args, no such checkpoint) comes
+// back as an ErrorResult, but an unknown tool name is not a real tool at
+// all — that's a protocol fault, surfaced as an RPC error (CodeInvalidParams).
+func TestUnknownToolIsInvalidParamsRPCError(t *testing.T) {
+	got := run(t, `{"jsonrpc":"2.0","id":1,"method":"tools/call","params":{"name":"unknown_tool","arguments":{}}}`)
+	if len(got) != 1 {
+		t.Fatalf("want 1 response, got %v", got)
+	}
+	e, ok := got[0]["error"].(map[string]any)
+	if !ok {
+		t.Fatalf("want an error response, got %v", got[0])
+	}
+	if int(e["code"].(float64)) != CodeInvalidParams {
+		t.Errorf("code = %v, want %d", e["code"], CodeInvalidParams)
 	}
 }
 
