@@ -137,9 +137,10 @@ func (t *OffshootTools) Tools() []Tool {
 		{
 			Name: "offshoot_promote",
 			Description: "Ship a winning attempt: repoint the target branch (often `main`) " +
-				"at the source branch's current head. Call this once you've validated " +
-				"a forked attempt and are ready to make it the branch of record. " +
-				"Protected branches (main is protected by default) refuse promotion " +
+				"at the source branch's current head, which resets the target's " +
+				"checkpoint history to just the new promote checkpoint. Call this once " +
+				"you've validated a forked attempt and are ready to make it the branch " +
+				"of record. Protected branches (main is protected by default) refuse promotion " +
 				"unless `force` is set — treat that refusal as confirmation you need, " +
 				"not a bug.",
 			InputSchema: schema(reqStr("database"), reqStr("source"), reqStr("target"), optBool("force")),
@@ -267,8 +268,9 @@ func (t *OffshootTools) checkout(args json.RawMessage) (ToolResult, error) {
 	msg += "\nthis checkout is not yet checkpointed: nothing written here can be rolled " +
 		"back to or forked from until you call offshoot_checkpoint"
 	if socket, serr := daemon.DefaultSocketPath(t.spec); serr == nil && daemon.Running(socket) {
-		msg += "\na daemon is running for this store; prefer a session-based connection " +
-			"over repeated checkouts if your client supports one"
+		msg += "\na daemon is running for this store, but no MCP tool currently opens a " +
+			"session against it; checkouts like this one are how you work with this " +
+			"branch from here"
 	}
 	return TextResult("%s", msg), nil
 }

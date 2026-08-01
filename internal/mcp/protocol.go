@@ -260,3 +260,14 @@ type modernToolCallResult struct {
 	IsError    bool         `json:"isError,omitempty"`
 	Meta       responseMeta `json:"_meta"`
 }
+
+// modernPingResult is the result of a ping request made under the modern
+// revision: just the resultType/_meta envelope. Like tools/call and unlike
+// tools/list and server/discover, ping is not in the 2026-07-28 spec's
+// CacheableResult interface's list of cacheable operations — a ping answer
+// has no value to cache, it's a liveness check — so this does NOT carry
+// ttlMs/cacheScope.
+type modernPingResult struct {
+	ResultType string       `json:"resultType"`
+	Meta       responseMeta `json:"_meta"`
+}
