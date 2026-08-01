@@ -334,3 +334,85 @@ func TestToolSchemaTypesMatchArgStructs(t *testing.T) {
 		}
 	}
 }
+
+// --- Task 5: hostile-MCP-client adversarial pass ---
+
+// TestToolsRejectPathEscapingNames is the brief's compact version of
+// TestToolsRejectEscapingNames above: a broader sweep of malformed names
+// (traversal, embedded slash, bare "." / "..", uppercase, and empty)
+// across offshoot_checkout's database and offshoot_fork's new_branch.
+// Every case except the empty string is caught by store.ValidateName inside
+// validateNames (the empty database is caught one line earlier, by
+// checkout's own `a.Database == ""` guard) — see the note in the report
+// about that one incidental pass, and
+// TestToolsRejectPathEscapingNamesViaHandlerNotPreCheck below for the
+// strengthened version that removes it.
+func TestToolsRejectPathEscapingNames(t *testing.T) {
+	ts, _ := newTools(t)
+	for _, bad := range []string{"../etc", "a/b", "..", ".", "UPPER", ""} {
+		r := call(t, ts, "offshoot_checkout", map[string]any{"database": bad})
+		if !r.IsError {
+			t.Errorf("database %q must be refused", bad)
+		}
+	}
+	for _, bad := range []string{"../x", "a/b", ".."} {
+		r := call(t, ts, "offshoot_fork", map[string]any{
+			"database": "app", "new_branch": bad})
+		if !r.IsError {
+			t.Errorf("branch %q must be refused", bad)
+		}
+	}
+}
+
+// TestToolsRejectPathEscapingNamesViaHandlerNotPreCheck strengthens
+// TestToolsRejectPathEscapingNames above for the one case that would
+// otherwise pass vacuously: an empty database string is refused by
+// checkout's own `a.Database == ""` guard before validateNames (and
+// store.ValidateName) ever runs, so that sub-case alone doesn't prove the
+// handler's name-validation gate works. Every value used here is non-empty
+// and reaches validateNames; each is rejected solely by store.ValidateName's
+// rules (charset, "..", bare "."), which is the actual gate a hostile name
+// must pass to reach ops.
+func TestToolsRejectPathEscapingNamesViaHandlerNotPreCheck(t *testing.T) {
+	ts, _ := newTools(t)
+	for _, bad := range []string{"../etc", "a/b", "..", ".", "UPPER", "sp ace", "trailing/"} {
+		r := call(t, ts, "offshoot_checkout", map[string]any{"database": bad})
+		if !r.IsError {
+			t.Errorf("database %q must be refused by validateNames", bad)
+		}
+	}
+	for _, bad := range []string{"../x", "a/b", "..", "UPPER"} {
+		r := call(t, ts, "offshoot_fork", map[string]any{
+			"database": "app", "new_branch": bad})
+		if !r.IsError {
+			t.Errorf("new_branch %q must be refused by validateNames", bad)
+		}
+	}
+}
+
+func TestDestroyProtectedMainRequiresForce(t *testing.T) {
+	ts, _ := newTools(t)
+	r := call(t, ts, "offshoot_destroy", map[string]any{"database": "app", "branch": "main"})
+	if !r.IsError {
+		t.Fatal("an agent must not be able to destroy protected main without force")
+	}
+	if !strings.Contains(strings.ToLower(text(r)), "protected") {
+		t.Fatalf("refusal should say why: %s", text(r))
+	}
+}
+
+func TestToolResultNeverClaimsUndeliveredDurability(t *testing.T) {
+	ts, _ := newTools(t)
+	co := call(t, ts, "offshoot_checkout", map[string]any{"database": "app"})
+	path := strings.TrimSpace(lastPath(text(co)))
+	if out, err := exec.Command("sqlite3", path,
+		"CREATE TABLE t (v); INSERT INTO t VALUES (1);").CombinedOutput(); err != nil {
+		t.Fatalf("%v: %s", err, out)
+	}
+	// checkout's result must not tell the agent the write is saved — nothing
+	// has been checkpointed yet.
+	low := strings.ToLower(text(co))
+	if strings.Contains(low, "durable") || strings.Contains(low, "saved") {
+		t.Fatalf("checkout must not imply durability: %s", text(co))
+	}
+}
