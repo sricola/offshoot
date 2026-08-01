@@ -15,6 +15,7 @@
 - Module `github.com/offshoot-db/offshoot`; Go 1.24+; cgo (mattn); Linux/macOS only
 - **No new module dependencies** — the MCP server is stdlib-only over the existing internal packages
 - MCP transport is stdio, one JSON-RPC 2.0 message per line, requests and responses framed as newline-delimited JSON; the server MUST NOT write anything but protocol messages to stdout (diagnostics go to stderr — a stray print corrupts the session)
+- **Dual protocol support (decided 2026-08-01):** the server speaks BOTH the legacy `initialize`/`tools/list` handshake (2025-11-25) and the current 2026-07-28 revision (per-request `_meta` versioning, `server/discover`); a client on either is served correctly
 - **Protocol details must be verified, not assumed:** the implementer checks the current MCP specification for exact method names, the `initialize` result shape, and the `tools/list`/`tools/call` payloads rather than trusting the plan's sketch; deviations are recorded in the report
 - Destructive tools (`destroy`, `promote`) honor the protected-branch rules already in `ops` — no tool may bypass a `--force` gate the CLI enforces
 - Every tool result reports what actually happened, including the durability state where relevant; never claim a write is durable when it is only committed to SQLite

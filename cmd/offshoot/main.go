@@ -11,6 +11,7 @@ import (
 	"time"
 
 	"github.com/offshoot-db/offshoot/internal/daemon"
+	"github.com/offshoot-db/offshoot/internal/mcp"
 	"github.com/offshoot-db/offshoot/internal/ops"
 	"github.com/offshoot-db/offshoot/internal/store"
 )
@@ -33,6 +34,7 @@ Usage:
   offshoot lease acquire <db>[@branch] [--ttl 30s]   claim or renew a lease
   offshoot lease release <db>[@branch]      release a lease
   offshoot serve [-socket PATH]             run the daemon until SIGINT/SIGTERM
+  offshoot mcp                              serve the MCP tool set on stdio for an agent
   offshoot session open <db>[@branch] [-socket PATH]      open a session; prints the checkout path
   offshoot session flush <db>[@branch] [name] [-socket PATH]   flush to a durable snapshot; prints the txid
   offshoot session status [-socket PATH]                  list open sessions and their durable txid
@@ -345,6 +347,13 @@ func run(args []string) error {
 		default:
 			return fmt.Errorf("unknown lease subcommand %q", rest[0])
 		}
+	case "mcp":
+		if len(rest) != 0 {
+			return fmt.Errorf("usage: offshoot mcp")
+		}
+		ts := mcp.NewOffshootTools(w, spec)
+		srv := mcp.NewServer(os.Stdin, os.Stdout, ts)
+		return srv.Serve(context.Background())
 	case "serve":
 		sock, rest, err := socketOverride(rest)
 		if err != nil {

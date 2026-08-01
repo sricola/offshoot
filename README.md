@@ -19,6 +19,11 @@ Requires Go 1.24+, cgo, and the `sqlite3` CLI for tests. Linux and macOS only.
     ./offshoot promote app@attempt-1 --onto main --force               # or ship it
     ./offshoot status
 
+Runnable demo: [`examples/parallel-attempts/`](examples/parallel-attempts/)
+forks a database three ways, races three migrations against the forks,
+promotes the one that's actually correct, and discards the other two —
+`./examples/parallel-attempts/run.sh`.
+
 Plan-2 (local mode) notes: checkpoints are full snapshots; checkout paths are
 fixed at `<store>/checkouts/{db}/{branch}.db`; operations require the
 checkout to be quiescent (no live writers). Daemon mode with live capture,
@@ -117,3 +122,19 @@ SQLite file both processes open.
 
 Design: docs/superpowers/specs/2026-07-29-offshoot-design.md
 Capture-spike evidence: docs/superpowers/specs/2026-07-29-offshoot-spike-report.md
+
+## Agent integration (MCP)
+
+`offshoot mcp` speaks the Model Context Protocol on stdio, so an agent can
+branch on its own initiative instead of asking you to run commands:
+
+    claude mcp add offshoot -- offshoot -store ./.offshoot mcp
+
+The agent gets seven tools — list, checkout, checkpoint, fork, rollback,
+promote, destroy — described so it knows *when* to use them: fork before a
+risky migration, checkpoint when tests pass, roll back when they don't,
+promote the attempt that worked.
+
+Destructive tools respect the same protected-branch rules as the CLI: an agent
+can fork and experiment freely, but promoting onto or destroying `main`
+requires an explicit force, and the refusal tells the agent so.
