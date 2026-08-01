@@ -19,9 +19,8 @@ type OffshootTools struct {
 }
 
 // NewOffshootTools binds a tool set to a workspace and store spec. The spec
-// is used to find a running daemon for session tools (offshoot_checkout
-// reports whether one is running, so the agent knows to prefer a session
-// once Plan 8's SDKs add them).
+// is used to detect a running daemon; offshoot_checkout reports whether one
+// is running for this store.
 func NewOffshootTools(ws *ops.Workspace, spec string) *OffshootTools {
 	return &OffshootTools{ws: ws, spec: spec}
 }
@@ -98,10 +97,10 @@ func (t *OffshootTools) Tools() []Tool {
 			Description: "Materialize a database branch to a local SQLite file and return " +
 				"the path to open. Call this before reading or writing a branch's data " +
 				"directly with a SQL client. If a daemon is running for this store, the " +
-				"result says so — prefer a session-based connection over repeated " +
-				"one-shot checkouts when one is available, since it holds a lease and " +
-				"streams writes incrementally instead of full-snapshotting. `branch` " +
-				"defaults to \"main\" if omitted.",
+				"result says so — checkouts like this one are how you work with this " +
+				"branch from here. Call offshoot_checkpoint to name the current state so " +
+				"it can be rolled back to or forked from later. `branch` defaults to " +
+				"\"main\" if omitted.",
 			InputSchema: schema(reqStr("database"), optStrDefault("branch", "main")),
 		},
 		{
