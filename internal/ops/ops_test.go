@@ -1270,3 +1270,111 @@ func TestCheckpointAfterEpochBumpIsMaterializable(t *testing.T) {
 		t.Fatalf("fork --at v1 (pre-bump checkpoint) after later checkpoint: %v", err)
 	}
 }
+
+// TestOpsRejectEscapingNames pins the fix for the MCP-facing path-traversal
+// finding: Checkout, Checkpoint, Rollback, Promote, and Destroy must reject
+// every db/branch/checkpoint-name argument that fails store.ValidateName
+// BEFORE touching the filesystem, exactly as ops.ParseTarget already gates
+// the CLI. Without this, an agent-supplied name (the MCP tools pass
+// database/branch straight from JSON, with no ParseTarget in between) flows
+// straight into Workspace.CheckoutPath's bare filepath.Join ahead of a real
+// os.MkdirAll/materialize/os.Remove.
+func TestOpsRejectEscapingNames(t *testing.T) {
+	badNames := []string{"../x", "a/b", "..", ".", "UPPER", ""}
+
+	setup := func(t *testing.T) *Workspace {
+		t.Helper()
+		w := newWS(t)
+		if err := w.Create("app"); err != nil {
+			t.Fatal(err)
+		}
+		if _, err := w.Checkout("app", "main"); err != nil {
+			t.Fatal(err)
+		}
+		if _, err := w.Checkpoint("app", "main", "v1"); err != nil {
+			t.Fatal(err)
+		}
+		return w
+	}
+
+	assertRejected := func(t *testing.T, err error, label string) {
+		t.Helper()
+		if err == nil {
+			t.Fatalf("%s: want a validation error, got nil", label)
+		}
+		if !strings.Contains(err.Error(), "invalid name") {
+			t.Fatalf("%s: want a store.ValidateName rejection, got: %v", label, err)
+		}
+	}
+
+	for _, bad := range badNames {
+		label := bad
+		if label == "" {
+			label = "<empty>"
+		}
+		label = strings.ReplaceAll(label, "/", "_")
+
+		t.Run("Checkout/db="+label, func(t *testing.T) {
+			w := setup(t)
+			_, err := w.Checkout(bad, "main")
+			assertRejected(t, err, "Checkout db")
+		})
+		t.Run("Checkout/branch="+label, func(t *testing.T) {
+			w := setup(t)
+			_, err := w.Checkout("app", bad)
+			assertRejected(t, err, "Checkout branch")
+		})
+
+		t.Run("Checkpoint/db="+label, func(t *testing.T) {
+			w := setup(t)
+			_, err := w.Checkpoint(bad, "main", "v2")
+			assertRejected(t, err, "Checkpoint db")
+		})
+		t.Run("Checkpoint/branch="+label, func(t *testing.T) {
+			w := setup(t)
+			_, err := w.Checkpoint("app", bad, "v2")
+			assertRejected(t, err, "Checkpoint branch")
+		})
+		t.Run("Checkpoint/name="+label, func(t *testing.T) {
+			w := setup(t)
+			_, err := w.Checkpoint("app", "main", bad)
+			assertRejected(t, err, "Checkpoint name")
+		})
+
+		t.Run("Rollback/db="+label, func(t *testing.T) {
+			w := setup(t)
+			_, err := w.Rollback(bad, "main", "v1")
+			assertRejected(t, err, "Rollback db")
+		})
+		t.Run("Rollback/branch="+label, func(t *testing.T) {
+			w := setup(t)
+			_, err := w.Rollback("app", bad, "v1")
+			assertRejected(t, err, "Rollback branch")
+		})
+		t.Run("Rollback/to="+label, func(t *testing.T) {
+			w := setup(t)
+			_, err := w.Rollback("app", "main", bad)
+			assertRejected(t, err, "Rollback to")
+		})
+
+		t.Run("Promote/db="+label, func(t *testing.T) {
+			w := setup(t)
+			if err := w.Create("target"); err != nil {
+				t.Fatal(err)
+			}
+			_, err := w.Promote(bad, "main", "target", true)
+			assertRejected(t, err, "Promote db")
+		})
+
+		t.Run("Destroy/db="+label, func(t *testing.T) {
+			w := setup(t)
+			err := w.Destroy(bad, "main", true)
+			assertRejected(t, err, "Destroy db")
+		})
+		t.Run("Destroy/branch="+label, func(t *testing.T) {
+			w := setup(t)
+			err := w.Destroy("app", bad, true)
+			assertRejected(t, err, "Destroy branch")
+		})
+	}
+}
