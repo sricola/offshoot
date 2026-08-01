@@ -6,6 +6,7 @@ import (
 	"encoding/json"
 	"fmt"
 	"io"
+	"strconv"
 	"strings"
 	"testing"
 	"time"
@@ -414,5 +415,175 @@ func TestServeCancelsPromptlyOnBlockedRead(t *testing.T) {
 		}
 	case <-time.After(2 * time.Second):
 		t.Fatal("Serve did not return promptly after ctx was cancelled while a read was blocked")
+	}
+}
+
+// --- Task 5: hostile-MCP-client adversarial pass ---
+
+// TestOversizedAndWeirdInputDoesNotBreakTheStream covers a large-but-under-
+// the-hard-cap tools/call argument (200KB, well past bufio.Scanner's old
+// 64KB default but nowhere near maxLineSize): it must be parsed and served
+// normally, and the connection must remain usable afterward. The over-cap
+// case (a line past maxLineSize) is covered separately by
+// TestOversizedLineGetsErrorAndServerContinues.
+func TestOversizedAndWeirdInputDoesNotBreakTheStream(t *testing.T) {
+	huge := `{"jsonrpc":"2.0","id":1,"method":"tools/call","params":{"name":"ping_tool","arguments":{"blob":"` +
+		strings.Repeat("x", 200_000) + `"}}}`
+	got := run(t,
+		huge,
+		`{"jsonrpc":"2.0","id":2,"method":"tools/list"}`)
+	if len(got) != 2 {
+		t.Fatalf("want 2 responses, got %d", len(got))
+	}
+	if got[1]["error"] != nil {
+		t.Fatalf("server must still serve after a large message: %v", got[1])
+	}
+}
+
+// TestOversizedAndWeirdInputDoesNotBreakTheStreamModernEra is the brief's
+// large-argument case replayed on the 2026-07-28 per-request _meta path.
+// The brief's own test only exercises the legacy handshake-based era;
+// requestEra's classification and the modern envelope construction are
+// separate code paths that a large-but-legal message could just as easily
+// trip up (e.g. by mis-sizing a buffer before the _meta envelope is even
+// unwrapped), so the same input is replayed here under modern framing.
+func TestOversizedAndWeirdInputDoesNotBreakTheStreamModernEra(t *testing.T) {
+	meta := `"_meta":{"io.modelcontextprotocol/protocolVersion":"2026-07-28","io.modelcontextprotocol/clientCapabilities":{}}`
+	huge := `{"jsonrpc":"2.0","id":1,"method":"tools/call","params":{"name":"ping_tool","arguments":{"blob":"` +
+		strings.Repeat("x", 200_000) + `"},` + meta + `}}`
+	list := `{"jsonrpc":"2.0","id":2,"method":"tools/list","params":{` + meta + `}}`
+	got := run(t, huge, list)
+	if len(got) != 2 {
+		t.Fatalf("want 2 responses, got %d", len(got))
+	}
+	if got[0]["error"] != nil {
+		t.Fatalf("modern tools/call must handle a large argument: %v", got[0])
+	}
+	if res, ok := got[0]["result"].(map[string]any); !ok || res["resultType"] != "complete" {
+		t.Fatalf("modern tools/call result malformed after a large argument: %v", got[0])
+	}
+	if got[1]["error"] != nil {
+		t.Fatalf("server must still serve after a large message: %v", got[1])
+	}
+}
+
+func TestBatchOfRequestsEachGetsExactlyOneResponse(t *testing.T) {
+	var lines []string
+	for i := 0; i < 50; i++ {
+		lines = append(lines, `{"jsonrpc":"2.0","id":`+strconv.Itoa(i)+`,"method":"tools/list"}`)
+	}
+	got := run(t, lines...)
+	if len(got) != 50 {
+		t.Fatalf("want 50 responses, got %d", len(got))
+	}
+	seen := map[float64]bool{}
+	for _, r := range got {
+		id := r["id"].(float64)
+		if seen[id] {
+			t.Fatalf("duplicate response for id %v", id)
+		}
+		seen[id] = true
+	}
+}
+
+// TestBatchMixingErasEachGetsExactlyOneCorrectlyShapedResponse hardens the
+// brief's batch test across both protocol eras: since requestEra classifies
+// each request independently (the server is stateless per request, not per
+// connection — see server.go's package doc and requestEra), a hostile or
+// merely confused client can interleave legacy and modern requests on one
+// connection. Each response must still be unique and shaped for its own
+// request's era, with no leakage from the previous line's classification.
+func TestBatchMixingErasEachGetsExactlyOneCorrectlyShapedResponse(t *testing.T) {
+	meta := `"_meta":{"io.modelcontextprotocol/protocolVersion":"2026-07-28","io.modelcontextprotocol/clientCapabilities":{}}`
+	var lines []string
+	wantModern := map[int]bool{}
+	for i := 0; i < 50; i++ {
+		id := strconv.Itoa(i)
+		if i%2 == 0 {
+			lines = append(lines, `{"jsonrpc":"2.0","id":`+id+`,"method":"tools/list"}`)
+			wantModern[i] = false
+		} else {
+			lines = append(lines, `{"jsonrpc":"2.0","id":`+id+`,"method":"tools/list","params":{`+meta+`}}`)
+			wantModern[i] = true
+		}
+	}
+	got := run(t, lines...)
+	if len(got) != 50 {
+		t.Fatalf("want 50 responses, got %d", len(got))
+	}
+	seen := map[float64]bool{}
+	for _, r := range got {
+		if r["error"] != nil {
+			t.Fatalf("unexpected error in mixed-era batch: %v", r)
+		}
+		id := r["id"].(float64)
+		if seen[id] {
+			t.Fatalf("duplicate response for id %v", id)
+		}
+		seen[id] = true
+		res, ok := r["result"].(map[string]any)
+		if !ok {
+			t.Fatalf("id %v: missing result: %v", id, r)
+		}
+		_, isModern := res["resultType"]
+		if want := wantModern[int(id)]; isModern != want {
+			t.Fatalf("id %v: resultType present=%v, want era-appropriate=%v: %v", id, isModern, want, res)
+		}
+	}
+}
+
+func TestMissingParamsIsHandledNotPanicked(t *testing.T) {
+	got := run(t,
+		`{"jsonrpc":"2.0","id":1,"method":"tools/call"}`,
+		`{"jsonrpc":"2.0","id":2,"method":"tools/call","params":{"name":"ping_tool"}}`,
+		`{"jsonrpc":"2.0","id":3,"method":"tools/list"}`)
+	if len(got) != 3 {
+		t.Fatalf("want 3 responses, got %d: %v", len(got), got)
+	}
+	if got[2]["error"] != nil {
+		t.Fatalf("server must survive malformed calls: %v", got[2])
+	}
+}
+
+// TestMissingParamsIsHandledNotPanickedModernEra replays the brief's
+// missing-params case under the modern era: a tools/call whose _meta is
+// present and valid (so it takes the modern branch through dispatch) but
+// whose name is absent must not panic, and the connection must remain
+// usable for a subsequent legitimate modern request.
+func TestMissingParamsIsHandledNotPanickedModernEra(t *testing.T) {
+	meta := `"_meta":{"io.modelcontextprotocol/protocolVersion":"2026-07-28","io.modelcontextprotocol/clientCapabilities":{}}`
+	got := run(t,
+		`{"jsonrpc":"2.0","id":1,"method":"tools/call","params":{`+meta+`}}`,
+		`{"jsonrpc":"2.0","id":2,"method":"tools/call","params":{"name":"ping_tool",`+meta+`}}`,
+		`{"jsonrpc":"2.0","id":3,"method":"tools/list","params":{`+meta+`}}`)
+	if len(got) != 3 {
+		t.Fatalf("want 3 responses, got %d: %v", len(got), got)
+	}
+	if got[0]["error"] == nil {
+		t.Fatalf("modern tools/call with no name must be a params error, not silently accepted: %v", got[0])
+	}
+	if got[2]["error"] != nil {
+		t.Fatalf("server must survive malformed modern calls: %v", got[2])
+	}
+}
+
+// TestUnknownMethodWithBadProtocolVersionPrefersVersionError covers a
+// hostile client that names both a garbage method and an unsupported modern
+// protocol version in the same request. dispatch's default-case comment
+// documents that the version mismatch should win over "method not found"
+// (it's the more actionable diagnostic), but until this test that branch
+// was documented, not verified.
+func TestUnknownMethodWithBadProtocolVersionPrefersVersionError(t *testing.T) {
+	got := run(t, `{"jsonrpc":"2.0","id":1,"method":"no/such/method","params":{"_meta":{"io.modelcontextprotocol/protocolVersion":"1900-01-01","io.modelcontextprotocol/clientCapabilities":{}}}}`)
+	if len(got) != 1 {
+		t.Fatalf("want 1 response, got %v", got)
+	}
+	e, ok := got[0]["error"].(map[string]any)
+	if !ok {
+		t.Fatalf("want an error response, got %v", got[0])
+	}
+	if int(e["code"].(float64)) != CodeUnsupportedProtocolVersion {
+		t.Errorf("code = %v, want %d (version mismatch should win over method-not-found)",
+			e["code"], CodeUnsupportedProtocolVersion)
 	}
 }
