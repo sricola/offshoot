@@ -218,6 +218,8 @@ func (s *Server) dispatch(ctx context.Context, req Request) (Response, bool) {
 			ResultType:        "complete",
 			SupportedVersions: []string{modernProtocolVersion, legacyProtocolVersion},
 			Capabilities:      serverCapabilities{Tools: toolsCapability{}},
+			TTLMs:             toolsListTTLMs,
+			CacheScope:        "public",
 			Meta:              newResponseMeta(),
 			Instructions:      "offshoot MCP server: fork before risky work, checkpoint on success, roll back on failure.",
 		}, nil)

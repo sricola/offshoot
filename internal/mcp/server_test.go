@@ -194,6 +194,12 @@ func TestModernClientFullFlow(t *testing.T) {
 	if !ok || len(supported) != 2 {
 		t.Fatalf("discover supportedVersions = %v", dres["supportedVersions"])
 	}
+	if dres["cacheScope"] != "public" {
+		t.Errorf("discover cacheScope = %v, want public", dres["cacheScope"])
+	}
+	if ttl, ok := dres["ttlMs"].(float64); !ok || ttl <= 0 {
+		t.Errorf("discover ttlMs = %v, want a positive freshness hint", dres["ttlMs"])
+	}
 	dmeta, ok := dres["_meta"].(map[string]any)
 	if !ok {
 		t.Fatalf("discover result missing _meta: %v", dres)
