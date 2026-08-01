@@ -19,6 +19,11 @@ Requires Go 1.24+, cgo, and the `sqlite3` CLI for tests. Linux and macOS only.
     ./offshoot promote app@attempt-1 --onto main --force               # or ship it
     ./offshoot status
 
+Runnable demo: [`examples/parallel-attempts/`](examples/parallel-attempts/)
+forks a database three ways, races three migrations against the forks,
+promotes the one that's actually correct, and discards the other two —
+`./examples/parallel-attempts/run.sh`.
+
 Plan-2 (local mode) notes: checkpoints are full snapshots; checkout paths are
 fixed at `<store>/checkouts/{db}/{branch}.db`; operations require the
 checkout to be quiescent (no live writers). Daemon mode with live capture,
