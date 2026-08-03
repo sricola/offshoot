@@ -240,6 +240,26 @@ func ParseMemberKey(key string) (ChainMember, bool) {
 	}
 }
 
+// keepHighestEpoch collapses members covering an identical TXID range down to
+// the one written under the highest epoch. A lower-epoch duplicate is an
+// orphan left by a writer that was fenced before its ref write landed, so it
+// must never be chosen — see the fencing note in Chain.
+func keepHighestEpoch(members []ChainMember) []ChainMember {
+	type rng struct{ min, max uint64 }
+	best := make(map[rng]ChainMember, len(members))
+	for _, m := range members {
+		k := rng{m.MinTXID, m.MaxTXID}
+		if cur, ok := best[k]; !ok || m.Epoch > cur.Epoch {
+			best[k] = m
+		}
+	}
+	out := make([]ChainMember, 0, len(best))
+	for _, m := range best {
+		out = append(out, m)
+	}
+	return out
+}
+
 // Chain returns the members needed to materialize lineage at target: the
 // newest snapshot with MaxTXID <= target, followed by every segment after it
 // up to target, in apply order. It returns an error when no snapshot covers
@@ -267,6 +287,17 @@ func (s *Store) Chain(lineage string, target uint64) ([]ChainMember, error) {
 			segments = append(segments, m)
 		}
 	}
+	// Two members can cover the same TXID range under different epochs: a
+	// writer uploads its object, loses the ref CAS, and is fenced, leaving an
+	// orphan; because HeadTXID only advances on a *successful* ref write, the
+	// next holder writes the same TXID under its own, higher epoch. Epochs
+	// only ever increase, so the live object is always the higher-epoch one
+	// and the lower-epoch one is by definition the superseded writer's.
+	// Keeping only the highest epoch per range is what makes Plan 4's fencing
+	// guarantee hold on this read path — otherwise a fenced writer's data
+	// could be materialized.
+	snapshots = keepHighestEpoch(snapshots)
+	segments = keepHighestEpoch(segments)
 	// List sorts lexically on the full key, which only sorts by TXID within
 	// a single epoch directory (the epoch path segment isn't zero-padded, so
 	// e.g. epoch 10 would sort before epoch 2). A chain can span epochs, so
