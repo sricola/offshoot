@@ -81,8 +81,6 @@ func EncodeSnapshot(dbPath string, txid uint64, w io.Writer) error {
 // trailer checksum. On any error the destination is left untouched (write to
 // temp file + rename). Returns the snapshot's MaxTXID.
 func Materialize(r io.Reader, dbPath string) (txid uint64, err error) {
-	dec := ltx.NewDecoder(r)
-
 	dir := filepath.Dir(dbPath)
 	tmp, err := os.CreateTemp(dir, filepath.Base(dbPath)+".tmp-*")
 	if err != nil {
@@ -96,27 +94,48 @@ func Materialize(r io.Reader, dbPath string) (txid uint64, err error) {
 		}
 	}()
 
-	// DecodeDatabaseTo decodes the header, streams every page (verifying the
-	// per-page checksum as it goes for snapshot files), and calls Close(),
-	// which verifies both the whole-file CRC64 checksum and the trailer's
-	// post-apply checksum. Any mismatch — including a mid-file bit flip —
-	// surfaces here before we ever touch dbPath.
-	if err = dec.DecodeDatabaseTo(tmp); err != nil {
-		return 0, fmt.Errorf("ltxio: decode snapshot: %w", err)
+	hdr, _, err := decodeSnapshot(r, tmp)
+	if err != nil {
+		return 0, err
 	}
 
-	if err = tmp.Sync(); err != nil {
+	if err = finalizeDestination(tmp, tmpPath, dbPath); err != nil {
 		return 0, err
 	}
-	if err = tmp.Close(); err != nil {
-		return 0, err
+	return uint64(hdr.MaxTXID), nil
+}
+
+// decodeSnapshot decodes a full-snapshot LTX from r into w (typically a temp
+// file destined to become the materialized database). DecodeDatabaseTo
+// streams every page (verifying the per-page checksum as it goes for
+// snapshot files) and calls Close(), which verifies both the whole-file
+// CRC64 checksum and the trailer's post-apply checksum. Any mismatch —
+// including a mid-file bit flip — surfaces here before the caller ever
+// touches its real destination. Returns the decoded header and trailer so
+// callers (e.g. MaterializeChain) can continue a chain from this state.
+func decodeSnapshot(r io.Reader, w io.Writer) (ltx.Header, ltx.Trailer, error) {
+	dec := ltx.NewDecoder(r)
+	if err := dec.DecodeDatabaseTo(w); err != nil {
+		return ltx.Header{}, ltx.Trailer{}, fmt.Errorf("ltxio: decode snapshot: %w", err)
 	}
-	if err = os.Rename(tmpPath, dbPath); err != nil {
-		return 0, err
+	return dec.Header(), dec.Trailer(), nil
+}
+
+// finalizeDestination syncs tmp, closes it, and renames it into place at
+// dbPath, then removes any stale -wal/-shm siblings. Called only once every
+// prior decode/verify step has succeeded, so a failure before this point
+// leaves dbPath untouched.
+func finalizeDestination(tmp *os.File, tmpPath, dbPath string) error {
+	if err := tmp.Sync(); err != nil {
+		return err
+	}
+	if err := tmp.Close(); err != nil {
+		return err
+	}
+	if err := os.Rename(tmpPath, dbPath); err != nil {
+		return err
 	}
 	os.Remove(dbPath + "-wal")
 	os.Remove(dbPath + "-shm")
-
-	h := dec.Header()
-	return uint64(h.MaxTXID), nil
+	return nil
 }
