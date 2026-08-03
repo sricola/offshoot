@@ -3,12 +3,15 @@ package ltxio
 import (
 	"bytes"
 	"database/sql"
+	"fmt"
 	"io"
 	"os"
 	"os/exec"
 	"path/filepath"
+	"strings"
 	"testing"
 
+	"github.com/superfly/ltx"
 	_ "github.com/mattn/go-sqlite3"
 )
 
@@ -235,4 +238,191 @@ func copyFileForTest(from, to string) error {
 		return err
 	}
 	return os.WriteFile(to, b, 0o644)
+}
+
+// diffPages returns the pages of after that are new or differ from before at
+// the same index — the same "changed pages" a caller would feed to
+// EncodeSegment when building a segment from a diff of two on-disk database
+// states. A shrinking after (fewer pages than before) naturally omits the
+// dropped trailing pages, since the loop only ranges over after; the
+// resulting segment's smaller Commit is what tells a reader those pages are
+// gone.
+func diffPages(before, after []Page) []Page {
+	var changed []Page
+	for i, p := range after {
+		if i >= len(before) || !bytes.Equal(p.Data, before[i].Data) {
+			changed = append(changed, p)
+		}
+	}
+	return changed
+}
+
+// insertManySQL returns n INSERT statements, each writing a blobSize-byte
+// blob, concatenated into one string suitable for a single sqlite3 CLI
+// invocation. Used to force a database to grow by several pages.
+func insertManySQL(n, blobSize int) string {
+	return strings.Repeat(fmt.Sprintf("INSERT INTO t (v) VALUES (randomblob(%d));", blobSize), n)
+}
+
+// TestUpdateChecksumMatchesFullRescan proves the incremental-update math
+// MaterializeChain relies on (UpdateChecksum, built on ChecksumPage) is
+// equivalent to ChecksumDatabase's O(database size) full rescan: given only
+// the "before" checksum and the pages that differ between two on-disk
+// states, folding each page's old contribution out and new contribution in
+// must land on exactly the same value as rescanning "after" from scratch.
+// Exercised across both a database growing (new trailing pages appear) and
+// shrinking (trailing pages are dropped), since those are the two cases
+// MaterializeChain's incremental checksum maintenance has to get right.
+func TestUpdateChecksumMatchesFullRescan(t *testing.T) {
+	if _, err := exec.LookPath("sqlite3"); err != nil {
+		t.Skip("sqlite3 CLI not on PATH")
+	}
+
+	assertIncrementalMatchesRescan := func(t *testing.T, before, after string) {
+		t.Helper()
+		oldChecksum := checksumOf(t, before)
+		pageSize, commitOld, pagesOld := readPages(t, before)
+		_, commitNew, pagesNew := readPages(t, after)
+		lockPgno := ltx.LockPgno(pageSize)
+
+		top := commitOld
+		if commitNew > top {
+			top = commitNew
+		}
+		running := oldChecksum
+		for pgno := uint32(1); pgno <= top; pgno++ {
+			if pgno == lockPgno {
+				continue
+			}
+			var oldData, newData []byte
+			if pgno <= commitOld {
+				oldData = pagesOld[pgno-1].Data
+			}
+			if pgno <= commitNew {
+				newData = pagesNew[pgno-1].Data
+			}
+			running = UpdateChecksum(running, pgno, oldData, newData)
+		}
+
+		want := checksumOf(t, after)
+		if running != want {
+			t.Fatalf("incremental checksum %016x != full rescan of %s: %016x", running, after, want)
+		}
+	}
+
+	v1 := buildDB(t, "CREATE TABLE t (id INTEGER PRIMARY KEY, v BLOB)",
+		"INSERT INTO t (v) VALUES (randomblob(50))")
+
+	// Growth: append enough rows to add several new trailing pages.
+	v2 := filepath.Join(t.TempDir(), "v2.sqlite")
+	if err := copyFileForTest(v1, v2); err != nil {
+		t.Fatal(err)
+	}
+	if out, err := exec.Command("sqlite3", v2,
+		insertManySQL(60, 300)+"PRAGMA wal_checkpoint(TRUNCATE);").CombinedOutput(); err != nil {
+		t.Fatalf("%v: %s", err, out)
+	}
+	_, c1, _ := readPages(t, v1)
+	_, c2, _ := readPages(t, v2)
+	if c2 <= c1 {
+		t.Fatalf("expected v2 (%d pages) to have more pages than v1 (%d)", c2, c1)
+	}
+	assertIncrementalMatchesRescan(t, v1, v2)
+
+	// Shrink: delete almost everything and VACUUM to drop trailing pages.
+	v3 := filepath.Join(t.TempDir(), "v3.sqlite")
+	if err := copyFileForTest(v2, v3); err != nil {
+		t.Fatal(err)
+	}
+	if out, err := exec.Command("sqlite3", v3,
+		"DELETE FROM t WHERE id > 1; VACUUM; PRAGMA wal_checkpoint(TRUNCATE);").CombinedOutput(); err != nil {
+		t.Fatalf("%v: %s", err, out)
+	}
+	_, c3, _ := readPages(t, v3)
+	if c3 >= c2 {
+		t.Fatalf("expected v3 (%d pages) to have fewer pages than v2 (%d)", c3, c2)
+	}
+	assertIncrementalMatchesRescan(t, v2, v3)
+}
+
+// TestMaterializeChainIncrementalChecksumMatchesFullRescan builds a chain
+// (snapshot, then a segment that grows the database, then a segment that
+// shrinks it) and materializes it. MaterializeChain verifies each segment's
+// incrementally-maintained checksum against that segment's declared
+// post-apply checksum internally and fails closed on a mismatch, so a
+// successful, correct-data materialization already demonstrates the
+// incremental path agrees with the full-rescan values used to build the
+// segments. This test also makes that explicit: it rescans the actual
+// materialized result with ChecksumDatabase and checks it against the last
+// segment's declared post-apply checksum.
+func TestMaterializeChainIncrementalChecksumMatchesFullRescan(t *testing.T) {
+	if _, err := exec.LookPath("sqlite3"); err != nil {
+		t.Skip("sqlite3 CLI not on PATH")
+	}
+
+	v1 := buildDB(t, "CREATE TABLE t (id INTEGER PRIMARY KEY, v BLOB)",
+		"INSERT INTO t (v) VALUES (randomblob(50))")
+	var snap bytes.Buffer
+	if err := EncodeSnapshot(v1, 1, &snap); err != nil {
+		t.Fatal(err)
+	}
+	_, commit0, before1 := readPages(t, v1)
+
+	// Segment 1 (txid 2): grow the database by several pages.
+	v2 := filepath.Join(t.TempDir(), "v2.sqlite")
+	if err := copyFileForTest(v1, v2); err != nil {
+		t.Fatal(err)
+	}
+	if out, err := exec.Command("sqlite3", v2,
+		insertManySQL(60, 300)+"PRAGMA wal_checkpoint(TRUNCATE);").CombinedOutput(); err != nil {
+		t.Fatalf("%v: %s", err, out)
+	}
+	pageSize, commit1, after1 := readPages(t, v2)
+	if commit1 <= commit0 {
+		t.Fatalf("expected v2 (%d pages) to have more pages than v1 (%d)", commit1, commit0)
+	}
+	pre1 := checksumOf(t, v1)
+	post1 := checksumOf(t, v2)
+	var seg1 bytes.Buffer
+	if err := EncodeSegment(pageSize, commit1, 2, 2, pre1, post1, diffPages(before1, after1), &seg1); err != nil {
+		t.Fatal(err)
+	}
+
+	// Segment 2 (txid 3): delete almost everything and VACUUM, shrinking the
+	// database back down.
+	v3 := filepath.Join(t.TempDir(), "v3.sqlite")
+	if err := copyFileForTest(v2, v3); err != nil {
+		t.Fatal(err)
+	}
+	if out, err := exec.Command("sqlite3", v3,
+		"DELETE FROM t WHERE id > 1; VACUUM; PRAGMA wal_checkpoint(TRUNCATE);").CombinedOutput(); err != nil {
+		t.Fatalf("%v: %s", err, out)
+	}
+	_, commit2, after2 := readPages(t, v3)
+	if commit2 >= commit1 {
+		t.Fatalf("expected v3 (%d pages) to have fewer pages than v2 (%d)", commit2, commit1)
+	}
+	pre2 := checksumOf(t, v2)
+	post2 := checksumOf(t, v3)
+	var seg2 bytes.Buffer
+	if err := EncodeSegment(pageSize, commit2, 3, 3, pre2, post2, diffPages(after1, after2), &seg2); err != nil {
+		t.Fatal(err)
+	}
+
+	out := filepath.Join(t.TempDir(), "rebuilt.sqlite")
+	txid, err := MaterializeChain(bytes.NewReader(snap.Bytes()),
+		[]io.Reader{bytes.NewReader(seg1.Bytes()), bytes.NewReader(seg2.Bytes())}, out)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if txid != 3 {
+		t.Errorf("txid = %d, want 3", txid)
+	}
+	if dumpOf(t, out) != dumpOf(t, v3) {
+		t.Fatal("snapshot+segments does not reproduce the later database")
+	}
+
+	if rescan := checksumOf(t, out); rescan != post2 {
+		t.Fatalf("full rescan of materialized result (%016x) != declared post-apply checksum (%016x)", rescan, post2)
+	}
 }

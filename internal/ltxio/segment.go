@@ -1,7 +1,6 @@
 package ltxio
 
 import (
-	"encoding/binary"
 	"fmt"
 	"io"
 	"os"
@@ -94,6 +93,19 @@ func EncodeSegment(pageSize, commit uint32, minTXID, maxTXID uint64, preApplyChe
 // a snapshot's post-apply checksum, and the value EncodeSegment's
 // preApplyChecksum/postApplyChecksum parameters expect. dbPath must have no
 // pending WAL (checkpoint(TRUNCATE) first).
+//
+// This is a full O(database size) scan, appropriate for a one-off checksum —
+// e.g. bootstrapping a chain from a database that arrived by some other
+// means. A caller that needs to keep a checksum current across many small
+// changes (one flush at a time, one segment at a time) should not call this
+// again after every change: that reduces to the O(N × database size) cost
+// this package exists to avoid. Maintain it incrementally instead with
+// ChecksumPage and UpdateChecksum.
+//
+// Like EncodeSnapshot (and the ltx decoder's own snapshot checksum
+// verification), this deliberately SKIPS the lock page — unlike the ltx
+// library's ltx.ChecksumReader, which includes it. The two conventions
+// produce different checksums for the same database; don't mix them.
 func ChecksumDatabase(dbPath string) (uint64, error) {
 	if fi, err := os.Stat(dbPath + "-wal"); err == nil && fi.Size() > 0 {
 		return 0, fmt.Errorf("ltxio: %s has a non-empty WAL; checkpoint(TRUNCATE) first", dbPath)
@@ -104,15 +116,10 @@ func ChecksumDatabase(dbPath string) (uint64, error) {
 	}
 	defer f.Close()
 
-	hdr := make([]byte, dbHeaderSize)
-	if _, err := io.ReadFull(f, hdr); err != nil {
-		return 0, fmt.Errorf("ltxio: read db header: %w", err)
+	pageSize, nPages, err := readDBHeader(f)
+	if err != nil {
+		return 0, err
 	}
-	pageSize := uint32(binary.BigEndian.Uint16(hdr[16:18]))
-	if pageSize == 1 {
-		pageSize = 65536
-	}
-	nPages := binary.BigEndian.Uint32(hdr[28:32])
 
 	chksum, err := checksumPages(f, pageSize, nPages)
 	if err != nil {
@@ -125,6 +132,11 @@ func ChecksumDatabase(dbPath string) (uint64, error) {
 // from src, skipping the lock page — the same convention EncodeSnapshot uses
 // when it computes a snapshot's post-apply checksum. src must have at least
 // nPages*pageSize bytes available.
+//
+// This is the O(database size) primitive backing ChecksumDatabase. Code that
+// updates a small number of pages at a time (MaterializeChain, and any
+// caller maintaining a checksum across repeated flushes) should use
+// UpdateChecksum instead of calling this on every change.
 func checksumPages(src io.ReaderAt, pageSize, nPages uint32) (ltx.Checksum, error) {
 	lockPgno := ltx.LockPgno(pageSize)
 	buf := make([]byte, pageSize)
@@ -141,6 +153,43 @@ func checksumPages(src io.ReaderAt, pageSize, nPages uint32) (ltx.Checksum, erro
 	return chksum, nil
 }
 
+// ChecksumPage returns the LTX per-page checksum that the rolling database
+// checksum (ChecksumDatabase, UpdateChecksum) folds together: it combines
+// pgno with data's bytes. data must be exactly the database's page size.
+// This is a thin wrapper over github.com/superfly/ltx so callers of this
+// package never need to import ltx directly.
+func ChecksumPage(pgno uint32, data []byte) uint64 {
+	return uint64(ltx.ChecksumPage(pgno, data))
+}
+
+// UpdateChecksum returns the rolling database checksum after page pgno
+// changes from oldData to newData, given running — the checksum before the
+// change. This is the O(1) counterpart to ChecksumDatabase's O(database
+// size) full scan: the rolling checksum is an XOR-fold of independent
+// per-page checksums (ChecksumPage), and XOR is self-cancelling, so
+// replacing one page's contribution only requires removing the old one and
+// adding the new one — the rest of the fold is untouched.
+//
+// Pass nil (or a zero-length slice) for oldData when pgno did not
+// previously exist in the database (a newly created page growing the file):
+// there is no old contribution to remove. Pass nil for newData when pgno no
+// longer exists (a page dropped by truncating the database smaller): there
+// is no new contribution to add. Passing nil for both is a no-op returning
+// running unchanged. Never pass the lock page's number here (see
+// ltx.LockPgno) — like ChecksumDatabase and EncodeSnapshot, the lock page
+// contributes nothing to the checksum, and folding it in produces a
+// checksum nothing else will agree with.
+func UpdateChecksum(running uint64, pgno uint32, oldData, newData []byte) uint64 {
+	c := running
+	if len(oldData) > 0 {
+		c ^= ChecksumPage(pgno, oldData)
+	}
+	if len(newData) > 0 {
+		c ^= ChecksumPage(pgno, newData)
+	}
+	return uint64(ltx.ChecksumFlag) | c
+}
+
 // MaterializeChain writes the database formed by a full snapshot followed by
 // zero or more segments applied in order into dbPath. Every member's checksum
 // is verified; the destination is written atomically (temp + rename) so a
@@ -150,9 +199,21 @@ func checksumPages(src io.ReaderAt, pageSize, nPages uint32) (ltx.Checksum, erro
 // is also verified against the chain's running state — a stronger guarantee
 // than TXID contiguity alone, since it is tied to actual page content rather
 // than a caller-declared number — and after a segment's pages are applied,
-// the resulting database is independently re-checksummed and compared against
-// the segment's declared post-apply checksum before it becomes the new
-// running state. Returns the resulting MaxTXID.
+// the resulting checksum is compared against the segment's declared
+// post-apply checksum before it becomes the new running state.
+//
+// The running checksum is maintained incrementally (UpdateChecksum), not by
+// re-scanning the whole database after every segment: for each page a
+// segment writes, the page's old contribution is XOR'd out (its prior bytes
+// are read before being overwritten) and its new contribution XOR'd in.
+// Pages a shrinking commit drops, and pages a growing commit adds beyond
+// what the segment explicitly wrote, are folded in the same way. This makes
+// replaying a chain of N segments O(total bytes changed) rather than O(N ×
+// database size), while verifying exactly the same guarantee as a full
+// re-checksum — the incremental and full-scan checksums are provably the
+// same rolling XOR-fold, just computed by different paths (see
+// TestMaterializeChainIncrementalChecksumMatchesFullRescan). Returns the
+// resulting MaxTXID.
 func MaterializeChain(snapshot io.Reader, segments []io.Reader, dbPath string) (uint64, error) {
 	dir := filepath.Dir(dbPath)
 	tmp, err := os.CreateTemp(dir, filepath.Base(dbPath)+".tmp-*")
@@ -175,6 +236,7 @@ func MaterializeChain(snapshot io.Reader, segments []io.Reader, dbPath string) (
 
 	pageSize := hdr.PageSize
 	prevMaxTXID := uint64(hdr.MaxTXID)
+	prevCommit := hdr.Commit
 	runningChecksum := trailer.PostApplyChecksum
 
 	for i, segR := range segments {
@@ -196,17 +258,46 @@ func MaterializeChain(snapshot io.Reader, segments []io.Reader, dbPath string) (
 			return 0, fmt.Errorf("ltxio: segment %d pre-apply checksum %s does not match chain state %s", i, shdr.PreApplyChecksum, runningChecksum)
 		}
 
+		lockPgno := shdr.LockPgno()
+		running := uint64(runningChecksum)
+		touched := make(map[uint32]bool)
+
 		var pageHeader ltx.PageHeader
 		buf := make([]byte, pageSize)
+		oldBuf := make([]byte, pageSize)
 		for {
 			if err := dec.DecodePage(&pageHeader, buf); err == io.EOF {
 				break
 			} else if err != nil {
 				return 0, fmt.Errorf("ltxio: decode segment %d page: %w", i, err)
 			}
-			if _, err := tmp.WriteAt(buf, int64(pageHeader.Pgno-1)*int64(pageSize)); err != nil {
-				return 0, fmt.Errorf("ltxio: write page %d: %w", pageHeader.Pgno, err)
+			pgno := pageHeader.Pgno
+			touched[pgno] = true
+
+			// Read the page's prior contents (if any) before they're
+			// overwritten, so its old checksum contribution can be XOR'd
+			// out below.
+			var oldData []byte
+			if pgno <= prevCommit && pgno != lockPgno {
+				if _, err := tmp.ReadAt(oldBuf, int64(pgno-1)*int64(pageSize)); err != nil {
+					return 0, fmt.Errorf("ltxio: read old page %d: %w", pgno, err)
+				}
+				oldData = oldBuf
 			}
+
+			if _, err := tmp.WriteAt(buf, int64(pgno-1)*int64(pageSize)); err != nil {
+				return 0, fmt.Errorf("ltxio: write page %d: %w", pgno, err)
+			}
+
+			// A page this segment writes may still end up truncated away
+			// below (Commit shrinking past it); only fold in its new
+			// contribution if it survives into the final database.
+			var newData []byte
+			if pgno <= shdr.Commit && pgno != lockPgno {
+				newData = buf
+			}
+
+			running = UpdateChecksum(running, pgno, oldData, newData)
 		}
 		// Close verifies the segment's own whole-file CRC64 checksum
 		// (catches a mid-file bit flip) and populates Trailer().
@@ -214,21 +305,52 @@ func MaterializeChain(snapshot io.Reader, segments []io.Reader, dbPath string) (
 			return 0, fmt.Errorf("ltxio: close segment %d: %w", i, err)
 		}
 
+		// A shrinking commit drops trailing pages the segment had no reason
+		// to write (there is no new content for a page that is going away).
+		// Their old contribution is still baked into `running`, so it must
+		// be removed explicitly here, reading their bytes before Truncate
+		// destroys them.
+		if shdr.Commit < prevCommit {
+			for pgno := shdr.Commit + 1; pgno <= prevCommit; pgno++ {
+				if pgno == lockPgno || touched[pgno] {
+					continue
+				}
+				if _, err := tmp.ReadAt(oldBuf, int64(pgno-1)*int64(pageSize)); err != nil {
+					return 0, fmt.Errorf("ltxio: read dropped page %d: %w", pgno, err)
+				}
+				running = UpdateChecksum(running, pgno, oldBuf, nil)
+			}
+		}
+
 		if err := tmp.Truncate(int64(shdr.Commit) * int64(pageSize)); err != nil {
 			return 0, fmt.Errorf("ltxio: truncate to commit size: %w", err)
 		}
 
-		actual, err := checksumPages(tmp, pageSize, shdr.Commit)
-		if err != nil {
-			return 0, fmt.Errorf("ltxio: recompute checksum after segment %d: %w", i, err)
+		// A growing commit can, in principle, extend past what the segment
+		// explicitly wrote (Truncate zero-extends the file); fold in any
+		// such page so the running checksum matches what a full re-scan of
+		// the resulting file would compute. Every real segment writes every
+		// page it introduces, so in practice this loop never executes.
+		if shdr.Commit > prevCommit {
+			for pgno := prevCommit + 1; pgno <= shdr.Commit; pgno++ {
+				if pgno == lockPgno || touched[pgno] {
+					continue
+				}
+				if _, err := tmp.ReadAt(oldBuf, int64(pgno-1)*int64(pageSize)); err != nil {
+					return 0, fmt.Errorf("ltxio: read new page %d: %w", pgno, err)
+				}
+				running = UpdateChecksum(running, pgno, nil, oldBuf)
+			}
 		}
+
 		declared := dec.Trailer().PostApplyChecksum
-		if actual != declared {
+		if actual := ltx.Checksum(running); actual != declared {
 			return 0, fmt.Errorf("ltxio: segment %d post-apply checksum mismatch: computed %s, declared %s", i, actual, declared)
 		}
 
 		runningChecksum = declared
 		prevMaxTXID = uint64(shdr.MaxTXID)
+		prevCommit = shdr.Commit
 	}
 
 	if err := finalizeDestination(tmp, tmpPath, dbPath); err != nil {

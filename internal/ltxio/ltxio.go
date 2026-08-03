@@ -17,6 +17,23 @@ import (
 
 const dbHeaderSize = 100
 
+// readDBHeader reads a quiesced SQLite database's page size and page count
+// (database size in pages) from its 100-byte header. r must be positioned at
+// the start of the file. Shared by EncodeSnapshot and ChecksumDatabase, which
+// both need exactly this parse.
+func readDBHeader(r io.Reader) (pageSize, nPages uint32, err error) {
+	hdr := make([]byte, dbHeaderSize)
+	if _, err := io.ReadFull(r, hdr); err != nil {
+		return 0, 0, fmt.Errorf("ltxio: read db header: %w", err)
+	}
+	pageSize = uint32(binary.BigEndian.Uint16(hdr[16:18]))
+	if pageSize == 1 {
+		pageSize = 65536
+	}
+	nPages = binary.BigEndian.Uint32(hdr[28:32])
+	return pageSize, nPages, nil
+}
+
 // EncodeSnapshot writes a full-snapshot LTX of the SQLite main database at
 // dbPath, covering TXIDs [1, txid]. Caller must have fully checkpointed the
 // WAL (TRUNCATE) first; EncodeSnapshot returns an error if a non-empty -wal
@@ -31,15 +48,10 @@ func EncodeSnapshot(dbPath string, txid uint64, w io.Writer) error {
 	}
 	defer f.Close()
 
-	hdr := make([]byte, dbHeaderSize)
-	if _, err := io.ReadFull(f, hdr); err != nil {
-		return fmt.Errorf("ltxio: read db header: %w", err)
+	pageSize, nPages, err := readDBHeader(f)
+	if err != nil {
+		return err
 	}
-	pageSize := uint32(binary.BigEndian.Uint16(hdr[16:18]))
-	if pageSize == 1 {
-		pageSize = 65536
-	}
-	nPages := binary.BigEndian.Uint32(hdr[28:32]) // database size in pages
 
 	enc, err := ltx.NewEncoder(w)
 	if err != nil {
