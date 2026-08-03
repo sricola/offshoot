@@ -5,6 +5,7 @@ import (
 	"encoding/binary"
 	"os"
 	"os/exec"
+	"path/filepath"
 	"testing"
 
 	"github.com/offshoot-db/offshoot/internal/ltxio"
@@ -243,4 +244,78 @@ func changedPagesForTest(t *testing.T, before, after string) (uint32, uint32, []
 		}
 	}
 	return pageSize, commit, changed
+}
+
+// TestCheckoutIgnoresAFencedWritersObject is the end-to-end consequence of
+// Plan 4's fencing guarantee on Plan 7's read path: when a writer is fenced
+// after uploading its object but before its ref write lands, the next holder
+// writes the same TXID under a higher epoch. A checkout must materialize the
+// live writer's content, never the orphan's.
+func TestCheckoutIgnoresAFencedWritersObject(t *testing.T) {
+	if _, err := exec.LookPath("sqlite3"); err != nil {
+		t.Skip("sqlite3 CLI not on PATH")
+	}
+	w := newWS(t)
+	if err := w.Create("app"); err != nil {
+		t.Fatal(err)
+	}
+	path, err := w.Checkout("app", "main")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if out, err := exec.Command("sqlite3", path,
+		"CREATE TABLE t (v); INSERT INTO t VALUES ('live');").CombinedOutput(); err != nil {
+		t.Fatalf("%v: %s", err, out)
+	}
+	if _, err := w.Checkpoint("app", "main", "live"); err != nil {
+		t.Fatal(err)
+	}
+	ref, etag, err := w.Store.GetRef("app", "main")
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	// Build what a fenced writer would have left: a valid snapshot with
+	// different content, at the SAME txid, under a LOWER epoch.
+	orphan := filepath.Join(t.TempDir(), "orphan.db")
+	if out, err := exec.Command("sqlite3", orphan,
+		"CREATE TABLE t (v); INSERT INTO t VALUES ('fenced');").CombinedOutput(); err != nil {
+		t.Fatalf("%v: %s", err, out)
+	}
+	var buf bytes.Buffer
+	if err := ltxio.EncodeSnapshot(orphan, ref.HeadTXID, &buf); err != nil {
+		t.Fatal(err)
+	}
+	if ref.HeadEpoch < 2 {
+		// Raise the live epoch so a lower one exists to be fenced.
+		ref.Epoch, ref.HeadEpoch = ref.HeadEpoch+1, ref.HeadEpoch+1
+		live, _, err := w.Store.B.Get(store.SnapshotKey(ref.Lineage, ref.HeadEpoch-1, ref.HeadTXID))
+		if err != nil {
+			t.Fatal(err)
+		}
+		if err := w.Store.B.Put(
+			store.SnapshotKey(ref.Lineage, ref.HeadEpoch, ref.HeadTXID), live); err != nil {
+			t.Fatal(err)
+		}
+		if _, err := w.Store.PutRef("app", "main", ref, etag); err != nil {
+			t.Fatal(err)
+		}
+	}
+	// The orphan sits at the now-superseded epoch.
+	if err := w.Store.B.Put(
+		store.SnapshotKey(ref.Lineage, ref.HeadEpoch-1, ref.HeadTXID), buf.Bytes()); err != nil {
+		t.Fatal(err)
+	}
+
+	got, err := w.Checkout("app", "main")
+	if err != nil {
+		t.Fatal(err)
+	}
+	out, err := exec.Command("sqlite3", got, "SELECT v FROM t;").Output()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if string(out) != "live\n" {
+		t.Fatalf("checkout materialized %q — a fenced writer's object was reachable", out)
+	}
 }

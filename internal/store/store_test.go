@@ -262,3 +262,63 @@ func TestChainRefusesWhenNoSnapshotCoversTarget(t *testing.T) {
 		t.Fatal("a chain with no base snapshot must be an error")
 	}
 }
+
+// TestChainPrefersTheHigherEpochOnSameTXID pins the fencing guarantee on the
+// read path: when a fenced writer's orphan shares a TXID with the live
+// object, the chain must always resolve to the live (higher-epoch) one.
+//
+// The pre-fix implementation sorted only by TXID and picked whichever member
+// map iteration happened to place last, so a single run could pass by luck.
+// Rebuilding the store and re-resolving many times makes a non-deterministic
+// implementation fail reliably.
+func TestChainPrefersTheHigherEpochOnSameTXID(t *testing.T) {
+	for i := 0; i < 50; i++ {
+		s := newStore(t)
+		// Same txid 5 under a fenced epoch 2 and the live epoch 3.
+		if err := s.B.Put(SnapshotKey("lin", 2, 5), []byte("fenced")); err != nil {
+			t.Fatal(err)
+		}
+		if err := s.B.Put(SnapshotKey("lin", 3, 5), []byte("live")); err != nil {
+			t.Fatal(err)
+		}
+		got, err := s.Chain("lin", 5)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if len(got) != 1 {
+			t.Fatalf("chain = %+v, want a single snapshot", got)
+		}
+		if got[0].Epoch != 3 {
+			t.Fatalf("iteration %d: chain resolved to epoch %d (the fenced writer's object), want 3",
+				i, got[0].Epoch)
+		}
+	}
+}
+
+// TestChainPrefersTheHigherEpochForSegments is the same guarantee for an
+// incremental segment covering an identical range under two epochs.
+func TestChainPrefersTheHigherEpochForSegments(t *testing.T) {
+	for i := 0; i < 50; i++ {
+		s := newStore(t)
+		if err := s.B.Put(SnapshotKey("lin", 3, 1), []byte("base")); err != nil {
+			t.Fatal(err)
+		}
+		if err := s.B.Put(SegmentKey("lin", 2, 2, 4), []byte("fenced")); err != nil {
+			t.Fatal(err)
+		}
+		if err := s.B.Put(SegmentKey("lin", 3, 2, 4), []byte("live")); err != nil {
+			t.Fatal(err)
+		}
+		got, err := s.Chain("lin", 4)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if len(got) != 2 {
+			t.Fatalf("chain = %+v, want snapshot + one segment", got)
+		}
+		if got[1].Epoch != 3 {
+			t.Fatalf("iteration %d: segment resolved to epoch %d (the fenced writer's), want 3",
+				i, got[1].Epoch)
+		}
+	}
+}
