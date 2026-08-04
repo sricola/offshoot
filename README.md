@@ -112,6 +112,19 @@ not yet in the store; `session status` reports the txid each session is durable
 through. A session that loses its lease is fenced and stops — it will not write
 under a dead epoch — and `session status` shows the error.
 
+### What a flush costs
+
+A daemon flush writes only the pages that changed since the previous flush —
+the capture engine already knows exactly which those are. Every sixteenth flush
+(configurable) writes a full snapshot instead, so materializing a branch never
+replays an unbounded chain: a read applies one snapshot plus at most that many
+segments.
+
+The at-rest `offshoot checkpoint` still writes a full snapshot every time. It
+runs without a daemon, so it has no record of which pages changed and would
+have to diff the whole database to find out. If you checkpoint large databases
+in a loop, run a daemon.
+
 The daemon serves a unix socket (mode 0600) under your cache directory, one per
 store; override with `OFFSHOOT_SOCKET`, or pass `-socket PATH` to `offshoot
 serve`. If you use `-socket PATH` on `serve`, pass the same `-socket PATH` to
