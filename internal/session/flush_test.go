@@ -211,6 +211,102 @@ func TestFlushDoesNotDeleteSnapshotOnNonCASRefFailure(t *testing.T) {
 	}
 }
 
+func TestFlushWritesASegmentThenSnapshotsOnCadence(t *testing.T) {
+	requireSQLite(t)
+	w := newWS(t)
+	if err := w.Create("app"); err != nil {
+		t.Fatal(err)
+	}
+	s, err := Open(context.Background(), Options{
+		WS: w, DB: "app", Branch: "main", SnapshotEvery: 3,
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer s.Close()
+
+	if out, err := exec.Command("sqlite3", s.CheckoutPath(),
+		"CREATE TABLE t (id INTEGER PRIMARY KEY, v TEXT);").CombinedOutput(); err != nil {
+		t.Fatalf("%v: %s", err, out)
+	}
+
+	var members []store.ChainMember
+	for i := 0; i < 5; i++ {
+		if out, err := exec.Command("sqlite3", s.CheckoutPath(),
+			"INSERT INTO t (v) VALUES ('row');").CombinedOutput(); err != nil {
+			t.Fatalf("%v: %s", err, out)
+		}
+		if _, err := s.Flush(""); err != nil {
+			t.Fatalf("flush %d: %v", i, err)
+		}
+	}
+	ref, _, err := w.Store.GetRef("app", "main")
+	if err != nil {
+		t.Fatal(err)
+	}
+	keys, err := w.Store.B.List(store.LineagePrefix(ref.Lineage))
+	if err != nil {
+		t.Fatal(err)
+	}
+	for _, k := range keys {
+		if m, ok := store.ParseMemberKey(k); ok {
+			members = append(members, m)
+		}
+	}
+	var snaps, segs int
+	for _, m := range members {
+		if m.Snapshot {
+			snaps++
+		} else {
+			segs++
+		}
+	}
+	if segs == 0 {
+		t.Fatal("with SnapshotEvery=3 some flushes must write segments")
+	}
+	if snaps < 2 {
+		t.Fatalf("the cadence must produce periodic snapshots, got %d", snaps)
+	}
+	// The branch still reads correctly across the mixed chain.
+	path, err := w.Checkout("app", "main")
+	if err != nil {
+		t.Fatal(err)
+	}
+	out, err := exec.Command("sqlite3", path, "SELECT count(*) FROM t;").Output()
+	if err != nil || string(out) != "5\n" {
+		t.Fatalf("rows after mixed chain = %q err=%v", out, err)
+	}
+}
+
+func TestSnapshotEveryOneKeepsOldBehavior(t *testing.T) {
+	requireSQLite(t)
+	w := newWS(t)
+	if err := w.Create("app"); err != nil {
+		t.Fatal(err)
+	}
+	s, err := Open(context.Background(), Options{
+		WS: w, DB: "app", Branch: "main", SnapshotEvery: 1,
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer s.Close()
+	exec.Command("sqlite3", s.CheckoutPath(), "CREATE TABLE t (v);").Run()
+	for i := 0; i < 3; i++ {
+		exec.Command("sqlite3", s.CheckoutPath(), "INSERT INTO t VALUES ('x');").Run()
+		if _, err := s.Flush(""); err != nil {
+			t.Fatal(err)
+		}
+	}
+	ref, _, _ := w.Store.GetRef("app", "main")
+	keys, _ := w.Store.B.List(store.LineagePrefix(ref.Lineage))
+	for _, k := range keys {
+		if m, ok := store.ParseMemberKey(k); ok && !m.Snapshot {
+			t.Fatalf("SnapshotEvery=1 must never write a segment, found %s", k)
+		}
+	}
+}
+
 // TestConcurrentFlushIsSerialized guards the flushMu fix: without
 // serialization, concurrent Flush calls on one Session compute the same
 // txid/key and race. With flushMu, every call's GetRef-through-PutRef is
@@ -278,14 +374,29 @@ func TestConcurrentFlushIsSerialized(t *testing.T) {
 	}
 
 	// The ref's head afterwards must reference an object that actually
-	// exists in the backend.
+	// exists in the backend — a snapshot or, since consecutive successful
+	// calls here advance TXID one at a time without SnapshotEvery forcing
+	// every one of them to snapshot, possibly an incremental segment.
 	ref, _, err := w.Store.GetRef("app", "main")
 	if err != nil {
 		t.Fatal(err)
 	}
-	headKey := store.SnapshotKey(ref.Lineage, ref.HeadEpoch, ref.HeadTXID)
+	keys, err := w.Store.B.List(store.LineagePrefix(ref.Lineage))
+	if err != nil {
+		t.Fatal(err)
+	}
+	var headKey string
+	for _, k := range keys {
+		if m, ok := store.ParseMemberKey(k); ok && m.Epoch == ref.HeadEpoch && m.MaxTXID == ref.HeadTXID {
+			headKey = k
+			break
+		}
+	}
+	if headKey == "" {
+		t.Fatalf("no snapshot or segment found for ref head (epoch %d, txid %d)", ref.HeadEpoch, ref.HeadTXID)
+	}
 	if data, _, err := w.Store.B.Get(headKey); err != nil || len(data) == 0 {
-		t.Fatalf("ref head %s must reference an existing snapshot: data=%d err=%v",
+		t.Fatalf("ref head %s must reference an existing object: data=%d err=%v",
 			headKey, len(data), err)
 	}
 }

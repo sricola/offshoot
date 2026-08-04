@@ -20,13 +20,21 @@ import (
 // valid SQLite database whose row count is monotonically non-decreasing — a
 // torn or half-applied flush would show up as a decode failure or a count that
 // goes backwards.
+//
+// SnapshotEvery: 1 here is deliberate, not incidental: this test verifies
+// consistency under contention by fetching each flush's OWN object directly
+// and decoding it standalone via ltxio.Materialize, which only understands a
+// full snapshot — resolving a snapshot+segment chain is a separate concern
+// tasks 1-3 already cover elsewhere. Forcing every flush to snapshot keeps
+// this test focused on what it actually exists to catch (a torn or dropped
+// write under load), independent of the cadence feature.
 func TestFlushesUnderContinuousWritesAreConsistent(t *testing.T) {
 	requireSQLite(t)
 	w := newWS(t)
 	if err := w.Create("app"); err != nil {
 		t.Fatal(err)
 	}
-	s, err := Open(context.Background(), Options{WS: w, DB: "app", Branch: "main"})
+	s, err := Open(context.Background(), Options{WS: w, DB: "app", Branch: "main", SnapshotEvery: 1})
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -147,13 +155,19 @@ func bytesReader(b []byte) *bytes.Reader { return bytes.NewReader(b) }
 // (and the row counts proving the omission wasn't just "a bit behind": the
 // flushed snapshot was missing the marker AND most of that round's backlog
 // entirely, not merely trailing it).
+//
+// SnapshotEvery: 1 is deliberate here too, for the same reason as
+// TestFlushesUnderContinuousWritesAreConsistent above: this test decodes
+// each flush's OWN object directly with ltxio.Materialize (a full-snapshot-
+// only decoder) to isolate DrainNow's contract from chain-resolution
+// concerns, which are exercised elsewhere.
 func TestFlushIncludesEverythingCommittedBeforeIt(t *testing.T) {
 	requireSQLite(t)
 	w := newWS(t)
 	if err := w.Create("app"); err != nil {
 		t.Fatal(err)
 	}
-	s, err := Open(context.Background(), Options{WS: w, DB: "app", Branch: "main"})
+	s, err := Open(context.Background(), Options{WS: w, DB: "app", Branch: "main", SnapshotEvery: 1})
 	if err != nil {
 		t.Fatal(err)
 	}
