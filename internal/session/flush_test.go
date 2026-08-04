@@ -223,7 +223,6 @@ func TestFlushWritesASegmentThenSnapshotsOnCadence(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	defer s.Close()
 
 	if out, err := exec.Command("sqlite3", s.CheckoutPath(),
 		"CREATE TABLE t (id INTEGER PRIMARY KEY, v TEXT);").CombinedOutput(); err != nil {
@@ -267,6 +266,17 @@ func TestFlushWritesASegmentThenSnapshotsOnCadence(t *testing.T) {
 	if snaps < 2 {
 		t.Fatalf("the cadence must produce periodic snapshots, got %d", snaps)
 	}
+	// Close the session before checking the branch out again: the capture
+	// engine holds a persistent read lock on the checkout for as long as the
+	// session is open (blocking any foreign checkpoint, by design — see
+	// internal/capture/engine.go), which is incidental to what this
+	// assertion cares about but pre-existing and unrelated to segments —
+	// w.Checkout's own quiesce step would otherwise fail with "database is
+	// busy" (tracked for final review, not a segment/snapshot bug).
+	if err := s.Close(); err != nil {
+		t.Fatal(err)
+	}
+
 	// The branch still reads correctly across the mixed chain.
 	path, err := w.Checkout("app", "main")
 	if err != nil {
