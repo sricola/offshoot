@@ -39,9 +39,13 @@ func TestReplayStaysBoundedAcrossManyFlushes(t *testing.T) {
 		t.Fatal(err)
 	}
 	defer s.Close()
-	exec.Command("sqlite3", s.CheckoutPath(), "CREATE TABLE t (v);").Run()
+	if out, err := exec.Command("sqlite3", s.CheckoutPath(), "CREATE TABLE t (v);").CombinedOutput(); err != nil {
+		t.Fatalf("CREATE TABLE failed: %v: %s", err, out)
+	}
 	for i := 0; i < 20; i++ {
-		exec.Command("sqlite3", s.CheckoutPath(), "INSERT INTO t VALUES ('x');").Run()
+		if out, err := exec.Command("sqlite3", s.CheckoutPath(), "INSERT INTO t VALUES ('x');").CombinedOutput(); err != nil {
+			t.Fatalf("INSERT %d failed: %v: %s", i, err, out)
+		}
 		if _, err := s.Flush(""); err != nil {
 			t.Fatalf("flush %d: %v", i, err)
 		}
@@ -79,16 +83,26 @@ func TestGCSweepsSegmentsWithTheirLineage(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	exec.Command("sqlite3", s.CheckoutPath(), "CREATE TABLE t (v);").Run()
+	if out, err := exec.Command("sqlite3", s.CheckoutPath(), "CREATE TABLE t (v);").CombinedOutput(); err != nil {
+		t.Fatalf("CREATE TABLE failed: %v: %s", err, out)
+	}
 	for i := 0; i < 3; i++ {
-		exec.Command("sqlite3", s.CheckoutPath(), "INSERT INTO t VALUES ('x');").Run()
+		if out, err := exec.Command("sqlite3", s.CheckoutPath(), "INSERT INTO t VALUES ('x');").CombinedOutput(); err != nil {
+			t.Fatalf("INSERT %d failed: %v: %s", i, err, out)
+		}
 		if _, err := s.Flush(""); err != nil {
 			t.Fatal(err)
 		}
 	}
-	ref, _, _ := w.Store.GetRef("app", "doomed")
+	ref, _, err := w.Store.GetRef("app", "doomed")
+	if err != nil {
+		t.Fatal(err)
+	}
 	lineage := ref.Lineage
-	keysBefore, _ := w.Store.B.List(store.LineagePrefix(lineage))
+	keysBefore, err := w.Store.B.List(store.LineagePrefix(lineage))
+	if err != nil {
+		t.Fatal(err)
+	}
 	var segs int
 	for _, k := range keysBefore {
 		if m, ok := store.ParseMemberKey(k); ok && !m.Snapshot {
@@ -109,7 +123,10 @@ func TestGCSweepsSegmentsWithTheirLineage(t *testing.T) {
 	if _, _, err := w.GC(0); err != nil {
 		t.Fatal(err)
 	}
-	after, _ := w.Store.B.List(store.LineagePrefix(lineage))
+	after, err := w.Store.B.List(store.LineagePrefix(lineage))
+	if err != nil {
+		t.Fatal(err)
+	}
 	if len(after) != 0 {
 		t.Fatalf("GC must sweep segments with their lineage, %d objects remain: %v", len(after), after)
 	}
