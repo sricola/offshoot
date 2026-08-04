@@ -43,3 +43,32 @@ func TestPageSetCopiesFrameData(t *testing.T) {
 		t.Fatal("pageSet must copy frame data, not alias the caller's buffer")
 	}
 }
+
+// TestPageSetDropAboveClearsStaleShrunkPages guards recordApply's shrink
+// path: a page recorded by one transaction (here, pgno 5) can be dropped by
+// a LATER transaction that shrinks the database without that later
+// transaction's own frames ever mentioning pgno 5 (there is nothing new to
+// write to a page that is going away). Without dropAbove, drain() would
+// still hand that stale, now-nonexistent page to EncodeSegment, which
+// rejects any page number beyond the segment's declared commit size.
+func TestPageSetDropAboveClearsStaleShrunkPages(t *testing.T) {
+	p := newPageSet()
+	p.record([]wal.Frame{frame(1, 'a'), frame(3, 'a'), frame(5, 'a')})
+	p.dropAbove(3)
+	if p.len() != 2 {
+		t.Fatalf("len = %d, want 2 (pgno 5 dropped)", p.len())
+	}
+	got := p.drain()
+	if len(got) != 2 || got[0].Pgno != 1 || got[1].Pgno != 3 {
+		t.Fatalf("dropAbove(3) must leave only pgnos <= 3: %+v", got)
+	}
+}
+
+func TestPageSetDropAboveIsANoOpWhenNothingExceedsCommit(t *testing.T) {
+	p := newPageSet()
+	p.record([]wal.Frame{frame(1, 'a'), frame(2, 'a')})
+	p.dropAbove(5)
+	if p.len() != 2 {
+		t.Fatalf("len = %d, want 2 (nothing above commit 5)", p.len())
+	}
+}

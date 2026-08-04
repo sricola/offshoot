@@ -393,6 +393,15 @@ func (s *Session) Close() error {
 // ltxio.MaterializeChain uses to replay a segment (see its doc comment),
 // applied here per-transaction instead of per-segment so the checksum never
 // falls behind what's actually on disk.
+//
+// This mutates running state (s.checksum, s.commit, s.pageSize, s.pages)
+// before replica.Apply below has validated the commit frame; that's safe
+// because it relies on the same contract Apply itself requires (the last
+// frame in a well-formed transaction is a commit frame — see
+// replay.Replica.Apply), and because any Apply failure surfaces to the
+// capture engine as fatal, which forces a rebase before capture resumes —
+// rebaseline() re-establishes all of this state from scratch rather than
+// leaving a partially-folded update in place.
 func (s *Session) recordApply(pageSize uint32, frames []wal.Frame) error {
 	if len(frames) == 0 {
 		return nil
@@ -408,6 +417,16 @@ func (s *Session) recordApply(pageSize uint32, frames []wal.Frame) error {
 	}
 	prevCommit := uint32(fi.Size() / int64(pageSize))
 	newCommit := frames[len(frames)-1].Header.CommitSize
+	// The lock page carries no real data — SQLite never stores page content
+	// there — and every other checksum path in this codebase (
+	// ltxio.ChecksumDatabase, ltxio.EncodeSnapshot, ltxio.MaterializeChain)
+	// skips it for exactly that reason. It matters here specifically for a
+	// shrinking commit that crosses the lock page's page number (the
+	// ~1GB PENDING_BYTE boundary): without this skip, the shrink loop below
+	// would fold OUT a contribution that was never folded IN, silently
+	// diverging s.checksum from the value ltxio.MaterializeChain computes on
+	// read — a checksum mismatch that hard-fails materialization.
+	lockPgno := ltxio.LockPgno(pageSize)
 
 	// Last write per pgno wins, matching pageSet's own latest-write
 	// semantics (record below re-derives this independently; touched here
@@ -426,6 +445,9 @@ func (s *Session) recordApply(pageSize uint32, frames []wal.Frame) error {
 	seen := make(map[uint32]bool, len(touched))
 	for _, pgno := range touched {
 		seen[pgno] = true
+		if pgno == lockPgno {
+			continue
+		}
 		var oldData []byte
 		if pgno <= prevCommit {
 			if _, err := f.ReadAt(buf, int64(pgno-1)*int64(pageSize)); err != nil {
@@ -441,9 +463,13 @@ func (s *Session) recordApply(pageSize uint32, frames []wal.Frame) error {
 	}
 	// A shrinking commit drops trailing pages this transaction had no reason
 	// to write explicitly; their old contribution must still be removed.
+	// pages.dropAbove clears any of those same page numbers pageSet may
+	// still be holding from an earlier, not-yet-flushed transaction — see
+	// its doc comment for why leaving them would corrupt the next segment.
 	if newCommit < prevCommit {
+		s.pages.dropAbove(newCommit)
 		for pgno := newCommit + 1; pgno <= prevCommit; pgno++ {
-			if seen[pgno] {
+			if seen[pgno] || pgno == lockPgno {
 				continue
 			}
 			if _, err := f.ReadAt(buf, int64(pgno-1)*int64(pageSize)); err != nil {
@@ -460,7 +486,7 @@ func (s *Session) recordApply(pageSize uint32, frames []wal.Frame) error {
 	if newCommit > prevCommit {
 		zero := make([]byte, pageSize)
 		for pgno := prevCommit + 1; pgno <= newCommit; pgno++ {
-			if seen[pgno] {
+			if seen[pgno] || pgno == lockPgno {
 				continue
 			}
 			running = ltxio.UpdateChecksum(running, pgno, nil, zero)

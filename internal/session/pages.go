@@ -31,6 +31,22 @@ func (p *pageSet) record(frames []wal.Frame) {
 	}
 }
 
+// dropAbove removes every recorded page numbered greater than commit. A
+// transaction that shrinks the database can drop a page this set is still
+// holding from an earlier, not-yet-flushed transaction even though the
+// shrinking transaction's own frames never mention that page (there is
+// nothing new to write to a page that is going away) — without this,
+// drain() would still hand that now-nonexistent page to EncodeSegment,
+// which rejects any page number beyond the segment's declared commit size.
+// Called by recordApply whenever it observes a shrinking commit.
+func (p *pageSet) dropAbove(commit uint32) {
+	for pgno := range p.pages {
+		if pgno > commit {
+			delete(p.pages, pgno)
+		}
+	}
+}
+
 // drain returns the accumulated pages sorted by Pgno and resets the set.
 func (p *pageSet) drain() []ltxio.Page {
 	out := make([]ltxio.Page, 0, len(p.pages))
