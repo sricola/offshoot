@@ -162,6 +162,19 @@ func ChecksumPage(pgno uint32, data []byte) uint64 {
 	return uint64(ltx.ChecksumPage(pgno, data))
 }
 
+// LockPgno returns the page number SQLite reserves for its lock byte at the
+// given page size — the one page ChecksumDatabase, EncodeSnapshot,
+// EncodeSegment, and MaterializeChain all skip when folding page content
+// into the rolling checksum (it never holds real page data; see
+// UpdateChecksum's doc comment). This is a thin wrapper over
+// github.com/superfly/ltx so callers maintaining their own incremental
+// checksum outside this package (e.g. session.Session, updating on every
+// captured WAL frame) can apply the same skip without importing ltx
+// directly.
+func LockPgno(pageSize uint32) uint32 {
+	return ltx.LockPgno(pageSize)
+}
+
 // UpdateChecksum returns the rolling database checksum after page pgno
 // changes from oldData to newData, given running — the checksum before the
 // change. This is the O(1) counterpart to ChecksumDatabase's O(database
