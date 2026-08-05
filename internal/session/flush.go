@@ -223,6 +223,7 @@ func (s *Session) Flush(name string) (uint64, error) {
 	if name != "" {
 		ref.SetCheckpoint(name, txid, lease.Epoch)
 	}
+	ref.Touch(time.Now())
 	if _, err := st.PutRef(s.db, s.branch, ref, etag); err != nil {
 		// Decide whether to clean up the uploaded object after a failed ref
 		// update. This mirrors ops.Checkpoint's identical decision exactly

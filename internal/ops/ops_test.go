@@ -293,7 +293,7 @@ func TestForkIsIndependentOfParent(t *testing.T) {
 		t.Fatal(err)
 	}
 
-	txid, err := w.Fork("app", "main", "attempt-1", "")
+	txid, err := w.Fork("app", "main", "attempt-1", "", 0)
 	if err != nil || txid != 2 {
 		t.Fatalf("fork: txid=%d err=%v", txid, err)
 	}
@@ -343,7 +343,7 @@ func TestForkAtCheckpoint(t *testing.T) {
 	exec.Command("sqlite3", path, "INSERT INTO t VALUES (2);").Run()
 	w.Checkpoint("app", "main", "v2")
 
-	if _, err := w.Fork("app", "main", "old", "v1"); err != nil {
+	if _, err := w.Fork("app", "main", "old", "v1", 0); err != nil {
 		t.Fatal(err)
 	}
 	p, _ := w.Checkout("app", "old")
@@ -351,10 +351,10 @@ func TestForkAtCheckpoint(t *testing.T) {
 	if string(got) != "1\n" {
 		t.Fatalf("fork --at v1 content: %q", got)
 	}
-	if _, err := w.Fork("app", "main", "bad", "nope"); err == nil {
+	if _, err := w.Fork("app", "main", "bad", "nope", 0); err == nil {
 		t.Fatal("unknown checkpoint must fail")
 	}
-	if _, err := w.Fork("app", "main", "old", ""); err == nil {
+	if _, err := w.Fork("app", "main", "old", "", 0); err == nil {
 		t.Fatal("existing branch name must fail")
 	}
 }
@@ -386,7 +386,7 @@ func TestForkWarnsOnUncheckpointedChanges(t *testing.T) {
 	// No-warning case: fork immediately after a fresh checkpoint (checkout
 	// matches the committed state exactly).
 	stderr := captureStderr(t, func() {
-		if _, err := w.Fork("app", "main", "clean", ""); err != nil {
+		if _, err := w.Fork("app", "main", "clean", "", 0); err != nil {
 			t.Fatal(err)
 		}
 	})
@@ -401,7 +401,7 @@ func TestForkWarnsOnUncheckpointedChanges(t *testing.T) {
 
 	var txid uint64
 	stderr = captureStderr(t, func() {
-		txid, err = w.Fork("app", "main", "dirty", "")
+		txid, err = w.Fork("app", "main", "dirty", "", 0)
 		if err != nil {
 			t.Fatal(err)
 		}
@@ -461,7 +461,7 @@ func TestForkWarnsOnStaleCheckout(t *testing.T) {
 
 	// Build a "new state" for main to be silently repointed to: fork a
 	// scratch branch off main, add more data, and checkpoint it there.
-	if _, err := w.Fork("app", "main", "scratch", ""); err != nil {
+	if _, err := w.Fork("app", "main", "scratch", "", 0); err != nil {
 		t.Fatal(err)
 	}
 	scratchPath, err := w.Checkout("app", "scratch")
@@ -498,7 +498,7 @@ func TestForkWarnsOnStaleCheckout(t *testing.T) {
 
 	var forkTXID uint64
 	stderr := captureStderr(t, func() {
-		forkTXID, err = w.Fork("app", "main", "child", "")
+		forkTXID, err = w.Fork("app", "main", "child", "", 0)
 		if err != nil {
 			t.Fatal(err)
 		}
@@ -623,7 +623,7 @@ func TestForkAtCheckpointAfterRollback(t *testing.T) {
 	if _, err := w.Rollback("app", "main", "v2"); err != nil {
 		t.Fatalf("rollback --to v2: %v", err)
 	}
-	if _, err := w.Fork("app", "main", "old", "v1"); err != nil {
+	if _, err := w.Fork("app", "main", "old", "v1", 0); err != nil {
 		t.Fatalf("fork --at v1 after rollback --to v2: %v", err)
 	}
 	p, err := w.Checkout("app", "old")
@@ -720,7 +720,7 @@ func TestPromoteWarnsOnUncheckpointedSourceChanges(t *testing.T) {
 	if _, err := w.Checkpoint("app", "main", "v1"); err != nil {
 		t.Fatal(err)
 	}
-	if _, err := w.Fork("app", "main", "attempt-1", ""); err != nil {
+	if _, err := w.Fork("app", "main", "attempt-1", "", 0); err != nil {
 		t.Fatal(err)
 	}
 	ap, err := w.Checkout("app", "attempt-1")
@@ -770,7 +770,7 @@ func TestPromote(t *testing.T) {
 	path, _ := w.Checkout("app", "main")
 	exec.Command("sqlite3", path, "CREATE TABLE t (v); INSERT INTO t VALUES (1);").Run()
 	w.Checkpoint("app", "main", "v1")
-	w.Fork("app", "main", "attempt-1", "")
+	w.Fork("app", "main", "attempt-1", "", 0)
 
 	ap, _ := w.Checkout("app", "attempt-1")
 	exec.Command("sqlite3", ap, "INSERT INTO t VALUES (99);").Run()
@@ -922,7 +922,7 @@ func TestConcurrentForksFromSameParent(t *testing.T) {
 		wg.Add(1)
 		go func(n int) {
 			defer wg.Done()
-			_, errs[n] = w.Fork("app", "main", fmt.Sprintf("f-%d", n), "")
+			_, errs[n] = w.Fork("app", "main", fmt.Sprintf("f-%d", n), "", 0)
 		}(i)
 	}
 	wg.Wait()
@@ -1198,7 +1198,7 @@ func TestMaterializeUsesCheckpointEpochNotRefEpoch(t *testing.T) {
 	if string(got) != "1\n" {
 		t.Fatalf("content after epoch bump: %q", got)
 	}
-	if _, err := w.Fork("app", "main", "child", "v1"); err != nil {
+	if _, err := w.Fork("app", "main", "child", "v1", 0); err != nil {
 		t.Fatalf("fork --at across an epoch bump: %v", err)
 	}
 }
@@ -1266,7 +1266,7 @@ func TestCheckpointAfterEpochBumpIsMaterializable(t *testing.T) {
 
 	// The pre-bump checkpoint must still be reachable: its object lives
 	// under the old epoch and was never touched by the bump or by v2.
-	if _, err := w.Fork("app", "main", "child", "v1"); err != nil {
+	if _, err := w.Fork("app", "main", "child", "v1", 0); err != nil {
 		t.Fatalf("fork --at v1 (pre-bump checkpoint) after later checkpoint: %v", err)
 	}
 }

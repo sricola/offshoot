@@ -47,6 +47,16 @@ type Ref struct {
 	// Lease fields are empty when no writer holds the branch.
 	LeaseHolder string `json:"lease_holder,omitempty"`
 	LeaseExpiry string `json:"lease_expiry,omitempty"` // RFC3339Nano UTC
+	// TTL fields govern branch reaping (Plan 8). TTL is a Go duration string
+	// ("2h"); empty means the branch is never reaped. TouchedAt is the
+	// activity clock: Reaping (ops.Reap, Task 2) measures TTL from the later
+	// of TouchedAt and LeaseExpiry, so any durable write or lease activity
+	// defers expiry. Reaping is set by Reap's CAS claim (Task 2) and, while
+	// true, refuses ops.Touch. All three are omitempty so a Plan-7 ref
+	// decodes with them empty/false — no TTL means never reaped.
+	TTL       string `json:"ttl,omitempty"`
+	TouchedAt string `json:"touched_at,omitempty"` // RFC3339Nano UTC
+	Reaping   bool   `json:"reaping,omitempty"`
 }
 
 // SetCheckpoint records name at (txid, epoch), allocating the map if needed.
@@ -55,6 +65,13 @@ func (r *Ref) SetCheckpoint(name string, txid, epoch uint64) {
 		r.Checkpoints = map[string]Checkpoint{}
 	}
 	r.Checkpoints[name] = Checkpoint{TXID: txid, Epoch: epoch}
+}
+
+// Touch stamps the ref's activity clock. Reaping (ops.Reap) measures TTL
+// from the later of this stamp and the lease expiry, so any durable write
+// or lease activity defers expiry.
+func (r *Ref) Touch(now time.Time) {
+	r.TouchedAt = now.UTC().Format(time.RFC3339Nano)
 }
 
 // refWire is the tolerant on-disk shape: checkpoints are either v1 numbers or
@@ -70,6 +87,9 @@ type refWire struct {
 	Protected   bool                       `json:"protected"`
 	LeaseHolder string                     `json:"lease_holder,omitempty"`
 	LeaseExpiry string                     `json:"lease_expiry,omitempty"`
+	TTL         string                     `json:"ttl,omitempty"`
+	TouchedAt   string                     `json:"touched_at,omitempty"`
+	Reaping     bool                       `json:"reaping,omitempty"`
 }
 
 // decodeRef parses the on-disk ref shape, upgrading a v1 ref (schema 1,
@@ -91,6 +111,7 @@ func decodeRef(data []byte) (Ref, error) {
 		HeadTXID: w.HeadTXID, HeadEpoch: w.HeadEpoch,
 		Parent: w.Parent, Protected: w.Protected,
 		LeaseHolder: w.LeaseHolder, LeaseExpiry: w.LeaseExpiry,
+		TTL: w.TTL, TouchedAt: w.TouchedAt, Reaping: w.Reaping,
 	}
 	// A v1 ref predates per-checkpoint epochs: everything it references was
 	// written under the ref's own epoch.

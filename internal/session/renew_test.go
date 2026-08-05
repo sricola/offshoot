@@ -134,7 +134,7 @@ func TestRenewalEndsWhenBranchDestroyed(t *testing.T) {
 	if err := w.Create("app"); err != nil {
 		t.Fatal(err)
 	}
-	if _, err := w.Fork("app", "main", "feature", ""); err != nil {
+	if _, err := w.Fork("app", "main", "feature", "", 0); err != nil {
 		t.Fatal(err)
 	}
 	s, err := Open(context.Background(), Options{
