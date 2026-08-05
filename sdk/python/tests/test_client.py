@@ -26,6 +26,15 @@ class TestTtlStr(unittest.TestCase):
         self.assertEqual(_ttl_str(0), "none")
         self.assertEqual(_ttl_str("none"), "none")
 
+    def test_zero_timedelta_clears(self):
+        # timedelta(0) == 0 is False in Python (timedelta only compares equal
+        # to another timedelta), so this must not fall through to the
+        # duration-string branch and render "0s" — that would silently
+        # contradict this function's own "0 clears" docstring for anyone
+        # passing a timedelta instead of a bare int.
+        self.assertEqual(_ttl_str(timedelta(0)), "none")
+        self.assertEqual(_ttl_str(timedelta(seconds=0)), "none")
+
     def test_timedelta_and_duration_string_set(self):
         self.assertEqual(_ttl_str(timedelta(hours=1)), "3600s")
         self.assertEqual(_ttl_str("1h"), "1h")
