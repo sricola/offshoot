@@ -109,6 +109,24 @@ class TestThreadLifecycle(unittest.TestCase):
             forks.fork_thread("never-opened", "ckpt-1", "t5")
         self.assertIn("never-opened", str(cm.exception))
 
+    def test_fork_thread_retried_with_same_new_thread_names_the_collision(self):
+        # A retried resume that reuses the same new_thread id must NOT be
+        # told to re-checkpoint (that can never fix a name collision) — it
+        # must be told the target thread's branch already exists.
+        forks = ThreadForks(self.client, "agent")
+        self.addCleanup(forks.close)
+        forks.path("t6")
+        forks.checkpoint("t6", "ckpt-1")
+        forks.fork_thread("t6", "ckpt-1", "t7")  # first fork succeeds
+
+        with self.assertRaises(OffshootError) as cm:
+            forks.fork_thread("t6", "ckpt-1", "t7")  # retried with same new_thread
+        msg = str(cm.exception)
+        self.assertIn("t7", msg)
+        self.assertIn("already has a branch", msg)
+        self.assertNotIn("was never recorded", msg)
+        self.assertNotIn("ckpt-1", msg)
+
 
 class TestNameSanitization(unittest.TestCase):
     @classmethod
