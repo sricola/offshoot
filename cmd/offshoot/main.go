@@ -325,6 +325,13 @@ func run(args []string) error {
 			}
 			grace = d
 		}
+		reaped, reapErr := w.Reap(time.Now())
+		if len(reaped) > 0 {
+			fmt.Printf("gc: reaped %v\n", reaped)
+		}
+		if reapErr != nil {
+			return reapErr
+		}
 		tombstoned, deleted, err := w.GC(grace)
 		if err != nil {
 			return err
@@ -432,10 +439,32 @@ func run(args []string) error {
 	case "serve":
 		sock, rest, err := socketOverride(rest)
 		if err != nil {
-			return fmt.Errorf("usage: offshoot serve [-socket PATH]: %w", err)
+			return fmt.Errorf("usage: offshoot serve [-socket PATH] [-reap-every DURATION] [-gc-grace DURATION]: %w", err)
+		}
+		reapEveryStr, rest, _, err := extractFlag(rest, "-reap-every")
+		if err != nil {
+			return err
+		}
+		if reapEveryStr == "" {
+			reapEveryStr = "1m"
+		}
+		reapEvery, err := time.ParseDuration(reapEveryStr)
+		if err != nil {
+			return fmt.Errorf("-reap-every: %w", err)
+		}
+		gcGraceStr, rest, _, err := extractFlag(rest, "-gc-grace")
+		if err != nil {
+			return err
+		}
+		if gcGraceStr == "" {
+			gcGraceStr = "15m"
+		}
+		gcGrace, err := time.ParseDuration(gcGraceStr)
+		if err != nil {
+			return fmt.Errorf("-gc-grace: %w", err)
 		}
 		if len(rest) != 0 {
-			return fmt.Errorf("usage: offshoot serve [-socket PATH]")
+			return fmt.Errorf("usage: offshoot serve [-socket PATH] [-reap-every DURATION] [-gc-grace DURATION]")
 		}
 		if sock == "" {
 			p, err := daemon.DefaultSocketPath(spec)
@@ -448,6 +477,7 @@ func run(args []string) error {
 		if err != nil {
 			return err
 		}
+		srv.StartJanitor(reapEvery, gcGrace)
 		fmt.Println("offshoot serving on", sock)
 		sigc := make(chan os.Signal, 1)
 		signal.Notify(sigc, os.Interrupt, syscall.SIGTERM)
