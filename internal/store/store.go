@@ -6,6 +6,7 @@ import (
 	"encoding/json"
 	"fmt"
 	"sort"
+	"strconv"
 	"strings"
 	"time"
 )
@@ -177,6 +178,175 @@ func SnapshotKey(lineage string, epoch, txid uint64) string {
 }
 
 func LineagePrefix(lineage string) string { return "data/" + lineage + "/" }
+
+// SegmentKey locates an incremental segment covering (minTXID, maxTXID].
+// Sorting by key sorts by maxTXID, so a lexical List is already in apply
+// order.
+func SegmentKey(lineage string, epoch, minTXID, maxTXID uint64) string {
+	return fmt.Sprintf("data/%s/%d/segment-%016x-%016x.ltx", lineage, epoch, maxTXID, minTXID)
+}
+
+// ChainMember identifies one object in a materialization chain.
+type ChainMember struct {
+	Key              string
+	Snapshot         bool
+	MinTXID, MaxTXID uint64
+	Epoch            uint64
+}
+
+// ParseMemberKey parses a snapshot or segment key back into a ChainMember.
+func ParseMemberKey(key string) (ChainMember, bool) {
+	rest, ok := strings.CutPrefix(key, "data/")
+	if !ok {
+		return ChainMember{}, false
+	}
+	parts := strings.Split(rest, "/")
+	if len(parts) != 3 {
+		return ChainMember{}, false
+	}
+	lineage, epochStr, file := parts[0], parts[1], parts[2]
+	if lineage == "" {
+		return ChainMember{}, false
+	}
+	epoch, err := strconv.ParseUint(epochStr, 10, 64)
+	if err != nil {
+		return ChainMember{}, false
+	}
+	switch {
+	case strings.HasPrefix(file, "snapshot-") && strings.HasSuffix(file, ".ltx"):
+		hexStr := strings.TrimSuffix(strings.TrimPrefix(file, "snapshot-"), ".ltx")
+		txid, err := strconv.ParseUint(hexStr, 16, 64)
+		if err != nil {
+			return ChainMember{}, false
+		}
+		return ChainMember{Key: key, Snapshot: true, MinTXID: 0, MaxTXID: txid, Epoch: epoch}, true
+	case strings.HasPrefix(file, "segment-") && strings.HasSuffix(file, ".ltx"):
+		hexStr := strings.TrimSuffix(strings.TrimPrefix(file, "segment-"), ".ltx")
+		fields := strings.Split(hexStr, "-")
+		if len(fields) != 2 {
+			return ChainMember{}, false
+		}
+		maxTXID, err := strconv.ParseUint(fields[0], 16, 64)
+		if err != nil {
+			return ChainMember{}, false
+		}
+		minTXID, err := strconv.ParseUint(fields[1], 16, 64)
+		if err != nil {
+			return ChainMember{}, false
+		}
+		return ChainMember{Key: key, Snapshot: false, MinTXID: minTXID, MaxTXID: maxTXID, Epoch: epoch}, true
+	default:
+		return ChainMember{}, false
+	}
+}
+
+// keepHighestEpoch collapses members covering an identical TXID range down to
+// the one written under the highest epoch. A lower-epoch duplicate is an
+// orphan left by a writer that was fenced before its ref write landed, so it
+// must never be chosen — see the fencing note in Chain.
+func keepHighestEpoch(members []ChainMember) []ChainMember {
+	type rng struct{ min, max uint64 }
+	best := make(map[rng]ChainMember, len(members))
+	for _, m := range members {
+		k := rng{m.MinTXID, m.MaxTXID}
+		if cur, ok := best[k]; !ok || m.Epoch > cur.Epoch {
+			best[k] = m
+		}
+	}
+	out := make([]ChainMember, 0, len(best))
+	for _, m := range best {
+		out = append(out, m)
+	}
+	return out
+}
+
+// Chain returns the members needed to materialize lineage at target: the
+// newest snapshot with MaxTXID <= target, followed by every segment after it
+// up to target, in apply order. It returns an error when no snapshot covers
+// the target or the segments do not form a contiguous run — a caller must
+// never be handed a chain with a hole.
+//
+// It lists LineagePrefix(lineage) once and works from the parsed keys, so it
+// costs one List regardless of epoch count — segments from superseded
+// epochs are simply members like any other, since an epoch bump does not
+// move objects.
+func (s *Store) Chain(lineage string, target uint64) ([]ChainMember, error) {
+	keys, err := s.B.List(LineagePrefix(lineage))
+	if err != nil {
+		return nil, err
+	}
+	var snapshots, segments []ChainMember
+	for _, k := range keys {
+		m, ok := ParseMemberKey(k)
+		if !ok {
+			continue
+		}
+		if m.Snapshot {
+			snapshots = append(snapshots, m)
+		} else {
+			segments = append(segments, m)
+		}
+	}
+	// Two members can cover the same TXID range under different epochs: a
+	// writer uploads its object, loses the ref CAS, and is fenced, leaving an
+	// orphan; because HeadTXID only advances on a *successful* ref write, the
+	// next holder writes the same TXID under its own, higher epoch. Epochs
+	// only ever increase, so the live object is always the higher-epoch one
+	// and the lower-epoch one is by definition the superseded writer's.
+	// Keeping only the highest epoch per range is what makes Plan 4's fencing
+	// guarantee hold on this read path — otherwise a fenced writer's data
+	// could be materialized.
+	snapshots = keepHighestEpoch(snapshots)
+	segments = keepHighestEpoch(segments)
+	// List sorts lexically on the full key, which only sorts by TXID within
+	// a single epoch directory (the epoch path segment isn't zero-padded, so
+	// e.g. epoch 10 would sort before epoch 2). A chain can span epochs, so
+	// sort explicitly by TXID here rather than trusting raw List order.
+	sort.Slice(snapshots, func(i, j int) bool { return snapshots[i].MaxTXID < snapshots[j].MaxTXID })
+	sort.Slice(segments, func(i, j int) bool {
+		if segments[i].MaxTXID != segments[j].MaxTXID {
+			return segments[i].MaxTXID < segments[j].MaxTXID
+		}
+		return segments[i].MinTXID < segments[j].MinTXID
+	})
+	// Newest snapshot with MaxTXID <= target: snapshot keys sort by TXID
+	// ascending, so scan from the end.
+	var base *ChainMember
+	for i := len(snapshots) - 1; i >= 0; i-- {
+		if snapshots[i].MaxTXID <= target {
+			base = &snapshots[i]
+			break
+		}
+	}
+	if base == nil {
+		return nil, fmt.Errorf("store: chain %s@%d: no snapshot covers target", lineage, target)
+	}
+	chain := []ChainMember{*base}
+	if base.MaxTXID == target {
+		return chain, nil
+	}
+	prevMax := base.MaxTXID
+	for _, seg := range segments {
+		if seg.MaxTXID <= prevMax {
+			continue
+		}
+		if seg.MinTXID != prevMax+1 {
+			return nil, fmt.Errorf(
+				"store: chain %s@%d: hole before segment %s (expected minTXID %d, got %d)",
+				lineage, target, seg.Key, prevMax+1, seg.MinTXID)
+		}
+		chain = append(chain, seg)
+		prevMax = seg.MaxTXID
+		if prevMax == target {
+			return chain, nil
+		}
+		if prevMax > target {
+			break
+		}
+	}
+	return nil, fmt.Errorf("store: chain %s@%d: no contiguous run reaches target (stopped at %d)",
+		lineage, target, prevMax)
+}
 
 func (s *Store) GetRef(db, branch string) (Ref, string, error) {
 	data, etag, err := s.B.Get(RefKey(db, branch))

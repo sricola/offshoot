@@ -211,6 +211,244 @@ func TestFlushDoesNotDeleteSnapshotOnNonCASRefFailure(t *testing.T) {
 	}
 }
 
+func TestFlushWritesASegmentThenSnapshotsOnCadence(t *testing.T) {
+	requireSQLite(t)
+	w := newWS(t)
+	if err := w.Create("app"); err != nil {
+		t.Fatal(err)
+	}
+	s, err := Open(context.Background(), Options{
+		WS: w, DB: "app", Branch: "main", SnapshotEvery: 3,
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	if out, err := exec.Command("sqlite3", s.CheckoutPath(),
+		"CREATE TABLE t (id INTEGER PRIMARY KEY, v TEXT);").CombinedOutput(); err != nil {
+		t.Fatalf("%v: %s", err, out)
+	}
+
+	var members []store.ChainMember
+	for i := 0; i < 5; i++ {
+		if out, err := exec.Command("sqlite3", s.CheckoutPath(),
+			"INSERT INTO t (v) VALUES ('row');").CombinedOutput(); err != nil {
+			t.Fatalf("%v: %s", err, out)
+		}
+		if _, err := s.Flush(""); err != nil {
+			t.Fatalf("flush %d: %v", i, err)
+		}
+	}
+	ref, _, err := w.Store.GetRef("app", "main")
+	if err != nil {
+		t.Fatal(err)
+	}
+	keys, err := w.Store.B.List(store.LineagePrefix(ref.Lineage))
+	if err != nil {
+		t.Fatal(err)
+	}
+	for _, k := range keys {
+		if m, ok := store.ParseMemberKey(k); ok {
+			members = append(members, m)
+		}
+	}
+	var snaps, segs int
+	for _, m := range members {
+		if m.Snapshot {
+			snaps++
+		} else {
+			segs++
+		}
+	}
+	if segs == 0 {
+		t.Fatal("with SnapshotEvery=3 some flushes must write segments")
+	}
+	if snaps < 2 {
+		t.Fatalf("the cadence must produce periodic snapshots, got %d", snaps)
+	}
+	// Close the session before checking the branch out again: the capture
+	// engine holds a persistent read lock on the checkout for as long as the
+	// session is open (blocking any foreign checkpoint, by design — see
+	// internal/capture/engine.go), which is incidental to what this
+	// assertion cares about but pre-existing and unrelated to segments —
+	// w.Checkout's own quiesce step would otherwise fail with "database is
+	// busy" (tracked for final review, not a segment/snapshot bug).
+	if err := s.Close(); err != nil {
+		t.Fatal(err)
+	}
+
+	// The branch still reads correctly across the mixed chain.
+	path, err := w.Checkout("app", "main")
+	if err != nil {
+		t.Fatal(err)
+	}
+	out, err := exec.Command("sqlite3", path, "SELECT count(*) FROM t;").Output()
+	if err != nil || string(out) != "5\n" {
+		t.Fatalf("rows after mixed chain = %q err=%v", out, err)
+	}
+}
+
+func TestSnapshotEveryOneKeepsOldBehavior(t *testing.T) {
+	requireSQLite(t)
+	w := newWS(t)
+	if err := w.Create("app"); err != nil {
+		t.Fatal(err)
+	}
+	s, err := Open(context.Background(), Options{
+		WS: w, DB: "app", Branch: "main", SnapshotEvery: 1,
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer s.Close()
+	exec.Command("sqlite3", s.CheckoutPath(), "CREATE TABLE t (v);").Run()
+	for i := 0; i < 3; i++ {
+		exec.Command("sqlite3", s.CheckoutPath(), "INSERT INTO t VALUES ('x');").Run()
+		if _, err := s.Flush(""); err != nil {
+			t.Fatal(err)
+		}
+	}
+	ref, _, _ := w.Store.GetRef("app", "main")
+	keys, _ := w.Store.B.List(store.LineagePrefix(ref.Lineage))
+	for _, k := range keys {
+		if m, ok := store.ParseMemberKey(k); ok && !m.Snapshot {
+			t.Fatalf("SnapshotEvery=1 must never write a segment, found %s", k)
+		}
+	}
+}
+
+// TestFlushSegmentAcrossAShrinkingCommit covers recordApply's shrink branch
+// (newCommit < prevCommit), which none of the other tests exercise — they
+// only ever INSERT, so the database only ever grows. A bulk insert followed
+// by a DELETE + VACUUM, flushed with SnapshotEvery high enough to stay off
+// the snapshot cadence, forces exactly that branch: VACUUM's commit frame
+// reports a smaller page count than the replica already has on disk, so
+// recordApply must fold OUT the dropped trailing pages' old checksum
+// contribution (the loop guarded by "newCommit < prevCommit") and drop any
+// of those same page numbers pageSet is still holding from the earlier
+// insert's transaction (pageSet.dropAbove — see its doc comment for why
+// record() alone can't do this: a shrinking transaction's own frames never
+// mention the pages it drops). If either loop's math (or the lock-page
+// skip) were wrong, the segment's declared postApplyChecksum would not
+// match what ltxio.MaterializeChain computes by actually replaying the
+// pages — a mismatch MaterializeChain treats as a hard failure, not a
+// silent misread — so a passing materialize-and-read-back below is genuine
+// evidence the shrink path is correct, not just that it ran. (PRAGMA
+// incremental_vacuum was tried first and rejected: empirically, against
+// this package's sqlite3 CLI in WAL mode, it left freed pages on the
+// freelist without ever truncating the file — freelist_count moved but
+// page_count did not — so it never reaches recordApply's shrink branch at
+// all. Plain VACUUM does, reliably.)
+//
+// This does not additionally cover the lock-page skip itself: reaching the
+// lock page's own pgno (ltx.LockPgno of a 4096-byte page is 262145,
+// PENDING_BYTE/pageSize+1) requires a database north of ~1GB, which isn't a
+// practical size for a unit test to build and shrink across on every test
+// run. recordApply's three loops were reviewed by hand against
+// ltxio.MaterializeChain's identical skip (see the code and its comments)
+// instead.
+func TestFlushSegmentAcrossAShrinkingCommit(t *testing.T) {
+	requireSQLite(t)
+	w := newWS(t)
+	if err := w.Create("app"); err != nil {
+		t.Fatal(err)
+	}
+	// SnapshotEvery high enough that neither flush below reaches the cadence
+	// trigger; the database stays well under minPagesForFractionCheck too,
+	// so the only thing that can force the second flush to snapshot instead
+	// of segment is a bug in this test's own arithmetic, not the cadence or
+	// fraction heuristics.
+	s, err := Open(context.Background(), Options{
+		WS: w, DB: "app", Branch: "main", SnapshotEvery: 100,
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	if out, err := exec.Command("sqlite3", s.CheckoutPath(),
+		"CREATE TABLE t (id INTEGER PRIMARY KEY, v BLOB);").CombinedOutput(); err != nil {
+		t.Fatalf("%v: %s", err, out)
+	}
+
+	// Bulk insert enough rows to span several pages, then flush: the
+	// session's first flush is always forced to a snapshot (txid 1 cannot
+	// start a segment chain), establishing the baseline this test's segment
+	// flush below continues from.
+	insertBulk := "INSERT INTO t (v) SELECT randomblob(300) FROM " +
+		"(WITH RECURSIVE c(x) AS (SELECT 1 UNION ALL SELECT x+1 FROM c WHERE x<60) SELECT x FROM c);"
+	if out, err := exec.Command("sqlite3", s.CheckoutPath(), insertBulk).CombinedOutput(); err != nil {
+		t.Fatalf("bulk insert: %v: %s", err, out)
+	}
+	if _, err := s.Flush(""); err != nil {
+		t.Fatalf("baseline flush: %v", err)
+	}
+
+	// Shrink: drop all but 3 rows, then VACUUM reclaims the freed pages and
+	// truncates the file. This is a separate transaction from the delete
+	// (VACUUM commits on its own), so DrainNow below catches both, and
+	// recordApply runs once per transaction — VACUUM's is what exercises
+	// the shrink branch.
+	if out, err := exec.Command("sqlite3", s.CheckoutPath(),
+		"DELETE FROM t WHERE id > 3;").CombinedOutput(); err != nil {
+		t.Fatalf("delete: %v: %s", err, out)
+	}
+	if out, err := exec.Command("sqlite3", s.CheckoutPath(),
+		"VACUUM;").CombinedOutput(); err != nil {
+		t.Fatalf("vacuum: %v: %s", err, out)
+	}
+	shrinkTxid, err := s.Flush("")
+	if err != nil {
+		t.Fatalf("shrink flush: %v", err)
+	}
+
+	// Confirm this flush actually took the segment path — otherwise the
+	// test would pass without ever exercising recordApply's shrink loop.
+	ref, _, err := w.Store.GetRef("app", "main")
+	if err != nil {
+		t.Fatal(err)
+	}
+	keys, err := w.Store.B.List(store.LineagePrefix(ref.Lineage))
+	if err != nil {
+		t.Fatal(err)
+	}
+	var found bool
+	for _, k := range keys {
+		m, ok := store.ParseMemberKey(k)
+		if !ok || m.MaxTXID != shrinkTxid {
+			continue
+		}
+		found = true
+		if m.Snapshot {
+			t.Fatalf("shrink flush (txid %d) was a snapshot, not a segment — this test needs the segment "+
+				"path to exercise recordApply's shrink branch; adjust SnapshotEvery or bulk size", shrinkTxid)
+		}
+	}
+	if !found {
+		t.Fatalf("no chain member found for shrink flush txid %d", shrinkTxid)
+	}
+
+	// Close before checking out again: w.Checkout re-materializes the fixed
+	// checkout path, which requires quiescing it — impossible while this
+	// session's capture engine still holds its persistent read lock on that
+	// same file (pre-existing, unrelated to segments; see
+	// TestFlushWritesASegmentThenSnapshotsOnCadence's identical comment).
+	if err := s.Close(); err != nil {
+		t.Fatal(err)
+	}
+
+	// A fresh materialization resolves snapshot+segment chain, verifying
+	// the shrink segment's checksum along the way (ltxio.MaterializeChain
+	// fails loudly on a mismatch, rather than silently misreading).
+	path, err := w.Checkout("app", "main")
+	if err != nil {
+		t.Fatalf("checkout after shrink: %v", err)
+	}
+	out, err := exec.Command("sqlite3", path, "SELECT count(*) FROM t;").Output()
+	if err != nil || string(out) != "3\n" {
+		t.Fatalf("rows after shrinking segment = %q err=%v", out, err)
+	}
+}
+
 // TestConcurrentFlushIsSerialized guards the flushMu fix: without
 // serialization, concurrent Flush calls on one Session compute the same
 // txid/key and race. With flushMu, every call's GetRef-through-PutRef is
@@ -278,14 +516,29 @@ func TestConcurrentFlushIsSerialized(t *testing.T) {
 	}
 
 	// The ref's head afterwards must reference an object that actually
-	// exists in the backend.
+	// exists in the backend — a snapshot or, since consecutive successful
+	// calls here advance TXID one at a time without SnapshotEvery forcing
+	// every one of them to snapshot, possibly an incremental segment.
 	ref, _, err := w.Store.GetRef("app", "main")
 	if err != nil {
 		t.Fatal(err)
 	}
-	headKey := store.SnapshotKey(ref.Lineage, ref.HeadEpoch, ref.HeadTXID)
+	keys, err := w.Store.B.List(store.LineagePrefix(ref.Lineage))
+	if err != nil {
+		t.Fatal(err)
+	}
+	var headKey string
+	for _, k := range keys {
+		if m, ok := store.ParseMemberKey(k); ok && m.Epoch == ref.HeadEpoch && m.MaxTXID == ref.HeadTXID {
+			headKey = k
+			break
+		}
+	}
+	if headKey == "" {
+		t.Fatalf("no snapshot or segment found for ref head (epoch %d, txid %d)", ref.HeadEpoch, ref.HeadTXID)
+	}
 	if data, _, err := w.Store.B.Get(headKey); err != nil || len(data) == 0 {
-		t.Fatalf("ref head %s must reference an existing snapshot: data=%d err=%v",
+		t.Fatalf("ref head %s must reference an existing object: data=%d err=%v",
 			headKey, len(data), err)
 	}
 }

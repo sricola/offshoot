@@ -178,3 +178,147 @@ func TestSetCheckpointAllocates(t *testing.T) {
 		t.Fatalf("checkpoints = %+v", r.Checkpoints)
 	}
 }
+
+func TestSegmentKeySortsByMaxTXID(t *testing.T) {
+	a := SegmentKey("lin", 1, 2, 5)
+	b := SegmentKey("lin", 1, 6, 9)
+	if !(a < b) {
+		t.Fatalf("segment keys must sort in apply order: %s !< %s", a, b)
+	}
+	m, ok := ParseMemberKey(a)
+	if !ok || m.Snapshot || m.MinTXID != 2 || m.MaxTXID != 5 || m.Epoch != 1 {
+		t.Fatalf("round trip failed: %+v ok=%v", m, ok)
+	}
+	sm, ok := ParseMemberKey(SnapshotKey("lin", 3, 7))
+	if !ok || !sm.Snapshot || sm.MaxTXID != 7 || sm.Epoch != 3 {
+		t.Fatalf("snapshot round trip failed: %+v ok=%v", sm, ok)
+	}
+	if _, ok := ParseMemberKey("data/lin/1/not-a-member.txt"); ok {
+		t.Fatal("a non-member key must not parse")
+	}
+}
+
+func TestChainPicksNewestSnapshotThenSegments(t *testing.T) {
+	s := newStore(t)
+	put := func(k string) {
+		if err := s.B.Put(k, []byte("x")); err != nil {
+			t.Fatal(err)
+		}
+	}
+	put(SnapshotKey("lin", 1, 1))
+	put(SegmentKey("lin", 1, 2, 3))
+	put(SegmentKey("lin", 1, 4, 5))
+	put(SnapshotKey("lin", 2, 6)) // a later full snapshot, different epoch
+	put(SegmentKey("lin", 2, 7, 8))
+
+	// Target after the second snapshot: chain starts there, not at txid 1.
+	got, err := s.Chain("lin", 8)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(got) != 2 || !got[0].Snapshot || got[0].MaxTXID != 6 || got[1].MaxTXID != 8 {
+		t.Fatalf("chain = %+v", got)
+	}
+
+	// Target in the middle of the first run: snapshot 1 plus one segment.
+	got, err = s.Chain("lin", 3)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(got) != 2 || !got[0].Snapshot || got[0].MaxTXID != 1 || got[1].MaxTXID != 3 {
+		t.Fatalf("chain = %+v", got)
+	}
+
+	// Exactly on a snapshot: just that snapshot.
+	got, err = s.Chain("lin", 6)
+	if err != nil || len(got) != 1 || !got[0].Snapshot {
+		t.Fatalf("chain = %+v err=%v", got, err)
+	}
+}
+
+func TestChainRefusesAHole(t *testing.T) {
+	s := newStore(t)
+	if err := s.B.Put(SnapshotKey("lin", 1, 1), []byte("x")); err != nil {
+		t.Fatal(err)
+	}
+	// 2..3 present, 4..5 missing, 6..7 present: a hole before the target.
+	if err := s.B.Put(SegmentKey("lin", 1, 2, 3), []byte("x")); err != nil {
+		t.Fatal(err)
+	}
+	if err := s.B.Put(SegmentKey("lin", 1, 6, 7), []byte("x")); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := s.Chain("lin", 7); err == nil {
+		t.Fatal("a hole in the chain must be an error")
+	}
+}
+
+func TestChainRefusesWhenNoSnapshotCoversTarget(t *testing.T) {
+	s := newStore(t)
+	if err := s.B.Put(SegmentKey("lin", 1, 2, 3), []byte("x")); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := s.Chain("lin", 3); err == nil {
+		t.Fatal("a chain with no base snapshot must be an error")
+	}
+}
+
+// TestChainPrefersTheHigherEpochOnSameTXID pins the fencing guarantee on the
+// read path: when a fenced writer's orphan shares a TXID with the live
+// object, the chain must always resolve to the live (higher-epoch) one.
+//
+// The pre-fix implementation sorted only by TXID and picked whichever member
+// map iteration happened to place last, so a single run could pass by luck.
+// Rebuilding the store and re-resolving many times makes a non-deterministic
+// implementation fail reliably.
+func TestChainPrefersTheHigherEpochOnSameTXID(t *testing.T) {
+	for i := 0; i < 50; i++ {
+		s := newStore(t)
+		// Same txid 5 under a fenced epoch 2 and the live epoch 3.
+		if err := s.B.Put(SnapshotKey("lin", 2, 5), []byte("fenced")); err != nil {
+			t.Fatal(err)
+		}
+		if err := s.B.Put(SnapshotKey("lin", 3, 5), []byte("live")); err != nil {
+			t.Fatal(err)
+		}
+		got, err := s.Chain("lin", 5)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if len(got) != 1 {
+			t.Fatalf("chain = %+v, want a single snapshot", got)
+		}
+		if got[0].Epoch != 3 {
+			t.Fatalf("iteration %d: chain resolved to epoch %d (the fenced writer's object), want 3",
+				i, got[0].Epoch)
+		}
+	}
+}
+
+// TestChainPrefersTheHigherEpochForSegments is the same guarantee for an
+// incremental segment covering an identical range under two epochs.
+func TestChainPrefersTheHigherEpochForSegments(t *testing.T) {
+	for i := 0; i < 50; i++ {
+		s := newStore(t)
+		if err := s.B.Put(SnapshotKey("lin", 3, 1), []byte("base")); err != nil {
+			t.Fatal(err)
+		}
+		if err := s.B.Put(SegmentKey("lin", 2, 2, 4), []byte("fenced")); err != nil {
+			t.Fatal(err)
+		}
+		if err := s.B.Put(SegmentKey("lin", 3, 2, 4), []byte("live")); err != nil {
+			t.Fatal(err)
+		}
+		got, err := s.Chain("lin", 4)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if len(got) != 2 {
+			t.Fatalf("chain = %+v, want snapshot + one segment", got)
+		}
+		if got[1].Epoch != 3 {
+			t.Fatalf("iteration %d: segment resolved to epoch %d (the fenced writer's), want 3",
+				i, got[1].Epoch)
+		}
+	}
+}

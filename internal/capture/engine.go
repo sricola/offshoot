@@ -100,6 +100,14 @@ type Engine struct {
 	// engine's own shutdown does not block forever with nobody left to
 	// service e.reqs.
 	done chan struct{}
+	// ready is closed exactly once, by Run's own goroutine, the moment its
+	// startup tryResume/rebase decision has settled — specifically, right
+	// after tryResume returns (successfully or not) and BEFORE the optional
+	// startup rebase() call that follows when it did not resume. At that
+	// point Resumed() already holds its final value (tryResume sets it,
+	// synchronously, before returning) even though the slower rebase() may
+	// still be running. See WaitReady.
+	ready chan struct{}
 }
 
 // drainRequest is one DrainNow call's handoff to Run's loop: done carries
@@ -114,7 +122,7 @@ func NewEngine(o Options) *Engine {
 	if o.Poll == 0 {
 		o.Poll = 10 * time.Millisecond
 	}
-	return &Engine{o: o, reqs: make(chan drainRequest), done: make(chan struct{})}
+	return &Engine{o: o, reqs: make(chan drainRequest), done: make(chan struct{}), ready: make(chan struct{})}
 }
 
 // Rebased reports how many times this Engine instance rebased. This
@@ -136,6 +144,30 @@ func (e *Engine) Rebased() int { return int(e.rebased.Load()) }
 // cleanly," not "has this session ever rebased since." A later in-session
 // rebase (e.g. a takeover fold-race) does not un-set it.
 func (e *Engine) Resumed() bool { return e.resumed.Load() }
+
+// WaitReady blocks until Run's startup tryResume/rebase decision has
+// settled — Resumed() is guaranteed to hold its final value once this
+// returns nil — or until the engine stops before getting there (Run
+// returned, e.done closed), or ctx is cancelled. See the ready field's doc
+// comment for exactly which moment this is (deliberately before, not after,
+// an ordinary startup rebase() finishes — that stays a slow, asynchronous
+// step exactly as it always has been; only the tryResume verdict itself is
+// worth blocking a caller on).
+//
+// A nil return does not by itself mean the engine started up successfully —
+// the e.done case returns nil too, exactly like DrainNow's identical
+// tradeoff (see its doc comment): a caller that needs to know about a
+// terminal engine failure must check that some other way (Session.Err).
+func (e *Engine) WaitReady(ctx context.Context) error {
+	select {
+	case <-e.ready:
+		return nil
+	case <-ctx.Done():
+		return ctx.Err()
+	case <-e.done:
+		return nil
+	}
+}
 
 func (e *Engine) statePath() string    { return filepath.Join(e.o.StateDir, "capture-state.json") }
 func (e *Engine) snapshotPath() string { return filepath.Join(e.o.StateDir, "snapshot.db") }
@@ -259,12 +291,23 @@ func (e *Engine) Run(ctx context.Context) error {
 		return err
 	}
 
-	if resumed, err := e.tryResume(ctx); err != nil {
+	resumed, err := e.tryResume(ctx)
+	if err != nil {
 		if ctx.Err() != nil {
 			return nil
 		}
 		return err
-	} else if !resumed {
+	}
+	// Resumed() already holds its final value at this point (tryResume sets
+	// it synchronously before returning) even though the rebase() call just
+	// below, when it runs, can still take a while (checkpoint + full-file
+	// copy + full-file hash — see rebase's and hashFile's doc comments).
+	// Closing ready here, rather than after that optional call, is what lets
+	// WaitReady's caller (Session.Open, see its doc comment there) learn the
+	// resume verdict promptly without also having to wait out an ordinary
+	// startup rebase that was always asynchronous before this existed.
+	close(e.ready)
+	if !resumed {
 		if err := e.rebase(ctx); err != nil {
 			if ctx.Err() != nil {
 				// Close() landed while the startup rebase was still
