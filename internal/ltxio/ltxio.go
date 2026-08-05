@@ -38,6 +38,16 @@ func readDBHeader(r io.Reader) (pageSize, nPages uint32, err error) {
 // dbPath, covering TXIDs [1, txid]. Caller must have fully checkpointed the
 // WAL (TRUNCATE) first; EncodeSnapshot returns an error if a non-empty -wal
 // file exists next to dbPath.
+//
+// Caller contract (POSIX lock hazard): this reads dbPath with an ordinary
+// os.Open/Close, which is safe ONLY because it is called on files no SQLite
+// connection in this process has open — a quiesced checkout (see ops.quiesce)
+// or a freshly materialized temp file. POSIX advisory locks are keyed by
+// (process, inode), so closing this descriptor would drop every lock this
+// process holds on dbPath; against a live capture engine that silently
+// unlocks it and loses every subsequent write. See internal/dbfile. Do not
+// call this on a database another goroutine may have open; route raw reads
+// of live databases through dbfile instead.
 func EncodeSnapshot(dbPath string, txid uint64, w io.Writer) error {
 	if fi, err := os.Stat(dbPath + "-wal"); err == nil && fi.Size() > 0 {
 		return fmt.Errorf("ltxio: %s has a non-empty WAL; checkpoint(TRUNCATE) first", dbPath)

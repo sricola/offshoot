@@ -4,8 +4,10 @@ import (
 	"context"
 	"database/sql"
 	"errors"
+	"os"
 	"os/exec"
 	"path/filepath"
+	"strings"
 	"sync/atomic"
 	"testing"
 	"time"
@@ -122,6 +124,121 @@ func TestEngineCapturesStockCLIWriter(t *testing.T) {
 			t.Fatalf("sqlite3 insert: %v: %s", err, out)
 		}
 	}
+	waitEqual(t, src, rep, 10*time.Second)
+}
+
+// sqlite3UnlinksWALOnExit reports whether the sqlite3 CLI on PATH performs
+// the standard close-time checkpoint-and-unlink of -wal/-shm when the last
+// connection to a WAL-mode database goes away. Stock builds do; Apple's
+// system build (persistent WAL) does not, and on it the absence of a read
+// lock has no observable consequence at all. Probed rather than assumed from
+// a version string or GOOS, since which sqlite3 is first on PATH is what
+// actually decides it.
+func sqlite3UnlinksWALOnExit(t *testing.T) bool {
+	t.Helper()
+	probe := filepath.Join(t.TempDir(), "probe.db")
+	if out, err := exec.Command("sqlite3", probe,
+		"PRAGMA journal_mode=WAL; CREATE TABLE p (v BLOB); INSERT INTO p VALUES (randomblob(64));").CombinedOutput(); err != nil {
+		t.Fatalf("sqlite3 probe: %v: %s", err, out)
+	}
+	// The CLI has exited and nothing else in this process ever opened the
+	// probe database, so it was unambiguously the last connection.
+	_, err := os.Stat(probe + "-wal")
+	return os.IsNotExist(err)
+}
+
+// TestEngineHoldsReadLockAcrossSnapshotCopy pins the invariant that the whole
+// capture design rests on: once the engine's startup rebase has taken its read
+// lock, a foreign writer that commits and then exits must NOT be able to
+// checkpoint the WAL into the main database and delete it. The read lock is
+// the only thing standing between the engine and that close-time cleanup, and
+// losing it is completely silent — the engine keeps reporting healthy while
+// its WAL reader sees an empty file forever and the replica never receives
+// another frame.
+//
+// The regression this guards is subtle and was invisible on the development
+// machine for thousands of runs: rebase() used to read the main database file
+// for its snapshot copy through a second, short-lived os.File. POSIX advisory
+// locks (fcntl), which is what SQLite uses on unix, are keyed by (process,
+// inode) rather than by descriptor, so closing that second descriptor dropped
+// every lock this process held on the database file — including the SHARED
+// lock SQLite holds for a WAL-mode connection's entire lifetime, which SQLite
+// tracks in memory and therefore never re-acquires. See internal/dbfile's
+// package comment for the full mechanism and copySrc/hashSrc for the fix.
+//
+// Note that this test only covers the engine's STARTUP snapshot copy. The
+// same hazard at engine teardown — where the closing descriptor drops the
+// locks of an unrelated, still-open SQLite connection elsewhere in the
+// process — is covered by TestEngineResumesCleanly and
+// TestEngineResumeAppliesNothingBeforeNewWrite, both of which hold a foreign
+// connection open across an engine bounce. Those two are the reason the
+// descriptor is owned by dbfile and never closed at all, rather than owned by
+// the engine and closed last.
+//
+// Written as a WAL-survival assertion rather than a lock-introspection one
+// because that is the observable consequence that actually breaks capture.
+// That makes the assertion meaningful only where the platform's sqlite3 build
+// actually performs the close-time checkpoint-and-delete: Apple's system
+// sqlite3 ships with persistent WAL enabled and leaves -wal/-shm in place
+// regardless of locking, so on that build this test would pass whether or not
+// the lock is held. Rather than let it stand as a green check that proves
+// nothing — exactly how the original bug reached CI — it probes for the
+// behaviour first and skips LOUDLY, naming the reason, when the platform
+// cannot observe the failure. It runs for real against any stock sqlite3
+// build (Linux distributions, Homebrew, and the GitHub-hosted runners).
+func TestEngineHoldsReadLockAcrossSnapshotCopy(t *testing.T) {
+	if _, err := exec.LookPath("sqlite3"); err != nil {
+		t.Skip("sqlite3 CLI not on PATH")
+	}
+	if !sqlite3UnlinksWALOnExit(t) {
+		v, _ := exec.Command("sqlite3", "--version").Output()
+		t.Skipf("this platform's sqlite3 does not unlink the WAL when the last "+
+			"connection closes (persistent WAL), so a dropped read lock is not "+
+			"observable here and this test cannot fail — it proves nothing on "+
+			"this machine. Run it against a stock sqlite3 build. CLI: %s",
+			strings.TrimSpace(string(v)))
+	}
+	src := filepath.Join(t.TempDir(), "src.db")
+	if out, err := exec.Command("sqlite3", src,
+		"PRAGMA journal_mode=WAL; CREATE TABLE t (id INTEGER PRIMARY KEY, v BLOB);").CombinedOutput(); err != nil {
+		t.Fatalf("sqlite3: %v: %s", err, out)
+	}
+
+	e, rep, cancel, done := startEngine(t, src)
+	defer func() { cancel(); <-done }()
+
+	// Wait for the startup rebase — which is what performs the snapshot copy
+	// and then takes the read lock — to have completed, so this test is
+	// asserting about an engine that is genuinely holding the lock rather
+	// than one that simply hasn't got there yet.
+	rctx, rcancel := context.WithTimeout(context.Background(), 10*time.Second)
+	defer rcancel()
+	if err := e.WaitReady(rctx); err != nil {
+		t.Fatalf("WaitReady: %v", err)
+	}
+	deadline := time.Now().Add(10 * time.Second)
+	for e.Rebased() < 1 && time.Now().Before(deadline) {
+		time.Sleep(5 * time.Millisecond)
+	}
+	if e.Rebased() < 1 {
+		t.Fatal("engine never completed its startup rebase")
+	}
+
+	// A whole foreign writer lifecycle: connect, commit, disconnect. The exit
+	// is the dangerous part — that is when SQLite tries to checkpoint and
+	// unlink the WAL if it believes it is the last connection.
+	if out, err := exec.Command("sqlite3", src,
+		"PRAGMA busy_timeout=5000; INSERT INTO t (v) VALUES (randomblob(128));").CombinedOutput(); err != nil {
+		t.Fatalf("sqlite3 insert: %v: %s", err, out)
+	}
+
+	if _, err := os.Stat(src + "-wal"); err != nil {
+		t.Fatalf("engine's read lock did not survive the startup snapshot copy: "+
+			"the foreign writer's close-time checkpoint folded and deleted the WAL "+
+			"(stat %s-wal: %v). Every frame committed from here on is lost silently.", src, err)
+	}
+	// The lock surviving is necessary but not sufficient — the frames must
+	// actually reach the sink.
 	waitEqual(t, src, rep, 10*time.Second)
 }
 
