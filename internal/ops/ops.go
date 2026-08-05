@@ -534,8 +534,21 @@ func (w *Workspace) copySnapshotToNewLineage(src store.Ref, cp store.Checkpoint)
 
 // Fork creates newBranch from db@srcBranch at head or a named checkpoint.
 // ttl > 0 sets the child's TTL (never the parent's — creating a child does
-// not extend the parent's activity clock either); ttl == 0 means no TTL.
+// not extend the parent's activity clock either); ttl == 0 means no TTL —
+// that is the API's one way to say "no TTL" (Fork has no separate "none"
+// sentinel the way Touch does, since a brand-new branch has no existing TTL
+// to preserve vs. clear). ttl < 0 is refused outright rather than silently
+// treated as ttl == 0: a caller that passed a negative duration made a
+// mistake, and swallowing it would mean the child forks with no TTL while
+// the caller believes it asked for one. Callers taking TTL as a wire string
+// (opFork, the CLI's --ttl) are expected to reject a non-positive value
+// before ever reaching here — see their own docs — so this is a second,
+// defense-in-depth check, not the primary one a caller should rely on for a
+// good error message.
 func (w *Workspace) Fork(db, srcBranch, newBranch, at string, ttl time.Duration) (uint64, error) {
+	if ttl < 0 {
+		return 0, fmt.Errorf("ops: fork ttl must be zero (no TTL) or positive, got %s", ttl)
+	}
 	if err := store.ValidateName(newBranch); err != nil {
 		return 0, err
 	}

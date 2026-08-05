@@ -64,6 +64,28 @@ func TestTouchSetsClearsAndStampsTTL(t *testing.T) {
 	}
 }
 
+// TestForkRejectsNegativeTTL pins the decision that Fork's ttl parameter
+// treats < 0 as a caller mistake, not a synonym for "no TTL" (ttl == 0):
+// silently swallowing a negative duration into "no TTL" would fork a
+// TTL-less branch while the caller believed it asked for one, exactly the
+// bug opFork/the CLI's --ttl guard against one layer up.
+func TestForkRejectsNegativeTTL(t *testing.T) {
+	w := newWS(t)
+	if err := w.Create("app"); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := w.Fork("app", "main", "kid", "", -time.Hour); err == nil {
+		t.Fatal("Fork must reject a negative ttl")
+	}
+	if _, _, err := w.Store.GetRef("app", "kid"); err == nil {
+		t.Fatal("a rejected fork must not create the branch")
+	}
+	// ttl == 0 remains the documented "no TTL" spelling.
+	if _, err := w.Fork("app", "main", "kid", "", 0); err != nil {
+		t.Fatalf("ttl == 0 must still mean no TTL: %v", err)
+	}
+}
+
 func TestDurableWritesStampTheClock(t *testing.T) {
 	requireSQLite(t)
 	w := newWS(t)

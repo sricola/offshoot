@@ -23,7 +23,7 @@ Usage:
   offshoot create <db> [--from f]    new database (branch main), or import file f
   offshoot checkout <db>[@branch]    materialize a working copy; prints its path
   offshoot checkpoint <db>[@branch] <name>   snapshot the checkout as a named checkpoint
-  offshoot fork <db>[@branch] <new> [--at cp] [--ttl duration|none]   branch from head or a checkpoint
+  offshoot fork <db>[@branch] <new> [--at cp] [--ttl duration]   branch from head or a checkpoint
   offshoot touch <db>[@branch] [--ttl duration|none]   reset a branch's activity clock, optionally (re)setting its TTL
   offshoot rollback <db>[@branch] --to <cp>       repoint a branch at a checkpoint
   offshoot promote <db>@<src> --onto <target> [--force]   repoint target at src's head
@@ -131,6 +131,26 @@ func parseTTLFlag(raw string) (time.Duration, error) {
 	return time.ParseDuration(raw)
 }
 
+// parseForkTTLFlag turns fork's --ttl flag into a duration. Unlike
+// parseTTLFlag (touch), fork has no "none" sentinel: a brand-new branch has
+// no existing TTL to explicitly clear, so a caller that wants no TTL simply
+// omits --ttl. A non-positive duration ("none", "0s", "-1h", ...) is
+// refused rather than silently treated as no TTL — swallowing it would fork
+// a TTL-less branch while the caller believes it asked for one.
+func parseForkTTLFlag(raw string) (time.Duration, error) {
+	if raw == "none" {
+		return 0, fmt.Errorf(`fork has no "none" concept; omit --ttl for no TTL`)
+	}
+	d, err := time.ParseDuration(raw)
+	if err != nil {
+		return 0, err
+	}
+	if d <= 0 {
+		return 0, fmt.Errorf(`fork --ttl %q must be positive; omit --ttl for no TTL`, raw)
+	}
+	return d, nil
+}
+
 func main() {
 	if err := run(os.Args[1:]); err != nil {
 		fmt.Fprintln(os.Stderr, "offshoot:", err)
@@ -186,21 +206,25 @@ func run(args []string) error {
 		fs := rest
 		at, fs, _, err := extractFlag(fs, "--at")
 		if err != nil {
-			return fmt.Errorf("usage: offshoot fork <db>[@branch] <new-branch> [--at checkpoint] [--ttl duration|none]: %w", err)
+			return fmt.Errorf("usage: offshoot fork <db>[@branch] <new-branch> [--at checkpoint] [--ttl duration]: %w", err)
 		}
 		ttlRaw, fs, hasTTL, err := extractFlag(fs, "--ttl")
 		if err != nil {
-			return fmt.Errorf("usage: offshoot fork <db>[@branch] <new-branch> [--at checkpoint] [--ttl duration|none]: %w", err)
+			return fmt.Errorf("usage: offshoot fork <db>[@branch] <new-branch> [--at checkpoint] [--ttl duration]: %w", err)
 		}
 		ttl := time.Duration(0)
 		if hasTTL {
-			ttl, err = parseTTLFlag(ttlRaw)
+			// fork has no "none" sentinel the way touch does (a brand-new
+			// branch has no existing TTL to explicitly clear), and a
+			// non-positive duration is refused rather than silently treated
+			// as no TTL — see parseForkTTLFlag.
+			ttl, err = parseForkTTLFlag(ttlRaw)
 			if err != nil {
 				return err
 			}
 		}
 		if len(fs) != 2 {
-			return fmt.Errorf("usage: offshoot fork <db>[@branch] <new-branch> [--at checkpoint] [--ttl duration|none]")
+			return fmt.Errorf("usage: offshoot fork <db>[@branch] <new-branch> [--at checkpoint] [--ttl duration]")
 		}
 		db, branch, err := ops.ParseTarget(fs[0])
 		if err != nil {
