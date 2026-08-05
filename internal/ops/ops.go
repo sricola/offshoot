@@ -22,6 +22,7 @@ import (
 	"time"
 
 	_ "github.com/mattn/go-sqlite3"
+	"github.com/offshoot-db/offshoot/internal/dbfile"
 	"github.com/offshoot-db/offshoot/internal/ltxio"
 	"github.com/offshoot-db/offshoot/internal/store"
 )
@@ -310,14 +311,34 @@ func checkoutState(path string, ref store.Ref) string {
 	return "clean"
 }
 
+// fileSum is the SHA-256 of a checkout file's bytes, used by checkoutState
+// to tell "clean" from "modified".
+//
+// It reads through internal/dbfile rather than os.Open/defer Close, and that
+// is load-bearing rather than stylistic. path here is a live checkout, and a
+// session's capture engine may hold SQLite connections on it in this same
+// process. POSIX advisory locks are keyed by (process, inode), so an ordinary
+// open/close of this file would drop every lock this process holds on it —
+// silently, with no error, and without SQLite noticing or re-acquiring —
+// leaving that engine running unlocked until a foreign writer's close-time
+// checkpoint folds and unlinks the WAL out from under it. See dbfile's
+// package comment for the full mechanism.
+//
+// It is tempting to argue this is unreachable because the only caller path
+// (warnIfUncheckpointed) runs quiesce first, and quiesce fails busy against
+// an engine that holds its read lock — verified empirically. That argument
+// is a race, not an invariant: the engine releases and re-takes that lock
+// around every takeover() and rebase(), so a quiesce landing in one of those
+// windows succeeds and this function then runs against an engine that has
+// since re-locked. Do not reintroduce a bare os.Open here on the strength of
+// the quiesce guard.
 func fileSum(path string) (string, error) {
-	f, err := os.Open(path)
+	r, err := dbfile.Reader(path)
 	if err != nil {
 		return "", err
 	}
-	defer f.Close()
 	h := sha256.New()
-	if _, err := io.Copy(h, f); err != nil {
+	if _, err := io.Copy(h, r); err != nil {
 		return "", err
 	}
 	return hex.EncodeToString(h.Sum(nil)), nil
@@ -357,6 +378,16 @@ func copyFile(from, to string) error {
 // Checkpoint snapshots the current checkout state as a named checkpoint.
 // Plan-2 (CLI/at-rest) semantics: full-snapshot encode; requires the
 // checkout to be quiescible (busy timeout 3s, then clean failure).
+//
+// NOT SAFE against a live in-process session's checkout: it calls
+// ltxio.EncodeSnapshot, which raw-opens (and closes) the checkout path, and
+// that close drops every SQLite lock this process holds on it — the POSIX
+// (process, inode) lock-drop hazard, see internal/dbfile. Today only the CLI
+// (cmd/offshoot) and MCP (internal/mcp) reach this, both of which are
+// separate processes from the daemon that runs sessions, so no in-process
+// session can be holding that checkout. The daemon conspicuously has no
+// checkpoint op; if one is ever added it MUST NOT call this directly —
+// route the snapshot through the session's own engine, or through dbfile.
 func (w *Workspace) Checkpoint(db, branch, name string) (uint64, error) {
 	if err := store.ValidateName(db); err != nil {
 		return 0, err
