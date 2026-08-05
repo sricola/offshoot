@@ -83,11 +83,27 @@ func (s *Server) SocketPath() string { return s.sock }
 // Sessions opened by this daemon hold live leases, so the janitor can never
 // reap a branch this daemon is actively writing to (see ttlDeadline: a live
 // lease only ever pushes a branch's deadline into the future).
+//
+// Refuses to start once Shutdown has begun (s.closing): Shutdown's own
+// close(s.janitorStop)+janitorWG.Wait() sequence assumes every Add it needs
+// to wait for has already happened. A janitorWG.Add racing after Shutdown's
+// Wait could observe the counter at zero and return early, or — per
+// sync.WaitGroup's contract that a positive-delta Add must happen before any
+// Wait call it's meant to be counted by — panic outright. Checking and
+// adding under s.mu, the same lock Shutdown takes to set closing, makes the
+// two calls linearize: either this call observes closing and backs off, or
+// it wins the race and its Add is guaranteed visible to Shutdown's Wait.
 func (s *Server) StartJanitor(every, grace time.Duration) {
 	if every <= 0 {
 		return
 	}
+	s.mu.Lock()
+	if s.closing {
+		s.mu.Unlock()
+		return
+	}
 	s.janitorWG.Add(1)
+	s.mu.Unlock()
 	go func() {
 		defer s.janitorWG.Done()
 		t := time.NewTicker(every)
@@ -348,14 +364,17 @@ func (s *Server) opClose(req Request) Response {
 //
 // Ordering here is load-bearing:
 //
-//  0. The janitor is stopped FIRST, before anything else below: it runs
-//     Reap/GC independently of the sessions map and s.mu, so nothing else in
-//     this ordering waits for or depends on it — but it must not still be
-//     running once sessions start closing (near the end of this function),
-//     since a session close releases that branch's lease, and a reap racing
-//     that release could observe a lease in a transient state it was never
-//     meant to see. Stopping it first, before the listener even closes,
-//     keeps that window from ever opening.
+//  0. The janitor's stop SIGNAL goes out first (close(s.janitorStop),
+//     immediately after closing is set), but Shutdown does not block
+//     waiting for it to actually finish until after the listener and live
+//     connections are closed below — a slow in-flight Reap/GC cycle must
+//     not delay shedding new connections. It still must be fully stopped
+//     before sessions start closing (near the end of this function), since a
+//     session close releases that branch's lease, and a reap racing that
+//     release could observe a lease in a transient state it was never meant
+//     to see. The wait for it is ordered right after the connection-close
+//     block and before anything session-related, which is early enough to
+//     guarantee that.
 //  1. closing is set first, under s.mu, before anything else. opOpen checks
 //     closing under the same lock before it ever reserves a slot or calls
 //     s.openWG.Add, so once this store completes no new Add can race with
@@ -386,7 +405,27 @@ func (s *Server) Shutdown(ctx context.Context) error {
 	s.closing = true
 	s.mu.Unlock()
 
+	// Signal the janitor to stop now — cheap and non-blocking, so it starts
+	// winding down immediately. The actual wait for it to finish (which can
+	// block for as long as its in-flight Reap/GC cycle takes) happens below,
+	// AFTER the listener and live connections are closed, so a slow janitor
+	// cycle never delays the daemon from shedding the listener and existing
+	// connections. It still must finish before sessions start closing (see
+	// item 0 above), so the wait stays ahead of the openWG/session-close
+	// sequence that follows.
 	close(s.janitorStop)
+
+	s.ln.Close()
+
+	// Close every live connection so a handle goroutine blocked in Decode
+	// (or about to Encode a response on a connection nobody will read again)
+	// unblocks and returns instead of leaking until its client disconnects.
+	s.connMu.Lock()
+	for c := range s.conns {
+		c.Close()
+	}
+	s.connMu.Unlock()
+
 	janitorWait := make(chan struct{})
 	go func() {
 		s.janitorWG.Wait()
@@ -399,17 +438,6 @@ func (s *Server) Shutdown(ctx context.Context) error {
 		// rather than retry a stop that never completed.
 		return fmt.Errorf("daemon: shutdown: timed out waiting for the janitor: %w", ctx.Err())
 	}
-
-	s.ln.Close()
-
-	// Close every live connection so a handle goroutine blocked in Decode
-	// (or about to Encode a response on a connection nobody will read again)
-	// unblocks and returns instead of leaking until its client disconnects.
-	s.connMu.Lock()
-	for c := range s.conns {
-		c.Close()
-	}
-	s.connMu.Unlock()
 
 	openWait := make(chan struct{})
 	go func() {

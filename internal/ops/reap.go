@@ -52,6 +52,14 @@ func (w *Workspace) Reap(now time.Time) ([]string, error) {
 func (w *Workspace) reapOne(db, branch string, now time.Time) (bool, error) {
 	ref, etag, err := w.Store.GetRef(db, branch)
 	if err != nil {
+		if errors.Is(err, store.ErrNotFound) {
+			// Listed by ListRefs but gone by the time we read it: destroyed
+			// (by an operator, or by a sibling reapOne call in this same
+			// Reap pass — see Rollback/Destroy) in the window between the
+			// two. Not this call's problem to report; the branch is already
+			// exactly as reaped as it needs to be.
+			return false, nil
+		}
 		return false, err
 	}
 	if ref.TTL == "" || ref.Protected {

@@ -791,14 +791,16 @@ type BranchStatus struct {
 
 // ttlDeadline computes when ref's TTL expires, measured from the later of
 // its activity clock (TouchedAt) and its lease expiry — either kind of
-// activity defers reaping. ok is false when ref has no TTL, or its TTL or
+// activity defers reaping. ok is false when ref has no TTL, its TTL is
+// non-positive (a negative or zero duration string is not a real TTL — fail
+// closed rather than compute a deadline already in the past), or its TTL or
 // timestamps fail to parse.
 func ttlDeadline(ref store.Ref) (time.Time, bool) {
 	if ref.TTL == "" {
 		return time.Time{}, false
 	}
 	d, err := time.ParseDuration(ref.TTL)
-	if err != nil {
+	if err != nil || d <= 0 {
 		return time.Time{}, false
 	}
 	base, ok := parseRefTime(ref.TouchedAt)
