@@ -4,6 +4,7 @@ import (
 	"errors"
 	"strings"
 	"testing"
+	"time"
 )
 
 func newStore(t *testing.T) *Store {
@@ -321,4 +322,39 @@ func TestChainPrefersTheHigherEpochForSegments(t *testing.T) {
 				i, got[1].Epoch)
 		}
 	}
+}
+
+func TestRefTTLFieldsRoundTripAndOldRefsDecode(t *testing.T) {
+	s := newStore(t)
+	if err := s.InitManifest(); err != nil {
+		t.Fatal(err)
+	}
+	r := Ref{Schema: 2, Lineage: "lin1", Epoch: 1, HeadTXID: 3, HeadEpoch: 1}
+	r.TTL = "2h"
+	r.Touch(time.Date(2026, 8, 5, 12, 0, 0, 0, time.UTC))
+	etag, err := s.PutRef("app", "b", r, "")
+	if err != nil {
+		t.Fatal(err)
+	}
+	got, _, err := s.GetRef("app", "b")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got.TTL != "2h" || got.TouchedAt != "2026-08-05T12:00:00Z" {
+		t.Fatalf("TTL fields did not round-trip: %+v", got)
+	}
+	// A ref written without the new fields (a Plan-7 ref) must decode with
+	// them empty — no TTL means never reaped.
+	old := Ref{Schema: 2, Lineage: "lin2", Epoch: 1, HeadTXID: 1, HeadEpoch: 1}
+	if _, err := s.PutRef("app", "old", old, ""); err != nil {
+		t.Fatal(err)
+	}
+	gotOld, _, err := s.GetRef("app", "old")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if gotOld.TTL != "" || gotOld.TouchedAt != "" || gotOld.Reaping {
+		t.Fatalf("plain ref grew TTL state: %+v", gotOld)
+	}
+	_ = etag
 }

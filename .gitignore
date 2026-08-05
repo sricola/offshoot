@@ -2,3 +2,7 @@
 *.db-wal
 *.db-shm
 /bin/
+sdk/typescript/node_modules/
+sdk/typescript/dist/
+sdk/typescript/test-dist/
+__pycache__/

@@ -131,7 +131,7 @@ func TestEveryFlushIsExactlyMaterializable(t *testing.T) {
 		// Every checkpoint so far must still materialize to the right row count.
 		for j := 0; j <= i; j++ {
 			br := fmt.Sprintf("check-%d-%d", i, j)
-			if _, err := w.Fork("app", "main", br, fmt.Sprintf("cp%d", j)); err != nil {
+			if _, err := w.Fork("app", "main", br, fmt.Sprintf("cp%d", j), 0); err != nil {
 				t.Fatalf("fork at cp%d: %v", j, err)
 			}
 			p, err := w.Checkout("app", br)

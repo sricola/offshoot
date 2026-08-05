@@ -12,10 +12,24 @@ package daemon
 
 // Request is one client request sent to the daemon.
 type Request struct {
-	Op     string `json:"op"` // "open" | "flush" | "status" | "close" | "shutdown"
+	// Op is one of: "open" | "flush" | "status" | "close" | "shutdown" |
+	// "create" | "checkout" | "fork" | "destroy" | "rollback" | "promote" |
+	// "touch" | "branches".
+	Op     string `json:"op"`
 	DB     string `json:"db,omitempty"`
-	Branch string `json:"branch,omitempty"`
-	Name   string `json:"name,omitempty"` // checkpoint name for flush
+	Branch string `json:"branch,omitempty"` // also: fork/promote source branch
+	// Name is overloaded by op: checkpoint name (flush, rollback),
+	// new-branch name (fork), or promote target branch.
+	Name string `json:"name,omitempty"`
+	// From is fork's source checkpoint name ("" = source branch's head).
+	From string `json:"from,omitempty"`
+	// TTL is a Go duration string. For fork/touch: "" means no change (fork:
+	// no TTL; touch: keep the current TTL); touch additionally accepts
+	// "none" to clear the TTL.
+	TTL string `json:"ttl,omitempty"`
+	// Force overrides protected-branch/live-lease refusals for destroy and
+	// promote (passed through to ops.Destroy/ops.Promote).
+	Force bool `json:"force,omitempty"`
 }
 
 // Response is the daemon's reply to a single Request.
@@ -25,6 +39,24 @@ type Response struct {
 	Checkout string        `json:"checkout,omitempty"`
 	TXID     uint64        `json:"txid,omitempty"`
 	Sessions []SessionInfo `json:"sessions,omitempty"`
+	Branches []BranchInfo  `json:"branches,omitempty"`
+}
+
+// BranchInfo describes one branch of one db, as returned by the "branches"
+// op.
+type BranchInfo struct {
+	Branch    string `json:"branch"`
+	HeadTXID  uint64 `json:"head_txid"`
+	Protected bool   `json:"protected"`
+	// TTL is the branch's TTL verbatim from the ref: time.Duration's
+	// canonical String() re-render (e.g. a fork requested with ttl "1h"
+	// reads back here as "1h0m0s"), not necessarily the literal string a
+	// client last sent. Safe to echo straight back as a future fork/touch
+	// request's TTL — it always round-trips through time.ParseDuration.
+	TTL          string   `json:"ttl,omitempty"`
+	TTLRemaining string   `json:"ttl_remaining,omitempty"`
+	LeaseHolder  string   `json:"lease_holder,omitempty"`
+	Checkpoints  []string `json:"checkpoints,omitempty"` // sorted names
 }
 
 // SessionInfo describes one session open in the daemon, as returned by the
