@@ -47,7 +47,7 @@ import (
 //     blind spot: any byte difference, regardless of file size or write
 //     timing, changes the hash. Cost: a full-file read at every clean
 //     shutdown and every resume attempt. Acceptable for this spike's target
-//     session sizes (MBs to low-single-digit GBs) — see hashFile's doc
+//     session sizes (MBs to low-single-digit GBs) — see hashSrc's doc
 //     comment in engine.go for the Plan-2 note (LTX's cumulative checksums
 //     subsume this and should replace it).
 //

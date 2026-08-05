@@ -17,6 +17,7 @@ import (
 	"time"
 
 	_ "github.com/mattn/go-sqlite3"
+	"github.com/offshoot-db/offshoot/internal/dbfile"
 	"github.com/offshoot-db/offshoot/internal/wal"
 )
 
@@ -264,6 +265,12 @@ func (e *Engine) DrainNow(ctx context.Context) error {
 func (e *Engine) Run(ctx context.Context) error {
 	defer close(e.done)
 	var err error
+	// NOTE: this function deliberately opens NO descriptor of its own on the
+	// main database file, and in particular closes none at teardown. Raw
+	// reads of that file go through internal/dbfile, whose descriptors are
+	// never closed — see copySrc/hashSrc below and dbfile's package comment
+	// for the POSIX (process, inode) lock semantics that make an engine-owned
+	// descriptor unsafe no matter how carefully its close is ordered.
 	e.db, err = sql.Open("sqlite3",
 		e.o.DBPath+"?_busy_timeout=5000&_journal_mode=WAL")
 	if err != nil {
@@ -301,7 +308,7 @@ func (e *Engine) Run(ctx context.Context) error {
 	// Resumed() already holds its final value at this point (tryResume sets
 	// it synchronously before returning) even though the rebase() call just
 	// below, when it runs, can still take a while (checkpoint + full-file
-	// copy + full-file hash — see rebase's and hashFile's doc comments).
+	// copy + full-file hash — see rebase's and hashSrc's doc comments).
 	// Closing ready here, rather than after that optional call, is what lets
 	// WaitReady's caller (Session.Open, see its doc comment there) learn the
 	// resume verdict promptly without also having to wait out an ordinary
@@ -691,7 +698,7 @@ func (e *Engine) shutdown() {
 	// checkpoint that folded everything we've captured into it. This is
 	// tryResume's condition (2) — see its doc comment for why WAL-emptiness
 	// alone isn't sufficient proof that nothing happened while we were down.
-	hash, err := hashFile(e.o.DBPath)
+	hash, err := e.hashSrc()
 	if err != nil {
 		// Can't fingerprint ⇒ can't offer a safe resume point. Same
 		// fallback: leave state as-is, next start rebases.
@@ -1163,7 +1170,7 @@ func (e *Engine) tryResume(ctx context.Context) (bool, error) {
 	// our shutdown's fingerprint (see doc comment above for why this is
 	// needed in addition to WAL-emptiness, and why a hash rather than
 	// mtime+size).
-	hash, err := hashFile(e.o.DBPath)
+	hash, err := e.hashSrc()
 	if err != nil {
 		e.endRead(ctx)
 		return false, nil // can't hash the main file ⇒ can't prove continuity ⇒ rebase
@@ -1204,11 +1211,11 @@ func (e *Engine) rebase(ctx context.Context) error {
 		// that can never converge.
 		return fmt.Errorf("rebase: checkpoint TRUNCATE: %w", err)
 	}
-	// Copy-window note: from here until copyFile below returns, no read lock
+	// Copy-window note: from here until copySrc below returns, no read lock
 	// is held — endRead() already ran above, and beginRead() doesn't run
 	// again until after the copy. A foreign writer can commit in that
 	// window, and a passive checkpoint (its own, or SQLite's automatic one)
-	// can fold those new frames into the main DB file while copyFile is
+	// can fold those new frames into the main DB file while copySrc is
 	// mid-read, so the snapshot produced here may include bytes this
 	// session's WAL reader never saw pass through Apply.
 	//
@@ -1221,7 +1228,19 @@ func (e *Engine) rebase(ctx context.Context) error {
 	// half-copied page the race could have produced, rather than
 	// compounding it. See the Sink interface doc comment above for the
 	// consequence this has for a sink's Apply/Rebase overlap contract.
-	if err := copyFile(e.o.DBPath, e.snapshotPath()); err != nil {
+	//
+	// One further wrinkle now that the copy reads through an io.SectionReader
+	// (see srcReader): the section's length is the file's size as of the
+	// moment the reader is obtained, so a foreign writer that GROWS the main
+	// file mid-copy — a checkpoint folding frames that extend the database —
+	// has its extra pages truncated out of the snapshot rather than
+	// half-copied into it. That is strictly the safer of the two outcomes and
+	// needs no extra handling for the same reason the torn-page case above
+	// needs none: every frame in the current WAL generation is re-applied on
+	// top of this snapshot by the fresh reader bound just below, so pages the
+	// snapshot is missing or has stale are written again at their original
+	// pgno. A short snapshot heals; it does not diverge.
+	if err := e.copySrc(e.snapshotPath()); err != nil {
 		return err
 	}
 	if err := e.beginRead(ctx); err != nil {
@@ -1374,8 +1393,30 @@ func (e *Engine) checkpoint(ctx context.Context, mode string) (log int, err erro
 	}
 }
 
-// hashFile returns the lowercase-hex SHA-256 of the file at path, computed
-// by streaming its full contents (io.Copy into the hash, not a full
+// srcReader returns a reader over the whole main database file as it exists
+// right now, obtained from internal/dbfile rather than by opening a
+// descriptor of this engine's own.
+//
+// The indirection is the entire fix for a silent capture failure, so it is
+// worth being precise about why an engine-owned descriptor cannot work here,
+// even one carefully closed last at teardown. POSIX advisory locks are keyed
+// by (process, inode): closing any descriptor drops every lock the PROCESS
+// holds on that file, including locks belonging to SQLite connections this
+// engine does not own and cannot see — another session's engine on the same
+// checkout, or an application connection a caller is holding open across
+// this engine's lifetime. An engine-scoped descriptor is therefore safe only
+// if this engine is the last thing in the process touching that file, which
+// is precisely what an engine cannot know. dbfile's descriptors are never
+// closed at all, which is the only formulation that is unconditionally safe.
+// See dbfile's package comment; TestEngineResumesCleanly and
+// TestEngineResumeAppliesNothingBeforeNewWrite are the regression tests
+// (both hold a foreign connection open across an engine bounce).
+func (e *Engine) srcReader() (*io.SectionReader, error) {
+	return dbfile.Reader(e.o.DBPath)
+}
+
+// hashSrc returns the lowercase-hex SHA-256 of the main database file,
+// computed by streaming its full contents (io.Copy into the hash, not a full
 // in-memory read).
 //
 // Plan-2 note: this re-hashes the entire main DB file on every clean
@@ -1388,30 +1429,33 @@ func (e *Engine) checkpoint(ctx context.Context, mode string) (log int, err erro
 // happen; once that lands, this whole-file re-hash should be replaced by
 // comparing against LTX's own running checksum instead of re-deriving one
 // from scratch here.
-func hashFile(path string) (string, error) {
-	f, err := os.Open(path)
+func (e *Engine) hashSrc() (string, error) {
+	r, err := e.srcReader()
 	if err != nil {
 		return "", err
 	}
-	defer f.Close()
 	h := sha256.New()
-	if _, err := io.Copy(h, f); err != nil {
+	if _, err := io.Copy(h, r); err != nil {
 		return "", err
 	}
 	return hex.EncodeToString(h.Sum(nil)), nil
 }
 
-func copyFile(from, to string) error {
-	in, err := os.Open(from)
+// copySrc copies the main database file to `to`. Only the destination
+// descriptor is opened and closed here; the source is read through
+// srcReader. Closing the destination is safe precisely because SQLite holds
+// no locks on it — it is a fresh snapshot path, not the database this engine
+// has open.
+func (e *Engine) copySrc(to string) error {
+	r, err := e.srcReader()
 	if err != nil {
 		return err
 	}
-	defer in.Close()
 	out, err := os.Create(to)
 	if err != nil {
 		return err
 	}
-	if _, err := io.Copy(out, in); err != nil {
+	if _, err := io.Copy(out, r); err != nil {
 		out.Close()
 		return err
 	}
