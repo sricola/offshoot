@@ -81,7 +81,7 @@ func (s *Server) SocketPath() string { return s.sock }
 // entirely (no goroutine is started).
 //
 // Sessions opened by this daemon hold live leases, so the janitor can never
-// reap a branch this daemon is actively writing to (see ttlDeadline: a live
+// reap a branch this daemon is actively writing to (see ops.ReapDeadline: a live
 // lease only ever pushes a branch's deadline into the future).
 //
 // Refuses to start once Shutdown has begun (s.closing): Shutdown's own
@@ -179,6 +179,22 @@ func (s *Server) dispatch(req Request) Response {
 	case "shutdown":
 		go s.Shutdown(context.Background())
 		return Response{OK: true}
+	case "create":
+		return s.opCreate(req)
+	case "checkout":
+		return s.opCheckoutAtRest(req)
+	case "fork":
+		return s.opFork(req)
+	case "destroy":
+		return s.opDestroy(req)
+	case "rollback":
+		return s.opRollback(req)
+	case "promote":
+		return s.opPromote(req)
+	case "touch":
+		return s.opTouch(req)
+	case "branches":
+		return s.opBranches(req)
 	default:
 		return errResp(fmt.Errorf("daemon: unknown op %q", req.Op))
 	}
@@ -355,6 +371,223 @@ func (s *Server) opClose(req Request) Response {
 		return errResp(err)
 	}
 	return Response{OK: true}
+}
+
+// openSession returns the live session for db@branch and true if this
+// daemon has one open, or (nil, false) otherwise (including while an open
+// for that key is still in flight — a reserved-but-nil slot does not
+// count). Used by the lifecycle ops below both to guard against operating
+// on a branch this daemon has open, and (fork/promote) to find the session
+// to flush first.
+func (s *Server) openSession(db, branch string) (*session.Session, bool) {
+	if branch == "" {
+		branch = "main"
+	}
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	sess, ok := s.sessions[key(db, branch)]
+	if !ok || sess == nil {
+		return nil, false
+	}
+	return sess, true
+}
+
+// opCreate creates a fresh db (main branch at TXID 1). Validation
+// (name shape) lives in ops.Create; this handler stays thin.
+func (s *Server) opCreate(req Request) Response {
+	if err := s.ws.Create(req.DB); err != nil {
+		return errResp(err)
+	}
+	return Response{OK: true}
+}
+
+// opCheckoutAtRest materializes db@branch's head snapshot to its fixed
+// checkout path (ops.Checkout) and returns that path. Refuses if this
+// daemon already has an open session on that branch — the session already
+// owns that checkout path and is the one place writes to it should go
+// through.
+func (s *Server) opCheckoutAtRest(req Request) Response {
+	branch := req.Branch
+	if branch == "" {
+		branch = "main"
+	}
+	if _, open := s.openSession(req.DB, branch); open {
+		return errResp(fmt.Errorf("daemon: %s is open here; close the session first", key(req.DB, branch)))
+	}
+	path, err := s.ws.Checkout(req.DB, branch)
+	if err != nil {
+		return errResp(err)
+	}
+	return Response{OK: true, Checkout: path}
+}
+
+// opFork creates req.Name as a new branch forked from req.Branch (source)
+// at checkpoint req.From ("" = source's head), with TTL req.TTL ("" = no
+// TTL; else a Go duration). If this daemon has an open session on the
+// source, that session is flushed (unnamed) first so the fork point
+// includes writes the caller never explicitly flushed — matching Fork's
+// semantics for a session that owns the source's checkout. Returns the
+// fork point's txid.
+func (s *Server) opFork(req Request) Response {
+	branch := req.Branch
+	if branch == "" {
+		branch = "main"
+	}
+	var ttl time.Duration
+	if req.TTL != "" {
+		d, err := time.ParseDuration(req.TTL)
+		if err != nil {
+			return errResp(fmt.Errorf("daemon: invalid ttl %q: %w", req.TTL, err))
+		}
+		ttl = d
+	}
+	if sess, open := s.openSession(req.DB, branch); open {
+		if _, err := sess.Flush(""); err != nil {
+			return errResp(fmt.Errorf("daemon: flush %s before fork: %w", key(req.DB, branch), err))
+		}
+	}
+	txid, err := s.ws.Fork(req.DB, branch, req.Name, req.From, ttl)
+	if err != nil {
+		return errResp(err)
+	}
+	return Response{OK: true, TXID: txid}
+}
+
+// opDestroy deletes db@branch (ops.Destroy; req.Force overrides the
+// protected-branch and live-lease refusals ops.Destroy itself enforces).
+// Refuses if this daemon has an open session on the branch — closing it
+// first, not force, is the way to destroy a branch you're writing to here.
+func (s *Server) opDestroy(req Request) Response {
+	branch := req.Branch
+	if branch == "" {
+		branch = "main"
+	}
+	if _, open := s.openSession(req.DB, branch); open {
+		return errResp(fmt.Errorf("daemon: %s is open here; close the session first", key(req.DB, branch)))
+	}
+	if err := s.ws.Destroy(req.DB, branch, req.Force); err != nil {
+		return errResp(err)
+	}
+	return Response{OK: true}
+}
+
+// opRollback repoints db@branch at checkpoint req.Name (ops.Rollback) and
+// returns the refreshed checkout path. Refuses if this daemon has an open
+// session on the branch, for the same reason as opDestroy: the session
+// owns the checkout that a rollback would repoint out from under it.
+func (s *Server) opRollback(req Request) Response {
+	branch := req.Branch
+	if branch == "" {
+		branch = "main"
+	}
+	if _, open := s.openSession(req.DB, branch); open {
+		return errResp(fmt.Errorf("daemon: %s is open here; close the session first", key(req.DB, branch)))
+	}
+	path, err := s.ws.Rollback(req.DB, branch, req.Name)
+	if err != nil {
+		return errResp(err)
+	}
+	return Response{OK: true, Checkout: path}
+}
+
+// opPromote repoints db@req.Name (target) at db@req.Branch's (source) head
+// (ops.Promote; req.Force overrides the protected-target refusal). Refuses
+// if this daemon has an open session on the TARGET, matching opDestroy and
+// opRollback's guard. If the SOURCE has an open session here, it is
+// flushed (unnamed) first, matching opFork, so an un-flushed write on the
+// source still lands. Returns the promoted txid.
+func (s *Server) opPromote(req Request) Response {
+	source := req.Branch
+	if source == "" {
+		source = "main"
+	}
+	target := req.Name
+	if target == "" {
+		target = "main"
+	}
+	if _, open := s.openSession(req.DB, target); open {
+		return errResp(fmt.Errorf("daemon: %s is open here; close the session first", key(req.DB, target)))
+	}
+	if sess, open := s.openSession(req.DB, source); open {
+		if _, err := sess.Flush(""); err != nil {
+			return errResp(fmt.Errorf("daemon: flush %s before promote: %w", key(req.DB, source), err))
+		}
+	}
+	txid, err := s.ws.Promote(req.DB, source, target, req.Force)
+	if err != nil {
+		return errResp(err)
+	}
+	return Response{OK: true, TXID: txid}
+}
+
+// opTouch resets db@branch's activity clock and optionally sets/clears its
+// TTL (ops.Touch): req.TTL == "" keeps the current TTL, "none" clears it,
+// anything else is parsed as a Go duration and becomes the new TTL (a
+// parse failure is reported as ok=false rather than silently ignored).
+// Returns nothing beyond ok.
+func (s *Server) opTouch(req Request) Response {
+	branch := req.Branch
+	if branch == "" {
+		branch = "main"
+	}
+	var ttl *time.Duration
+	switch req.TTL {
+	case "":
+		ttl = nil
+	case "none":
+		var zero time.Duration
+		ttl = &zero
+	default:
+		d, err := time.ParseDuration(req.TTL)
+		if err != nil {
+			return errResp(fmt.Errorf("daemon: invalid ttl %q: %w", req.TTL, err))
+		}
+		ttl = &d
+	}
+	if _, err := s.ws.Touch(req.DB, branch, ttl, time.Now()); err != nil {
+		return errResp(err)
+	}
+	return Response{OK: true}
+}
+
+// opBranches lists every branch of req.DB as BranchInfo, sorted by branch
+// name. TTLRemaining is computed with ops.ReapDeadline, the same clock
+// logic the janitor's Reap uses, so a client sees exactly how long it has
+// before a branch becomes reap-eligible.
+func (s *Server) opBranches(req Request) Response {
+	refs, err := s.ws.Store.ListRefs()
+	if err != nil {
+		return errResp(err)
+	}
+	branches := refs[req.DB]
+	now := time.Now()
+	infos := make([]BranchInfo, 0, len(branches))
+	for _, br := range branches {
+		ref, _, err := s.ws.Store.GetRef(req.DB, br)
+		if err != nil {
+			return errResp(err)
+		}
+		cps := make([]string, 0, len(ref.Checkpoints))
+		for name := range ref.Checkpoints {
+			cps = append(cps, name)
+		}
+		sort.Strings(cps)
+		remaining := ""
+		if deadline, ok := ops.ReapDeadline(ref); ok {
+			if now.After(deadline) {
+				remaining = "expired"
+			} else {
+				remaining = deadline.Sub(now).String()
+			}
+		}
+		infos = append(infos, BranchInfo{
+			Branch: br, HeadTXID: ref.HeadTXID, Protected: ref.Protected,
+			TTL: ref.TTL, TTLRemaining: remaining, LeaseHolder: ref.LeaseHolder,
+			Checkpoints: cps,
+		})
+	}
+	sort.Slice(infos, func(i, j int) bool { return infos[i].Branch < infos[j].Branch })
+	return Response{OK: true, Branches: infos}
 }
 
 // Shutdown stops the janitor, stops accepting, refuses any further opens,

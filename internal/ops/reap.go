@@ -43,7 +43,7 @@ func (w *Workspace) Reap(now time.Time) ([]string, error) {
 }
 
 // reapOne reaps db@branch iff it is unprotected and its TTL has expired.
-// Expiry itself is computed by ttlDeadline (shared with Status): TTL counted
+// Expiry itself is computed by ReapDeadline (shared with Status): TTL counted
 // from the later of the activity clock and the lease expiry. That already
 // folds in "a live lease defers expiry" as a corollary — a live LeaseExpiry
 // is by definition still in the future, so it can only push the deadline
@@ -65,7 +65,7 @@ func (w *Workspace) reapOne(db, branch string, now time.Time) (bool, error) {
 	if ref.TTL == "" || ref.Protected {
 		return false, nil
 	}
-	deadline, ok := ttlDeadline(ref)
+	deadline, ok := ReapDeadline(ref)
 	if !ok {
 		if _, derr := time.ParseDuration(ref.TTL); derr != nil {
 			fmt.Fprintf(os.Stderr, "offshoot: warning: %s@%s has unparseable ttl %q; not reaping\n", db, branch, ref.TTL)
