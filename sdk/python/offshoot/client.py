@@ -46,14 +46,20 @@ def _ttl_str(ttl) -> str:
     """
     if ttl is None:
         return ""
+    # timedelta(0) == 0 is False in Python (timedelta only compares equal to
+    # another timedelta), so this must be checked before the "ttl == 0"
+    # literal-zero check below, or a caller passing timedelta(0) to mean
+    # "clear the TTL" (per this function's own docstring) would instead fall
+    # through to the timedelta branch and render "0s" — a TTL of zero
+    # seconds, not "no TTL".
+    if isinstance(ttl, timedelta):
+        return "none" if ttl == timedelta(0) else f"{int(ttl.total_seconds())}s"
     if ttl == 0 or ttl == "none":
         return "none"
     if isinstance(ttl, int) and not isinstance(ttl, bool):
         raise TypeError(
             f"ttl={ttl!r}: a nonzero int is ambiguous; use a timedelta or a "
             'Go duration string (e.g. "1h", "3600s")')
-    if isinstance(ttl, timedelta):
-        return f"{int(ttl.total_seconds())}s"
     return str(ttl)  # a Go duration string like "2h"
 
 
@@ -67,6 +73,12 @@ class Client:
 
     Use as a context manager, or call :meth:`close` explicitly, to release
     the underlying unix socket.
+
+    Not thread-safe: the wire protocol is one request, one response, no
+    pipelining, and this class keeps no lock around its socket and read
+    buffer, so concurrent calls from multiple threads can interleave and
+    corrupt each other's request/response framing. Use one Client per
+    thread.
     """
 
     def __init__(self, socket_path: str):
