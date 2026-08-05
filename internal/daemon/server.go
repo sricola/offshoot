@@ -11,6 +11,7 @@ import (
 	"os"
 	"sort"
 	"sync"
+	"time"
 
 	"github.com/offshoot-db/offshoot/internal/ops"
 	"github.com/offshoot-db/offshoot/internal/session"
@@ -41,6 +42,13 @@ type Server struct {
 
 	connMu sync.Mutex
 	conns  map[net.Conn]struct{} // live accepted connections; Shutdown closes them all
+
+	// janitorStop, closed by Shutdown, tells StartJanitor's loop to exit;
+	// janitorWG lets Shutdown wait for that exit before it proceeds. Both
+	// are always initialized (in NewServer) even if StartJanitor is never
+	// called, so Shutdown's close+Wait is unconditionally safe.
+	janitorStop chan struct{}
+	janitorWG   sync.WaitGroup
 }
 
 func key(db, branch string) string { return db + "@" + branch }
@@ -58,11 +66,49 @@ func NewServer(ws *ops.Workspace, socketPath string) (*Server, error) {
 		return nil, err
 	}
 	return &Server{ws: ws, ln: ln, sock: socketPath,
-		sessions: map[string]*session.Session{},
-		conns:    map[net.Conn]struct{}{}}, nil
+		sessions:    map[string]*session.Session{},
+		conns:       map[net.Conn]struct{}{},
+		janitorStop: make(chan struct{}),
+	}, nil
 }
 
 func (s *Server) SocketPath() string { return s.sock }
+
+// StartJanitor reaps expired branches and runs GC every interval until
+// Shutdown. grace is passed to GC (tombstone age before deletion); the
+// default in cmd is deliberately generous — the spec requires it to exceed
+// the longest plausible in-flight fork. every <= 0 disables the janitor
+// entirely (no goroutine is started).
+//
+// Sessions opened by this daemon hold live leases, so the janitor can never
+// reap a branch this daemon is actively writing to (see ttlDeadline: a live
+// lease only ever pushes a branch's deadline into the future).
+func (s *Server) StartJanitor(every, grace time.Duration) {
+	if every <= 0 {
+		return
+	}
+	s.janitorWG.Add(1)
+	go func() {
+		defer s.janitorWG.Done()
+		t := time.NewTicker(every)
+		defer t.Stop()
+		for {
+			select {
+			case <-s.janitorStop: // closed by Shutdown before it waits on janitorWG
+				return
+			case <-t.C:
+				if reaped, err := s.ws.Reap(time.Now()); err != nil {
+					fmt.Fprintf(os.Stderr, "offshoot: janitor: reap: %v\n", err)
+				} else if len(reaped) > 0 {
+					fmt.Fprintf(os.Stderr, "offshoot: janitor: reaped %v\n", reaped)
+				}
+				if _, _, err := s.ws.GC(grace); err != nil {
+					fmt.Fprintf(os.Stderr, "offshoot: janitor: gc: %v\n", err)
+				}
+			}
+		}
+	}()
+}
 
 func (s *Server) Serve() error {
 	for {
@@ -295,13 +341,21 @@ func (s *Server) opClose(req Request) Response {
 	return Response{OK: true}
 }
 
-// Shutdown stops accepting, refuses any further opens, waits out every open
-// already in flight, closes every live session (so no lease is orphaned) and
-// every live connection (so no handle goroutine outlives it), and removes
-// the socket. It is safe to call twice.
+// Shutdown stops the janitor, stops accepting, refuses any further opens,
+// waits out every open already in flight, closes every live session (so no
+// lease is orphaned) and every live connection (so no handle goroutine
+// outlives it), and removes the socket. It is safe to call twice.
 //
 // Ordering here is load-bearing:
 //
+//  0. The janitor is stopped FIRST, before anything else below: it runs
+//     Reap/GC independently of the sessions map and s.mu, so nothing else in
+//     this ordering waits for or depends on it — but it must not still be
+//     running once sessions start closing (near the end of this function),
+//     since a session close releases that branch's lease, and a reap racing
+//     that release could observe a lease in a transient state it was never
+//     meant to see. Stopping it first, before the listener even closes,
+//     keeps that window from ever opening.
 //  1. closing is set first, under s.mu, before anything else. opOpen checks
 //     closing under the same lock before it ever reserves a slot or calls
 //     s.openWG.Add, so once this store completes no new Add can race with
@@ -331,6 +385,20 @@ func (s *Server) Shutdown(ctx context.Context) error {
 	}
 	s.closing = true
 	s.mu.Unlock()
+
+	close(s.janitorStop)
+	janitorWait := make(chan struct{})
+	go func() {
+		s.janitorWG.Wait()
+		close(janitorWait)
+	}()
+	select {
+	case <-janitorWait:
+	case <-ctx.Done():
+		// Note: closing stays true, so a later call to Shutdown will no-op
+		// rather than retry a stop that never completed.
+		return fmt.Errorf("daemon: shutdown: timed out waiting for the janitor: %w", ctx.Err())
+	}
 
 	s.ln.Close()
 
