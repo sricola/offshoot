@@ -133,6 +133,10 @@ func (s *Store) ReleaseLease(l Lease) error {
 	}
 	ref.LeaseHolder = ""
 	ref.LeaseExpiry = ""
+	// A lease that was just live counts as activity: stamping the clock here
+	// means a branch isn't instantly eligible for reaping the moment its
+	// session closes.
+	ref.Touch(time.Now())
 	if _, err := s.PutRef(l.DB, l.Branch, ref, etag); err != nil {
 		return fmt.Errorf("store: release lease on %s@%s: %w", l.DB, l.Branch, err)
 	}

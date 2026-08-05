@@ -324,7 +324,7 @@ func (t *OffshootTools) fork(args json.RawMessage) (ToolResult, error) {
 	if r, bad := validateNames(toValidate...); bad {
 		return r, nil
 	}
-	txid, err := t.ws.Fork(a.Database, branch, a.NewBranch, a.At)
+	txid, err := t.ws.Fork(a.Database, branch, a.NewBranch, a.At, 0)
 	if err != nil {
 		return ErrorResult("%v", err), nil
 	}

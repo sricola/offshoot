@@ -19,6 +19,7 @@ import (
 	"path/filepath"
 	"sort"
 	"strings"
+	"time"
 
 	_ "github.com/mattn/go-sqlite3"
 	"github.com/offshoot-db/offshoot/internal/ltxio"
@@ -411,6 +412,7 @@ func (w *Workspace) Checkpoint(db, branch, name string) (uint64, error) {
 	ref.HeadTXID = txid
 	ref.HeadEpoch = ref.Epoch
 	ref.SetCheckpoint(name, txid, ref.Epoch)
+	ref.Touch(time.Now())
 	if _, err := w.Store.PutRef(db, branch, ref, etag); err != nil {
 		// Decide whether to clean up the snapshot after PutRef failure.
 		// Unlike Fork/Rollback/Promote (which delete keys in freshly-minted
@@ -531,7 +533,9 @@ func (w *Workspace) copySnapshotToNewLineage(src store.Ref, cp store.Checkpoint)
 }
 
 // Fork creates newBranch from db@srcBranch at head or a named checkpoint.
-func (w *Workspace) Fork(db, srcBranch, newBranch, at string) (uint64, error) {
+// ttl > 0 sets the child's TTL (never the parent's — creating a child does
+// not extend the parent's activity clock either); ttl == 0 means no TTL.
+func (w *Workspace) Fork(db, srcBranch, newBranch, at string, ttl time.Duration) (uint64, error) {
 	if err := store.ValidateName(newBranch); err != nil {
 		return 0, err
 	}
@@ -560,6 +564,10 @@ func (w *Workspace) Fork(db, srcBranch, newBranch, at string) (uint64, error) {
 		Lineage: childLineage, Epoch: 1, HeadTXID: txid, HeadEpoch: 1,
 		Parent: fmt.Sprintf("%s@%s@%d", db, srcBranch, txid),
 	}
+	if ttl > 0 {
+		child.TTL = ttl.String()
+	}
+	child.Touch(time.Now())
 	child.SetCheckpoint("fork", txid, 1)
 	if _, err := w.Store.PutRef(db, newBranch, child, ""); err != nil {
 		// Branch already exists (or lost a race): remove the orphan snapshot.
@@ -657,6 +665,7 @@ func (w *Workspace) Rollback(db, branch, to string) (string, error) {
 	// stuck until the stale TTL lapses. Clear the lease so the branch is
 	// immediately acquirable post-repoint.
 	next.LeaseHolder, next.LeaseExpiry = "", ""
+	next.Touch(time.Now())
 	if _, err := w.Store.PutRef(db, branch, next, etag); err != nil {
 		cleanup()
 		return "", fmt.Errorf("ops: rollback lost a race (retry): %w", err)
@@ -741,6 +750,7 @@ func (w *Workspace) Promote(db, source, target string, force bool) (uint64, erro
 	// stuck until the stale TTL lapses. Clear the lease so the branch is
 	// immediately acquirable post-repoint.
 	next.LeaseHolder, next.LeaseExpiry = "", ""
+	next.Touch(time.Now())
 	if _, err := w.Store.PutRef(db, target, next, tgtEtag); err != nil {
 		w.Store.B.Delete(store.SnapshotKey(lineage, 1, txid))
 		return 0, fmt.Errorf("ops: promote lost a race (retry): %w", err)
@@ -771,6 +781,47 @@ type BranchStatus struct {
 	Protected   bool
 	Parent      string
 	CheckedOut  bool
+	// TTL is the branch's TTL verbatim from the ref ("" if none).
+	TTL string
+	// TTLRemaining is how long until the branch is eligible for reaping,
+	// measured from the later of TouchedAt and LeaseExpiry ("" if TTL is
+	// unset; "expired" once past the deadline).
+	TTLRemaining string
+}
+
+// ttlDeadline computes when ref's TTL expires, measured from the later of
+// its activity clock (TouchedAt) and its lease expiry — either kind of
+// activity defers reaping. ok is false when ref has no TTL, or its TTL or
+// timestamps fail to parse.
+func ttlDeadline(ref store.Ref) (time.Time, bool) {
+	if ref.TTL == "" {
+		return time.Time{}, false
+	}
+	d, err := time.ParseDuration(ref.TTL)
+	if err != nil {
+		return time.Time{}, false
+	}
+	base, ok := parseRefTime(ref.TouchedAt)
+	if !ok {
+		return time.Time{}, false
+	}
+	if lease, ok := parseRefTime(ref.LeaseExpiry); ok && lease.After(base) {
+		base = lease
+	}
+	return base.Add(d), true
+}
+
+// parseRefTime parses an RFC3339Nano ref timestamp field (TouchedAt or
+// LeaseExpiry), which is empty when unset.
+func parseRefTime(s string) (time.Time, bool) {
+	if s == "" {
+		return time.Time{}, false
+	}
+	t, err := time.Parse(time.RFC3339Nano, s)
+	if err != nil {
+		return time.Time{}, false
+	}
+	return t, true
 }
 
 func (w *Workspace) Status() ([]BranchStatus, error) {
@@ -783,6 +834,7 @@ func (w *Workspace) Status() ([]BranchStatus, error) {
 		dbs = append(dbs, db)
 	}
 	sort.Strings(dbs)
+	now := time.Now()
 	var out []BranchStatus
 	for _, db := range dbs {
 		for _, br := range refs[db] {
@@ -796,9 +848,18 @@ func (w *Workspace) Status() ([]BranchStatus, error) {
 			}
 			sort.Strings(cps)
 			_, coErr := os.Stat(w.CheckoutPath(db, br))
+			remaining := ""
+			if deadline, ok := ttlDeadline(r); ok {
+				if now.After(deadline) {
+					remaining = "expired"
+				} else {
+					remaining = deadline.Sub(now).String()
+				}
+			}
 			out = append(out, BranchStatus{
 				DB: db, Branch: br, HeadTXID: r.HeadTXID, Checkpoints: cps,
 				Protected: r.Protected, Parent: r.Parent, CheckedOut: coErr == nil,
+				TTL: r.TTL, TTLRemaining: remaining,
 			})
 		}
 	}
