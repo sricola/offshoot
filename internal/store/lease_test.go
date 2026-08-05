@@ -334,6 +334,47 @@ func TestEpochNeverDecreasesAcrossReclaims(t *testing.T) {
 	}
 }
 
+// TestAcquireRefusesReapingClaim pins the fix for the claim->Destroy race:
+// a lease acquired while a branch is claimed for reaping (Reaping=true)
+// could have that branch deleted out from under it, since Destroy's own
+// GetRef can still read the pre-lease ref and DeleteRef is unconditional.
+// AcquireLease must refuse outright while the claim stands, and this is
+// only safe together with ops.Reap's self-heal of a stale claim (a separate
+// fix): once that clears Reaping, AcquireLease must succeed again — a
+// permanent claim would otherwise brick the branch's leasability forever.
+func TestAcquireRefusesReapingClaim(t *testing.T) {
+	s := newStore(t)
+	seedBranch(t, s)
+	now := time.Date(2026, 8, 1, 12, 0, 0, 0, time.UTC)
+
+	ref, etag, err := s.GetRef("app", "main")
+	if err != nil {
+		t.Fatal(err)
+	}
+	ref.Reaping = true
+	if _, err := s.PutRef("app", "main", ref, etag); err != nil {
+		t.Fatal(err)
+	}
+
+	if _, err := s.AcquireLease("app", "main", "daemon-a", time.Minute, now); !errors.Is(err, ErrReaping) {
+		t.Fatalf("want ErrReaping while a reap claim stands, got %v", err)
+	}
+
+	// Once the claim clears (here, simulating ops.Reap's self-heal of a
+	// stale claim directly), AcquireLease must succeed again.
+	ref, etag, err = s.GetRef("app", "main")
+	if err != nil {
+		t.Fatal(err)
+	}
+	ref.Reaping = false
+	if _, err := s.PutRef("app", "main", ref, etag); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := s.AcquireLease("app", "main", "daemon-a", time.Minute, now); err != nil {
+		t.Fatalf("AcquireLease must succeed once the reap claim clears, got %v", err)
+	}
+}
+
 func TestRenewAfterExpiryButBeforeReclaimStillWorks(t *testing.T) {
 	// A holder whose lease lapsed but whom nobody has displaced may renew:
 	// expiry alone does not fence, only another acquisition does.

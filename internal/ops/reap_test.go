@@ -144,6 +144,96 @@ func TestConcurrentTouchAndReapHaveExactlyOneWinner(t *testing.T) {
 	}
 }
 
+// TestReapSelfHealsStaleReapingClaim pins the fix for a crashed reaper: it
+// CAS-claimed a branch (Reaping=true) but never reached Destroy, and then
+// activity (here, a fresh TouchedAt stamped directly, as ReleaseLease or a
+// durable flush would) deferred the deadline back into the future. Before
+// the fix, that claim was permanent — Touch refuses forever on Reaping, and
+// nothing else ever clears it. A single Reap pass must clear the stale
+// claim so Touch succeeds again, while a genuinely-expired Reaping ref
+// (deadline still in the past) is left alone to proceed to Destroy exactly
+// as before.
+func TestReapSelfHealsStaleReapingClaim(t *testing.T) {
+	w := newWS(t)
+	if err := w.Create("app"); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := w.Fork("app", "main", "crashed", "", 0); err != nil {
+		t.Fatal(err)
+	}
+	now := time.Now().UTC()
+
+	// Simulate a crashed reaper: land the CAS claim directly, exactly as
+	// reapOne's own claim write would, on a ref whose deadline had passed.
+	ref, etag, err := w.Store.GetRef("app", "crashed")
+	if err != nil {
+		t.Fatal(err)
+	}
+	ref.TTL = "1h"
+	ref.TouchedAt = now.Add(-2 * time.Hour).Format(time.RFC3339Nano)
+	ref.Reaping = true
+	if _, err := w.Store.PutRef("app", "crashed", ref, etag); err != nil {
+		t.Fatal(err)
+	}
+
+	// Activity defers the deadline: a fresh TouchedAt, exactly as
+	// ReleaseLease/a durable flush would stamp without ever touching
+	// Reaping. The claim is now stale — the branch it names is no longer
+	// past its deadline — but Reaping is still set.
+	ref, etag, err = w.Store.GetRef("app", "crashed")
+	if err != nil {
+		t.Fatal(err)
+	}
+	ref.TouchedAt = now.Format(time.RFC3339Nano)
+	if _, err := w.Store.PutRef("app", "crashed", ref, etag); err != nil {
+		t.Fatal(err)
+	}
+
+	if reaped, err := w.Reap(now); err != nil {
+		t.Fatal(err)
+	} else if len(reaped) != 0 {
+		t.Fatalf("a stale claim must not be destroyed, reaped %v", reaped)
+	}
+
+	after, _, err := w.Store.GetRef("app", "crashed")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if after.Reaping {
+		t.Fatal("Reap must self-heal a stale Reaping claim once activity has deferred the deadline")
+	}
+
+	// Touch must now succeed: the whole point of the fix.
+	if _, err := w.Touch("app", "crashed", nil, now); err != nil {
+		t.Fatalf("Touch must succeed once the stale claim is cleared, got %v", err)
+	}
+
+	// A genuinely-expired Reaping ref (deadline still in the past) must
+	// still proceed to Destroy, unaffected by the self-heal path above.
+	if _, err := w.Fork("app", "main", "genuinely-expired", "", 0); err != nil {
+		t.Fatal(err)
+	}
+	setTTLAt(t, w, "app", "genuinely-expired", "1h", now.Add(-2*time.Hour).Format(time.RFC3339Nano))
+	ref, etag, err = w.Store.GetRef("app", "genuinely-expired")
+	if err != nil {
+		t.Fatal(err)
+	}
+	ref.Reaping = true
+	if _, err := w.Store.PutRef("app", "genuinely-expired", ref, etag); err != nil {
+		t.Fatal(err)
+	}
+	reaped, err := w.Reap(now)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(reaped) != 1 || reaped[0] != "app@genuinely-expired" {
+		t.Fatalf("reaped = %v, want exactly [app@genuinely-expired]", reaped)
+	}
+	if _, _, err := w.Store.GetRef("app", "genuinely-expired"); !errors.Is(err, store.ErrNotFound) {
+		t.Fatalf("a genuinely-expired claimed ref must still be destroyed, err=%v", err)
+	}
+}
+
 func TestReapedLineageIsCollectableByGC(t *testing.T) {
 	w := newWS(t)
 	if err := w.Create("app"); err != nil {
