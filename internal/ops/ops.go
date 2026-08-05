@@ -813,6 +813,22 @@ func ReapDeadline(ref store.Ref) (time.Time, bool) {
 	return base.Add(d), true
 }
 
+// FormatTTLRemaining renders ref's time-to-reap as of now, for display:
+// "" if ref has no (real) TTL, "expired" once past ReapDeadline, otherwise
+// the remaining time.Duration's String(). Shared by Status and the daemon's
+// "branches" op so the two report identical numbers computed the same way,
+// rather than each formatting ReapDeadline's result independently.
+func FormatTTLRemaining(ref store.Ref, now time.Time) string {
+	deadline, ok := ReapDeadline(ref)
+	if !ok {
+		return ""
+	}
+	if now.After(deadline) {
+		return "expired"
+	}
+	return deadline.Sub(now).String()
+}
+
 // parseRefTime parses an RFC3339Nano ref timestamp field (TouchedAt or
 // LeaseExpiry), which is empty when unset.
 func parseRefTime(s string) (time.Time, bool) {
@@ -850,18 +866,10 @@ func (w *Workspace) Status() ([]BranchStatus, error) {
 			}
 			sort.Strings(cps)
 			_, coErr := os.Stat(w.CheckoutPath(db, br))
-			remaining := ""
-			if deadline, ok := ReapDeadline(r); ok {
-				if now.After(deadline) {
-					remaining = "expired"
-				} else {
-					remaining = deadline.Sub(now).String()
-				}
-			}
 			out = append(out, BranchStatus{
 				DB: db, Branch: br, HeadTXID: r.HeadTXID, Checkpoints: cps,
 				Protected: r.Protected, Parent: r.Parent, CheckedOut: coErr == nil,
-				TTL: r.TTL, TTLRemaining: remaining,
+				TTL: r.TTL, TTLRemaining: FormatTTLRemaining(r, now),
 			})
 		}
 	}
