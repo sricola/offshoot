@@ -12,9 +12,12 @@ Ground rules carried over from the design spec: correctness stays paranoid
 (limits documented as plainly as features), and the storage format carries a
 layout version so incompatibility is always detected, never guessed.
 
+Releases use the 0.1.x prerelease series (tags `v0.1.0`, `v0.1.1`, …); 1.0 is
+reserved for the storage-format freeze.
+
 ---
 
-## v0.1 — Installable and trustworthy
+## Milestone 1 — Installable and trustworthy
 
 *Bar: a stranger can install offshoot without a Go toolchain, read the repo
 without tripping over internal artifacts, and watch CI prove the claims.*
@@ -50,7 +53,7 @@ without tripping over internal artifacts, and watch CI prove the claims.*
 - **Site hygiene.** The live site must not link to a private repo; teaser mode
   until the repo flips public.
 
-## v0.2 — Safe by default for agents
+## Milestone 2 — Safe by default for agents
 
 *Bar: an unattended agent writing through offshoot cannot silently lose hours
 of work, leak branches forever, or take the slow path by default.*
@@ -80,7 +83,7 @@ of work, leak branches forever, or take the slow path by default.*
 - **Resource behavior documented.** No budgets yet (v0.4), but the current
   per-session disk/FD costs and failure modes go in the docs now.
 
-## v0.3 — The eval-harness release
+## Milestone 3 — The eval-harness release
 
 *Bar: the target persona's first hour is paved end to end: install, seed,
 fork-per-test, inspect, export, clean up — from their language.*
@@ -113,7 +116,7 @@ fork-per-test, inspect, export, clean up — from their language.*
 - **Listings.** MCP registry submission; LangGraph community-integration PR
   (requires PyPI first).
 
-## v0.4 — Operable at scale
+## Milestone 4 — Operable at scale
 
 *Bar: a platform running hundreds of agent sessions can see, bound, and
 automate offshoot.*

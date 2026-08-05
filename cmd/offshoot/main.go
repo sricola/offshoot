@@ -6,6 +6,7 @@ import (
 	"fmt"
 	"os"
 	"os/signal"
+	"runtime"
 	"strings"
 	"syscall"
 	"time"
@@ -15,6 +16,11 @@ import (
 	"github.com/offshoot-db/offshoot/internal/ops"
 	"github.com/offshoot-db/offshoot/internal/store"
 )
+
+// version is the offshoot release version, embedded at build time via
+// -ldflags "-X main.version=...". release.yml sets it to the pushed tag
+// (e.g. v0.1.0); local `go build`/`go run` leave it at "dev".
+var version = "dev"
 
 const usage = `offshoot — branch SQLite like git (local mode)
 
@@ -41,6 +47,7 @@ Usage:
   offshoot session status [-socket PATH]                  list open sessions and their durable txid
   offshoot session close <db>[@branch] [-socket PATH]     close a session, releasing its lease
   offshoot session shutdown [-socket PATH]                ask the daemon to shut down gracefully
+  offshoot version                   print the offshoot version and Go runtime info
 
   -socket PATH on a session subcommand must match the -socket PATH (if any)
   given to the serve that's running, or OFFSHOOT_SOCKET; otherwise it is
@@ -172,6 +179,14 @@ func run(args []string) error {
 			fmt.Println("initialized store at", spec)
 		}
 		return err
+	}
+
+	if cmd == "version" {
+		if len(rest) != 0 {
+			return fmt.Errorf("usage: offshoot version")
+		}
+		fmt.Printf("offshoot %s %s %s/%s\n", version, runtime.Version(), runtime.GOOS, runtime.GOARCH)
+		return nil
 	}
 
 	w, err := ops.Open(spec)

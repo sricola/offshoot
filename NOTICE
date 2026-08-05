@@ -1,0 +1,22 @@
+offshoot
+Copyright 2026 the offshoot authors
+
+This product is licensed under the Apache License, Version 2.0. See the
+LICENSE file for the full license text.
+
+This product depends on github.com/superfly/ltx (Copyright Fly.io, Inc.,
+licensed under the Apache License, Version 2.0), which defines the LTX
+transaction-segment format offshoot uses for durable storage. See go.mod for
+the full set of third-party dependencies and their respective licenses.
+
+offshoot's WAL capture engine (internal/capture) uses a technique publicly
+described by Litestream (github.com/benbjohnson/litestream, Apache License,
+Version 2.0) — holding a long-running read transaction on a dedicated SQLite
+connection to prevent foreign checkpoints from restarting the WAL out from
+under an in-progress capture. offshoot's implementation was independently
+written against the public SQLite WAL file format and Litestream's
+published description of that approach; no Litestream source code was
+copied, vendored, or adapted into this repository. See
+docs/superpowers/plans/2026-07-29-offshoot-capture-spike.md and
+docs/superpowers/specs/2026-07-29-offshoot-spike-report.md for the
+implementation record.

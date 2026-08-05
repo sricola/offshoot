@@ -3,8 +3,32 @@
 Branch SQLite like git: create, fork, checkpoint, rollback, and promote
 SQLite databases — stock SQLite files, your storage, one binary.
 
-**Status: pre-alpha — local and S3-compatible stores working (Plans 2-3); capture spike GO (Plan 1).**
+**Status: prerelease (0.1.x).** The CLI and daemon both work today: local and
+S3-compatible stores, live WAL capture with incremental segments, leases and
+TTL reaping, an MCP server, and Python/TypeScript SDKs. See
+[docs/status.md](docs/status.md) for exactly what's shipped-and-tested,
+what's shipped-but-unverified, and what's still on the [roadmap](ROADMAP.md).
 Requires Go 1.24+, cgo, and the `sqlite3` CLI for tests. Linux and macOS only.
+
+**Install:** build from source (see Quickstart below) — tagged binaries land
+with the first 0.1.x release. No package-manager install yet.
+
+**Docs:** [FAQ](docs/faq.md) (why not Litestream / LiteFS / Turso / Dolt / `cp`) ·
+[CLI reference](docs/reference.md) · [architecture](docs/architecture.md) ·
+[implemented/deferred status](docs/status.md) · [roadmap](ROADMAP.md)
+
+**Contributing:** [CONTRIBUTING.md](CONTRIBUTING.md) has dev setup and the
+test tiers; [SECURITY.md](SECURITY.md) covers vulnerability reporting.
+Release notes live in [CHANGELOG.md](CHANGELOG.md).
+
+## Versioning
+
+offshoot is in the 0.1.x prerelease series (tags `v0.1.0`, `v0.1.1`, …). The
+CLI surface and the on-disk storage format may still change release to
+release. Compatibility is never left to guesswork: the store's layout version
+detects a mismatch outright — a newer binary refuses to write a layout an
+older one wouldn't understand. 1.0 is reserved for the point the storage
+format freezes.
 
 ## Quickstart (60 seconds, no server, no bucket)
 
@@ -24,10 +48,11 @@ forks a database three ways, races three migrations against the forks,
 promotes the one that's actually correct, and discards the other two —
 `./examples/parallel-attempts/run.sh`.
 
-Plan-2 (local mode) notes: checkpoints are full snapshots; checkout paths are
-fixed at `<store>/checkouts/{db}/{branch}.db`; operations require the
-checkout to be quiescent (no live writers). Daemon mode with live capture,
-incremental segments, and S3/R2/Tigris backends is Plan 3.
+At rest (no daemon running): checkpoints are full snapshots; checkout paths
+are fixed at `<store>/checkouts/{db}/{branch}.db`; operations require the
+checkout to be quiescent (no live writers). Daemon mode (below) layers live
+capture, incremental segments, and S3/R2/Tigris backends on top of the same
+commands.
 
 ## Storage
 
@@ -40,8 +65,8 @@ if conditional writes are not enforced, rather than silently degrading. That
 probe re-runs on every command (every CLI invocation attaches fresh) — a
 handful of sequential round trips against a remote store, paid every time by
 design (fail-closed beats a cached "it was fine last time"); a long-lived
-daemon in Plan 4 will amortize it across a session instead of paying it per
-command.
+daemon (see Daemon mode below) amortizes it across a session instead of
+paying it per command.
 
 Configuration for `s3://` specs — credentials come from the AWS SDK default
 chain (environment, shared config, IAM role):
@@ -74,7 +99,7 @@ live in the store.
 
 ## Leases and fencing
 
-A long-running writer (Plan 5's daemon) claims a branch with a lease:
+A long-running writer — offshoot's daemon (see Daemon mode below) — claims a branch with a lease:
 
     offshoot lease list
     offshoot lease acquire app@main --ttl 60s

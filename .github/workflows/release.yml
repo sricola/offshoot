@@ -1,0 +1,145 @@
+name: release
+
+on:
+  push:
+    tags:
+      - "v0.1.*"
+  workflow_dispatch:
+
+permissions:
+  contents: write
+  packages: write
+
+jobs:
+  build:
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - os: ubuntu-latest
+            goos: linux
+            goarch: amd64
+          - os: ubuntu-24.04-arm
+            goos: linux
+            goarch: arm64
+          - os: macos-13
+            goos: darwin
+            goarch: amd64
+          - os: macos-latest
+            goos: darwin
+            goarch: arm64
+    runs-on: ${{ matrix.os }}
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-go@v5
+        with:
+          go-version-file: go.mod
+
+      - name: Resolve ref name
+        id: ref
+        run: |
+          if [ "${{ github.event_name }}" = "workflow_dispatch" ]; then
+            echo "name=dev-$(git rev-parse --short HEAD)" >> "$GITHUB_OUTPUT"
+          else
+            echo "name=${GITHUB_REF_NAME}" >> "$GITHUB_OUTPUT"
+          fi
+
+      - name: Build (native, cgo on)
+        env:
+          CGO_ENABLED: "1"
+        run: |
+          go build -trimpath -ldflags "-s -w -X main.version=${{ steps.ref.outputs.name }}" \
+            -o offshoot ./cmd/offshoot
+
+      - name: Smoke test
+        run: |
+          ./offshoot version
+          ./offshoot version | grep -q "${{ steps.ref.outputs.name }}"
+
+      - name: Package
+        id: pkg
+        run: |
+          name="offshoot_${{ steps.ref.outputs.name }}_${{ matrix.goos }}_${{ matrix.goarch }}"
+          tar czf "${name}.tar.gz" offshoot
+          shasum -a 256 "${name}.tar.gz" > "${name}.tar.gz.sha256"
+          echo "name=${name}" >> "$GITHUB_OUTPUT"
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: ${{ steps.pkg.outputs.name }}
+          path: |
+            ${{ steps.pkg.outputs.name }}.tar.gz
+            ${{ steps.pkg.outputs.name }}.tar.gz.sha256
+          if-no-files-found: error
+
+  collect:
+    needs: build
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-go@v5
+        with:
+          go-version-file: go.mod
+
+      - name: Generate THIRD_PARTY_LICENSES.csv
+        run: make third-party-licenses
+
+      - uses: actions/download-artifact@v4
+        with:
+          path: dist
+          merge-multiple: true
+
+      - name: List collected assets
+        run: ls -la dist THIRD_PARTY_LICENSES.csv
+
+      - name: Create GitHub release
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          if [ "${{ github.event_name }}" = "workflow_dispatch" ]; then
+            tag="dev-$(git rev-parse --short HEAD)"
+          else
+            tag="${GITHUB_REF_NAME}"
+          fi
+          gh release create "$tag" \
+            dist/*.tar.gz dist/*.tar.gz.sha256 THIRD_PARTY_LICENSES.csv \
+            --repo "${{ github.repository }}" \
+            --title "$tag" \
+            --prerelease \
+            --generate-notes
+
+  docker:
+    needs: build
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Resolve ref name
+        id: ref
+        run: |
+          if [ "${{ github.event_name }}" = "workflow_dispatch" ]; then
+            echo "name=dev-$(git rev-parse --short HEAD)" >> "$GITHUB_OUTPUT"
+          else
+            echo "name=${GITHUB_REF_NAME}" >> "$GITHUB_OUTPUT"
+          fi
+
+      - uses: docker/setup-buildx-action@v3
+
+      - name: Log in to GHCR
+        uses: docker/login-action@v3
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      - uses: docker/build-push-action@v6
+        with:
+          context: .
+          push: true
+          build-args: |
+            VERSION=${{ steps.ref.outputs.name }}
+          tags: |
+            ghcr.io/${{ github.repository }}:${{ steps.ref.outputs.name }}
+            ghcr.io/${{ github.repository }}:latest

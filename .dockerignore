@@ -1,0 +1,17 @@
+.git
+.github
+.superpowers
+bin/
+*.db
+*.db-wal
+*.db-shm
+sdk/typescript/node_modules/
+sdk/typescript/dist/
+sdk/typescript/test-dist/
+__pycache__/
+site/
+docs/
+examples/
+*.tar.gz
+*.tar.gz.sha256
+THIRD_PARTY_LICENSES.csv
