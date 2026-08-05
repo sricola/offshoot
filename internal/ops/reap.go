@@ -67,6 +67,14 @@ func (w *Workspace) reapOne(db, branch string, now time.Time) (bool, error) {
 	}
 	deadline, ok := ReapDeadline(ref)
 	if !ok {
+		if ref.Reaping {
+			// A previous claim's activity clock (or TTL) no longer computes a
+			// deadline at all — e.g. Touch's guard was bypassed by a direct
+			// ref edit, or the TTL was cleared out from under a stale claim.
+			// Same self-heal as the now.Before(deadline) branch below: see
+			// its comment for why this can't be left set.
+			return w.clearStaleReapingClaim(db, branch, ref, etag)
+		}
 		if _, derr := time.ParseDuration(ref.TTL); derr != nil {
 			fmt.Fprintf(os.Stderr, "offshoot: warning: %s@%s has unparseable ttl %q; not reaping\n", db, branch, ref.TTL)
 		}
@@ -75,6 +83,23 @@ func (w *Workspace) reapOne(db, branch string, now time.Time) (bool, error) {
 		return false, nil
 	}
 	if now.Before(deadline) {
+		if ref.Reaping {
+			// A reaper claimed this ref (set Reaping=true) but never reached
+			// Destroy — most likely it crashed between the claim write and
+			// the destroy call, since a normal run unwinds the claim itself
+			// on failure (below) and clears it on success (the ref is just
+			// gone). Left alone, that stale claim is permanent: Touch refuses
+			// forever (touch.go's Reaping guard), and both ReleaseLease and a
+			// durable flush stamp a fresh TouchedAt without ever clearing
+			// Reaping, so ordinary activity defers the deadline right back
+			// past `now` on every subsequent cycle without ever un-sticking
+			// the branch. Since activity has in fact deferred the deadline
+			// (we're in the now.Before(deadline) arm), this claim is stale,
+			// not active: CAS-clear it so the branch is touchable again.
+			// Genuinely-expired claims (deadline already passed) skip this
+			// and fall through to the claim-and-destroy path below as today.
+			return w.clearStaleReapingClaim(db, branch, ref, etag)
+		}
 		return false, nil
 	}
 
@@ -100,4 +125,23 @@ func (w *Workspace) reapOne(db, branch string, now time.Time) (bool, error) {
 		return false, err
 	}
 	return true, nil
+}
+
+// clearStaleReapingClaim CAS-clears ref's Reaping flag: ref is currently
+// claimed but does not compute a deadline in the past, so the claim cannot
+// be an in-progress reap (that would require the deadline to have already
+// passed to have set Reaping in the first place) — it is a leftover from a
+// reaper that claimed the branch and then never finished (crash, panic, a
+// killed process) before activity moved the deadline back into the future.
+// A lost CAS race (etag stale — someone else already cleared or reclaimed
+// this ref) is benign: the next Reap cycle just re-evaluates from scratch.
+func (w *Workspace) clearStaleReapingClaim(db, branch string, ref store.Ref, etag string) (bool, error) {
+	ref.Reaping = false
+	if _, err := w.Store.PutRef(db, branch, ref, etag); err != nil {
+		if errors.Is(err, store.ErrCAS) {
+			return false, nil
+		}
+		return false, err
+	}
+	return false, nil
 }
