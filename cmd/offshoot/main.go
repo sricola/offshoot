@@ -325,12 +325,17 @@ func run(args []string) error {
 			}
 			grace = d
 		}
+		// A reap failure on one branch (e.g. its checkout has an open
+		// connection, "database is busy") must not stop GC from running:
+		// GC is independent lineage cleanup, and skipping it entirely would
+		// let one unreapable branch wedge garbage collection forever.
+		// Report the failure and press on.
 		reaped, reapErr := w.Reap(time.Now())
 		if len(reaped) > 0 {
 			fmt.Printf("gc: reaped %v\n", reaped)
 		}
 		if reapErr != nil {
-			return reapErr
+			fmt.Fprintf(os.Stderr, "offshoot: gc: reap: %v\n", reapErr)
 		}
 		tombstoned, deleted, err := w.GC(grace)
 		if err != nil {
