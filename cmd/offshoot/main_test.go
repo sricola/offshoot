@@ -46,6 +46,36 @@ func TestCreateFromMissingFileArgErrors(t *testing.T) {
 	}
 }
 
+// TestForkRejectsNonPositiveTTL pins the CLI-level half of the fix for fork
+// silently treating a non-positive --ttl as no-TTL: `fork --ttl -1h` used to
+// parse fine (time.ParseDuration accepts negative durations) and then fall
+// through Fork's `if ttl > 0` check, forking a TTL-less branch while the
+// caller believed it asked for one. fork also has no "none" sentinel the
+// way touch does (a brand-new branch has no existing TTL to explicitly
+// clear), so "--ttl none" must be refused too, naming the fix: omit --ttl
+// for no TTL.
+func TestForkRejectsNonPositiveTTL(t *testing.T) {
+	dir := filepath.Join(t.TempDir(), "s")
+	if err := run([]string{"-store", dir, "init"}); err != nil {
+		t.Fatal(err)
+	}
+	if err := run([]string{"-store", dir, "create", "app"}); err != nil {
+		t.Fatal(err)
+	}
+	for _, ttl := range []string{"-1h", "0s", "none"} {
+		if err := run([]string{"-store", dir, "fork", "app", "kid-" + ttl, "--ttl", ttl}); err == nil {
+			t.Fatalf("fork --ttl %q must be refused", ttl)
+		}
+	}
+	if _, err := os.Stat(filepath.Join(dir, "refs", "app", "kid--1h")); err == nil {
+		t.Fatal("a refused fork must not create the branch")
+	}
+	// Omitting --ttl entirely still means no TTL, unaffected by the guard.
+	if err := run([]string{"-store", dir, "fork", "app", "kid-none"}); err != nil {
+		t.Fatalf("fork with no --ttl flag must still succeed: %v", err)
+	}
+}
+
 func TestQuickstartTranscript(t *testing.T) {
 	if _, err := exec.LookPath("sqlite3"); err != nil {
 		t.Skip("sqlite3 CLI not on PATH")

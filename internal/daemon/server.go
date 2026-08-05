@@ -6,6 +6,7 @@ package daemon
 import (
 	"context"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"net"
 	"os"
@@ -15,6 +16,7 @@ import (
 
 	"github.com/offshoot-db/offshoot/internal/ops"
 	"github.com/offshoot-db/offshoot/internal/session"
+	"github.com/offshoot-db/offshoot/internal/store"
 )
 
 type Server struct {
@@ -476,11 +478,17 @@ func (s *Server) opCheckoutAtRest(req Request) Response {
 
 // opFork creates req.Name as a new branch forked from req.Branch (source)
 // at checkpoint req.From ("" = source's head), with TTL req.TTL ("" = no
-// TTL; else a Go duration). If this daemon has an open session on the
-// source, that session is flushed (unnamed) first so the fork point
-// includes writes the caller never explicitly flushed — matching Fork's
-// semantics for a session that owns the source's checkout. Returns the
-// fork point's txid.
+// TTL; else a Go duration). A non-positive duration (<= 0) is refused: fork
+// has no "none" sentinel the way touch does (a brand-new branch has no
+// existing TTL to explicitly clear), so a caller that means "no TTL" omits
+// req.TTL entirely rather than sending a zero or negative one — sending one
+// anyway is almost certainly a mistake (e.g. an unintended negative
+// duration string), and Fork itself would otherwise silently treat it as no
+// TTL, the exact silent-swallow this check exists to prevent. If this
+// daemon has an open session on the source, that session is flushed
+// (unnamed) first so the fork point includes writes the caller never
+// explicitly flushed — matching Fork's semantics for a session that owns
+// the source's checkout. Returns the fork point's txid.
 func (s *Server) opFork(req Request) Response {
 	branch := req.Branch
 	if branch == "" {
@@ -491,6 +499,10 @@ func (s *Server) opFork(req Request) Response {
 		d, err := time.ParseDuration(req.TTL)
 		if err != nil {
 			return errResp(fmt.Errorf("daemon: invalid ttl %q: %w", req.TTL, err))
+		}
+		if d <= 0 {
+			return errResp(fmt.Errorf(
+				"daemon: fork ttl %q must be positive; fork has no \"none\" concept, omit ttl for no TTL", req.TTL))
 		}
 		ttl = d
 	}
@@ -619,6 +631,12 @@ func (s *Server) opTouch(req Request) Response {
 // (or had) at least one ref, so an absent key means the db was never
 // created, or every branch has already been destroyed — either way, not a
 // db a client asking for its branches should be quietly told "empty".
+//
+// A branch that ListRefs saw but is gone by the time its own GetRef runs is
+// skipped rather than failing the whole listing: with the janitor reaping
+// branches on its own schedule, that window is a real, recurring race, not
+// a one-off — see reapOne's identical ErrNotFound-is-benign handling for the
+// same race on the reap side.
 func (s *Server) opBranches(req Request) Response {
 	refs, err := s.ws.Store.ListRefs()
 	if err != nil {
@@ -633,6 +651,9 @@ func (s *Server) opBranches(req Request) Response {
 	for _, br := range branches {
 		ref, _, err := s.ws.Store.GetRef(req.DB, br)
 		if err != nil {
+			if errors.Is(err, store.ErrNotFound) {
+				continue
+			}
 			return errResp(err)
 		}
 		cps := make([]string, 0, len(ref.Checkpoints))

@@ -587,6 +587,95 @@ func TestBranchesUnknownDBErrors(t *testing.T) {
 	}
 }
 
+// TestOpForkRejectsNonPositiveTTL pins the fix for opFork silently treating
+// a non-positive ttl string ("-1h") as no-TTL: time.ParseDuration("-1h")
+// parses fine (no error), so before this fix the resulting negative
+// time.Duration reached ops.Fork, whose `if ttl > 0` check simply skipped
+// setting the child's TTL — the caller asked for a TTL and silently got
+// none. Both a negative and a literal-zero duration must be refused with an
+// error, and — since fork has no "none" sentinel the way touch does (a
+// brand-new branch has no existing TTL to explicitly clear) — a caller
+// wanting no TTL must omit req.TTL, not send "0s"/"-1h".
+func TestOpForkRejectsNonPositiveTTL(t *testing.T) {
+	srv, w := newServer(t)
+	sock := srv.SocketPath()
+
+	for _, ttl := range []string{"-1h", "0s"} {
+		r := call(t, sock, Request{Op: "fork", DB: "app", Branch: "main", Name: "kid-" + ttl, TTL: ttl})
+		if r.OK {
+			t.Fatalf("fork with ttl=%q must be refused, got ok=true", ttl)
+		}
+		if r.Error == "" {
+			t.Fatalf("a refused fork must carry an error message, ttl=%q", ttl)
+		}
+	}
+	if _, _, err := w.Store.GetRef("app", "kid--1h"); err == nil {
+		t.Fatal("a refused fork must not create the branch")
+	}
+
+	// Omitting TTL entirely still means no TTL, unaffected by the guard.
+	r := call(t, sock, Request{Op: "fork", DB: "app", Branch: "main", Name: "kid-none"})
+	if !r.OK {
+		t.Fatalf("fork with no ttl field must still succeed, got %+v", r)
+	}
+}
+
+// vanishingGetBackend wraps a store.Backend and, for one tracked key, makes
+// every Get report store.ErrNotFound instead of delegating — simulating a
+// ref that ListRefs still saw but is gone by the time a later, per-branch
+// GetRef runs. Timing that race for real (deleting the ref in the tiny
+// window between opBranches' ListRefs and its per-branch GetRef) is not
+// reliably reproducible from a test; this reproduces the same observable
+// condition deterministically instead.
+type vanishingGetBackend struct {
+	store.Backend
+	vanishedKey string
+}
+
+func (b *vanishingGetBackend) Get(key string) ([]byte, string, error) {
+	if key == b.vanishedKey {
+		return nil, "", store.ErrNotFound
+	}
+	return b.Backend.Get(key)
+}
+
+// TestBranchesSkipsBranchVanishedMidIteration pins the fix for opBranches
+// failing its ENTIRE listing when just one branch is destroyed in the
+// window between its ListRefs call and that branch's own per-branch GetRef.
+// The janitor makes this a real, recurring race (it reaps on its own
+// schedule, independent of any "branches" call in flight) rather than a
+// one-off — reapOne already treats the identical race as benign (see its
+// ErrNotFound handling), and opBranches must too: skip the vanished branch,
+// list everything else.
+func TestBranchesSkipsBranchVanishedMidIteration(t *testing.T) {
+	srv, w := newServer(t)
+	sock := srv.SocketPath()
+
+	if _, err := w.Fork("app", "main", "doomed", "", 0); err != nil {
+		t.Fatal(err)
+	}
+
+	// Swap in a backend that makes "doomed"'s ref Get report ErrNotFound,
+	// exactly as if a sibling reapOne (or an operator) had destroyed it in
+	// the window right after ListRefs saw it.
+	w.Store.B = &vanishingGetBackend{Backend: w.Store.B, vanishedKey: store.RefKey("app", "doomed")}
+
+	r := call(t, sock, Request{Op: "branches", DB: "app"})
+	if !r.OK {
+		t.Fatalf("branches must skip a vanished branch, not fail the whole listing: %+v", r)
+	}
+	names := make(map[string]bool, len(r.Branches))
+	for _, b := range r.Branches {
+		names[b.Branch] = true
+	}
+	if names["doomed"] {
+		t.Fatalf("vanished branch must be skipped, not listed: %+v", r.Branches)
+	}
+	if !names["main"] {
+		t.Fatalf("main must still be listed: %+v", r.Branches)
+	}
+}
+
 // TestJanitorNeverReapsThisDaemonsOwnSession pins the spec sentence "a
 // branch with an active lease is never reaped — expiry defers until the
 // lease is released" against a REAL running daemon and REAL janitor loop,
