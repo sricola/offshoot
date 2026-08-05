@@ -115,10 +115,12 @@ under a dead epoch — and `session status` shows the error.
 ### What a flush costs
 
 A daemon flush writes only the pages that changed since the previous flush —
-the capture engine already knows exactly which those are. Every sixteenth flush
-(configurable) writes a full snapshot instead, so materializing a branch never
-replays an unbounded chain: a read applies one snapshot plus at most that many
-segments.
+the capture engine already knows exactly which those are. Every sixteenth
+flush writes a full snapshot instead, so materializing a branch never replays
+an unbounded chain: a read applies one snapshot plus at most fifteen
+segments. (That cadence is configurable when embedding the session library
+directly — `Options.SnapshotEvery` — but the daemon does not currently
+expose it, so every daemon-managed session uses the default of sixteen.)
 
 The at-rest `offshoot checkpoint` still writes a full snapshot every time. It
 runs without a daemon, so it has no record of which pages changed and would

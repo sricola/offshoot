@@ -278,6 +278,39 @@ func Open(ctx context.Context, o Options) (*Session, error) {
 	s.engDone = make(chan struct{})
 	s.renewDone = make(chan struct{})
 	go s.runEngine(cctx)
+
+	// A clean resume (see capture.Engine.Resumed's doc comment — reused
+	// Options.Dir, clean prior shutdown, main file unchanged) makes the
+	// engine skip its startup rebase entirely, which means
+	// replicaSink.Rebase — and therefore Session.rebaseline, the only thing
+	// that ever seeds s.checksum/s.flushChecksum/s.forceSnapshot — never
+	// runs. Left alone, this session would start with all three at their
+	// zero values while the replica file it's continuing to trust already
+	// holds real content: the first flush's segment would declare a bogus
+	// preApplyChecksum and every read of the resulting chain would hard-fail
+	// checksum verification. WaitReady blocks only until the engine's
+	// resume-or-rebase verdict has settled (see its doc comment) — not the
+	// full startup rebase when one runs, which stays exactly as
+	// asynchronous as it always was — so this adds no latency to the
+	// ordinary (fresh Dir, always-rebase) path.
+	if s.captured.WaitReady(ctx) == nil && s.captured.Resumed() {
+		s.replicaMu.Lock()
+		rerr := s.rebaseline()
+		s.replicaMu.Unlock()
+		if rerr != nil {
+			cancel()
+			<-s.engDone
+			relErr := o.WS.ReleaseLease(lease)
+			cleanup()
+			err := fmt.Errorf("session: establish checksum baseline after clean resume: %w", rerr)
+			if relErr != nil {
+				return nil, errors.Join(err,
+					fmt.Errorf("session: also failed to release the lease: %w", relErr))
+			}
+			return nil, err
+		}
+	}
+
 	go s.renewLoop(cctx, o.RenewEvery, o.LeaseTTL)
 	return s, nil
 }
@@ -304,9 +337,17 @@ func (s *Session) fail(err error) {
 }
 
 func (s *Session) CheckoutPath() string { return s.checkoutPath }
-func (s *Session) ReplicaPath() string  { return s.replica.Path() }
-func (s *Session) DB() string           { return s.db }
-func (s *Session) Branch() string       { return s.branch }
+
+// Resumed reports whether this Session's capture engine skipped its startup
+// rebase because it proved continuity with a prior clean shutdown of a
+// session that used the same Options.Dir — see capture.Engine.Resumed's doc
+// comment for exactly what that proves. Ordinary callers do not need this;
+// it exists mainly so tests can assert which startup path Open actually
+// took (see TestCleanResumeRebaselinesBeforeFirstSegment).
+func (s *Session) Resumed() bool       { return s.captured.Resumed() }
+func (s *Session) ReplicaPath() string { return s.replica.Path() }
+func (s *Session) DB() string          { return s.db }
+func (s *Session) Branch() string      { return s.branch }
 
 func (s *Session) Lease() store.Lease {
 	s.mu.Lock()
@@ -463,11 +504,11 @@ func (s *Session) recordApply(pageSize uint32, frames []wal.Frame) error {
 	}
 	// A shrinking commit drops trailing pages this transaction had no reason
 	// to write explicitly; their old contribution must still be removed.
-	// pages.dropAbove clears any of those same page numbers pageSet may
-	// still be holding from an earlier, not-yet-flushed transaction — see
-	// its doc comment for why leaving them would corrupt the next segment.
+	// pageSet's own dropAbove(newCommit) call below (after record) clears any
+	// of those same page numbers pageSet may still be holding from an
+	// earlier, not-yet-flushed transaction — see its doc comment for why
+	// leaving them would corrupt the next segment.
 	if newCommit < prevCommit {
-		s.pages.dropAbove(newCommit)
 		for pgno := newCommit + 1; pgno <= prevCommit; pgno++ {
 			if seen[pgno] || pgno == lockPgno {
 				continue
@@ -496,7 +537,20 @@ func (s *Session) recordApply(pageSize uint32, frames []wal.Frame) error {
 	s.checksum = running
 	s.commit = newCommit
 	s.pageSize = pageSize
+	// record must run BEFORE dropAbove, unconditionally, in that order: this
+	// transaction's own frames are folded into pageSet first, and only then
+	// is anything numbered beyond the (possibly just-shrunk) commit size
+	// evicted. Running dropAbove only inside the shrink branch above, before
+	// record, let a stale pgno > newCommit recorded by THIS transaction (or
+	// left over from pageSet's own map iteration order relative to record)
+	// survive into drain() — which ltxio.EncodeSegment then rejects as a
+	// page number beyond the segment's declared commit size, a spurious
+	// flush failure that only self-heals via forceSnapshot on retry. Calling
+	// dropAbove unconditionally here, after record, guarantees pageSet never
+	// holds anything past the current commit regardless of whether this
+	// transaction grew or shrank the database.
 	s.pages.record(frames)
+	s.pages.dropAbove(newCommit)
 	return nil
 }
 

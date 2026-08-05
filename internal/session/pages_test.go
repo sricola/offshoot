@@ -72,3 +72,38 @@ func TestPageSetDropAboveIsANoOpWhenNothingExceedsCommit(t *testing.T) {
 		t.Fatalf("len = %d, want 2 (nothing above commit 5)", p.len())
 	}
 }
+
+// TestPageSetRecordThenDropAboveOrderMatters guards the exact defect fixed
+// in Session.recordApply (see its "record must run BEFORE dropAbove"
+// comment): dropAbove only clears pages already present in the set at the
+// moment it runs. Calling it BEFORE the record() that introduces a page
+// beyond the new commit size leaves that page behind — record-then-
+// dropAbove, unconditionally in that order, is the only sequence that
+// actually guarantees pageSet never holds anything past the current commit.
+// The other pageSet tests in this file only ever exercise the correct
+// order; this one demonstrates why the order is load-bearing by contrasting
+// it against the wrong one.
+func TestPageSetRecordThenDropAboveOrderMatters(t *testing.T) {
+	// Wrong order (what recordApply used to do inside its shrink branch):
+	// dropAbove runs first, so it cannot see a page record() is about to
+	// introduce above the new commit size — that page survives.
+	wrong := newPageSet()
+	wrong.dropAbove(3)
+	wrong.record([]wal.Frame{frame(1, 'a'), frame(5, 'a')})
+	if wrong.len() != 2 {
+		t.Fatalf("dropAbove-before-record len = %d, want 2 (pgno 5 wrongly survives)", wrong.len())
+	}
+
+	// Correct order (what recordApply does now, unconditionally): record
+	// first, then dropAbove(3) — the stale page above commit is gone.
+	right := newPageSet()
+	right.record([]wal.Frame{frame(1, 'a'), frame(5, 'a')})
+	right.dropAbove(3)
+	if right.len() != 1 {
+		t.Fatalf("record-then-dropAbove len = %d, want 1 (pgno 5 dropped)", right.len())
+	}
+	got := right.drain()
+	if len(got) != 1 || got[0].Pgno != 1 {
+		t.Fatalf("record-then-dropAbove left %+v, want only pgno 1", got)
+	}
+}
