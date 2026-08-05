@@ -10,9 +10,29 @@ from pathlib import Path
 import sys
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 import offshoot
-from offshoot.client import OffshootError
+from datetime import timedelta
+from offshoot.client import OffshootError, _ttl_str
 
 REPO = Path(__file__).resolve().parents[3]
+
+
+class TestTtlStr(unittest.TestCase):
+    """Pure-logic tests for _ttl_str; no daemon needed."""
+
+    def test_none_means_no_change(self):
+        self.assertEqual(_ttl_str(None), "")
+
+    def test_zero_and_literal_none_clear(self):
+        self.assertEqual(_ttl_str(0), "none")
+        self.assertEqual(_ttl_str("none"), "none")
+
+    def test_timedelta_and_duration_string_set(self):
+        self.assertEqual(_ttl_str(timedelta(hours=1)), "3600s")
+        self.assertEqual(_ttl_str("1h"), "1h")
+
+    def test_nonzero_int_is_rejected(self):
+        with self.assertRaises(TypeError):
+            _ttl_str(3600)
 
 
 def build_binary(tmp: Path) -> Path:
@@ -26,11 +46,16 @@ def build_binary(tmp: Path) -> Path:
 
 
 class DaemonFixture:
-    """One daemon on a temp store+socket for the whole test class."""
+    """A daemon on a temp store+socket.
 
-    def __init__(self):
+    binpath, when given, reuses an already-built binary instead of building
+    a fresh one — used by tests that want a second, independently killable
+    daemon without paying build_binary's cost again.
+    """
+
+    def __init__(self, binpath: Path | None = None):
         self.dir = Path(tempfile.mkdtemp(prefix="offshoot-sdk-"))
-        self.bin = build_binary(self.dir)
+        self.bin = binpath or build_binary(self.dir)
         self.store = self.dir / "store"
         # The store must exist before `serve` will open it (ops.Open refuses
         # an uninitialized store — see cmd/offshoot/main.go); mirrors
@@ -54,6 +79,7 @@ class DaemonFixture:
     def stop(self):
         self.proc.terminate()
         self.proc.wait(timeout=10)
+        self.proc.stderr.close()
         shutil.rmtree(self.dir, ignore_errors=True)
 
 
@@ -79,7 +105,9 @@ class TestClient(unittest.TestCase):
             # Fork from the LIVE session — the row must be there.
             c.fork("app", "main", "try", ttl="1h")
             p = c.checkout("app", "try")
-            rows = sqlite3.connect(p).execute("SELECT count(*) FROM t").fetchone()[0]
+            conn = sqlite3.connect(p)
+            rows = conn.execute("SELECT count(*) FROM t").fetchone()[0]
+            conn.close()
             self.assertEqual(rows, 1)
             # branches reflects TTL and checkpoints.
             info = {b.branch: b for b in c.branches("app")}
@@ -134,3 +162,18 @@ class TestClient(unittest.TestCase):
             c.fork("rp", "main", "feature")
             txid = c.promote("rp", "feature", "main", force=True)
             self.assertGreater(txid, 0)
+
+    def test_daemon_death_mid_call_raises_offshoot_error(self):
+        # A dedicated, short-lived daemon (not the shared class fixture) so
+        # killing it doesn't disturb the other tests. Reuses the already-
+        # built binary to avoid a second `go build`.
+        d = DaemonFixture(binpath=self.d.bin)
+        try:
+            with offshoot.connect(d.sock) as c:
+                c.create("warm")  # prove the connection works before killing it
+                d.proc.kill()
+                d.proc.wait(timeout=10)
+                with self.assertRaises(OffshootError):
+                    c.status()
+        finally:
+            d.stop()

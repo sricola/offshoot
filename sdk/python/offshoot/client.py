@@ -40,12 +40,18 @@ def _ttl_str(ttl) -> str:
 
     None means "no change" (fork: no TTL; touch: keep the current TTL); 0 or
     the literal string "none" clears a TTL (touch only); a timedelta or a Go
-    duration string like "2h" sets it.
+    duration string like "2h" sets it. A nonzero int is rejected — it's
+    ambiguous (seconds? a bare number the daemon won't parse?) — pass a
+    timedelta or a Go duration string like "3600s" instead.
     """
     if ttl is None:
         return ""
     if ttl == 0 or ttl == "none":
         return "none"
+    if isinstance(ttl, int) and not isinstance(ttl, bool):
+        raise TypeError(
+            f"ttl={ttl!r}: a nonzero int is ambiguous; use a timedelta or a "
+            'Go duration string (e.g. "1h", "3600s")')
     if isinstance(ttl, timedelta):
         return f"{int(ttl.total_seconds())}s"
     return str(ttl)  # a Go duration string like "2h"
@@ -65,8 +71,12 @@ class Client:
 
     def __init__(self, socket_path: str):
         self._sock = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
-        self._sock.connect(socket_path)
-        self._rfile = self._sock.makefile("rb")
+        try:
+            self._sock.connect(socket_path)
+            self._rfile = self._sock.makefile("rb")
+        except OSError:
+            self._sock.close()
+            raise
 
     def __enter__(self) -> "Client":
         return self
@@ -76,11 +86,17 @@ class Client:
 
     def _call(self, op: str, **fields) -> dict:
         req = {"op": op, **{k: v for k, v in fields.items() if v not in ("", None, False)}}
-        self._sock.sendall(json.dumps(req).encode() + b"\n")
-        line = self._rfile.readline()
+        try:
+            self._sock.sendall(json.dumps(req).encode() + b"\n")
+            line = self._rfile.readline()
+        except OSError as e:
+            raise OffshootError(f"daemon connection failed: {e}") from e
         if not line:
             raise OffshootError("daemon closed the connection")
-        resp = json.loads(line)
+        try:
+            resp = json.loads(line)
+        except json.JSONDecodeError as e:
+            raise OffshootError(f"daemon sent a malformed response: {e}") from e
         if not resp.get("ok", False):
             raise OffshootError(resp.get("error", "unknown daemon error"))
         return resp
