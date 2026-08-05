@@ -789,13 +789,13 @@ type BranchStatus struct {
 	TTLRemaining string
 }
 
-// ttlDeadline computes when ref's TTL expires, measured from the later of
+// ReapDeadline computes when ref's TTL expires, measured from the later of
 // its activity clock (TouchedAt) and its lease expiry — either kind of
 // activity defers reaping. ok is false when ref has no TTL, its TTL is
 // non-positive (a negative or zero duration string is not a real TTL — fail
 // closed rather than compute a deadline already in the past), or its TTL or
 // timestamps fail to parse.
-func ttlDeadline(ref store.Ref) (time.Time, bool) {
+func ReapDeadline(ref store.Ref) (time.Time, bool) {
 	if ref.TTL == "" {
 		return time.Time{}, false
 	}
@@ -851,7 +851,7 @@ func (w *Workspace) Status() ([]BranchStatus, error) {
 			sort.Strings(cps)
 			_, coErr := os.Stat(w.CheckoutPath(db, br))
 			remaining := ""
-			if deadline, ok := ttlDeadline(r); ok {
+			if deadline, ok := ReapDeadline(r); ok {
 				if now.After(deadline) {
 					remaining = "expired"
 				} else {
