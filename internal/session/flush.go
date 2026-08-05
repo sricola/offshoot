@@ -133,19 +133,39 @@ func (s *Session) Flush(name string) (uint64, error) {
 	// fraction of the database that a segment buys little over just
 	// re-snapshotting.
 	//
-	// This is NOT "the session's first flush": a session opened against a
-	// branch that already has history (the common case — ops.Create already
-	// wrote TXID 1 before any session ever exists) starts with a perfectly
-	// valid checksum baseline of its own, established by rebaseline() the
-	// moment the capture engine performs its mandatory startup Rebase (see
-	// replicaSink.Rebase) — long before this Flush call. That baseline is
-	// exactly as trustworthy as one this session established itself, so
-	// this session's OWN first flush can validly be a segment continuing
-	// someone else's chain.
+	// In practice this snapshot check is never reached by forceSnapshot alone
+	// on a session's first-ever Flush call — it's already covered above,
+	// unconditionally: every Open() leaves forceSnapshot true by the time
+	// any Flush can run. On the ordinary path (a branch that already has
+	// history — the common case, since ops.Create already wrote TXID 1
+	// before any session ever exists) the capture engine's mandatory startup
+	// Rebase runs before Open returns and calls replicaSink.Rebase, which
+	// sets it. On a session that instead resumed cleanly from a reused
+	// Options.Dir — where the engine deliberately skips that startup Rebase,
+	// see capture.Engine.Resumed's doc comment — Open calls rebaseline()
+	// itself for exactly this reason (see Open's comment). Either way,
+	// forceSnapshot is true and the pending pageSet is empty going into this
+	// session's first Flush, so txid==1 and the cadence/fraction checks
+	// above are redundant with it there, not the deciding factor. Kept
+	// listed anyway (rather than collapsed into "just forceSnapshot") because
+	// each remains independently sufficient reasoning on its own — txid==1
+	// in particular is a hard EncodeSegment-level invariant, true regardless
+	// of whether this session's own forceSnapshot bookkeeping is ever
+	// involved at all.
+	//
+	// s.pageSize == 0 belongs in this same list, not handled separately
+	// below: it means recordApply has never run (a Flush racing session
+	// startup, before the capture engine's first Apply — pageSize is only
+	// ever set there, never by rebaseline), so there is no valid
+	// pageSizeAtEncode for EncodeSegment to use. EncodeSnapshot has no such
+	// dependency — it derives the page size itself from the replica file's
+	// own SQLite header — so forcing a snapshot here sidesteps the problem
+	// entirely instead of merely detecting and erroring on it.
 	snapshot := txid == 1 ||
 		s.flushesSinceSnapshot >= s.snapshotEvery-1 ||
 		s.forceSnapshot ||
-		pageFrac >= largeSegmentFraction
+		pageFrac >= largeSegmentFraction ||
+		s.pageSize == 0
 
 	// Either branch below consumes the pending pageSet: a snapshot makes it
 	// stale (it's now fully reflected in the fresh full state) and a segment
@@ -169,9 +189,10 @@ func (s *Session) Flush(name string) (uint64, error) {
 
 	if snapshot {
 		err = ltxio.EncodeSnapshot(s.replica.Path(), txid, &buf)
-	} else if pageSizeAtEncode == 0 {
-		err = fmt.Errorf("session: no page size recorded yet for an incremental segment")
 	} else {
+		// pageSizeAtEncode is guaranteed non-zero here: snapshot's own
+		// condition above already covers s.pageSize == 0, so this branch is
+		// only ever reached once recordApply has run at least once.
 		err = ltxio.EncodeSegment(pageSizeAtEncode, commitAtEncode, txid, txid,
 			s.flushChecksum, checksumAtEncode, pages, &buf)
 	}
