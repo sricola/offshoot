@@ -11,10 +11,10 @@ Requires Go 1.24+, cgo, and the `sqlite3` CLI for tests. Linux and macOS only.
     go build -o offshoot ./cmd/offshoot
     ./offshoot init
     ./offshoot create app
-    sqlite3 "$(./offshoot path app)" "CREATE TABLE users (name); INSERT INTO users VALUES ('ada');"
+    sqlite3 "$(./offshoot checkout app)" "CREATE TABLE users (name); INSERT INTO users VALUES ('ada');"
     ./offshoot checkpoint app v1
     ./offshoot fork app attempt-1        # instant branch
-    sqlite3 "$(./offshoot path app@attempt-1)" "DELETE FROM users;"   # destructive experiment
+    sqlite3 "$(./offshoot checkout app@attempt-1)" "DELETE FROM users;"   # destructive experiment
     ./offshoot rollback app@attempt-1 --to fork                        # undo it
     ./offshoot promote app@attempt-1 --onto main --force               # or ship it
     ./offshoot status
