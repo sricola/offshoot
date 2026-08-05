@@ -1,0 +1,18 @@
+{
+  "name": "@offshoot-db/client",
+  "version": "0.1.0",
+  "description": "TypeScript client for offshoot: branchable SQLite for agents",
+  "license": "Apache-2.0",
+  "type": "module",
+  "main": "dist/client.js",
+  "types": "dist/client.d.ts",
+  "engines": { "node": ">=20" },
+  "scripts": {
+    "build": "tsc -p tsconfig.build.json",
+    "test": "tsc && node --test test-dist/test/*.test.js"
+  },
+  "devDependencies": {
+    "typescript": "^5.5.0",
+    "@types/node": "^20.0.0"
+  }
+}

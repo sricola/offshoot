@@ -1,0 +1,237 @@
+// node:test end-to-end suite mirroring sdk/python/tests/test_client.py.
+//
+// Builds the offshoot binary (or reuses $OFFSHOOT_BIN), starts a daemon on a
+// temp store+socket, and drives it through the TypeScript client. Writes and
+// reads to checked-out SQLite files go through the `sqlite3` CLI via
+// execFileSync since this SDK ships no DB driver. Skips cleanly if `go` or
+// `sqlite3` are not on PATH.
+
+import { test, before, after, type TestContext } from "node:test";
+import assert from "node:assert/strict";
+import { execFileSync, spawn, type ChildProcess } from "node:child_process";
+import { existsSync, mkdtempSync, rmSync } from "node:fs";
+import { tmpdir } from "node:os";
+import { join } from "node:path";
+import { fileURLToPath } from "node:url";
+
+import { connect, OffshootError, type Client } from "../src/client.js";
+
+// test-dist/test/client.test.js -> repo root is four levels up.
+const REPO = join(fileURLToPath(new URL(".", import.meta.url)), "..", "..", "..", "..");
+
+function sleep(ms: number): Promise<void> {
+  return new Promise((res) => setTimeout(res, ms));
+}
+
+function hasCmd(cmd: string): boolean {
+  try {
+    execFileSync(process.platform === "win32" ? "where" : "which", [cmd], { stdio: "ignore" });
+    return true;
+  } catch {
+    return false;
+  }
+}
+
+const canRun = hasCmd("go") && hasCmd("sqlite3");
+
+function buildBinary(dir: string): string {
+  const fromEnv = process.env.OFFSHOOT_BIN;
+  if (fromEnv) return fromEnv;
+  const out = join(dir, "offshoot");
+  execFileSync("go", ["build", "-o", out, "./cmd/offshoot"], { cwd: REPO });
+  return out;
+}
+
+function sqlite3(dbPath: string, sql: string): string {
+  return execFileSync("sqlite3", [dbPath, sql]).toString();
+}
+
+/** A daemon on a temp store+socket.
+ *
+ * bin, when given, reuses an already-built binary instead of building a
+ * fresh one — used by tests that want a second, independently killable
+ * daemon without paying buildBinary's cost again.
+ */
+class DaemonFixture {
+  readonly dir: string;
+  readonly bin: string;
+  readonly store: string;
+  readonly sock: string;
+  proc: ChildProcess;
+  private readonly stderrChunks: Buffer[] = [];
+
+  private constructor(dir: string, bin: string, proc: ChildProcess) {
+    this.dir = dir;
+    this.bin = bin;
+    this.store = join(dir, "store");
+    this.sock = join(dir, "d.sock");
+    this.proc = proc;
+  }
+
+  static async start(bin?: string): Promise<DaemonFixture> {
+    const dir = mkdtempSync(join(tmpdir(), "offshoot-sdk-"));
+    const binpath = bin ?? buildBinary(dir);
+    const store = join(dir, "store");
+    const sock = join(dir, "d.sock");
+    // The store must exist before `serve` will open it (ops.Open refuses an
+    // uninitialized store — see cmd/offshoot/main.go); mirrors the Python
+    // SDK's DaemonFixture.
+    execFileSync(binpath, ["-store", store, "init"], { stdio: ["ignore", "ignore", "pipe"] });
+    const proc = spawn(binpath, ["-store", store, "serve", "-socket", sock], {
+      stdio: ["ignore", "ignore", "pipe"],
+    });
+    const fx = new DaemonFixture(dir, binpath, proc);
+    proc.stderr?.on("data", (c: Buffer) => fx.stderrChunks.push(c));
+
+    const deadline = Date.now() + 10_000;
+    while (!existsSync(fx.sock)) {
+      if (Date.now() > deadline) {
+        throw new Error("daemon did not start: " + Buffer.concat(fx.stderrChunks).toString());
+      }
+      if (fx.proc.exitCode !== null || fx.proc.signalCode !== null) {
+        throw new Error(Buffer.concat(fx.stderrChunks).toString());
+      }
+      await sleep(50);
+    }
+    return fx;
+  }
+
+  async stop(): Promise<void> {
+    if (this.proc.exitCode === null && this.proc.signalCode === null) {
+      this.proc.kill();
+      await Promise.race([
+        new Promise<void>((resolve) => this.proc.once("exit", () => resolve())),
+        sleep(10_000),
+      ]);
+    }
+    rmSync(this.dir, { recursive: true, force: true });
+  }
+}
+
+let fixture: DaemonFixture | undefined;
+
+before(async () => {
+  if (canRun) fixture = await DaemonFixture.start();
+});
+
+after(async () => {
+  if (fixture) await fixture.stop();
+});
+
+test("full lifecycle: create, open, write, flush, fork, checkout, branches, guards, touch, destroy", async (t: TestContext) => {
+  if (!canRun) {
+    t.skip("go and/or sqlite3 not on PATH");
+    return;
+  }
+  const c: Client = await connect(fixture!.sock);
+  try {
+    await c.create("app");
+    const s = await c.open("app");
+    sqlite3(s.path, "CREATE TABLE t (v TEXT); INSERT INTO t VALUES ('one');");
+    const txid = await s.flush("v1");
+    assert.ok(txid > 0);
+
+    // Fork from the LIVE session — the row must be there.
+    await c.fork("app", "main", "try", { ttl: "1h" });
+    const p = await c.checkout("app", "try");
+    const rows = sqlite3(p, "SELECT count(*) FROM t;").trim();
+    assert.equal(rows, "1");
+
+    // branches reflects TTL and checkpoints.
+    let info = new Map((await c.branches("app")).map((b) => [b.branch, b]));
+    assert.ok(info.has("try"));
+    assert.ok(info.get("try")!.ttl);
+    assert.ok(info.get("main")!.checkpoints.includes("v1"));
+
+    // main is protected by default.
+    await assert.rejects(() => c.destroy("app", "main"), OffshootError);
+
+    await c.touch("app", "try", { ttl: "none" });
+    info = new Map((await c.branches("app")).map((b) => [b.branch, b]));
+    assert.equal(info.get("try")!.ttl, "");
+
+    await s.close();
+    await c.destroy("app", "try");
+    const remaining = new Set((await c.branches("app")).map((b) => b.branch));
+    assert.ok(!remaining.has("try"));
+  } finally {
+    await c.close();
+  }
+});
+
+test("errors are loud", async (t: TestContext) => {
+  if (!canRun) {
+    t.skip("go and/or sqlite3 not on PATH");
+    return;
+  }
+  const c = await connect(fixture!.sock);
+  try {
+    await assert.rejects(
+      () => c.checkout("nope", "main"),
+      (err: unknown) => {
+        assert.ok(err instanceof OffshootError);
+        assert.ok(err.message);
+        return true;
+      },
+    );
+  } finally {
+    await c.close();
+  }
+});
+
+test("rollback, promote, status", async (t: TestContext) => {
+  if (!canRun) {
+    t.skip("go and/or sqlite3 not on PATH");
+    return;
+  }
+  // Uses its own db so it can't interfere with the lifecycle test's
+  // assertions even though they share one daemon fixture.
+  const c = await connect(fixture!.sock);
+  try {
+    await c.create("rp");
+    const s = await c.open("rp");
+    const sessions = await c.status();
+    assert.ok(sessions.some((st) => st.db === "rp" && st.branch === "main"));
+
+    sqlite3(s.path, "CREATE TABLE t (v TEXT);");
+    const cp1 = await s.flush("cp1");
+    assert.ok(cp1 > 0);
+    sqlite3(s.path, "INSERT INTO t VALUES ('x');");
+    await s.flush("cp2");
+    await s.close();
+
+    const path = await c.rollback("rp", "main", "cp1");
+    const rows = sqlite3(path, "SELECT count(*) FROM t;").trim();
+    assert.equal(rows, "0"); // rolled back before the insert
+
+    await c.fork("rp", "main", "feature");
+    const txid = await c.promote("rp", "feature", "main", { force: true });
+    assert.ok(txid > 0);
+  } finally {
+    await c.close();
+  }
+});
+
+test("daemon death mid-call raises OffshootError", async (t: TestContext) => {
+  if (!canRun) {
+    t.skip("go and/or sqlite3 not on PATH");
+    return;
+  }
+  // A dedicated, short-lived daemon (not the shared fixture) so killing it
+  // doesn't disturb the other tests. Reuses the already-built binary to
+  // avoid a second `go build`.
+  const d = await DaemonFixture.start(fixture!.bin);
+  try {
+    const c = await connect(d.sock);
+    try {
+      await c.create("warm"); // prove the connection works before killing it
+      d.proc.kill("SIGKILL");
+      await new Promise<void>((resolve) => d.proc.once("exit", () => resolve()));
+      await assert.rejects(() => c.status(), OffshootError);
+    } finally {
+      await c.close();
+    }
+  } finally {
+    await d.stop();
+  }
+});
