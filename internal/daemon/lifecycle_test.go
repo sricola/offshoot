@@ -586,3 +586,184 @@ func TestBranchesUnknownDBErrors(t *testing.T) {
 		t.Fatal("a refused branches call must carry an error message")
 	}
 }
+
+// TestJanitorNeverReapsThisDaemonsOwnSession pins the spec sentence "a
+// branch with an active lease is never reaped — expiry defers until the
+// lease is released" against a REAL running daemon and REAL janitor loop,
+// not just ops.Reap in isolation (TestExpiredLeaseDefersToTTLNotBlocksForever
+// in internal/ops/reap_test.go already covers the deferral arithmetic in
+// isolation; this test is about whether the daemon's own live session
+// actually produces that live lease and survives the janitor because of it).
+//
+// "live" is opened here (giving it a real session lease, acquired for
+// ops.DefaultLeaseTTL = 30s) and then backdated the way
+// TestJanitorReapsExpiredBranchWhileDaemonRuns backdates an unleased branch:
+// TouchedAt two hours in the past — already reap-eligible by the activity
+// clock alone. The TTL itself is deliberately short (200ms), not the "1h"
+// TestJanitorReapsExpiredBranchWhileDaemonRuns uses: store.ReleaseLease
+// stamps a fresh Touch(now) the moment it clears a lease (see
+// internal/store/lease.go — "a lease that was just live counts as
+// activity"), so this test's own post-close deadline is close-time+TTL, not
+// close-time+0. A 200ms TTL keeps that comfortably inside the 5s window this
+// test waits for the post-close reap in, while a 1h TTL would not reap for
+// another hour. A sibling branch, "doomed", gets the identical backdating
+// but is never opened, so it carries no lease at all. Waiting for "doomed"
+// to disappear under a 50ms janitor is how this test knows the janitor is
+// actually cycling against live server state, not merely that wall-clock
+// time passed: reaping "doomed" requires a real Reap pass to run and tell
+// the two apart. The test then keeps the janitor cycling for ~20 more ticks
+// (a further ~1s at 50ms) — "live" must survive every single one, and a
+// flush through the still-open session must keep succeeding. Both survive
+// because the live lease's Expiry (~30s out, acquired at Open) dominates the
+// deadline regardless of the short TTL — this is what proves it is the
+// lease, not the TTL's length, doing the deferring. Only after Close
+// releases the lease does the deadline collapse to close-time+200ms: the
+// janitor must reap it within 5s.
+func TestJanitorNeverReapsThisDaemonsOwnSession(t *testing.T) {
+	srv, w := newServer(t)
+	sock := srv.SocketPath()
+
+	if _, err := w.Fork("app", "main", "live", "", 0); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := w.Fork("app", "main", "doomed", "", 0); err != nil {
+		t.Fatal(err)
+	}
+
+	open := call(t, sock, Request{Op: "open", DB: "app", Branch: "live"})
+	if !open.OK {
+		t.Fatalf("open = %+v", open)
+	}
+
+	now := time.Now().UTC()
+	backdate := func(branch string) {
+		ref, etag, err := w.Store.GetRef("app", branch)
+		if err != nil {
+			t.Fatal(err)
+		}
+		ref.TTL = "200ms"
+		ref.TouchedAt = now.Add(-2 * time.Hour).Format(time.RFC3339Nano)
+		if _, err := w.Store.PutRef("app", branch, ref, etag); err != nil {
+			t.Fatal(err)
+		}
+	}
+	backdate("live")
+	backdate("doomed")
+
+	srv.StartJanitor(50*time.Millisecond, 0)
+
+	// Proof the janitor is actually cycling against real state: "doomed"
+	// (unleased) must go, distinguishing it from "live" (leased) despite
+	// both starting out identically backdated.
+	deadline := time.Now().Add(5 * time.Second)
+	for {
+		if _, _, err := w.Store.GetRef("app", "doomed"); errors.Is(err, store.ErrNotFound) {
+			break
+		}
+		if time.Now().After(deadline) {
+			t.Fatal("janitor never reaped the unleased sibling within 5s")
+		}
+		time.Sleep(20 * time.Millisecond)
+	}
+
+	// Keep the janitor cycling for ~20 more 50ms ticks. "live" must survive
+	// every one of them, and the open session must keep working throughout.
+	for i := 0; i < 20; i++ {
+		time.Sleep(50 * time.Millisecond)
+		if _, _, err := w.Store.GetRef("app", "live"); err != nil {
+			t.Fatalf("cycle %d: live session's branch was reaped out from under it: %v", i, err)
+		}
+	}
+	if flush := call(t, sock, Request{Op: "flush", DB: "app", Branch: "live", Name: ""}); !flush.OK {
+		t.Fatalf("flush on the still-open live session = %+v", flush)
+	}
+
+	if cl := call(t, sock, Request{Op: "close", DB: "app", Branch: "live"}); !cl.OK {
+		t.Fatalf("close = %+v", cl)
+	}
+
+	// Lease released: ReleaseLease's own Touch(now) resets the clock, but the
+	// TTL is only 200ms, so the janitor must reap it well within 5s.
+	deadline = time.Now().Add(5 * time.Second)
+	for {
+		if _, _, err := w.Store.GetRef("app", "live"); errors.Is(err, store.ErrNotFound) {
+			break
+		}
+		if time.Now().After(deadline) {
+			t.Fatal("janitor never reaped live after its session closed, within 5s")
+		}
+		time.Sleep(20 * time.Millisecond)
+	}
+
+	if _, _, err := w.Store.GetRef("app", "main"); err != nil {
+		t.Fatalf("main must survive: %v", err)
+	}
+
+	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+	defer cancel()
+	if err := srv.Shutdown(ctx); err != nil {
+		t.Fatal(err)
+	}
+}
+
+// TestForkFromLiveSessionSeesLatestWrite is a regression pin for the
+// flush-then-fork contract (already exercised incidentally inside
+// TestLifecycleOpsRoundTrip's fork2 case): write a row through an open
+// session's checkout, deliberately never flush it, then daemon-op fork that
+// branch. opFork's flushIfOpen step must flush the live session before
+// forking, so the child must carry the row even though the caller never
+// explicitly flushed it. It also asserts the other half of the contract that
+// a naive implementation could get wrong: flushing the source out from under
+// its own open session must not leave that session damaged — a further
+// write, an explicit flush, and a status check must all still succeed
+// afterward.
+func TestForkFromLiveSessionSeesLatestWrite(t *testing.T) {
+	srv, _ := newServer(t)
+	sock := srv.SocketPath()
+
+	open := call(t, sock, Request{Op: "open", DB: "app", Branch: "main"})
+	if !open.OK {
+		t.Fatalf("open = %+v", open)
+	}
+	sqliteExec(t, open.Checkout, "CREATE TABLE t (v); INSERT INTO t VALUES (1);")
+
+	// No flush here: the point is that opFork's flush-then-fork step, not an
+	// explicit flush from the caller, is what carries this write forward.
+	fork := call(t, sock, Request{Op: "fork", DB: "app", Branch: "main", Name: "child"})
+	if !fork.OK {
+		t.Fatalf("fork from a live, unflushed session = %+v", fork)
+	}
+
+	co := call(t, sock, Request{Op: "checkout", DB: "app", Branch: "child"})
+	if !co.OK || co.Checkout == "" {
+		t.Fatalf("checkout child = %+v", co)
+	}
+	if n := sqliteCount(t, co.Checkout, "SELECT COUNT(*) FROM t;"); n != 1 {
+		t.Fatalf("child row count = %d, want 1 (the unflushed write)", n)
+	}
+
+	// The SOURCE session must still be healthy after fork flushed it out
+	// from under the caller: a further write, an explicit flush, and status
+	// must all still succeed.
+	sqliteExec(t, open.Checkout, "INSERT INTO t VALUES (2);")
+	flush := call(t, sock, Request{Op: "flush", DB: "app", Branch: "main", Name: "after-fork"})
+	if !flush.OK {
+		t.Fatalf("flush on source after fork = %+v", flush)
+	}
+	st := call(t, sock, Request{Op: "status"})
+	if !st.OK {
+		t.Fatalf("status = %+v", st)
+	}
+	var found bool
+	for _, in := range st.Sessions {
+		if in.DB == "app" && in.Branch == "main" {
+			found = true
+			if in.Error != "" {
+				t.Fatalf("source session unhealthy after fork: %+v", in)
+			}
+		}
+	}
+	if !found {
+		t.Fatalf("source session missing from status after fork: %+v", st.Sessions)
+	}
+}
