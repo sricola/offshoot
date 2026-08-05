@@ -318,3 +318,271 @@ func TestUnknownOpStillErrors(t *testing.T) {
 		t.Fatal("unknown op must carry an error message")
 	}
 }
+
+// branchInfo finds branch in a "branches" Response, failing the test if it
+// is not listed.
+func branchInfo(t *testing.T, resp Response, branch string) BranchInfo {
+	t.Helper()
+	for _, b := range resp.Branches {
+		if b.Branch == branch {
+			return b
+		}
+	}
+	t.Fatalf("branches missing %q: %+v", branch, resp.Branches)
+	return BranchInfo{}
+}
+
+// TestGuardsRefuseDuringInFlightOpen closes the gap where a branch reserved
+// (key present, nil value) by an in-flight opOpen — still inside its slow,
+// unlocked session.Open, which is materializing the checkout file — was
+// invisible to every open-session guard because they only checked for a
+// non-nil session. That let checkout/destroy/rollback/promote's target
+// guard, and fork/promote's "is the source open" check, all sail straight
+// past a reservation and run concurrently with session.Open's write to the
+// exact same checkout file: the very on-disk race opOpen's reservation
+// exists to prevent (see opOpen's doc comment). Uses the same openDelay
+// test hook TestShutdownDuringInFlightOpenLeavesNoLease uses to
+// deterministically hold an open in that reserved-but-not-yet-live window.
+func TestGuardsRefuseDuringInFlightOpen(t *testing.T) {
+	srv, w := newServer(t)
+	sock := srv.SocketPath()
+
+	if _, err := w.Fork("app", "main", "mid", "", 0); err != nil {
+		t.Fatal(err)
+	}
+
+	entered := make(chan struct{})
+	proceed := make(chan struct{})
+	openDelay = func() {
+		close(entered)
+		<-proceed
+	}
+	defer func() { openDelay = nil }()
+
+	openDone := make(chan Response, 1)
+	go func() {
+		resp, err := rawCall(sock, Request{Op: "open", DB: "app", Branch: "mid"})
+		if err != nil {
+			resp = errResp(err)
+		}
+		openDone <- resp
+	}()
+	<-entered // opOpen has reserved app@mid and is blocked before session.Open
+
+	if r := call(t, sock, Request{Op: "checkout", DB: "app", Branch: "mid"}); r.OK || !strings.Contains(r.Error, "close") {
+		t.Fatalf("checkout during in-flight open = %+v, want a close-session refusal", r)
+	}
+	if r := call(t, sock, Request{Op: "destroy", DB: "app", Branch: "mid"}); r.OK || !strings.Contains(r.Error, "close") {
+		t.Fatalf("destroy during in-flight open = %+v, want a close-session refusal", r)
+	}
+	if r := call(t, sock, Request{Op: "rollback", DB: "app", Branch: "mid", Name: "fork"}); r.OK || !strings.Contains(r.Error, "close") {
+		t.Fatalf("rollback during in-flight open = %+v, want a close-session refusal", r)
+	}
+	if r := call(t, sock, Request{Op: "promote", DB: "app", Branch: "main", Name: "mid"}); r.OK || !strings.Contains(r.Error, "close") {
+		t.Fatalf("promote onto an in-flight-open target = %+v, want a close-session refusal", r)
+	}
+	if r := call(t, sock, Request{Op: "fork", DB: "app", Branch: "mid", Name: "mid-fork"}); r.OK || !strings.Contains(r.Error, "close") {
+		t.Fatalf("fork from an in-flight-open source = %+v, want a close-session refusal", r)
+	}
+
+	openDelay = nil
+	close(proceed)
+	var openResp Response
+	select {
+	case openResp = <-openDone:
+	case <-time.After(10 * time.Second):
+		t.Fatal("open never returned after being released")
+	}
+	if !openResp.OK {
+		t.Fatalf("open eventually = %+v", openResp)
+	}
+	if cl := call(t, sock, Request{Op: "close", DB: "app", Branch: "mid"}); !cl.OK {
+		t.Fatalf("close = %+v", cl)
+	}
+}
+
+// TestOpPromoteDoesNotDefaultTarget pins the fix for a real footgun: an
+// omitted req.Name used to default to "main" the same way req.Branch
+// (source) does, so a client bug that dropped the target field silently
+// became "promote onto main" instead of a clean validation error — and
+// once req.Force can override main's protected-branch guard, that default
+// is destructive. An omitted target must fail via ops.Promote's own
+// store.ValidateName("") refusal, and must leave main completely untouched.
+func TestOpPromoteDoesNotDefaultTarget(t *testing.T) {
+	srv, _ := newServer(t)
+	sock := srv.SocketPath()
+
+	before := call(t, sock, Request{Op: "branches", DB: "app"})
+	mainBefore := branchInfo(t, before, "main")
+
+	r := call(t, sock, Request{Op: "promote", DB: "app", Branch: "main"}) // Name omitted
+	if r.OK {
+		t.Fatal("promote with an omitted target must not silently default to main")
+	}
+	if r.Error == "" {
+		t.Fatal("a refused promote must carry an error message")
+	}
+
+	after := call(t, sock, Request{Op: "branches", DB: "app"})
+	mainAfter := branchInfo(t, after, "main")
+	if mainAfter.HeadTXID != mainBefore.HeadTXID {
+		t.Fatalf("main was mutated by a promote with no target: before=%+v after=%+v", mainBefore, mainAfter)
+	}
+}
+
+// TestTouchOp covers all four of touch's ttl arms end to end through the
+// daemon, asserting the result via the "branches" op: "" keeps the current
+// TTL, "none" clears it, a positive duration sets it, and both an
+// unparseable string and a non-positive parsed duration are refused
+// (ok=false) rather than silently accepted or aliased to "none".
+func TestTouchOp(t *testing.T) {
+	srv, _ := newServer(t)
+	sock := srv.SocketPath()
+
+	// "2h" sets.
+	if r := call(t, sock, Request{Op: "touch", DB: "app", Branch: "main", TTL: "2h"}); !r.OK {
+		t.Fatalf("touch 2h = %+v", r)
+	}
+	want := (2 * time.Hour).String()
+	br := call(t, sock, Request{Op: "branches", DB: "app"})
+	if got := branchInfo(t, br, "main").TTL; got != want {
+		t.Fatalf("ttl after touch 2h = %q, want %q", got, want)
+	}
+
+	// "" keeps the current TTL unchanged.
+	if r := call(t, sock, Request{Op: "touch", DB: "app", Branch: "main", TTL: ""}); !r.OK {
+		t.Fatalf("touch \"\" = %+v", r)
+	}
+	br = call(t, sock, Request{Op: "branches", DB: "app"})
+	if got := branchInfo(t, br, "main").TTL; got != want {
+		t.Fatalf("touch \"\" changed the ttl: got %q, want unchanged %q", got, want)
+	}
+
+	// "none" clears.
+	if r := call(t, sock, Request{Op: "touch", DB: "app", Branch: "main", TTL: "none"}); !r.OK {
+		t.Fatalf("touch none = %+v", r)
+	}
+	br = call(t, sock, Request{Op: "branches", DB: "app"})
+	if got := branchInfo(t, br, "main").TTL; got != "" {
+		t.Fatalf("touch none did not clear the ttl, got %q", got)
+	}
+
+	// Unparseable -> ok=false with an error.
+	r := call(t, sock, Request{Op: "touch", DB: "app", Branch: "main", TTL: "not-a-duration"})
+	if r.OK {
+		t.Fatal("touch with an unparseable ttl must be refused")
+	}
+	if r.Error == "" {
+		t.Fatal("a failed touch must carry an error message")
+	}
+
+	// A non-positive parsed duration must not silently alias "none".
+	r = call(t, sock, Request{Op: "touch", DB: "app", Branch: "main", TTL: "0s"})
+	if r.OK {
+		t.Fatal("touch with a zero ttl must be refused, not aliased to \"none\"")
+	}
+	if !strings.Contains(r.Error, "none") {
+		t.Fatalf("zero-ttl error = %q, want it to name \"none\" as the way to clear", r.Error)
+	}
+	r = call(t, sock, Request{Op: "touch", DB: "app", Branch: "main", TTL: "-1h"})
+	if r.OK {
+		t.Fatal("touch with a negative ttl must be refused, not aliased to \"none\"")
+	}
+	if !strings.Contains(r.Error, "none") {
+		t.Fatalf("negative-ttl error = %q, want it to name \"none\" as the way to clear", r.Error)
+	}
+}
+
+// TestCheckoutRefusesOpenSession covers the checkout op's open-session
+// guard directly (previously exercised only incidentally as a side effect
+// of other tests): a checkout of a branch this daemon already has open
+// must be refused, mentioning "close".
+func TestCheckoutRefusesOpenSession(t *testing.T) {
+	srv, _ := newServer(t)
+	sock := srv.SocketPath()
+
+	if r := call(t, sock, Request{Op: "open", DB: "app", Branch: "main"}); !r.OK {
+		t.Fatalf("open = %+v", r)
+	}
+	r := call(t, sock, Request{Op: "checkout", DB: "app", Branch: "main"})
+	if r.OK {
+		t.Fatal("checkout of an open branch must be refused")
+	}
+	if !strings.Contains(r.Error, "close") {
+		t.Fatalf("checkout error = %q, want it to mention closing the session", r.Error)
+	}
+}
+
+// TestForkFromNamedCheckpoint covers fork's req.From: forking at an earlier
+// named checkpoint (rather than the branch's current head) must carry
+// exactly that checkpoint's state, not anything written after it.
+func TestForkFromNamedCheckpoint(t *testing.T) {
+	srv, _ := newServer(t)
+	sock := srv.SocketPath()
+
+	open := call(t, sock, Request{Op: "open", DB: "app", Branch: "main"})
+	if !open.OK {
+		t.Fatalf("open = %+v", open)
+	}
+	sqliteExec(t, open.Checkout, "CREATE TABLE t (v); INSERT INTO t VALUES (1);")
+	if r := call(t, sock, Request{Op: "flush", DB: "app", Branch: "main", Name: "cp1"}); !r.OK {
+		t.Fatalf("flush cp1 = %+v", r)
+	}
+	sqliteExec(t, open.Checkout, "INSERT INTO t VALUES (2);")
+	if r := call(t, sock, Request{Op: "flush", DB: "app", Branch: "main", Name: "cp2"}); !r.OK {
+		t.Fatalf("flush cp2 = %+v", r)
+	}
+	if cl := call(t, sock, Request{Op: "close", DB: "app", Branch: "main"}); !cl.OK {
+		t.Fatalf("close = %+v", cl)
+	}
+
+	fork := call(t, sock, Request{Op: "fork", DB: "app", Branch: "main", Name: "fromcp1", From: "cp1"})
+	if !fork.OK {
+		t.Fatalf("fork from=cp1 = %+v", fork)
+	}
+	co := call(t, sock, Request{Op: "checkout", DB: "app", Branch: "fromcp1"})
+	if !co.OK {
+		t.Fatalf("checkout fromcp1 = %+v", co)
+	}
+	if n := sqliteCount(t, co.Checkout, "SELECT COUNT(*) FROM t;"); n != 1 {
+		t.Fatalf("fromcp1 row count = %d, want 1 (cp1's state, not cp2's)", n)
+	}
+}
+
+// TestDestroyForceOnProtectedBranch covers destroy's req.Force: main is
+// protected by default (ops.Create), so destroying it without force must
+// fail, and with force must succeed.
+func TestDestroyForceOnProtectedBranch(t *testing.T) {
+	srv, _ := newServer(t)
+	sock := srv.SocketPath()
+
+	if r := call(t, sock, Request{Op: "destroy", DB: "app", Branch: "main"}); r.OK {
+		t.Fatal("destroy of a protected branch without force must be refused")
+	}
+	r := call(t, sock, Request{Op: "destroy", DB: "app", Branch: "main", Force: true})
+	if !r.OK {
+		t.Fatalf("destroy with force = %+v", r)
+	}
+	br := call(t, sock, Request{Op: "branches", DB: "app"})
+	for _, b := range br.Branches {
+		if b.Branch == "main" {
+			t.Fatalf("main still listed after forced destroy: %+v", br.Branches)
+		}
+	}
+}
+
+// TestBranchesUnknownDBErrors pins the fix for "branches" on a db that was
+// never created (or has had every branch destroyed): it must return an
+// error, not ok=true with an empty list — a client asking for a specific
+// db's branches should be told plainly that the db doesn't exist rather
+// than silently seeing "no branches".
+func TestBranchesUnknownDBErrors(t *testing.T) {
+	srv, _ := newServer(t)
+	r := call(t, srv.SocketPath(), Request{Op: "branches", DB: "does-not-exist"})
+	if r.OK {
+		t.Fatal("branches of a nonexistent db must be refused, not ok=true with an empty list")
+	}
+	if r.Error == "" {
+		t.Fatal("a refused branches call must carry an error message")
+	}
+}

@@ -45,9 +45,14 @@ type Response struct {
 // BranchInfo describes one branch of one db, as returned by the "branches"
 // op.
 type BranchInfo struct {
-	Branch       string   `json:"branch"`
-	HeadTXID     uint64   `json:"head_txid"`
-	Protected    bool     `json:"protected"`
+	Branch    string `json:"branch"`
+	HeadTXID  uint64 `json:"head_txid"`
+	Protected bool   `json:"protected"`
+	// TTL is the branch's TTL verbatim from the ref: time.Duration's
+	// canonical String() re-render (e.g. a fork requested with ttl "1h"
+	// reads back here as "1h0m0s"), not necessarily the literal string a
+	// client last sent. Safe to echo straight back as a future fork/touch
+	// request's TTL — it always round-trips through time.ParseDuration.
 	TTL          string   `json:"ttl,omitempty"`
 	TTLRemaining string   `json:"ttl_remaining,omitempty"`
 	LeaseHolder  string   `json:"lease_holder,omitempty"`
