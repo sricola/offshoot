@@ -1,0 +1,113 @@
+name: ci
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+permissions:
+  contents: read
+
+jobs:
+  test:
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, macos-latest]
+    runs-on: ${{ matrix.os }}
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-go@v5
+        with:
+          go-version-file: go.mod
+
+      - name: Install sqlite3 CLI (ubuntu)
+        if: runner.os == 'Linux'
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y sqlite3
+
+      - name: Verify sqlite3 CLI is present
+        run: sqlite3 --version
+
+      - name: go vet
+        run: go vet ./...
+
+      - name: go test
+        run: go test ./... -count=1 -race
+
+  sdks:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-go@v5
+        with:
+          go-version-file: go.mod
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: "22"
+
+      - name: Verify system python3 is present
+        run: python3 --version
+
+      - name: Install sqlite3 CLI
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y sqlite3
+
+      - name: make test-sdks
+        run: make test-sdks
+
+  s3-conformance:
+    runs-on: ubuntu-latest
+    # MinIO is started with a plain `docker run` (see "Start MinIO" below)
+    # rather than a `services:` container: the job-level services schema has
+    # no way to pass `server /data` as the container command without
+    # replacing the image's entrypoint, and `docker run ... minio/minio:latest
+    # server /data` is exactly the invocation the README's supported-provider
+    # table cites as verified, so this keeps CI matching that evidence.
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-go@v5
+        with:
+          go-version-file: go.mod
+
+      - name: Start MinIO
+        run: |
+          docker run -d --name minio \
+            -p 9000:9000 \
+            -e MINIO_ROOT_USER=minioadmin \
+            -e MINIO_ROOT_PASSWORD=minioadmin \
+            minio/minio:latest server /data
+          for i in $(seq 1 30); do
+            if curl -sSf http://127.0.0.1:9000/minio/health/live >/dev/null; then
+              echo "minio is up"
+              break
+            fi
+            sleep 1
+          done
+          curl -sSf http://127.0.0.1:9000/minio/health/live
+
+      - name: Create test bucket
+        run: |
+          docker run --rm --network host \
+            -e MC_HOST_local=http://minioadmin:minioadmin@127.0.0.1:9000 \
+            minio/mc:latest mb -p local/offshoot-test
+
+      - name: make test-s3
+        env:
+          OFFSHOOT_S3_TEST_BUCKET: offshoot-test
+          OFFSHOOT_S3_ENDPOINT: http://127.0.0.1:9000
+          OFFSHOOT_S3_PATH_STYLE: "1"
+          AWS_ACCESS_KEY_ID: minioadmin
+          AWS_SECRET_ACCESS_KEY: minioadmin
+          AWS_REGION: us-east-1
+        run: make test-s3
+
+      - name: Stop MinIO
+        if: always()
+        run: docker rm -f minio || true

@@ -1,0 +1,50 @@
+name: Feature request
+description: Propose something offshoot doesn't do yet
+labels: ["enhancement"]
+body:
+  - type: markdown
+    attributes:
+      value: |
+        Lead with the problem, not the solution — it's easier to evaluate,
+        and might already have an answer (or a better one than what you had
+        in mind).
+  - type: textarea
+    id: problem
+    attributes:
+      label: Problem / user story
+      description: >
+        What are you trying to do, and where does offshoot get in the way?
+        A concrete scenario beats an abstract ask.
+      placeholder: >
+        "I'm running N parallel agent attempts against forks of the same
+        DB and I need to X, but currently Y happens instead."
+    validations:
+      required: true
+  - type: textarea
+    id: proposal
+    attributes:
+      label: Proposed solution
+      description: >
+        If you have one in mind. Optional — sometimes the problem statement
+        alone is enough to start the conversation.
+    validations:
+      required: false
+  - type: textarea
+    id: alternatives
+    attributes:
+      label: Alternatives considered
+      description: Other ways you've worked around this, or other tools you compared against.
+    validations:
+      required: false
+  - type: checkboxes
+    id: sensitive-area
+    attributes:
+      label: Does this touch a design-sensitive area?
+      description: >
+        Storage format, wire protocol, or public API changes need an
+        RFC-style discussion before a PR gets written against them (see
+        GOVERNANCE.md). Checking this doesn't block filing — it just sets
+        expectations for how this gets resolved.
+      options:
+        - label: This may affect the on-disk/store layout, wire protocol, or a public API (CLI flags, SDK methods)
+          required: false

@@ -1,0 +1,7 @@
+blank_issues_enabled: false
+contact_links:
+  - name: Questions and discussion
+    url: https://github.com/sricola/offshoot/discussions
+    about: >-
+      Usage questions, ideas you want to think out loud about, or anything
+      that isn't a bug report or a concrete feature ask.

@@ -1,9 +1,11 @@
 package main
 
 import (
+	"fmt"
 	"os"
 	"os/exec"
 	"path/filepath"
+	"runtime"
 	"strings"
 	"testing"
 	"time"
@@ -73,6 +75,30 @@ func TestForkRejectsNonPositiveTTL(t *testing.T) {
 	// Omitting --ttl entirely still means no TTL, unaffected by the guard.
 	if err := run([]string{"-store", dir, "fork", "app", "kid-none"}); err != nil {
 		t.Fatalf("fork with no --ttl flag must still succeed: %v", err)
+	}
+}
+
+// TestVersion pins the `offshoot version` output shape: it must not require
+// an initialized store (it's handled before ops.Open, alongside "init"),
+// and it must report the build-time version var, the Go runtime version,
+// and GOOS/GOARCH, in that order.
+func TestVersion(t *testing.T) {
+	dir := filepath.Join(t.TempDir(), "s")
+	out := call(t, dir, "version")
+	want := fmt.Sprintf("offshoot %s %s %s/%s\n", version, runtime.Version(), runtime.GOOS, runtime.GOARCH)
+	if out != want {
+		t.Fatalf("offshoot version = %q, want %q", out, want)
+	}
+	// No store was ever initialized at dir; version must not have created one.
+	if _, err := os.Stat(dir); err == nil {
+		t.Fatal("offshoot version must not create a store")
+	}
+}
+
+func TestVersionRejectsArgs(t *testing.T) {
+	dir := filepath.Join(t.TempDir(), "s")
+	if err := run([]string{"-store", dir, "version", "extra"}); err == nil {
+		t.Fatal("offshoot version with extra args must be rejected")
 	}
 }
 

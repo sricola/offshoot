@@ -1,0 +1,81 @@
+name: Bug report
+description: Something is broken or behaving incorrectly
+labels: ["bug"]
+body:
+  - type: markdown
+    attributes:
+      value: |
+        offshoot is pre-alpha and single-maintainer — the more precise the
+        repro, the faster this gets looked at. If this might be a data-loss,
+        fencing, path-traversal, or credential-handling issue, please use
+        private reporting instead (see SECURITY.md) rather than filing it
+        here in public.
+  - type: input
+    id: version
+    attributes:
+      label: offshoot version
+      description: >
+        Output of `offshoot version`. If your build predates that command,
+        paste `git rev-parse HEAD` (or the release tag) of the build you're
+        running instead.
+      placeholder: "offshoot version 0.1.0 (abc1234)"
+    validations:
+      required: true
+  - type: dropdown
+    id: store-type
+    attributes:
+      label: Store type
+      description: What backend is the store pointed at?
+      options:
+        - Local directory
+        - S3-compatible - AWS S3
+        - S3-compatible - Cloudflare R2
+        - S3-compatible - Tigris
+        - S3-compatible - MinIO
+        - S3-compatible - other (name it in the repro section)
+        - Not sure / not applicable
+    validations:
+      required: true
+  - type: dropdown
+    id: mode
+    attributes:
+      label: Mode
+      description: Which mode were you using when this happened?
+      options:
+        - At-rest CLI (create/checkout/checkpoint/fork/rollback/promote/... with no daemon running)
+        - Daemon session (offshoot serve + session open/flush/close)
+        - MCP server
+        - Not sure
+    validations:
+      required: true
+  - type: textarea
+    id: status
+    attributes:
+      label: offshoot status output
+      description: >
+        Paste the output of `offshoot status` (or `offshoot session status`
+        in daemon mode) from around the time of the bug, if you have it.
+      render: text
+    validations:
+      required: false
+  - type: textarea
+    id: repro
+    attributes:
+      label: What happened, and how to reproduce it
+      description: >
+        Exact commands run, expected behavior, actual behavior. A minimal
+        repro (even a shell script) is the single most useful thing you can
+        attach.
+    validations:
+      required: true
+  - type: textarea
+    id: env
+    attributes:
+      label: Environment
+      description: >
+        OS/arch, Go version if built from source, and anything unusual about
+        the filesystem the checkout lives on (network mount, container,
+        overlay fs, etc — relevant because offshoot requires a shared
+        kernel and local POSIX filesystem between agent and daemon).
+    validations:
+      required: false
