@@ -322,20 +322,13 @@ func fileSum(path string) (string, error) {
 	return hex.EncodeToString(h.Sum(nil)), nil
 }
 
-// materializeAt writes the snapshot identified by cp into dst. The epoch
-// comes from the checkpoint, not from the ref: acquiring or reclaiming a
-// branch bumps the ref's epoch, but objects stay in the prefix they were
-// written under.
+// materializeAt writes the state identified by cp into dst. It is a thin
+// wrapper over materializeChainAt (see materialize.go), which resolves the
+// full snapshot+segment chain rather than assuming cp's txid is itself a
+// snapshot: every caller here (Checkout, Rollback's refresh, Promote's
+// refresh, copySnapshotIntoLineage's read side) picks that up unchanged.
 func (w *Workspace) materializeAt(ref store.Ref, cp store.Checkpoint, dst string) error {
-	data, _, err := w.Store.B.Get(store.SnapshotKey(ref.Lineage, cp.Epoch, cp.TXID))
-	if err != nil {
-		return fmt.Errorf("ops: snapshot txid %d (epoch %d) not found in lineage %s: %w",
-			cp.TXID, cp.Epoch, ref.Lineage, err)
-	}
-	if _, err := ltxio.Materialize(bytes.NewReader(data), dst); err != nil {
-		return err
-	}
-	return nil
+	return w.materializeChainAt(ref, cp, dst)
 }
 
 // headCheckpoint is the ref's current head as a Checkpoint.
@@ -498,20 +491,30 @@ func (w *Workspace) warnIfUncheckpointed(db, branch string, ref store.Ref) {
 	}
 }
 
-// copySnapshotIntoLineage copies the snapshot identified by cp (in src's
-// lineage, at cp's own recorded epoch — not src.Epoch) into lineage at epoch
-// 1 via a create-only put and returns the key it was written under.
-// Destinations are always freshly-minted lineages, and a fresh lineage
-// always starts at epoch 1: this is the primitive behind fork, rollback, and
-// promote, every branch repoint gets a fresh lineage, preserving
-// one-writer-per-lineage.
+// copySnapshotIntoLineage materializes src's lineage at cp — resolving its
+// full snapshot+segment chain, not assuming cp.TXID is itself a snapshot
+// object; e.g. forking or rolling back at HEAD after segment writes lands on
+// a txid only reachable by applying segments past src's last snapshot — into
+// a scratch file, then re-encodes that as a single fresh snapshot in
+// lineage at epoch 1 via a create-only put, and returns the key it was
+// written under. Destinations are always freshly-minted lineages, and a
+// fresh lineage always starts at epoch 1: this is the primitive behind fork,
+// rollback, and promote, every branch repoint gets a fresh lineage,
+// preserving one-writer-per-lineage. Re-encoding as a single snapshot
+// (rather than copying whatever mix of objects src's chain resolved to) is
+// also what keeps the destination lineage storage-independent from src.
 func (w *Workspace) copySnapshotIntoLineage(src store.Ref, cp store.Checkpoint, lineage string) (string, error) {
-	data, _, err := w.Store.B.Get(store.SnapshotKey(src.Lineage, cp.Epoch, cp.TXID))
-	if err != nil {
-		return "", fmt.Errorf("ops: snapshot txid %d (epoch %d) not found in lineage %s: %w", cp.TXID, cp.Epoch, src.Lineage, err)
+	tmp := filepath.Join(os.TempDir(), "offshoot-copy-"+store.NewLineageID()+".db")
+	defer os.Remove(tmp)
+	if err := w.materializeChainAt(src, cp, tmp); err != nil {
+		return "", fmt.Errorf("ops: materializing lineage %s at txid %d for copy: %w", src.Lineage, cp.TXID, err)
+	}
+	var buf bytes.Buffer
+	if err := ltxio.EncodeSnapshot(tmp, cp.TXID, &buf); err != nil {
+		return "", err
 	}
 	key := store.SnapshotKey(lineage, 1, cp.TXID)
-	if _, err := w.Store.B.PutIf(key, data, ""); err != nil {
+	if _, err := w.Store.B.PutIf(key, buf.Bytes(), ""); err != nil {
 		return "", err
 	}
 	return key, nil
