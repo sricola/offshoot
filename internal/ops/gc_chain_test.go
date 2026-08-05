@@ -74,7 +74,7 @@ func TestGCSweepsSegmentsWithTheirLineage(t *testing.T) {
 	if err := w.Create("app"); err != nil {
 		t.Fatal(err)
 	}
-	if _, err := w.Fork("app", "main", "doomed", ""); err != nil {
+	if _, err := w.Fork("app", "main", "doomed", "", 0); err != nil {
 		t.Fatal(err)
 	}
 	s, err := session.Open(context.Background(), session.Options{

@@ -11,10 +11,10 @@ Requires Go 1.24+, cgo, and the `sqlite3` CLI for tests. Linux and macOS only.
     go build -o offshoot ./cmd/offshoot
     ./offshoot init
     ./offshoot create app
-    sqlite3 "$(./offshoot path app)" "CREATE TABLE users (name); INSERT INTO users VALUES ('ada');"
+    sqlite3 "$(./offshoot checkout app)" "CREATE TABLE users (name); INSERT INTO users VALUES ('ada');"
     ./offshoot checkpoint app v1
     ./offshoot fork app attempt-1        # instant branch
-    sqlite3 "$(./offshoot path app@attempt-1)" "DELETE FROM users;"   # destructive experiment
+    sqlite3 "$(./offshoot checkout app@attempt-1)" "DELETE FROM users;"   # destructive experiment
     ./offshoot rollback app@attempt-1 --to fork                        # undo it
     ./offshoot promote app@attempt-1 --onto main --force               # or ship it
     ./offshoot status
@@ -112,6 +112,44 @@ not yet in the store; `session status` reports the txid each session is durable
 through. A session that loses its lease is fenced and stops — it will not write
 under a dead epoch — and `session status` shows the error.
 
+### TTLs and the reaping janitor
+
+A branch can carry a TTL, set at fork time or any time after:
+
+    offshoot fork app attempt-1 --ttl 2h        # reap-eligible 2h after last activity
+    offshoot touch app@attempt-1 --ttl 30m      # resets the clock, changes the TTL
+    offshoot touch app@attempt-1                # resets the clock, TTL unchanged
+    offshoot touch app@attempt-1 --ttl none     # clears the TTL
+
+Per the design spec:
+
+> TTL is measured from the last durable write (last shipped segment) or lease
+> renewal, whichever is later; `offshoot touch` resets it explicitly. A branch
+> with an active lease is never reaped — expiry defers until the lease is
+> released or times out (a wedged holder loses the lease first, then TTL
+> applies). Creating a child does not extend the parent. Branches without a
+> TTL live until destroyed.
+
+In practice: a daemon session holding a branch open keeps renewing its lease,
+so the janitor can never reap a branch this daemon is actively writing to,
+TTL or not; `offshoot touch` is how you defer expiry on a branch nobody has
+open. Protected branches (`main`, by default) are never reaped regardless of
+TTL. `offshoot status` and the daemon's own responses report the TTL
+re-rendered through Go's canonical `time.Duration.String()` — a fork
+requested with `--ttl 1h` reads back as `ttl=1h0m0s`, not the literal `1h` it
+was given.
+
+`offshoot serve` runs the janitor — TTL reaping plus the periodic GC sweep —
+on an interval:
+
+    offshoot serve -reap-every 1m -gc-grace 15m   # both are the defaults
+
+`-reap-every 0` disables the janitor entirely: neither TTL reaping nor the
+periodic GC sweep runs (GC is still available on demand via `offshoot gc`).
+`-gc-grace` is how long a tombstoned (unreachable) lineage's storage must sit
+before a later cycle actually deletes it — `0` makes it eligible for deletion
+on the very next cycle after being marked, rather than disabling GC.
+
 ### What a flush costs
 
 A daemon flush writes only the pages that changed since the previous flush —
@@ -138,7 +176,13 @@ SQLite file both processes open.
 Design: docs/superpowers/specs/2026-07-29-offshoot-design.md
 Capture-spike evidence: docs/superpowers/specs/2026-07-29-offshoot-spike-report.md
 
-## Agent integration (MCP)
+## Integration surface
+
+Four ways to talk to offshoot (the design spec's "integration surface"): the
+CLI above needs no daemon and no SDK; everything else below is a client of
+the daemon's lifecycle API and requires `offshoot serve` already running.
+
+### MCP
 
 `offshoot mcp` speaks the Model Context Protocol on stdio, so an agent can
 branch on its own initiative instead of asking you to run commands:
@@ -153,3 +197,61 @@ promote the attempt that worked.
 Destructive tools respect the same protected-branch rules as the CLI: an agent
 can fork and experiment freely, but promoting onto or destroying `main`
 requires an explicit force, and the refusal tells the agent so.
+
+### Python SDK
+
+`sdk/python` is a stdlib-only, thin client over the daemon's lifecycle API —
+it never opens SQLite itself and can't do anything the CLI can't; it just
+lets your process drive a running daemon instead of shelling out. Not yet
+published to PyPI — import it from a checkout of this repo:
+
+    offshoot -store ./.offshoot init
+    offshoot serve -socket /tmp/o.sock &
+
+```python
+import sys; sys.path.insert(0, "sdk/python")
+import offshoot
+
+with offshoot.connect("/tmp/o.sock") as c:
+    c.create("app")
+    s = c.open("app")              # sqlite3.connect(s.path); write; commit
+    s.flush("v1")                  # durable in the store, writer never paused
+    c.fork("app", "main", "try", ttl="2h")
+    s.close()
+```
+
+### TypeScript SDK
+
+`sdk/typescript` is the same thin client, zero runtime dependencies. Also not
+yet published to npm — build and import it from a checkout of this repo:
+
+    offshoot -store ./.offshoot init
+    offshoot serve -socket /tmp/o.sock &
+    (cd sdk/typescript && npm install --no-audit --no-fund && npm run build)
+
+```ts
+import { connect } from "./sdk/typescript/dist/client.js";
+
+const c = await connect("/tmp/o.sock");
+await c.create("app");
+const s = await c.open("app");     // sqlite3 s.path; write; commit
+await s.flush("v1");               // durable in the store, writer never paused
+await c.fork("app", "main", "try", { ttl: "2h" });
+await s.close();
+await c.close();
+```
+
+Both SDKs are exercised against a real daemon by `make test-sdks` (needs
+`python3` and `node`/`npm` on PATH — not part of the default `make test`,
+which stays hermetic to the Go suite).
+
+### LangGraph
+
+`offshoot.langgraph.ThreadForks` is a checkpointer *companion*, not a
+`BaseCheckpointSaver`: it maps each LangGraph thread to its own offshoot
+branch, so rewinding a thread to an earlier checkpoint and retrying also
+forks the *database* from that same point — the retry never inherits what
+the original attempt wrote after it. See
+[`examples/langgraph-rewind/`](examples/langgraph-rewind/), runnable with
+`python3 examples/langgraph-rewind/agent.py` — no server or bucket needed
+(it builds `offshoot` and starts its own private daemon).

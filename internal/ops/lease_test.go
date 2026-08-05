@@ -221,7 +221,7 @@ func TestRepointClearsLease(t *testing.T) {
 		if err := w.Create("app"); err != nil {
 			t.Fatal(err)
 		}
-		if _, err := w.Fork("app", "main", "feature", ""); err != nil {
+		if _, err := w.Fork("app", "main", "feature", "", 0); err != nil {
 			t.Fatal(err)
 		}
 		if _, err := w.Checkout("app", "feature"); err != nil {

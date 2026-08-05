@@ -14,6 +14,16 @@ var (
 	// claimed: someone reclaimed the branch, the caller's epoch is dead, and
 	// anything it writes now lands in an unreferenced prefix.
 	ErrLeaseLost = errors.New("store: branch lease lost")
+	// ErrReaping reports that db@branch has an active reap claim
+	// (Reaping=true). A lease acquired in the window between Reap's claim
+	// and its Destroy call would have its branch deleted out from under it
+	// (Destroy's own GetRef can still read the pre-claim ref, and DeleteRef
+	// is unconditional), so AcquireLease refuses outright rather than race
+	// it. The claim is transient: it clears when Reap's Destroy call
+	// unwinds it (failure) or the branch is gone (success), or — for a
+	// claim stranded by a crashed reaper — the next Reap cycle's self-heal
+	// (see ops.reapOne). Retrying shortly is always the right move.
+	ErrReaping = errors.New("store: branch is being reaped")
 )
 
 // Lease is a claim on a branch, valid until Expiry unless renewed.
@@ -42,6 +52,9 @@ func parseExpiry(s string) (time.Time, bool) {
 
 // AcquireLease claims db@branch for holder until now+ttl.
 //
+// A ref with an active reap claim (Reaping=true) refuses outright — see
+// ErrReaping — before any of the lease logic below even runs.
+//
 // A fresh acquisition, or a reclaim of an expired (or corrupt, see below)
 // lease, bumps the epoch so any previous holder's subsequent writes are
 // fenced into a dead prefix. But if the caller already holds a live lease
@@ -68,6 +81,9 @@ func (s *Store) AcquireLease(db, branch, holder string, ttl time.Duration, now t
 	ref, etag, err := s.GetRef(db, branch)
 	if err != nil {
 		return Lease{}, err
+	}
+	if ref.Reaping {
+		return Lease{}, fmt.Errorf("%w: %s@%s; retry shortly", ErrReaping, db, branch)
 	}
 	exp, parseOK := parseExpiry(ref.LeaseExpiry)
 	if ref.LeaseExpiry != "" && !parseOK {
@@ -133,6 +149,10 @@ func (s *Store) ReleaseLease(l Lease) error {
 	}
 	ref.LeaseHolder = ""
 	ref.LeaseExpiry = ""
+	// A lease that was just live counts as activity: stamping the clock here
+	// means a branch isn't instantly eligible for reaping the moment its
+	// session closes.
+	ref.Touch(time.Now())
 	if _, err := s.PutRef(l.DB, l.Branch, ref, etag); err != nil {
 		return fmt.Errorf("store: release lease on %s@%s: %w", l.DB, l.Branch, err)
 	}

@@ -23,7 +23,8 @@ Usage:
   offshoot create <db> [--from f]    new database (branch main), or import file f
   offshoot checkout <db>[@branch]    materialize a working copy; prints its path
   offshoot checkpoint <db>[@branch] <name>   snapshot the checkout as a named checkpoint
-  offshoot fork <db>[@branch] <new> [--at cp]   branch from head or a checkpoint
+  offshoot fork <db>[@branch] <new> [--at cp] [--ttl duration]   branch from head or a checkpoint
+  offshoot touch <db>[@branch] [--ttl duration|none]   reset a branch's activity clock, optionally (re)setting its TTL
   offshoot rollback <db>[@branch] --to <cp>       repoint a branch at a checkpoint
   offshoot promote <db>@<src> --onto <target> [--force]   repoint target at src's head
   offshoot destroy <db>[@branch] [--force]   delete a branch (requires --force for protected)
@@ -101,6 +102,55 @@ func socketOverride(args []string) (string, []string, error) {
 	return sock, out, nil
 }
 
+// extractFlag pulls a "name value" pair out of args, in any position,
+// mirroring socketOverride's parsing style. ok reports whether the flag was
+// present at all; err is non-nil only when the flag is present with no
+// value following it.
+func extractFlag(args []string, name string) (value string, rest []string, ok bool, err error) {
+	out := args[:0]
+	for i := 0; i < len(args); i++ {
+		if args[i] == name {
+			if i+1 >= len(args) {
+				return "", nil, false, fmt.Errorf("%s requires a value", name)
+			}
+			value, ok = args[i+1], true
+			i++
+			continue
+		}
+		out = append(out, args[i])
+	}
+	return value, out, ok, nil
+}
+
+// parseTTLFlag turns a --ttl flag's raw value into a duration: "none" means
+// explicitly no TTL (0), anything else is parsed with time.ParseDuration.
+func parseTTLFlag(raw string) (time.Duration, error) {
+	if raw == "none" {
+		return 0, nil
+	}
+	return time.ParseDuration(raw)
+}
+
+// parseForkTTLFlag turns fork's --ttl flag into a duration. Unlike
+// parseTTLFlag (touch), fork has no "none" sentinel: a brand-new branch has
+// no existing TTL to explicitly clear, so a caller that wants no TTL simply
+// omits --ttl. A non-positive duration ("none", "0s", "-1h", ...) is
+// refused rather than silently treated as no TTL — swallowing it would fork
+// a TTL-less branch while the caller believes it asked for one.
+func parseForkTTLFlag(raw string) (time.Duration, error) {
+	if raw == "none" {
+		return 0, fmt.Errorf(`fork has no "none" concept; omit --ttl for no TTL`)
+	}
+	d, err := time.ParseDuration(raw)
+	if err != nil {
+		return 0, err
+	}
+	if d <= 0 {
+		return 0, fmt.Errorf(`fork --ttl %q must be positive; omit --ttl for no TTL`, raw)
+	}
+	return d, nil
+}
+
 func main() {
 	if err := run(os.Args[1:]); err != nil {
 		fmt.Fprintln(os.Stderr, "offshoot:", err)
@@ -154,23 +204,68 @@ func run(args []string) error {
 		return nil
 	case "fork":
 		fs := rest
-		at := ""
-		if len(fs) == 4 && fs[2] == "--at" {
-			at = fs[3]
-			fs = fs[:2]
+		at, fs, _, err := extractFlag(fs, "--at")
+		if err != nil {
+			return fmt.Errorf("usage: offshoot fork <db>[@branch] <new-branch> [--at checkpoint] [--ttl duration]: %w", err)
+		}
+		ttlRaw, fs, hasTTL, err := extractFlag(fs, "--ttl")
+		if err != nil {
+			return fmt.Errorf("usage: offshoot fork <db>[@branch] <new-branch> [--at checkpoint] [--ttl duration]: %w", err)
+		}
+		ttl := time.Duration(0)
+		if hasTTL {
+			// fork has no "none" sentinel the way touch does (a brand-new
+			// branch has no existing TTL to explicitly clear), and a
+			// non-positive duration is refused rather than silently treated
+			// as no TTL — see parseForkTTLFlag.
+			ttl, err = parseForkTTLFlag(ttlRaw)
+			if err != nil {
+				return err
+			}
 		}
 		if len(fs) != 2 {
-			return fmt.Errorf("usage: offshoot fork <db>[@branch] <new-branch> [--at checkpoint]")
+			return fmt.Errorf("usage: offshoot fork <db>[@branch] <new-branch> [--at checkpoint] [--ttl duration]")
 		}
 		db, branch, err := ops.ParseTarget(fs[0])
 		if err != nil {
 			return err
 		}
-		txid, err := w.Fork(db, branch, fs[1], at)
+		txid, err := w.Fork(db, branch, fs[1], at, ttl)
 		if err != nil {
 			return err
 		}
 		fmt.Printf("forked %s@%s -> %s@%s at txid %d\n", db, branch, db, fs[1], txid)
+		return nil
+	case "touch":
+		fs := rest
+		ttlRaw, fs, hasTTL, err := extractFlag(fs, "--ttl")
+		if err != nil {
+			return fmt.Errorf("usage: offshoot touch <db>[@branch] [--ttl duration|none]: %w", err)
+		}
+		if len(fs) != 1 {
+			return fmt.Errorf("usage: offshoot touch <db>[@branch] [--ttl duration|none]")
+		}
+		db, branch, err := ops.ParseTarget(fs[0])
+		if err != nil {
+			return err
+		}
+		var ttl *time.Duration
+		if hasTTL {
+			d, err := parseTTLFlag(ttlRaw)
+			if err != nil {
+				return err
+			}
+			ttl = &d
+		}
+		ref, err := w.Touch(db, branch, ttl, time.Now())
+		if err != nil {
+			return err
+		}
+		out := ref.TTL
+		if out == "" {
+			out = "none"
+		}
+		fmt.Printf("touched %s@%s ttl=%s touched_at=%s\n", db, branch, out, ref.TouchedAt)
 		return nil
 	case "rollback":
 		if len(rest) != 3 || rest[1] != "--to" {
@@ -254,6 +349,18 @@ func run(args []string) error {
 			}
 			grace = d
 		}
+		// A reap failure on one branch (e.g. its checkout has an open
+		// connection, "database is busy") must not stop GC from running:
+		// GC is independent lineage cleanup, and skipping it entirely would
+		// let one unreapable branch wedge garbage collection forever.
+		// Report the failure and press on.
+		reaped, reapErr := w.Reap(time.Now())
+		if len(reaped) > 0 {
+			fmt.Printf("gc: reaped %v\n", reaped)
+		}
+		if reapErr != nil {
+			fmt.Fprintf(os.Stderr, "offshoot: gc: reap: %v\n", reapErr)
+		}
 		tombstoned, deleted, err := w.GC(grace)
 		if err != nil {
 			return err
@@ -273,8 +380,12 @@ func run(args []string) error {
 			if s.CheckedOut {
 				flags += " checked-out"
 			}
-			fmt.Printf("%s@%s txid=%d checkpoints=[%s]%s\n",
+			line := fmt.Sprintf("%s@%s txid=%d checkpoints=[%s]%s",
 				s.DB, s.Branch, s.HeadTXID, strings.Join(s.Checkpoints, ","), flags)
+			if s.TTL != "" {
+				line += fmt.Sprintf(" ttl=%s remaining=%s", s.TTL, s.TTLRemaining)
+			}
+			fmt.Println(line)
 		}
 		return nil
 	case "lease":
@@ -357,10 +468,32 @@ func run(args []string) error {
 	case "serve":
 		sock, rest, err := socketOverride(rest)
 		if err != nil {
-			return fmt.Errorf("usage: offshoot serve [-socket PATH]: %w", err)
+			return fmt.Errorf("usage: offshoot serve [-socket PATH] [-reap-every DURATION] [-gc-grace DURATION]: %w", err)
+		}
+		reapEveryStr, rest, _, err := extractFlag(rest, "-reap-every")
+		if err != nil {
+			return err
+		}
+		if reapEveryStr == "" {
+			reapEveryStr = "1m"
+		}
+		reapEvery, err := time.ParseDuration(reapEveryStr)
+		if err != nil {
+			return fmt.Errorf("-reap-every: %w", err)
+		}
+		gcGraceStr, rest, _, err := extractFlag(rest, "-gc-grace")
+		if err != nil {
+			return err
+		}
+		if gcGraceStr == "" {
+			gcGraceStr = "15m"
+		}
+		gcGrace, err := time.ParseDuration(gcGraceStr)
+		if err != nil {
+			return fmt.Errorf("-gc-grace: %w", err)
 		}
 		if len(rest) != 0 {
-			return fmt.Errorf("usage: offshoot serve [-socket PATH]")
+			return fmt.Errorf("usage: offshoot serve [-socket PATH] [-reap-every DURATION] [-gc-grace DURATION]")
 		}
 		if sock == "" {
 			p, err := daemon.DefaultSocketPath(spec)
@@ -373,6 +506,7 @@ func run(args []string) error {
 		if err != nil {
 			return err
 		}
+		srv.StartJanitor(reapEvery, gcGrace)
 		fmt.Println("offshoot serving on", sock)
 		sigc := make(chan os.Signal, 1)
 		signal.Notify(sigc, os.Interrupt, syscall.SIGTERM)

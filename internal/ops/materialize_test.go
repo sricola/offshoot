@@ -96,7 +96,7 @@ func TestForkFromAChainProducesASingleSnapshot(t *testing.T) {
 	if _, err := w.Checkpoint("app", "main", "base"); err != nil {
 		t.Fatal(err)
 	}
-	if _, err := w.Fork("app", "main", "child", ""); err != nil {
+	if _, err := w.Fork("app", "main", "child", "", 0); err != nil {
 		t.Fatal(err)
 	}
 	cref, _, err := w.Store.GetRef("app", "child")
@@ -172,7 +172,7 @@ func TestForkAtHeadAfterASegmentProducesASingleSnapshot(t *testing.T) {
 	}
 
 	// Fork at HEAD, which now sits past the last snapshot on the segment.
-	if _, err := w.Fork("app", "main", "child", ""); err != nil {
+	if _, err := w.Fork("app", "main", "child", "", 0); err != nil {
 		t.Fatalf("fork at head across a chain: %v", err)
 	}
 	cref, _, err := w.Store.GetRef("app", "child")
