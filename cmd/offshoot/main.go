@@ -45,11 +45,18 @@ Usage:
                                              -flush-every ships every open session's
                                              work on a cadence even if it's never
                                              flushed explicitly (default 30s; 0 disables)
-  offshoot mcp [-default-ttl d|none]        serve the MCP tool set on stdio for an agent;
+  offshoot mcp [-default-ttl d|none] [-socket PATH]
+                                             serve the MCP tool set on stdio for an agent;
                                              forked branches get this TTL unless the fork
                                              call overrides it (default 24h; 0/none disables
                                              — reaping still needs a running janitor, i.e.
-                                             offshoot serve, or a manual offshoot gc)
+                                             offshoot serve, or a manual offshoot gc);
+                                             -socket names the daemon to ride when one is up
+                                             (default: same derivation offshoot serve uses) —
+                                             checkpoint/fork/checkout on a branch with a
+                                             session already open there use it for live
+                                             capture; everything else, and any branch with no
+                                             open session, still runs entirely at rest
   offshoot session open <db>[@branch] [-socket PATH]      open a session; prints the checkout path
   offshoot session flush <db>[@branch] [name] [-socket PATH]   flush to a durable snapshot; prints the txid
   offshoot session status [-socket PATH]                  list open sessions and their durable txid
@@ -508,14 +515,23 @@ func run(args []string) error {
 			return fmt.Errorf("unknown lease subcommand %q", rest[0])
 		}
 	case "mcp":
+		sock, rest, err := socketOverride(rest)
+		if err != nil {
+			return fmt.Errorf("usage: offshoot mcp [-default-ttl DURATION|none] [-socket PATH]: %w", err)
+		}
 		defaultTTL, rest, err := parseDefaultTTLFlag(rest)
 		if err != nil {
-			return fmt.Errorf("usage: offshoot mcp [-default-ttl DURATION|none]: %w", err)
+			return fmt.Errorf("usage: offshoot mcp [-default-ttl DURATION|none] [-socket PATH]: %w", err)
 		}
 		if len(rest) != 0 {
-			return fmt.Errorf("usage: offshoot mcp [-default-ttl DURATION|none]")
+			return fmt.Errorf("usage: offshoot mcp [-default-ttl DURATION|none] [-socket PATH]")
 		}
-		ts := mcp.NewOffshootTools(w, spec, defaultTTL)
+		// sock == "" here (the common case: no -socket given) is resolved by
+		// NewOffshootTools itself via daemon.DefaultSocketPath(spec) — the
+		// same default `offshoot serve` binds to for this store — so a bare
+		// `offshoot mcp` and a bare `offshoot serve` against the same store
+		// agree on where to look without either side hardcoding the path.
+		ts := mcp.NewOffshootTools(w, spec, defaultTTL, sock)
 		srv := mcp.NewServer(os.Stdin, os.Stdout, ts)
 		return srv.Serve(context.Background())
 	case "serve":

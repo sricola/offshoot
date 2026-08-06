@@ -52,7 +52,7 @@ file, IAM role).
 |---|---|
 | `OFFSHOOT_STORE` | Default store spec when `-store` isn't passed |
 | `OFFSHOOT_CHECKOUTS` | Where checkouts are materialized, for a *remote* (`s3://`) store; local stores always keep checkouts under the store directory itself. Defaults to a per-store directory under the user cache dir, keyed by the store's resolved identity (endpoint/region/path-style included, not just the literal spec string) |
-| `OFFSHOOT_SOCKET` | Overrides the daemon socket path for both `offshoot serve` and `offshoot session ...`; if unset, both derive the same default path from the store spec, so they agree without it |
+| `OFFSHOOT_SOCKET` | Overrides the daemon socket path for `offshoot serve`, `offshoot session ...`, and `offshoot mcp`; if unset, all three derive the same default path from the store spec, so they agree without it |
 
 **Naming rules**, enforced on every database name, branch name, and
 checkpoint name: 1–128 characters, charset `[a-z0-9-_.]`, and never exactly
@@ -366,7 +366,7 @@ store-attach failure.
 ## `offshoot mcp`
 
 ```
-offshoot mcp [-default-ttl DURATION|none]
+offshoot mcp [-default-ttl DURATION|none] [-socket PATH]
 claude mcp add offshoot -- offshoot -store ./.offshoot mcp
 ```
 
@@ -390,9 +390,23 @@ it either way — an explicit `ttl:"<duration>"` always wins, and
 fork tool's response echoes the applied TTL and, when there is one, the
 computed expiry timestamp, so both land in the agent's own transcript.
 **TTL alone does not reap anything**: reaping requires a running janitor
-(`offshoot serve`); this mode runs entirely at rest (no daemon integration
-yet — see [docs/status.md](status.md)), so a daemonless `offshoot mcp`
-setup only sweeps expired branches when `offshoot gc` is run by hand.
+(`offshoot serve`); `offshoot mcp` runs no daemon of its own, so a
+daemonless setup only sweeps expired branches when `offshoot gc` is run by
+hand.
+
+**MCP rides a running daemon, but only for a branch a session is already
+open on.** No MCP tool ever opens a session itself (that's a harness's job —
+the SDKs, `offshoot session open`, or a custom loop); each call to
+`offshoot_checkpoint`, `offshoot_fork`, or `offshoot_checkout` freshly
+checks whether the daemon named by `-socket` (default: the same socket
+`offshoot serve` derives for this store) has one open for the branch in
+question. If so, `offshoot_checkpoint` flushes it live through the daemon
+instead of writing a full at-rest snapshot; `offshoot_fork` forks through
+the daemon, which flushes an open source session first; `offshoot_checkout`
+returns that session's own live checkout path. Without an already-open
+session — the common case for a bare `offshoot mcp` — every one of those
+tools behaves exactly as it does with no daemon running at all; see
+[docs/status.md](status.md) for what's tested.
 
 ## `offshoot session open <db>[@branch] [-socket PATH]`
 

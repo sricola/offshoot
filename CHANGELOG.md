@@ -15,6 +15,25 @@ version if you depend on format stability.
 
 ### Added
 
+- MCP rides a running daemon: `offshoot_checkpoint`, `offshoot_fork`, and
+  `offshoot_checkout` each probe the daemon fresh on every call (never
+  cached — the daemon may start after the MCP server does) and take a
+  live-capture path when one is up, falling back silently to exactly
+  today's at-rest behavior otherwise. `offshoot_checkpoint` on a branch
+  with an open daemon session flushes it live (the daemon's `flush` op —
+  no quiesce, no full-snapshot re-encode); `offshoot_fork` routes through
+  the daemon's `fork` op whenever a daemon is up, which flushes an open
+  source session first so an unflushed write always lands in the new
+  branch; `offshoot_checkout` on a branch with an open session returns
+  that session's own live checkout path instead of materializing a
+  separate at-rest copy. No MCP tool opens a session itself — the good
+  path requires a harness (the SDKs, `offshoot session open`, or your own
+  loop) to have opened one already; without that, MCP checkpoints stay
+  at-rest even with a daemon running. `offshoot mcp` gains `-socket PATH`
+  (default: the same derivation `offshoot serve` uses for the store), so
+  an MCP server and a daemon started against the same store agree on
+  where to look without either hardcoding the path.
+
 - MCP forks expire by default: `offshoot_fork` gains a `ttl` argument (a Go
   duration string, or `"none"` for a branch that never expires) and falls
   back to `offshoot mcp -default-ttl` (default `24h`) when `ttl` is
