@@ -28,5 +28,18 @@ type Backend interface {
 	// ErrCopyUnsupported if this backend cannot perform the copy at all —
 	// see ErrCopyUnsupported's doc comment for what callers must do with
 	// that.
+	//
+	// CopyObject OVERWRITES an existing dst — like Put, not like the
+	// create-only PutIf every snapshot/segment write otherwise uses. Today's
+	// only caller (ops.Fork's fast path) always mints a fresh destination
+	// key (a brand-new lineage's snapshot key) that nothing else can be
+	// racing to write, so this is never observably different from
+	// create-only in practice; it is specified as overwrite because that is
+	// what a rename-into-place (the local backend) and a single-request
+	// server-side copy (S3, Task 6b) both do natively, and requiring
+	// create-only here would mean an extra existence check or conditional
+	// request for no caller that needs it. A future caller that DOES need
+	// create-only-or-fail must check for an existing dst itself (e.g. via
+	// Get) before calling CopyObject.
 	CopyObject(dst, src string) error
 }

@@ -711,6 +711,24 @@ func TestForkFastPathMatchesSlowPath(t *testing.T) {
 		t.Fatalf("fast-path and slow-path children diverge:\n--- fast ---\n%s\n--- slow ---\n%s", fastDump, slowDump)
 	}
 
+	// Stronger than the .dump comparison above: the two materialized
+	// CHECKOUT FILES themselves must be byte-identical, not merely
+	// equivalent after re-parsing. Both children were seeded from the same
+	// source content at the same page size and commit size, and both
+	// ltxio.Materialize/MaterializeChain skip the lock page identically, so
+	// there is no legitimate reason for the raw bytes to differ.
+	fastFileData, err := os.ReadFile(fastPath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	slowFileData, err := os.ReadFile(slowPath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !bytes.Equal(fastFileData, slowFileData) {
+		t.Fatal("fast-path and slow-path children' materialized checkout files are not byte-identical")
+	}
+
 	// Object-level: fetch the source object and the fast-path child's object
 	// directly from the backend and compare bytes, not just decoded content.
 	fastRef, _, err := w.Store.GetRef("app", "fast")
@@ -727,6 +745,55 @@ func TestForkFastPathMatchesSlowPath(t *testing.T) {
 	}
 	if !bytes.Equal(srcData, fastData) {
 		t.Fatal("fast-path child's stored snapshot object must be byte-identical to the source snapshot object")
+	}
+}
+
+// TestForkFastPathFallsBackOnS3Sentinel pins Task 6a's explicit scope limit:
+// forking against a backend that returns store.ErrCopyUnsupported (S3,
+// today, always — see store.S3.CopyObject's doc comment) must fall back to
+// the slow path silently, never firing the fast path and never erroring,
+// even though the precondition (a single-snapshot chain) holds — the same
+// precondition TestForkFastPathMatchesSlowPath exercises against the local
+// backend, where it DOES fire.
+func TestForkFastPathFallsBackOnS3Sentinel(t *testing.T) {
+	if _, err := exec.LookPath("sqlite3"); err != nil {
+		t.Skip("sqlite3 CLI not on PATH")
+	}
+	w := newWSOnFakeS3(t)
+	if err := w.Create("app"); err != nil {
+		t.Fatal(err)
+	}
+	path, _ := w.Checkout("app", "main")
+	if out, err := exec.Command("sqlite3", path,
+		"CREATE TABLE t (v); INSERT INTO t VALUES (1),(2);").CombinedOutput(); err != nil {
+		t.Fatalf("seed: %v: %s", err, out)
+	}
+	if _, err := w.Checkpoint("app", "main", "v1"); err != nil {
+		t.Fatal(err)
+	}
+
+	before := ForkFastPathHits()
+	if _, err := w.Fork("app", "main", "child", "", 0); err != nil {
+		t.Fatal(err)
+	}
+	if got := ForkFastPathHits(); got != before {
+		t.Fatalf("fork fast path hits = %d, want %d unchanged (S3's ErrCopyUnsupported sentinel must fall back to the slow path)", got, before)
+	}
+
+	srcDump, err := exec.Command("sqlite3", path, ".dump").Output()
+	if err != nil {
+		t.Fatal(err)
+	}
+	cpath, err := w.Checkout("app", "child")
+	if err != nil {
+		t.Fatal(err)
+	}
+	childDump, err := exec.Command("sqlite3", cpath, ".dump").Output()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !bytes.Equal(srcDump, childDump) {
+		t.Fatalf("child diverges from source on the fallback path:\n--- src ---\n%s\n--- child ---\n%s", srcDump, childDump)
 	}
 }
 

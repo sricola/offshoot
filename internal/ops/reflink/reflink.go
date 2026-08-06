@@ -32,6 +32,13 @@ var forceFallbackForTest bool
 // failure in the fallback itself (e.g. src does not exist, dst already
 // exists, permission denied) is returned as err.
 //
+// dst is durable on disk (fsynced) before CopyFile returns success on
+// EITHER path — see syncFile's doc comment for why the clone path needs an
+// explicit step for this and copyPlain doesn't. A caller relying on dst
+// surviving a crash immediately after CopyFile returns (e.g. before a
+// rename that publishes it at a final path) does not need to fsync again
+// itself.
+//
 // dst is created O_EXCL-equivalent: both the clone syscalls and the plain-
 // copy fallback require dst to not already exist, and CopyFile writes it
 // directly rather than through a temp file. A caller that wants dst to land
@@ -41,12 +48,40 @@ var forceFallbackForTest bool
 // that convention.
 func CopyFile(dst, src string) (cloned bool, err error) {
 	if !forceFallbackForTest && cloneFile(dst, src) {
+		if err := syncFile(dst); err != nil {
+			return true, err
+		}
 		return true, nil
 	}
 	if err := copyPlain(dst, src); err != nil {
 		return false, err
 	}
 	return false, nil
+}
+
+// syncFile opens path (which CopyFile has just populated via a successful
+// clone) and fsyncs it, then closes it.
+//
+// Neither clone mechanism hands CopyFile an open descriptor it could fsync
+// directly: clonefile(2) (darwin) only ever takes paths, never returning an
+// fd, and FICLONE (linux)'s destination fd is opened and closed entirely
+// inside cloneFile, private to that platform file. Without this, a
+// completed clone would be LESS durable than copyPlain's fallback (which
+// does fsync its own handle before closing — see copyPlain's doc comment)
+// even though both are meant to give CopyFile's caller the same guarantee:
+// a power loss immediately after CopyFile returns must never leave dst
+// missing or truncated once fsynced metadata (e.g. a ref written after a
+// rename of dst into place) claims it exists.
+func syncFile(path string) error {
+	f, err := os.OpenFile(path, os.O_WRONLY, 0)
+	if err != nil {
+		return err
+	}
+	if err := f.Sync(); err != nil {
+		f.Close()
+		return err
+	}
+	return f.Close()
 }
 
 // copyPlain copies src to dst by reading and writing bytes, with no cloning
@@ -57,8 +92,10 @@ func CopyFile(dst, src string) (cloned bool, err error) {
 // dst is opened create-only (O_EXCL) to match the clone syscalls' own
 // create-only semantics, so a caller sees the same "dst already exists"
 // failure mode on every platform regardless of which path CopyFile actually
-// took. The written data is fsynced before close so a completed plain copy
-// is exactly as durable as a completed clone.
+// took. The written data is fsynced before close here directly (unlike the
+// clone path, which has no open handle to fsync and uses syncFile instead —
+// see CopyFile's doc comment) so a completed plain copy is exactly as
+// durable as a completed clone.
 func copyPlain(dst, src string) (err error) {
 	in, err := os.Open(src)
 	if err != nil {
