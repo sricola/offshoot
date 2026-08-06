@@ -245,6 +245,29 @@ type Session struct {
 	// upload is untouched and still shows up as pending afterward.
 	appliedGen, flushedGen, flushedRebaseGen int
 
+	// cleanAtOpen is set once by Open, from CheckoutProven's Clean result,
+	// and never written again: true means the checkout Open received was
+	// already proven byte-identical to the branch's CURRENT head (the
+	// sidecar "clean" fast path — see ops.CheckoutResult.Clean) rather than
+	// freshly (re)materialized. rebaseline's very first call — the session's
+	// mandatory startup rebase, whichever of its two call sites reaches it
+	// first (see rebaseline's doc comment) — uses this to prove, without any
+	// additional store read, that the replica it just seeded from that
+	// checkout already matches the durable head exactly, and suppresses the
+	// settling flush that would otherwise re-upload content already known
+	// durable (the settling-flush suppression, M2 follow-up, ledgered — see
+	// appliedGen's doc comment above for what that flush exists to close and
+	// why skipping it is only safe here, not for any later rebase).
+	// Read-only after Open; no lock needed for the read in rebaseline, which
+	// already holds replicaMu for everything else it touches. Safe without
+	// its own synchronization because Open sets this field before either of
+	// rebaseline's two possible first callers can run: the engine goroutine
+	// (started via `go s.runEngine` after this field is assigned in the
+	// struct literal, so the `go` statement's happens-before guarantee
+	// covers it) and Open's own direct call on the clean-resume path (same
+	// goroutine, strictly later).
+	cleanAtOpen bool
+
 	// snapshotEvery and flushesSinceSnapshot are read and written only from
 	// within Flush, which already holds flushMu for its entire body — no
 	// separate lock needed.
@@ -339,7 +362,7 @@ func Open(ctx context.Context, o Options) (*Session, error) {
 		return nil, fmt.Errorf("session: acquire %s@%s: %w", o.DB, o.Branch, err)
 	}
 
-	checkoutPath, err := o.WS.Checkout(o.DB, o.Branch)
+	checkoutRes, err := o.WS.CheckoutProven(o.DB, o.Branch)
 	if err != nil {
 		relErr := o.WS.ReleaseLease(lease)
 		cleanup()
@@ -351,17 +374,18 @@ func Open(ctx context.Context, o Options) (*Session, error) {
 
 	s := &Session{
 		ws: o.WS, db: o.DB, branch: o.Branch, dir: dir, ownsDir: ownsDir,
-		checkoutPath:  checkoutPath,
+		checkoutPath:  checkoutRes.Path,
 		replica:       replay.New(filepath.Join(dir, "replica.db")),
 		lease:         lease,
 		pages:         newPageSet(),
 		snapshotEvery: o.SnapshotEvery,
+		cleanAtOpen:   checkoutRes.Clean,
 	}
 
 	cctx, cancel := context.WithCancel(ctx)
 	s.cancel = cancel
 	s.captured = capture.NewEngine(capture.Options{
-		DBPath: checkoutPath, StateDir: dir, Sink: replicaSink{s},
+		DBPath: checkoutRes.Path, StateDir: dir, Sink: replicaSink{s},
 	})
 	s.engDone = make(chan struct{})
 	s.renewDone = make(chan struct{})
@@ -863,15 +887,76 @@ func (s *Session) recordApply(pageSize uint32, frames []wal.Frame) error {
 // which needs neither, and the next recordApply call — which always runs
 // before pageSet can hold anything a segment would need them for —
 // re-establishes both from the frames it receives.
+//
+// Settling-flush suppression (M2 follow-up, ledgered). This is the FIRST
+// call of rebaseline's life (rebaseGen 0 -> 1 — either call site: the
+// engine's mandatory startup Rebase, or Open's own direct call on the
+// clean-resume path, see cleanAtOpen's doc comment) AND s.cleanAtOpen is
+// true suppresses the settling flush that appliedGen/flushedRebaseGen's doc
+// comment describes: it marks THIS rebase as already durable
+// (flushedRebaseGen = rebaseGen) instead of leaving it pending, and clears
+// forceSnapshot, so flushLoop's next tick finds nothing pending and performs
+// no upload at all.
+//
+// Proof obligation: this is sound exactly when the checksum this rebaseline
+// call just computed (sum, above) is provably equal to the branch head's
+// true content-checksum (every LTX chain member's postApplyChecksum is, by
+// construction, exactly ltxio.ChecksumDatabase of the content that results
+// from applying it — see ltxio.MaterializeChain's verification) AND nothing
+// has raced between that head being read and this replica being seeded from
+// it. cleanAtOpen supplies both without this function needing to fetch or
+// compute anything itself: ops.CheckoutProven already read the CURRENT ref
+// (satisfying "nothing raced" — this session's lease was already held
+// before that read, so no other writer could have moved HeadTXID/HeadEpoch
+// since) and, on the Clean=true path, already proved the checkout's bytes
+// are byte-identical (SHA-256, strictly stronger than an LTX checksum
+// comparison) to what was fingerprinted at that exact head — see
+// ops.CheckoutResult.Clean's doc comment. The replica this rebaseline call
+// just checksummed was seeded directly from that same checkout (a raw copy,
+// for the engine's startup Rebase; the resumed path's own contract —
+// "clean prior shutdown, main file unchanged" — see Open's comment — ties
+// its continued replica to that same unchanged checkout just as tightly),
+// so sum is, by transitivity, already proven equal to the head's true
+// checksum without a live comparison. No store read is added here or
+// anywhere in the engine goroutine: the one relevant read (GetRef) already
+// happened synchronously inside Open's call to CheckoutProven, before the
+// engine ever starts — see CheckoutProven's doc comment on why that read
+// costs nothing extra either (Checkout already needed it).
+//
+// When cleanAtOpen is false (the checkout was freshly (re)materialized —
+// stale, locally modified, or simply didn't exist yet), this suppression
+// does NOT apply, even though the freshly materialized checkout ALSO
+// exactly equals the head afterward: proving that would need capturing a
+// checksum as a byproduct of the chain replay materializeChainAt just did,
+// which this function deliberately does not attempt, matching the
+// suppression's actual target — the reopen-after-clean-close workload
+// (Session.Close's sidecar refresh pairs directly with this) — rather than
+// trying to also optimize the cold-materialize path. The settle proceeds
+// exactly as before M2's original settling-flush behavior.
+//
+// This gate applies ONLY to rebaseGen's 0 -> 1 transition, never to a later
+// rebase-on-divergence (rebaseGen 1 -> 2, 2 -> 3, ...): those have no
+// cleanAtOpen-shaped proof available (cleanAtOpen describes Open's ONE-TIME
+// checkout materialization, not anything about mid-session state), so
+// `first` below is false for them and this whole block is skipped — the
+// settle for a rebase that DID fold content (M2's critical fix, see
+// TestFlushLoopFlushesRebaseFoldedContentWhenOtherwiseIdle and
+// TestFlushLoopRetriesAfterRebaseDuringUpload) is completely untouched by
+// this change.
 func (s *Session) rebaseline() error {
 	sum, err := ltxio.ChecksumDatabase(s.replica.Path())
 	if err != nil {
 		return fmt.Errorf("session: checksum replica after rebase: %w", err)
 	}
+	first := s.rebaseGen == 0
 	s.checksum = sum
 	s.flushChecksum = sum
 	s.pages = newPageSet()
 	s.forceSnapshot = true
 	s.rebaseGen++
+	if first && s.cleanAtOpen {
+		s.forceSnapshot = false
+		s.flushedRebaseGen = s.rebaseGen
+	}
 	return nil
 }

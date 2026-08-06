@@ -1090,3 +1090,108 @@ func TestFlushLoopRetriesAfterRebaseDuringUpload(t *testing.T) {
 		t.Fatalf("raced rebase content missing after retry: %q err=%v", out, err)
 	}
 }
+
+// TestReadOnlySessionWithCleanCheckoutMakesNoStoreWrites pins the
+// settling-flush suppression (M2 follow-up, ledgered — see rebaseline's doc
+// comment): a session opened against a checkout that is ALREADY proven
+// clean-and-current (materialized here via a bare w.Checkout call before the
+// session ever exists — this test deliberately does not depend on Commit
+// B's Close-time sidecar refresh, so it stays meaningful even if that half
+// is deferred separately) must perform literally zero backend writes, ever
+// — not even the one-PUT-per-lifetime settling flush every prior session
+// performed. Extends TestIdleAutoFlushWritesNothing's countingBackend
+// pattern; the difference from that test is entirely in the setup (a
+// pre-existing clean checkout here vs. a brand-new one there) and in
+// asserting zero writes from the moment Open returns, not just after the
+// session has already settled.
+func TestReadOnlySessionWithCleanCheckoutMakesNoStoreWrites(t *testing.T) {
+	requireSQLite(t)
+	w := newWS(t)
+	if err := w.Create("app"); err != nil {
+		t.Fatal(err)
+	}
+	// Materialize + sidecar-stamp the checkout against the current head
+	// BEFORE wrapping the backend in a counter: this write must not be
+	// counted, and it is what makes ops.CheckoutProven report Clean=true
+	// once Open calls it below.
+	if _, err := w.Checkout("app", "main"); err != nil {
+		t.Fatal(err)
+	}
+
+	cb := &countingBackend{Backend: w.Store.B}
+	w.Store.B = cb
+
+	s, err := Open(context.Background(), Options{
+		WS: w, DB: "app", Branch: "main",
+		FlushEvery: 40 * time.Millisecond,
+		// Long enough that lease renewal (which also writes the ref) cannot
+		// fire during this test's short observation window — see
+		// TestIdleAutoFlushWritesNothing's identical choice.
+		LeaseTTL: 30 * time.Second,
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer s.Close()
+
+	if !s.cleanAtOpen {
+		t.Fatal("expected cleanAtOpen: the checkout was materialized fresh against the current head just before Open")
+	}
+
+	// baseline excludes AcquireLease's own ref write (a legitimate write
+	// Open always makes, unrelated to the settling-flush suppression under
+	// test) — same reasoning as TestIdleAutoFlushWritesNothing's baseline,
+	// just captured right after Open returns instead of after the session
+	// settles, since here nothing should ever cause it to write at all.
+	baseline := cb.Count()
+	// Spans the startup rebase, its (suppressed) settle decision, and
+	// several idle flushLoop ticks — ~12 at 40ms.
+	time.Sleep(500 * time.Millisecond)
+	if got := cb.Count(); got != baseline {
+		t.Fatalf("a read-only session with a clean-at-open checkout performed %d backend write(s) after Open returned (baseline %d, now %d), want 0 (no settling flush, no idle-tick writes)",
+			got-baseline, baseline, got)
+	}
+	if s.autoFlushPending() {
+		t.Fatal("expected the suppressed startup rebase to leave nothing pending")
+	}
+}
+
+// TestSettleStillHappensWhenCheckoutWasStaleAtOpen guards the suppression's
+// safety boundary from the other side: a checkout whose on-disk content
+// differs from the branch head when Open runs — simulated here by dirtying
+// a materialized checkout directly, bypassing ops entirely, exactly the
+// kind of un-checkpointed local edit a stray sqlite3 client or an unclean
+// prior shutdown can leave behind — must NOT be treated as clean-at-open,
+// and the settling flush must still happen, same as before this change.
+func TestSettleStillHappensWhenCheckoutWasStaleAtOpen(t *testing.T) {
+	requireSQLite(t)
+	w := newWS(t)
+	if err := w.Create("app"); err != nil {
+		t.Fatal(err)
+	}
+	path, err := w.Checkout("app", "main")
+	if err != nil {
+		t.Fatal(err)
+	}
+	// Dirties the checkout without touching its .sum sidecar: checkoutState
+	// will read this as "modified" (sidecar identity still matches ref, but
+	// the file's content no longer matches the recorded hash).
+	mustExec(t, path, "CREATE TABLE stray (v); INSERT INTO stray VALUES ('predates-session');")
+
+	s, err := Open(context.Background(), Options{
+		WS: w, DB: "app", Branch: "main", FlushEvery: 40 * time.Millisecond,
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer s.Close()
+
+	if s.cleanAtOpen {
+		t.Fatal("expected a stray-edited checkout to NOT be recognized clean at open")
+	}
+
+	waitFor(t, 5*time.Second, "the settling flush", func() bool {
+		ref, _, err := w.Store.GetRef("app", "main")
+		return err == nil && ref.HeadTXID > 1
+	})
+}

@@ -216,20 +216,64 @@ func (w *Workspace) CreateFrom(db, srcPath string) error {
 // checkout has un-checkpointed local edits, Checkout proceeds (head always
 // wins) but warns first, since those edits are about to be discarded.
 func (w *Workspace) Checkout(db, branch string) (string, error) {
-	if err := store.ValidateName(db); err != nil {
+	res, err := w.CheckoutProven(db, branch)
+	if err != nil {
 		return "", err
 	}
+	return res.Path, nil
+}
+
+// CheckoutResult is CheckoutProven's return value: the materialized path,
+// plus the proof session.Open's settling-flush suppression needs — see
+// Clean.
+type CheckoutResult struct {
+	Path string
+	// Clean reports whether this checkout was ALREADY byte-identical to
+	// ref's CURRENT head when this call ran (the sidecar "clean" fast path
+	// below) rather than freshly (re)materialized. When true, Ref is the
+	// exact head identity (lineage, HeadEpoch, HeadTXID) this checkout is
+	// now proven to equal.
+	//
+	// The proof is the sidecar's SHA-256 content hash matching the file's
+	// actual current bytes (checkoutState's "clean" verdict) AND the
+	// sidecar's recorded identity matching a GetRef read of the CURRENT
+	// ref, both already computed below at no extra cost — Clean adds no
+	// store read of its own. It is strictly stronger than comparing the
+	// replica's LTX rolling checksum (ltxio.ChecksumDatabase) against the
+	// head's LTX postApplyChecksum would be: a byte-for-byte match of the
+	// entire file implies a checksum match (every LTX chain member's
+	// postApplyChecksum is, by construction — see ltxio.MaterializeChain's
+	// verification — exactly ltxio.ChecksumDatabase of the content that
+	// results from applying it), so nothing here needs to separately fetch
+	// or compute that number.
+	//
+	// See Session.Open / Session.rebaseline's doc comment for how the
+	// session package consumes this to decide whether its startup settling
+	// flush can be safely skipped.
+	Clean bool
+	Ref   store.Ref
+}
+
+// CheckoutProven is Checkout plus the clean-cache proof described on
+// CheckoutResult.Clean. Exported (rather than folding Clean into Checkout's
+// own signature) so Checkout's three other call sites (cmd/offshoot,
+// internal/mcp, internal/daemon) — none of which need the proof — are
+// unaffected.
+func (w *Workspace) CheckoutProven(db, branch string) (CheckoutResult, error) {
+	if err := store.ValidateName(db); err != nil {
+		return CheckoutResult{}, err
+	}
 	if err := store.ValidateName(branch); err != nil {
-		return "", err
+		return CheckoutResult{}, err
 	}
 	ref, _, err := w.Store.GetRef(db, branch)
 	if err != nil {
-		return "", err
+		return CheckoutResult{}, err
 	}
 	path := w.CheckoutPath(db, branch)
 	if _, err := os.Stat(path); err == nil {
 		if err := quiesce(path); err != nil {
-			return "", err
+			return CheckoutResult{}, err
 		}
 		// checkoutState compares the sidecar's recorded (lineage, epoch,
 		// txid) against ref.Lineage/ref.HeadEpoch/ref.HeadTXID — the CURRENT
@@ -245,21 +289,33 @@ func (w *Workspace) Checkout(db, branch string) (string, error) {
 		// another descriptor) to rebuild bytes that are already correct.
 		switch checkoutState(path, ref) {
 		case "clean":
-			return path, nil
+			return CheckoutResult{Path: path, Clean: true, Ref: ref}, nil
 		case "modified":
 			fmt.Fprintf(os.Stderr, "offshoot: warning: overwriting un-checkpointed changes in %s@%s checkout\n", db, branch)
 		}
 	}
 	if err := os.MkdirAll(filepath.Dir(path), 0o755); err != nil {
-		return "", err
+		return CheckoutResult{}, err
 	}
 	if err := w.materializeAt(ref, headCheckpoint(ref), path); err != nil {
-		return "", err
+		return CheckoutResult{}, err
 	}
 	if err := writeSum(path, ref.Lineage, ref.HeadEpoch, ref.HeadTXID); err != nil {
-		return "", err
+		return CheckoutResult{}, err
 	}
-	return path, nil
+	return CheckoutResult{Path: path, Clean: false, Ref: ref}, nil
+}
+
+// RefreshSum re-stamps path's .sum sidecar to record it as current for
+// (lineage, epoch, txid) — see writeSum. Exported for Session.Close's
+// clean-close sidecar refresh (M2 follow-up): the session package knows its
+// own db/branch/checkout path and, from its last successful flush, the
+// exact ref identity that checkout now durably reflects, but sidecar
+// writing itself (content hash + JSON shape) is ops' concern, not
+// session's — see writeSum's doc comment for the format and sumRecord's for
+// why epoch is load-bearing in it.
+func RefreshSum(path, lineage string, epoch, txid uint64) error {
+	return writeSum(path, lineage, epoch, txid)
 }
 
 // sumRecord is the on-disk shape of a checkout's .sum sidecar: a content hash
