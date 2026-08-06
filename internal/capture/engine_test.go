@@ -963,3 +963,54 @@ func TestEngineLagReportsPendingBacklogThenZero(t *testing.T) {
 		t.Fatalf("Lag() after DrainNow = %d, want 0", got)
 	}
 }
+
+// TestEngineLagOrderingUndercountsAcrossARestartRace is the regression test
+// for the review finding that Lag()'s two independent reads (e.consumed,
+// then the WAL file's on-disk size) can race a WAL restart landing in the
+// gap between them — and that which read runs first decides which direction
+// the resulting skew errs in. See Lag's doc comment for the full algebra;
+// this pins the consequence directly, without needing a real Run goroutine
+// or an actual WAL restart: lagRaceHook fires in the exact gap between
+// Lag()'s e.consumed.Load() and its os.Stat call, and mutates both exactly
+// the way a real restart landing there would (a fresh, small WAL file; a
+// freshly-reset e.consumed) — reproducing the race deterministically on
+// every run instead of leaving it to chance.
+//
+// e.consumed starts at 5000, matching a WAL file that is ALSO 5000 bytes —
+// i.e. fully caught up, Lag() should read 0 if nothing races it. The hook
+// then simulates a restart: it shrinks the on-disk WAL to 100 bytes (a fresh
+// generation) and resets e.consumed to 0 (Run's own
+// expectRestart-continuation branches do exactly this). Lag()'s consumed
+// local was already captured (5000) before the hook ran, so the subtraction
+// becomes 100 - 5000 = -4900, clamped to 0 — an undercount of a real
+// pre-restart backlog, never a false-positive one. Had the read order been
+// reversed (stat first, consumed second — the ordering Lag's doc comment
+// explicitly rejects), the same hook landing between those two reads would
+// instead produce 5000 - 0 = 5000: a large false-positive backlog with no
+// real write behind it. This test only passes under the documented,
+// safe-direction ordering.
+func TestEngineLagOrderingUndercountsAcrossARestartRace(t *testing.T) {
+	dir := t.TempDir()
+	src := filepath.Join(dir, "src.db")
+	walPath := src + "-wal"
+	if err := os.WriteFile(walPath, make([]byte, 5000), 0o644); err != nil {
+		t.Fatal(err)
+	}
+
+	// Lag() only ever touches e.o.DBPath and e.consumed — no Sink, no Run
+	// goroutine, no sqlite3 CLI needed to exercise it in isolation.
+	e := NewEngine(Options{DBPath: src, StateDir: dir})
+	e.consumed.Store(5000)
+
+	lagRaceHook = func() {
+		if err := os.WriteFile(walPath, make([]byte, 100), 0o644); err != nil {
+			t.Fatal(err)
+		}
+		e.consumed.Store(0)
+	}
+	defer func() { lagRaceHook = nil }()
+
+	if got := e.Lag(); got != 0 {
+		t.Fatalf("Lag() racing a restart landing mid-call = %d, want 0 (undercount, never a false-positive backlog)", got)
+	}
+}
