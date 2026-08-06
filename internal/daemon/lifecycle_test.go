@@ -856,3 +856,54 @@ func TestForkFromLiveSessionSeesLatestWrite(t *testing.T) {
 		t.Fatalf("source session missing from status after fork: %+v", st.Sessions)
 	}
 }
+
+// TestServeFlushesAutomaticallyWithoutAnExplicitFlushOp proves the daemon's
+// -flush-every wiring (Server.SetFlushEvery, plumbed through opOpen into
+// session.Options.FlushEvery) actually drives a session's background flush
+// loop: with FlushEvery set on the server, a written but never-explicitly-
+// flushed session's durable_txid must advance on its own, discovered purely
+// by polling "status" — no "flush" op is ever sent over the socket.
+func TestServeFlushesAutomaticallyWithoutAnExplicitFlushOp(t *testing.T) {
+	srv, _ := newServer(t)
+	srv.SetFlushEvery(100 * time.Millisecond)
+	sock := srv.SocketPath()
+
+	open := call(t, sock, Request{Op: "open", DB: "app", Branch: "main"})
+	if !open.OK {
+		t.Fatalf("open = %+v", open)
+	}
+	sqliteExec(t, open.Checkout, "CREATE TABLE t (v); INSERT INTO t VALUES (1);")
+
+	deadline := time.Now().Add(10 * time.Second)
+	for {
+		st := call(t, sock, Request{Op: "status"})
+		if !st.OK {
+			t.Fatalf("status = %+v", st)
+		}
+		var found bool
+		var durable uint64
+		for _, in := range st.Sessions {
+			if in.DB == "app" && in.Branch == "main" {
+				found = true
+				durable = in.DurableTXID
+				if in.Error != "" {
+					t.Fatalf("session unhealthy while waiting on auto-flush: %+v", in)
+				}
+			}
+		}
+		if !found {
+			t.Fatal("session missing from status")
+		}
+		if durable > 0 {
+			break
+		}
+		if time.Now().After(deadline) {
+			t.Fatal("durable_txid never advanced via auto-flush within 10s (no flush op was ever sent)")
+		}
+		time.Sleep(50 * time.Millisecond)
+	}
+
+	if cl := call(t, sock, Request{Op: "close", DB: "app", Branch: "main"}); !cl.OK {
+		t.Fatalf("close = %+v", cl)
+	}
+}

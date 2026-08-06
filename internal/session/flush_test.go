@@ -542,3 +542,200 @@ func TestConcurrentFlushIsSerialized(t *testing.T) {
 			headKey, len(data), err)
 	}
 }
+
+// mustExec runs sql against the SQLite file at path via the sqlite3 CLI,
+// failing the test with the command's combined output on error.
+func mustExec(t *testing.T, path, sql string) {
+	t.Helper()
+	if out, err := exec.Command("sqlite3", path, sql).CombinedOutput(); err != nil {
+		t.Fatalf("%v: %s", err, out)
+	}
+}
+
+// countingBackend wraps a store.Backend and counts every mutating call
+// (Put, PutIf, Delete) it observes, regardless of outcome. Used by
+// TestIdleAutoFlushWritesNothing to prove the idle short-circuit performs
+// literally zero backend writes across several ticks with nothing pending —
+// the PM-review blocking amendment this task exists to satisfy.
+type countingBackend struct {
+	store.Backend
+	mu     sync.Mutex
+	writes int
+}
+
+func (c *countingBackend) Put(key string, data []byte) error {
+	c.mu.Lock()
+	c.writes++
+	c.mu.Unlock()
+	return c.Backend.Put(key, data)
+}
+
+func (c *countingBackend) PutIf(key string, data []byte, ifMatch string) (string, error) {
+	c.mu.Lock()
+	c.writes++
+	c.mu.Unlock()
+	return c.Backend.PutIf(key, data, ifMatch)
+}
+
+func (c *countingBackend) Delete(key string) error {
+	c.mu.Lock()
+	c.writes++
+	c.mu.Unlock()
+	return c.Backend.Delete(key)
+}
+
+func (c *countingBackend) Count() int {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	return c.writes
+}
+
+// TestAutoFlushShipsWritesWithoutManualFlush pins Options.FlushEvery: a
+// session opened with a short auto-flush cadence must make a committed write
+// durable on its own, with the caller never calling Flush.
+func TestAutoFlushShipsWritesWithoutManualFlush(t *testing.T) {
+	requireSQLite(t)
+	w := newWS(t)
+	if err := w.Create("app"); err != nil {
+		t.Fatal(err)
+	}
+	s, err := Open(context.Background(), Options{
+		WS: w, DB: "app", Branch: "main", FlushEvery: 150 * time.Millisecond,
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer s.Close()
+	mustExec(t, s.CheckoutPath(), "CREATE TABLE t (v); INSERT INTO t VALUES ('x');")
+	// No manual flush. Within a few ticks the write must be durable.
+	deadline := time.Now().Add(10 * time.Second)
+	for {
+		ref, _, err := w.Store.GetRef("app", "main")
+		if err != nil {
+			t.Fatal(err)
+		}
+		if ref.HeadTXID > 1 { // creation snapshot is txid 1; adapt to the actual baseline txid observed
+			break
+		}
+		if time.Now().After(deadline) {
+			t.Fatal("auto-flush never shipped the committed write")
+		}
+		time.Sleep(50 * time.Millisecond)
+	}
+	if _, _, ok := s.LastFlush(); !ok {
+		t.Fatal("LastFlush must report the successful auto-flush")
+	}
+	if err := s.LastFlushErr(); err != nil {
+		t.Fatalf("LastFlushErr = %v, want nil", err)
+	}
+}
+
+// failNRefPutIf wraps a store.Backend and turns each of the first n PutIf
+// calls on a "refs/" key into a non-CAS failure — the same class of
+// ambiguous transient error failRefPutIf injects, but healing after n
+// occurrences instead of forever — simulating a transient outage (e.g. a
+// flaky network) that later recovers.
+type failNRefPutIf struct {
+	store.Backend
+	mu sync.Mutex
+	n  int
+}
+
+func (f *failNRefPutIf) PutIf(key string, data []byte, ifMatch string) (string, error) {
+	if strings.HasPrefix(key, "refs/") {
+		f.mu.Lock()
+		if f.n > 0 {
+			f.n--
+			f.mu.Unlock()
+			return "", fmt.Errorf("test: injected transient ref failure on %s", key)
+		}
+		f.mu.Unlock()
+	}
+	return f.Backend.PutIf(key, data, ifMatch)
+}
+
+// TestAutoFlushFailureSurfacesAndRecovers pins the auto-flush failure
+// contract: a failing tick records LastFlushErr but must not kill the
+// session (Err() stays nil, the checkout stays usable), and once the backend
+// heals a later tick clears LastFlushErr again.
+func TestAutoFlushFailureSurfacesAndRecovers(t *testing.T) {
+	requireSQLite(t)
+	w := newWS(t)
+	if err := w.Create("app"); err != nil {
+		t.Fatal(err)
+	}
+	s, err := Open(context.Background(), Options{
+		WS: w, DB: "app", Branch: "main", FlushEvery: 60 * time.Millisecond,
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer s.Close()
+
+	mustExec(t, s.CheckoutPath(), "CREATE TABLE t (v); INSERT INTO t VALUES ('x');")
+
+	// w.Store and s.ws.Store are the same *store.Store, so mutating w.Store.B
+	// is visible to the session's own flush loop. Fail the first two ref
+	// writes, then let everything through.
+	w.Store.B = &failNRefPutIf{Backend: w.Store.B, n: 2}
+
+	waitFor(t, 5*time.Second, "LastFlushErr to be set by a failing tick", func() bool {
+		return s.LastFlushErr() != nil
+	})
+	if err := s.Err(); err != nil {
+		t.Fatalf("a transient auto-flush failure must not kill the session: %v", err)
+	}
+	// The checkout is still usable after the failure.
+	mustExec(t, s.CheckoutPath(), "INSERT INTO t VALUES ('y');")
+
+	waitFor(t, 5*time.Second, "LastFlushErr to clear once the backend heals", func() bool {
+		return s.LastFlushErr() == nil
+	})
+	if _, txid, ok := s.LastFlush(); !ok || txid == 0 {
+		t.Fatalf("LastFlush must report the successful recovery, got txid=%d ok=%v", txid, ok)
+	}
+}
+
+// TestIdleAutoFlushWritesNothing is the PM-review blocking amendment: a tick
+// with nothing pending (no committed frames since the last successful flush)
+// must write NOTHING — no object PUT, no ref PUT, no flushesSinceSnapshot
+// advance. Without this, an idle session under a short cadence would upload
+// a full snapshot every SnapshotEvery ticks forever, since Flush always
+// advances txid and writes something once actually called, regardless of
+// whether anything changed.
+func TestIdleAutoFlushWritesNothing(t *testing.T) {
+	requireSQLite(t)
+	w := newWS(t)
+	if err := w.Create("app"); err != nil {
+		t.Fatal(err)
+	}
+	cb := &countingBackend{Backend: w.Store.B}
+	w.Store.B = cb
+
+	s, err := Open(context.Background(), Options{
+		WS: w, DB: "app", Branch: "main",
+		FlushEvery: 40 * time.Millisecond,
+		// Long enough that lease renewal (which also writes the ref) cannot
+		// fire during this test's short observation window, isolating the
+		// backend write count to whatever the flush loop itself does.
+		LeaseTTL: 30 * time.Second,
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer s.Close()
+
+	// No writes to the checkout at all, ever. Let several idle ticks pass.
+	baseline := cb.Count()
+	time.Sleep(500 * time.Millisecond) // ~12 ticks at 40ms
+	if got := cb.Count(); got != baseline {
+		t.Fatalf("idle auto-flush ticks performed %d backend write(s) (baseline %d, now %d), want 0",
+			got-baseline, baseline, got)
+	}
+	if _, _, ok := s.LastFlush(); ok {
+		t.Fatal("LastFlush must not report success: no auto-flush should ever have run while idle")
+	}
+	if err := s.LastFlushErr(); err != nil {
+		t.Fatalf("LastFlushErr = %v, want nil", err)
+	}
+}

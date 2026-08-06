@@ -40,7 +40,11 @@ Usage:
   offshoot lease list                       list every branch's lease
   offshoot lease acquire <db>[@branch] [--ttl 30s]   claim or renew a lease
   offshoot lease release <db>[@branch]      release a lease
-  offshoot serve [-socket PATH]             run the daemon until SIGINT/SIGTERM
+  offshoot serve [-socket PATH] [-reap-every d] [-gc-grace d] [-flush-every d]
+                                             run the daemon until SIGINT/SIGTERM;
+                                             -flush-every ships every open session's
+                                             work on a cadence even if it's never
+                                             flushed explicitly (default 30s; 0 disables)
   offshoot mcp                              serve the MCP tool set on stdio for an agent
   offshoot session open <db>[@branch] [-socket PATH]      open a session; prints the checkout path
   offshoot session flush <db>[@branch] [name] [-socket PATH]   flush to a durable snapshot; prints the txid
@@ -483,7 +487,7 @@ func run(args []string) error {
 	case "serve":
 		sock, rest, err := socketOverride(rest)
 		if err != nil {
-			return fmt.Errorf("usage: offshoot serve [-socket PATH] [-reap-every DURATION] [-gc-grace DURATION]: %w", err)
+			return fmt.Errorf("usage: offshoot serve [-socket PATH] [-reap-every DURATION] [-gc-grace DURATION] [-flush-every DURATION]: %w", err)
 		}
 		reapEveryStr, rest, _, err := extractFlag(rest, "-reap-every")
 		if err != nil {
@@ -507,8 +511,19 @@ func run(args []string) error {
 		if err != nil {
 			return fmt.Errorf("-gc-grace: %w", err)
 		}
+		flushEveryStr, rest, _, err := extractFlag(rest, "-flush-every")
+		if err != nil {
+			return err
+		}
+		if flushEveryStr == "" {
+			flushEveryStr = "30s"
+		}
+		flushEvery, err := time.ParseDuration(flushEveryStr)
+		if err != nil {
+			return fmt.Errorf("-flush-every: %w", err)
+		}
 		if len(rest) != 0 {
-			return fmt.Errorf("usage: offshoot serve [-socket PATH] [-reap-every DURATION] [-gc-grace DURATION]")
+			return fmt.Errorf("usage: offshoot serve [-socket PATH] [-reap-every DURATION] [-gc-grace DURATION] [-flush-every DURATION]")
 		}
 		if sock == "" {
 			p, err := daemon.DefaultSocketPath(spec)
@@ -522,6 +537,11 @@ func run(args []string) error {
 			return err
 		}
 		srv.StartJanitor(reapEvery, gcGrace)
+		// safe-by-default cadence: the daemon ships work on a cadence even
+		// if the agent it's serving never calls flush; -flush-every 0
+		// disables this, restoring manual-only (session.Options' own
+		// default).
+		srv.SetFlushEvery(flushEvery)
 		fmt.Println("offshoot serving on", sock)
 		sigc := make(chan os.Signal, 1)
 		signal.Notify(sigc, os.Interrupt, syscall.SIGTERM)
