@@ -20,13 +20,20 @@ version if you depend on format stability.
   still gets bounded data loss on crash (library default stays `0`, manual
   only). `Session.LastFlush()`/`LastFlushErr()` expose the most recent
   successful flush and the most recent automatic-flush failure — a failure
-  is recorded and retried next tick, never kills the session. `offshoot
-  serve` gains `-flush-every` (default `30s`, `0` disables) and applies it
-  to every session it opens — the daemon ships work on a cadence by default,
-  the safe default lives at that boundary rather than in the library
-  primitive. An idle tick (nothing committed since the last successful
-  flush) does nothing at all — no object write, no ref write — rather than
-  uploading a pointless full snapshot every `SnapshotEvery` ticks forever.
+  is recorded and retried next tick (never one already superseded by a
+  fresher success), never kills the session, and a session-closed race never
+  surfaces as a spurious flush error. `offshoot serve` gains `-flush-every`
+  (default `30s`, `0` disables, negative rejected as a usage error) and
+  applies it to every session it opens — the daemon ships work on a cadence
+  by default, the safe default lives at that boundary rather than in the
+  library primitive. An idle tick (nothing committed via a captured
+  transaction, AND no rebase, since the last successful flush) does nothing
+  at all — no object write, no ref write — rather than uploading a pointless
+  full snapshot every `SnapshotEvery` ticks forever; the rebase half of that
+  check matters because a rebase's checkpoint can fold a real commit into
+  the baseline without it ever passing through ordinary WAL capture, so
+  every session performs one settling flush shortly after its startup
+  rebase lands, even if the agent never writes anything.
 
 ### Changed
 
