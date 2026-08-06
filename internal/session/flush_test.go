@@ -756,6 +756,55 @@ func TestAutoFlushFailureSurfacesAndRecovers(t *testing.T) {
 	}
 }
 
+// TestAutoFlushTransitionLogsRecordKindAutoAndFailure extends
+// TestAutoFlushFailureSurfacesAndRecovers's fault-injection scenario with
+// task 7's structured transition-log contract: a failing auto-flush tick
+// logs "flush-failed kind=auto error=...", and the later tick that recovers
+// once the backend heals logs "flushed kind=auto txid=...".
+func TestAutoFlushTransitionLogsRecordKindAutoAndFailure(t *testing.T) {
+	requireSQLite(t)
+	w := newWS(t)
+	if err := w.Create("app"); err != nil {
+		t.Fatal(err)
+	}
+	fp := &failNRefPutIf{Backend: w.Store.B}
+	w.Store.B = fp
+
+	var s *Session
+	out := captureStderr(t, func() {
+		var err error
+		s, err = Open(context.Background(), Options{
+			WS: w, DB: "app", Branch: "main", FlushEvery: 60 * time.Millisecond,
+		})
+		if err != nil {
+			t.Fatal(err)
+		}
+		defer s.Close()
+
+		mustExec(t, s.CheckoutPath(), "CREATE TABLE t (v); INSERT INTO t VALUES ('x');")
+		waitFor(t, 5*time.Second, "an initial successful flush", func() bool {
+			_, _, ok := s.LastFlush()
+			return ok
+		})
+
+		fp.arm(2)
+		mustExec(t, s.CheckoutPath(), "INSERT INTO t VALUES ('y');")
+		waitFor(t, 5*time.Second, "LastFlushErr to be set by a failing tick", func() bool {
+			return s.LastFlushErr() != nil
+		})
+		waitFor(t, 5*time.Second, "LastFlushErr to clear once the backend heals", func() bool {
+			return s.LastFlushErr() == nil
+		})
+	})
+
+	if !strings.Contains(out, `offshoot: session: app@main: flush-failed kind="auto" error=`) {
+		t.Fatalf("missing flush-failed(auto) transition log in:\n%s", out)
+	}
+	if !strings.Contains(out, `offshoot: session: app@main: flushed kind="auto" txid=`) {
+		t.Fatalf("missing flushed(auto) transition log in:\n%s", out)
+	}
+}
+
 // TestIdleAutoFlushWritesNothing is the PM-review blocking amendment: a tick
 // with nothing pending (no committed frames, and no rebase, since the last
 // successful flush) must write NOTHING — no object PUT, no ref PUT, no

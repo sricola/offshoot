@@ -2,14 +2,35 @@ package session
 
 import (
 	"context"
+	"fmt"
+	"io"
 	"os"
 	"os/exec"
 	"path/filepath"
+	"strings"
 	"testing"
 	"time"
 
 	"github.com/offshoot-db/offshoot/internal/ops"
 )
+
+// captureStderr redirects os.Stderr for the duration of fn and returns
+// everything written to it — the same helper internal/ops and internal/store
+// already use for their own stderr-log tests.
+func captureStderr(t *testing.T, fn func()) string {
+	t.Helper()
+	orig := os.Stderr
+	r, wr, err := os.Pipe()
+	if err != nil {
+		t.Fatal(err)
+	}
+	os.Stderr = wr
+	fn()
+	wr.Close()
+	os.Stderr = orig
+	out, _ := io.ReadAll(r)
+	return string(out)
+}
 
 func newWS(t *testing.T) *ops.Workspace {
 	t.Helper()
@@ -152,5 +173,87 @@ func TestOpenReleasesLeaseWhenCheckoutFails(t *testing.T) {
 	// The branch must be immediately acquirable, proving the lease was released.
 	if _, err := w.AcquireLease("app", "main", "next", ops.DefaultLeaseTTL); err != nil {
 		t.Fatalf("branch not acquirable after Open failure: %v", err)
+	}
+}
+
+// TestSessionTransitionLogsOpenedFlushedClosed pins task 7's structured
+// transition-log contract: Open, a manual Flush, and Close each write one
+// "offshoot: session: db@branch: event key=value ..." line to stderr,
+// matching the daemon janitor's own "offshoot: janitor: ..." prefix family
+// (see internal/daemon/server.go's StartJanitor) rather than inventing a
+// second log format. FlushEvery is left at its default (0, manual only), so
+// the single "flushed" line asserted below is unambiguously this test's own
+// manual call, not a background auto-flush tick.
+func TestSessionTransitionLogsOpenedFlushedClosed(t *testing.T) {
+	requireSQLite(t)
+	w := newWS(t)
+	if err := w.Create("app"); err != nil {
+		t.Fatal(err)
+	}
+
+	var txid uint64
+	out := captureStderr(t, func() {
+		s, err := Open(context.Background(), Options{WS: w, DB: "app", Branch: "main", Holder: "logtest"})
+		if err != nil {
+			t.Fatal(err)
+		}
+		if out, err := exec.Command("sqlite3", s.CheckoutPath(),
+			"CREATE TABLE t (v); INSERT INTO t VALUES (1);").CombinedOutput(); err != nil {
+			t.Fatalf("%v: %s", err, out)
+		}
+		waitFor(t, 10*time.Second, "capture", func() bool {
+			out, err := exec.Command("sqlite3", s.ReplicaPath(), "SELECT count(*) FROM t;").Output()
+			return err == nil && string(out) == "1\n"
+		})
+		txid, err = s.Flush("")
+		if err != nil {
+			t.Fatal(err)
+		}
+		if err := s.Close(); err != nil {
+			t.Fatal(err)
+		}
+	})
+
+	const prefix = "offshoot: session: app@main: "
+	if !strings.Contains(out, prefix+`opened holder="logtest" epoch=`) {
+		t.Fatalf("missing/malformed opened line in:\n%s", out)
+	}
+	wantFlushed := fmt.Sprintf("%sflushed kind=%q txid=%d", prefix, "manual", txid)
+	if !strings.Contains(out, wantFlushed) {
+		t.Fatalf("missing/malformed flushed line (want %q) in:\n%s", wantFlushed, out)
+	}
+	if !strings.Contains(out, prefix+"closed") {
+		t.Fatalf("missing closed line in:\n%s", out)
+	}
+}
+
+// TestSessionFencedTransitionIsLogged extends TestFlushAfterFencingIsRefused's
+// scenario with the "fenced" transition log: fail()'s first call must write
+// one "offshoot: session: db@branch: fenced cause=..." line, quoting the
+// underlying ErrFenced cause.
+func TestSessionFencedTransitionIsLogged(t *testing.T) {
+	requireSQLite(t)
+	w := newWS(t)
+	if err := w.Create("app"); err != nil {
+		t.Fatal(err)
+	}
+	s, err := Open(context.Background(), Options{WS: w, DB: "app", Branch: "main",
+		Holder: "session-a", LeaseTTL: time.Nanosecond})
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer s.Close()
+	if _, err := w.AcquireLease("app", "main", "thief", ops.DefaultLeaseTTL); err != nil {
+		t.Fatal(err)
+	}
+
+	out := captureStderr(t, func() {
+		if _, err := s.Flush(""); err == nil {
+			t.Fatal("Flush after fencing must fail")
+		}
+	})
+	const prefix = "offshoot: session: app@main: fenced cause="
+	if !strings.Contains(out, prefix) {
+		t.Fatalf("missing fenced transition log in:\n%s", out)
 	}
 }

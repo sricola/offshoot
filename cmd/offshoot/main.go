@@ -665,8 +665,17 @@ func run(args []string) error {
 				return err
 			}
 			for _, in := range resp.Sessions {
-				line := fmt.Sprintf("%s@%s durable=%d epoch=%d holder=%s checkout=%s",
-					in.DB, in.Branch, in.DurableTXID, in.Epoch, in.Holder, in.Checkout)
+				line := fmt.Sprintf("%s@%s durable=%d epoch=%d holder=%s checkout=%s lag=%d",
+					in.DB, in.Branch, in.DurableTXID, in.Epoch, in.Holder, in.Checkout, in.CaptureLag)
+				if in.LastFlushAt != "" {
+					line += " last_flush=" + in.LastFlushAt
+				}
+				if in.DurableAge != "" {
+					line += " age=" + in.DurableAge
+				}
+				if in.FlushError != "" {
+					line += " flush_error=" + in.FlushError
+				}
 				if in.Error != "" {
 					line += " ERROR=" + in.Error
 				}

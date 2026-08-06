@@ -75,6 +75,18 @@ type Engine struct {
 	// goroutine at any time, not just after an established happens-before.
 	rebased atomic.Int64
 
+	// consumed mirrors e.reader's current byte offset within whatever WAL
+	// generation it is presently bound to (see wal.Reader.Offset) — i.e. how
+	// far the replica has been brought up to date. It is written by Run's own
+	// goroutine at exactly the points e.reader's binding changes or advances
+	// (drainStep, on every successful catch-up; rebase and the two
+	// expectRestart-continuation branches in pollOnce/pollOnceTo, on a fresh
+	// unbound reader), and read by Lag() from any goroutine at any time — the
+	// same atomic-field pattern rebased/resumed above already use to make an
+	// otherwise Run-goroutine-only value safe to read concurrently, since
+	// this struct has no general-purpose mutex for e.reader's state.
+	consumed atomic.Int64
+
 	captured int // txns since last takeover
 
 	// resumed is set true exactly once, in tryResume's success branch, when
@@ -145,6 +157,39 @@ func (e *Engine) Rebased() int { return int(e.rebased.Load()) }
 // cleanly," not "has this session ever rebased since." A later in-session
 // rebase (e.g. a takeover fold-race) does not un-set it.
 func (e *Engine) Resumed() bool { return e.resumed.Load() }
+
+// Lag reports WAL bytes committed by writers but not yet applied to the
+// replica: the gap between the WAL's current on-disk size and e.consumed,
+// the byte offset this engine's reader has actually caught up to within that
+// same generation (see e.consumed's doc comment for why that field, rather
+// than reading e.reader directly, is what makes this safe to call from any
+// goroutine — status reporting in particular calls this concurrently with
+// Run's own goroutine).
+//
+// The on-disk size is read fresh on every call, the same way drainTarget
+// does for DrainNow — a missing WAL file (nothing written yet, or just
+// truncated by a rebase/takeover) means there is nothing outstanding, so 0
+// is reported rather than an error; Lag has no error return to give one.
+//
+// This can transiently read low (never a false-positive backlog, only ever
+// an under-report) across a WAL restart: e.consumed and the on-disk file it
+// is compared against can belong to different generations for the brief
+// window between the physical reset landing and Run's goroutine rebinding
+// e.reader and zeroing e.consumed (see pollOnce/pollOnceTo's
+// expectRestart-continuation branches, and rebase). A negative difference
+// from that skew is clamped to 0 rather than surfaced as a nonsensical
+// negative lag.
+func (e *Engine) Lag() int64 {
+	fi, err := os.Stat(e.o.DBPath + "-wal")
+	if err != nil {
+		return 0
+	}
+	lag := fi.Size() - e.consumed.Load()
+	if lag < 0 {
+		return 0
+	}
+	return lag
+}
 
 // WaitReady blocks until Run's startup tryResume/rebase decision has
 // settled — Resumed() is guaranteed to hold its final value once this
@@ -447,6 +492,7 @@ func (e *Engine) pollOnce(ctx context.Context, idle *time.Time) error {
 			// continuity. No rebase, no snapshot, not counted.
 			e.expectRestart = false
 			e.reader = wal.NewReader(e.o.DBPath + "-wal")
+			e.consumed.Store(0) // fresh generation: nothing consumed from it yet
 			e.captured = 0
 			return nil
 		}
@@ -513,6 +559,7 @@ func (e *Engine) pollOnceTo(ctx context.Context, idle *time.Time, target int64, 
 			if e.expectRestart {
 				e.expectRestart = false
 				e.reader = wal.NewReader(e.o.DBPath + "-wal")
+				e.consumed.Store(0) // fresh generation: nothing consumed from it yet
 				e.captured = 0
 				newTarget, terr := e.drainTarget()
 				if terr != nil {
@@ -823,6 +870,7 @@ func (e *Engine) drainStep() ([]wal.Frame, error) {
 		return nil, err
 	}
 	off, s1, s2 := e.reader.Offset()
+	e.consumed.Store(off)
 	if err := SaveState(e.statePath(), State{Off: off, Salt1: s1, Salt2: s2}); err != nil {
 		return nil, err
 	}
@@ -1180,6 +1228,7 @@ func (e *Engine) tryResume(ctx context.Context) (bool, error) {
 		return false, nil // main file content changed since our shutdown ⇒ rebase
 	}
 	e.reader = wal.NewReader(e.o.DBPath + "-wal")
+	e.consumed.Store(0) // unbound reader, no prior generation to carry an offset from
 	e.captured = 0
 	e.rebased.Store(0) // a true resume is never a rebase
 	e.expectRestart = false
@@ -1250,6 +1299,7 @@ func (e *Engine) rebase(ctx context.Context) error {
 		return err
 	}
 	e.reader = wal.NewReader(e.o.DBPath + "-wal")
+	e.consumed.Store(0) // fresh snapshot baseline: nothing consumed from the new generation yet
 	e.rebased.Add(1)
 	e.captured = 0
 	return SaveState(e.statePath(), State{})

@@ -68,5 +68,23 @@ type SessionInfo struct {
 	Holder      string `json:"holder"`
 	Epoch       uint64 `json:"epoch"`
 	DurableTXID uint64 `json:"durable_txid"`
-	Error       string `json:"error,omitempty"`
+	// DurableAge is how long it has been since the most recent successful
+	// flush (manual or automatic), rendered via time.Duration.String() at
+	// the moment "status" was answered — "" if this session has never
+	// flushed successfully. Answers "how stale is durable_txid, right now."
+	DurableAge string `json:"durable_age,omitempty"`
+	// LastFlushAt is the RFC3339 timestamp of the most recent successful
+	// flush (manual or automatic), or "" if none has ever succeeded.
+	LastFlushAt string `json:"last_flush_at,omitempty"`
+	// FlushError is the most recent AUTOMATIC-flush failure (see
+	// session.Session.LastFlushErr) — "" once a later flush, manual or
+	// automatic, has succeeded, or if auto-flush was never enabled
+	// (Options.FlushEvery == 0) or has never failed. A manual "flush" op's
+	// own failure is returned directly as this Response's Error, not here.
+	FlushError string `json:"flush_error,omitempty"`
+	// CaptureLag is capture.Engine.Lag(): WAL bytes committed by writers but
+	// not yet applied to this session's replica. Always present (no
+	// omitempty) — 0 is itself meaningful ("fully caught up"), not "absent".
+	CaptureLag int64  `json:"capture_lag_bytes"`
+	Error      string `json:"error,omitempty"`
 }

@@ -145,6 +145,27 @@ version if you depend on format stability.
   every session performs one settling flush shortly after its startup
   rebase lands, even if the agent never writes anything.
 
+- Observability (Milestone 2, Task 7): `status` now answers "which branch is
+  behind and why." `capture.Engine` gains `Lag()`, WAL bytes a writer has
+  committed but this engine's replica has not yet applied — tracked via a new
+  atomic offset field (the same lock-free pattern `Rebased`/`Resumed` already
+  use, since the engine has no general mutex covering its reader state) so it
+  is safe to call from any goroutine concurrently with `Run`. `SessionInfo`
+  (the daemon's "status" op) gains `durable_age` (time since the last
+  successful flush, empty if never), `last_flush_at` (RFC3339), `flush_error`
+  (the most recent automatic-flush failure, mirroring `LastFlushErr`'s
+  clear-on-success semantics exactly — `ErrClosed` is never recorded, same as
+  the library-level field it surfaces), and `capture_lag_bytes` (always
+  present, 0 is meaningful). `offshoot session status`'s output line gains
+  `lag=`, and — when set — `last_flush=`, `age=`, and `flush_error=`.
+  Every session state transition (opened; flushed, tagged `kind=manual` or
+  `kind=auto`, with its txid; flush-failed, with the error — `ErrClosed`
+  races excluded, since a `Close`-in-progress isn't an operational failure;
+  fenced, with the terminal cause; closed) now writes one structured
+  `offshoot: session: db@branch: event key=value ...` line to stderr,
+  matching the daemon janitor's existing `offshoot: janitor: ...` prefix
+  family rather than a second format.
+
 ### Changed
 
 - `Checkout` no longer re-materializes a checkout that is already clean at
