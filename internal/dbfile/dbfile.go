@@ -64,11 +64,13 @@
 //
 // Tracked follow-ups, in order of how much they buy:
 //
-//   - Make ops.Checkout skip materialization when checkoutState reports the
-//     checkout is already clean and current. It already computes exactly that
-//     verdict a few lines earlier and then re-materializes regardless. This
-//     removes the dominant source above — the per-session-open stranding —
-//     and is the natural mitigation.
+//   - DONE: ops.Checkout now skips materialization when checkoutState
+//     reports the checkout is already clean and current, instead of
+//     re-materializing regardless. This removed the dominant source above —
+//     the per-session-open stranding — for the common clean-reopen case; a
+//     checkout that IS re-materialized (dirty, stale, or destroyed/reaped
+//     while an earlier open's descriptor still references its old inode)
+//     still strands one, same as before.
 //   - Reclaim map entries for paths that no longer exist, so deletion stops
 //     being permanent. (Closing the stranded descriptor is the part that
 //     needs care: it is only safe once nothing in the process can still hold

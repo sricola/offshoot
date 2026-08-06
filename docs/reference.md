@@ -234,8 +234,12 @@ collision). `source` survives unchanged (it's typically left to TTL-reap
 later, or destroyed explicitly). `target`'s old lineage is orphaned and
 later garbage-collected; its checkpoint map resets to just `{"promote":
 <txid>}`. If `target` is protected (`main` is protected by default),
-`--force` is required. `target`'s checkout, if any, is refreshed after a
-busy probe — same best-effort semantics as rollback.
+`--force` is required. Promote never checks `target`'s lease at all — with
+or without `--force` — and any lease on `target` is cleared by the repoint
+(the same unconditional clearing rollback does; see above), so `target` is
+immediately acquirable afterward regardless of who held it. `target`'s
+checkout, if any, is refreshed after a busy probe — same best-effort
+semantics as rollback.
 
 **Errors:** `source == target`; `target` is protected without `--force`;
 target checkout is busy (repoint still lands; checkout refresh is skipped
@@ -422,12 +426,16 @@ Three tools take the opposite stance: `offshoot_rollback`,
 `offshoot_promote` (checked against its `target` only), and
 `offshoot_destroy` **refuse** — rather than proceeding at rest — whenever
 the daemon has any session, healthy or fenced, open on the affected branch.
-Unlike the CLI's own `--force`, which does override a live lease on
-`offshoot destroy` and `offshoot promote --onto` (see those sections
-above), the MCP tools' `force` argument has no effect on this particular
-refusal: repointing or deleting a branch's ref out from under a session the
-daemon still believes it owns is refused unconditionally, and the fix is to
-close the session first (`offshoot session close`) and retry.
+The CLI's own `--force` is not a uniform precedent here: `offshoot destroy
+--force` does override a live lease (see that section above), but `offshoot
+promote --onto` never gates on the target's lease at all, with or without
+`--force` — its `--force` overrides only the protected-branch check, and a
+promote unconditionally clears the target's lease as a side effect of the
+repoint either way (see "Promote" above). Whatever the CLI does, the MCP
+tools' `force` argument has no effect on this particular refusal: repointing
+or deleting a branch's ref out from under a session the daemon still
+believes it owns is refused unconditionally, and the fix is to close the
+session first (`offshoot session close`) and retry.
 `offshoot_promote`'s `source` is the one exception not guarded this way: an
 open session there doesn't block the promote, but the promoted state is the
 source's last-flushed/checkpointed head, not whatever is unflushed in that

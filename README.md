@@ -325,10 +325,14 @@ session, healthy or fenced, open on the affected branch, rather than
 proceeding at rest. All three repoint or delete a branch's ref directly,
 bypassing the daemon entirely; without the refusal, one of these calls could
 clear a lease or delete/repoint storage out from under a session the daemon
-still believes it owns. `force` only ever overrides the protected-branch
-check described above — it has no effect on this refusal. The remedy is to
-close the session first (`offshoot session close`, or the SDK/harness
-equivalent) and retry. `offshoot_promote`'s `source` is the one exception:
+still believes it owns. `force` has no effect on *this* refusal, whatever
+else it does at the ops layer underneath (it overrides a live lease on
+destroy; promote never gates on the target's lease at all, force or not,
+and clears it unconditionally as a repoint side effect — see the
+`offshoot promote` entry in [docs/reference.md](docs/reference.md)). The
+remedy here is the same regardless: close the session first (`offshoot
+session close`, or the SDK/harness equivalent) and retry.
+`offshoot_promote`'s `source` is the one exception:
 an open session there does not block the promote, but the promoted state is
 the source's last-flushed/checkpointed head, not any write still unflushed
 in that live session.
