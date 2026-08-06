@@ -1014,3 +1014,90 @@ func TestEngineLagOrderingUndercountsAcrossARestartRace(t *testing.T) {
 		t.Fatalf("Lag() racing a restart landing mid-call = %d, want 0 (undercount, never a false-positive backlog)", got)
 	}
 }
+
+// TestEngineLagRetiresPhantomAfterIdleTakeover is the regression test for the
+// whole-branch review finding that Lag() reports a persistent phantom
+// backlog after any mid-session WAL takeover: takeover() uses
+// checkpoint(RESTART), which — unlike TRUNCATE (see takeover()'s and
+// e.deadTail's doc comments) — never shrinks the -wal file on disk. Once the
+// lazy reset lands and the expectRestart continuation stores consumed=0, the
+// OLD generation's now-inert dead tail is still physically present in the
+// file, and an unfixed Lag() (fi.Size() - consumed) reads it as outstanding
+// backlog forever, with no real write behind it (reviewer repro: drained,
+// WAL 32768 bytes, consumed 4152, Lag()=28616).
+//
+// This exercises the exact trigger path a running daemon hits routinely: a
+// write, then idle past afterDrain's takeover threshold (captured > 0 &&
+// idle > 5s — the >=64-txn threshold is exercised instead by
+// TestEngineTakeoverExpectedRestartIsNotRebase, but that path never reaches
+// this bug because 64 rapid txns don't leave time for the file to look
+// "quiet" the way a real idle daemon session does; the idle threshold is
+// what settling-flush/daemon-reopen sessions actually hit — see the
+// README/dbfile.go doc fixes in this same review pass), then a further small
+// write to actually land the lazy reset, then DrainNow to fully catch up.
+// Lag() must read exactly 0 once fully drained — never the dead tail.
+//
+// Fail-verified against the pre-fix code (temporary revert of e.deadTail and
+// Lag()'s floor, confirming this test fails with a large nonzero Lag()
+// before the fix is restored) — see the task-8 report's "Whole-branch fix
+// wave" section for that run.
+func TestEngineLagRetiresPhantomAfterIdleTakeover(t *testing.T) {
+	if _, err := exec.LookPath("sqlite3"); err != nil {
+		t.Skip("sqlite3 CLI not on PATH")
+	}
+	dir := t.TempDir()
+	src := filepath.Join(dir, "src.db")
+	if out, err := exec.Command("sqlite3", src,
+		"PRAGMA journal_mode=WAL; CREATE TABLE t (id INTEGER PRIMARY KEY, v BLOB);").CombinedOutput(); err != nil {
+		t.Fatalf("init: %v: %s", err, out)
+	}
+
+	rep := replay.New(filepath.Join(dir, "replica.db"))
+	e := NewEngine(Options{DBPath: src, StateDir: dir, Sink: replicaSink{rep}})
+	ctx, cancel := context.WithCancel(context.Background())
+	done := make(chan error, 1)
+	go func() { done <- e.Run(ctx) }()
+	defer func() { cancel(); <-done }()
+
+	// Let the engine's initial rebase finish before writing — same ordering
+	// every other test in this file relies on.
+	time.Sleep(300 * time.Millisecond)
+
+	// The big write: gives afterDrain's captured>0 half of the idle-takeover
+	// condition, and resets idle to roughly now.
+	if out, err := exec.Command("sqlite3", src,
+		"PRAGMA busy_timeout=5000; INSERT INTO t (v) VALUES (randomblob(4096));").CombinedOutput(); err != nil {
+		t.Fatalf("insert: %v: %s", err, out)
+	}
+	waitEqual(t, src, rep, 5*time.Second)
+
+	// Idle past afterDrain's 5s threshold — the smallest honest margin above
+	// it, since the poll loop only checks time.Since(idle) > 5*time.Second on
+	// its own 10ms ticks. Once crossed, the engine's own ticker drives
+	// takeover() (checkpoint RESTART, verified clean, arms expectRestart)
+	// with no test-side call needed.
+	time.Sleep(5300 * time.Millisecond)
+
+	// The small write: what actually lands SQLite's deferred WAL-header
+	// rewrite (new salts) — takeover() only ARMS the reset, this is what
+	// makes it land. This is also the write whose commit leaves the OLD
+	// generation's on-disk length behind as a dead tail once the reset
+	// physically happens, exactly the reviewer's repro shape.
+	if out, err := exec.Command("sqlite3", src,
+		"PRAGMA busy_timeout=5000; INSERT INTO t (v) VALUES (randomblob(16));").CombinedOutput(); err != nil {
+		t.Fatalf("insert: %v: %s", err, out)
+	}
+
+	dctx, dcancel := context.WithTimeout(context.Background(), 10*time.Second)
+	defer dcancel()
+	if err := e.DrainNow(dctx); err != nil {
+		t.Fatalf("DrainNow() = %v, want nil", err)
+	}
+
+	if got := e.Lag(); got != 0 {
+		t.Fatalf("Lag() after a fully-drained mid-session takeover = %d, want 0 (phantom dead-tail backlog, not a real one)", got)
+	}
+	if got := e.Rebased(); got != 1 {
+		t.Errorf("a clean idle-triggered takeover must not rebase; Rebased() = %d, want 1 (the startup rebase only)", got)
+	}
+}
