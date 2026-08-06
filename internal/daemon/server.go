@@ -349,6 +349,26 @@ func (s *Server) opFlush(req Request) Response {
 	return Response{OK: true, TXID: txid}
 }
 
+// opStatus snapshots the session pointers under s.mu, then builds each
+// SessionInfo OUTSIDE the lock. sess.CaptureLag() stats the WAL file (real
+// disk I/O — see capture.Engine.Lag), and s.mu is the single lock every
+// other RPC (open/flush/close/create/...) also needs to touch the sessions
+// map; building status responses while holding it would serialize every
+// concurrent request in this daemon behind however long that I/O (repeated
+// once per open session) happens to take. See review finding IMPORTANT-2 on
+// task 7.
+//
+// A session snapshotted here can concurrently Close() while its SessionInfo
+// is still being built below — that is fine and deliberate, not a race left
+// unfixed: every Session accessor used below (DB/Branch/CheckoutPath/
+// Lease/DurableTXID/CaptureLag/LastFlush/LastFlushErr/Err) reads the
+// session's own internal, still-valid mutex-protected state and remains
+// safe to call after Close (CaptureLag's WAL stat simply fails closed to 0
+// once the scratch dir is gone — "nothing outstanding", exactly Lag's
+// ordinary missing-file case). The cost is ordinary snapshot semantics: this
+// response can list a session that finished closing a moment ago, the same
+// staleness any status endpoint already has the instant its answer is sent
+// over the wire — not a new correctness gap this introduces.
 func (s *Server) opStatus() Response {
 	s.mu.Lock()
 	keys := make([]string, 0, len(s.sessions))
@@ -359,9 +379,14 @@ func (s *Server) opStatus() Response {
 		keys = append(keys, k)
 	}
 	sort.Strings(keys)
-	infos := make([]SessionInfo, 0, len(keys))
+	sessList := make([]*session.Session, 0, len(keys))
 	for _, k := range keys {
-		sess := s.sessions[k]
+		sessList = append(sessList, s.sessions[k])
+	}
+	s.mu.Unlock()
+
+	infos := make([]SessionInfo, 0, len(sessList))
+	for _, sess := range sessList {
 		info := SessionInfo{
 			DB: sess.DB(), Branch: sess.Branch(), Checkout: sess.CheckoutPath(),
 			Holder: sess.Lease().Holder, Epoch: sess.Lease().Epoch,
@@ -380,7 +405,6 @@ func (s *Server) opStatus() Response {
 		}
 		infos = append(infos, info)
 	}
-	s.mu.Unlock()
 	return Response{OK: true, Sessions: infos}
 }
 

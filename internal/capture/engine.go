@@ -171,25 +171,56 @@ func (e *Engine) Resumed() bool { return e.resumed.Load() }
 // truncated by a rebase/takeover) means there is nothing outstanding, so 0
 // is reported rather than an error; Lag has no error return to give one.
 //
-// This can transiently read low (never a false-positive backlog, only ever
-// an under-report) across a WAL restart: e.consumed and the on-disk file it
-// is compared against can belong to different generations for the brief
-// window between the physical reset landing and Run's goroutine rebinding
-// e.reader and zeroing e.consumed (see pollOnce/pollOnceTo's
-// expectRestart-continuation branches, and rebase). A negative difference
-// from that skew is clamped to 0 rather than surfaced as a nonsensical
-// negative lag.
+// ORDER IS LOAD-BEARING: e.consumed.Load() MUST run BEFORE os.Stat, never
+// after — do not reorder these two lines. This is two independent reads (an
+// atomic load, then a syscall) with no lock spanning them, so a WAL restart
+// can physically land in the gap between them regardless of which comes
+// first; the ordering only decides which direction the resulting skew errs
+// in. Consumed-then-stat (this function): if a restart lands in the gap, the
+// stat observes the FRESH, small post-reset file size while consumed still
+// holds the STALE, large pre-reset offset from the old generation —
+// oldLargeConsumed > newSmallSize, so the subtraction goes negative and
+// clamps to 0, i.e. undercounts a real backlog for one call. Stat-then-load
+// (the ordering this function deliberately does NOT use) inverts the skew:
+// the stat would observe the old generation's large on-disk size, then a
+// restart landing before the load would leave consumed freshly reset to 0
+// by the same race, producing largeOldSize - 0 — a large false-positive
+// backlog with no real write behind it, exactly the "dashboard lies"
+// failure this metric exists to avoid. Both orderings can race a restart;
+// only one of the two errs toward under- rather than over-reporting, which
+// is why the order is fixed and commented rather than arbitrary. The
+// under-report window this leaves is bounded by however long a caller's own
+// Poll interval takes to next update e.consumed after the restart lands —
+// which can be the engine's configured Poll duration, not merely
+// microseconds — not "brief" the way a single-instruction race would be;
+// still strictly the safe direction (Lag never invents a backlog that isn't
+// there), which is the property Lag's contract actually needs.
 func (e *Engine) Lag() int64 {
+	consumed := e.consumed.Load()
+	if lagRaceHook != nil {
+		lagRaceHook() // test hook; nil (a no-op) in production
+	}
 	fi, err := os.Stat(e.o.DBPath + "-wal")
 	if err != nil {
 		return 0
 	}
-	lag := fi.Size() - e.consumed.Load()
+	lag := fi.Size() - consumed
 	if lag < 0 {
 		return 0
 	}
 	return lag
 }
+
+// lagRaceHook, when non-nil, is invoked by Lag() immediately after it reads
+// e.consumed and immediately before it stats the WAL file — exactly the gap
+// Lag's doc comment's ordering argument is about. It exists purely so a test
+// can deterministically simulate a WAL restart landing in that gap (mutate
+// the on-disk WAL file and e.consumed the same way Run's own
+// expectRestart-continuation branches would) and assert Lag degrades in the
+// documented safe (under-report, never over-report) direction, without
+// needing to actually race a real WAL restart against a live Run goroutine.
+// nil (the default) is a no-op and imposes no cost in production.
+var lagRaceHook func()
 
 // WaitReady blocks until Run's startup tryResume/rebase decision has
 // settled — Resumed() is guaranteed to hold its final value once this
