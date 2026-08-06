@@ -15,6 +15,19 @@ version if you depend on format stability.
 
 ### Added
 
+- MCP forks expire by default: `offshoot_fork` gains a `ttl` argument (a Go
+  duration string, or `"none"` for a branch that never expires) and falls
+  back to `offshoot mcp -default-ttl` (default `24h`) when `ttl` is
+  omitted — an explicit `ttl` on the call always wins, and `ttl:"none"`
+  always yields no TTL even under a configured default. `-default-ttl 0` or
+  `-default-ttl none` disables the default entirely. The fork tool's
+  response now echoes the TTL it applied and, when there is one, the
+  computed expiry timestamp, so both land in the agent's own transcript.
+  Reaping still requires a running janitor (`offshoot serve`) — a
+  daemonless `offshoot mcp` setup only sweeps expired branches when
+  `offshoot gc` is run by hand, and both the tool's Description and the
+  README now say so.
+
 - Background flush: `session.Options.FlushEvery`, when > 0, flushes a
   session automatically on that cadence so an agent that never calls `Flush`
   still gets bounded data loss on crash (library default stays `0`, manual

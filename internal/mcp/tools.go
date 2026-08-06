@@ -4,6 +4,7 @@ import (
 	"context"
 	"encoding/json"
 	"fmt"
+	"time"
 
 	"github.com/offshoot-db/offshoot/internal/daemon"
 	"github.com/offshoot-db/offshoot/internal/ops"
@@ -16,13 +17,22 @@ import (
 type OffshootTools struct {
 	ws   *ops.Workspace
 	spec string
+	// defaultTTL is applied to a fork whose call omits `ttl` entirely;
+	// zero means forks have no TTL unless one is given explicitly. An
+	// explicit `ttl:"none"` on the call always overrides this, and an
+	// explicit `ttl:"<duration>"` always wins over it too — see
+	// resolveForkTTL.
+	defaultTTL time.Duration
 }
 
 // NewOffshootTools binds a tool set to a workspace and store spec. The spec
 // is used to detect a running daemon; offshoot_checkout reports whether one
-// is running for this store.
-func NewOffshootTools(ws *ops.Workspace, spec string) *OffshootTools {
-	return &OffshootTools{ws: ws, spec: spec}
+// is running for this store. defaultTTL is the TTL offshoot_fork applies
+// when a call omits `ttl`; zero means agent-created forks are immortal
+// unless a call passes `ttl` itself (the CLI's `offshoot mcp -default-ttl`
+// flag is how an operator sets this — see cmd/offshoot/main.go).
+func NewOffshootTools(ws *ops.Workspace, spec string, defaultTTL time.Duration) *OffshootTools {
+	return &OffshootTools{ws: ws, spec: spec, defaultTTL: defaultTTL}
 }
 
 // prop describes one property of a tool's JSON Schema input: its argument
@@ -120,9 +130,11 @@ func (t *OffshootTools) Tools() []Tool {
 				"experiments). Forking is instant and costs nothing until you write. " +
 				"Prefer forking over backing up by hand. Forks from the branch's " +
 				"current head by default, or from a named checkpoint via `at`. " +
-				"`branch` (the source) defaults to \"main\" if omitted.",
+				"`branch` (the source) defaults to \"main\" if omitted. " +
+				forkTTLDescription(t.defaultTTL) + " " + forkTTLJanitorNote,
 			InputSchema: schema(reqStr("database"), reqStr("new_branch"),
-				optStrDefault("branch", "main"), optStr("at")),
+				optStrDefault("branch", "main"), optStr("at"),
+				optStrDefault("ttl", ttlDefaultDisplay(t.defaultTTL))),
 		},
 		{
 			Name: "offshoot_rollback",
@@ -305,6 +317,96 @@ type forkArgs struct {
 	Branch    string `json:"branch"`
 	NewBranch string `json:"new_branch"`
 	At        string `json:"at"`
+	// TTL is a Go duration string ("2h"), "none" for no TTL (overrides any
+	// configured default), or "" to fall back to OffshootTools.defaultTTL —
+	// see resolveForkTTL.
+	TTL string `json:"ttl"`
+}
+
+// forkTTLJanitorNote is appended to offshoot_fork's Description (and, in
+// spirit, its response text — see forkTTLSummary) per the PM amendment: a
+// TTL alone does not reap anything. Reaping is a janitor's job
+// (`offshoot serve`'s background sweep); a daemonless MCP setup — the
+// common case, since `offshoot mcp` needs no daemon — only reaps expired
+// branches when `offshoot gc` is run by hand.
+const forkTTLJanitorNote = "TTL reaping only happens while a janitor is running " +
+	"(`offshoot serve`); a daemonless setup sweeps expired branches only when " +
+	"`offshoot gc` is run."
+
+// forkTTLDescription is the Description clause explaining fork's default TTL
+// behavior for the given defaultTTL, so the model can reason about what a
+// call that omits `ttl` will actually get.
+func forkTTLDescription(defaultTTL time.Duration) string {
+	if defaultTTL <= 0 {
+		return "Forks have no TTL unless you pass one: `ttl` accepts a Go duration " +
+			"string (e.g. \"2h\") after which the branch expires if not promoted or " +
+			"touched."
+	}
+	return fmt.Sprintf("Forked branches expire %s after their last activity by "+
+		"default; pass `ttl:\"none\"` to keep one indefinitely, or `ttl` as a Go "+
+		"duration string (e.g. \"2h\") to override.", defaultTTL.String())
+}
+
+// ttlDefaultDisplay renders defaultTTL the way the fork schema's `ttl`
+// property advertises its default: "none" when no default is configured,
+// otherwise its canonical time.Duration.String() form — the same rendering
+// a ref's own TTL round-trips as (see the README's TTLs section).
+func ttlDefaultDisplay(defaultTTL time.Duration) string {
+	if defaultTTL <= 0 {
+		return "none"
+	}
+	return defaultTTL.String()
+}
+
+// resolveForkTTL determines the TTL to apply to a fresh fork from the call's
+// raw `ttl` argument and the tool set's configured default. An explicit
+// `ttl` always wins over defaultTTL: "" (the argument omitted) falls back to
+// defaultTTL, "none" explicitly disables TTL even under a configured
+// default, and anything else is parsed as a Go duration. Fork has no "none"
+// concept the way touch does — a brand-new branch has no existing TTL to
+// preserve or clear — so a parsed non-positive duration is refused rather
+// than silently treated as no TTL (matching ops.Workspace.Fork's own rule).
+func resolveForkTTL(raw string, defaultTTL time.Duration) (time.Duration, error) {
+	if raw == "" {
+		return defaultTTL, nil
+	}
+	if raw == "none" {
+		return 0, nil
+	}
+	d, err := time.ParseDuration(raw)
+	if err != nil {
+		return 0, fmt.Errorf("ttl %q is not a valid duration: use a Go duration string "+
+			"like \"2h\" or \"30m\", or \"none\" for no TTL (%v)", raw, err)
+	}
+	if d <= 0 {
+		return 0, fmt.Errorf("ttl %q must be positive; use \"none\" for no TTL", raw)
+	}
+	return d, nil
+}
+
+// forkTTLSummary describes the TTL just applied to a fresh fork, for the
+// tool's response text. Per the PM amendment, this (not just the ref
+// written to the store) is what carries the applied TTL and computed expiry
+// into the agent's transcript, so the model can reason about them later
+// without a separate offshoot_list/offshoot_checkout round trip. Expiry is
+// computed the same way Status does: ops.ReapDeadline from the ref's own
+// TouchedAt, not from time.Now() here, so it reflects what was actually
+// durably written.
+func forkTTLSummary(ws *ops.Workspace, db, branch string, ttl time.Duration) string {
+	if ttl <= 0 {
+		return "ttl=none (never expires)"
+	}
+	ref, _, err := ws.Store.GetRef(db, branch)
+	if err != nil {
+		// The fork itself already succeeded; a re-read failure here just
+		// means the response can't include a computed expiry.
+		return fmt.Sprintf("ttl=%s", ttl)
+	}
+	deadline, ok := ops.ReapDeadline(ref)
+	if !ok {
+		return fmt.Sprintf("ttl=%s", ref.TTL)
+	}
+	return fmt.Sprintf("ttl=%s expires_at=%s (%s)", ref.TTL, deadline.Format(time.RFC3339), forkTTLJanitorNote)
 }
 
 func (t *OffshootTools) fork(args json.RawMessage) (ToolResult, error) {
@@ -324,11 +426,17 @@ func (t *OffshootTools) fork(args json.RawMessage) (ToolResult, error) {
 	if r, bad := validateNames(toValidate...); bad {
 		return r, nil
 	}
-	txid, err := t.ws.Fork(a.Database, branch, a.NewBranch, a.At, 0)
+	ttl, err := resolveForkTTL(a.TTL, t.defaultTTL)
 	if err != nil {
 		return ErrorResult("%v", err), nil
 	}
-	return TextResult("forked %s@%s to %s@%s at txid %d", a.Database, branch, a.Database, a.NewBranch, txid), nil
+	txid, err := t.ws.Fork(a.Database, branch, a.NewBranch, a.At, ttl)
+	if err != nil {
+		return ErrorResult("%v", err), nil
+	}
+	msg := fmt.Sprintf("forked %s@%s to %s@%s at txid %d", a.Database, branch, a.Database, a.NewBranch, txid)
+	msg += "; " + forkTTLSummary(t.ws, a.Database, a.NewBranch, ttl)
+	return TextResult("%s", msg), nil
 }
 
 type rollbackArgs struct {

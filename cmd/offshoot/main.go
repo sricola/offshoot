@@ -45,7 +45,11 @@ Usage:
                                              -flush-every ships every open session's
                                              work on a cadence even if it's never
                                              flushed explicitly (default 30s; 0 disables)
-  offshoot mcp                              serve the MCP tool set on stdio for an agent
+  offshoot mcp [-default-ttl d|none]        serve the MCP tool set on stdio for an agent;
+                                             forked branches get this TTL unless the fork
+                                             call overrides it (default 24h; 0/none disables
+                                             — reaping still needs a running janitor, i.e.
+                                             offshoot serve, or a manual offshoot gc)
   offshoot session open <db>[@branch] [-socket PATH]      open a session; prints the checkout path
   offshoot session flush <db>[@branch] [name] [-socket PATH]   flush to a durable snapshot; prints the txid
   offshoot session status [-socket PATH]                  list open sessions and their durable txid
@@ -478,10 +482,27 @@ func run(args []string) error {
 			return fmt.Errorf("unknown lease subcommand %q", rest[0])
 		}
 	case "mcp":
-		if len(rest) != 0 {
-			return fmt.Errorf("usage: offshoot mcp")
+		defaultTTLStr, rest, _, err := extractFlag(rest, "-default-ttl")
+		if err != nil {
+			return fmt.Errorf("usage: offshoot mcp [-default-ttl DURATION|none]: %w", err)
 		}
-		ts := mcp.NewOffshootTools(w, spec)
+		if defaultTTLStr == "" {
+			defaultTTLStr = "24h"
+		}
+		// parseTTLFlag's "none" sentinel (0, explicitly no TTL) doubles as
+		// -default-ttl's disable switch; a plain "0"/"0s" parses to the same
+		// zero duration and disables it too.
+		defaultTTL, err := parseTTLFlag(defaultTTLStr)
+		if err != nil {
+			return fmt.Errorf("-default-ttl: %w", err)
+		}
+		if defaultTTL < 0 {
+			return fmt.Errorf("-default-ttl %q must be zero, \"none\" (both disable it), or positive", defaultTTLStr)
+		}
+		if len(rest) != 0 {
+			return fmt.Errorf("usage: offshoot mcp [-default-ttl DURATION|none]")
+		}
+		ts := mcp.NewOffshootTools(w, spec, defaultTTL)
 		srv := mcp.NewServer(os.Stdin, os.Stdout, ts)
 		return srv.Serve(context.Background())
 	case "serve":

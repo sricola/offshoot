@@ -70,7 +70,7 @@ Status legend:
 |---|---|---|
 | CLI (create/checkout/checkpoint/fork/rollback/promote/destroy/touch/gc/status/lease) | shipped-and-tested | See [docs/reference.md](reference.md) for every command |
 | MCP server, 7 tools, at rest | shipped-and-tested | `offshoot mcp`; protected-branch rules enforced same as CLI |
-| MCP forks carry a TTL | **not yet implemented** | [Milestone 2](../ROADMAP.md#milestone-2--safe-by-default-for-agents) — `offshoot_fork` has no `ttl` argument today, so every agent-initiated fork is immortal until manually `touch`ed |
+| MCP forks carry a TTL | shipped-and-tested | `offshoot_fork` takes `ttl` (explicit always wins) and falls back to `offshoot mcp -default-ttl` (default `24h`; `0`/`none` disables) when omitted; `ttl:"none"` overrides even a configured default. The response echoes the applied TTL and computed expiry. Reaping still requires a running janitor (`offshoot serve`) — a daemonless MCP setup sweeps expired branches only on `offshoot gc` |
 | MCP rides the daemon (live capture, session-aware checkpoint) | **not yet implemented** | [Milestone 2](../ROADMAP.md#milestone-2--safe-by-default-for-agents) — the MCP server operates entirely at rest today: full-snapshot checkpoints, no session integration, and a lease collision is possible against a daemon running on the same store |
 | Python SDK (stdlib-only, over the unix-socket lifecycle API) | shipped-and-tested | `sdk/python`; not yet published to PyPI ([Milestone 3](../ROADMAP.md#milestone-3--the-eval-harness-release)) |
 | TypeScript SDK (zero runtime deps) | shipped-and-tested | `sdk/typescript`; not yet published to npm ([Milestone 3](../ROADMAP.md#milestone-3--the-eval-harness-release)) |
