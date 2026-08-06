@@ -622,11 +622,14 @@ func TestForkResponseEchoesTTLAndExpiry(t *testing.T) {
 	if !strings.Contains(msg, "2h0m0s") {
 		t.Errorf("response must echo the applied TTL (canonical \"2h0m0s\"): %s", msg)
 	}
-	// The computed expiry is a timestamp: look for a plausible year rather
-	// than a specific format, since any reasonable rendering will contain
-	// one — this test shouldn't be coupled to RFC3339 vs. another layout.
-	if !strings.Contains(msg, "20") {
-		t.Errorf("response must echo a computed expiry timestamp: %s", msg)
+	// Anchor on the "expires_at=" label forkTTLSummary actually emits, not a
+	// bare "20" substring — the latter is nearly vacuous: it happens to pass
+	// today only because the current year starts with "20", so it would keep
+	// passing even if forkTTLSummary's degraded path (see its doc comment)
+	// dropped expires_at while some OTHER "20"-containing text (a txid, a
+	// future year, an unrelated number) remained in the message.
+	if !strings.Contains(msg, "expires_at=") {
+		t.Errorf("response must echo a computed expiry timestamp (expires_at=...): %s", msg)
 	}
 	if !strings.Contains(strings.ToLower(msg), "janitor") {
 		t.Errorf("response must note that reaping requires a running janitor: %s", msg)
@@ -646,5 +649,28 @@ func TestForkResponseNoTTLSaysSo(t *testing.T) {
 	msg := strings.ToLower(text(r))
 	if !strings.Contains(msg, "none") && !strings.Contains(msg, "never") && !strings.Contains(msg, "no ttl") {
 		t.Errorf("response should say the fork has no TTL: %s", text(r))
+	}
+}
+
+// TestForkTTLSummaryKeepsJanitorNoteWhenReReadFails is the regression test
+// for the whole-branch review finding that forkTTLSummary's degraded path
+// dropped the janitor caveat along with the computed expiry when the
+// post-fork GetRef re-read fails — even though the caveat is a static fact
+// about how reaping works, not something derived from that re-read, so it
+// should never have depended on it succeeding. Exercised directly against
+// forkTTLSummary (rather than through the fork tool end to end) by asking
+// for a branch that was never forked, so GetRef fails exactly the way a real
+// race (the ref vanishing between fork and re-read) would.
+func TestForkTTLSummaryKeepsJanitorNoteWhenReReadFails(t *testing.T) {
+	_, ws := newTools(t)
+	msg := forkTTLSummary(ws, "app", "never-forked", time.Hour)
+	if strings.Contains(msg, "expires_at=") {
+		t.Fatalf("expected the degraded (no re-read) path, but got an expiry anyway: %s", msg)
+	}
+	if !strings.Contains(strings.ToLower(msg), "janitor") {
+		t.Errorf("degraded path must still carry the janitor caveat — it doesn't depend on the re-read: %s", msg)
+	}
+	if !strings.Contains(msg, "1h0m0s") {
+		t.Errorf("degraded path must still echo the applied TTL: %s", msg)
 	}
 }
