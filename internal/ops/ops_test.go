@@ -1378,3 +1378,106 @@ func TestOpsRejectEscapingNames(t *testing.T) {
 		})
 	}
 }
+
+// TestCheckoutSkipsRematerializeWhenCleanAndCurrent pins the optimization
+// that Checkout must not re-materialize (temp file + rename over the fixed
+// checkout path) when the existing checkout is already byte-correct: clean
+// (matches its .sum sidecar fingerprint) AND current (the sidecar's recorded
+// lineage+txid equals the ref's CURRENT head, which checkoutState already
+// compares against — see checkoutState's doc comment). materializeChainAt
+// (internal/ltxio.MaterializeChain) always writes via os.CreateTemp + rename,
+// so a skipped re-materialization is observable as the checkout path keeping
+// the SAME inode across calls; a re-materialized one gets a fresh inode.
+func TestCheckoutSkipsRematerializeWhenCleanAndCurrent(t *testing.T) {
+	requireSQLite(t)
+	w := newWS(t)
+	if err := w.Create("app"); err != nil {
+		t.Fatal(err)
+	}
+	p1, err := w.Checkout("app", "main")
+	if err != nil {
+		t.Fatal(err)
+	}
+	st1, err := os.Stat(p1)
+	if err != nil {
+		t.Fatal(err)
+	}
+	// The checkout is clean and current immediately after materializing: a
+	// second Checkout must return the SAME file, not rebuild it.
+	p2, err := w.Checkout("app", "main")
+	if err != nil {
+		t.Fatal(err)
+	}
+	st2, err := os.Stat(p2)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !os.SameFile(st1, st2) {
+		t.Fatal("a clean, current checkout must not be re-materialized (same inode expected)")
+	}
+
+	// A checkpoint advances the head; Checkpoint itself refreshes the .sum
+	// sidecar to the new (lineage, txid) in place (see writeSum in
+	// Checkpoint), so the checkout is STILL clean and current at the new
+	// head without Checkout doing anything — still no re-materialize.
+	mustExecSQL(t, p2, "CREATE TABLE t (v);")
+	if _, err := w.Checkpoint("app", "main", "cp1"); err != nil {
+		t.Fatal(err)
+	}
+	p3, err := w.Checkout("app", "main")
+	if err != nil {
+		t.Fatal(err)
+	}
+	st3, err := os.Stat(p3)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !os.SameFile(st2, st3) {
+		t.Fatal("checkpoint leaves the checkout clean at the new head; still no re-materialize")
+	}
+
+	// An unverifiable checkout (sidecar present but not a valid current-format
+	// record) must fall back to checkoutState == "unknown" and re-materialize
+	// rather than risk skipping over something it can't prove is clean.
+	// checkoutState treats {} as unknown: it decodes fine but rec.Hash == "".
+	sum := p3 + ".sum"
+	if _, err := os.Stat(sum); err != nil {
+		t.Fatalf("expected a .sum sidecar at %s: %v", sum, err)
+	}
+	if err := os.WriteFile(sum, []byte("{}"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	p4, err := w.Checkout("app", "main")
+	if err != nil {
+		t.Fatal(err)
+	}
+	st4, err := os.Stat(p4)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if os.SameFile(st3, st4) {
+		t.Fatal("an unverifiable checkout (bad sidecar) must be re-materialized")
+	}
+
+	// A modified checkout (un-checkpointed local edits) must still warn and
+	// be overwritten, exactly as before this change — the "clean" fast path
+	// must not swallow the "modified" case.
+	mustExecSQL(t, p4, "INSERT INTO t VALUES (1);")
+	var p5 string
+	stderr := captureStderr(t, func() {
+		p5, err = w.Checkout("app", "main")
+		if err != nil {
+			t.Fatal(err)
+		}
+	})
+	if !strings.Contains(stderr, "un-checkpointed changes") {
+		t.Fatalf("warning missing expected text: %q", stderr)
+	}
+	st5, err := os.Stat(p5)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if os.SameFile(st4, st5) {
+		t.Fatal("a modified checkout must still be re-materialized (and warned about)")
+	}
+}

@@ -13,6 +13,17 @@ version if you depend on format stability.
 
 ## [Unreleased]
 
+### Changed
+
+- `Checkout` no longer re-materializes a checkout that is already clean at
+  the branch's current head (sidecar fingerprint matches the file, and the
+  fingerprint's recorded lineage/txid matches the ref right now); it returns
+  the existing file as-is. Every `session.Open` calls `Checkout`, so this
+  avoids an O(size) temp-file-and-rename plus a stranded `dbfile` descriptor
+  on every open when the checkout hasn't drifted. Modified and stale
+  checkouts are unaffected: they still warn and re-materialize exactly as
+  before.
+
 ## [0.1.0] - 2026-08-05
 
 Initial pre-release. offshoot brings git-like branching to SQLite databases:

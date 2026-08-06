@@ -230,7 +230,18 @@ func (w *Workspace) Checkout(db, branch string) (string, error) {
 		if err := quiesce(path); err != nil {
 			return "", err
 		}
-		if checkoutState(path, ref) == "modified" {
+		// checkoutState compares the sidecar's recorded (lineage, txid)
+		// against ref.Lineage/ref.HeadTXID — the CURRENT head, just fetched
+		// above — so "clean" here already means "byte-correct for the head
+		// right now", not merely "matches whatever it was last verified
+		// against". A clean, current checkout needs no re-materialization:
+		// return it as-is rather than paying the temp+rename cost (and, via
+		// materializeAt->dbfile, stranding another descriptor) to rebuild
+		// bytes that are already correct.
+		switch checkoutState(path, ref) {
+		case "clean":
+			return path, nil
+		case "modified":
 			fmt.Fprintf(os.Stderr, "offshoot: warning: overwriting un-checkpointed changes in %s@%s checkout\n", db, branch)
 		}
 	}
