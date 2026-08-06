@@ -176,6 +176,25 @@ func TestBareTrailingSocketFlagIsRejected(t *testing.T) {
 	}
 }
 
+// TestServeNegativeFlushEveryIsRejected pins the fix: a negative
+// -flush-every must fail closed as a usage error, not silently disable
+// auto-flush. 0 stays the explicit "disable" sentinel; a negative duration
+// is (almost certainly) a mistake and must not be quietly aliased to it —
+// run() must return before ever starting to serve, so this needs no daemon
+// lifecycle at all (mirrors TestBareTrailingSocketFlagIsRejected's shape).
+func TestServeNegativeFlushEveryIsRejected(t *testing.T) {
+	dir := filepath.Join(t.TempDir(), "s")
+	if err := run([]string{"-store", dir, "init"}); err != nil {
+		t.Fatal(err)
+	}
+	if err := run([]string{"-store", dir, "create", "app"}); err != nil {
+		t.Fatal(err)
+	}
+	if err := run([]string{"-store", dir, "serve", "-flush-every", "-5s"}); err == nil {
+		t.Fatal("serve -flush-every -5s must be rejected, not silently disable auto-flush")
+	}
+}
+
 // TestSessionHonorsServeSocketOverride guards the fix for `serve -socket`
 // and `session` disagreeing on where the socket lives: `serve -socket PATH`
 // used to be unreachable by `session` subcommands because they only ever

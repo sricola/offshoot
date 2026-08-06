@@ -208,6 +208,10 @@ func (s *Session) Flush(name string) (uint64, error) {
 		return 0, fmt.Errorf("session: encode replica: %w", err)
 	}
 
+	if FlushUploadHook != nil {
+		FlushUploadHook() // test hook; nil (a no-op) in production
+	}
+
 	var objKey, kind string
 	if snapshot {
 		objKey, kind = store.SnapshotKey(ref.Lineage, lease.Epoch, txid), "snapshot"
@@ -281,14 +285,34 @@ func (s *Session) Flush(name string) (uint64, error) {
 	if s.rebaseGen == genAtEncode {
 		s.flushChecksum = checksumAtEncode
 		s.forceSnapshot = false
+		// flushedRebaseGen MUST be gated identically to forceSnapshot/
+		// flushChecksum above, not advanced unconditionally: a rebase that
+		// raced this upload has already folded content into the replica
+		// (via checkpoint(TRUNCATE), before ever calling Apply — see
+		// appliedGen/flushedRebaseGen's doc comment on Session) that this
+		// attempt's uploaded bytes do NOT contain, because they were encoded
+		// before the race. Advancing flushedRebaseGen past that race would
+		// mark those un-uploaded, rebase-folded bytes durable — and since
+		// forceSnapshot is deliberately left true by this same race (the gate
+		// above didn't run), nothing would ever call Flush again to actually
+		// ship them: flushLoop's idle short-circuit would then skip every
+		// future tick forever, believing there was nothing pending, and the
+		// rebase-folded write would sit unflushed indefinitely. Leaving
+		// flushedRebaseGen at its pre-race value instead keeps
+		// `rebaseGen != flushedRebaseGen` true, so flushLoop's very next tick
+		// sees it pending and retries.
+		s.flushedRebaseGen = genAtEncode
 	}
-	// Unconditional, unlike the rebaseGen-gated fields above: appliedGen is
-	// unaffected by a racing rebase (a rebase doesn't undo previously
-	// applied transactions), so "everything through appliedGenAtEncode is
-	// now durable" holds regardless of whether one raced this upload. Any
-	// transaction applied DURING the upload/PutRef window already bumped
-	// appliedGen past appliedGenAtEncode by the time we regain replicaMu
-	// here, so it correctly remains visible as still-pending afterward.
+	// flushedGen, by contrast, IS unconditional: appliedGen only ever
+	// advances from recordApply (a real Apply call), never from a rebase,
+	// and the payload this attempt uploaded was drained from pages at
+	// exactly appliedGenAtEncode — so "everything Applied through here is
+	// now durable" holds regardless of whether a rebase also raced this
+	// upload. Any transaction Applied DURING the upload/PutRef window
+	// already bumped appliedGen past appliedGenAtEncode by the time we
+	// regain replicaMu here, so it correctly remains visible as
+	// still-pending afterward (via the appliedGen != flushedGen half of
+	// flushLoop's pending check) regardless of what this assignment does.
 	s.flushedGen = appliedGenAtEncode
 	s.replicaMu.Unlock()
 
@@ -333,6 +357,16 @@ const minPagesForFractionCheck = 64
 // observed waiting on flushMu); nil (the default) is a no-op and imposes no
 // cost in production.
 var FlushEncodeHook func()
+
+// FlushUploadHook, when non-nil, is invoked by Flush immediately after it
+// releases replicaMu following a successful encode — i.e. exactly inside the
+// window where Flush's own upload (PutIf/PutRef) runs without replicaMu
+// held, and a concurrent Rebase (a real one via the capture engine, or a
+// test driving replicaSink.Rebase directly) can race in and change rebaseGen
+// out from under this attempt. It exists purely for tests exercising that
+// race (see TestFlushLoopRetriesAfterRebaseDuringUpload); nil (the default)
+// is a no-op and imposes no cost in production.
+var FlushUploadHook func()
 
 // DurableTXID is the txid the store is durable through for this session, or
 // 0 before the first flush.

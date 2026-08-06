@@ -5,8 +5,10 @@ import (
 	"errors"
 	"fmt"
 	"os/exec"
+	"path/filepath"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"testing"
 	"time"
 
@@ -630,26 +632,38 @@ func TestAutoFlushShipsWritesWithoutManualFlush(t *testing.T) {
 	}
 }
 
-// failNRefPutIf wraps a store.Backend and turns each of the first n PutIf
+// failNRefPutIf wraps a store.Backend and turns each of the next N PutIf
 // calls on a "refs/" key into a non-CAS failure — the same class of
-// ambiguous transient error failRefPutIf injects, but healing after n
+// ambiguous transient error failRefPutIf injects, but healing after N
 // occurrences instead of forever — simulating a transient outage (e.g. a
-// flaky network) that later recovers.
+// flaky network) that later recovers. N is an atomic.Int64 rather than a
+// plain field guarded by installing/swapping the whole wrapper: a session
+// with FlushEvery set reads s.ws.Store.B from its own flushLoop goroutine as
+// soon as Open returns, so a test must install this wrapper as w.Store.B
+// BEFORE calling Open (an unarmed instance always lets everything through,
+// n starting at 0) and arm the actual failure count afterward via arm() —
+// swapping w.Store.B itself after Open would race that goroutine's read
+// under -race.
 type failNRefPutIf struct {
 	store.Backend
-	mu sync.Mutex
-	n  int
+	n atomic.Int64
 }
+
+// arm sets the number of upcoming refs/ PutIf calls to fail from now on.
+// Safe to call concurrently with PutIf.
+func (f *failNRefPutIf) arm(n int64) { f.n.Store(n) }
 
 func (f *failNRefPutIf) PutIf(key string, data []byte, ifMatch string) (string, error) {
 	if strings.HasPrefix(key, "refs/") {
-		f.mu.Lock()
-		if f.n > 0 {
-			f.n--
-			f.mu.Unlock()
-			return "", fmt.Errorf("test: injected transient ref failure on %s", key)
+		for {
+			cur := f.n.Load()
+			if cur <= 0 {
+				break
+			}
+			if f.n.CompareAndSwap(cur, cur-1) {
+				return "", fmt.Errorf("test: injected transient ref failure on %s", key)
+			}
 		}
-		f.mu.Unlock()
 	}
 	return f.Backend.PutIf(key, data, ifMatch)
 }
@@ -664,6 +678,12 @@ func TestAutoFlushFailureSurfacesAndRecovers(t *testing.T) {
 	if err := w.Create("app"); err != nil {
 		t.Fatal(err)
 	}
+	// Install BEFORE Open — see failNRefPutIf's doc comment. Unarmed (n=0),
+	// so the startup settling flush and lease acquisition go through
+	// untouched.
+	fp := &failNRefPutIf{Backend: w.Store.B}
+	w.Store.B = fp
+
 	s, err := Open(context.Background(), Options{
 		WS: w, DB: "app", Branch: "main", FlushEvery: 60 * time.Millisecond,
 	})
@@ -674,10 +694,17 @@ func TestAutoFlushFailureSurfacesAndRecovers(t *testing.T) {
 
 	mustExec(t, s.CheckoutPath(), "CREATE TABLE t (v); INSERT INTO t VALUES ('x');")
 
-	// w.Store and s.ws.Store are the same *store.Store, so mutating w.Store.B
-	// is visible to the session's own flush loop. Fail the first two ref
-	// writes, then let everything through.
-	w.Store.B = &failNRefPutIf{Backend: w.Store.B, n: 2}
+	// Let an initial successful flush (the unconditional startup settling
+	// flush, this write, or both coalesced) land before injecting failures,
+	// so the failure this test asserts on is unambiguously its own attempt's,
+	// not a race with that first flush.
+	waitFor(t, 5*time.Second, "an initial successful flush", func() bool {
+		_, _, ok := s.LastFlush()
+		return ok
+	})
+
+	fp.arm(2)
+	mustExec(t, s.CheckoutPath(), "INSERT INTO t VALUES ('y');")
 
 	waitFor(t, 5*time.Second, "LastFlushErr to be set by a failing tick", func() bool {
 		return s.LastFlushErr() != nil
@@ -686,7 +713,7 @@ func TestAutoFlushFailureSurfacesAndRecovers(t *testing.T) {
 		t.Fatalf("a transient auto-flush failure must not kill the session: %v", err)
 	}
 	// The checkout is still usable after the failure.
-	mustExec(t, s.CheckoutPath(), "INSERT INTO t VALUES ('y');")
+	mustExec(t, s.CheckoutPath(), "INSERT INTO t VALUES ('z');")
 
 	waitFor(t, 5*time.Second, "LastFlushErr to clear once the backend heals", func() bool {
 		return s.LastFlushErr() == nil
@@ -696,13 +723,34 @@ func TestAutoFlushFailureSurfacesAndRecovers(t *testing.T) {
 	}
 }
 
+// pendingAutoFlush mirrors flushLoop's own pending check exactly (test-only:
+// this file is package session, so it can read the unexported gen counters
+// directly under replicaMu, the same way flushLoop itself does).
+func pendingAutoFlush(s *Session) bool {
+	s.replicaMu.Lock()
+	defer s.replicaMu.Unlock()
+	return s.appliedGen != s.flushedGen || s.rebaseGen != s.flushedRebaseGen
+}
+
 // TestIdleAutoFlushWritesNothing is the PM-review blocking amendment: a tick
-// with nothing pending (no committed frames since the last successful flush)
-// must write NOTHING — no object PUT, no ref PUT, no flushesSinceSnapshot
-// advance. Without this, an idle session under a short cadence would upload
-// a full snapshot every SnapshotEvery ticks forever, since Flush always
-// advances txid and writes something once actually called, regardless of
-// whether anything changed.
+// with nothing pending (no committed frames, and no rebase, since the last
+// successful flush) must write NOTHING — no object PUT, no ref PUT, no
+// flushesSinceSnapshot advance. Without this, an idle session under a short
+// cadence would upload a full snapshot every SnapshotEvery ticks forever,
+// since Flush always advances txid and writes something once actually
+// called, regardless of whether anything changed.
+//
+// This does one real write and waits for the session to fully settle (via
+// pendingAutoFlush, not just "a flush happened") before measuring: every
+// session performs one unconditional settling flush shortly after its
+// startup rebase (rebaseGen 0->1) regardless of whether the agent ever
+// writes anything — see appliedGen/flushedRebaseGen's doc comment on
+// Session — so counting from Open itself would either race that settling
+// flush into the "idle" window (flaky) or, if deleted entirely, this test
+// would still pass with a write that was never captured, which caught
+// neither the original PM-amendment bug nor the rebase-folding one. Counting
+// only after the session is provably caught up isolates exactly the
+// idle-tick behavior this test exists to pin.
 func TestIdleAutoFlushWritesNothing(t *testing.T) {
 	requireSQLite(t)
 	w := newWS(t)
@@ -725,17 +773,217 @@ func TestIdleAutoFlushWritesNothing(t *testing.T) {
 	}
 	defer s.Close()
 
-	// No writes to the checkout at all, ever. Let several idle ticks pass.
+	mustExec(t, s.CheckoutPath(), "CREATE TABLE t (v); INSERT INTO t VALUES ('x');")
+	waitFor(t, 10*time.Second, "the write to ship via auto-flush", func() bool {
+		ref, _, err := w.Store.GetRef("app", "main")
+		return err == nil && ref.HeadTXID > 1
+	})
+	waitFor(t, 10*time.Second, "the session to fully settle (nothing pending)", func() bool {
+		return s.LastFlushErr() == nil && !pendingAutoFlush(s)
+	})
+
 	baseline := cb.Count()
-	time.Sleep(500 * time.Millisecond) // ~12 ticks at 40ms
+	time.Sleep(500 * time.Millisecond) // ~12 idle ticks at 40ms
 	if got := cb.Count(); got != baseline {
-		t.Fatalf("idle auto-flush ticks performed %d backend write(s) (baseline %d, now %d), want 0",
+		t.Fatalf("idle auto-flush ticks performed %d backend write(s) after settling (baseline %d, now %d), want 0",
 			got-baseline, baseline, got)
 	}
-	if _, _, ok := s.LastFlush(); ok {
-		t.Fatal("LastFlush must not report success: no auto-flush should ever have run while idle")
+}
+
+// TestFlushLoopFlushesRebaseFoldedContentWhenOtherwiseIdle is CRITICAL fix
+// (i): a rebase (capture.Engine.rebase's checkpoint(TRUNCATE) — see
+// appliedGen/flushedRebaseGen's doc comment on Session) can fold a real
+// commit into the replica's baseline without that commit ever passing
+// through Apply, so appliedGen alone never notices it. This drives
+// replicaSink.Rebase directly with a modified snapshot — exactly what the
+// engine's own rebase() hands to Sink.Rebase — completely independent of the
+// live checkout, so no Apply call for this content ever happens, and asserts
+// the ref still advances within a few ticks: the rebaseGen half of
+// flushLoop's pending check must catch what the appliedGen half cannot.
+func TestFlushLoopFlushesRebaseFoldedContentWhenOtherwiseIdle(t *testing.T) {
+	requireSQLite(t)
+	w := newWS(t)
+	if err := w.Create("app"); err != nil {
+		t.Fatal(err)
 	}
-	if err := s.LastFlushErr(); err != nil {
-		t.Fatalf("LastFlushErr = %v, want nil", err)
+	s, err := Open(context.Background(), Options{
+		WS: w, DB: "app", Branch: "main", FlushEvery: 40 * time.Millisecond,
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer s.Close()
+
+	// Let the startup settling flush land and the session fully settle
+	// first, so the rebase below is unambiguously what triggers the next
+	// flush, not a race with startup.
+	waitFor(t, 5*time.Second, "the session to settle after startup", func() bool {
+		_, _, ok := s.LastFlush()
+		return ok && !pendingAutoFlush(s)
+	})
+	before, _, err := w.Store.GetRef("app", "main")
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	// A snapshot with content the live checkout (and therefore this
+	// session's WAL reader) never saw — built independently, the way the
+	// capture engine builds its own rebase snapshot from the checkpointed
+	// main file, so no Apply call for this content is possible.
+	snapPath := filepath.Join(t.TempDir(), "rebase-snapshot.db")
+	mustExec(t, snapPath, "CREATE TABLE rebased (v); INSERT INTO rebased VALUES ('rebase-only');")
+	if err := (replicaSink{s}).Rebase(snapPath); err != nil {
+		t.Fatal(err)
+	}
+
+	waitFor(t, 5*time.Second, "flushLoop to ship the rebase-folded content", func() bool {
+		ref, _, err := w.Store.GetRef("app", "main")
+		return err == nil && ref.HeadTXID > before.HeadTXID
+	})
+
+	if err := s.Close(); err != nil {
+		t.Fatal(err)
+	}
+	path, err := w.Checkout("app", "main")
+	if err != nil {
+		t.Fatal(err)
+	}
+	out, err := exec.Command("sqlite3", path, "SELECT v FROM rebased;").Output()
+	if err != nil || string(out) != "rebase-only\n" {
+		t.Fatalf("rebase-folded content missing after flush: %q err=%v", out, err)
+	}
+}
+
+// TestFlushLoopRetriesAfterRebaseDuringUpload is CRITICAL fix (ii): a rebase
+// racing a flush's upload window (replicaMu released after encode, before
+// PutRef confirms) must not let that flush's success bookkeeping mark the
+// raced rebase's content durable — flushedRebaseGen's gate (mirroring
+// forceSnapshot's own) must leave it pending so the NEXT tick retries and
+// actually ships it. Uses FlushUploadHook, FlushEncodeHook's sibling, to
+// pause a real auto-flush exactly inside that window.
+func TestFlushLoopRetriesAfterRebaseDuringUpload(t *testing.T) {
+	requireSQLite(t)
+	w := newWS(t)
+	if err := w.Create("app"); err != nil {
+		t.Fatal(err)
+	}
+
+	// Installed BEFORE Open: flushLoop's goroutine (started inside Open)
+	// reads the package-level FlushUploadHook variable on every tick, so
+	// assigning it afterward — as an earlier version of this test did —
+	// races that read under -race exactly the way swapping w.Store.B after
+	// Open does (see failNRefPutIf's doc comment for the identical hazard).
+	// The write here happens-before flushLoop's goroutine via Open's own
+	// `go` statement, so this assignment itself is race-free; armed (an
+	// atomic.Bool, safe for concurrent use by construction) is what
+	// actually turns the pause on and off afterward, never the hook
+	// variable itself.
+	var armed atomic.Bool
+	entered := make(chan struct{})
+	proceed := make(chan struct{})
+	var enteredOnce sync.Once
+	FlushUploadHook = func() {
+		if !armed.Load() {
+			return
+		}
+		enteredOnce.Do(func() { close(entered) })
+		<-proceed
+	}
+
+	s, err := Open(context.Background(), Options{
+		WS: w, DB: "app", Branch: "main", FlushEvery: 60 * time.Millisecond,
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	waitFor(t, 5*time.Second, "the session to settle after startup", func() bool {
+		_, _, ok := s.LastFlush()
+		return ok && !pendingAutoFlush(s)
+	})
+	ref0, _, err := w.Store.GetRef("app", "main")
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	armed.Store(true)
+	// Give the loop something to flush so it actually reaches the hook
+	// instead of idling.
+	mustExec(t, s.CheckoutPath(), "CREATE TABLE t (v); INSERT INTO t VALUES (1);")
+
+	select {
+	case <-entered:
+		// The auto-flush is now paused immediately after encode, replicaMu
+		// released, upload not yet attempted.
+	case <-time.After(10 * time.Second):
+		t.Fatal("auto-flush never reached the upload hook")
+	}
+
+	// Race a rebase in while that flush is paused mid-upload — exactly the
+	// window flushedRebaseGen's gating exists to protect.
+	snapPath := filepath.Join(t.TempDir(), "raced-rebase.db")
+	mustExec(t, snapPath, "CREATE TABLE raced (v); INSERT INTO raced VALUES ('raced');")
+	if err := (replicaSink{s}).Rebase(snapPath); err != nil {
+		t.Fatal(err)
+	}
+
+	// Disarm before releasing: the next (retry) flush must sail through the
+	// hook rather than pausing again.
+	armed.Store(false)
+	close(proceed)
+
+	// The paused flush completes and succeeds — the race doesn't fail or
+	// corrupt an upload already begun — advancing the ref once.
+	var afterFirst store.Ref
+	deadline := time.Now().Add(10 * time.Second)
+	for {
+		afterFirst, _, err = w.Store.GetRef("app", "main")
+		if err != nil {
+			t.Fatal(err)
+		}
+		if afterFirst.HeadTXID > ref0.HeadTXID {
+			break
+		}
+		if time.Now().After(deadline) {
+			t.Fatal("the paused flush never completed")
+		}
+		time.Sleep(20 * time.Millisecond)
+	}
+
+	// Because the rebase raced this flush's upload window, flushedRebaseGen
+	// must have been left at its pre-race value: the session must not
+	// believe the raced rebase's content is durable, so the NEXT tick must
+	// retry and ship it.
+	deadline = time.Now().Add(10 * time.Second)
+	for {
+		ref, _, err := w.Store.GetRef("app", "main")
+		if err != nil {
+			t.Fatal(err)
+		}
+		if ref.HeadTXID > afterFirst.HeadTXID {
+			break
+		}
+		if time.Now().After(deadline) {
+			t.Fatal("flushLoop never retried after a rebase raced the upload window")
+		}
+		time.Sleep(20 * time.Millisecond)
+	}
+
+	if err := s.Close(); err != nil {
+		t.Fatal(err)
+	}
+	// Safe only now: Close joins flushLoop's goroutine (<-s.flushDone)
+	// before returning, so it can never call the hook again — see
+	// FlushUploadHook's own installation above for why this must not
+	// happen any earlier.
+	FlushUploadHook = nil
+
+	path, err := w.Checkout("app", "main")
+	if err != nil {
+		t.Fatal(err)
+	}
+	out, err := exec.Command("sqlite3", path, "SELECT v FROM raced;").Output()
+	if err != nil || string(out) != "raced\n" {
+		t.Fatalf("raced rebase content missing after retry: %q err=%v", out, err)
 	}
 }

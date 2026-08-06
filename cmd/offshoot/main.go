@@ -522,6 +522,10 @@ func run(args []string) error {
 		if err != nil {
 			return fmt.Errorf("-flush-every: %w", err)
 		}
+		if flushEvery < 0 {
+			return fmt.Errorf("-flush-every %q must be zero or positive; zero disables auto-flush "+
+				"(there is no \"none\" alias — a negative value is almost certainly a mistake)", flushEveryStr)
+		}
 		if len(rest) != 0 {
 			return fmt.Errorf("usage: offshoot serve [-socket PATH] [-reap-every DURATION] [-gc-grace DURATION] [-flush-every DURATION]")
 		}

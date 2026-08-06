@@ -151,11 +151,11 @@ type Session struct {
 	//
 	// It also guards every field below that derives from the replica's
 	// content — pages, checksum, flushChecksum, pageSize, commit,
-	// forceSnapshot, rebaseGen, appliedGen, flushedGen — for the same
-	// reason: they are maintained incrementally exactly where Apply/Rebase
-	// already touch the file (recordApply, rebaseline), and Flush reads
-	// them from within its own replicaMu section, so they can never be
-	// observed out of step with the file they describe.
+	// forceSnapshot, rebaseGen, appliedGen, flushedGen, flushedRebaseGen —
+	// for the same reason: they are maintained incrementally exactly where
+	// Apply/Rebase already touch the file (recordApply, rebaseline), and
+	// Flush reads them from within its own replicaMu section, so they can
+	// never be observed out of step with the file they describe.
 	replicaMu sync.Mutex
 
 	// pages accumulates the latest content of every page recordApply has
@@ -193,28 +193,57 @@ type Session struct {
 
 	// appliedGen counts recordApply calls that folded in at least one real
 	// frame — i.e. every time the capture engine actually observed a
-	// committed transaction, not merely a rebase. flushedGen is the value
-	// appliedGen held at the moment the most recently CONFIRMED-successful
-	// Flush drained its pageSet (captured as appliedGenAtEncode in Flush,
-	// stored here only once PutRef confirms). appliedGen != flushedGen is
-	// therefore exactly "at least one transaction has committed since the
-	// last successful flush" — the idle short-circuit's pending signal (see
-	// flushLoop). Using a monotonic counter rather than a bool sidesteps a
-	// race a bool would need extra bookkeeping to avoid: a new transaction
-	// applied while a Flush's upload/PutRef is in flight (both run without
-	// replicaMu held) must not be silently cleared by that Flush's own
-	// post-success bookkeeping — with a counter, flushedGen is simply set to
-	// the pre-encode snapshot value, so any appliedGen increment racing the
-	// upload is untouched and still shows up as pending afterward.
+	// committed transaction via Apply, not merely a rebase. flushedGen is
+	// the value appliedGen held at the moment the most recently
+	// CONFIRMED-successful Flush drained its pageSet (captured as
+	// appliedGenAtEncode in Flush, stored here only once PutRef confirms).
+	// appliedGen != flushedGen means "at least one transaction has been
+	// applied since the last successful flush."
 	//
-	// This does not, and cannot without the new engine query the brief
-	// explicitly rules out, catch a rebase-on-divergence that folds real
-	// content changes into the replica without ever going through Apply
-	// (see capture.Sink's doc comment on the Rebase/Apply overlap) — such a
-	// rebase alone does not advance appliedGen. In practice this is a
-	// narrow window: any agent still writing to the checkout keeps
-	// generating ordinary Apply calls that do advance it.
-	appliedGen, flushedGen int
+	// That alone is NOT a sufficient idle-short-circuit signal for
+	// flushLoop: capture.Engine.rebase's checkpoint(TRUNCATE) folds whatever
+	// is currently sitting in the foreign WAL into the main file BEFORE
+	// Sink.Rebase (and therefore rebaseline) ever runs — see engine.go's
+	// rebase doc comment. Any transaction that had already committed but
+	// that this session's WAL reader had not yet consumed at that instant is
+	// absorbed into the fresh baseline snapshot WITHOUT ever passing through
+	// Apply: appliedGen never advances for it, even though real,
+	// previously-unflushed content is now sitting in the replica file. This
+	// is reachable on a session's very first write — Open returns once
+	// WaitReady's resume-or-rebase VERDICT has settled, not once a
+	// fresh-Dir session's startup rebase has actually finished running (see
+	// Open's comment) — and on any later rebase-on-divergence too.
+	//
+	// flushedRebaseGen closes this using state Flush already tracks for its
+	// own forceSnapshot bookkeeping — rebaseGen — rather than a new
+	// engine-side query: it is the value rebaseGen held at the drain point
+	// of the most recently CONFIRMED-successful flush (mirroring
+	// flushedGen/appliedGen exactly), and is gated the same way
+	// forceSnapshot's own clear already is (see Flush) — a rebase racing the
+	// upload/PutRef window must leave flushedRebaseGen at its pre-race
+	// value, so the pending signal below stays true and the next tick
+	// retries rather than believing the raced rebase's content is durable.
+	// rebaseGen != flushedRebaseGen means "a rebase has happened since the
+	// last successful flush." flushLoop's full pending check is
+	// `appliedGen != flushedGen || rebaseGen != flushedRebaseGen`.
+	//
+	// Consequence: every session performs one settling flush shortly after
+	// its startup rebase lands (rebaseGen ticks 0→1; flushedRebaseGen is
+	// still 0 until the first flush confirms), even if the agent never
+	// writes anything. That is correct — it is exactly what closes the
+	// startup-write race described above — and costs one PUT per session
+	// lifetime, nothing like the PM amendment's actual target (an idle
+	// session re-uploading a full snapshot every SnapshotEvery ticks
+	// forever).
+	//
+	// Using monotonic counters rather than bools for both pairs sidesteps a
+	// race bools would need extra bookkeeping to avoid: state that changes
+	// while a Flush's upload/PutRef is in flight (both run without
+	// replicaMu held) must not be silently cleared by that Flush's own
+	// post-success bookkeeping — with a counter, the "flushed" value is
+	// simply set to the pre-encode snapshot, so any increment racing the
+	// upload is untouched and still shows up as pending afterward.
+	appliedGen, flushedGen, flushedRebaseGen int
 
 	// snapshotEvery and flushesSinceSnapshot are read and written only from
 	// within Flush, which already holds flushMu for its entire body — no
@@ -351,7 +380,14 @@ func Open(ctx context.Context, o Options) (*Session, error) {
 	// resume-or-rebase verdict has settled (see its doc comment) — not the
 	// full startup rebase when one runs, which stays exactly as
 	// asynchronous as it always was — so this adds no latency to the
-	// ordinary (fresh Dir, always-rebase) path.
+	// ordinary (fresh Dir, always-rebase) path. A consequence: on that
+	// ordinary path, Open can return to its caller before the startup
+	// rebase has actually finished running, so a write the caller makes
+	// immediately after Open returns can land in the checkout's WAL before
+	// that rebase's checkpoint(TRUNCATE) runs and get folded into its
+	// snapshot without ever passing through Apply. See
+	// appliedGen/flushedRebaseGen's doc comment on Session for why
+	// flushLoop's idle short-circuit does not lose track of that write.
 	if s.captured.WaitReady(ctx) == nil && s.captured.Resumed() {
 		s.replicaMu.Lock()
 		rerr := s.rebaseline()
@@ -455,20 +491,47 @@ func (s *Session) LastFlushErr() error {
 // no special handling for that case beyond exiting on its next ctx.Done()
 // check) and closes flushDone exactly once so Close can join it.
 //
-// Idle short-circuit (PM-review blocking amendment): a tick with nothing
-// pending — appliedGen == flushedGen (no transaction has committed since the
-// last successful flush) AND no outstanding failure to retry — calls Flush
-// not at all: no object write, no ref write, no flushesSinceSnapshot
-// advance. Without this, an idle session would still upload a full snapshot
-// every SnapshotEvery ticks forever: Flush unconditionally advances txid and
-// writes something once actually called, whether or not anything changed.
+// Idle short-circuit (PM-review blocking amendment) — pending signal: a tick
+// calls Flush only when EITHER appliedGen != flushedGen (a real transaction
+// has been applied since the last successful flush) OR rebaseGen !=
+// flushedRebaseGen (a rebase — startup, or on-divergence — has happened
+// since the last successful flush). See appliedGen/flushedRebaseGen's doc
+// comment on Session for exactly why the rebaseGen half is load-bearing and
+// not redundant with the appliedGen half — in short, a rebase's
+// checkpoint(TRUNCATE) can fold a real, previously-uncaptured commit into
+// the baseline without ever calling Apply, so appliedGen alone would miss
+// it. When neither signal is pending, this tick calls Flush not at all: no
+// DrainNow, no GetRef, no object write, no ref write, no
+// flushesSinceSnapshot advance. Without this, an idle session would still
+// upload a full snapshot every SnapshotEvery ticks forever: Flush
+// unconditionally advances txid and writes something once actually called,
+// whether or not anything changed.
+//
+// Consequence: every session performs one settling flush shortly after its
+// startup rebase lands (see appliedGen/flushedRebaseGen's doc comment for
+// why), even if the agent never writes anything — one PUT per session
+// lifetime, nothing like the idle-forever-snapshotting bug the short-circuit
+// exists to prevent.
 //
 // A failing tick records lastFlushErr and is retried on the next tick (the
-// pending check above is satisfied unconditionally while lastFlushErr != nil,
-// regardless of appliedGen/flushedGen, so a failed attempt keeps retrying
-// even if nothing NEW has committed since); it never terminates the session.
-// lastFlushErr is cleared by Flush itself on any later success, so once a
-// retry lands this loop has nothing further to do.
+// pending check above is satisfied unconditionally while lastFlushErr !=
+// nil, so a failed attempt keeps retrying even if nothing NEW is pending);
+// it never terminates the session. lastFlushErr is cleared by Flush itself
+// on any later success, manual or automatic. Because a manual Flush can run
+// concurrently with this loop's own (flushMu only serializes their bodies,
+// not their outcomes' visibility), a failing tick only stamps lastFlushErr
+// if lastFlushAt/lastFlushTXID are still exactly what they were when this
+// tick's own attempt began — otherwise a fresher success already landed
+// (from this tick's own call racing a concurrent manual Flush, or from a
+// manual Flush that ran between this tick's Flush call returning and this
+// loop regaining s.mu below) and stamping the stale error would incorrectly
+// resurrect a failure that no longer reflects reality.
+//
+// Flush returning ErrClosed means Close has already started (or finished)
+// concurrently with this tick — session shutdown racing the ticker, not an
+// operational failure worth surfacing: a caller polling status mid-shutdown
+// must not see "session: closed" reported as a flush error. ctx.Done() ends
+// this loop on its own next iteration regardless.
 //
 // Uses a time.Ticker, which drops ticks it cannot deliver in time rather
 // than queuing them — so a tick delayed behind a slow manual Flush holding
@@ -485,15 +548,24 @@ func (s *Session) flushLoop(ctx context.Context, every time.Duration) {
 		}
 
 		s.replicaMu.Lock()
-		pending := s.appliedGen != s.flushedGen
+		pending := s.appliedGen != s.flushedGen || s.rebaseGen != s.flushedRebaseGen
 		s.replicaMu.Unlock()
 		if !pending && s.LastFlushErr() == nil {
 			continue // idle short-circuit: nothing to do this tick.
 		}
 
+		s.mu.Lock()
+		beforeAt, beforeTXID := s.lastFlushAt, s.lastFlushTXID
+		s.mu.Unlock()
+
 		if _, err := s.Flush(""); err != nil {
+			if errors.Is(err, ErrClosed) {
+				continue
+			}
 			s.mu.Lock()
-			s.lastFlushErr = err
+			if s.lastFlushAt.Equal(beforeAt) && s.lastFlushTXID == beforeTXID {
+				s.lastFlushErr = err
+			}
 			s.mu.Unlock()
 		}
 	}
