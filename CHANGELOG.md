@@ -13,6 +13,21 @@ version if you depend on format stability.
 
 ## [Unreleased]
 
+### Added
+
+- Background flush: `session.Options.FlushEvery`, when > 0, flushes a
+  session automatically on that cadence so an agent that never calls `Flush`
+  still gets bounded data loss on crash (library default stays `0`, manual
+  only). `Session.LastFlush()`/`LastFlushErr()` expose the most recent
+  successful flush and the most recent automatic-flush failure — a failure
+  is recorded and retried next tick, never kills the session. `offshoot
+  serve` gains `-flush-every` (default `30s`, `0` disables) and applies it
+  to every session it opens — the daemon ships work on a cadence by default,
+  the safe default lives at that boundary rather than in the library
+  primitive. An idle tick (nothing committed since the last successful
+  flush) does nothing at all — no object write, no ref write — rather than
+  uploading a pointless full snapshot every `SnapshotEvery` ticks forever.
+
 ### Changed
 
 - `Checkout` no longer re-materializes a checkout that is already clean at

@@ -179,6 +179,13 @@ func (s *Session) Flush(name string) (uint64, error) {
 	checksumAtEncode := s.checksum
 	pageSizeAtEncode, commitAtEncode := s.pageSize, s.commit
 	genAtEncode := s.rebaseGen
+	// appliedGenAtEncode is the idle short-circuit's counterpart to
+	// genAtEncode: the value appliedGen held at exactly this drain point, so
+	// a confirmed success below can record "everything through here is now
+	// durable" without racing a transaction applied later, concurrently,
+	// while this attempt's upload/PutRef run without replicaMu held — see
+	// appliedGen's doc comment on Session.
+	appliedGenAtEncode := s.appliedGen
 	// Pessimistically assume this attempt will not pan out: pageSet has
 	// already been drained above, so if anything below fails, a retried
 	// Flush must not trust a segment rebuilt from what (little, or nothing)
@@ -275,6 +282,14 @@ func (s *Session) Flush(name string) (uint64, error) {
 		s.flushChecksum = checksumAtEncode
 		s.forceSnapshot = false
 	}
+	// Unconditional, unlike the rebaseGen-gated fields above: appliedGen is
+	// unaffected by a racing rebase (a rebase doesn't undo previously
+	// applied transactions), so "everything through appliedGenAtEncode is
+	// now durable" holds regardless of whether one raced this upload. Any
+	// transaction applied DURING the upload/PutRef window already bumped
+	// appliedGen past appliedGenAtEncode by the time we regain replicaMu
+	// here, so it correctly remains visible as still-pending afterward.
+	s.flushedGen = appliedGenAtEncode
 	s.replicaMu.Unlock()
 
 	if snapshot {
@@ -285,6 +300,14 @@ func (s *Session) Flush(name string) (uint64, error) {
 
 	s.mu.Lock()
 	s.durable = txid
+	// Stamp the single ref-write site's success — covers both the snapshot
+	// and segment paths above, and both a manual and an automatic
+	// (flushLoop) caller: LastFlushErr clears on ANY successful flush, per
+	// the Options.FlushEvery contract.
+	s.lastFlushAt = time.Now()
+	s.lastFlushTXID = txid
+	s.lastFlushOK = true
+	s.lastFlushErr = nil
 	s.mu.Unlock()
 	return txid, nil
 }

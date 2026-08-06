@@ -33,6 +33,14 @@ type Server struct {
 	// replaces a check-then-open-then-recheck pattern.
 	sessions map[string]*session.Session
 	closing  bool
+	// flushEvery is passed as Options.FlushEvery to every session opOpen
+	// opens, so every session this daemon serves gets the same background-
+	// flush cadence. 0 (the zero value, matching session.Options' own
+	// default) means manual only. Set via SetFlushEvery before Serve starts
+	// accepting connections; cmd/offshoot's `serve` command sets it from
+	// -flush-every (default 30s) — safe-by-default cadence lives at this
+	// daemon boundary, not in the session library's own default.
+	flushEvery time.Duration
 	// openWG counts in-flight opOpen calls: Add(1) happens under mu at the
 	// moment a slot is reserved, Done() happens once that call's bookkeeping
 	// has fully resolved (map updated and, if it self-closed, the session
@@ -75,6 +83,19 @@ func NewServer(ws *ops.Workspace, socketPath string) (*Server, error) {
 }
 
 func (s *Server) SocketPath() string { return s.sock }
+
+// SetFlushEvery sets the background-flush cadence (session.Options.FlushEvery)
+// applied to every session opOpen opens from now on. Call before Serve
+// starts accepting connections (or accept that only opens that race after
+// the call see the new value — reads and writes here are both guarded by
+// s.mu, so no torn read is possible, but ordering relative to concurrent
+// opens is otherwise the caller's responsibility). 0 disables auto-flush
+// (manual only, matching session.Options' own default).
+func (s *Server) SetFlushEvery(d time.Duration) {
+	s.mu.Lock()
+	s.flushEvery = d
+	s.mu.Unlock()
+}
 
 // StartJanitor reaps expired branches and runs GC every interval until
 // Shutdown. grace is passed to GC (tombstone age before deletion); the
@@ -255,6 +276,7 @@ func (s *Server) opOpen(req Request) Response {
 	}
 	s.sessions[k] = nil // reserve the slot
 	s.openWG.Add(1)
+	flushEvery := s.flushEvery
 	s.mu.Unlock()
 
 	if openDelay != nil {
@@ -262,7 +284,7 @@ func (s *Server) opOpen(req Request) Response {
 	}
 
 	sess, err := session.Open(context.Background(), session.Options{
-		WS: s.ws, DB: req.DB, Branch: branch,
+		WS: s.ws, DB: req.DB, Branch: branch, FlushEvery: flushEvery,
 	})
 
 	s.mu.Lock()

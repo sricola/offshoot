@@ -40,6 +40,16 @@ type Options struct {
 	// chain), and one following a large enough batch of changed pages does
 	// too (see largeSegmentFraction).
 	SnapshotEvery int
+
+	// FlushEvery, if > 0, starts a background goroutine that calls
+	// Flush("") on this cadence for as long as the session is open, so a
+	// caller that never calls Flush manually still gets bounded data loss
+	// on crash. 0 (the default) means manual only — the library stays
+	// conservative by default; safe-by-default cadence lives at the daemon
+	// boundary instead (cmd/offshoot serve defaults its own -flush-every to
+	// 30s), not baked into this primitive. See flushLoop's doc comment for
+	// the idle short-circuit and failure-handling contract.
+	FlushEvery time.Duration
 }
 
 // replicaSink adapts replay.Replica to the capture engine's Sink. The
@@ -127,6 +137,13 @@ type Session struct {
 	// comment for the required shutdown order.
 	renewDone chan struct{}
 
+	// flushDone mirrors renewDone, for flushLoop: nil if Options.FlushEvery
+	// was 0 (no loop was ever started, so there is nothing to join), else
+	// closed exactly once by flushLoop itself after its loop exits (ctx
+	// cancelled). Close joins this, alongside engDone/renewDone, before it
+	// proceeds to release the lease and remove the scratch dir.
+	flushDone chan struct{}
+
 	// replicaMu serializes writes to the replica file (capture's Rebase and
 	// Apply, via replicaSink) against Flush's read of that same file, so
 	// Flush never encodes a torn mix of pre- and post-mutation bytes. See
@@ -134,11 +151,11 @@ type Session struct {
 	//
 	// It also guards every field below that derives from the replica's
 	// content — pages, checksum, flushChecksum, pageSize, commit,
-	// forceSnapshot, rebaseGen — for the same reason: they are maintained
-	// incrementally exactly where Apply/Rebase already touch the file
-	// (recordApply, rebaseline), and Flush reads them from within its own
-	// replicaMu section, so they can never be observed out of step with the
-	// file they describe.
+	// forceSnapshot, rebaseGen, appliedGen, flushedGen — for the same
+	// reason: they are maintained incrementally exactly where Apply/Rebase
+	// already touch the file (recordApply, rebaseline), and Flush reads
+	// them from within its own replicaMu section, so they can never be
+	// observed out of step with the file they describe.
 	replicaMu sync.Mutex
 
 	// pages accumulates the latest content of every page recordApply has
@@ -174,6 +191,31 @@ type Session struct {
 	// pre-rebase values. See Flush.
 	rebaseGen int
 
+	// appliedGen counts recordApply calls that folded in at least one real
+	// frame — i.e. every time the capture engine actually observed a
+	// committed transaction, not merely a rebase. flushedGen is the value
+	// appliedGen held at the moment the most recently CONFIRMED-successful
+	// Flush drained its pageSet (captured as appliedGenAtEncode in Flush,
+	// stored here only once PutRef confirms). appliedGen != flushedGen is
+	// therefore exactly "at least one transaction has committed since the
+	// last successful flush" — the idle short-circuit's pending signal (see
+	// flushLoop). Using a monotonic counter rather than a bool sidesteps a
+	// race a bool would need extra bookkeeping to avoid: a new transaction
+	// applied while a Flush's upload/PutRef is in flight (both run without
+	// replicaMu held) must not be silently cleared by that Flush's own
+	// post-success bookkeeping — with a counter, flushedGen is simply set to
+	// the pre-encode snapshot value, so any appliedGen increment racing the
+	// upload is untouched and still shows up as pending afterward.
+	//
+	// This does not, and cannot without the new engine query the brief
+	// explicitly rules out, catch a rebase-on-divergence that folds real
+	// content changes into the replica without ever going through Apply
+	// (see capture.Sink's doc comment on the Rebase/Apply overlap) — such a
+	// rebase alone does not advance appliedGen. In practice this is a
+	// narrow window: any agent still writing to the checkout keeps
+	// generating ordinary Apply calls that do advance it.
+	appliedGen, flushedGen int
+
 	// snapshotEvery and flushesSinceSnapshot are read and written only from
 	// within Flush, which already holds flushMu for its entire body — no
 	// separate lock needed.
@@ -207,6 +249,23 @@ type Session struct {
 	err     error
 	closed  bool
 	durable uint64
+
+	// lastFlushAt, lastFlushTXID, lastFlushOK describe the most recent
+	// SUCCESSFUL flush, manual or automatic (see LastFlush). Stamped by
+	// Flush itself, at its single ref-write confirmation site, alongside
+	// durable above — see Flush.
+	lastFlushAt   time.Time
+	lastFlushTXID uint64
+	lastFlushOK   bool
+	// lastFlushErr is the most recent AUTOMATIC-flush failure (see
+	// LastFlushErr): set by flushLoop when its own call to Flush returns an
+	// error, and cleared by Flush itself on any later success — manual or
+	// automatic — alongside lastFlushAt/lastFlushTXID/lastFlushOK above. A
+	// manual Flush failure (e.g. from a direct caller, or the daemon's
+	// "flush" op) does NOT set this: it already returns its error directly
+	// to that caller, and lastFlushErr exists specifically to surface a
+	// failure nobody was synchronously waiting on.
+	lastFlushErr error
 }
 
 // Open acquires the lease, materializes the checkout, seeds the replica from
@@ -312,6 +371,11 @@ func Open(ctx context.Context, o Options) (*Session, error) {
 	}
 
 	go s.renewLoop(cctx, o.RenewEvery, o.LeaseTTL)
+
+	if o.FlushEvery > 0 {
+		s.flushDone = make(chan struct{})
+		go s.flushLoop(cctx, o.FlushEvery)
+	}
 	return s, nil
 }
 
@@ -364,6 +428,77 @@ func (s *Session) Err() error {
 	return s.err
 }
 
+// LastFlush reports the time and txid of the most recent SUCCESSFUL flush —
+// manual (an explicit Flush call) or automatic (flushLoop) — and ok=false if
+// no flush has ever succeeded on this Session.
+func (s *Session) LastFlush() (t time.Time, txid uint64, ok bool) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	return s.lastFlushAt, s.lastFlushTXID, s.lastFlushOK
+}
+
+// LastFlushErr reports the most recent AUTOMATIC-flush failure recorded by
+// flushLoop, or nil if none has happened since the last success (manual or
+// automatic). A manual Flush call's own error is returned directly to its
+// caller and never touches this — see the field's doc comment.
+func (s *Session) LastFlushErr() error {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	return s.lastFlushErr
+}
+
+// flushLoop calls Flush("") on a fixed cadence for as long as the session is
+// open, so a caller that never calls Flush manually still gets bounded data
+// loss on crash. Mirrors renewLoop's shutdown discipline exactly: it exits
+// when ctx is cancelled (Close, or a terminal fail() elsewhere — a fenced or
+// otherwise fatal session already stops itself via Err(), so this loop needs
+// no special handling for that case beyond exiting on its next ctx.Done()
+// check) and closes flushDone exactly once so Close can join it.
+//
+// Idle short-circuit (PM-review blocking amendment): a tick with nothing
+// pending — appliedGen == flushedGen (no transaction has committed since the
+// last successful flush) AND no outstanding failure to retry — calls Flush
+// not at all: no object write, no ref write, no flushesSinceSnapshot
+// advance. Without this, an idle session would still upload a full snapshot
+// every SnapshotEvery ticks forever: Flush unconditionally advances txid and
+// writes something once actually called, whether or not anything changed.
+//
+// A failing tick records lastFlushErr and is retried on the next tick (the
+// pending check above is satisfied unconditionally while lastFlushErr != nil,
+// regardless of appliedGen/flushedGen, so a failed attempt keeps retrying
+// even if nothing NEW has committed since); it never terminates the session.
+// lastFlushErr is cleared by Flush itself on any later success, so once a
+// retry lands this loop has nothing further to do.
+//
+// Uses a time.Ticker, which drops ticks it cannot deliver in time rather
+// than queuing them — so a tick delayed behind a slow manual Flush holding
+// flushMu is simply skipped, never piled up.
+func (s *Session) flushLoop(ctx context.Context, every time.Duration) {
+	defer close(s.flushDone)
+	t := time.NewTicker(every)
+	defer t.Stop()
+	for {
+		select {
+		case <-ctx.Done():
+			return
+		case <-t.C:
+		}
+
+		s.replicaMu.Lock()
+		pending := s.appliedGen != s.flushedGen
+		s.replicaMu.Unlock()
+		if !pending && s.LastFlushErr() == nil {
+			continue // idle short-circuit: nothing to do this tick.
+		}
+
+		if _, err := s.Flush(""); err != nil {
+			s.mu.Lock()
+			s.lastFlushErr = err
+			s.mu.Unlock()
+		}
+	}
+}
+
 // ErrClosed reports that Flush was called on a session that Close has
 // already started closing (or finished closing). Close sets the closed flag
 // as the very first thing it does, before any of its own slow work (joining
@@ -411,6 +546,9 @@ func (s *Session) Close() error {
 	s.cancel()
 	<-s.engDone
 	<-s.renewDone
+	if s.flushDone != nil {
+		<-s.flushDone
+	}
 
 	var relErr error
 	if err := s.ws.ReleaseLease(lease); err != nil && !errors.Is(err, store.ErrLeaseLost) {
@@ -551,6 +689,9 @@ func (s *Session) recordApply(pageSize uint32, frames []wal.Frame) error {
 	// transaction grew or shrank the database.
 	s.pages.record(frames)
 	s.pages.dropAbove(newCommit)
+	// A real transaction was folded in — see appliedGen's doc comment for
+	// why this is the idle short-circuit's pending signal.
+	s.appliedGen++
 	return nil
 }
 
