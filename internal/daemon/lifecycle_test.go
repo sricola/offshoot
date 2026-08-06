@@ -863,18 +863,12 @@ func TestForkFromLiveSessionSeesLatestWrite(t *testing.T) {
 // loop: with FlushEvery set on the server, a written but never-explicitly-
 // flushed session's durable_txid must advance on its own, discovered purely
 // by polling "status" — no "flush" op is ever sent over the socket.
-func TestServeFlushesAutomaticallyWithoutAnExplicitFlushOp(t *testing.T) {
-	srv, _ := newServer(t)
-	srv.SetFlushEvery(100 * time.Millisecond)
-	sock := srv.SocketPath()
-
-	open := call(t, sock, Request{Op: "open", DB: "app", Branch: "main"})
-	if !open.OK {
-		t.Fatalf("open = %+v", open)
-	}
-	sqliteExec(t, open.Checkout, "CREATE TABLE t (v); INSERT INTO t VALUES (1);")
-
-	deadline := time.Now().Add(10 * time.Second)
+// pollDurable polls "status" until db@branch's DurableTXID satisfies want,
+// failing the test if it never does within deadline or the session reports
+// an error meanwhile. Used by TestServeFlushesAutomaticallyWithoutAnExplicitFlushOp
+// to both find the settled baseline and to prove the ref advances past it.
+func pollDurable(t *testing.T, sock, db, branch string, deadline time.Time, want func(uint64) bool) uint64 {
+	t.Helper()
 	for {
 		st := call(t, sock, Request{Op: "status"})
 		if !st.OK {
@@ -883,7 +877,7 @@ func TestServeFlushesAutomaticallyWithoutAnExplicitFlushOp(t *testing.T) {
 		var found bool
 		var durable uint64
 		for _, in := range st.Sessions {
-			if in.DB == "app" && in.Branch == "main" {
+			if in.DB == db && in.Branch == branch {
 				found = true
 				durable = in.DurableTXID
 				if in.Error != "" {
@@ -894,16 +888,59 @@ func TestServeFlushesAutomaticallyWithoutAnExplicitFlushOp(t *testing.T) {
 		if !found {
 			t.Fatal("session missing from status")
 		}
-		if durable > 0 {
-			break
+		if want(durable) {
+			return durable
 		}
 		if time.Now().After(deadline) {
-			t.Fatal("durable_txid never advanced via auto-flush within 10s (no flush op was ever sent)")
+			t.Fatalf("durable_txid (%d) never satisfied the wait condition within the deadline", durable)
 		}
 		time.Sleep(50 * time.Millisecond)
 	}
+}
+
+// TestServeFlushesAutomaticallyWithoutAnExplicitFlushOp proves the daemon's
+// -flush-every wiring (Server.SetFlushEvery, plumbed through opOpen into
+// session.Options.FlushEvery) actually drives a session's background flush
+// loop, discovered purely by polling "status" — no "flush" op is ever sent
+// over the socket.
+//
+// Every session performs one unconditional settling flush shortly after its
+// startup rebase lands, even with nothing written (see
+// appliedGen/flushedRebaseGen's doc comment on session.Session) — so a bare
+// "durable_txid > 0" is satisfied by that settling flush alone and would
+// pass even if this test's own write were never captured. This waits for
+// the session to settle FIRST (durable_txid stops moving on its own),
+// captures that settled value, writes via sqlite3, and then requires
+// durable_txid to advance BEYOND it. A txid bump still isn't proof of WHAT
+// shipped, so after closing the session this also checks the branch out
+// fresh via the daemon's own "checkout" op and reads the row back.
+func TestServeFlushesAutomaticallyWithoutAnExplicitFlushOp(t *testing.T) {
+	srv, _ := newServer(t)
+	srv.SetFlushEvery(100 * time.Millisecond)
+	sock := srv.SocketPath()
+
+	open := call(t, sock, Request{Op: "open", DB: "app", Branch: "main"})
+	if !open.OK {
+		t.Fatalf("open = %+v", open)
+	}
+
+	deadline := time.Now().Add(10 * time.Second)
+	settled := pollDurable(t, sock, "app", "main", deadline, func(d uint64) bool { return d > 0 })
+
+	sqliteExec(t, open.Checkout, "CREATE TABLE t (v); INSERT INTO t VALUES (1);")
+
+	deadline = time.Now().Add(10 * time.Second)
+	pollDurable(t, sock, "app", "main", deadline, func(d uint64) bool { return d > settled })
 
 	if cl := call(t, sock, Request{Op: "close", DB: "app", Branch: "main"}); !cl.OK {
 		t.Fatalf("close = %+v", cl)
+	}
+
+	co := call(t, sock, Request{Op: "checkout", DB: "app", Branch: "main"})
+	if !co.OK || co.Checkout == "" {
+		t.Fatalf("checkout after auto-flush = %+v", co)
+	}
+	if n := sqliteCount(t, co.Checkout, "SELECT COUNT(*) FROM t WHERE v = 1;"); n != 1 {
+		t.Fatalf("auto-flushed content missing from a fresh checkout: row count = %d, want 1", n)
 	}
 }

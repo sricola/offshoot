@@ -483,6 +483,23 @@ func (s *Session) LastFlushErr() error {
 	return s.lastFlushErr
 }
 
+// autoFlushPending reports flushLoop's idle-short-circuit pending signal:
+// true when EITHER appliedGen != flushedGen (a real transaction has been
+// applied since the last successful flush) OR rebaseGen != flushedRebaseGen
+// (a rebase — startup, or on-divergence — has happened since the last
+// successful flush). See appliedGen/flushedRebaseGen's doc comment on
+// Session for exactly why the rebaseGen half is load-bearing and not
+// redundant with the appliedGen half. A single method, rather than the
+// two-line expression inlined at each call site, so flushLoop's own check
+// and tests that need to know "has the session settled yet" (see
+// TestIdleAutoFlushWritesNothing and the rebase tests in flush_test.go)
+// can never drift apart from what flushLoop itself actually evaluates.
+func (s *Session) autoFlushPending() bool {
+	s.replicaMu.Lock()
+	defer s.replicaMu.Unlock()
+	return s.appliedGen != s.flushedGen || s.rebaseGen != s.flushedRebaseGen
+}
+
 // flushLoop calls Flush("") on a fixed cadence for as long as the session is
 // open, so a caller that never calls Flush manually still gets bounded data
 // loss on crash. Mirrors renewLoop's shutdown discipline exactly: it exits
@@ -547,10 +564,7 @@ func (s *Session) flushLoop(ctx context.Context, every time.Duration) {
 		case <-t.C:
 		}
 
-		s.replicaMu.Lock()
-		pending := s.appliedGen != s.flushedGen || s.rebaseGen != s.flushedRebaseGen
-		s.replicaMu.Unlock()
-		if !pending && s.LastFlushErr() == nil {
+		if !s.autoFlushPending() && s.LastFlushErr() == nil {
 			continue // idle short-circuit: nothing to do this tick.
 		}
 

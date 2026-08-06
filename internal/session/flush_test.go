@@ -595,6 +595,16 @@ func (c *countingBackend) Count() int {
 // TestAutoFlushShipsWritesWithoutManualFlush pins Options.FlushEvery: a
 // session opened with a short auto-flush cadence must make a committed write
 // durable on its own, with the caller never calling Flush.
+//
+// Every session performs one unconditional settling flush shortly after its
+// startup rebase lands, even with nothing written (see
+// appliedGen/flushedRebaseGen's doc comment on Session) — so a bare
+// "HeadTXID > 1" is satisfied by that settling flush alone and would pass
+// even if this test's own write were never captured at all. This waits for
+// the session to settle FIRST, captures the settled ref, then requires the
+// ref to advance BEYOND that settled txid after the write — and, since a
+// txid bump alone still isn't proof of WHAT shipped, reads the row back from
+// a fresh materialization as the actual content proof.
 func TestAutoFlushShipsWritesWithoutManualFlush(t *testing.T) {
 	requireSQLite(t)
 	w := newWS(t)
@@ -608,15 +618,26 @@ func TestAutoFlushShipsWritesWithoutManualFlush(t *testing.T) {
 		t.Fatal(err)
 	}
 	defer s.Close()
+
+	waitFor(t, 10*time.Second, "the session to settle after startup", func() bool {
+		_, _, ok := s.LastFlush()
+		return ok && !s.autoFlushPending()
+	})
+	settled, _, err := w.Store.GetRef("app", "main")
+	if err != nil {
+		t.Fatal(err)
+	}
+
 	mustExec(t, s.CheckoutPath(), "CREATE TABLE t (v); INSERT INTO t VALUES ('x');")
-	// No manual flush. Within a few ticks the write must be durable.
+	// No manual flush. Within a few ticks the write must be durable, past
+	// whatever the settling flush alone already produced.
 	deadline := time.Now().Add(10 * time.Second)
 	for {
 		ref, _, err := w.Store.GetRef("app", "main")
 		if err != nil {
 			t.Fatal(err)
 		}
-		if ref.HeadTXID > 1 { // creation snapshot is txid 1; adapt to the actual baseline txid observed
+		if ref.HeadTXID > settled.HeadTXID {
 			break
 		}
 		if time.Now().After(deadline) {
@@ -629,6 +650,18 @@ func TestAutoFlushShipsWritesWithoutManualFlush(t *testing.T) {
 	}
 	if err := s.LastFlushErr(); err != nil {
 		t.Fatalf("LastFlushErr = %v, want nil", err)
+	}
+
+	if err := s.Close(); err != nil {
+		t.Fatal(err)
+	}
+	path, err := w.Checkout("app", "main")
+	if err != nil {
+		t.Fatal(err)
+	}
+	out, err := exec.Command("sqlite3", path, "SELECT v FROM t;").Output()
+	if err != nil || string(out) != "x\n" {
+		t.Fatalf("auto-flushed content missing from a fresh materialization: %q err=%v", out, err)
 	}
 }
 
@@ -723,15 +756,6 @@ func TestAutoFlushFailureSurfacesAndRecovers(t *testing.T) {
 	}
 }
 
-// pendingAutoFlush mirrors flushLoop's own pending check exactly (test-only:
-// this file is package session, so it can read the unexported gen counters
-// directly under replicaMu, the same way flushLoop itself does).
-func pendingAutoFlush(s *Session) bool {
-	s.replicaMu.Lock()
-	defer s.replicaMu.Unlock()
-	return s.appliedGen != s.flushedGen || s.rebaseGen != s.flushedRebaseGen
-}
-
 // TestIdleAutoFlushWritesNothing is the PM-review blocking amendment: a tick
 // with nothing pending (no committed frames, and no rebase, since the last
 // successful flush) must write NOTHING — no object PUT, no ref PUT, no
@@ -741,7 +765,7 @@ func pendingAutoFlush(s *Session) bool {
 // called, regardless of whether anything changed.
 //
 // This does one real write and waits for the session to fully settle (via
-// pendingAutoFlush, not just "a flush happened") before measuring: every
+// Session.autoFlushPending, not just "a flush happened") before measuring: every
 // session performs one unconditional settling flush shortly after its
 // startup rebase (rebaseGen 0->1) regardless of whether the agent ever
 // writes anything — see appliedGen/flushedRebaseGen's doc comment on
@@ -779,7 +803,7 @@ func TestIdleAutoFlushWritesNothing(t *testing.T) {
 		return err == nil && ref.HeadTXID > 1
 	})
 	waitFor(t, 10*time.Second, "the session to fully settle (nothing pending)", func() bool {
-		return s.LastFlushErr() == nil && !pendingAutoFlush(s)
+		return s.LastFlushErr() == nil && !s.autoFlushPending()
 	})
 
 	baseline := cb.Count()
@@ -819,7 +843,7 @@ func TestFlushLoopFlushesRebaseFoldedContentWhenOtherwiseIdle(t *testing.T) {
 	// flush, not a race with startup.
 	waitFor(t, 5*time.Second, "the session to settle after startup", func() bool {
 		_, _, ok := s.LastFlush()
-		return ok && !pendingAutoFlush(s)
+		return ok && !s.autoFlushPending()
 	})
 	before, _, err := w.Store.GetRef("app", "main")
 	if err != nil {
@@ -881,7 +905,12 @@ func TestFlushLoopRetriesAfterRebaseDuringUpload(t *testing.T) {
 	var armed atomic.Bool
 	entered := make(chan struct{})
 	proceed := make(chan struct{})
-	var enteredOnce sync.Once
+	var enteredOnce, proceedOnce sync.Once
+	// release closes proceed exactly once — used both by the deliberate
+	// mid-test release below and by the safety-net cleanup defer, so a
+	// t.Fatal after the deliberate release cannot double-close (which would
+	// panic) and a t.Fatal before it still gets proceed closed exactly once.
+	release := func() { proceedOnce.Do(func() { close(proceed) }) }
 	FlushUploadHook = func() {
 		if !armed.Load() {
 			return
@@ -889,6 +918,12 @@ func TestFlushLoopRetriesAfterRebaseDuringUpload(t *testing.T) {
 		enteredOnce.Do(func() { close(entered) })
 		<-proceed
 	}
+	// Registered before Open, so on ANY exit path (including an early
+	// t.Fatal) it runs LAST — after the deferred s.Close() below (registered
+	// after Open, so LIFO runs it first) has fully joined flushLoop. Nilling
+	// this any earlier could race flushLoop's own read of it — see this
+	// hook's installation comment above.
+	defer func() { FlushUploadHook = nil }()
 
 	s, err := Open(context.Background(), Options{
 		WS: w, DB: "app", Branch: "main", FlushEvery: 60 * time.Millisecond,
@@ -896,10 +931,29 @@ func TestFlushLoopRetriesAfterRebaseDuringUpload(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
+	// Registered before the unblock defer just below, so LIFO runs it
+	// second (after the unblock, before the FlushUploadHook=nil defer
+	// above).
+	defer s.Close()
+	// Registered last, so LIFO runs it FIRST, before s.Close() above: a
+	// t.Fatal on the "auto-flush never reached the upload hook" path below
+	// would otherwise leave armed true and proceed unclosed. If flushLoop's
+	// own goroutine then reaches the hook a moment later — a real, if
+	// narrow, race against exactly that timeout firing — it blocks at
+	// <-proceed forever, holding flushMu, and the deferred s.Close() above
+	// would hang right behind it waiting for flushLoop to notice ctx.Done(),
+	// which it cannot do while stuck inside Flush. Disarming and
+	// unconditionally releasing here first closes that window regardless of
+	// which line triggered the exit, so a failure here can never leave a
+	// goroutine wedged for the rest of the package's test run.
+	defer func() {
+		armed.Store(false)
+		release()
+	}()
 
 	waitFor(t, 5*time.Second, "the session to settle after startup", func() bool {
 		_, _, ok := s.LastFlush()
-		return ok && !pendingAutoFlush(s)
+		return ok && !s.autoFlushPending()
 	})
 	ref0, _, err := w.Store.GetRef("app", "main")
 	if err != nil {
@@ -930,7 +984,7 @@ func TestFlushLoopRetriesAfterRebaseDuringUpload(t *testing.T) {
 	// Disarm before releasing: the next (retry) flush must sail through the
 	// hook rather than pausing again.
 	armed.Store(false)
-	close(proceed)
+	release()
 
 	// The paused flush completes and succeeds — the race doesn't fail or
 	// corrupt an upload already begun — advancing the ref once.
