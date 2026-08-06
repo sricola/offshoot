@@ -334,12 +334,12 @@ Releases the branch's current lease (looked up first via the same listing
 
 **Errors:** no lease currently held on that branch.
 
-## `offshoot serve [-socket PATH] [-reap-every DURATION] [-gc-grace DURATION]`
+## `offshoot serve [-socket PATH] [-reap-every DURATION] [-gc-grace DURATION] [-flush-every DURATION]`
 
 ```
 offshoot serve
 offshoot serve -socket /tmp/o.sock
-offshoot serve -reap-every 1m -gc-grace 15m   # both are the defaults
+offshoot serve -reap-every 1m -gc-grace 15m -flush-every 30s   # all three are the defaults
 ```
 
 Starts the daemon: a long-running process that serves a unix socket (mode
@@ -360,8 +360,18 @@ entirely (GC and reaping are still available on demand via `offshoot gc`).
 `-gc-grace` is the tombstone grace period the janitor's GC pass uses
 (default `15m`) — see `offshoot gc` above for what grace means.
 
+`-flush-every` sets the background-flush cadence applied to every session
+this daemon opens (default `30s`, `0` disables, a negative value is a usage
+error): each open session ships whatever it's captured but not yet flushed
+on that timer, without the agent ever calling `session flush` itself. It
+bounds exposure — worst case, a daemon that dies loses at most one
+`-flush-every` interval's worth of committed-but-unflushed writes, instead
+of everything since the last manual flush. See [What a flush
+costs](../README.md#what-a-flush-costs) in the README for what a background
+flush (and every session's mandatory first "settling" flush) actually cost.
+
 **Errors:** socket path already in use by another listener; underlying
-store-attach failure.
+store-attach failure; `-flush-every` given a negative duration.
 
 ## `offshoot mcp`
 
@@ -407,6 +417,24 @@ returns that session's own live checkout path. Without an already-open
 session — the common case for a bare `offshoot mcp` — every one of those
 tools behaves exactly as it does with no daemon running at all; see
 [docs/status.md](status.md) for what's tested.
+
+Three tools take the opposite stance: `offshoot_rollback`,
+`offshoot_promote` (checked against its `target` only), and
+`offshoot_destroy` **refuse** — rather than proceeding at rest — whenever
+the daemon has any session, healthy or fenced, open on the affected branch.
+Unlike the CLI's own `--force`, which does override a live lease on
+`offshoot destroy` and `offshoot promote --onto` (see those sections
+above), the MCP tools' `force` argument has no effect on this particular
+refusal: repointing or deleting a branch's ref out from under a session the
+daemon still believes it owns is refused unconditionally, and the fix is to
+close the session first (`offshoot session close`) and retry.
+`offshoot_promote`'s `source` is the one exception not guarded this way: an
+open session there doesn't block the promote, but the promoted state is the
+source's last-flushed/checkpointed head, not whatever is unflushed in that
+live session. Put together: **the good path for `offshoot mcp` requires a
+harness-opened session** (the SDKs, `offshoot session open`, or a custom
+loop) already open before the agent calls a tool — without one, every tool
+still works, just entirely at rest.
 
 ## `offshoot session open <db>[@branch] [-socket PATH]`
 
