@@ -195,6 +195,85 @@ func TestServeNegativeFlushEveryIsRejected(t *testing.T) {
 	}
 }
 
+// TestMCPDefaultTTLNegativeIsRejected mirrors
+// TestServeNegativeFlushEveryIsRejected for mcp's -default-ttl: a negative
+// duration is (almost certainly) a mistake and must fail closed as a usage
+// error rather than being silently aliased to "disabled" (that's what 0 and
+// "none" are for — see TestMCPDefaultTTLDisableSpellings). run()'s
+// -default-ttl validation happens before mcp.NewOffshootTools/srv.Serve are
+// ever reached, so — like the flush-every case — this needs no daemon
+// lifecycle, and (unlike a valid `mcp` invocation) it can't block on
+// os.Stdin either.
+func TestMCPDefaultTTLNegativeIsRejected(t *testing.T) {
+	dir := filepath.Join(t.TempDir(), "s")
+	if err := run([]string{"-store", dir, "init"}); err != nil {
+		t.Fatal(err)
+	}
+	if err := run([]string{"-store", dir, "mcp", "-default-ttl", "-1h"}); err == nil {
+		t.Fatal("mcp -default-ttl -1h must be rejected, not silently disable the default")
+	}
+}
+
+// TestMCPDefaultTTLUnparseableIsRejected pins that an unparseable
+// -default-ttl comes back as a clear usage error rather than reaching
+// mcp.NewOffshootTools with a zero-value duration it never asked for.
+func TestMCPDefaultTTLUnparseableIsRejected(t *testing.T) {
+	dir := filepath.Join(t.TempDir(), "s")
+	if err := run([]string{"-store", dir, "init"}); err != nil {
+		t.Fatal(err)
+	}
+	err := run([]string{"-store", dir, "mcp", "-default-ttl", "bananas"})
+	if err == nil {
+		t.Fatal("mcp -default-ttl bananas must be rejected")
+	}
+	if !strings.Contains(err.Error(), "-default-ttl") {
+		t.Fatalf("error should name the offending flag: %v", err)
+	}
+}
+
+// TestMCPDefaultTTLDisableSpellings and TestMCPDefaultTTLDefaultsTo24h
+// exercise parseDefaultTTLFlag directly rather than driving `mcp` through
+// run(): a valid -default-ttl (unlike the rejected cases above) falls
+// through to srv.Serve(context.Background()), which blocks reading
+// os.Stdin until EOF or cancellation — not a daemon lifecycle exactly, but
+// still not something a unit test should spin up just to observe a flag's
+// parsed value. parseDefaultTTLFlag is the actual code the "mcp" case
+// calls, so this covers the real behavior, not a proxy for it.
+
+// TestMCPDefaultTTLDisableSpellings pins that "0" and "none" both parse to
+// the same disabled (zero) TTL, matching parseTTLFlag's touch/CLI
+// convention reused here.
+func TestMCPDefaultTTLDisableSpellings(t *testing.T) {
+	for _, spelling := range []string{"0", "0s", "none"} {
+		got, rest, err := parseDefaultTTLFlag([]string{"-default-ttl", spelling})
+		if err != nil {
+			t.Fatalf("-default-ttl %q: %v", spelling, err)
+		}
+		if got != 0 {
+			t.Errorf("-default-ttl %q = %v, want 0 (disabled)", spelling, got)
+		}
+		if len(rest) != 0 {
+			t.Errorf("-default-ttl %q: leftover args = %v, want none consumed", spelling, rest)
+		}
+	}
+}
+
+// TestMCPDefaultTTLDefaultsTo24h pins the documented default (README,
+// docs/reference.md, the `offshoot mcp` usage line): omitting -default-ttl
+// entirely applies 24h, not 0/disabled.
+func TestMCPDefaultTTLDefaultsTo24h(t *testing.T) {
+	got, rest, err := parseDefaultTTLFlag(nil)
+	if err != nil {
+		t.Fatalf("parseDefaultTTLFlag(nil): %v", err)
+	}
+	if got != 24*time.Hour {
+		t.Errorf("default TTL with no -default-ttl flag = %v, want 24h", got)
+	}
+	if len(rest) != 0 {
+		t.Errorf("leftover args = %v, want none", rest)
+	}
+}
+
 // TestSessionHonorsServeSocketOverride guards the fix for `serve -socket`
 // and `session` disagreeing on where the socket lives: `serve -socket PATH`
 // used to be unreachable by `session` subcommands because they only ever

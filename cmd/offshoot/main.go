@@ -166,6 +166,32 @@ func parseForkTTLFlag(raw string) (time.Duration, error) {
 	return d, nil
 }
 
+// parseDefaultTTLFlag extracts mcp's -default-ttl flag from args and parses
+// it, defaulting to 24h when the flag is absent. It reuses parseTTLFlag, so
+// "none" and a literal zero duration ("0", "0s", ...) both disable the
+// default identically; a negative duration is rejected as a usage error
+// (mirroring -flush-every's own non-positive-is-a-mistake rule) rather than
+// silently aliased to "disabled". Returns the parsed default TTL and the
+// remaining (flag-stripped) args, so the caller can still reject leftover
+// arguments itself.
+func parseDefaultTTLFlag(args []string) (time.Duration, []string, error) {
+	raw, rest, _, err := extractFlag(args, "-default-ttl")
+	if err != nil {
+		return 0, nil, err
+	}
+	if raw == "" {
+		raw = "24h"
+	}
+	d, err := parseTTLFlag(raw)
+	if err != nil {
+		return 0, nil, fmt.Errorf("-default-ttl: %w", err)
+	}
+	if d < 0 {
+		return 0, nil, fmt.Errorf("-default-ttl %q must be zero, \"none\" (both disable it), or positive", raw)
+	}
+	return d, rest, nil
+}
+
 func main() {
 	if err := run(os.Args[1:]); err != nil {
 		fmt.Fprintln(os.Stderr, "offshoot:", err)
@@ -482,22 +508,9 @@ func run(args []string) error {
 			return fmt.Errorf("unknown lease subcommand %q", rest[0])
 		}
 	case "mcp":
-		defaultTTLStr, rest, _, err := extractFlag(rest, "-default-ttl")
+		defaultTTL, rest, err := parseDefaultTTLFlag(rest)
 		if err != nil {
 			return fmt.Errorf("usage: offshoot mcp [-default-ttl DURATION|none]: %w", err)
-		}
-		if defaultTTLStr == "" {
-			defaultTTLStr = "24h"
-		}
-		// parseTTLFlag's "none" sentinel (0, explicitly no TTL) doubles as
-		// -default-ttl's disable switch; a plain "0"/"0s" parses to the same
-		// zero duration and disables it too.
-		defaultTTL, err := parseTTLFlag(defaultTTLStr)
-		if err != nil {
-			return fmt.Errorf("-default-ttl: %w", err)
-		}
-		if defaultTTL < 0 {
-			return fmt.Errorf("-default-ttl %q must be zero, \"none\" (both disable it), or positive", defaultTTLStr)
 		}
 		if len(rest) != 0 {
 			return fmt.Errorf("usage: offshoot mcp [-default-ttl DURATION|none]")
