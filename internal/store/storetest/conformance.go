@@ -212,5 +212,19 @@ func RunConformance(t *testing.T, keyPrefix string, newBackend func(t *testing.T
 		if err := b.CopyObject(k("data/copy/dst2"), k("data/copy/nope")); !errors.Is(err, store.ErrNotFound) {
 			t.Fatalf("want ErrNotFound copying an absent source, got %v", err)
 		}
+
+		// CopyObject overwrites an existing dst (see store.Backend's doc
+		// comment) — unlike PutIf's create-only semantics, every other
+		// snapshot/segment write in this codebase uses.
+		if err := b.Put(k("data/copy/src2"), []byte("overwritten")); err != nil {
+			t.Fatal(err)
+		}
+		if err := b.CopyObject(k("data/copy/dst"), k("data/copy/src2")); err != nil {
+			t.Fatalf("CopyObject onto an existing dst must overwrite, not error: %v", err)
+		}
+		data, _, err = b.Get(k("data/copy/dst"))
+		if err != nil || string(data) != "overwritten" {
+			t.Fatalf("dst after overwrite = %q, want %q: %v", data, "overwritten", err)
+		}
 	})
 }
