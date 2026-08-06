@@ -22,9 +22,15 @@ jobs:
           - os: ubuntu-24.04-arm
             goos: linux
             goarch: arm64
-          - os: macos-13
+          # GitHub retired Intel macOS runners; darwin/amd64 cross-builds on
+          # the Apple-silicon runner via clang -arch x86_64 (same-OS cgo
+          # cross-arch is supported by Apple's toolchain). Smoke test is
+          # skipped for that pairing — arm64 hosts can still run amd64
+          # binaries under Rosetta, but runners don't guarantee it.
+          - os: macos-latest
             goos: darwin
             goarch: amd64
+            cc: clang -arch x86_64
           - os: macos-latest
             goos: darwin
             goarch: arm64
@@ -45,17 +51,26 @@ jobs:
             echo "name=${GITHUB_REF_NAME}" >> "$GITHUB_OUTPUT"
           fi
 
-      - name: Build (native, cgo on)
+      - name: Build (cgo on)
         env:
           CGO_ENABLED: "1"
+          GOOS: ${{ matrix.goos }}
+          GOARCH: ${{ matrix.goarch }}
+          CC: ${{ matrix.cc || 'cc' }}
         run: |
           go build -trimpath -ldflags "-s -w -X main.version=${{ steps.ref.outputs.name }}" \
             -o offshoot ./cmd/offshoot
 
       - name: Smoke test
+        # Cross-arch pairings can't execute their binary on the build host;
+        # verify the architecture instead.
         run: |
-          ./offshoot version
-          ./offshoot version | grep -q "${{ steps.ref.outputs.name }}"
+          if [ "$(uname -m | sed 's/x86_64/amd64/;s/aarch64/arm64/')" = "${{ matrix.goarch }}" ]; then
+            ./offshoot version
+            ./offshoot version | grep -q "${{ steps.ref.outputs.name }}"
+          else
+            file ./offshoot | grep -qi "x86_64\|x86-64"
+          fi
 
       - name: Package
         id: pkg
