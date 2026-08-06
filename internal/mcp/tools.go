@@ -343,8 +343,9 @@ func forkTTLDescription(defaultTTL time.Duration) string {
 			"touched."
 	}
 	return fmt.Sprintf("Forked branches expire %s after their last activity by "+
-		"default; pass `ttl:\"none\"` to keep one indefinitely, or `ttl` as a Go "+
-		"duration string (e.g. \"2h\") to override.", defaultTTL.String())
+		"default, unless promoted or touched; pass `ttl:\"none\"` to keep one "+
+		"indefinitely, or `ttl` as a Go duration string (e.g. \"2h\") to override.",
+		defaultTTL.String())
 }
 
 // ttlDefaultDisplay renders defaultTTL the way the fork schema's `ttl`
@@ -406,7 +407,7 @@ func forkTTLSummary(ws *ops.Workspace, db, branch string, ttl time.Duration) str
 	if !ok {
 		return fmt.Sprintf("ttl=%s", ref.TTL)
 	}
-	return fmt.Sprintf("ttl=%s expires_at=%s (%s)", ref.TTL, deadline.Format(time.RFC3339), forkTTLJanitorNote)
+	return fmt.Sprintf("ttl=%s expires_at=%s; %s", ref.TTL, deadline.Format(time.RFC3339), forkTTLJanitorNote)
 }
 
 func (t *OffshootTools) fork(args json.RawMessage) (ToolResult, error) {
