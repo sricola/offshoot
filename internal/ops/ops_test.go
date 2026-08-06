@@ -1481,3 +1481,95 @@ func TestCheckoutSkipsRematerializeWhenCleanAndCurrent(t *testing.T) {
 		t.Fatal("a modified checkout must still be re-materialized (and warned about)")
 	}
 }
+
+// TestCheckoutRematerializesOnEpochMismatchOrOldFormatSidecar guards the gap
+// flagged in review of the clean-fast-path change above: checkoutState's
+// identity check must compare Epoch, not just (Lineage, TXID). Chain
+// resolution (store.keepHighestEpoch) exists precisely because a fenced-out
+// writer's orphaned object can share a TXID with the live object under a
+// different epoch, so lineage+txid alone does not prove two checkouts hold
+// the same committed bytes. A sidecar with the right Lineage+TXID but a
+// stale Epoch must read as "stale" (rebuild, not skip); so must an
+// OLD-FORMAT sidecar that predates the Epoch field entirely (decodes Epoch
+// to its zero value) — it must not be trusted as clean just because a real
+// ref's HeadEpoch is never 0.
+func TestCheckoutRematerializesOnEpochMismatchOrOldFormatSidecar(t *testing.T) {
+	requireSQLite(t)
+	w := newWS(t)
+	if err := w.Create("app"); err != nil {
+		t.Fatal(err)
+	}
+	p1, err := w.Checkout("app", "main")
+	if err != nil {
+		t.Fatal(err)
+	}
+	st1, err := os.Stat(p1)
+	if err != nil {
+		t.Fatal(err)
+	}
+	ref, _, err := w.Store.GetRef("app", "main")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if ref.HeadEpoch == 0 {
+		t.Fatal("test assumption violated: a real ref's HeadEpoch must be >= 1 (see decodeRef)")
+	}
+	hash, err := fileSum(p1)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	// Right lineage, right txid, WRONG epoch: checkoutState must call this
+	// "stale" (not "clean"), and Checkout must rebuild rather than skip.
+	staleEpoch := fmt.Sprintf(`{"hash":%q,"lineage":%q,"epoch":%d,"txid":%d}`,
+		hash, ref.Lineage, ref.HeadEpoch+1, ref.HeadTXID)
+	if err := os.WriteFile(p1+".sum", []byte(staleEpoch), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	if got := checkoutState(p1, ref); got != "stale" {
+		t.Fatalf("checkoutState with mismatched epoch = %q, want %q", got, "stale")
+	}
+	p2, err := w.Checkout("app", "main")
+	if err != nil {
+		t.Fatal(err)
+	}
+	st2, err := os.Stat(p2)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if os.SameFile(st1, st2) {
+		t.Fatal("a sidecar with a stale epoch (right lineage+txid) must be re-materialized, not skipped")
+	}
+
+	// Old-format sidecar: no "epoch" field at all, as any sidecar written
+	// before this fix would be. Decodes Epoch to its zero value, which must
+	// NOT be treated as matching a real ref's HeadEpoch (always >= 1) —
+	// that's the safe direction (rebuild) rather than the unsafe one (trust
+	// a pre-epoch-tracking sidecar as clean).
+	ref2, _, err := w.Store.GetRef("app", "main")
+	if err != nil {
+		t.Fatal(err)
+	}
+	hash2, err := fileSum(p2)
+	if err != nil {
+		t.Fatal(err)
+	}
+	oldFormat := fmt.Sprintf(`{"hash":%q,"lineage":%q,"txid":%d}`, hash2, ref2.Lineage, ref2.HeadTXID)
+	if err := os.WriteFile(p2+".sum", []byte(oldFormat), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	if got := checkoutState(p2, ref2); got != "stale" {
+		t.Fatalf("checkoutState for an old-format (no epoch) sidecar = %q, want %q", got, "stale")
+	}
+	p3, err := w.Checkout("app", "main")
+	if err != nil {
+		t.Fatal(err)
+	}
+	st3, err := os.Stat(p3)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if os.SameFile(st2, st3) {
+		t.Fatal("an old-format sidecar (no epoch field) must be re-materialized, not skipped")
+	}
+}

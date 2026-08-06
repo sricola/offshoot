@@ -17,10 +17,10 @@ version if you depend on format stability.
 
 - `Checkout` no longer re-materializes a checkout that is already clean at
   the branch's current head (sidecar fingerprint matches the file, and the
-  fingerprint's recorded lineage/txid matches the ref right now); it returns
-  the existing file as-is. Every `session.Open` calls `Checkout`, so this
-  avoids an O(size) temp-file-and-rename plus a stranded `dbfile` descriptor
-  on every open when the checkout hasn't drifted. Modified and stale
+  fingerprint's recorded lineage/epoch/txid matches the ref right now); it
+  returns the existing file as-is. Every `session.Open` calls `Checkout`, so
+  this avoids an O(size) temp-file-and-rename plus a stranded `dbfile`
+  descriptor on every open when the checkout hasn't drifted. Modified and stale
   checkouts are unaffected: they still warn and re-materialize exactly as
   before.
 

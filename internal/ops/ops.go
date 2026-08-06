@@ -230,14 +230,18 @@ func (w *Workspace) Checkout(db, branch string) (string, error) {
 		if err := quiesce(path); err != nil {
 			return "", err
 		}
-		// checkoutState compares the sidecar's recorded (lineage, txid)
-		// against ref.Lineage/ref.HeadTXID — the CURRENT head, just fetched
-		// above — so "clean" here already means "byte-correct for the head
-		// right now", not merely "matches whatever it was last verified
-		// against". A clean, current checkout needs no re-materialization:
-		// return it as-is rather than paying the temp+rename cost (and, via
-		// materializeAt->dbfile, stranding another descriptor) to rebuild
-		// bytes that are already correct.
+		// checkoutState compares the sidecar's recorded (lineage, epoch,
+		// txid) against ref.Lineage/ref.HeadEpoch/ref.HeadTXID — the CURRENT
+		// head, just fetched above — so "clean" here already means
+		// "byte-correct for the head right now", not merely "matches
+		// whatever it was last verified against". Epoch is load-bearing in
+		// that comparison, not redundant with txid: Chain resolution can
+		// resolve the same txid to different bytes under different epochs
+		// (a fenced writer's orphan vs. the live object), so lineage+txid
+		// alone would not prove identity. A clean, current checkout needs no
+		// re-materialization: return it as-is rather than paying the
+		// temp+rename cost (and, via materializeAt->dbfile, stranding
+		// another descriptor) to rebuild bytes that are already correct.
 		switch checkoutState(path, ref) {
 		case "clean":
 			return path, nil
@@ -251,35 +255,48 @@ func (w *Workspace) Checkout(db, branch string) (string, error) {
 	if err := w.materializeAt(ref, headCheckpoint(ref), path); err != nil {
 		return "", err
 	}
-	if err := writeSum(path, ref.Lineage, ref.HeadTXID); err != nil {
+	if err := writeSum(path, ref.Lineage, ref.HeadEpoch, ref.HeadTXID); err != nil {
 		return "", err
 	}
 	return path, nil
 }
 
 // sumRecord is the on-disk shape of a checkout's .sum sidecar: a content hash
-// plus the ref identity (lineage + txid) the checkout embodied at the moment
-// the sidecar was written. Recording identity (not just a bare hash) is what
-// lets checkoutState tell apart a checkout with local edits from one whose
-// branch ref moved out from under it without a refresh.
+// plus the ref identity (lineage + epoch + txid) the checkout embodied at the
+// moment the sidecar was written. Recording identity (not just a bare hash)
+// is what lets checkoutState tell apart a checkout with local edits from one
+// whose branch ref moved out from under it without a refresh.
+//
+// Epoch is part of that identity, not decoration: Chain resolution
+// (store.keepHighestEpoch) exists precisely because a fenced-out writer's
+// orphaned object can share a TXID with the live one under a different
+// epoch, so lineage+txid alone does not uniquely identify committed content
+// — epoch does. Without comparing it here, checkoutState's "clean" verdict
+// would rest on an unenforced cross-module assumption that HeadEpoch only
+// ever changes in lockstep with Lineage/TXID; a future change to that
+// invariant would make the fast path in Checkout serve stale bytes as
+// current.
 type sumRecord struct {
 	Hash    string `json:"hash"`
 	Lineage string `json:"lineage"`
+	Epoch   uint64 `json:"epoch"`
 	TXID    uint64 `json:"txid"`
 }
 
 // writeSum computes the hex SHA-256 of the file at path and writes it, along
-// with the (lineage, txid) ref identity the checkout currently embodies, to
-// path + ".sum". This is the checkout fingerprint: it records what the
-// checkout file looked like, and which branch state it was, at the moment it
-// was last known to equal a committed state (fresh materialize, a successful
-// checkpoint encode, or a post-repoint refresh).
-func writeSum(path string, lineage string, txid uint64) error {
+// with the (lineage, epoch, txid) ref identity the checkout currently
+// embodies, to path + ".sum". This is the checkout fingerprint: it records
+// what the checkout file looked like, and which branch state it was, at the
+// moment it was last known to equal a committed state (fresh materialize, a
+// successful checkpoint encode, or a post-repoint refresh). Callers pass the
+// ref's HeadEpoch (the epoch the checkout's current head was written under),
+// not the ref's own (writer-generation) Epoch — see sumRecord's doc comment.
+func writeSum(path string, lineage string, epoch, txid uint64) error {
 	sum, err := fileSum(path)
 	if err != nil {
 		return err
 	}
-	data, err := json.Marshal(sumRecord{Hash: sum, Lineage: lineage, TXID: txid})
+	data, err := json.Marshal(sumRecord{Hash: sum, Lineage: lineage, Epoch: epoch, TXID: txid})
 	if err != nil {
 		return err
 	}
@@ -288,14 +305,18 @@ func writeSum(path string, lineage string, txid uint64) error {
 
 // checkoutState reports how the checkout at path relates to ref:
 //
-//   - "clean": the sidecar's recorded identity (lineage, txid) matches ref,
-//     and the file's content still matches the recorded hash.
+//   - "clean": the sidecar's recorded identity (lineage, epoch, txid)
+//     matches ref, and the file's content still matches the recorded hash.
 //   - "modified": the sidecar's recorded identity matches ref, but the
 //     file's content has changed since it was last fingerprinted — local,
 //     un-checkpointed edits.
 //   - "stale": the sidecar's recorded identity no longer matches ref — the
 //     branch was repointed (rollback/promote with a skipped refresh) since
-//     this checkout was last materialized or checkpointed.
+//     this checkout was last materialized or checkpointed. A sidecar
+//     written before Epoch was tracked (or any other record whose Epoch
+//     doesn't decode to ref.HeadEpoch) falls here too: zero-value Epoch
+//     never matches a real ref's HeadEpoch (always >= 1), so an old-format
+//     sidecar reads as stale rather than being trusted as clean.
 //   - "unknown": no sidecar, or one that isn't a valid current-format
 //     record (including legacy bare-hash sidecars predating this fix, and
 //     corrupt files). Provenance can't be determined, so callers should
@@ -309,7 +330,7 @@ func checkoutState(path string, ref store.Ref) string {
 	if err := json.Unmarshal(raw, &rec); err != nil || rec.Hash == "" {
 		return "unknown"
 	}
-	if rec.Lineage != ref.Lineage || rec.TXID != ref.HeadTXID {
+	if rec.Lineage != ref.Lineage || rec.Epoch != ref.HeadEpoch || rec.TXID != ref.HeadTXID {
 		return "stale"
 	}
 	got, err := fileSum(path)
@@ -488,7 +509,7 @@ func (w *Workspace) Checkpoint(db, branch, name string) (uint64, error) {
 	// encode above and this point leaves the OLD sidecar in place — which
 	// still correctly describes the checkout's actual (pre-checkpoint)
 	// identity, rather than claiming a commit that never landed.
-	if err := writeSum(path, ref.Lineage, txid); err != nil {
+	if err := writeSum(path, ref.Lineage, ref.HeadEpoch, txid); err != nil {
 		return 0, fmt.Errorf("ops: checkpoint %q committed (txid %d), but the checkout fingerprint could not be refreshed: %w", name, txid, err)
 	}
 	return txid, nil
@@ -745,7 +766,7 @@ func (w *Workspace) Rollback(db, branch, to string) (string, error) {
 		// The checkout now equals committed state: refresh the fingerprint
 		// (identity too, since this repointed to a new lineage) so a later
 		// Fork sees it as clean rather than stale.
-		return writeSum(path, next.Lineage, txid)
+		return writeSum(path, next.Lineage, next.HeadEpoch, txid)
 	}
 	if err := refresh(); err != nil {
 		return "", fmt.Errorf("ops: branch repointed to checkpoint %q (txid %d), but the checkout could not be refreshed (run 'offshoot checkout' to re-materialize): %w", to, txid, err)
@@ -822,7 +843,7 @@ func (w *Workspace) Promote(db, source, target string, force bool) (uint64, erro
 		// The checkout now equals committed state: refresh the fingerprint
 		// (identity too, since this repointed to a new lineage) so a later
 		// Fork sees it as clean rather than stale.
-		if err := writeSum(path, next.Lineage, txid); err != nil {
+		if err := writeSum(path, next.Lineage, next.HeadEpoch, txid); err != nil {
 			return txid, fmt.Errorf("ops: promoted, but checkout %s could not be refreshed: %w", path, err)
 		}
 	}
