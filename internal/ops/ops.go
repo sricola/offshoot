@@ -642,9 +642,12 @@ var forkFastPathHits atomic.Int64
 // Any chain longer than one member (a checkpoint reached via segments past
 // the lineage's last snapshot — the daemon's flush cadence) does not meet
 // the precondition and falls through to the slow path unchanged. A backend
-// that cannot perform CopyObject at all (S3 in Task 6a; store.
-// ErrCopyUnsupported) also falls through to the slow path — see
-// store.S3.CopyObject's doc comment.
+// that cannot perform CopyObject at all for this particular object (store.
+// ErrCopyUnsupported) also falls through to the slow path — every backend
+// offshoot ships (local since Task 6a, S3 since Task 6b) supports
+// CopyObject in general, but S3's is gated to objects at or under its 5GB
+// single-request CopyObject limit, so the sentinel still fires for anything
+// larger — see store.S3.CopyObject's doc comment.
 func (w *Workspace) copySnapshotToNewLineage(src store.Ref, cp store.Checkpoint) (string, error) {
 	lineage := store.NewLineageID()
 	// Resolved once, up front, and threaded through both the fast-path

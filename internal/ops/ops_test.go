@@ -748,14 +748,19 @@ func TestForkFastPathMatchesSlowPath(t *testing.T) {
 	}
 }
 
-// TestForkFastPathFallsBackOnS3Sentinel pins Task 6a's explicit scope limit:
-// forking against a backend that returns store.ErrCopyUnsupported (S3,
-// today, always — see store.S3.CopyObject's doc comment) must fall back to
-// the slow path silently, never firing the fast path and never erroring,
-// even though the precondition (a single-snapshot chain) holds — the same
-// precondition TestForkFastPathMatchesSlowPath exercises against the local
-// backend, where it DOES fire.
-func TestForkFastPathFallsBackOnS3Sentinel(t *testing.T) {
+// TestForkFastPathFiresOnS3WithinSizeLimit pins Task 6b's behavior: S3
+// server-side CopyObject means forking a single-snapshot chain over an S3
+// backend now takes the SAME fast path the local backend does (Task 6a),
+// for any object at or under S3's 5GB single-request CopyObject limit —
+// this is no longer the "S3 always falls back" world Task 6a shipped with.
+// The size-gated fallback itself (over the limit, store.ErrCopyUnsupported)
+// is pinned directly against store.S3.CopyObject in
+// internal/store/s3_test.go's TestS3CopyObjectOverSizeLimitFallsBack — that
+// path shares tryFastForkCopy's generic errors.Is(err,
+// store.ErrCopyUnsupported) fallback wiring with
+// TestForkFastPathSkipsMultiMemberChains (gc_chain_test.go), so it isn't
+// duplicated again here at the ops level.
+func TestForkFastPathFiresOnS3WithinSizeLimit(t *testing.T) {
 	if _, err := exec.LookPath("sqlite3"); err != nil {
 		t.Skip("sqlite3 CLI not on PATH")
 	}
@@ -776,8 +781,8 @@ func TestForkFastPathFallsBackOnS3Sentinel(t *testing.T) {
 	if _, err := w.Fork("app", "main", "child", "", 0); err != nil {
 		t.Fatal(err)
 	}
-	if got := ForkFastPathHits(); got != before {
-		t.Fatalf("fork fast path hits = %d, want %d unchanged (S3's ErrCopyUnsupported sentinel must fall back to the slow path)", got, before)
+	if got := ForkFastPathHits(); got != before+1 {
+		t.Fatalf("fork fast path hits = %d, want %d (S3's server-side CopyObject should fire the fast path for a single-snapshot chain within the size limit)", got, before+1)
 	}
 
 	srcDump, err := exec.Command("sqlite3", path, ".dump").Output()
@@ -793,7 +798,7 @@ func TestForkFastPathFallsBackOnS3Sentinel(t *testing.T) {
 		t.Fatal(err)
 	}
 	if !bytes.Equal(srcDump, childDump) {
-		t.Fatalf("child diverges from source on the fallback path:\n--- src ---\n%s\n--- child ---\n%s", srcDump, childDump)
+		t.Fatalf("child diverges from source on the S3 fast path:\n--- src ---\n%s\n--- child ---\n%s", srcDump, childDump)
 	}
 }
 

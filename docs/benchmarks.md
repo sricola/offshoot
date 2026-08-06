@@ -77,13 +77,18 @@ call, not two different things being measured.
   (HTTP, request signing, `PutIf`-style conditional writes) but **not** a
   real network path — no WAN latency, no TLS. Treat it as "S3 API overhead
   measured locally," not "S3 performance from a real client location."
-  `store.S3.CopyObject` returns the `ErrCopyUnsupported` sentinel
-  unconditionally in Task 6a (S3 server-side `CopyObject` is Task 6b), so
-  `Fork` against S3 takes the same materialize-and-re-encode path it did
-  before this change — these numbers are a same-code-path re-measurement,
-  not a claim of improvement.
-- "Before" measured 2026-08-06 (pre-Task-6a, `main`); "after" measured
-  2026-08-06 (post-Task-6a, this branch), same day, same machine.
+  `store.S3.CopyObject` returned the `ErrCopyUnsupported` sentinel
+  unconditionally in Task 6a; Task 6b (this update) replaces that with a
+  real server-side `CopyObject` call (gated to objects at or under S3's
+  5GB single-request `CopyObject` limit — see "Task 6b: what changed"
+  below). All MinIO-local numbers throughout this section are exactly
+  that: MinIO-local. They say nothing about a real AWS S3 endpoint's
+  network latency, throughput, or server-side copy performance at scale —
+  do not read them as an AWS claim.
+- "Before" (Task 6a's numbers) measured 2026-08-06 (pre-Task-6a, `main`);
+  "after Task 6a" measured 2026-08-06 (post-Task-6a, this branch), same
+  day, same machine. "After Task 6b" (S3 server-side copy) measured
+  2026-08-06, same machine, separate section below.
 
 ## Task 6a: what changed
 
@@ -109,6 +114,44 @@ multi-member chain has no single source object to copy, so `Fork` falls
 through to exactly the pre-6a materialize-and-re-encode path, unchanged
 (`internal/ops/gc_chain_test.go`'s `TestForkFastPathSkipsMultiMemberChains`
 covers this).
+
+## Task 6b: what changed
+
+`store.S3.CopyObject` (`internal/store/s3.go`) now issues a real
+server-side copy — S3's `CopyObject` API (a `PUT` carrying an
+`X-Amz-Copy-Source` header, no request body, no download to this process
+and no re-upload) — instead of returning `ErrCopyUnsupported`
+unconditionally. `ops.Fork`'s fast path (Task 6a, unchanged by this slice)
+now actually fires against an S3 backend for any single-snapshot-chain
+checkpoint, the same way it already did against the local backend.
+
+**The 5GB guard:** S3's `CopyObject` supports source objects up to 5 GiB in
+a single request; anything larger needs the multipart `UploadPartCopy` API,
+which this backend does not implement (out of scope for this slice, same as
+it was for Task 6a's local reflink path — see `copyObjectMaxBytes` in
+`s3.go`). `CopyObject` HEADs the source first — one request, not a
+download — reads `ContentLength`, and returns the `ErrCopyUnsupported`
+sentinel for anything over 5 GiB *before* ever attempting the copy. That
+sentinel is the exact signal `ops.Fork`'s fast path (Task 6a) was already
+wired to treat as "fall back to the slow, materialize-and-re-encode path,"
+so an oversized checkpoint still forks correctly, just without the
+server-side-copy win — pinned directly at the `store.S3.CopyObject`
+boundary by `TestS3CopyObjectOverSizeLimitFallsBack`
+(`internal/store/s3_test.go`), using a fake-S3 hook
+(`FakeS3.SetSizeOverride`) to make a small stored object report a >5GB
+size on `HEAD` without actually allocating or uploading one.
+
+The shared `storetest.RunConformance` `CopyObject` subtest (added in Task
+6a, at the one place backend conformance tests live) now **runs for real**
+against S3 — both the in-process fake (`TestS3Conformance/CopyObject`) and
+the MinIO-gated real-provider suite (`TestS3RealProvider/Conformance/
+CopyObject`, `make test-s3`) — instead of skipping on the sentinel, exactly
+as the brief's placement of that subtest was meant to let 6b inherit for
+free. The in-process fake (`internal/store/storetest/fakes3.go`) gained
+`CopyObject`-request handling (an `X-Amz-Copy-Source`-carrying `PUT`) to
+make that possible — without it, the fake would have silently overwritten
+the destination with an empty body instead of a copy, since a `CopyObject`
+request has no body of its own.
 
 ## Results: local store (host, `make bench`, `-count=3`)
 
@@ -227,17 +270,62 @@ filesystem with no clone support.
 | SessionOpen | 64MB | 31.9ms | 31.8ms | 2109 | 2115 |
 | SessionOpen | 512MB | 214.4ms | 203.4ms | 2506 | 2642 |
 
-`Fork` against S3 takes exactly the pre-6a code path (`store.S3.CopyObject`
-returns `ErrCopyUnsupported` immediately, with no HTTP call, before
-`copySnapshotToNewLineage` falls through to the unchanged
-materialize-and-re-encode path). The 64MB numbers land within 1% of the
-"before" run; 512MB is ~12% slower here, which reads as single-sample
+This table is Task 6a's measurement, kept as published: at that point
+`store.S3.CopyObject` still returned `ErrCopyUnsupported` immediately, with
+no HTTP call, before `copySnapshotToNewLineage` fell through to the
+unchanged materialize-and-re-encode path. The 64MB numbers landed within 1%
+of the pre-6a run; 512MB was ~12% slower, which read as single-sample
 Docker/MinIO variance (`-count=1`, no repeats to average, a different
 container/network warm-up state than the original run) rather than a
-regression from this change — there is no code-path difference on this
-backend for `make bench-s3` to have introduced. `CheckoutCleanSkip` and
-`SessionOpen` are, as before, close to the local numbers because their
-dominant cost never touches the backend at all.
+regression — there was no code-path difference on this backend for Task 6a
+to have introduced. `CheckoutCleanSkip` and `SessionOpen` are, as before,
+close to the local numbers because their dominant cost never touches the
+backend at all — Task 6b doesn't change that either.
+
+### Task 6b: S3 server-side CopyObject (`make bench-s3`, MinIO in Docker, `-count=1`)
+
+| Benchmark | Size | ns/op, before Task 6b (=after 6a) | ns/op, after Task 6b | MB/s, before | MB/s, after |
+|---|---|---|---|---|---|
+| ForkAtHead | 64MB | 536.9ms | **153.0ms** | 125 | 439 |
+| ForkAtHead | 512MB | 4.57s | **1.03s** | 118 | 522 |
+| CheckoutCleanSkip | 64MB | 27.5ms | 27.2ms | 2442 | 2466 |
+| CheckoutCleanSkip | 512MB | 198.2ms | 194.4ms | 2712 | 2764 |
+| SessionOpen | 64MB | 31.8ms | 30.7ms | 2115 | 2191 |
+| SessionOpen | 512MB | 203.4ms | 202.7ms | 2642 | 2651 |
+
+`ForkAtHead` is ~3.5x faster at 64MB and ~4.4x faster at 512MB: the
+server-side copy means this process never downloads the source snapshot
+object, never re-encodes it, and never re-uploads it — MinIO copies the
+object on its own side of the wire, so the only round trips this process
+pays for are the `HEAD` (size gate), the `CopyObject` request itself, and
+the same `PutRef`/`GetRef` calls every fork makes regardless of path. It is
+NOT as fast as the local numbers (1.03s vs. ~198ms at 512MB): `Fork`'s
+uncheckpointed-changes SHA-256 check (see "Isolating the fast path itself"
+above) still runs against the LOCAL checkout file either way
+(`OFFSHOOT_CHECKOUTS` is local disk regardless of backend), so that ~192ms
+cost is present in both the local and S3 numbers; the remaining gap is
+real HTTP round trips (`HEAD`, `CopyObject`, `PutRef`) plus MinIO's own
+server-side copy time, which is real disk I/O on MinIO's side even though
+it never crosses the network back to this process. `CheckoutCleanSkip` and
+`SessionOpen` are unaffected, as expected (neither calls `CopyObject`).
+
+Raw "after Task 6b" output:
+
+```
+BenchmarkForkAtHead/size=64MB-10              7   152972149 ns/op    439.24 MB/s
+BenchmarkForkAtHead/size=512MB-10             1  1030185084 ns/op    521.72 MB/s
+BenchmarkCheckoutCleanSkip/size=64MB-10      39    27249625 ns/op   2465.75 MB/s
+BenchmarkCheckoutCleanSkip/size=512MB-10      6   194418798 ns/op   2764.49 MB/s
+BenchmarkSessionOpen/size=64MB-10            34    30661629 ns/op   2191.36 MB/s   settleSnapshotBytes=67710606
+BenchmarkSessionOpen/size=512MB-10            5   202717683 ns/op   2651.32 MB/s   settleSnapshotBytes=541863202
+```
+
+Same caveat as every other S3 number in this document: MinIO-local,
+`-count=1`, no WAN latency, no TLS — this is "S3 API overhead measured
+locally," not an AWS performance claim, and a real network hop to a real
+AWS region would add real latency Task 6b's design does nothing to hide
+(one `HEAD` + one `CopyObject` round trip per fork, same as any other S3
+API call this codebase makes).
 
 ## The 4GB case
 
@@ -289,10 +377,13 @@ the object copy itself.
 - **`session.Open`**: dominated by the same `Checkout` clean-skip cost,
   since `Open` calls `Checkout` internally. Unchanged by Task 6a.
 - **`Fork` itself, when the fast-path precondition doesn't hold**: a
-  multi-member chain (post-segment-flush branch), or a backend that returns
-  `store.ErrCopyUnsupported` (S3 today), still takes the full
-  materialize-and-re-encode path, unchanged from before Task 6a — see
-  "Results: S3 path" above and `TestForkFastPathSkipsMultiMemberChains`.
+  multi-member chain (post-segment-flush branch), or — since Task 6b — a
+  single-snapshot checkpoint whose object is over S3's 5GB single-request
+  `CopyObject` limit, still takes the full materialize-and-re-encode path,
+  unchanged from before Task 6a. Before Task 6b, EVERY S3 fork took this
+  path regardless of chain shape or size (`store.S3.CopyObject` returned
+  `ErrCopyUnsupported` unconditionally) — see `TestForkFastPathSkipsMultiMemberChains`
+  and, for the size gate specifically, `TestS3CopyObjectOverSizeLimitFallsBack`.
 
 **Task 6a's fast path applies only when the checkpoint being forked
 resolves to a chain of exactly one member, and that member is itself a

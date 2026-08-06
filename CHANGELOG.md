@@ -43,6 +43,29 @@ version if you depend on format stability.
   already covers local, the in-process S3 fake, and the MinIO-gated
   real-provider suite.
 
+- Fast-path fork (Task 6b, S3 half): `store.S3.CopyObject` now issues a
+  real server-side `CopyObject` API call (a `PUT` carrying
+  `X-Amz-Copy-Source`, no request body) instead of returning the
+  `ErrCopyUnsupported` sentinel unconditionally — `ops.Fork`'s fast path
+  (Task 6a) now fires against an S3 backend too, for any single-snapshot
+  checkpoint at or under S3's 5GB single-request `CopyObject` limit.
+  `CopyObject` HEADs the source first (one request, not a download) and
+  returns `ErrCopyUnsupported` for anything over that limit — the same
+  fallback signal Task 6a already wired `Fork` to treat as "use the slow,
+  materialize-and-re-encode path" — rather than implementing the
+  multipart `UploadPartCopy` API this backend doesn't support. The shared
+  `storetest.RunConformance` `CopyObject` subtest (added in Task 6a) now
+  runs for real against S3 instead of skipping on the sentinel, covering
+  both the in-process fake and the MinIO-gated real-provider suite
+  (`make test-s3`); `storetest.FakeS3` gained `CopyObject`-request
+  handling (it previously had no concept of the header-only, bodyless
+  copy request and would have silently overwritten the destination with
+  an empty body) and a `SetSizeOverride` test hook so the 5GB gate can be
+  exercised without allocating a real multi-gigabyte object. Measured
+  (MinIO-local, not an AWS claim; `make bench-s3`) 512MB fork over S3
+  4.57s → 1.03s (~4.4x) and 64MB 536.9ms → 153.0ms (~3.5x) — see
+  docs/benchmarks.md.
+
 - Benchmarks: `internal/ops/fork_bench_test.go` measures `Fork`'s current
   slow path (`copySnapshotToNewLineage` materializes the source checkpoint
   and re-encodes a fresh snapshot for the child lineage — O(size)),

@@ -172,16 +172,18 @@ func RunConformance(t *testing.T, keyPrefix string, newBackend func(t *testing.T
 		}
 	})
 
-	// CopyObject: a backend that cannot perform the copy at all (S3 in Task
-	// 6a, before Task 6b's server-side CopyObject lands) returns the
-	// sentinel store.ErrCopyUnsupported, and this subtest tolerates that by
-	// skipping rather than failing — the same call this backend's real
-	// caller (ops.Fork's fast path) makes to decide whether to fall back.
-	// Every backend that DOES support it (local today; S3 from Task 6b) must
-	// pass the full round-trip + ErrNotFound checks below, so this same
-	// subtest verifies local, the in-process S3 fake, and (once wired) the
-	// MinIO-gated real-provider suite, all through this one shared entry
-	// point.
+	// CopyObject: every backend offshoot ships (local since Task 6a, S3
+	// since Task 6b) supports it for objects within its own limits, and
+	// this subtest exercises the full round-trip + ErrNotFound + overwrite
+	// checks below against all of them — local, the in-process S3 fake, and
+	// the MinIO-gated real-provider suite all run through this one shared
+	// entry point. It still tolerates a backend legitimately returning the
+	// sentinel store.ErrCopyUnsupported by skipping rather than failing
+	// (the same call this subtest's real caller, ops.Fork's fast path,
+	// makes to decide whether to fall back) — S3 itself takes exactly that
+	// path for a source object over its 5GB single-request CopyObject
+	// limit (see store.S3.CopyObject), just not for anything this subtest's
+	// small test objects ever reach.
 	t.Run("CopyObject", func(t *testing.T) {
 		b := newBackend(t)
 		if err := b.Put(k("data/copy/src"), []byte("copy-me")); err != nil {
