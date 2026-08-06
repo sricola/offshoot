@@ -412,6 +412,7 @@ func Open(ctx context.Context, o Options) (*Session, error) {
 		s.flushDone = make(chan struct{})
 		go s.flushLoop(cctx, o.FlushEvery)
 	}
+	s.logTransition("opened", "holder", lease.Holder, "epoch", lease.Epoch)
 	return s, nil
 }
 
@@ -429,11 +430,51 @@ func (s *Session) runEngine(ctx context.Context) {
 // fail records the first terminal error and stops the session's work.
 func (s *Session) fail(err error) {
 	s.mu.Lock()
-	if s.err == nil {
+	first := s.err == nil
+	if first {
 		s.err = err
 	}
 	s.mu.Unlock()
+	if first {
+		// "fenced" names this session's one terminal-failure transition,
+		// whatever its cause — lease loss (the literal ErrFenced case),
+		// the branch being destroyed out from under it, or a capture-engine
+		// failure (see runEngine and renewLoop, this function's only
+		// callers). All three end the session the same way from an
+		// observer's point of view: it stops serving and Err() starts
+		// returning non-nil. Logged once, matching the "if s.err == nil"
+		// gate above exactly, so a session that fails twice (e.g. a second
+		// caller racing to report the same underlying failure) reports the
+		// transition exactly once, not once per caller.
+		s.logTransition("fenced", "cause", err.Error())
+	}
 	s.cancel()
+}
+
+// logTransition writes one structured, key=value line to stderr for a
+// session state transition (opened, flushed, flush-failed, fenced, closed —
+// see Open, flush, fail, and Close). It deliberately matches the daemon
+// janitor's existing "offshoot: janitor: ..." prefix family (see
+// internal/daemon/server.go's StartJanitor) — "offshoot: session: db@branch:
+// event key=value ..." — so an operator grepping stderr for "offshoot:"
+// finds one consistent line shape rather than two competing ones.
+//
+// kv is a flat key/value list (kv[0], kv[1], kv[2], kv[3], ...); an odd
+// trailing element with no paired value is silently dropped rather than
+// panicking — this is a logging path, not something that should ever be
+// able to take a session down over a caller's own bug. String values are
+// %q-quoted (so an error message containing spaces stays a single token for
+// anything parsing key=value pairs); everything else uses %v.
+func (s *Session) logTransition(event string, kv ...any) {
+	line := fmt.Sprintf("offshoot: session: %s@%s: %s", s.db, s.branch, event)
+	for i := 0; i+1 < len(kv); i += 2 {
+		if sv, ok := kv[i+1].(string); ok {
+			line += fmt.Sprintf(" %v=%q", kv[i], sv)
+		} else {
+			line += fmt.Sprintf(" %v=%v", kv[i], kv[i+1])
+		}
+	}
+	fmt.Fprintln(os.Stderr, line)
 }
 
 func (s *Session) CheckoutPath() string { return s.checkoutPath }
@@ -448,6 +489,12 @@ func (s *Session) Resumed() bool       { return s.captured.Resumed() }
 func (s *Session) ReplicaPath() string { return s.replica.Path() }
 func (s *Session) DB() string          { return s.db }
 func (s *Session) Branch() string      { return s.branch }
+
+// CaptureLag reports WAL bytes committed by writers but not yet applied to
+// the replica — see capture.Engine.Lag's doc comment. Safe to call at any
+// time, including concurrently with the capture engine's own goroutine (see
+// Lag's doc comment for why).
+func (s *Session) CaptureLag() int64 { return s.captured.Lag() }
 
 func (s *Session) Lease() store.Lease {
 	s.mu.Lock()
@@ -500,10 +547,12 @@ func (s *Session) autoFlushPending() bool {
 	return s.appliedGen != s.flushedGen || s.rebaseGen != s.flushedRebaseGen
 }
 
-// flushLoop calls Flush("") on a fixed cadence for as long as the session is
-// open, so a caller that never calls Flush manually still gets bounded data
-// loss on crash. Mirrors renewLoop's shutdown discipline exactly: it exits
-// when ctx is cancelled (Close, or a terminal fail() elsewhere — a fenced or
+// flushLoop calls flush("", true) — the auto-tagged path Flush("") itself is
+// a thin wrapper around, see flush's doc comment — on a fixed cadence for as
+// long as the session is open, so a caller that never calls Flush manually
+// still gets bounded data loss on crash. Mirrors renewLoop's shutdown
+// discipline exactly: it exits when ctx is cancelled (Close, or a terminal
+// fail() elsewhere — a fenced or
 // otherwise fatal session already stops itself via Err(), so this loop needs
 // no special handling for that case beyond exiting on its next ctx.Done()
 // check) and closes flushDone exactly once so Close can join it.
@@ -572,7 +621,7 @@ func (s *Session) flushLoop(ctx context.Context, every time.Duration) {
 		beforeAt, beforeTXID := s.lastFlushAt, s.lastFlushTXID
 		s.mu.Unlock()
 
-		if _, err := s.Flush(""); err != nil {
+		if _, err := s.flush("", true); err != nil {
 			if errors.Is(err, ErrClosed) {
 				continue
 			}
@@ -644,6 +693,11 @@ func (s *Session) Close() error {
 		s.flushMu.Lock()
 		os.RemoveAll(s.dir)
 		s.flushMu.Unlock()
+	}
+	if relErr != nil {
+		s.logTransition("closed", "error", relErr.Error())
+	} else {
+		s.logTransition("closed")
 	}
 	return relErr
 }

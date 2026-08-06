@@ -366,6 +366,14 @@ func (s *Server) opStatus() Response {
 			DB: sess.DB(), Branch: sess.Branch(), Checkout: sess.CheckoutPath(),
 			Holder: sess.Lease().Holder, Epoch: sess.Lease().Epoch,
 			DurableTXID: sess.DurableTXID(),
+			CaptureLag:  sess.CaptureLag(),
+		}
+		if t, _, ok := sess.LastFlush(); ok {
+			info.LastFlushAt = t.Format(time.RFC3339)
+			info.DurableAge = time.Since(t).Round(time.Second).String()
+		}
+		if err := sess.LastFlushErr(); err != nil {
+			info.FlushError = err.Error()
 		}
 		if err := sess.Err(); err != nil {
 			info.Error = err.Error()

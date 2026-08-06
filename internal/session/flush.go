@@ -34,6 +34,44 @@ var ErrFenced = errors.New("session: fenced — lease lost")
 // txid. See flushMu's doc comment for the lock-ordering invariant this
 // implies.
 func (s *Session) Flush(name string) (uint64, error) {
+	return s.flush(name, false)
+}
+
+// flush is Flush's actual implementation, plus the auto/manual distinction
+// flushLoop needs for its own "flushed"/"flush-failed" transition logging
+// (see the deferred call below) — a distinction Flush's own public signature
+// has no room for. flushLoop calls this directly (same package, so no
+// exported surface changes); Flush itself is just auto=false.
+//
+// Named returns (txid, err) exist for exactly one reason: the deferred log
+// call below needs to see this call's actual outcome regardless of which of
+// the many return statements in the body below produced it, without
+// touching every one of them individually. Every "return N, someErr"
+// statement in the body works unchanged under named returns — Go assigns
+// through the names before running deferred funcs either way.
+func (s *Session) flush(name string, auto bool) (txid uint64, err error) {
+	// flushKind — not "kind", which the body below already uses for the
+	// object kind ("snapshot" vs "segment") — is this call's auto/manual
+	// tag for the deferred transition log below.
+	flushKind := "manual"
+	if auto {
+		flushKind = "auto"
+	}
+	defer func() {
+		if err != nil {
+			if errors.Is(err, ErrClosed) {
+				// A Flush racing Close's own shutdown is not an operational
+				// failure worth logging — see ErrClosed's doc comment; the
+				// "closed" transition (Session.Close) already covers this
+				// moment.
+				return
+			}
+			s.logTransition("flush-failed", "kind", flushKind, "error", err.Error())
+			return
+		}
+		s.logTransition("flushed", "kind", flushKind, "txid", txid)
+	}()
+
 	s.flushMu.Lock()
 	defer s.flushMu.Unlock()
 
@@ -74,7 +112,7 @@ func (s *Session) Flush(name string) (uint64, error) {
 	// drain-safety budgets ever grow, this constant should be revisited
 	// rather than left silently coupled to them.
 	dctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
-	err := s.captured.DrainNow(dctx)
+	err = s.captured.DrainNow(dctx)
 	cancel()
 	if err != nil {
 		return 0, fmt.Errorf("session: catch up before flush: %w", err)
@@ -100,7 +138,7 @@ func (s *Session) Flush(name string) (uint64, error) {
 		}
 	}
 
-	txid := ref.HeadTXID + 1
+	txid = ref.HeadTXID + 1
 	var buf bytes.Buffer
 
 	// replicaMu excludes the capture engine's Rebase/Apply for the duration

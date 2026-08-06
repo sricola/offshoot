@@ -901,3 +901,65 @@ func TestDrainNowFatalErrorStopsRun(t *testing.T) {
 		t.Fatal("Run did not stop after DrainNow's fatal error — fatal error was swallowed")
 	}
 }
+
+// TestEngineLagReportsPendingBacklogThenZero pins task 7's Engine.Lag()
+// contract: WAL bytes committed by writers but not yet applied to the
+// replica. Poll is set to an hour, the same shape the DrainNow tests above
+// use to construct a pending backlog — with no ticker able to drain it
+// within this test's timeframe, a committed write sits undrained until an
+// explicit DrainNow call, so Lag() has a real, deterministic backlog to
+// report in between.
+func TestEngineLagReportsPendingBacklogThenZero(t *testing.T) {
+	if _, err := exec.LookPath("sqlite3"); err != nil {
+		t.Skip("sqlite3 CLI not on PATH")
+	}
+	dir := t.TempDir()
+	src := filepath.Join(dir, "src.db")
+	if out, err := exec.Command("sqlite3", src,
+		"PRAGMA journal_mode=WAL; CREATE TABLE t (id INTEGER PRIMARY KEY, v BLOB);").CombinedOutput(); err != nil {
+		t.Fatalf("init: %v: %s", err, out)
+	}
+
+	rep := replay.New(filepath.Join(dir, "replica.db"))
+	e := NewEngine(Options{
+		DBPath:   src,
+		StateDir: dir,
+		Sink:     replicaSink{rep},
+		Poll:     time.Hour, // long enough that only DrainNow can trigger a poll here
+	})
+	ctx, cancel := context.WithCancel(context.Background())
+	done := make(chan error, 1)
+	go func() { done <- e.Run(ctx) }()
+	defer func() { cancel(); <-done }()
+
+	// Let the engine's initial rebase (checkpoint + snapshot + reader bind)
+	// finish before checking or writing — same ordering every other test in
+	// this file relies on.
+	time.Sleep(300 * time.Millisecond)
+
+	if got := e.Lag(); got != 0 {
+		t.Fatalf("Lag() before any write = %d, want 0", got)
+	}
+
+	if out, err := exec.Command("sqlite3", src,
+		"PRAGMA busy_timeout=5000; INSERT INTO t (v) VALUES (randomblob(4096));").CombinedOutput(); err != nil {
+		t.Fatalf("insert: %v: %s", err, out)
+	}
+	// Give the commit a moment to land on disk. The ticker cannot drain it
+	// (Poll is an hour) and nothing else in this test calls DrainNow yet, so
+	// this is not a race against the engine's own catch-up.
+	time.Sleep(100 * time.Millisecond)
+
+	if got := e.Lag(); got <= 0 {
+		t.Fatalf("Lag() with an undrained committed write = %d, want > 0", got)
+	}
+
+	dctx, dcancel := context.WithTimeout(context.Background(), 10*time.Second)
+	defer dcancel()
+	if err := e.DrainNow(dctx); err != nil {
+		t.Fatalf("DrainNow() = %v, want nil", err)
+	}
+	if got := e.Lag(); got != 0 {
+		t.Fatalf("Lag() after DrainNow = %d, want 0", got)
+	}
+}
