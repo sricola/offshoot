@@ -219,6 +219,18 @@ func (s *S3) List(prefix string) ([]string, error) {
 	return keys, nil
 }
 
+// CopyObject always returns ErrCopyUnsupported. Task 6a (this change) ships
+// only the local reflink-backed fast path; S3 server-side CopyObject —
+// gated so objects over S3's 5GB single-request CopyObject limit fall back
+// to the slow path — is Task 6b. Returning the sentinel here means
+// ops.Fork's fast path (copySnapshotToNewLineage) falls back to its
+// existing materialize-and-re-encode path against an S3 backend, exactly as
+// it behaved before Task 6 — this backend gains no new behavior yet, only
+// the capability signal a caller needs to know that.
+func (s *S3) CopyObject(dst, src string) error {
+	return ErrCopyUnsupported
+}
+
 func (s *S3) Delete(key string) error {
 	fk, err := s.full(key)
 	if err != nil {

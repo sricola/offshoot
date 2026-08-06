@@ -1,6 +1,7 @@
 package ops
 
 import (
+	"bytes"
 	"database/sql"
 	"errors"
 	"fmt"
@@ -633,6 +634,99 @@ func TestForkAtCheckpointAfterRollback(t *testing.T) {
 	got, _ := exec.Command("sqlite3", p, "SELECT v FROM t;").Output()
 	if string(got) != "1\n" {
 		t.Fatalf("fork --at v1 content: %q, want just the v1 row", got)
+	}
+}
+
+// TestForkFastPathMatchesSlowPath is Task 6's core equivalence test: forking
+// the same source (a freshly checkpointed branch, whose chain is always
+// exactly one snapshot — ops.Checkpoint always writes a full snapshot, never
+// a segment) via the fast object-copy path and via the slow
+// materialize-and-re-encode path (forced via forkSlowPathForTest) must
+// produce equivalent children two ways:
+//   - Row-level: both children's `.dump` output is byte-identical.
+//   - Object-level: the fast-path child's stored snapshot object is
+//     byte-identical to the SOURCE snapshot object it was copied from — not
+//     merely equivalent after a decode/re-encode round trip.
+func TestForkFastPathMatchesSlowPath(t *testing.T) {
+	if _, err := exec.LookPath("sqlite3"); err != nil {
+		t.Skip("sqlite3 CLI not on PATH")
+	}
+	w := newWS(t)
+	if err := w.Create("app"); err != nil {
+		t.Fatal(err)
+	}
+	path, _ := w.Checkout("app", "main")
+	if out, err := exec.Command("sqlite3", path,
+		"CREATE TABLE t (v); INSERT INTO t VALUES (1),(2),(3);").CombinedOutput(); err != nil {
+		t.Fatalf("seed: %v: %s", err, out)
+	}
+	if _, err := w.Checkpoint("app", "main", "v1"); err != nil {
+		t.Fatal(err)
+	}
+	srcRef, _, err := w.Store.GetRef("app", "main")
+	if err != nil {
+		t.Fatal(err)
+	}
+	chain, err := w.Store.Chain(srcRef.Lineage, srcRef.HeadTXID)
+	if err != nil || len(chain) != 1 || !chain[0].Snapshot {
+		t.Fatalf("test precondition: source chain must be a single snapshot, got %+v err=%v", chain, err)
+	}
+
+	before := ForkFastPathHits()
+	if _, err := w.Fork("app", "main", "fast", "", 0); err != nil {
+		t.Fatal(err)
+	}
+	if got := ForkFastPathHits(); got != before+1 {
+		t.Fatalf("fork fast path hits = %d, want %d (fast path should have fired for a single-snapshot chain)", got, before+1)
+	}
+
+	SetForkSlowPathForTest(true)
+	t.Cleanup(func() { SetForkSlowPathForTest(false) })
+	before = ForkFastPathHits()
+	if _, err := w.Fork("app", "main", "slow", "", 0); err != nil {
+		t.Fatal(err)
+	}
+	if got := ForkFastPathHits(); got != before {
+		t.Fatalf("fork fast path hits = %d, want %d (forkSlowPathForTest must suppress the fast path)", got, before)
+	}
+	SetForkSlowPathForTest(false)
+
+	fastPath, err := w.Checkout("app", "fast")
+	if err != nil {
+		t.Fatal(err)
+	}
+	slowPath, err := w.Checkout("app", "slow")
+	if err != nil {
+		t.Fatal(err)
+	}
+	fastDump, err := exec.Command("sqlite3", fastPath, ".dump").Output()
+	if err != nil {
+		t.Fatalf("dump fast-path child: %v", err)
+	}
+	slowDump, err := exec.Command("sqlite3", slowPath, ".dump").Output()
+	if err != nil {
+		t.Fatalf("dump slow-path child: %v", err)
+	}
+	if !bytes.Equal(fastDump, slowDump) {
+		t.Fatalf("fast-path and slow-path children diverge:\n--- fast ---\n%s\n--- slow ---\n%s", fastDump, slowDump)
+	}
+
+	// Object-level: fetch the source object and the fast-path child's object
+	// directly from the backend and compare bytes, not just decoded content.
+	fastRef, _, err := w.Store.GetRef("app", "fast")
+	if err != nil {
+		t.Fatal(err)
+	}
+	srcData, _, err := w.Store.B.Get(store.SnapshotKey(srcRef.Lineage, srcRef.HeadEpoch, srcRef.HeadTXID))
+	if err != nil {
+		t.Fatal(err)
+	}
+	fastData, _, err := w.Store.B.Get(store.SnapshotKey(fastRef.Lineage, fastRef.HeadEpoch, fastRef.HeadTXID))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !bytes.Equal(srcData, fastData) {
+		t.Fatal("fast-path child's stored snapshot object must be byte-identical to the source snapshot object")
 	}
 }
 

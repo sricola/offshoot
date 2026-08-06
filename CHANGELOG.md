@@ -15,6 +15,34 @@ version if you depend on format stability.
 
 ### Added
 
+- Fast-path fork (Task 6a, local half): `ops.Workspace.Fork`/`Rollback`/
+  `Promote` now copy the source checkpoint's snapshot object directly,
+  instead of materializing it to a temp file and re-encoding a fresh
+  snapshot, whenever the checkpoint's chain (`store.Chain`) resolves to
+  exactly one member and that member is a snapshot — the common case for an
+  at-rest fork. New `internal/ops/reflink` package backs this on the local
+  backend: a filesystem clone (`clonefile(2)` on darwin, the `FICLONE`
+  ioctl on Linux via the new `golang.org/x/sys` dependency) when the
+  filesystem supports it, silently falling back to a plain byte copy
+  otherwise. `store.Backend` gains `CopyObject(dst, src string) error`; the
+  local backend implements it (temp+rename for atomicity, matching its
+  existing write pattern), and S3 returns the new `store.ErrCopyUnsupported`
+  sentinel unconditionally for now — S3 server-side `CopyObject` (gated to
+  objects ≤5GB) is a separate follow-up (Task 6b), so `Fork` against S3
+  takes exactly its pre-existing slow path, unchanged. Falls back to the
+  slow path automatically whenever the precondition doesn't hold (a branch
+  that has been flushed through a daemon session's segment cadence past its
+  last snapshot) or a backend can't perform the copy — never a hard
+  failure. Measured 512MB fork 2.87s → 198ms locally on APFS (~14.5x;
+  ~9.3ms for the copy itself, isolated from a separate pre-existing O(size)
+  check — see docs/benchmarks.md), and a real, if smaller, win even without
+  clone support (a Linux container without `FICLONE`: 3.02s → 513ms).
+  `internal/store/storetest`'s shared conformance suite gained a
+  `CopyObject` round-trip + `ErrNotFound` subtest that skips (rather than
+  fails) against a backend returning the unsupported sentinel, so it
+  already covers local, the in-process S3 fake, and the MinIO-gated
+  real-provider suite.
+
 - Benchmarks: `internal/ops/fork_bench_test.go` measures `Fork`'s current
   slow path (`copySnapshotToNewLineage` materializes the source checkpoint
   and re-encodes a fresh snapshot for the child lineage — O(size)),

@@ -25,23 +25,43 @@ func (w *Workspace) materializeChainAt(ref store.Ref, cp store.Checkpoint, dst s
 		return fmt.Errorf("ops: resolving chain for lineage %s to txid %d (target %s): %w",
 			ref.Lineage, cp.TXID, dst, err)
 	}
+	return w.materializeMembersAt(ref.Lineage, members, dst)
+}
+
+// materializeMembersAt applies an already-resolved chain (see store.Chain)
+// into dst: fetches the snapshot and every segment object in order, then
+// hands them to ltxio.MaterializeChain. lineage is used only for error
+// messages (the members themselves already carry everything needed to fetch
+// and apply them).
+//
+// Split out from materializeChainAt so a caller that has already resolved
+// the chain for another reason can reuse that resolution instead of issuing
+// a second store.Chain call. Task 6's fast-path fork attempt
+// (ops.Workspace.tryFastForkCopy) is exactly that case: it must resolve the
+// source chain to even decide whether the fast-path precondition (a single
+// snapshot member) holds, and when it doesn't, or the backend doesn't
+// support CopyObject, the slow path takes over immediately after — re-
+// resolving from scratch would mean a second store.Chain call (an extra
+// List RPC on a remote backend like S3) for the exact same lineage and
+// txid. See copySnapshotToNewLineage/copySnapshotIntoLineageFromChain.
+func (w *Workspace) materializeMembersAt(lineage string, members []store.ChainMember, dst string) error {
 	snapData, _, err := w.Store.B.Get(members[0].Key)
 	if err != nil {
 		return fmt.Errorf("ops: fetching snapshot %s for lineage %s (target %s): %w",
-			members[0].Key, ref.Lineage, dst, err)
+			members[0].Key, lineage, dst, err)
 	}
 	segs := make([]io.Reader, 0, len(members)-1)
 	for _, m := range members[1:] {
 		segData, _, err := w.Store.B.Get(m.Key)
 		if err != nil {
 			return fmt.Errorf("ops: fetching segment %s for lineage %s (target %s): %w",
-				m.Key, ref.Lineage, dst, err)
+				m.Key, lineage, dst, err)
 		}
 		segs = append(segs, bytes.NewReader(segData))
 	}
 	if _, err := ltxio.MaterializeChain(bytes.NewReader(snapData), segs, dst); err != nil {
 		return fmt.Errorf("ops: materializing chain for lineage %s (target %s): %w",
-			ref.Lineage, dst, err)
+			lineage, dst, err)
 	}
 	return nil
 }

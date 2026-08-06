@@ -10,6 +10,8 @@ import (
 	"sort"
 	"strings"
 	"time"
+
+	"github.com/offshoot-db/offshoot/internal/ops/reflink"
 )
 
 // Local is a directory-backed Backend. CAS is implemented with a per-key
@@ -198,6 +200,73 @@ func (l *Local) List(prefix string) ([]string, error) {
 	}
 	sort.Strings(keys)
 	return keys, nil
+}
+
+// tempName returns a unique path in dir (using base as the filename
+// pattern's stem) that is guaranteed to have been free at least momentarily,
+// without leaving a file behind. CopyObject needs this rather than write()'s
+// os.CreateTemp-and-keep-the-handle approach: reflink.CopyFile (like the
+// clonefile(2)/FICLONE syscalls it wraps) requires its destination to not
+// already exist, so the temp path itself must be absent, not merely unique.
+// The same benign race write()'s doc comment accepts for its own per-call
+// temp names applies here identically.
+func tempName(dir, base string) (string, error) {
+	f, err := os.CreateTemp(dir, base+".tmp-*")
+	if err != nil {
+		return "", err
+	}
+	name := f.Name()
+	if err := f.Close(); err != nil {
+		os.Remove(name)
+		return "", err
+	}
+	if err := os.Remove(name); err != nil {
+		return "", err
+	}
+	return name, nil
+}
+
+// CopyObject makes dst a byte-identical copy of src, using reflink.CopyFile
+// (a filesystem clone on APFS/btrfs/xfs-with-reflink, a plain byte copy
+// otherwise) so the copy is near-constant-time when the filesystem supports
+// it. Like write(), it copies to a uniquely-named temp file first and
+// renames into place, so a reader of dst never observes a partial file and
+// a failure partway through leaves dst untouched.
+func (l *Local) CopyObject(dst, src string) error {
+	dstPath, err := l.path(dst)
+	if err != nil {
+		return err
+	}
+	srcPath, err := l.path(src)
+	if err != nil {
+		return err
+	}
+	if _, err := os.Stat(srcPath); err != nil {
+		if os.IsNotExist(err) {
+			return ErrNotFound
+		}
+		return err
+	}
+	dir := filepath.Dir(dstPath)
+	if err := os.MkdirAll(dir, 0o755); err != nil {
+		return err
+	}
+	tmp, err := tempName(dir, filepath.Base(dstPath))
+	if err != nil {
+		return err
+	}
+	if _, err := reflink.CopyFile(tmp, srcPath); err != nil {
+		os.Remove(tmp)
+		if os.IsNotExist(err) {
+			return ErrNotFound
+		}
+		return err
+	}
+	if err := os.Rename(tmp, dstPath); err != nil {
+		os.Remove(tmp)
+		return err
+	}
+	return nil
 }
 
 func (l *Local) Delete(key string) error {

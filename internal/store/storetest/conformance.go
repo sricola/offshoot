@@ -171,4 +171,46 @@ func RunConformance(t *testing.T, keyPrefix string, newBackend func(t *testing.T
 			t.Fatalf("delete of absent key must not error: %v", err)
 		}
 	})
+
+	// CopyObject: a backend that cannot perform the copy at all (S3 in Task
+	// 6a, before Task 6b's server-side CopyObject lands) returns the
+	// sentinel store.ErrCopyUnsupported, and this subtest tolerates that by
+	// skipping rather than failing — the same call this backend's real
+	// caller (ops.Fork's fast path) makes to decide whether to fall back.
+	// Every backend that DOES support it (local today; S3 from Task 6b) must
+	// pass the full round-trip + ErrNotFound checks below, so this same
+	// subtest verifies local, the in-process S3 fake, and (once wired) the
+	// MinIO-gated real-provider suite, all through this one shared entry
+	// point.
+	t.Run("CopyObject", func(t *testing.T) {
+		b := newBackend(t)
+		if err := b.Put(k("data/copy/src"), []byte("copy-me")); err != nil {
+			t.Fatal(err)
+		}
+		err := b.CopyObject(k("data/copy/dst"), k("data/copy/src"))
+		if errors.Is(err, store.ErrCopyUnsupported) {
+			t.Skip("backend does not support CopyObject (ErrCopyUnsupported); callers fall back to the slow path")
+		}
+		if err != nil {
+			t.Fatal(err)
+		}
+		data, etag, err := b.Get(k("data/copy/dst"))
+		if err != nil {
+			t.Fatal(err)
+		}
+		if string(data) != "copy-me" {
+			t.Errorf("copied data = %q, want %q", data, "copy-me")
+		}
+		if etag == "" {
+			t.Error("etag must not be empty")
+		}
+		// The source must be untouched by the copy.
+		srcData, _, err := b.Get(k("data/copy/src"))
+		if err != nil || string(srcData) != "copy-me" {
+			t.Fatalf("source must be unchanged after CopyObject: %q %v", srcData, err)
+		}
+		if err := b.CopyObject(k("data/copy/dst2"), k("data/copy/nope")); !errors.Is(err, store.ErrNotFound) {
+			t.Fatalf("want ErrNotFound copying an absent source, got %v", err)
+		}
+	})
 }

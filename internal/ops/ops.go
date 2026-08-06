@@ -19,6 +19,7 @@ import (
 	"path/filepath"
 	"sort"
 	"strings"
+	"sync/atomic"
 	"time"
 
 	_ "github.com/mattn/go-sqlite3"
@@ -569,30 +570,138 @@ func (w *Workspace) warnIfUncheckpointed(db, branch string, ref store.Ref) {
 // (rather than copying whatever mix of objects src's chain resolved to) is
 // also what keeps the destination lineage storage-independent from src.
 func (w *Workspace) copySnapshotIntoLineage(src store.Ref, cp store.Checkpoint, lineage string) (string, error) {
+	members, err := w.Store.Chain(src.Lineage, cp.TXID)
+	if err != nil {
+		return "", fmt.Errorf("ops: resolving chain for lineage %s to txid %d: %w", src.Lineage, cp.TXID, err)
+	}
+	return w.copySnapshotIntoLineageFromChain(src.Lineage, members, cp, lineage)
+}
+
+// copySnapshotIntoLineageFromChain is copySnapshotIntoLineage's guts, taking
+// an already-resolved chain instead of re-resolving it via store.Chain — see
+// materializeMembersAt's doc comment for why that split exists and who
+// benefits from it (Task 6's fast-path fork attempt falling back to the
+// slow path for the SAME checkpoint it already resolved a chain for).
+func (w *Workspace) copySnapshotIntoLineageFromChain(srcLineage string, members []store.ChainMember, cp store.Checkpoint, dstLineage string) (string, error) {
 	tmp := filepath.Join(os.TempDir(), "offshoot-copy-"+store.NewLineageID()+".db")
 	defer os.Remove(tmp)
-	if err := w.materializeChainAt(src, cp, tmp); err != nil {
-		return "", fmt.Errorf("ops: materializing lineage %s at txid %d for copy: %w", src.Lineage, cp.TXID, err)
+	if err := w.materializeMembersAt(srcLineage, members, tmp); err != nil {
+		return "", fmt.Errorf("ops: materializing lineage %s at txid %d for copy: %w", srcLineage, cp.TXID, err)
 	}
 	var buf bytes.Buffer
 	if err := ltxio.EncodeSnapshot(tmp, cp.TXID, &buf); err != nil {
 		return "", err
 	}
-	key := store.SnapshotKey(lineage, 1, cp.TXID)
+	key := store.SnapshotKey(dstLineage, 1, cp.TXID)
 	if _, err := w.Store.B.PutIf(key, buf.Bytes(), ""); err != nil {
 		return "", err
 	}
 	return key, nil
 }
 
+// forkSlowPathForTest, when true, forces copySnapshotToNewLineage to take
+// the slow materialize-and-re-encode path unconditionally, even when the
+// fast-path precondition holds. Test-only: never set outside a test, and
+// tests that set it must restore it (e.g. via t.Cleanup) since it is
+// process-global. It exists so the ops equivalence tests can produce a
+// "definitely slow path" child from the exact same source as a fast-path
+// child, to compare their outputs — see ops_test.go's fork fast-path tests.
+// The external ops_test package (which needs to import session without an
+// import cycle) reaches this via the exported test-only wrapper in
+// export_test.go.
+var forkSlowPathForTest bool
+
+// forkFastPathHits counts how many times copySnapshotToNewLineage has taken
+// the fast object-copy path (single-snapshot chain, backend CopyObject
+// succeeded) since process start. Test-only instrumentation — nothing in
+// non-test code reads it — so tests can assert the fast path did or didn't
+// fire without depending on backend-specific side effects (e.g. whether a
+// given machine's filesystem actually supports reflink). Atomic because
+// Fork itself has no lock preventing concurrent callers (see
+// TestConcurrentForksFromSameParent), and this counter must not race with
+// itself just because it is test instrumentation.
+var forkFastPathHits atomic.Int64
+
 // copySnapshotToNewLineage copies the snapshot identified by cp (in src's
 // lineage) into a brand-new lineage (epoch 1) and returns the lineage id.
+//
+// Fast path (Task 6a): when src's chain at cp resolves to EXACTLY ONE
+// member and that member is itself a snapshot, the child's seed is a
+// byte-identical backend-level copy of the source snapshot object rather
+// than a materialize-then-re-encode. This is sound because an LTX object
+// names no lineage anywhere in its own bytes — only the KEY it is stored
+// under does (see store.SnapshotKey/store.SegmentKey and
+// github.com/superfly/ltx's Header, which carries page size/commit/TXIDs/
+// checksums/timestamp/NodeID, nothing lineage-identifying) — so the same
+// object is valid content at a different key in a different lineage.
+// tryFastForkCopy verifies the result the same way every other path trusts
+// its output: the child's chain must resolve after the copy; the LTX
+// decoder's own checksum verification happens at first materialization, as
+// everywhere else.
+//
+// Any chain longer than one member (a checkpoint reached via segments past
+// the lineage's last snapshot — the daemon's flush cadence) does not meet
+// the precondition and falls through to the slow path unchanged. A backend
+// that cannot perform CopyObject at all (S3 in Task 6a; store.
+// ErrCopyUnsupported) also falls through to the slow path — see
+// store.S3.CopyObject's doc comment.
 func (w *Workspace) copySnapshotToNewLineage(src store.Ref, cp store.Checkpoint) (string, error) {
 	lineage := store.NewLineageID()
-	if _, err := w.copySnapshotIntoLineage(src, cp, lineage); err != nil {
+	// Resolved once, up front, and threaded through both the fast-path
+	// attempt and the slow-path fallback — see materializeMembersAt's doc
+	// comment for why sharing this one store.Chain call (rather than each
+	// path resolving its own) matters on a remote backend.
+	members, err := w.Store.Chain(src.Lineage, cp.TXID)
+	if err != nil {
+		return "", fmt.Errorf("ops: resolving chain for lineage %s to txid %d: %w", src.Lineage, cp.TXID, err)
+	}
+	if !forkSlowPathForTest {
+		ok, err := w.tryFastForkCopy(members, cp, lineage)
+		if err != nil {
+			return "", err
+		}
+		if ok {
+			return lineage, nil
+		}
+	}
+	if _, err := w.copySnapshotIntoLineageFromChain(src.Lineage, members, cp, lineage); err != nil {
 		return "", err
 	}
 	return lineage, nil
+}
+
+// tryFastForkCopy attempts the fast object-copy fork path into lineage,
+// given src's already-resolved chain at cp (see copySnapshotToNewLineage's
+// doc comment for the precondition and why it is sound). ok is false, err is
+// nil when the precondition doesn't hold or the backend doesn't support
+// CopyObject — both are "fall back to the slow path", not errors. A non-nil
+// err means something actually went wrong (a CopyObject failure that isn't
+// the unsupported sentinel, or the copy landed but the child chain didn't
+// resolve) and must propagate rather than being swallowed into a silent
+// fallback — the slow path would very likely fail the same way, and masking
+// a real error as "just take the slow path" would hide it behind a
+// redundant, slower failure instead of reporting it.
+func (w *Workspace) tryFastForkCopy(members []store.ChainMember, cp store.Checkpoint, lineage string) (ok bool, err error) {
+	if len(members) != 1 || !members[0].Snapshot {
+		return false, nil
+	}
+	srcKey := members[0].Key
+	dstKey := store.SnapshotKey(lineage, 1, cp.TXID)
+	if err := w.Store.B.CopyObject(dstKey, srcKey); err != nil {
+		if errors.Is(err, store.ErrCopyUnsupported) {
+			return false, nil
+		}
+		return false, fmt.Errorf("ops: fast-path fork copy %s -> %s: %w", srcKey, dstKey, err)
+	}
+	// Verify the copy the same way the slow path's output is trusted: the
+	// child chain must resolve. Checksum verification itself happens at
+	// first materialization, same as every other path (Checkout, Rollback,
+	// Promote) already relies on.
+	if _, err := w.Store.Chain(lineage, cp.TXID); err != nil {
+		return false, fmt.Errorf("ops: fast-path fork copy %s -> %s: child chain did not resolve: %w", srcKey, dstKey, err)
+	}
+	forkFastPathHits.Add(1)
+	return true, nil
 }
 
 // Fork creates newBranch from db@srcBranch at head or a named checkpoint.

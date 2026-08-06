@@ -24,7 +24,7 @@ Status legend:
 | Branch = named ref (lineage, epoch, head txid, checkpoints, TTL, protected flag) | shipped-and-tested | `internal/ops/ops.go`, `internal/store` |
 | One writer per lineage, enforced by lease + epoch fencing | shipped-and-tested | `internal/ops/fencing_test.go`; every object write lands under the epoch current at write time |
 | CAS on every ref mutation | shipped-and-tested | Local backend: `O_CREAT\|O_EXCL` lock file. S3-compatible: conditional `PutIf`, gated by an attach-time capability probe |
-| Materialized fork (child gets an independent lineage) | shipped-and-tested | Byte-copy today, not reflink — see Fork performance below |
+| Materialized fork (child gets an independent lineage) | shipped-and-tested | Local backend: reflink/`CopyObject` fast path for single-snapshot chains (Task 6a), falling back to materialize-and-re-encode otherwise; S3 always takes the fallback for now — see Fork performance below |
 | Checkpoint (named state within a branch, not inherited by children) | shipped-and-tested | |
 | Rollback (repoint at new lineage seeded from a checkpoint) | shipped-and-tested | Kept checkpoints' snapshots are copied forward into the new lineage |
 | Promote (repoint target at source's head via fork machinery) | shipped-and-tested | Protected targets require `--force` |
@@ -53,7 +53,7 @@ Status legend:
 | Explicit flush durability (`session status` reports durable-through txid) | shipped-and-tested | Durability advances only on `flush`/`checkpoint`; nothing ships to the store automatically between them |
 | **Background flush interval** (`serve -flush-every`, on by default) | not yet implemented | [Milestone 2](../ROADMAP.md#milestone-2--safe-by-default-for-agents) — today's single sharpest edge: a daemon that dies between flushes loses everything since the last one |
 | Connection contract enforcement (WAL-mode probe, rollback-journal detection) | shipped-and-tested | Violation hard-fails the branch rather than diverging silently |
-| Reflink/clonefile fork (`~40ms` claim in the design spec) | **not yet implemented** | [Milestone 2](../ROADMAP.md#milestone-2--safe-by-default-for-agents) — fork is a synchronous local byte copy today, O(size), unbenchmarked at any scale. The spec's launch-demo number describes the *planned* mechanism, not the current one |
+| Reflink/clonefile fork (`~40ms` claim in the design spec) | shipped-and-tested (local backend, single-snapshot-chain window) | Task 6a of [Milestone 2](../ROADMAP.md#milestone-2--safe-by-default-for-agents) — `ops.Workspace.Fork`'s `copySnapshotToNewLineage` copies the source snapshot object directly (`internal/ops/reflink`: `clonefile(2)` on darwin, `FICLONE` on Linux, silent plain-copy fallback otherwise) instead of materializing and re-encoding, when the source checkpoint's chain resolves to exactly one snapshot. Falls back to the pre-6a path once a daemon session has flushed segments past the last snapshot, or on any backend returning `store.ErrCopyUnsupported` (S3 today — server-side S3 `CopyObject`, gated to objects ≤5GB, is Task 6b, not yet implemented). Measured 512MB fork ~198ms on APFS (was 2.87s), ~9.3ms for the copy alone in isolation from an unrelated pre-existing O(size) check — see docs/benchmarks.md |
 | Async fork-point upload (`pending` marker + fork pin on GC) | **not yet implemented** | [Milestone 2](../ROADMAP.md#milestone-2--safe-by-default-for-agents) — today's fork-point snapshot upload is synchronous, inside the fork call |
 
 ## TTL, GC, and janitor
