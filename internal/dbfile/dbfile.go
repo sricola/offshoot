@@ -64,11 +64,26 @@
 //
 // Tracked follow-ups, in order of how much they buy:
 //
-//   - Make ops.Checkout skip materialization when checkoutState reports the
-//     checkout is already clean and current. It already computes exactly that
-//     verdict a few lines earlier and then re-materializes regardless. This
-//     removes the dominant source above — the per-session-open stranding —
-//     and is the natural mitigation.
+//   - MITIGATED, not removed: ops.Checkout now skips materialization when
+//     checkoutState reports the checkout is already clean and current,
+//     instead of re-materializing regardless. This genuinely removes the
+//     per-session-open stranding above for at-rest/CLI-style reopen
+//     patterns — anything that closes (or never opens under a daemon at
+//     all) before the checkout's `.sum` sidecar goes stale. It does NOT
+//     remove it for the daemon's own default config: the settling flush
+//     (internal/session's first auto-flush after open, landing ~30s later
+//     under `-flush-every`'s default) advances the branch ref's head txid,
+//     but no clean Session.Close rewrites the sidecar to match — only
+//     Checkout/Checkpoint/Rollback/Promote do (see ops.go's writeSum call
+//     sites) — so a session that outlives its own settling flush leaves the
+//     sidecar stale the moment it closes, and the NEXT session.Open on that
+//     branch re-materializes exactly as before this mitigation landed. Two
+//     ledgered follow-ups, neither built this pass: suppressing the
+//     settling flush's own re-baseline cost when content is provably
+//     unchanged (docs/status.md's "Settling-flush checksum-compare
+//     suppression" row), and refreshing the sidecar on a clean Close so
+//     reopen-after-settling stays clean too (docs/status.md's "Sidecar
+//     refresh on clean Close" row).
 //   - Reclaim map entries for paths that no longer exist, so deletion stops
 //     being permanent. (Closing the stranded descriptor is the part that
 //     needs care: it is only safe once nothing in the process can still hold

@@ -171,4 +171,62 @@ func RunConformance(t *testing.T, keyPrefix string, newBackend func(t *testing.T
 			t.Fatalf("delete of absent key must not error: %v", err)
 		}
 	})
+
+	// CopyObject: every backend offshoot ships (local since Task 6a, S3
+	// since Task 6b) supports it for objects within its own limits, and
+	// this subtest exercises the full round-trip + ErrNotFound + overwrite
+	// checks below against all of them — local, the in-process S3 fake, and
+	// the MinIO-gated real-provider suite all run through this one shared
+	// entry point. It still tolerates a backend legitimately returning the
+	// sentinel store.ErrCopyUnsupported by skipping rather than failing
+	// (the same call this subtest's real caller, ops.Fork's fast path,
+	// makes to decide whether to fall back) — S3 itself takes exactly that
+	// path for a source object over its 5GB single-request CopyObject
+	// limit (see store.S3.CopyObject), just not for anything this subtest's
+	// small test objects ever reach.
+	t.Run("CopyObject", func(t *testing.T) {
+		b := newBackend(t)
+		if err := b.Put(k("data/copy/src"), []byte("copy-me")); err != nil {
+			t.Fatal(err)
+		}
+		err := b.CopyObject(k("data/copy/dst"), k("data/copy/src"))
+		if errors.Is(err, store.ErrCopyUnsupported) {
+			t.Skip("backend does not support CopyObject (ErrCopyUnsupported); callers fall back to the slow path")
+		}
+		if err != nil {
+			t.Fatal(err)
+		}
+		data, etag, err := b.Get(k("data/copy/dst"))
+		if err != nil {
+			t.Fatal(err)
+		}
+		if string(data) != "copy-me" {
+			t.Errorf("copied data = %q, want %q", data, "copy-me")
+		}
+		if etag == "" {
+			t.Error("etag must not be empty")
+		}
+		// The source must be untouched by the copy.
+		srcData, _, err := b.Get(k("data/copy/src"))
+		if err != nil || string(srcData) != "copy-me" {
+			t.Fatalf("source must be unchanged after CopyObject: %q %v", srcData, err)
+		}
+		if err := b.CopyObject(k("data/copy/dst2"), k("data/copy/nope")); !errors.Is(err, store.ErrNotFound) {
+			t.Fatalf("want ErrNotFound copying an absent source, got %v", err)
+		}
+
+		// CopyObject overwrites an existing dst (see store.Backend's doc
+		// comment) — unlike PutIf's create-only semantics, every other
+		// snapshot/segment write in this codebase uses.
+		if err := b.Put(k("data/copy/src2"), []byte("overwritten")); err != nil {
+			t.Fatal(err)
+		}
+		if err := b.CopyObject(k("data/copy/dst"), k("data/copy/src2")); err != nil {
+			t.Fatalf("CopyObject onto an existing dst must overwrite, not error: %v", err)
+		}
+		data, _, err = b.Get(k("data/copy/dst"))
+		if err != nil || string(data) != "overwritten" {
+			t.Fatalf("dst after overwrite = %q, want %q: %v", data, "overwritten", err)
+		}
+	})
 }

@@ -61,16 +61,39 @@ of work, leak branches forever, or take the slow path by default.*
 - **Background flush interval.** Today durability advances only on explicit
   `flush`; capture is continuous but nothing ships to the store on its own. A
   daemon that dies four hours after the last flush loses four hours. Add
-  `serve -flush-every` (per-session override), defaulting on.
+  `serve -flush-every` (per-session override), defaulting on. *Delivered as
+  one daemon-wide cadence, not a per-session override — see
+  [docs/status.md](docs/status.md)'s "Per-session `FlushEvery` override" row
+  for that gap, deferred as YAGNI. Follow-up: every session's mandatory
+  first "settling" flush still uploads a full snapshot unconditionally, even
+  when nothing changed since open; a checksum-compare-and-skip refinement is
+  scoped but not built — see status.md's "Settling-flush checksum-compare
+  suppression" row. Related follow-up: that same settling flush advances the
+  branch ref's head txid, but no clean `Session.Close` refreshes the
+  checkout's `.sum` sidecar to match, so any session outliving its own
+  settling flush leaves the next `session open` re-materializing the
+  checkout — see status.md's "Sidecar refresh on clean Close" row.*
 - **MCP forks get TTLs.** The MCP `fork` tool currently cannot set a TTL, so
   every agent-initiated fork is immortal — the exact orphan-leak class the
   design calls launch-killing. Add the tool argument plus a server-side
   default TTL for MCP-created branches.
-- **MCP rides the daemon.** The MCP server currently operates at rest: no live
-  capture, full-snapshot checkpoints, lease collisions with a running daemon.
-  When a daemon is up, MCP should proxy through it (session-aware checkpoint,
-  open/flush/close tools). MCP-first stacks are the default enterprise path;
-  they should get the good path.
+- **MCP rides the daemon.** *(Amended to reflect what this milestone
+  actually delivers.)* MCP's `checkpoint`/`fork`/`checkout` tools ride an
+  **existing** daemon session — one already opened by a harness (the SDKs,
+  `offshoot session open`, or a custom loop) — instead of running at rest,
+  whenever a daemon is up and has a session open on the branch in question;
+  `rollback`/`promote` (its target)/`destroy` refuse rather than repoint or
+  delete a branch out from under such a session. No MCP tool opens or closes
+  a session itself — that scope (an `offshoot_open`/`offshoot_close` pair or
+  similar) is explicitly deferred, not delivered here, and moves to
+  [Milestone 3](#milestone-3--the-eval-harness-release): an MCP-opened
+  session would have no natural owner responsible for closing it, which
+  would recreate exactly the leak class (leases and branches nobody ever
+  releases) this milestone's TTL and background-flush work exists to kill.
+  Milestone 3's pytest fixture plugin (and its vitest counterpart) is where
+  session lifecycle gets an actual, always-present owner. MCP-first stacks
+  are the default enterprise path; the existing-session path is the good
+  path they get today.
 - **Fork performance, measured then fixed.** Fork is currently a local byte
   copy plus a synchronous fork-point upload — O(size) twice, unmeasured at any
   size. Ship a benchmark suite (100MB / 1GB / 10GB, local + MinIO), publish
@@ -91,6 +114,10 @@ fork-per-test, inspect, export, clean up — from their language.*
 - **`offshoot.pytest` fixture plugin + vitest helper + the serious tutorial:**
   session-scoped daemon, seed fixture, fork-per-test with TTL, worker-parallel
   branch naming, teardown. Highest leverage per line of code on this list.
+  This is also where MCP-initiated session open/close belongs, deferred from
+  Milestone 2's "MCP rides the daemon" (see that bullet) — the fixture is a
+  lifecycle owner that reliably closes what it opens, unlike a bare MCP tool
+  call with no equivalent guarantee.
 - **Publish the SDKs.** PyPI + npm with trusted publishing/provenance; SDK
   docs rewritten to installed-package form; manifests filled out
   (urls, classifiers, files whitelist).

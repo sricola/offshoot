@@ -75,6 +75,47 @@ type Engine struct {
 	// goroutine at any time, not just after an established happens-before.
 	rebased atomic.Int64
 
+	// consumed mirrors e.reader's current byte offset within whatever WAL
+	// generation it is presently bound to (see wal.Reader.Offset) — i.e. how
+	// far the replica has been brought up to date. It is written by Run's own
+	// goroutine at exactly the points e.reader's binding changes or advances
+	// (drainStep, on every successful catch-up; rebase and the two
+	// expectRestart-continuation branches in pollOnce/pollOnceTo, on a fresh
+	// unbound reader), and read by Lag() from any goroutine at any time — the
+	// same atomic-field pattern rebased/resumed above already use to make an
+	// otherwise Run-goroutine-only value safe to read concurrently, since
+	// this struct has no general-purpose mutex for e.reader's state.
+	consumed atomic.Int64
+
+	// deadTail is a floor on how much of the WAL's on-disk size Lag() should
+	// ever attribute to outstanding backlog, for the current generation. It
+	// exists because checkpoint(RESTART) — what takeover() uses — resets the
+	// WAL only lazily and, unlike TRUNCATE, never shrinks the -wal file on
+	// disk (see takeover()'s doc comment): when the reset physically lands,
+	// the file can retain its OLD generation's full on-disk length as inert
+	// leftover bytes behind the new generation's (much smaller, freshly
+	// consumed) data, indefinitely, until enough new writes eventually grow
+	// the file past that length. Without this floor, Lag() reads that
+	// leftover length as if it were unconsumed backlog and never stops
+	// reporting it — a persistent phantom lag with no real write behind it
+	// (reviewer repro: drained, WAL 32768 bytes, consumed 4152, phantom
+	// Lag()=28616).
+	//
+	// It is stat'd fresh and recorded at exactly the two points e.consumed
+	// resets to 0 for a brand-new generation — the expectRestart-continuation
+	// branches in pollOnce/pollOnceTo, right after a takeover-armed restart
+	// physically lands — capturing the old file's dead length at the moment
+	// there is (by construction) nothing genuinely outstanding yet. It is
+	// reset to 0 by tryResume and rebase, whose WAL is actually TRUNCATEd
+	// (physically emptied), so no dead tail exists there. See Lag() for how
+	// it is used as a floor rather than a subtrahend, which is what lets Lag()
+	// self-correct once real writes grow the generation past this length,
+	// rather than permanently suppressing genuine backlog. Written only by
+	// Run's own goroutine, at the same points and for the same
+	// no-general-purpose-mutex reason as e.consumed (see its doc comment);
+	// read by Lag() from any goroutine at any time.
+	deadTail atomic.Int64
+
 	captured int // txns since last takeover
 
 	// resumed is set true exactly once, in tryResume's success branch, when
@@ -145,6 +186,116 @@ func (e *Engine) Rebased() int { return int(e.rebased.Load()) }
 // cleanly," not "has this session ever rebased since." A later in-session
 // rebase (e.g. a takeover fold-race) does not un-set it.
 func (e *Engine) Resumed() bool { return e.resumed.Load() }
+
+// Lag reports WAL bytes committed by writers but not yet applied to the
+// replica: the gap between the WAL's current on-disk size and whichever is
+// larger of e.consumed (the byte offset this engine's reader has actually
+// caught up to within the current generation) and e.deadTail (a floor
+// recording how much of that on-disk size is known-inert leftover from a
+// PRIOR generation rather than anything outstanding in this one — see its
+// doc comment for why checkpoint(RESTART)-based takeover makes this
+// necessary, and why a floor rather than a subtrahend is what lets Lag()
+// self-correct once real writes grow the file past it). See e.consumed's
+// doc comment for why reading these atomic fields, rather than e.reader
+// directly, is what makes this safe to call from any goroutine — status
+// reporting in particular calls this concurrently with Run's own goroutine.
+//
+// The on-disk size is read fresh on every call, the same way drainTarget
+// does for DrainNow — a missing WAL file (nothing written yet, or just
+// truncated by a rebase/takeover) means there is nothing outstanding, so 0
+// is reported rather than an error; Lag has no error return to give one.
+//
+// ORDER IS LOAD-BEARING: e.consumed.Load() and e.deadTail.Load() MUST both
+// run BEFORE os.Stat, never after — do not reorder these lines. These are
+// independent reads (two atomic loads, then a syscall) with no lock spanning
+// any of them, so a WAL restart can physically land in the gaps between them
+// regardless of ordering; which ordering is used only decides which
+// direction the resulting skew errs in. The relative order of the two loads
+// against EACH OTHER does not matter (see below); only "both before the
+// stat" does.
+//
+// Why loads-then-stat is safe: e.deadTail is written only alongside
+// e.consumed's reset to 0, at the same two call sites, and every value it is
+// EVER set to is, by construction, an upper bound on that generation's true
+// dead-tail length (see its doc comment — it is stat'd at the exact instant
+// nothing has yet been consumed from the new generation, so the whole
+// on-disk file at that instant is either inert old-generation leftover or,
+// at worst, real data a very fast writer already landed — either way, no
+// smaller than the true dead-tail length). Subtracting an upper bound can
+// only exclude too much, never too little — so no matter which of
+// e.consumed/e.deadTail's current or previous-generation values this
+// function happens to observe (a restart landing mid-read can only make
+// this function see values from BEFORE the restart, per Go's memory model —
+// a goroutine's writes become visible to readers only in the order it made
+// them, never out of order or from the future), max(consumed, deadTail) is
+// never an over-estimate of what should be excluded from fi.Size(). Pairing
+// that floor with a stat read strictly AFTER both loads means fi.Size() can
+// only be >= the on-disk size those loads were computed against, so the
+// subtraction never goes further negative than reality allows — it can
+// under-report (the floor was for an older, smaller on-disk size than the
+// stat now sees) but never over-report. Stat-then-loads (the ordering this
+// function deliberately does NOT use) inverts that: the stat would observe
+// the OLD, larger on-disk size while a restart landing before the loads
+// resets consumed/deadTail out from under it, producing a large false-
+// positive backlog with no real write behind it — exactly the "dashboard
+// lies" failure this metric exists to avoid. The under-report window
+// loads-then-stat leaves is bounded by however long a caller's own Poll
+// interval takes to next update these fields after the restart lands —
+// which can be the engine's configured Poll duration, not merely
+// microseconds — not "brief" the way a single-instruction race would be;
+// still strictly the safe direction (Lag never invents a backlog that isn't
+// there), which is the property Lag's contract actually needs.
+func (e *Engine) Lag() int64 {
+	consumed := e.consumed.Load()
+	deadTail := e.deadTail.Load()
+	if lagRaceHook != nil {
+		lagRaceHook() // test hook; nil (a no-op) in production
+	}
+	fi, err := os.Stat(e.o.DBPath + "-wal")
+	if err != nil {
+		return 0
+	}
+	floor := consumed
+	if deadTail > floor {
+		floor = deadTail
+	}
+	lag := fi.Size() - floor
+	if lag < 0 {
+		return 0
+	}
+	return lag
+}
+
+// lagRaceHook, when non-nil, is invoked by Lag() immediately after it reads
+// e.consumed and e.deadTail and immediately before it stats the WAL file —
+// exactly the gap Lag's doc comment's ordering argument is about. It exists
+// purely so a test can deterministically simulate a WAL restart landing in
+// that gap (mutate the on-disk WAL file and e.consumed/e.deadTail the same
+// way Run's own expectRestart-continuation branches would) and assert Lag
+// degrades in the documented safe (under-report, never over-report)
+// direction, without needing to actually race a real WAL restart against a
+// live Run goroutine. nil (the default) is a no-op and imposes no cost in
+// production.
+var lagRaceHook func()
+
+// armDeadTailBaseline stats the WAL file's current on-disk size and records
+// it as e.deadTail — see e.deadTail's doc comment for why this must run at
+// exactly the same two points e.consumed resets to 0 for a fresh generation
+// (the expectRestart-continuation branches in pollOnce/pollOnceTo), and
+// nowhere else. A stat failure (e.g. the WAL vanished in the instant between
+// drainStep detecting the restart and this call — an external actor
+// truncating it) is recorded as "no dead tail", the conservative,
+// under-report-safe default, exactly like Lag()'s own stat failure handling
+// — never propagated as an error: this is pure bookkeeping for Lag(), never
+// allowed to affect capture's own control flow.
+func (e *Engine) armDeadTailBaseline() {
+	fi, err := os.Stat(e.o.DBPath + "-wal")
+	if err != nil {
+		e.deadTail.Store(0)
+		return
+	}
+	e.deadTail.Store(fi.Size())
+}
 
 // WaitReady blocks until Run's startup tryResume/rebase decision has
 // settled — Resumed() is guaranteed to hold its final value once this
@@ -447,6 +598,8 @@ func (e *Engine) pollOnce(ctx context.Context, idle *time.Time) error {
 			// continuity. No rebase, no snapshot, not counted.
 			e.expectRestart = false
 			e.reader = wal.NewReader(e.o.DBPath + "-wal")
+			e.consumed.Store(0) // fresh generation: nothing consumed from it yet
+			e.armDeadTailBaseline()
 			e.captured = 0
 			return nil
 		}
@@ -513,11 +666,17 @@ func (e *Engine) pollOnceTo(ctx context.Context, idle *time.Time, target int64, 
 			if e.expectRestart {
 				e.expectRestart = false
 				e.reader = wal.NewReader(e.o.DBPath + "-wal")
+				e.consumed.Store(0) // fresh generation: nothing consumed from it yet
 				e.captured = 0
 				newTarget, terr := e.drainTarget()
 				if terr != nil {
 					return terr
 				}
+				// newTarget is the WAL's on-disk size stat'd just now, at the
+				// same moment armDeadTailBaseline (pollOnce's equivalent
+				// branch) would stat it separately — reuse it directly rather
+				// than stat the same file twice. See e.deadTail's doc comment.
+				e.deadTail.Store(newTarget)
 				target = newTarget
 				continue
 			}
@@ -823,6 +982,7 @@ func (e *Engine) drainStep() ([]wal.Frame, error) {
 		return nil, err
 	}
 	off, s1, s2 := e.reader.Offset()
+	e.consumed.Store(off)
 	if err := SaveState(e.statePath(), State{Off: off, Salt1: s1, Salt2: s2}); err != nil {
 		return nil, err
 	}
@@ -1180,6 +1340,8 @@ func (e *Engine) tryResume(ctx context.Context) (bool, error) {
 		return false, nil // main file content changed since our shutdown ⇒ rebase
 	}
 	e.reader = wal.NewReader(e.o.DBPath + "-wal")
+	e.consumed.Store(0) // unbound reader, no prior generation to carry an offset from
+	e.deadTail.Store(0) // shutdown()'s TRUNCATE physically emptied the WAL: no dead tail
 	e.captured = 0
 	e.rebased.Store(0) // a true resume is never a rebase
 	e.expectRestart = false
@@ -1250,6 +1412,8 @@ func (e *Engine) rebase(ctx context.Context) error {
 		return err
 	}
 	e.reader = wal.NewReader(e.o.DBPath + "-wal")
+	e.consumed.Store(0) // fresh snapshot baseline: nothing consumed from the new generation yet
+	e.deadTail.Store(0) // the checkpoint(TRUNCATE) above physically emptied the WAL: no dead tail
 	e.rebased.Add(1)
 	e.captured = 0
 	return SaveState(e.statePath(), State{})

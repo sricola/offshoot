@@ -34,6 +34,44 @@ var ErrFenced = errors.New("session: fenced — lease lost")
 // txid. See flushMu's doc comment for the lock-ordering invariant this
 // implies.
 func (s *Session) Flush(name string) (uint64, error) {
+	return s.flush(name, false)
+}
+
+// flush is Flush's actual implementation, plus the auto/manual distinction
+// flushLoop needs for its own "flushed"/"flush-failed" transition logging
+// (see the deferred call below) — a distinction Flush's own public signature
+// has no room for. flushLoop calls this directly (same package, so no
+// exported surface changes); Flush itself is just auto=false.
+//
+// Named returns (txid, err) exist for exactly one reason: the deferred log
+// call below needs to see this call's actual outcome regardless of which of
+// the many return statements in the body below produced it, without
+// touching every one of them individually. Every "return N, someErr"
+// statement in the body works unchanged under named returns — Go assigns
+// through the names before running deferred funcs either way.
+func (s *Session) flush(name string, auto bool) (txid uint64, err error) {
+	// flushKind — not "kind", which the body below already uses for the
+	// object kind ("snapshot" vs "segment") — is this call's auto/manual
+	// tag for the deferred transition log below.
+	flushKind := "manual"
+	if auto {
+		flushKind = "auto"
+	}
+	defer func() {
+		if err != nil {
+			if errors.Is(err, ErrClosed) {
+				// A Flush racing Close's own shutdown is not an operational
+				// failure worth logging — see ErrClosed's doc comment; the
+				// "closed" transition (Session.Close) already covers this
+				// moment.
+				return
+			}
+			s.logTransition("flush-failed", "kind", flushKind, "error", err.Error())
+			return
+		}
+		s.logTransition("flushed", "kind", flushKind, "txid", txid)
+	}()
+
 	s.flushMu.Lock()
 	defer s.flushMu.Unlock()
 
@@ -74,7 +112,7 @@ func (s *Session) Flush(name string) (uint64, error) {
 	// drain-safety budgets ever grow, this constant should be revisited
 	// rather than left silently coupled to them.
 	dctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
-	err := s.captured.DrainNow(dctx)
+	err = s.captured.DrainNow(dctx)
 	cancel()
 	if err != nil {
 		return 0, fmt.Errorf("session: catch up before flush: %w", err)
@@ -100,7 +138,7 @@ func (s *Session) Flush(name string) (uint64, error) {
 		}
 	}
 
-	txid := ref.HeadTXID + 1
+	txid = ref.HeadTXID + 1
 	var buf bytes.Buffer
 
 	// replicaMu excludes the capture engine's Rebase/Apply for the duration
@@ -179,6 +217,13 @@ func (s *Session) Flush(name string) (uint64, error) {
 	checksumAtEncode := s.checksum
 	pageSizeAtEncode, commitAtEncode := s.pageSize, s.commit
 	genAtEncode := s.rebaseGen
+	// appliedGenAtEncode is the idle short-circuit's counterpart to
+	// genAtEncode: the value appliedGen held at exactly this drain point, so
+	// a confirmed success below can record "everything through here is now
+	// durable" without racing a transaction applied later, concurrently,
+	// while this attempt's upload/PutRef run without replicaMu held — see
+	// appliedGen's doc comment on Session.
+	appliedGenAtEncode := s.appliedGen
 	// Pessimistically assume this attempt will not pan out: pageSet has
 	// already been drained above, so if anything below fails, a retried
 	// Flush must not trust a segment rebuilt from what (little, or nothing)
@@ -199,6 +244,10 @@ func (s *Session) Flush(name string) (uint64, error) {
 	s.replicaMu.Unlock()
 	if err != nil {
 		return 0, fmt.Errorf("session: encode replica: %w", err)
+	}
+
+	if FlushUploadHook != nil {
+		FlushUploadHook() // test hook; nil (a no-op) in production
 	}
 
 	var objKey, kind string
@@ -274,7 +323,35 @@ func (s *Session) Flush(name string) (uint64, error) {
 	if s.rebaseGen == genAtEncode {
 		s.flushChecksum = checksumAtEncode
 		s.forceSnapshot = false
+		// flushedRebaseGen MUST be gated identically to forceSnapshot/
+		// flushChecksum above, not advanced unconditionally: a rebase that
+		// raced this upload has already folded content into the replica
+		// (via checkpoint(TRUNCATE), before ever calling Apply — see
+		// appliedGen/flushedRebaseGen's doc comment on Session) that this
+		// attempt's uploaded bytes do NOT contain, because they were encoded
+		// before the race. Advancing flushedRebaseGen past that race would
+		// mark those un-uploaded, rebase-folded bytes durable — and since
+		// forceSnapshot is deliberately left true by this same race (the gate
+		// above didn't run), nothing would ever call Flush again to actually
+		// ship them: flushLoop's idle short-circuit would then skip every
+		// future tick forever, believing there was nothing pending, and the
+		// rebase-folded write would sit unflushed indefinitely. Leaving
+		// flushedRebaseGen at its pre-race value instead keeps
+		// `rebaseGen != flushedRebaseGen` true, so flushLoop's very next tick
+		// sees it pending and retries.
+		s.flushedRebaseGen = genAtEncode
 	}
+	// flushedGen, by contrast, IS unconditional: appliedGen only ever
+	// advances from recordApply (a real Apply call), never from a rebase,
+	// and the payload this attempt uploaded was drained from pages at
+	// exactly appliedGenAtEncode — so "everything Applied through here is
+	// now durable" holds regardless of whether a rebase also raced this
+	// upload. Any transaction Applied DURING the upload/PutRef window
+	// already bumped appliedGen past appliedGenAtEncode by the time we
+	// regain replicaMu here, so it correctly remains visible as
+	// still-pending afterward (via the appliedGen != flushedGen half of
+	// flushLoop's pending check) regardless of what this assignment does.
+	s.flushedGen = appliedGenAtEncode
 	s.replicaMu.Unlock()
 
 	if snapshot {
@@ -285,6 +362,14 @@ func (s *Session) Flush(name string) (uint64, error) {
 
 	s.mu.Lock()
 	s.durable = txid
+	// Stamp the single ref-write site's success — covers both the snapshot
+	// and segment paths above, and both a manual and an automatic
+	// (flushLoop) caller: LastFlushErr clears on ANY successful flush, per
+	// the Options.FlushEvery contract.
+	s.lastFlushAt = time.Now()
+	s.lastFlushTXID = txid
+	s.lastFlushOK = true
+	s.lastFlushErr = nil
 	s.mu.Unlock()
 	return txid, nil
 }
@@ -310,6 +395,16 @@ const minPagesForFractionCheck = 64
 // observed waiting on flushMu); nil (the default) is a no-op and imposes no
 // cost in production.
 var FlushEncodeHook func()
+
+// FlushUploadHook, when non-nil, is invoked by Flush immediately after it
+// releases replicaMu following a successful encode — i.e. exactly inside the
+// window where Flush's own upload (PutIf/PutRef) runs without replicaMu
+// held, and a concurrent Rebase (a real one via the capture engine, or a
+// test driving replicaSink.Rebase directly) can race in and change rebaseGen
+// out from under this attempt. It exists purely for tests exercising that
+// race (see TestFlushLoopRetriesAfterRebaseDuringUpload); nil (the default)
+// is a no-op and imposes no cost in production.
+var FlushUploadHook func()
 
 // DurableTXID is the txid the store is durable through for this session, or
 // 0 before the first flush.

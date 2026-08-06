@@ -10,11 +10,15 @@ import (
 	"reflect"
 	"strings"
 	"testing"
+	"time"
 
 	"github.com/offshoot-db/offshoot/internal/ops"
 )
 
-func newTools(t *testing.T) (*OffshootTools, *ops.Workspace) {
+// newTools builds a tool set with no default fork TTL, unless a single
+// defaultTTL duration is passed (variadic so every existing call site is
+// unaffected).
+func newTools(t *testing.T, defaultTTL ...time.Duration) (*OffshootTools, *ops.Workspace) {
 	t.Helper()
 	if _, err := exec.LookPath("sqlite3"); err != nil {
 		t.Skip("sqlite3 CLI not on PATH")
@@ -27,7 +31,17 @@ func newTools(t *testing.T) (*OffshootTools, *ops.Workspace) {
 	if err := w.Create("app"); err != nil {
 		t.Fatal(err)
 	}
-	return NewOffshootTools(w, spec), w
+	var ttl time.Duration
+	if len(defaultTTL) > 0 {
+		ttl = defaultTTL[0]
+	}
+	// No daemon listens here: every test built on this harness exercises
+	// the at-rest fallback path (see daemon_test.go's
+	// TestNoDaemonBehavesExactlyAtRest, which spot-checks that a bad socket
+	// produces identical behavior to the pre-daemon-integration at-rest
+	// tools below).
+	sock := filepath.Join(t.TempDir(), "absent.sock")
+	return NewOffshootTools(w, spec, ttl, sock), w
 }
 
 func call(t *testing.T, ts *OffshootTools, name string, args map[string]any) ToolResult {
@@ -463,5 +477,200 @@ func TestToolResultNeverClaimsUndeliveredDurability(t *testing.T) {
 	}
 	if !strings.Contains(msg, "offshoot_checkpoint") {
 		t.Fatalf("checkout result must name the tool (offshoot_checkpoint) the agent needs to call: %s", msg)
+	}
+}
+
+// --- Task 3: MCP forks carry TTLs ---
+
+// refTTL reads back new_branch's TTL directly from the store, the same way
+// `offshoot status` does, so these tests assert on the ref that was actually
+// written rather than trusting the tool's own response text.
+func refTTL(t *testing.T, w *ops.Workspace, db, branch string) string {
+	t.Helper()
+	ref, _, err := w.Store.GetRef(db, branch)
+	if err != nil {
+		t.Fatalf("GetRef(%s, %s): %v", db, branch, err)
+	}
+	return ref.TTL
+}
+
+// TestForkExplicitTTLIsApplied covers brief case (a): an explicit `ttl` on
+// the fork call lands on the child ref, rendered through Go's canonical
+// time.Duration.String() ("2h" -> "2h0m0s"), matching how every other TTL
+// surface (CLI, Status) round-trips it.
+func TestForkExplicitTTLIsApplied(t *testing.T) {
+	ts, w := newTools(t)
+	r := call(t, ts, "offshoot_fork", map[string]any{
+		"database": "app", "new_branch": "attempt-1", "ttl": "2h"})
+	if r.IsError {
+		t.Fatalf("fork: %s", text(r))
+	}
+	if got := refTTL(t, w, "app", "attempt-1"); got != "2h0m0s" {
+		t.Fatalf("ref TTL = %q, want canonical \"2h0m0s\"", got)
+	}
+}
+
+// TestForkFallsBackToDefaultTTL covers brief case (b): a fork that omits
+// `ttl` entirely picks up NewOffshootTools' configured DefaultTTL.
+func TestForkFallsBackToDefaultTTL(t *testing.T) {
+	ts, w := newTools(t, 24*time.Hour)
+	r := call(t, ts, "offshoot_fork", map[string]any{
+		"database": "app", "new_branch": "attempt-1"})
+	if r.IsError {
+		t.Fatalf("fork: %s", text(r))
+	}
+	if got := refTTL(t, w, "app", "attempt-1"); got != "24h0m0s" {
+		t.Fatalf("ref TTL = %q, want canonical \"24h0m0s\" (the configured default)", got)
+	}
+}
+
+// TestForkExplicitNoneOverridesDefaultTTL covers brief case (c): `ttl:"none"`
+// always yields no TTL, even when NewOffshootTools has a configured default
+// — the explicit argument wins.
+func TestForkExplicitNoneOverridesDefaultTTL(t *testing.T) {
+	ts, w := newTools(t, 24*time.Hour)
+	r := call(t, ts, "offshoot_fork", map[string]any{
+		"database": "app", "new_branch": "attempt-1", "ttl": "none"})
+	if r.IsError {
+		t.Fatalf("fork: %s", text(r))
+	}
+	if got := refTTL(t, w, "app", "attempt-1"); got != "" {
+		t.Fatalf("ref TTL = %q, want \"\" (ttl:\"none\" must override the default)", got)
+	}
+}
+
+// TestForkUnparseableTTLIsAToolError covers brief case (d): a TTL the
+// handler can't parse comes back as a tool error (not an RPC fault) that
+// names the accepted forms, so the agent can retry with a valid value.
+func TestForkUnparseableTTLIsAToolError(t *testing.T) {
+	ts, _ := newTools(t)
+	r := call(t, ts, "offshoot_fork", map[string]any{
+		"database": "app", "new_branch": "attempt-1", "ttl": "bananas"})
+	if !r.IsError {
+		t.Fatal("ttl:\"bananas\" must be a tool error")
+	}
+	if !strings.Contains(strings.ToLower(text(r)), "duration") {
+		t.Fatalf("error should name the accepted forms (a Go duration, or \"none\"): %s", text(r))
+	}
+}
+
+// TestForkNegativeOrZeroTTLIsRefused pins that fork's explicit `ttl`, unlike
+// touch, has no "none" concept for a non-positive parsed duration: "0s" or
+// "-1h" is refused rather than silently treated as no TTL (see
+// ops.Workspace.Fork's own doc for the same rule at the ops layer).
+func TestForkNegativeOrZeroTTLIsRefused(t *testing.T) {
+	ts, _ := newTools(t)
+	for _, bad := range []string{"0s", "-1h"} {
+		r := call(t, ts, "offshoot_fork", map[string]any{
+			"database": "app", "new_branch": "attempt-" + bad, "ttl": bad})
+		if !r.IsError {
+			t.Errorf("ttl:%q must be refused (positive only, or \"none\")", bad)
+		}
+	}
+}
+
+// TestForkSchemaAdvertisesTTL covers brief case (e): the fork tool's schema
+// advertises `ttl` as a string property, so an agent that introspects the
+// schema (rather than reading the Description) still discovers the
+// argument.
+func TestForkSchemaAdvertisesTTL(t *testing.T) {
+	ts, _ := newTools(t)
+	for _, tl := range ts.Tools() {
+		if tl.Name != "offshoot_fork" {
+			continue
+		}
+		schemaMap, ok := tl.InputSchema.(map[string]any)
+		if !ok {
+			t.Fatalf("offshoot_fork: InputSchema is not a map[string]any: %T", tl.InputSchema)
+		}
+		props, _ := schemaMap["properties"].(map[string]any)
+		prop, ok := props["ttl"].(map[string]any)
+		if !ok {
+			t.Fatalf("offshoot_fork: schema does not advertise a \"ttl\" property: %v", props)
+		}
+		if prop["type"] != "string" {
+			t.Errorf("offshoot_fork: ttl property type = %v, want \"string\"", prop["type"])
+		}
+		if !strings.Contains(strings.ToLower(tl.Description), "expire") {
+			t.Errorf("offshoot_fork: Description must state the default TTL behavior: %s", tl.Description)
+		}
+		if !strings.Contains(strings.ToLower(tl.Description), "janitor") {
+			t.Errorf("offshoot_fork: Description must note reaping requires a running janitor: %s", tl.Description)
+		}
+		return
+	}
+	t.Fatal("offshoot_fork not found in Tools()")
+}
+
+// --- PM amendment: the fork response echoes the applied TTL and expiry ---
+
+// TestForkResponseEchoesTTLAndExpiry pins the PM amendment: the fork tool's
+// RESPONSE text (not just the ref written to the store) must state the
+// applied TTL and a computed expiry timestamp, so both land in the agent's
+// transcript and it can reason about them later without a separate
+// offshoot_list/offshoot_checkout round trip. It must also carry the same
+// "requires a running janitor" caveat as the Description, since a
+// daemonless MCP setup only reaps on `offshoot gc`.
+func TestForkResponseEchoesTTLAndExpiry(t *testing.T) {
+	ts, _ := newTools(t)
+	r := call(t, ts, "offshoot_fork", map[string]any{
+		"database": "app", "new_branch": "attempt-1", "ttl": "2h"})
+	if r.IsError {
+		t.Fatalf("fork: %s", text(r))
+	}
+	msg := text(r)
+	if !strings.Contains(msg, "2h0m0s") {
+		t.Errorf("response must echo the applied TTL (canonical \"2h0m0s\"): %s", msg)
+	}
+	// Anchor on the "expires_at=" label forkTTLSummary actually emits, not a
+	// bare "20" substring — the latter is nearly vacuous: it happens to pass
+	// today only because the current year starts with "20", so it would keep
+	// passing even if forkTTLSummary's degraded path (see its doc comment)
+	// dropped expires_at while some OTHER "20"-containing text (a txid, a
+	// future year, an unrelated number) remained in the message.
+	if !strings.Contains(msg, "expires_at=") {
+		t.Errorf("response must echo a computed expiry timestamp (expires_at=...): %s", msg)
+	}
+	if !strings.Contains(strings.ToLower(msg), "janitor") {
+		t.Errorf("response must note that reaping requires a running janitor: %s", msg)
+	}
+}
+
+// TestForkResponseNoTTLSaysSo covers the no-TTL case: the response should
+// clearly say the fork never expires rather than silently omitting any TTL
+// mention (which would be ambiguous with a bug that dropped the TTL text).
+func TestForkResponseNoTTLSaysSo(t *testing.T) {
+	ts, _ := newTools(t)
+	r := call(t, ts, "offshoot_fork", map[string]any{
+		"database": "app", "new_branch": "attempt-1"})
+	if r.IsError {
+		t.Fatalf("fork: %s", text(r))
+	}
+	msg := strings.ToLower(text(r))
+	if !strings.Contains(msg, "none") && !strings.Contains(msg, "never") && !strings.Contains(msg, "no ttl") {
+		t.Errorf("response should say the fork has no TTL: %s", text(r))
+	}
+}
+
+// TestForkTTLSummaryKeepsJanitorNoteWhenReReadFails is the regression test
+// for the whole-branch review finding that forkTTLSummary's degraded path
+// dropped the janitor caveat along with the computed expiry when the
+// post-fork GetRef re-read fails — even though the caveat is a static fact
+// about how reaping works, not something derived from that re-read, so it
+// should never have depended on it succeeding. Exercised directly against
+// forkTTLSummary (rather than through the fork tool end to end) by asking
+// for a branch that was never forked, so GetRef fails exactly the way a real
+// race (the ref vanishing between fork and re-read) would.
+func TestForkTTLSummaryKeepsJanitorNoteWhenReReadFails(t *testing.T) {
+	_, ws := newTools(t)
+	msg := forkTTLSummary(ws, "app", "never-forked", time.Hour)
+	if strings.Contains(msg, "expires_at=") {
+		t.Fatalf("expected the degraded (no re-read) path, but got an expiry anyway: %s", msg)
+	}
+	if !strings.Contains(strings.ToLower(msg), "janitor") {
+		t.Errorf("degraded path must still carry the janitor caveat — it doesn't depend on the re-read: %s", msg)
+	}
+	if !strings.Contains(msg, "1h0m0s") {
+		t.Errorf("degraded path must still echo the applied TTL: %s", msg)
 	}
 }

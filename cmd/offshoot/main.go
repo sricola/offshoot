@@ -40,8 +40,23 @@ Usage:
   offshoot lease list                       list every branch's lease
   offshoot lease acquire <db>[@branch] [--ttl 30s]   claim or renew a lease
   offshoot lease release <db>[@branch]      release a lease
-  offshoot serve [-socket PATH]             run the daemon until SIGINT/SIGTERM
-  offshoot mcp                              serve the MCP tool set on stdio for an agent
+  offshoot serve [-socket PATH] [-reap-every d] [-gc-grace d] [-flush-every d]
+                                             run the daemon until SIGINT/SIGTERM;
+                                             -flush-every ships every open session's
+                                             work on a cadence even if it's never
+                                             flushed explicitly (default 30s; 0 disables)
+  offshoot mcp [-default-ttl d|none] [-socket PATH]
+                                             serve the MCP tool set on stdio for an agent;
+                                             forked branches get this TTL unless the fork
+                                             call overrides it (default 24h; 0/none disables
+                                             — reaping still needs a running janitor, i.e.
+                                             offshoot serve, or a manual offshoot gc);
+                                             -socket names the daemon to ride when one is up
+                                             (default: same derivation offshoot serve uses) —
+                                             checkpoint/fork/checkout on a branch with a
+                                             session already open there use it for live
+                                             capture; everything else, and any branch with no
+                                             open session, still runs entirely at rest
   offshoot session open <db>[@branch] [-socket PATH]      open a session; prints the checkout path
   offshoot session flush <db>[@branch] [name] [-socket PATH]   flush to a durable snapshot; prints the txid
   offshoot session status [-socket PATH]                  list open sessions and their durable txid
@@ -156,6 +171,32 @@ func parseForkTTLFlag(raw string) (time.Duration, error) {
 		return 0, fmt.Errorf(`fork --ttl %q must be positive; omit --ttl for no TTL`, raw)
 	}
 	return d, nil
+}
+
+// parseDefaultTTLFlag extracts mcp's -default-ttl flag from args and parses
+// it, defaulting to 24h when the flag is absent. It reuses parseTTLFlag, so
+// "none" and a literal zero duration ("0", "0s", ...) both disable the
+// default identically; a negative duration is rejected as a usage error
+// (mirroring -flush-every's own non-positive-is-a-mistake rule) rather than
+// silently aliased to "disabled". Returns the parsed default TTL and the
+// remaining (flag-stripped) args, so the caller can still reject leftover
+// arguments itself.
+func parseDefaultTTLFlag(args []string) (time.Duration, []string, error) {
+	raw, rest, _, err := extractFlag(args, "-default-ttl")
+	if err != nil {
+		return 0, nil, err
+	}
+	if raw == "" {
+		raw = "24h"
+	}
+	d, err := parseTTLFlag(raw)
+	if err != nil {
+		return 0, nil, fmt.Errorf("-default-ttl: %w", err)
+	}
+	if d < 0 {
+		return 0, nil, fmt.Errorf("-default-ttl %q must be zero, \"none\" (both disable it), or positive", raw)
+	}
+	return d, rest, nil
 }
 
 func main() {
@@ -474,16 +515,29 @@ func run(args []string) error {
 			return fmt.Errorf("unknown lease subcommand %q", rest[0])
 		}
 	case "mcp":
-		if len(rest) != 0 {
-			return fmt.Errorf("usage: offshoot mcp")
+		sock, rest, err := socketOverride(rest)
+		if err != nil {
+			return fmt.Errorf("usage: offshoot mcp [-default-ttl DURATION|none] [-socket PATH]: %w", err)
 		}
-		ts := mcp.NewOffshootTools(w, spec)
+		defaultTTL, rest, err := parseDefaultTTLFlag(rest)
+		if err != nil {
+			return fmt.Errorf("usage: offshoot mcp [-default-ttl DURATION|none] [-socket PATH]: %w", err)
+		}
+		if len(rest) != 0 {
+			return fmt.Errorf("usage: offshoot mcp [-default-ttl DURATION|none] [-socket PATH]")
+		}
+		// sock == "" here (the common case: no -socket given) is resolved by
+		// NewOffshootTools itself via daemon.DefaultSocketPath(spec) — the
+		// same default `offshoot serve` binds to for this store — so a bare
+		// `offshoot mcp` and a bare `offshoot serve` against the same store
+		// agree on where to look without either side hardcoding the path.
+		ts := mcp.NewOffshootTools(w, spec, defaultTTL, sock)
 		srv := mcp.NewServer(os.Stdin, os.Stdout, ts)
 		return srv.Serve(context.Background())
 	case "serve":
 		sock, rest, err := socketOverride(rest)
 		if err != nil {
-			return fmt.Errorf("usage: offshoot serve [-socket PATH] [-reap-every DURATION] [-gc-grace DURATION]: %w", err)
+			return fmt.Errorf("usage: offshoot serve [-socket PATH] [-reap-every DURATION] [-gc-grace DURATION] [-flush-every DURATION]: %w", err)
 		}
 		reapEveryStr, rest, _, err := extractFlag(rest, "-reap-every")
 		if err != nil {
@@ -507,8 +561,23 @@ func run(args []string) error {
 		if err != nil {
 			return fmt.Errorf("-gc-grace: %w", err)
 		}
+		flushEveryStr, rest, _, err := extractFlag(rest, "-flush-every")
+		if err != nil {
+			return err
+		}
+		if flushEveryStr == "" {
+			flushEveryStr = "30s"
+		}
+		flushEvery, err := time.ParseDuration(flushEveryStr)
+		if err != nil {
+			return fmt.Errorf("-flush-every: %w", err)
+		}
+		if flushEvery < 0 {
+			return fmt.Errorf("-flush-every %q must be zero or positive; zero disables auto-flush "+
+				"(there is no \"none\" alias — a negative value is almost certainly a mistake)", flushEveryStr)
+		}
 		if len(rest) != 0 {
-			return fmt.Errorf("usage: offshoot serve [-socket PATH] [-reap-every DURATION] [-gc-grace DURATION]")
+			return fmt.Errorf("usage: offshoot serve [-socket PATH] [-reap-every DURATION] [-gc-grace DURATION] [-flush-every DURATION]")
 		}
 		if sock == "" {
 			p, err := daemon.DefaultSocketPath(spec)
@@ -522,6 +591,11 @@ func run(args []string) error {
 			return err
 		}
 		srv.StartJanitor(reapEvery, gcGrace)
+		// safe-by-default cadence: the daemon ships work on a cadence even
+		// if the agent it's serving never calls flush; -flush-every 0
+		// disables this, restoring manual-only (session.Options' own
+		// default).
+		srv.SetFlushEvery(flushEvery)
 		fmt.Println("offshoot serving on", sock)
 		sigc := make(chan os.Signal, 1)
 		signal.Notify(sigc, os.Interrupt, syscall.SIGTERM)
@@ -591,8 +665,17 @@ func run(args []string) error {
 				return err
 			}
 			for _, in := range resp.Sessions {
-				line := fmt.Sprintf("%s@%s durable=%d epoch=%d holder=%s checkout=%s",
-					in.DB, in.Branch, in.DurableTXID, in.Epoch, in.Holder, in.Checkout)
+				line := fmt.Sprintf("%s@%s durable=%d epoch=%d holder=%s checkout=%s lag=%d",
+					in.DB, in.Branch, in.DurableTXID, in.Epoch, in.Holder, in.Checkout, in.CaptureLag)
+				if in.LastFlushAt != "" {
+					line += " last_flush=" + in.LastFlushAt
+				}
+				if in.DurableAge != "" {
+					line += " age=" + in.DurableAge
+				}
+				if in.FlushError != "" {
+					line += " flush_error=" + in.FlushError
+				}
 				if in.Error != "" {
 					line += " ERROR=" + in.Error
 				}
