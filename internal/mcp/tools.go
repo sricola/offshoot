@@ -631,13 +631,16 @@ func forkTTLSummary(ws *ops.Workspace, db, branch string, ttl time.Duration) str
 	}
 	ref, _, err := ws.Store.GetRef(db, branch)
 	if err != nil {
-		// The fork itself already succeeded; a re-read failure here just
-		// means the response can't include a computed expiry.
-		return fmt.Sprintf("ttl=%s", ttl)
+		// The fork itself already succeeded; a re-read failure here only
+		// means the response can't include a computed expiry — the janitor
+		// caveat below doesn't depend on that re-read at all (it's a static
+		// fact about how reaping works, not a value derived from the ref),
+		// so it must not degrade along with expires_at.
+		return fmt.Sprintf("ttl=%s; %s", ttl, forkTTLJanitorNote)
 	}
 	deadline, ok := ops.ReapDeadline(ref)
 	if !ok {
-		return fmt.Sprintf("ttl=%s", ref.TTL)
+		return fmt.Sprintf("ttl=%s; %s", ref.TTL, forkTTLJanitorNote)
 	}
 	return fmt.Sprintf("ttl=%s expires_at=%s; %s", ref.TTL, deadline.Format(time.RFC3339), forkTTLJanitorNote)
 }
