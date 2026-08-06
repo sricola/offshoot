@@ -15,6 +15,22 @@ version if you depend on format stability.
 
 ### Added
 
+- Benchmarks: `internal/ops/fork_bench_test.go` measures `Fork`'s current
+  slow path (`copySnapshotToNewLineage` materializes the source checkpoint
+  and re-encodes a fresh snapshot for the child lineage — O(size)),
+  `Checkout`'s clean-skip fast path (still O(size): it still quiesces and
+  SHA-256-hashes the whole file, just skips the rebuild), and
+  `session.Open`'s latency, all against a shared 64MB/512MB size table (plus
+  a `size=4GB` case, skipped by default under `-short`) so before/after
+  numbers read off identical subtest names once Task 6's fast path lands.
+  `BenchmarkSessionOpen` also measures, once per size, the stored size of a
+  session's settling flush — the full snapshot every daemon session uploads
+  on its first auto-flush tick, even read-only — confirming that cost is
+  O(size) rather than fixed. `make bench` runs the default sweep locally;
+  `make bench-s3` runs the same benchmarks against a real MinIO container.
+  Measured baselines, method, and machine description (host + a Linux
+  container) are recorded in `docs/benchmarks.md`.
+
 - MCP rides a running daemon: `offshoot_checkpoint`, `offshoot_fork`, and
   `offshoot_checkout` each probe the daemon fresh on every call (never
   cached — the daemon may start after the MCP server does) and take a
