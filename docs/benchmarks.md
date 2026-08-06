@@ -101,7 +101,14 @@ been flushed through a live session's segment cadence — the child's seed is
 a direct backend-level object copy (`store.Backend.CopyObject`) of the
 source snapshot object, verified by resolving the child's own chain
 afterward, rather than a materialize-to-temp-file-then-`ltxio.EncodeSnapshot`
-round trip. `internal/ops/reflink` backs the local implementation: a
+round trip. That post-copy verification (`tryFastForkCopy`'s second call to
+`store.Chain`, which is itself one `Backend.List` call) is a real extra
+round trip the fast path pays that the slow path doesn't need — it's what's
+included in every `ForkAtHead` number in this document (the numbers were
+never measured with it stripped out), and on the S3 backend it's a real
+extra HTTP request per fork alongside the `HEAD`/`CopyObject`/`PutRef`
+sequence described in "Results: S3 path" below. `internal/ops/reflink` backs
+the local implementation: a
 filesystem clone (`clonefile(2)` on darwin, the `FICLONE` ioctl on Linux)
 when the filesystem supports it, silently falling back to a plain byte copy
 otherwise. S3 returns `store.ErrCopyUnsupported` unconditionally in this
@@ -199,18 +206,24 @@ hash). To see the fast path's own cost in isolation, forking at a **named**
 checkpoint (`at="seed"`) skips that check entirely:
 
 ```
-go test ./internal/ops -bench 'ForkAtHead' -benchmem -run '^$' -count=3 -short
+go test ./internal/ops -bench 'ForkAtHead' -benchmem -run '^$' -short
 # (fork_bench_test.go temporarily edited: w.Fork(db, "main", branch, "seed", 0))
 BenchmarkForkAtHead/size=64MB-10            146     9290401 ns/op    7232.28 MB/s
 BenchmarkForkAtHead/size=512MB-10           148     9254606 ns/op   58075.83 MB/s
 ```
 
-**~9.3ms regardless of size** — 64MB and 512MB land within run-to-run noise
-of each other. This is the number that matters for the design spec's
-"~40ms" figure: it's in the same regime, on this machine, in this fast
-path's applicability window. It is not the number the committed benchmark
-suite reports (that suite deliberately measures `Fork`'s actual default
-behavior, `at=""`, which still includes Task 1's separate O(size) check),
+Each line above is a **single run** (`go test`'s default `-count=1`), not
+this document's usual `-count=3`-and-average the tables further up use —
+labeled that way here so it isn't mistaken for the same kind of measurement.
+It is a spot-check, taken once per size with the temporary edit noted above,
+not a repeated-and-averaged number.
+
+**~9.3ms regardless of size** — the 64MB and 512MB single-run figures land
+within a few percent of each other. This is the number that matters for the
+design spec's "~40ms" figure: it's in the same regime, on this machine, in
+this fast path's applicability window. It is not the number the committed
+benchmark suite reports (that suite deliberately measures `Fork`'s actual
+default behavior, `at=""`, which still includes Task 1's separate O(size) check),
 and it required a one-line, temporary, uncommitted edit to produce — it's
 reported here for honesty about what's actually constant-time and what
 isn't, not as a replacement for the table above.
@@ -296,9 +309,12 @@ backend at all — Task 6b doesn't change that either.
 `ForkAtHead` is ~3.5x faster at 64MB and ~4.4x faster at 512MB: the
 server-side copy means this process never downloads the source snapshot
 object, never re-encodes it, and never re-uploads it — MinIO copies the
-object on its own side of the wire, so the only round trips this process
-pays for are the `HEAD` (size gate), the `CopyObject` request itself, and
-the same `PutRef`/`GetRef` calls every fork makes regardless of path. It is
+object on its own side of the wire, so the round trips this process pays
+for are the `HEAD` (size gate), the `CopyObject` request itself, one `List`
+call to verify the child's chain resolves after the copy (see "Task 6a: what
+changed" above — this is extra work the fast path pays that the slow path
+doesn't, not free), and the same `PutRef`/`GetRef` calls every fork makes
+regardless of path. It is
 NOT as fast as the local numbers (1.03s vs. ~198ms at 512MB): `Fork`'s
 uncheckpointed-changes SHA-256 check (see "Isolating the fast path itself"
 above) still runs against the LOCAL checkout file either way

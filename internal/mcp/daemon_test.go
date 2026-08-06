@@ -486,3 +486,44 @@ func TestPromoteProceedsAtRestWhenNoSessionOpen(t *testing.T) {
 		t.Fatalf("promote with daemon up but no open session must proceed at rest: %s", text(r))
 	}
 }
+
+// TestPromoteFromOpenSourceProceedsAtRest proves promote's asymmetric guard
+// (see the promote function's doc comment above): an open daemon session on
+// the SOURCE does NOT trigger refuseIfSessionOpen the way one on the target
+// does — a session-free target must promote successfully — but the
+// promoted state must reflect the source's last-flushed/checkpointed head,
+// not an unflushed write sitting only in the source's live SQLite file.
+// This MCP codepath calls ops.Workspace.Promote directly, bypassing the
+// daemon entirely, so there is no "flush the source first" step here the
+// way the daemon's own fork op has for offshoot_fork. Pinning this today
+// means a future symmetry refactor (making promote refuse on an open
+// source too, or flush it first) can't silently change this behavior
+// without a test failing to call it out.
+func TestPromoteFromOpenSourceProceedsAtRest(t *testing.T) {
+	ts, w, sock := newDaemonTools(t)
+	if _, err := w.Fork("app", "main", "attempt-1", "", 0); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := w.Fork("app", "main", "attempt-2", "", 0); err != nil {
+		t.Fatal(err)
+	}
+	checkoutPath := openSession(t, sock, "app", "attempt-1") // the promote SOURCE
+
+	sqliteExec(t, checkoutPath, "CREATE TABLE t (v); INSERT INTO t VALUES ('unflushed');")
+
+	r := call(t, ts, "offshoot_promote", map[string]any{
+		"database": "app", "source": "attempt-1", "target": "attempt-2"})
+	if r.IsError {
+		t.Fatalf("promote from an open-session SOURCE (session-free target) must proceed at rest: %s", text(r))
+	}
+
+	path, err := w.Checkout("app", "attempt-2")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if n := sqliteCount(t, path,
+		"SELECT COUNT(*) FROM sqlite_master WHERE type='table' AND name='t';"); n != 0 {
+		t.Fatalf("promoted target has table t (count=%d), want 0 — promote must use the source's "+
+			"last-flushed head, not the unflushed write sitting in its open session", n)
+	}
+}

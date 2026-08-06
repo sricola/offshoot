@@ -13,6 +13,19 @@ version if you depend on format stability.
 
 ## [Unreleased]
 
+## [0.1.1] - 2026-08-06
+
+Milestone 2: safe defaults for an unattended agent. The daemon now ships
+work on its own cadence instead of relying on an explicit `flush`, forks and
+`session.Open` are fast on the common single-snapshot-chain path (measured,
+before and after, in `docs/benchmarks.md`), MCP rides an already-open daemon
+session for live capture and now TTLs its own forks by default, `status`
+answers "which branch is behind and why," and `docs/status.md` /
+`docs/reference.md` / this file are the honest accounting of what shipped,
+what's merely "shipped" (unverified in some dimension), and what was
+deliberately deferred with a stated reason rather than just left undone.
+Release tag lands after this branch merges.
+
 ### Added
 
 - Fast-path fork (Task 6a, local half): `ops.Workspace.Fork`/`Rollback`/

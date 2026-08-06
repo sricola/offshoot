@@ -9,8 +9,13 @@ var (
 	ErrNotFound = errors.New("store: not found")
 	ErrCAS      = errors.New("store: compare-and-swap conflict")
 	// ErrCopyUnsupported is returned by CopyObject when a backend cannot
-	// perform a server-side or filesystem-level copy at all (e.g. S3 in
-	// Task 6a, before Task 6b's server-side CopyObject lands). Callers
+	// perform a server-side or filesystem-level copy of THIS particular
+	// object — every backend offshoot ships supports CopyObject in general
+	// (local: a filesystem clone or plain-copy fallback; S3: a real
+	// server-side CopyObject call), but S3's is gated to objects at or
+	// under its 5GB single-request CopyObject limit, so the sentinel still
+	// fires for anything larger (see store.S3.CopyObject's doc comment;
+	// multipart UploadPartCopy is not implemented, out of scope). Callers
 	// (ops.Fork's fast path) must treat this as "fall back to the slow,
 	// materialize-and-re-encode path" — it is a capability signal, not a
 	// hard failure.

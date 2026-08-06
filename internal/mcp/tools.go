@@ -307,7 +307,11 @@ func (t *OffshootTools) Tools() []Tool {
 				"everything written since. Call this when an attempt on a branch has " +
 				"gone wrong and you want to restore known-good state rather than " +
 				"manually undoing changes. Reports the checkout path to reopen after " +
-				"the rollback. `branch` defaults to \"main\" if omitted.",
+				"the rollback. `branch` defaults to \"main\" if omitted. If a daemon " +
+				"session is open on this branch, the call is refused instead of " +
+				"proceeding, since rollback repoints the branch's storage out from " +
+				"under a session the daemon still believes it owns — close the " +
+				"session first (e.g. `offshoot session close`) and retry.",
 			InputSchema: schema(reqStr("database"), reqStr("to"), optStrDefault("branch", "main")),
 		},
 		{
@@ -318,7 +322,15 @@ func (t *OffshootTools) Tools() []Tool {
 				"you've validated a forked attempt and are ready to make it the branch " +
 				"of record. Protected branches (main is protected by default) refuse promotion " +
 				"unless `force` is set — treat that refusal as confirmation you need, " +
-				"not a bug.",
+				"not a bug. If a daemon session is open on the TARGET branch, the call " +
+				"is refused instead of proceeding — `force` does not override this — " +
+				"since promoting repoints the target's storage out from under a session " +
+				"the daemon still believes it owns; close the session first (e.g. " +
+				"`offshoot session close`) and retry. An open session on the SOURCE " +
+				"does not block the call, but the promoted state is the source's " +
+				"last-flushed/checkpointed head, not any write still unflushed in that " +
+				"live session — flush or checkpoint the source first if you need its " +
+				"very latest state promoted.",
 			InputSchema: schema(reqStr("database"), reqStr("source"), reqStr("target"), optBool("force")),
 		},
 		{
@@ -326,7 +338,11 @@ func (t *OffshootTools) Tools() []Tool {
 			Description: "Permanently discard a branch and its checkout. Call this to " +
 				"clean up a failed or abandoned attempt once you're done with it. " +
 				"Protected branches refuse destruction unless `force` is set — treat " +
-				"that refusal as confirmation you need, not a bug.",
+				"that refusal as confirmation you need, not a bug. If a daemon session " +
+				"is open on this branch, the call is refused instead of proceeding — " +
+				"`force` does not override this — since destroy deletes the branch's " +
+				"storage out from under a session the daemon still believes it owns; " +
+				"close the session first (e.g. `offshoot session close`) and retry.",
 			InputSchema: schema(reqStr("database"), reqStr("branch"), optBool("force")),
 		},
 	}
@@ -731,7 +747,10 @@ type promoteArgs struct {
 // quirk (identical to promote's pre-existing at-rest behavior), not a
 // fencing hazard — there's nothing here for the daemon's own "flush the
 // source first" semantics (opPromote) to ride, since this path never
-// touches the daemon at all.
+// touches the daemon at all. daemon_test.go's
+// TestPromoteFromOpenSourceProceedsAtRest pins exactly this: an open
+// source session doesn't refuse, and the promoted state is the source's
+// last-flushed head, not the unflushed write.
 func (t *OffshootTools) promote(args json.RawMessage) (ToolResult, error) {
 	var a promoteArgs
 	if err := json.Unmarshal(args, &a); err != nil {

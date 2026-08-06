@@ -137,6 +137,20 @@ not yet in the store; `session status` reports the txid each session is durable
 through. A session that loses its lease is fenced and stops — it will not write
 under a dead epoch — and `session status` shows the error.
 
+By default the daemon also ships every open session's work on a timer,
+independent of any explicit `flush`:
+
+    offshoot serve -flush-every 30s        # the default; 0 disables it
+
+`-flush-every` bounds how much committed-but-unflushed work is ever at risk:
+worst case, a daemon that dies loses at most one `-flush-every` interval's
+worth of writes, instead of everything since the last manual flush. `-flush-every
+0` turns the timer off and returns to durability that only advances when
+something calls `flush` explicitly — this project's original behavior, still
+available if you want it. The cadence is a daemon-wide setting applied to
+every session `offshoot serve` opens; there's no way yet to give one session
+a different cadence than the rest (see [docs/status.md](docs/status.md)).
+
 ### TTLs and the reaping janitor
 
 A branch can carry a TTL, set at fork time or any time after:
@@ -185,10 +199,39 @@ segments. (That cadence is configurable when embedding the session library
 directly — `Options.SnapshotEvery` — but the daemon does not currently
 expose it, so every daemon-managed session uses the default of sixteen.)
 
+A session's very first auto-flush after `session open` is always a full
+snapshot too, no matter where that lands in the sixteen-flush cadence —
+closing a startup-rebase race requires it — so **every** daemon-managed
+session pays for one full-snapshot upload shortly after opening, even a
+read-only one that never writes anything. That upload is sized to the
+database, not fixed: measured at 541.9MB uploaded for a 512MB source
+database. It happens once per session (the "settling flush"), not on every
+tick after that — see [docs/benchmarks.md](docs/benchmarks.md#settling-flush-cost-task-2-controller-decision)
+for the measurement and how it was taken.
+
+Under continuous writing, the daemon's default `-flush-every 30s` combined
+with the default sixteen-flush snapshot cadence means a full snapshot ships
+roughly every 8 minutes (30s × 16 ticks) for as long as the agent keeps
+writing between every tick. An idle session — nothing committed and no
+rebase since the last successful flush — skips the tick entirely (no object
+write, no ref write at all), so a quiet session pays none of this; the cost
+scales with how much the agent is actually writing, not with wall-clock time
+alone.
+
 The at-rest `offshoot checkpoint` still writes a full snapshot every time. It
 runs without a daemon, so it has no record of which pages changed and would
 have to diff the whole database to find out. If you checkpoint large databases
 in a loop, run a daemon.
+
+Forking is a different cost from flushing. At rest, `offshoot fork` (and the
+same machinery behind `rollback`/`promote`) copies the source snapshot object
+directly — a filesystem clone or a backend-side server copy, not a
+materialize-and-re-encode round trip — whenever the checkpoint being forked
+resolves to a single, unsegmented snapshot; once a daemon session has
+flushed even one segment past a branch's last snapshot, fork falls back to
+the slower materialize-and-re-encode path for that checkpoint. Measured
+before/after numbers for both paths, both backends, are in
+[docs/benchmarks.md](docs/benchmarks.md).
 
 The daemon serves a unix socket (mode 0600) under your cache directory, one per
 store; override with `OFFSHOOT_SOCKET`, or pass `-socket PATH` to `offshoot
@@ -197,6 +240,25 @@ every `offshoot session ...` command too (or export `OFFSHOOT_SOCKET`
 instead) — the CLI has no other way to find a non-default socket. Daemon and
 agent must share a kernel and a local filesystem: the checkout is a real
 SQLite file both processes open.
+
+### Resource behavior
+
+There are no resource budgets yet — no checkout-cache disk limit, no FD
+limit, no eviction of cold sessions (all [Milestone 4](ROADMAP.md#milestone-4--operable-at-scale)).
+In today's code, an open session's own FD footprint is small and fixed
+(capture engine reader, WAL reader, lease-renewal timer — none of it scales
+with how long the session stays open or how much it writes). Disk is the
+sharper cost: `Checkout` no longer re-materializes a checkout that's already
+clean and current at the branch's head, which removes the common case of
+stranding a leftover file descriptor — and the full copy of the database
+behind it — on every session open. But a checkout that *does* get
+re-materialized (dirty, stale, or destroyed/reaped while an earlier open's
+descriptor still points at its now-unlinked inode) still strands one
+descriptor, and the disk behind it, for the life of the daemon process —
+there is no reclamation path for that yet. In practice: a daemon that keeps
+reopening the same clean branches stays flat; one that churns through many
+short-lived or dirty checkouts accumulates orphaned disk over its uptime.
+Restarting the daemon reclaims everything a fresh process never opened.
 
 Design: docs/superpowers/specs/2026-07-29-offshoot-design.md
 Capture-spike evidence: docs/superpowers/specs/2026-07-29-offshoot-spike-report.md
@@ -255,6 +317,26 @@ a daemon merely running in the background changes nothing on its own.
 `offshoot mcp -socket PATH` names the daemon to ride; omit it and MCP derives
 the same default socket `offshoot serve` does for the store, so the two
 agree without either side hardcoding a path.
+
+`offshoot_rollback`, `offshoot_promote` (checked against its `target`), and
+`offshoot_destroy` take the opposite stance from checkpoint/fork/checkout:
+each **refuses outright — even with `force`** — whenever the daemon has any
+session, healthy or fenced, open on the affected branch, rather than
+proceeding at rest. All three repoint or delete a branch's ref directly,
+bypassing the daemon entirely; without the refusal, one of these calls could
+clear a lease or delete/repoint storage out from under a session the daemon
+still believes it owns. `force` only ever overrides the protected-branch
+check described above — it has no effect on this refusal. The remedy is to
+close the session first (`offshoot session close`, or the SDK/harness
+equivalent) and retry. `offshoot_promote`'s `source` is the one exception:
+an open session there does not block the promote, but the promoted state is
+the source's last-flushed/checkpointed head, not any write still unflushed
+in that live session.
+
+**In short: the good path for `offshoot mcp` requires a harness-opened
+session** — the SDKs, `offshoot session open`, or your own loop, opened
+*before* the agent's tool calls. Without one, every tool still works, just
+entirely at rest, exactly as if no daemon were running.
 
 ### Python SDK
 
