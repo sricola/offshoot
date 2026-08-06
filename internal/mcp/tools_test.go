@@ -35,7 +35,13 @@ func newTools(t *testing.T, defaultTTL ...time.Duration) (*OffshootTools, *ops.W
 	if len(defaultTTL) > 0 {
 		ttl = defaultTTL[0]
 	}
-	return NewOffshootTools(w, spec, ttl), w
+	// No daemon listens here: every test built on this harness exercises
+	// the at-rest fallback path (see daemon_test.go's
+	// TestNoDaemonBehavesExactlyAtRest, which spot-checks that a bad socket
+	// produces identical behavior to the pre-daemon-integration at-rest
+	// tools below).
+	sock := filepath.Join(t.TempDir(), "absent.sock")
+	return NewOffshootTools(w, spec, ttl, sock), w
 }
 
 func call(t *testing.T, ts *OffshootTools, name string, args map[string]any) ToolResult {

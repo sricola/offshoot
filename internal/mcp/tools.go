@@ -17,6 +17,11 @@ import (
 type OffshootTools struct {
 	ws   *ops.Workspace
 	spec string
+	// socket is the daemon socket every tool call probes fresh (see
+	// daemonStatus/openSession) — never cached, since the daemon may start
+	// or stop between calls. Always concrete (never ""): NewOffshootTools
+	// resolves it once at construction.
+	socket string
 	// defaultTTL is applied to a fork whose call omits `ttl` entirely;
 	// zero means forks have no TTL unless one is given explicitly. An
 	// explicit `ttl:"none"` on the call always overrides this, and an
@@ -25,14 +30,65 @@ type OffshootTools struct {
 	defaultTTL time.Duration
 }
 
-// NewOffshootTools binds a tool set to a workspace and store spec. The spec
-// is used to detect a running daemon; offshoot_checkout reports whether one
-// is running for this store. defaultTTL is the TTL offshoot_fork applies
-// when a call omits `ttl`; zero means agent-created forks are immortal
-// unless a call passes `ttl` itself (the CLI's `offshoot mcp -default-ttl`
-// flag is how an operator sets this — see cmd/offshoot/main.go).
-func NewOffshootTools(ws *ops.Workspace, spec string, defaultTTL time.Duration) *OffshootTools {
-	return &OffshootTools{ws: ws, spec: spec, defaultTTL: defaultTTL}
+// NewOffshootTools binds a tool set to a workspace, store spec, and daemon
+// socket. socket, if non-empty, is the exact socket every tool call probes
+// (see daemonStatus); "" falls back to daemon.DefaultSocketPath(spec) — the
+// same default `offshoot serve` binds to for this store — resolved once
+// here rather than per call, since neither the spec nor an OFFSHOOT_SOCKET
+// override changes for the lifetime of a tool set. A resolution failure
+// (e.g. no cache dir) leaves socket empty, which every call's dial then
+// fails fast against — the same silent at-rest fallback as a daemon that
+// simply isn't running.
+//
+// defaultTTL is the TTL offshoot_fork applies when a call omits `ttl`;
+// zero means agent-created forks are immortal unless a call passes `ttl`
+// itself (the CLI's `offshoot mcp -default-ttl` flag is how an operator
+// sets this — see cmd/offshoot/main.go).
+//
+// Per-call daemon routing (checkpoint → daemon flush when the branch has an
+// open session, fork → daemon fork whenever a daemon is up, checkout →
+// the open session's own checkout path) is documented on each handler; see
+// checkpoint, fork, and checkout below. Every other tool is a ref-level
+// operation the daemon adds nothing to and always runs at rest.
+func NewOffshootTools(ws *ops.Workspace, spec string, defaultTTL time.Duration, socket string) *OffshootTools {
+	if socket == "" {
+		if p, err := daemon.DefaultSocketPath(spec); err == nil {
+			socket = p
+		}
+	}
+	return &OffshootTools{ws: ws, spec: spec, socket: socket, defaultTTL: defaultTTL}
+}
+
+// daemonStatus probes the daemon at t.socket, fresh on every call — the
+// daemon may start after this tool set was constructed, so this is never
+// cached. ok is false whenever the daemon isn't reachable (not running,
+// still starting, a dial timeout, anything) or answers with ok=false;
+// callers treat that uniformly as a silent fallback to at-rest behavior,
+// never as an error surfaced to the agent.
+func (t *OffshootTools) daemonStatus() (resp daemon.Response, ok bool) {
+	resp, err := daemon.Call(t.socket, daemon.Request{Op: "status"})
+	if err != nil || !resp.OK {
+		return daemon.Response{}, false
+	}
+	return resp, true
+}
+
+// openSession reports the daemon's SessionInfo for db@branch, or ok=false
+// if the daemon isn't reachable at all OR is reachable but has no session
+// open on that exact branch — checkpoint and checkout both collapse those
+// two "no" cases into the same at-rest fallback, per this package's
+// silent-detection-failure contract.
+func (t *OffshootTools) openSession(db, branch string) (info daemon.SessionInfo, ok bool) {
+	resp, up := t.daemonStatus()
+	if !up {
+		return daemon.SessionInfo{}, false
+	}
+	for _, s := range resp.Sessions {
+		if s.DB == db && s.Branch == branch {
+			return s, true
+		}
+	}
+	return daemon.SessionInfo{}, false
 }
 
 // prop describes one property of a tool's JSON Schema input: its argument
@@ -106,11 +162,14 @@ func (t *OffshootTools) Tools() []Tool {
 			Name: "offshoot_checkout",
 			Description: "Materialize a database branch to a local SQLite file and return " +
 				"the path to open. Call this before reading or writing a branch's data " +
-				"directly with a SQL client. If a daemon is running for this store, the " +
-				"result says so — checkouts like this one are how you work with this " +
-				"branch from here. Call offshoot_checkpoint to name the current state so " +
-				"it can be rolled back to or forked from later. `branch` defaults to " +
-				"\"main\" if omitted.",
+				"directly with a SQL client. If a daemon session is already open on this " +
+				"branch (opened by a harness, not by this tool — this tool never opens " +
+				"one itself), the result is that session's live checkout path instead: " +
+				"writes there are captured continuously, and offshoot_checkpoint against " +
+				"it flushes live rather than writing a fresh snapshot. Otherwise this is a " +
+				"plain at-rest materialization, even if a daemon happens to be running. " +
+				"Call offshoot_checkpoint to name the current state so it can be rolled " +
+				"back to or forked from later. `branch` defaults to \"main\" if omitted.",
 			InputSchema: schema(reqStr("database"), optStrDefault("branch", "main")),
 		},
 		{
@@ -119,8 +178,10 @@ func (t *OffshootTools) Tools() []Tool {
 				"returned to later. Call this after a batch of changes you might want " +
 				"to keep or roll back to individually — e.g. after a migration step " +
 				"succeeds, or before starting a riskier change on the same branch. " +
-				"Cheap: only the diff since the last checkpoint is stored. `branch` " +
-				"defaults to \"main\" if omitted.",
+				"If a daemon session is open on this branch, this is a live flush " +
+				"(cheap, only the diff since the last checkpoint, no pause in writes); " +
+				"otherwise it's a full-snapshot checkpoint of the checkout file. " +
+				"`branch` defaults to \"main\" if omitted.",
 			InputSchema: schema(reqStr("database"), reqStr("name"), optStrDefault("branch", "main")),
 		},
 		{
@@ -129,7 +190,9 @@ func (t *OffshootTools) Tools() []Tool {
 				"risky or destructive work (schema migrations, bulk deletes, " +
 				"experiments). Forking is instant and costs nothing until you write. " +
 				"Prefer forking over backing up by hand. Forks from the branch's " +
-				"current head by default, or from a named checkpoint via `at`. " +
+				"current head by default, or from a named checkpoint via `at`. If a " +
+				"daemon session is open on the source branch, its unflushed writes are " +
+				"flushed first, so the fork always includes everything written so far. " +
 				"`branch` (the source) defaults to \"main\" if omitted. " +
 				forkTTLDescription(t.defaultTTL) + " " + forkTTLJanitorNote,
 			InputSchema: schema(reqStr("database"), reqStr("new_branch"),
@@ -259,6 +322,12 @@ type checkoutArgs struct {
 	Branch   string `json:"branch"`
 }
 
+// checkout materializes db@branch, or — if a daemon session is already open
+// on that exact branch — reports the session's own live checkout path
+// instead of materializing a fresh at-rest copy. No MCP tool ever opens a
+// session itself (see openSession): this only takes the live path when
+// something else (a harness, the SDKs, `offshoot session open`) already
+// has. Detection is per call, never cached — see daemonStatus/openSession.
 func (t *OffshootTools) checkout(args json.RawMessage) (ToolResult, error) {
 	var a checkoutArgs
 	if err := json.Unmarshal(args, &a); err != nil {
@@ -271,6 +340,13 @@ func (t *OffshootTools) checkout(args json.RawMessage) (ToolResult, error) {
 	if r, bad := validateNames(namedArg("database", a.Database), namedArg("branch", branch)); bad {
 		return r, nil
 	}
+	if info, ok := t.openSession(a.Database, branch); ok {
+		msg := fmt.Sprintf("%s@%s has an open daemon session; its live checkout is %s",
+			a.Database, branch, info.Checkout)
+		msg += "\nwrite there directly — the daemon captures every commit continuously; " +
+			"call offshoot_checkpoint to name a point you can roll back to or fork from"
+		return TextResult("%s", msg), nil
+	}
 	path, err := t.ws.Checkout(a.Database, branch)
 	if err != nil {
 		return ErrorResult("%v", err), nil
@@ -278,10 +354,10 @@ func (t *OffshootTools) checkout(args json.RawMessage) (ToolResult, error) {
 	msg := fmt.Sprintf("checked out %s@%s at %s", a.Database, branch, path)
 	msg += "\nthis checkout is not yet checkpointed: nothing written here can be rolled " +
 		"back to or forked from until you call offshoot_checkpoint"
-	if socket, serr := daemon.DefaultSocketPath(t.spec); serr == nil && daemon.Running(socket) {
-		msg += "\na daemon is running for this store, but no MCP tool currently opens a " +
-			"session against it; checkouts like this one are how you work with this " +
-			"branch from here"
+	if _, up := t.daemonStatus(); up {
+		msg += "\na daemon is running for this store, but no session is open on this " +
+			"branch, so this checkout is at rest: offshoot_checkpoint here will write a " +
+			"full snapshot, not a live flush, until something opens a session on it"
 	}
 	return TextResult("%s", msg), nil
 }
@@ -292,6 +368,14 @@ type checkpointArgs struct {
 	Name     string `json:"name"`
 }
 
+// checkpoint names the current state of db@branch. If a daemon session is
+// open on that exact branch, this is a live capture: the daemon's own
+// "flush" op ships whatever the session has captured so far under the given
+// name, with no quiesce and no risk of colliding with the session's lease
+// (ops.Workspace.Checkpoint's raw open/close of the checkout file is unsafe
+// against a live in-process session — this path never reaches it while one
+// is open). No open session falls back to that at-rest snapshot exactly as
+// before.
 func (t *OffshootTools) checkpoint(args json.RawMessage) (ToolResult, error) {
 	var a checkpointArgs
 	if err := json.Unmarshal(args, &a); err != nil {
@@ -304,6 +388,14 @@ func (t *OffshootTools) checkpoint(args json.RawMessage) (ToolResult, error) {
 	if r, bad := validateNames(namedArg("database", a.Database), namedArg("branch", branch),
 		namedArg("name", a.Name)); bad {
 		return r, nil
+	}
+	if _, ok := t.openSession(a.Database, branch); ok {
+		resp, err := daemon.Call(t.socket, daemon.Request{Op: "flush", DB: a.Database, Branch: branch, Name: a.Name})
+		if err != nil {
+			return ErrorResult("%v", err), nil
+		}
+		return TextResult("checkpointed %s@%s as %q at txid %d — captured live from the open daemon session, no pause in writes",
+			a.Database, branch, a.Name, resp.TXID), nil
 	}
 	txid, err := t.ws.Checkpoint(a.Database, branch, a.Name)
 	if err != nil {
@@ -410,6 +502,14 @@ func forkTTLSummary(ws *ops.Workspace, db, branch string, ttl time.Duration) str
 	return fmt.Sprintf("ttl=%s expires_at=%s; %s", ref.TTL, deadline.Format(time.RFC3339), forkTTLJanitorNote)
 }
 
+// fork creates new_branch from branch's head (or checkpoint `at`). If a
+// daemon is up (whether or not it has a session open on the source — the
+// daemon's own "fork" op handles both), the fork is routed through it, so
+// an open source session's unflushed writes are flushed first and always
+// land in the new branch. No daemon routes to the plain at-rest fork, as
+// before. Either way, the response's TTL/expiry summary is computed by
+// re-reading the ref straight from the store (forkTTLSummary), not from
+// whichever path performed the fork.
 func (t *OffshootTools) fork(args json.RawMessage) (ToolResult, error) {
 	var a forkArgs
 	if err := json.Unmarshal(args, &a); err != nil {
@@ -431,9 +531,23 @@ func (t *OffshootTools) fork(args json.RawMessage) (ToolResult, error) {
 	if err != nil {
 		return ErrorResult("%v", err), nil
 	}
-	txid, err := t.ws.Fork(a.Database, branch, a.NewBranch, a.At, ttl)
-	if err != nil {
-		return ErrorResult("%v", err), nil
+
+	var txid uint64
+	if _, up := t.daemonStatus(); up {
+		req := daemon.Request{Op: "fork", DB: a.Database, Branch: branch, Name: a.NewBranch, From: a.At}
+		if ttl > 0 {
+			req.TTL = ttl.String()
+		}
+		resp, err := daemon.Call(t.socket, req)
+		if err != nil {
+			return ErrorResult("%v", err), nil
+		}
+		txid = resp.TXID
+	} else {
+		txid, err = t.ws.Fork(a.Database, branch, a.NewBranch, a.At, ttl)
+		if err != nil {
+			return ErrorResult("%v", err), nil
+		}
 	}
 	msg := fmt.Sprintf("forked %s@%s to %s@%s at txid %d", a.Database, branch, a.Database, a.NewBranch, txid)
 	msg += "; " + forkTTLSummary(t.ws, a.Database, a.NewBranch, ttl)

@@ -235,9 +235,26 @@ branch that never expires even under a configured default:
 The tool's response echoes the TTL it applied and, when there is one, the
 computed expiry timestamp, so both are visible in the agent's own
 transcript. **A TTL alone does not reap anything** — reaping is the
-janitor's job (`offshoot serve`), and MCP mode runs entirely at rest with no
-daemon of its own, so a daemonless `offshoot mcp` setup only sweeps expired
-branches when `offshoot gc` is run by hand.
+janitor's job (`offshoot serve`), and `offshoot mcp` runs no daemon of its
+own, so a daemonless MCP setup only sweeps expired branches when
+`offshoot gc` is run by hand.
+
+**MCP rides a running daemon when one is up, but only for a branch a
+session is already open on.** `offshoot mcp` never opens a session itself —
+that's still a harness's job (the SDKs, `offshoot session open`, or your own
+loop) — but on every call, `offshoot_checkpoint`, `offshoot_fork`, and
+`offshoot_checkout` each check fresh whether the daemon has one open for the
+branch in question. If so: `offshoot_checkpoint` flushes it live through the
+daemon (no quiesce, no full-snapshot re-encode, no lease collision);
+`offshoot_fork` forks through the daemon, which flushes an open source
+session first so an unflushed write always lands in the child; and
+`offshoot_checkout` returns that session's own live checkout path instead of
+materializing a separate at-rest copy. **Without an already-open session,
+every one of those tools runs exactly as it does with no daemon at all** —
+a daemon merely running in the background changes nothing on its own.
+`offshoot mcp -socket PATH` names the daemon to ride; omit it and MCP derives
+the same default socket `offshoot serve` does for the store, so the two
+agree without either side hardcoding a path.
 
 ### Python SDK
 
