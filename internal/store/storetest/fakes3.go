@@ -4,13 +4,16 @@ import (
 	"crypto/md5"
 	"encoding/hex"
 	"encoding/xml"
+	"fmt"
 	"io"
 	"net/http"
 	"net/http/httptest"
+	"net/url"
 	"sort"
 	"strings"
 	"sync"
 	"testing"
+	"time"
 )
 
 const fakeBucket = "offshoot-test"
@@ -23,6 +26,15 @@ type FakeS3 struct {
 
 	// fault, when set and returning ok, replaces the response with status.
 	fault func(method, key string) (int, bool)
+
+	// sizeOverrides, when a key is present, is the Content-Length this fake
+	// reports for that key's HEAD response instead of len(objs[key]). Exists
+	// so a test can exercise store.S3.CopyObject's 5GB size gate
+	// (copyObjectMaxBytes) without actually allocating and uploading a
+	// multi-gigabyte object — the gate only ever inspects the HEAD response,
+	// never the real bytes, so a small stored object with a lied-about size
+	// drives the same code path a real oversized object would.
+	sizeOverrides map[string]int64
 }
 
 func NewFakeS3(t *testing.T) *FakeS3 {
@@ -48,6 +60,18 @@ func (f *FakeS3) SetFault(fn func(method, key string) (int, bool)) {
 	f.mu.Lock()
 	defer f.mu.Unlock()
 	f.fault = fn
+}
+
+// SetSizeOverride makes this fake report size for key's Content-Length on
+// HEAD, regardless of how much data is actually stored under it. See the
+// sizeOverrides field's doc comment for why this exists.
+func (f *FakeS3) SetSizeOverride(key string, size int64) {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	if f.sizeOverrides == nil {
+		f.sizeOverrides = map[string]int64{}
+	}
+	f.sizeOverrides[key] = size
 }
 
 func etagOf(b []byte) string {
@@ -106,6 +130,15 @@ func (f *FakeS3) handle(w http.ResponseWriter, r *http.Request) {
 		w.Write(data)
 
 	case http.MethodPut:
+		// store.S3.CopyObject issues a PUT carrying X-Amz-Copy-Source
+		// instead of a body — S3's server-side copy contract. Route it
+		// separately: the ordinary PUT path below would otherwise treat
+		// this as a normal (bodyless) write and silently truncate dst to
+		// empty, which is exactly backwards from what the client asked for.
+		if copySrc := r.Header.Get("X-Amz-Copy-Source"); copySrc != "" {
+			f.copyObject(w, key, copySrc)
+			return
+		}
 		body, err := io.ReadAll(r.Body)
 		if err != nil {
 			w.WriteHeader(http.StatusBadRequest)
@@ -143,11 +176,77 @@ func (f *FakeS3) handle(w http.ResponseWriter, r *http.Request) {
 			return
 		}
 		w.Header().Set("ETag", etagOf(data))
+		// store.S3.CopyObject's 5GB size gate reads HeadObjectOutput.
+		// ContentLength; without this header the SDK reports it as 0/nil
+		// regardless of the object's real size, which would make that gate
+		// untestable against this fake. sizeOverrides lets a test lie about
+		// it deliberately — see that field's doc comment.
+		size := int64(len(data))
+		if override, ok := f.sizeOverrides[key]; ok {
+			size = override
+		}
+		w.Header().Set("Content-Length", fmt.Sprintf("%d", size))
 		w.WriteHeader(http.StatusOK)
 
 	default:
 		w.WriteHeader(http.StatusMethodNotAllowed)
 	}
+}
+
+// copyObject serves a CopyObject request (a PUT carrying X-Amz-Copy-Source
+// instead of a body): looks up the source named by that header — "bucket/
+// key", percent-encoded per S3's contract, see store.S3's s3CopySource —
+// and stores a copy of its bytes at dstKey, overwriting any existing
+// content there (store.Backend.CopyObject's documented contract; nothing
+// extra to enforce here since a plain map write already overwrites).
+//
+// Precondition headers (CopySourceIfMatch etc.) are not simulated: store.
+// S3.CopyObject never sets them, so there is nothing exercising that
+// behavior to fake.
+func (f *FakeS3) copyObject(w http.ResponseWriter, dstKey, copySource string) {
+	srcKey, err := decodeCopySource(copySource)
+	if err != nil {
+		w.Header().Set("Content-Type", "application/xml")
+		w.WriteHeader(http.StatusBadRequest)
+		io.WriteString(w, `<Error><Code>InvalidArgument</Code></Error>`)
+		return
+	}
+	data, ok := f.objs[srcKey]
+	if !ok {
+		w.Header().Set("Content-Type", "application/xml")
+		w.WriteHeader(http.StatusNotFound)
+		io.WriteString(w, `<Error><Code>NoSuchKey</Code></Error>`)
+		return
+	}
+	cp := make([]byte, len(data))
+	copy(cp, data)
+	f.objs[dstKey] = cp
+	w.Header().Set("Content-Type", "application/xml")
+	w.WriteHeader(http.StatusOK)
+	fmt.Fprintf(w, `<CopyObjectResult><ETag>%s</ETag><LastModified>%s</LastModified></CopyObjectResult>`,
+		etagOf(cp), time.Now().UTC().Format("2006-01-02T15:04:05.000Z"))
+}
+
+// decodeCopySource extracts the object key from an X-Amz-Copy-Source header
+// value: "[/]bucket/key" (percent-encoded), optionally carrying a
+// "?versionId=..." suffix this fake ignores (store.S3.CopyObject never sets
+// a version). The bucket component is checked against fakeBucket — this
+// fake serves exactly one bucket, same as the rest of its handlers.
+func decodeCopySource(v string) (string, error) {
+	v = strings.TrimPrefix(v, "/")
+	v, _, _ = strings.Cut(v, "?")
+	bucket, key, ok := strings.Cut(v, "/")
+	if !ok || bucket != fakeBucket {
+		return "", fmt.Errorf("unexpected copy source %q", v)
+	}
+	// url.PathUnescape (not QueryUnescape) to match store.S3's s3CopySource,
+	// which encodes with url.PathEscape — QueryUnescape would additionally
+	// (and wrongly) turn a literal '+' into a space.
+	dec, err := url.PathUnescape(key)
+	if err != nil {
+		return "", err
+	}
+	return dec, nil
 }
 
 type listResult struct {

@@ -3,9 +3,11 @@ package daemon
 import (
 	"context"
 	"errors"
+	"fmt"
 	"os/exec"
 	"strconv"
 	"strings"
+	"sync/atomic"
 	"testing"
 	"time"
 
@@ -854,5 +856,226 @@ func TestForkFromLiveSessionSeesLatestWrite(t *testing.T) {
 	}
 	if !found {
 		t.Fatalf("source session missing from status after fork: %+v", st.Sessions)
+	}
+}
+
+// TestServeFlushesAutomaticallyWithoutAnExplicitFlushOp proves the daemon's
+// -flush-every wiring (Server.SetFlushEvery, plumbed through opOpen into
+// session.Options.FlushEvery) actually drives a session's background flush
+// loop: with FlushEvery set on the server, a written but never-explicitly-
+// flushed session's durable_txid must advance on its own, discovered purely
+// by polling "status" — no "flush" op is ever sent over the socket.
+// pollDurable polls "status" until db@branch's DurableTXID satisfies want,
+// failing the test if it never does within deadline or the session reports
+// an error meanwhile. Used by TestServeFlushesAutomaticallyWithoutAnExplicitFlushOp
+// to both find the settled baseline and to prove the ref advances past it.
+func pollDurable(t *testing.T, sock, db, branch string, deadline time.Time, want func(uint64) bool) uint64 {
+	t.Helper()
+	for {
+		st := call(t, sock, Request{Op: "status"})
+		if !st.OK {
+			t.Fatalf("status = %+v", st)
+		}
+		var found bool
+		var durable uint64
+		for _, in := range st.Sessions {
+			if in.DB == db && in.Branch == branch {
+				found = true
+				durable = in.DurableTXID
+				if in.Error != "" {
+					t.Fatalf("session unhealthy while waiting on auto-flush: %+v", in)
+				}
+			}
+		}
+		if !found {
+			t.Fatal("session missing from status")
+		}
+		if want(durable) {
+			return durable
+		}
+		if time.Now().After(deadline) {
+			t.Fatalf("durable_txid (%d) never satisfied the wait condition within the deadline", durable)
+		}
+		time.Sleep(50 * time.Millisecond)
+	}
+}
+
+// TestServeFlushesAutomaticallyWithoutAnExplicitFlushOp proves the daemon's
+// -flush-every wiring (Server.SetFlushEvery, plumbed through opOpen into
+// session.Options.FlushEvery) actually drives a session's background flush
+// loop, discovered purely by polling "status" — no "flush" op is ever sent
+// over the socket.
+//
+// Every session performs one unconditional settling flush shortly after its
+// startup rebase lands, even with nothing written (see
+// appliedGen/flushedRebaseGen's doc comment on session.Session) — so a bare
+// "durable_txid > 0" is satisfied by that settling flush alone and would
+// pass even if this test's own write were never captured. This waits for
+// the session to settle FIRST (durable_txid stops moving on its own),
+// captures that settled value, writes via sqlite3, and then requires
+// durable_txid to advance BEYOND it. A txid bump still isn't proof of WHAT
+// shipped, so after closing the session this also checks the branch out
+// fresh via the daemon's own "checkout" op and reads the row back.
+func TestServeFlushesAutomaticallyWithoutAnExplicitFlushOp(t *testing.T) {
+	srv, _ := newServer(t)
+	srv.SetFlushEvery(100 * time.Millisecond)
+	sock := srv.SocketPath()
+
+	open := call(t, sock, Request{Op: "open", DB: "app", Branch: "main"})
+	if !open.OK {
+		t.Fatalf("open = %+v", open)
+	}
+
+	deadline := time.Now().Add(10 * time.Second)
+	settled := pollDurable(t, sock, "app", "main", deadline, func(d uint64) bool { return d > 0 })
+
+	sqliteExec(t, open.Checkout, "CREATE TABLE t (v); INSERT INTO t VALUES (1);")
+
+	deadline = time.Now().Add(10 * time.Second)
+	pollDurable(t, sock, "app", "main", deadline, func(d uint64) bool { return d > settled })
+
+	if cl := call(t, sock, Request{Op: "close", DB: "app", Branch: "main"}); !cl.OK {
+		t.Fatalf("close = %+v", cl)
+	}
+
+	co := call(t, sock, Request{Op: "checkout", DB: "app", Branch: "main"})
+	if !co.OK || co.Checkout == "" {
+		t.Fatalf("checkout after auto-flush = %+v", co)
+	}
+	if n := sqliteCount(t, co.Checkout, "SELECT COUNT(*) FROM t WHERE v = 1;"); n != 1 {
+		t.Fatalf("auto-flushed content missing from a fresh checkout: row count = %d, want 1", n)
+	}
+}
+
+// failNRefPutIf wraps a store.Backend and turns each of the next N PutIf
+// calls on a "refs/" key into a non-CAS failure, simulating a transient
+// outage (e.g. a flaky network) that later recovers — same fault-injection
+// shape internal/session/flush_test.go's identical type uses, reproduced
+// here since it must intercept calls the daemon's own opOpen-created session
+// makes internally, not one this test constructs directly. N is an
+// atomic.Int64, not a plain field, for the same reason as the session-level
+// original: install it as w.Store.B BEFORE the daemon opens any session
+// (unarmed, n=0, lets the startup settling flush through untouched), then
+// arm() the actual failure count afterward.
+type failNRefPutIf struct {
+	store.Backend
+	n atomic.Int64
+}
+
+func (f *failNRefPutIf) arm(n int64) { f.n.Store(n) }
+
+func (f *failNRefPutIf) PutIf(key string, data []byte, ifMatch string) (string, error) {
+	if strings.HasPrefix(key, "refs/") {
+		for {
+			cur := f.n.Load()
+			if cur <= 0 {
+				break
+			}
+			if f.n.CompareAndSwap(cur, cur-1) {
+				return "", fmt.Errorf("test: injected transient ref failure on %s", key)
+			}
+		}
+	}
+	return f.Backend.PutIf(key, data, ifMatch)
+}
+
+// getStatus fetches "status" once and returns the SessionInfo for db@branch,
+// failing the test if the session is not listed.
+func getStatus(t *testing.T, sock, db, branch string) SessionInfo {
+	t.Helper()
+	st := call(t, sock, Request{Op: "status"})
+	if !st.OK {
+		t.Fatalf("status = %+v", st)
+	}
+	for _, in := range st.Sessions {
+		if in.DB == db && in.Branch == branch {
+			return in
+		}
+	}
+	t.Fatalf("session missing from status: %+v", st.Sessions)
+	return SessionInfo{}
+}
+
+// pollStatus polls "status" until db@branch's SessionInfo satisfies want,
+// failing the test if it never does within deadline.
+func pollStatus(t *testing.T, sock, db, branch string, deadline time.Time, want func(SessionInfo) bool) SessionInfo {
+	t.Helper()
+	for {
+		in := getStatus(t, sock, db, branch)
+		if want(in) {
+			return in
+		}
+		if time.Now().After(deadline) {
+			t.Fatalf("status for %s@%s never satisfied the wait condition within the deadline, last = %+v", db, branch, in)
+		}
+		time.Sleep(50 * time.Millisecond)
+	}
+}
+
+// TestStatusReportsDurableAgeFlushErrorAndCaptureLag pins task 7's
+// observability fields on the "status" op. LastFlushAt/DurableAge and
+// FlushError are the deterministic assertions the task brief calls for —
+// LastFlushAt set once a flush has succeeded, FlushError set by an injected
+// auto-flush failure and cleared again once the backend heals (proven by
+// durable_txid advancing past its pre-failure value, via the same
+// pollDurable helper TestServeFlushesAutomaticallyWithoutAnExplicitFlushOp
+// uses). CaptureLag is only sanity-checked (present, never negative): its
+// exact value depends on poll timing against the fault injection above and
+// is not a deterministic signal — see the task brief's own guidance to
+// prefer LastFlushAt/FlushError.
+func TestStatusReportsDurableAgeFlushErrorAndCaptureLag(t *testing.T) {
+	srv, w := newServer(t)
+	// Install BEFORE any session opens — see failNRefPutIf's doc comment.
+	fp := &failNRefPutIf{Backend: w.Store.B}
+	w.Store.B = fp
+	srv.SetFlushEvery(60 * time.Millisecond)
+	sock := srv.SocketPath()
+
+	open := call(t, sock, Request{Op: "open", DB: "app", Branch: "main"})
+	if !open.OK {
+		t.Fatalf("open = %+v", open)
+	}
+	sqliteExec(t, open.Checkout, "CREATE TABLE t (v); INSERT INTO t VALUES (1);")
+
+	deadline := time.Now().Add(10 * time.Second)
+	settledTXID := pollDurable(t, sock, "app", "main", deadline, func(d uint64) bool { return d > 0 })
+
+	settled := getStatus(t, sock, "app", "main")
+	if settled.LastFlushAt == "" {
+		t.Fatalf("LastFlushAt must be set once durable_txid > 0: %+v", settled)
+	}
+	if settled.DurableAge == "" {
+		t.Fatalf("DurableAge must be set alongside LastFlushAt: %+v", settled)
+	}
+	if settled.FlushError != "" {
+		t.Fatalf("FlushError must be empty before any injected failure: %+v", settled)
+	}
+	if settled.CaptureLag < 0 {
+		t.Fatalf("CaptureLag must never be negative: %+v", settled)
+	}
+
+	fp.arm(2)
+	sqliteExec(t, open.Checkout, "INSERT INTO t VALUES (2);")
+
+	deadline = time.Now().Add(10 * time.Second)
+	failed := pollStatus(t, sock, "app", "main", deadline, func(in SessionInfo) bool {
+		return in.FlushError != ""
+	})
+	if !strings.Contains(failed.FlushError, "injected") {
+		t.Fatalf("FlushError = %q, want it to mention the injected failure", failed.FlushError)
+	}
+	if failed.Error != "" {
+		t.Fatalf("a transient auto-flush failure must not mark the session unhealthy: %+v", failed)
+	}
+
+	deadline = time.Now().Add(10 * time.Second)
+	pollDurable(t, sock, "app", "main", deadline, func(d uint64) bool { return d > settledTXID })
+
+	deadline = time.Now().Add(10 * time.Second)
+	healed := pollStatus(t, sock, "app", "main", deadline, func(in SessionInfo) bool {
+		return in.FlushError == ""
+	})
+	if healed.LastFlushAt == "" {
+		t.Fatalf("LastFlushAt must still be set after recovery: %+v", healed)
 	}
 }

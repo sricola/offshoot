@@ -19,6 +19,7 @@ import (
 	"path/filepath"
 	"sort"
 	"strings"
+	"sync/atomic"
 	"time"
 
 	_ "github.com/mattn/go-sqlite3"
@@ -230,7 +231,22 @@ func (w *Workspace) Checkout(db, branch string) (string, error) {
 		if err := quiesce(path); err != nil {
 			return "", err
 		}
-		if checkoutState(path, ref) == "modified" {
+		// checkoutState compares the sidecar's recorded (lineage, epoch,
+		// txid) against ref.Lineage/ref.HeadEpoch/ref.HeadTXID — the CURRENT
+		// head, just fetched above — so "clean" here already means
+		// "byte-correct for the head right now", not merely "matches
+		// whatever it was last verified against". Epoch is load-bearing in
+		// that comparison, not redundant with txid: Chain resolution can
+		// resolve the same txid to different bytes under different epochs
+		// (a fenced writer's orphan vs. the live object), so lineage+txid
+		// alone would not prove identity. A clean, current checkout needs no
+		// re-materialization: return it as-is rather than paying the
+		// temp+rename cost (and, via materializeAt->dbfile, stranding
+		// another descriptor) to rebuild bytes that are already correct.
+		switch checkoutState(path, ref) {
+		case "clean":
+			return path, nil
+		case "modified":
 			fmt.Fprintf(os.Stderr, "offshoot: warning: overwriting un-checkpointed changes in %s@%s checkout\n", db, branch)
 		}
 	}
@@ -240,35 +256,48 @@ func (w *Workspace) Checkout(db, branch string) (string, error) {
 	if err := w.materializeAt(ref, headCheckpoint(ref), path); err != nil {
 		return "", err
 	}
-	if err := writeSum(path, ref.Lineage, ref.HeadTXID); err != nil {
+	if err := writeSum(path, ref.Lineage, ref.HeadEpoch, ref.HeadTXID); err != nil {
 		return "", err
 	}
 	return path, nil
 }
 
 // sumRecord is the on-disk shape of a checkout's .sum sidecar: a content hash
-// plus the ref identity (lineage + txid) the checkout embodied at the moment
-// the sidecar was written. Recording identity (not just a bare hash) is what
-// lets checkoutState tell apart a checkout with local edits from one whose
-// branch ref moved out from under it without a refresh.
+// plus the ref identity (lineage + epoch + txid) the checkout embodied at the
+// moment the sidecar was written. Recording identity (not just a bare hash)
+// is what lets checkoutState tell apart a checkout with local edits from one
+// whose branch ref moved out from under it without a refresh.
+//
+// Epoch is part of that identity, not decoration: Chain resolution
+// (store.keepHighestEpoch) exists precisely because a fenced-out writer's
+// orphaned object can share a TXID with the live one under a different
+// epoch, so lineage+txid alone does not uniquely identify committed content
+// — epoch does. Without comparing it here, checkoutState's "clean" verdict
+// would rest on an unenforced cross-module assumption that HeadEpoch only
+// ever changes in lockstep with Lineage/TXID; a future change to that
+// invariant would make the fast path in Checkout serve stale bytes as
+// current.
 type sumRecord struct {
 	Hash    string `json:"hash"`
 	Lineage string `json:"lineage"`
+	Epoch   uint64 `json:"epoch"`
 	TXID    uint64 `json:"txid"`
 }
 
 // writeSum computes the hex SHA-256 of the file at path and writes it, along
-// with the (lineage, txid) ref identity the checkout currently embodies, to
-// path + ".sum". This is the checkout fingerprint: it records what the
-// checkout file looked like, and which branch state it was, at the moment it
-// was last known to equal a committed state (fresh materialize, a successful
-// checkpoint encode, or a post-repoint refresh).
-func writeSum(path string, lineage string, txid uint64) error {
+// with the (lineage, epoch, txid) ref identity the checkout currently
+// embodies, to path + ".sum". This is the checkout fingerprint: it records
+// what the checkout file looked like, and which branch state it was, at the
+// moment it was last known to equal a committed state (fresh materialize, a
+// successful checkpoint encode, or a post-repoint refresh). Callers pass the
+// ref's HeadEpoch (the epoch the checkout's current head was written under),
+// not the ref's own (writer-generation) Epoch — see sumRecord's doc comment.
+func writeSum(path string, lineage string, epoch, txid uint64) error {
 	sum, err := fileSum(path)
 	if err != nil {
 		return err
 	}
-	data, err := json.Marshal(sumRecord{Hash: sum, Lineage: lineage, TXID: txid})
+	data, err := json.Marshal(sumRecord{Hash: sum, Lineage: lineage, Epoch: epoch, TXID: txid})
 	if err != nil {
 		return err
 	}
@@ -277,14 +306,18 @@ func writeSum(path string, lineage string, txid uint64) error {
 
 // checkoutState reports how the checkout at path relates to ref:
 //
-//   - "clean": the sidecar's recorded identity (lineage, txid) matches ref,
-//     and the file's content still matches the recorded hash.
+//   - "clean": the sidecar's recorded identity (lineage, epoch, txid)
+//     matches ref, and the file's content still matches the recorded hash.
 //   - "modified": the sidecar's recorded identity matches ref, but the
 //     file's content has changed since it was last fingerprinted — local,
 //     un-checkpointed edits.
 //   - "stale": the sidecar's recorded identity no longer matches ref — the
 //     branch was repointed (rollback/promote with a skipped refresh) since
-//     this checkout was last materialized or checkpointed.
+//     this checkout was last materialized or checkpointed. A sidecar
+//     written before Epoch was tracked (or any other record whose Epoch
+//     doesn't decode to ref.HeadEpoch) falls here too: zero-value Epoch
+//     never matches a real ref's HeadEpoch (always >= 1), so an old-format
+//     sidecar reads as stale rather than being trusted as clean.
 //   - "unknown": no sidecar, or one that isn't a valid current-format
 //     record (including legacy bare-hash sidecars predating this fix, and
 //     corrupt files). Provenance can't be determined, so callers should
@@ -298,7 +331,7 @@ func checkoutState(path string, ref store.Ref) string {
 	if err := json.Unmarshal(raw, &rec); err != nil || rec.Hash == "" {
 		return "unknown"
 	}
-	if rec.Lineage != ref.Lineage || rec.TXID != ref.HeadTXID {
+	if rec.Lineage != ref.Lineage || rec.Epoch != ref.HeadEpoch || rec.TXID != ref.HeadTXID {
 		return "stale"
 	}
 	got, err := fileSum(path)
@@ -477,7 +510,7 @@ func (w *Workspace) Checkpoint(db, branch, name string) (uint64, error) {
 	// encode above and this point leaves the OLD sidecar in place — which
 	// still correctly describes the checkout's actual (pre-checkpoint)
 	// identity, rather than claiming a commit that never landed.
-	if err := writeSum(path, ref.Lineage, txid); err != nil {
+	if err := writeSum(path, ref.Lineage, ref.HeadEpoch, txid); err != nil {
 		return 0, fmt.Errorf("ops: checkpoint %q committed (txid %d), but the checkout fingerprint could not be refreshed: %w", name, txid, err)
 	}
 	return txid, nil
@@ -537,30 +570,141 @@ func (w *Workspace) warnIfUncheckpointed(db, branch string, ref store.Ref) {
 // (rather than copying whatever mix of objects src's chain resolved to) is
 // also what keeps the destination lineage storage-independent from src.
 func (w *Workspace) copySnapshotIntoLineage(src store.Ref, cp store.Checkpoint, lineage string) (string, error) {
+	members, err := w.Store.Chain(src.Lineage, cp.TXID)
+	if err != nil {
+		return "", fmt.Errorf("ops: resolving chain for lineage %s to txid %d: %w", src.Lineage, cp.TXID, err)
+	}
+	return w.copySnapshotIntoLineageFromChain(src.Lineage, members, cp, lineage)
+}
+
+// copySnapshotIntoLineageFromChain is copySnapshotIntoLineage's guts, taking
+// an already-resolved chain instead of re-resolving it via store.Chain — see
+// materializeMembersAt's doc comment for why that split exists and who
+// benefits from it (Task 6's fast-path fork attempt falling back to the
+// slow path for the SAME checkpoint it already resolved a chain for).
+func (w *Workspace) copySnapshotIntoLineageFromChain(srcLineage string, members []store.ChainMember, cp store.Checkpoint, dstLineage string) (string, error) {
 	tmp := filepath.Join(os.TempDir(), "offshoot-copy-"+store.NewLineageID()+".db")
 	defer os.Remove(tmp)
-	if err := w.materializeChainAt(src, cp, tmp); err != nil {
-		return "", fmt.Errorf("ops: materializing lineage %s at txid %d for copy: %w", src.Lineage, cp.TXID, err)
+	if err := w.materializeMembersAt(srcLineage, members, tmp); err != nil {
+		return "", fmt.Errorf("ops: materializing lineage %s at txid %d for copy: %w", srcLineage, cp.TXID, err)
 	}
 	var buf bytes.Buffer
 	if err := ltxio.EncodeSnapshot(tmp, cp.TXID, &buf); err != nil {
 		return "", err
 	}
-	key := store.SnapshotKey(lineage, 1, cp.TXID)
+	key := store.SnapshotKey(dstLineage, 1, cp.TXID)
 	if _, err := w.Store.B.PutIf(key, buf.Bytes(), ""); err != nil {
 		return "", err
 	}
 	return key, nil
 }
 
+// forkSlowPathForTest, when true, forces copySnapshotToNewLineage to take
+// the slow materialize-and-re-encode path unconditionally, even when the
+// fast-path precondition holds. Test-only: never set outside a test, and
+// tests that set it must restore it (e.g. via t.Cleanup) since it is
+// process-global. It exists so the ops equivalence tests can produce a
+// "definitely slow path" child from the exact same source as a fast-path
+// child, to compare their outputs — see ops_test.go's fork fast-path tests.
+// The external ops_test package (which needs to import session without an
+// import cycle) reaches this via the exported test-only wrapper in
+// export_test.go.
+var forkSlowPathForTest bool
+
+// forkFastPathHits counts how many times copySnapshotToNewLineage has taken
+// the fast object-copy path (single-snapshot chain, backend CopyObject
+// succeeded) since process start. Test-only instrumentation — nothing in
+// non-test code reads it — so tests can assert the fast path did or didn't
+// fire without depending on backend-specific side effects (e.g. whether a
+// given machine's filesystem actually supports reflink). Atomic because
+// Fork itself has no lock preventing concurrent callers (see
+// TestConcurrentForksFromSameParent), and this counter must not race with
+// itself just because it is test instrumentation.
+var forkFastPathHits atomic.Int64
+
 // copySnapshotToNewLineage copies the snapshot identified by cp (in src's
 // lineage) into a brand-new lineage (epoch 1) and returns the lineage id.
+//
+// Fast path (Task 6a): when src's chain at cp resolves to EXACTLY ONE
+// member and that member is itself a snapshot, the child's seed is a
+// byte-identical backend-level copy of the source snapshot object rather
+// than a materialize-then-re-encode. This is sound because an LTX object
+// names no lineage anywhere in its own bytes — only the KEY it is stored
+// under does (see store.SnapshotKey/store.SegmentKey and
+// github.com/superfly/ltx's Header, which carries page size/commit/TXIDs/
+// checksums/timestamp/NodeID, nothing lineage-identifying) — so the same
+// object is valid content at a different key in a different lineage.
+// tryFastForkCopy verifies the result the same way every other path trusts
+// its output: the child's chain must resolve after the copy; the LTX
+// decoder's own checksum verification happens at first materialization, as
+// everywhere else.
+//
+// Any chain longer than one member (a checkpoint reached via segments past
+// the lineage's last snapshot — the daemon's flush cadence) does not meet
+// the precondition and falls through to the slow path unchanged. A backend
+// that cannot perform CopyObject at all for this particular object (store.
+// ErrCopyUnsupported) also falls through to the slow path — every backend
+// offshoot ships (local since Task 6a, S3 since Task 6b) supports
+// CopyObject in general, but S3's is gated to objects at or under its 5GB
+// single-request CopyObject limit, so the sentinel still fires for anything
+// larger — see store.S3.CopyObject's doc comment.
 func (w *Workspace) copySnapshotToNewLineage(src store.Ref, cp store.Checkpoint) (string, error) {
 	lineage := store.NewLineageID()
-	if _, err := w.copySnapshotIntoLineage(src, cp, lineage); err != nil {
+	// Resolved once, up front, and threaded through both the fast-path
+	// attempt and the slow-path fallback — see materializeMembersAt's doc
+	// comment for why sharing this one store.Chain call (rather than each
+	// path resolving its own) matters on a remote backend.
+	members, err := w.Store.Chain(src.Lineage, cp.TXID)
+	if err != nil {
+		return "", fmt.Errorf("ops: resolving chain for lineage %s to txid %d: %w", src.Lineage, cp.TXID, err)
+	}
+	if !forkSlowPathForTest {
+		ok, err := w.tryFastForkCopy(members, cp, lineage)
+		if err != nil {
+			return "", err
+		}
+		if ok {
+			return lineage, nil
+		}
+	}
+	if _, err := w.copySnapshotIntoLineageFromChain(src.Lineage, members, cp, lineage); err != nil {
 		return "", err
 	}
 	return lineage, nil
+}
+
+// tryFastForkCopy attempts the fast object-copy fork path into lineage,
+// given src's already-resolved chain at cp (see copySnapshotToNewLineage's
+// doc comment for the precondition and why it is sound). ok is false, err is
+// nil when the precondition doesn't hold or the backend doesn't support
+// CopyObject — both are "fall back to the slow path", not errors. A non-nil
+// err means something actually went wrong (a CopyObject failure that isn't
+// the unsupported sentinel, or the copy landed but the child chain didn't
+// resolve) and must propagate rather than being swallowed into a silent
+// fallback — the slow path would very likely fail the same way, and masking
+// a real error as "just take the slow path" would hide it behind a
+// redundant, slower failure instead of reporting it.
+func (w *Workspace) tryFastForkCopy(members []store.ChainMember, cp store.Checkpoint, lineage string) (ok bool, err error) {
+	if len(members) != 1 || !members[0].Snapshot {
+		return false, nil
+	}
+	srcKey := members[0].Key
+	dstKey := store.SnapshotKey(lineage, 1, cp.TXID)
+	if err := w.Store.B.CopyObject(dstKey, srcKey); err != nil {
+		if errors.Is(err, store.ErrCopyUnsupported) {
+			return false, nil
+		}
+		return false, fmt.Errorf("ops: fast-path fork copy %s -> %s: %w", srcKey, dstKey, err)
+	}
+	// Verify the copy the same way the slow path's output is trusted: the
+	// child chain must resolve. Checksum verification itself happens at
+	// first materialization, same as every other path (Checkout, Rollback,
+	// Promote) already relies on.
+	if _, err := w.Store.Chain(lineage, cp.TXID); err != nil {
+		return false, fmt.Errorf("ops: fast-path fork copy %s -> %s: child chain did not resolve: %w", srcKey, dstKey, err)
+	}
+	forkFastPathHits.Add(1)
+	return true, nil
 }
 
 // Fork creates newBranch from db@srcBranch at head or a named checkpoint.
@@ -734,7 +878,7 @@ func (w *Workspace) Rollback(db, branch, to string) (string, error) {
 		// The checkout now equals committed state: refresh the fingerprint
 		// (identity too, since this repointed to a new lineage) so a later
 		// Fork sees it as clean rather than stale.
-		return writeSum(path, next.Lineage, txid)
+		return writeSum(path, next.Lineage, next.HeadEpoch, txid)
 	}
 	if err := refresh(); err != nil {
 		return "", fmt.Errorf("ops: branch repointed to checkpoint %q (txid %d), but the checkout could not be refreshed (run 'offshoot checkout' to re-materialize): %w", to, txid, err)
@@ -811,7 +955,7 @@ func (w *Workspace) Promote(db, source, target string, force bool) (uint64, erro
 		// The checkout now equals committed state: refresh the fingerprint
 		// (identity too, since this repointed to a new lineage) so a later
 		// Fork sees it as clean rather than stale.
-		if err := writeSum(path, next.Lineage, txid); err != nil {
+		if err := writeSum(path, next.Lineage, next.HeadEpoch, txid); err != nil {
 			return txid, fmt.Errorf("ops: promoted, but checkout %s could not be refreshed: %w", path, err)
 		}
 	}

@@ -33,6 +33,49 @@ func TestS3Conformance(t *testing.T) {
 	storetest.RunConformance(t, "", newFakeBacked)
 }
 
+// TestS3CopyObjectOverSizeLimitFallsBack pins the >5GB guard documented on
+// store.S3.CopyObject: S3's single-request "PUT Object - Copy" supports
+// source objects up to 5 GiB, so CopyObject HEADs the source first and
+// returns ErrCopyUnsupported for anything over that limit rather than
+// letting the copy fail with an opaque API error — the same signal
+// ops.Fork's fast path already treats as "fall back to the slow path"
+// (Task 6a). Uses storetest.FakeS3's SetSizeOverride to make a tiny stored
+// object report a >5GB Content-Length on HEAD, so this test exercises the
+// gate without allocating or uploading a real multi-gigabyte object.
+func TestS3CopyObjectOverSizeLimitFallsBack(t *testing.T) {
+	f := storetest.NewFakeS3(t)
+	t.Setenv("AWS_ACCESS_KEY_ID", "test")
+	t.Setenv("AWS_SECRET_ACCESS_KEY", "test")
+	b, err := store.NewS3(context.Background(), store.S3Config{
+		Bucket: f.Bucket(), Endpoint: f.URL(), Region: "us-east-1", UsePathStyle: true,
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := b.Put("data/huge/src", []byte("not actually 6GB")); err != nil {
+		t.Fatal(err)
+	}
+	const sixGiB = 6 * 1024 * 1024 * 1024
+	f.SetSizeOverride("data/huge/src", sixGiB)
+
+	if err := b.CopyObject("data/huge/dst", "data/huge/src"); !errors.Is(err, store.ErrCopyUnsupported) {
+		t.Fatalf("want ErrCopyUnsupported copying a >5GB source, got %v", err)
+	}
+	if _, _, err := b.Get("data/huge/dst"); !errors.Is(err, store.ErrNotFound) {
+		t.Fatalf("a declined copy must not create dst, got %v", err)
+	}
+
+	// Just under the limit: must proceed normally (a real, if small, copy).
+	f.SetSizeOverride("data/huge/src", sixGiB/2)
+	if err := b.CopyObject("data/huge/dst", "data/huge/src"); err != nil {
+		t.Fatalf("copy under the 5GB limit must succeed: %v", err)
+	}
+	data, _, err := b.Get("data/huge/dst")
+	if err != nil || string(data) != "not actually 6GB" {
+		t.Fatalf("dst = %q, err = %v, want the source content copied", data, err)
+	}
+}
+
 func TestS3PrefixIsolatesKeys(t *testing.T) {
 	f := storetest.NewFakeS3(t)
 	t.Setenv("AWS_ACCESS_KEY_ID", "test")

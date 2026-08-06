@@ -52,7 +52,7 @@ file, IAM role).
 |---|---|
 | `OFFSHOOT_STORE` | Default store spec when `-store` isn't passed |
 | `OFFSHOOT_CHECKOUTS` | Where checkouts are materialized, for a *remote* (`s3://`) store; local stores always keep checkouts under the store directory itself. Defaults to a per-store directory under the user cache dir, keyed by the store's resolved identity (endpoint/region/path-style included, not just the literal spec string) |
-| `OFFSHOOT_SOCKET` | Overrides the daemon socket path for both `offshoot serve` and `offshoot session ...`; if unset, both derive the same default path from the store spec, so they agree without it |
+| `OFFSHOOT_SOCKET` | Overrides the daemon socket path for `offshoot serve`, `offshoot session ...`, and `offshoot mcp`; if unset, all three derive the same default path from the store spec, so they agree without it |
 
 **Naming rules**, enforced on every database name, branch name, and
 checkpoint name: 1–128 characters, charset `[a-z0-9-_.]`, and never exactly
@@ -234,8 +234,12 @@ collision). `source` survives unchanged (it's typically left to TTL-reap
 later, or destroyed explicitly). `target`'s old lineage is orphaned and
 later garbage-collected; its checkpoint map resets to just `{"promote":
 <txid>}`. If `target` is protected (`main` is protected by default),
-`--force` is required. `target`'s checkout, if any, is refreshed after a
-busy probe — same best-effort semantics as rollback.
+`--force` is required. Promote never checks `target`'s lease at all — with
+or without `--force` — and any lease on `target` is cleared by the repoint
+(the same unconditional clearing rollback does; see above), so `target` is
+immediately acquirable afterward regardless of who held it. `target`'s
+checkout, if any, is refreshed after a busy probe — same best-effort
+semantics as rollback.
 
 **Errors:** `source == target`; `target` is protected without `--force`;
 target checkout is busy (repoint still lands; checkout refresh is skipped
@@ -334,12 +338,12 @@ Releases the branch's current lease (looked up first via the same listing
 
 **Errors:** no lease currently held on that branch.
 
-## `offshoot serve [-socket PATH] [-reap-every DURATION] [-gc-grace DURATION]`
+## `offshoot serve [-socket PATH] [-reap-every DURATION] [-gc-grace DURATION] [-flush-every DURATION]`
 
 ```
 offshoot serve
 offshoot serve -socket /tmp/o.sock
-offshoot serve -reap-every 1m -gc-grace 15m   # both are the defaults
+offshoot serve -reap-every 1m -gc-grace 15m -flush-every 30s   # all three are the defaults
 ```
 
 Starts the daemon: a long-running process that serves a unix socket (mode
@@ -360,13 +364,23 @@ entirely (GC and reaping are still available on demand via `offshoot gc`).
 `-gc-grace` is the tombstone grace period the janitor's GC pass uses
 (default `15m`) — see `offshoot gc` above for what grace means.
 
+`-flush-every` sets the background-flush cadence applied to every session
+this daemon opens (default `30s`, `0` disables, a negative value is a usage
+error): each open session ships whatever it's captured but not yet flushed
+on that timer, without the agent ever calling `session flush` itself. It
+bounds exposure — worst case, a daemon that dies loses at most one
+`-flush-every` interval's worth of committed-but-unflushed writes, instead
+of everything since the last manual flush. See [What a flush
+costs](../README.md#what-a-flush-costs) in the README for what a background
+flush (and every session's mandatory first "settling" flush) actually cost.
+
 **Errors:** socket path already in use by another listener; underlying
-store-attach failure.
+store-attach failure; `-flush-every` given a negative duration.
 
 ## `offshoot mcp`
 
 ```
-offshoot mcp
+offshoot mcp [-default-ttl DURATION|none] [-socket PATH]
 claude mcp add offshoot -- offshoot -store ./.offshoot mcp
 ```
 
@@ -378,13 +392,57 @@ before risky work, checkpoint when tests pass, roll back when they fail,
 promote the attempt that worked). Destructive tools honor the same
 protected-branch rules as the CLI — an unforced `offshoot_promote --onto
 main` or `offshoot_destroy` on `main` is refused, and the refusal is
-returned to the agent as the tool result, not a transport-level error. Note:
-`offshoot_fork` over MCP currently has no way to set a TTL (a roadmap gap,
-tracked as
-[Milestone 2](../ROADMAP.md#milestone-2--safe-by-default-for-agents)), so
-every agent-initiated fork is TTL-less until you `touch --ttl` it yourself.
-This mode runs entirely at rest (no daemon integration yet) — see
-[docs/status.md](status.md).
+returned to the agent as the tool result, not a transport-level error.
+
+Agent-initiated forks carry a TTL by default: `offshoot_fork` applies
+`-default-ttl` (default `24h`) to any call that omits its own `ttl`
+argument, so a branch an agent forks and forgets is eligible for reaping
+instead of accumulating forever. `-default-ttl 0` or `-default-ttl none`
+disables the default; an individual `offshoot_fork` call can still override
+it either way — an explicit `ttl:"<duration>"` always wins, and
+`ttl:"none"` always yields no TTL even under a configured default. The
+fork tool's response echoes the applied TTL and, when there is one, the
+computed expiry timestamp, so both land in the agent's own transcript.
+**TTL alone does not reap anything**: reaping requires a running janitor
+(`offshoot serve`); `offshoot mcp` runs no daemon of its own, so a
+daemonless setup only sweeps expired branches when `offshoot gc` is run by
+hand.
+
+**MCP rides a running daemon, but only for a branch a session is already
+open on.** No MCP tool ever opens a session itself (that's a harness's job —
+the SDKs, `offshoot session open`, or a custom loop); each call to
+`offshoot_checkpoint`, `offshoot_fork`, or `offshoot_checkout` freshly
+checks whether the daemon named by `-socket` (default: the same socket
+`offshoot serve` derives for this store) has one open for the branch in
+question. If so, `offshoot_checkpoint` flushes it live through the daemon
+instead of writing a full at-rest snapshot; `offshoot_fork` forks through
+the daemon, which flushes an open source session first; `offshoot_checkout`
+returns that session's own live checkout path. Without an already-open
+session — the common case for a bare `offshoot mcp` — every one of those
+tools behaves exactly as it does with no daemon running at all; see
+[docs/status.md](status.md) for what's tested.
+
+Three tools take the opposite stance: `offshoot_rollback`,
+`offshoot_promote` (checked against its `target` only), and
+`offshoot_destroy` **refuse** — rather than proceeding at rest — whenever
+the daemon has any session, healthy or fenced, open on the affected branch.
+The CLI's own `--force` is not a uniform precedent here: `offshoot destroy
+--force` does override a live lease (see that section above), but `offshoot
+promote --onto` never gates on the target's lease at all, with or without
+`--force` — its `--force` overrides only the protected-branch check, and a
+promote unconditionally clears the target's lease as a side effect of the
+repoint either way (see "Promote" above). Whatever the CLI does, the MCP
+tools' `force` argument has no effect on this particular refusal: repointing
+or deleting a branch's ref out from under a session the daemon still
+believes it owns is refused unconditionally, and the fix is to close the
+session first (`offshoot session close`) and retry.
+`offshoot_promote`'s `source` is the one exception not guarded this way: an
+open session there doesn't block the promote, but the promoted state is the
+source's last-flushed/checkpointed head, not whatever is unflushed in that
+live session. Put together: **the good path for `offshoot mcp` requires a
+harness-opened session** (the SDKs, `offshoot session open`, or a custom
+loop) already open before the agent calls a tool — without one, every tool
+still works, just entirely at rest.
 
 ## `offshoot session open <db>[@branch] [-socket PATH]`
 

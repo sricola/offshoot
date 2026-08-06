@@ -40,6 +40,16 @@ type Options struct {
 	// chain), and one following a large enough batch of changed pages does
 	// too (see largeSegmentFraction).
 	SnapshotEvery int
+
+	// FlushEvery, if > 0, starts a background goroutine that calls
+	// Flush("") on this cadence for as long as the session is open, so a
+	// caller that never calls Flush manually still gets bounded data loss
+	// on crash. 0 (the default) means manual only — the library stays
+	// conservative by default; safe-by-default cadence lives at the daemon
+	// boundary instead (cmd/offshoot serve defaults its own -flush-every to
+	// 30s), not baked into this primitive. See flushLoop's doc comment for
+	// the idle short-circuit and failure-handling contract.
+	FlushEvery time.Duration
 }
 
 // replicaSink adapts replay.Replica to the capture engine's Sink. The
@@ -127,6 +137,13 @@ type Session struct {
 	// comment for the required shutdown order.
 	renewDone chan struct{}
 
+	// flushDone mirrors renewDone, for flushLoop: nil if Options.FlushEvery
+	// was 0 (no loop was ever started, so there is nothing to join), else
+	// closed exactly once by flushLoop itself after its loop exits (ctx
+	// cancelled). Close joins this, alongside engDone/renewDone, before it
+	// proceeds to release the lease and remove the scratch dir.
+	flushDone chan struct{}
+
 	// replicaMu serializes writes to the replica file (capture's Rebase and
 	// Apply, via replicaSink) against Flush's read of that same file, so
 	// Flush never encodes a torn mix of pre- and post-mutation bytes. See
@@ -134,11 +151,11 @@ type Session struct {
 	//
 	// It also guards every field below that derives from the replica's
 	// content — pages, checksum, flushChecksum, pageSize, commit,
-	// forceSnapshot, rebaseGen — for the same reason: they are maintained
-	// incrementally exactly where Apply/Rebase already touch the file
-	// (recordApply, rebaseline), and Flush reads them from within its own
-	// replicaMu section, so they can never be observed out of step with the
-	// file they describe.
+	// forceSnapshot, rebaseGen, appliedGen, flushedGen, flushedRebaseGen —
+	// for the same reason: they are maintained incrementally exactly where
+	// Apply/Rebase already touch the file (recordApply, rebaseline), and
+	// Flush reads them from within its own replicaMu section, so they can
+	// never be observed out of step with the file they describe.
 	replicaMu sync.Mutex
 
 	// pages accumulates the latest content of every page recordApply has
@@ -174,6 +191,60 @@ type Session struct {
 	// pre-rebase values. See Flush.
 	rebaseGen int
 
+	// appliedGen counts recordApply calls that folded in at least one real
+	// frame — i.e. every time the capture engine actually observed a
+	// committed transaction via Apply, not merely a rebase. flushedGen is
+	// the value appliedGen held at the moment the most recently
+	// CONFIRMED-successful Flush drained its pageSet (captured as
+	// appliedGenAtEncode in Flush, stored here only once PutRef confirms).
+	// appliedGen != flushedGen means "at least one transaction has been
+	// applied since the last successful flush."
+	//
+	// That alone is NOT a sufficient idle-short-circuit signal for
+	// flushLoop: capture.Engine.rebase's checkpoint(TRUNCATE) folds whatever
+	// is currently sitting in the foreign WAL into the main file BEFORE
+	// Sink.Rebase (and therefore rebaseline) ever runs — see engine.go's
+	// rebase doc comment. Any transaction that had already committed but
+	// that this session's WAL reader had not yet consumed at that instant is
+	// absorbed into the fresh baseline snapshot WITHOUT ever passing through
+	// Apply: appliedGen never advances for it, even though real,
+	// previously-unflushed content is now sitting in the replica file. This
+	// is reachable on a session's very first write — Open returns once
+	// WaitReady's resume-or-rebase VERDICT has settled, not once a
+	// fresh-Dir session's startup rebase has actually finished running (see
+	// Open's comment) — and on any later rebase-on-divergence too.
+	//
+	// flushedRebaseGen closes this using state Flush already tracks for its
+	// own forceSnapshot bookkeeping — rebaseGen — rather than a new
+	// engine-side query: it is the value rebaseGen held at the drain point
+	// of the most recently CONFIRMED-successful flush (mirroring
+	// flushedGen/appliedGen exactly), and is gated the same way
+	// forceSnapshot's own clear already is (see Flush) — a rebase racing the
+	// upload/PutRef window must leave flushedRebaseGen at its pre-race
+	// value, so the pending signal below stays true and the next tick
+	// retries rather than believing the raced rebase's content is durable.
+	// rebaseGen != flushedRebaseGen means "a rebase has happened since the
+	// last successful flush." flushLoop's full pending check is
+	// `appliedGen != flushedGen || rebaseGen != flushedRebaseGen`.
+	//
+	// Consequence: every session performs one settling flush shortly after
+	// its startup rebase lands (rebaseGen ticks 0→1; flushedRebaseGen is
+	// still 0 until the first flush confirms), even if the agent never
+	// writes anything. That is correct — it is exactly what closes the
+	// startup-write race described above — and costs one PUT per session
+	// lifetime, nothing like the PM amendment's actual target (an idle
+	// session re-uploading a full snapshot every SnapshotEvery ticks
+	// forever).
+	//
+	// Using monotonic counters rather than bools for both pairs sidesteps a
+	// race bools would need extra bookkeeping to avoid: state that changes
+	// while a Flush's upload/PutRef is in flight (both run without
+	// replicaMu held) must not be silently cleared by that Flush's own
+	// post-success bookkeeping — with a counter, the "flushed" value is
+	// simply set to the pre-encode snapshot, so any increment racing the
+	// upload is untouched and still shows up as pending afterward.
+	appliedGen, flushedGen, flushedRebaseGen int
+
 	// snapshotEvery and flushesSinceSnapshot are read and written only from
 	// within Flush, which already holds flushMu for its entire body — no
 	// separate lock needed.
@@ -207,6 +278,23 @@ type Session struct {
 	err     error
 	closed  bool
 	durable uint64
+
+	// lastFlushAt, lastFlushTXID, lastFlushOK describe the most recent
+	// SUCCESSFUL flush, manual or automatic (see LastFlush). Stamped by
+	// Flush itself, at its single ref-write confirmation site, alongside
+	// durable above — see Flush.
+	lastFlushAt   time.Time
+	lastFlushTXID uint64
+	lastFlushOK   bool
+	// lastFlushErr is the most recent AUTOMATIC-flush failure (see
+	// LastFlushErr): set by flushLoop when its own call to Flush returns an
+	// error, and cleared by Flush itself on any later success — manual or
+	// automatic — alongside lastFlushAt/lastFlushTXID/lastFlushOK above. A
+	// manual Flush failure (e.g. from a direct caller, or the daemon's
+	// "flush" op) does NOT set this: it already returns its error directly
+	// to that caller, and lastFlushErr exists specifically to surface a
+	// failure nobody was synchronously waiting on.
+	lastFlushErr error
 }
 
 // Open acquires the lease, materializes the checkout, seeds the replica from
@@ -292,7 +380,14 @@ func Open(ctx context.Context, o Options) (*Session, error) {
 	// resume-or-rebase verdict has settled (see its doc comment) — not the
 	// full startup rebase when one runs, which stays exactly as
 	// asynchronous as it always was — so this adds no latency to the
-	// ordinary (fresh Dir, always-rebase) path.
+	// ordinary (fresh Dir, always-rebase) path. A consequence: on that
+	// ordinary path, Open can return to its caller before the startup
+	// rebase has actually finished running, so a write the caller makes
+	// immediately after Open returns can land in the checkout's WAL before
+	// that rebase's checkpoint(TRUNCATE) runs and get folded into its
+	// snapshot without ever passing through Apply. See
+	// appliedGen/flushedRebaseGen's doc comment on Session for why
+	// flushLoop's idle short-circuit does not lose track of that write.
 	if s.captured.WaitReady(ctx) == nil && s.captured.Resumed() {
 		s.replicaMu.Lock()
 		rerr := s.rebaseline()
@@ -312,6 +407,12 @@ func Open(ctx context.Context, o Options) (*Session, error) {
 	}
 
 	go s.renewLoop(cctx, o.RenewEvery, o.LeaseTTL)
+
+	if o.FlushEvery > 0 {
+		s.flushDone = make(chan struct{})
+		go s.flushLoop(cctx, o.FlushEvery)
+	}
+	s.logTransition("opened", "holder", lease.Holder, "epoch", lease.Epoch)
 	return s, nil
 }
 
@@ -329,11 +430,51 @@ func (s *Session) runEngine(ctx context.Context) {
 // fail records the first terminal error and stops the session's work.
 func (s *Session) fail(err error) {
 	s.mu.Lock()
-	if s.err == nil {
+	first := s.err == nil
+	if first {
 		s.err = err
 	}
 	s.mu.Unlock()
+	if first {
+		// "fenced" names this session's one terminal-failure transition,
+		// whatever its cause — lease loss (the literal ErrFenced case),
+		// the branch being destroyed out from under it, or a capture-engine
+		// failure (see runEngine and renewLoop, this function's only
+		// callers). All three end the session the same way from an
+		// observer's point of view: it stops serving and Err() starts
+		// returning non-nil. Logged once, matching the "if s.err == nil"
+		// gate above exactly, so a session that fails twice (e.g. a second
+		// caller racing to report the same underlying failure) reports the
+		// transition exactly once, not once per caller.
+		s.logTransition("fenced", "cause", err.Error())
+	}
 	s.cancel()
+}
+
+// logTransition writes one structured, key=value line to stderr for a
+// session state transition (opened, flushed, flush-failed, fenced, closed —
+// see Open, flush, fail, and Close). It deliberately matches the daemon
+// janitor's existing "offshoot: janitor: ..." prefix family (see
+// internal/daemon/server.go's StartJanitor) — "offshoot: session: db@branch:
+// event key=value ..." — so an operator grepping stderr for "offshoot:"
+// finds one consistent line shape rather than two competing ones.
+//
+// kv is a flat key/value list (kv[0], kv[1], kv[2], kv[3], ...); an odd
+// trailing element with no paired value is silently dropped rather than
+// panicking — this is a logging path, not something that should ever be
+// able to take a session down over a caller's own bug. String values are
+// %q-quoted (so an error message containing spaces stays a single token for
+// anything parsing key=value pairs); everything else uses %v.
+func (s *Session) logTransition(event string, kv ...any) {
+	line := fmt.Sprintf("offshoot: session: %s@%s: %s", s.db, s.branch, event)
+	for i := 0; i+1 < len(kv); i += 2 {
+		if sv, ok := kv[i+1].(string); ok {
+			line += fmt.Sprintf(" %v=%q", kv[i], sv)
+		} else {
+			line += fmt.Sprintf(" %v=%v", kv[i], kv[i+1])
+		}
+	}
+	fmt.Fprintln(os.Stderr, line)
 }
 
 func (s *Session) CheckoutPath() string { return s.checkoutPath }
@@ -349,6 +490,12 @@ func (s *Session) ReplicaPath() string { return s.replica.Path() }
 func (s *Session) DB() string          { return s.db }
 func (s *Session) Branch() string      { return s.branch }
 
+// CaptureLag reports WAL bytes committed by writers but not yet applied to
+// the replica — see capture.Engine.Lag's doc comment. Safe to call at any
+// time, including concurrently with the capture engine's own goroutine (see
+// Lag's doc comment for why).
+func (s *Session) CaptureLag() int64 { return s.captured.Lag() }
+
 func (s *Session) Lease() store.Lease {
 	s.mu.Lock()
 	defer s.mu.Unlock()
@@ -362,6 +509,129 @@ func (s *Session) Err() error {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	return s.err
+}
+
+// LastFlush reports the time and txid of the most recent SUCCESSFUL flush —
+// manual (an explicit Flush call) or automatic (flushLoop) — and ok=false if
+// no flush has ever succeeded on this Session.
+func (s *Session) LastFlush() (t time.Time, txid uint64, ok bool) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	return s.lastFlushAt, s.lastFlushTXID, s.lastFlushOK
+}
+
+// LastFlushErr reports the most recent AUTOMATIC-flush failure recorded by
+// flushLoop, or nil if none has happened since the last success (manual or
+// automatic). A manual Flush call's own error is returned directly to its
+// caller and never touches this — see the field's doc comment.
+func (s *Session) LastFlushErr() error {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	return s.lastFlushErr
+}
+
+// autoFlushPending reports flushLoop's idle-short-circuit pending signal:
+// true when EITHER appliedGen != flushedGen (a real transaction has been
+// applied since the last successful flush) OR rebaseGen != flushedRebaseGen
+// (a rebase — startup, or on-divergence — has happened since the last
+// successful flush). See appliedGen/flushedRebaseGen's doc comment on
+// Session for exactly why the rebaseGen half is load-bearing and not
+// redundant with the appliedGen half. A single method, rather than the
+// two-line expression inlined at each call site, so flushLoop's own check
+// and tests that need to know "has the session settled yet" (see
+// TestIdleAutoFlushWritesNothing and the rebase tests in flush_test.go)
+// can never drift apart from what flushLoop itself actually evaluates.
+func (s *Session) autoFlushPending() bool {
+	s.replicaMu.Lock()
+	defer s.replicaMu.Unlock()
+	return s.appliedGen != s.flushedGen || s.rebaseGen != s.flushedRebaseGen
+}
+
+// flushLoop calls flush("", true) — the auto-tagged path Flush("") itself is
+// a thin wrapper around, see flush's doc comment — on a fixed cadence for as
+// long as the session is open, so a caller that never calls Flush manually
+// still gets bounded data loss on crash. Mirrors renewLoop's shutdown
+// discipline exactly: it exits when ctx is cancelled (Close, or a terminal
+// fail() elsewhere — a fenced or
+// otherwise fatal session already stops itself via Err(), so this loop needs
+// no special handling for that case beyond exiting on its next ctx.Done()
+// check) and closes flushDone exactly once so Close can join it.
+//
+// Idle short-circuit (PM-review blocking amendment) — pending signal: a tick
+// calls Flush only when EITHER appliedGen != flushedGen (a real transaction
+// has been applied since the last successful flush) OR rebaseGen !=
+// flushedRebaseGen (a rebase — startup, or on-divergence — has happened
+// since the last successful flush). See appliedGen/flushedRebaseGen's doc
+// comment on Session for exactly why the rebaseGen half is load-bearing and
+// not redundant with the appliedGen half — in short, a rebase's
+// checkpoint(TRUNCATE) can fold a real, previously-uncaptured commit into
+// the baseline without ever calling Apply, so appliedGen alone would miss
+// it. When neither signal is pending, this tick calls Flush not at all: no
+// DrainNow, no GetRef, no object write, no ref write, no
+// flushesSinceSnapshot advance. Without this, an idle session would still
+// upload a full snapshot every SnapshotEvery ticks forever: Flush
+// unconditionally advances txid and writes something once actually called,
+// whether or not anything changed.
+//
+// Consequence: every session performs one settling flush shortly after its
+// startup rebase lands (see appliedGen/flushedRebaseGen's doc comment for
+// why), even if the agent never writes anything — one PUT per session
+// lifetime, nothing like the idle-forever-snapshotting bug the short-circuit
+// exists to prevent.
+//
+// A failing tick records lastFlushErr and is retried on the next tick (the
+// pending check above is satisfied unconditionally while lastFlushErr !=
+// nil, so a failed attempt keeps retrying even if nothing NEW is pending);
+// it never terminates the session. lastFlushErr is cleared by Flush itself
+// on any later success, manual or automatic. Because a manual Flush can run
+// concurrently with this loop's own (flushMu only serializes their bodies,
+// not their outcomes' visibility), a failing tick only stamps lastFlushErr
+// if lastFlushAt/lastFlushTXID are still exactly what they were when this
+// tick's own attempt began — otherwise a fresher success already landed
+// (from this tick's own call racing a concurrent manual Flush, or from a
+// manual Flush that ran between this tick's Flush call returning and this
+// loop regaining s.mu below) and stamping the stale error would incorrectly
+// resurrect a failure that no longer reflects reality.
+//
+// Flush returning ErrClosed means Close has already started (or finished)
+// concurrently with this tick — session shutdown racing the ticker, not an
+// operational failure worth surfacing: a caller polling status mid-shutdown
+// must not see "session: closed" reported as a flush error. ctx.Done() ends
+// this loop on its own next iteration regardless.
+//
+// Uses a time.Ticker, which drops ticks it cannot deliver in time rather
+// than queuing them — so a tick delayed behind a slow manual Flush holding
+// flushMu is simply skipped, never piled up.
+func (s *Session) flushLoop(ctx context.Context, every time.Duration) {
+	defer close(s.flushDone)
+	t := time.NewTicker(every)
+	defer t.Stop()
+	for {
+		select {
+		case <-ctx.Done():
+			return
+		case <-t.C:
+		}
+
+		if !s.autoFlushPending() && s.LastFlushErr() == nil {
+			continue // idle short-circuit: nothing to do this tick.
+		}
+
+		s.mu.Lock()
+		beforeAt, beforeTXID := s.lastFlushAt, s.lastFlushTXID
+		s.mu.Unlock()
+
+		if _, err := s.flush("", true); err != nil {
+			if errors.Is(err, ErrClosed) {
+				continue
+			}
+			s.mu.Lock()
+			if s.lastFlushAt.Equal(beforeAt) && s.lastFlushTXID == beforeTXID {
+				s.lastFlushErr = err
+			}
+			s.mu.Unlock()
+		}
+	}
 }
 
 // ErrClosed reports that Flush was called on a session that Close has
@@ -411,6 +681,9 @@ func (s *Session) Close() error {
 	s.cancel()
 	<-s.engDone
 	<-s.renewDone
+	if s.flushDone != nil {
+		<-s.flushDone
+	}
 
 	var relErr error
 	if err := s.ws.ReleaseLease(lease); err != nil && !errors.Is(err, store.ErrLeaseLost) {
@@ -420,6 +693,11 @@ func (s *Session) Close() error {
 		s.flushMu.Lock()
 		os.RemoveAll(s.dir)
 		s.flushMu.Unlock()
+	}
+	if relErr != nil {
+		s.logTransition("closed", "error", relErr.Error())
+	} else {
+		s.logTransition("closed")
 	}
 	return relErr
 }
@@ -551,6 +829,9 @@ func (s *Session) recordApply(pageSize uint32, frames []wal.Frame) error {
 	// transaction grew or shrank the database.
 	s.pages.record(frames)
 	s.pages.dropAbove(newCommit)
+	// A real transaction was folded in — see appliedGen's doc comment for
+	// why this is the idle short-circuit's pending signal.
+	s.appliedGen++
 	return nil
 }
 

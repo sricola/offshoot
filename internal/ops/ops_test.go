@@ -1,6 +1,7 @@
 package ops
 
 import (
+	"bytes"
 	"database/sql"
 	"errors"
 	"fmt"
@@ -633,6 +634,171 @@ func TestForkAtCheckpointAfterRollback(t *testing.T) {
 	got, _ := exec.Command("sqlite3", p, "SELECT v FROM t;").Output()
 	if string(got) != "1\n" {
 		t.Fatalf("fork --at v1 content: %q, want just the v1 row", got)
+	}
+}
+
+// TestForkFastPathMatchesSlowPath is Task 6's core equivalence test: forking
+// the same source (a freshly checkpointed branch, whose chain is always
+// exactly one snapshot — ops.Checkpoint always writes a full snapshot, never
+// a segment) via the fast object-copy path and via the slow
+// materialize-and-re-encode path (forced via forkSlowPathForTest) must
+// produce equivalent children two ways:
+//   - Row-level: both children's `.dump` output is byte-identical.
+//   - Object-level: the fast-path child's stored snapshot object is
+//     byte-identical to the SOURCE snapshot object it was copied from — not
+//     merely equivalent after a decode/re-encode round trip.
+func TestForkFastPathMatchesSlowPath(t *testing.T) {
+	if _, err := exec.LookPath("sqlite3"); err != nil {
+		t.Skip("sqlite3 CLI not on PATH")
+	}
+	w := newWS(t)
+	if err := w.Create("app"); err != nil {
+		t.Fatal(err)
+	}
+	path, _ := w.Checkout("app", "main")
+	if out, err := exec.Command("sqlite3", path,
+		"CREATE TABLE t (v); INSERT INTO t VALUES (1),(2),(3);").CombinedOutput(); err != nil {
+		t.Fatalf("seed: %v: %s", err, out)
+	}
+	if _, err := w.Checkpoint("app", "main", "v1"); err != nil {
+		t.Fatal(err)
+	}
+	srcRef, _, err := w.Store.GetRef("app", "main")
+	if err != nil {
+		t.Fatal(err)
+	}
+	chain, err := w.Store.Chain(srcRef.Lineage, srcRef.HeadTXID)
+	if err != nil || len(chain) != 1 || !chain[0].Snapshot {
+		t.Fatalf("test precondition: source chain must be a single snapshot, got %+v err=%v", chain, err)
+	}
+
+	before := ForkFastPathHits()
+	if _, err := w.Fork("app", "main", "fast", "", 0); err != nil {
+		t.Fatal(err)
+	}
+	if got := ForkFastPathHits(); got != before+1 {
+		t.Fatalf("fork fast path hits = %d, want %d (fast path should have fired for a single-snapshot chain)", got, before+1)
+	}
+
+	SetForkSlowPathForTest(true)
+	t.Cleanup(func() { SetForkSlowPathForTest(false) })
+	before = ForkFastPathHits()
+	if _, err := w.Fork("app", "main", "slow", "", 0); err != nil {
+		t.Fatal(err)
+	}
+	if got := ForkFastPathHits(); got != before {
+		t.Fatalf("fork fast path hits = %d, want %d (forkSlowPathForTest must suppress the fast path)", got, before)
+	}
+	SetForkSlowPathForTest(false)
+
+	fastPath, err := w.Checkout("app", "fast")
+	if err != nil {
+		t.Fatal(err)
+	}
+	slowPath, err := w.Checkout("app", "slow")
+	if err != nil {
+		t.Fatal(err)
+	}
+	fastDump, err := exec.Command("sqlite3", fastPath, ".dump").Output()
+	if err != nil {
+		t.Fatalf("dump fast-path child: %v", err)
+	}
+	slowDump, err := exec.Command("sqlite3", slowPath, ".dump").Output()
+	if err != nil {
+		t.Fatalf("dump slow-path child: %v", err)
+	}
+	if !bytes.Equal(fastDump, slowDump) {
+		t.Fatalf("fast-path and slow-path children diverge:\n--- fast ---\n%s\n--- slow ---\n%s", fastDump, slowDump)
+	}
+
+	// Stronger than the .dump comparison above: the two materialized
+	// CHECKOUT FILES themselves must be byte-identical, not merely
+	// equivalent after re-parsing. Both children were seeded from the same
+	// source content at the same page size and commit size, and both
+	// ltxio.Materialize/MaterializeChain skip the lock page identically, so
+	// there is no legitimate reason for the raw bytes to differ.
+	fastFileData, err := os.ReadFile(fastPath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	slowFileData, err := os.ReadFile(slowPath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !bytes.Equal(fastFileData, slowFileData) {
+		t.Fatal("fast-path and slow-path children' materialized checkout files are not byte-identical")
+	}
+
+	// Object-level: fetch the source object and the fast-path child's object
+	// directly from the backend and compare bytes, not just decoded content.
+	fastRef, _, err := w.Store.GetRef("app", "fast")
+	if err != nil {
+		t.Fatal(err)
+	}
+	srcData, _, err := w.Store.B.Get(store.SnapshotKey(srcRef.Lineage, srcRef.HeadEpoch, srcRef.HeadTXID))
+	if err != nil {
+		t.Fatal(err)
+	}
+	fastData, _, err := w.Store.B.Get(store.SnapshotKey(fastRef.Lineage, fastRef.HeadEpoch, fastRef.HeadTXID))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !bytes.Equal(srcData, fastData) {
+		t.Fatal("fast-path child's stored snapshot object must be byte-identical to the source snapshot object")
+	}
+}
+
+// TestForkFastPathFiresOnS3WithinSizeLimit pins Task 6b's behavior: S3
+// server-side CopyObject means forking a single-snapshot chain over an S3
+// backend now takes the SAME fast path the local backend does (Task 6a),
+// for any object at or under S3's 5GB single-request CopyObject limit —
+// this is no longer the "S3 always falls back" world Task 6a shipped with.
+// The size-gated fallback itself (over the limit, store.ErrCopyUnsupported)
+// is pinned directly against store.S3.CopyObject in
+// internal/store/s3_test.go's TestS3CopyObjectOverSizeLimitFallsBack — that
+// path shares tryFastForkCopy's generic errors.Is(err,
+// store.ErrCopyUnsupported) fallback wiring with
+// TestForkFastPathSkipsMultiMemberChains (gc_chain_test.go), so it isn't
+// duplicated again here at the ops level.
+func TestForkFastPathFiresOnS3WithinSizeLimit(t *testing.T) {
+	if _, err := exec.LookPath("sqlite3"); err != nil {
+		t.Skip("sqlite3 CLI not on PATH")
+	}
+	w := newWSOnFakeS3(t)
+	if err := w.Create("app"); err != nil {
+		t.Fatal(err)
+	}
+	path, _ := w.Checkout("app", "main")
+	if out, err := exec.Command("sqlite3", path,
+		"CREATE TABLE t (v); INSERT INTO t VALUES (1),(2);").CombinedOutput(); err != nil {
+		t.Fatalf("seed: %v: %s", err, out)
+	}
+	if _, err := w.Checkpoint("app", "main", "v1"); err != nil {
+		t.Fatal(err)
+	}
+
+	before := ForkFastPathHits()
+	if _, err := w.Fork("app", "main", "child", "", 0); err != nil {
+		t.Fatal(err)
+	}
+	if got := ForkFastPathHits(); got != before+1 {
+		t.Fatalf("fork fast path hits = %d, want %d (S3's server-side CopyObject should fire the fast path for a single-snapshot chain within the size limit)", got, before+1)
+	}
+
+	srcDump, err := exec.Command("sqlite3", path, ".dump").Output()
+	if err != nil {
+		t.Fatal(err)
+	}
+	cpath, err := w.Checkout("app", "child")
+	if err != nil {
+		t.Fatal(err)
+	}
+	childDump, err := exec.Command("sqlite3", cpath, ".dump").Output()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !bytes.Equal(srcDump, childDump) {
+		t.Fatalf("child diverges from source on the S3 fast path:\n--- src ---\n%s\n--- child ---\n%s", srcDump, childDump)
 	}
 }
 
@@ -1376,5 +1542,200 @@ func TestOpsRejectEscapingNames(t *testing.T) {
 			err := w.Destroy("app", bad, true)
 			assertRejected(t, err, "Destroy branch")
 		})
+	}
+}
+
+// TestCheckoutSkipsRematerializeWhenCleanAndCurrent pins the optimization
+// that Checkout must not re-materialize (temp file + rename over the fixed
+// checkout path) when the existing checkout is already byte-correct: clean
+// (matches its .sum sidecar fingerprint) AND current (the sidecar's recorded
+// lineage+txid equals the ref's CURRENT head, which checkoutState already
+// compares against — see checkoutState's doc comment). materializeChainAt
+// (internal/ltxio.MaterializeChain) always writes via os.CreateTemp + rename,
+// so a skipped re-materialization is observable as the checkout path keeping
+// the SAME inode across calls; a re-materialized one gets a fresh inode.
+func TestCheckoutSkipsRematerializeWhenCleanAndCurrent(t *testing.T) {
+	requireSQLite(t)
+	w := newWS(t)
+	if err := w.Create("app"); err != nil {
+		t.Fatal(err)
+	}
+	p1, err := w.Checkout("app", "main")
+	if err != nil {
+		t.Fatal(err)
+	}
+	st1, err := os.Stat(p1)
+	if err != nil {
+		t.Fatal(err)
+	}
+	// The checkout is clean and current immediately after materializing: a
+	// second Checkout must return the SAME file, not rebuild it.
+	p2, err := w.Checkout("app", "main")
+	if err != nil {
+		t.Fatal(err)
+	}
+	st2, err := os.Stat(p2)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !os.SameFile(st1, st2) {
+		t.Fatal("a clean, current checkout must not be re-materialized (same inode expected)")
+	}
+
+	// A checkpoint advances the head; Checkpoint itself refreshes the .sum
+	// sidecar to the new (lineage, txid) in place (see writeSum in
+	// Checkpoint), so the checkout is STILL clean and current at the new
+	// head without Checkout doing anything — still no re-materialize.
+	mustExecSQL(t, p2, "CREATE TABLE t (v);")
+	if _, err := w.Checkpoint("app", "main", "cp1"); err != nil {
+		t.Fatal(err)
+	}
+	p3, err := w.Checkout("app", "main")
+	if err != nil {
+		t.Fatal(err)
+	}
+	st3, err := os.Stat(p3)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !os.SameFile(st2, st3) {
+		t.Fatal("checkpoint leaves the checkout clean at the new head; still no re-materialize")
+	}
+
+	// An unverifiable checkout (sidecar present but not a valid current-format
+	// record) must fall back to checkoutState == "unknown" and re-materialize
+	// rather than risk skipping over something it can't prove is clean.
+	// checkoutState treats {} as unknown: it decodes fine but rec.Hash == "".
+	sum := p3 + ".sum"
+	if _, err := os.Stat(sum); err != nil {
+		t.Fatalf("expected a .sum sidecar at %s: %v", sum, err)
+	}
+	if err := os.WriteFile(sum, []byte("{}"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	p4, err := w.Checkout("app", "main")
+	if err != nil {
+		t.Fatal(err)
+	}
+	st4, err := os.Stat(p4)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if os.SameFile(st3, st4) {
+		t.Fatal("an unverifiable checkout (bad sidecar) must be re-materialized")
+	}
+
+	// A modified checkout (un-checkpointed local edits) must still warn and
+	// be overwritten, exactly as before this change — the "clean" fast path
+	// must not swallow the "modified" case.
+	mustExecSQL(t, p4, "INSERT INTO t VALUES (1);")
+	var p5 string
+	stderr := captureStderr(t, func() {
+		p5, err = w.Checkout("app", "main")
+		if err != nil {
+			t.Fatal(err)
+		}
+	})
+	if !strings.Contains(stderr, "un-checkpointed changes") {
+		t.Fatalf("warning missing expected text: %q", stderr)
+	}
+	st5, err := os.Stat(p5)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if os.SameFile(st4, st5) {
+		t.Fatal("a modified checkout must still be re-materialized (and warned about)")
+	}
+}
+
+// TestCheckoutRematerializesOnEpochMismatchOrOldFormatSidecar guards the gap
+// flagged in review of the clean-fast-path change above: checkoutState's
+// identity check must compare Epoch, not just (Lineage, TXID). Chain
+// resolution (store.keepHighestEpoch) exists precisely because a fenced-out
+// writer's orphaned object can share a TXID with the live object under a
+// different epoch, so lineage+txid alone does not prove two checkouts hold
+// the same committed bytes. A sidecar with the right Lineage+TXID but a
+// stale Epoch must read as "stale" (rebuild, not skip); so must an
+// OLD-FORMAT sidecar that predates the Epoch field entirely (decodes Epoch
+// to its zero value) — it must not be trusted as clean just because a real
+// ref's HeadEpoch is never 0.
+func TestCheckoutRematerializesOnEpochMismatchOrOldFormatSidecar(t *testing.T) {
+	requireSQLite(t)
+	w := newWS(t)
+	if err := w.Create("app"); err != nil {
+		t.Fatal(err)
+	}
+	p1, err := w.Checkout("app", "main")
+	if err != nil {
+		t.Fatal(err)
+	}
+	st1, err := os.Stat(p1)
+	if err != nil {
+		t.Fatal(err)
+	}
+	ref, _, err := w.Store.GetRef("app", "main")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if ref.HeadEpoch == 0 {
+		t.Fatal("test assumption violated: a real ref's HeadEpoch must be >= 1 (see decodeRef)")
+	}
+	hash, err := fileSum(p1)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	// Right lineage, right txid, WRONG epoch: checkoutState must call this
+	// "stale" (not "clean"), and Checkout must rebuild rather than skip.
+	staleEpoch := fmt.Sprintf(`{"hash":%q,"lineage":%q,"epoch":%d,"txid":%d}`,
+		hash, ref.Lineage, ref.HeadEpoch+1, ref.HeadTXID)
+	if err := os.WriteFile(p1+".sum", []byte(staleEpoch), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	if got := checkoutState(p1, ref); got != "stale" {
+		t.Fatalf("checkoutState with mismatched epoch = %q, want %q", got, "stale")
+	}
+	p2, err := w.Checkout("app", "main")
+	if err != nil {
+		t.Fatal(err)
+	}
+	st2, err := os.Stat(p2)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if os.SameFile(st1, st2) {
+		t.Fatal("a sidecar with a stale epoch (right lineage+txid) must be re-materialized, not skipped")
+	}
+
+	// Old-format sidecar: no "epoch" field at all, as any sidecar written
+	// before this fix would be. Decodes Epoch to its zero value, which must
+	// NOT be treated as matching a real ref's HeadEpoch (always >= 1) —
+	// that's the safe direction (rebuild) rather than the unsafe one (trust
+	// a pre-epoch-tracking sidecar as clean).
+	ref2, _, err := w.Store.GetRef("app", "main")
+	if err != nil {
+		t.Fatal(err)
+	}
+	hash2, err := fileSum(p2)
+	if err != nil {
+		t.Fatal(err)
+	}
+	oldFormat := fmt.Sprintf(`{"hash":%q,"lineage":%q,"txid":%d}`, hash2, ref2.Lineage, ref2.HeadTXID)
+	if err := os.WriteFile(p2+".sum", []byte(oldFormat), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	if got := checkoutState(p2, ref2); got != "stale" {
+		t.Fatalf("checkoutState for an old-format (no epoch) sidecar = %q, want %q", got, "stale")
+	}
+	p3, err := w.Checkout("app", "main")
+	if err != nil {
+		t.Fatal(err)
+	}
+	st3, err := os.Stat(p3)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if os.SameFile(st2, st3) {
+		t.Fatal("an old-format sidecar (no epoch field) must be re-materialized, not skipped")
 	}
 }
