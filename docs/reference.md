@@ -366,7 +366,7 @@ store-attach failure.
 ## `offshoot mcp`
 
 ```
-offshoot mcp
+offshoot mcp [-default-ttl DURATION|none]
 claude mcp add offshoot -- offshoot -store ./.offshoot mcp
 ```
 
@@ -378,13 +378,21 @@ before risky work, checkpoint when tests pass, roll back when they fail,
 promote the attempt that worked). Destructive tools honor the same
 protected-branch rules as the CLI — an unforced `offshoot_promote --onto
 main` or `offshoot_destroy` on `main` is refused, and the refusal is
-returned to the agent as the tool result, not a transport-level error. Note:
-`offshoot_fork` over MCP currently has no way to set a TTL (a roadmap gap,
-tracked as
-[Milestone 2](../ROADMAP.md#milestone-2--safe-by-default-for-agents)), so
-every agent-initiated fork is TTL-less until you `touch --ttl` it yourself.
-This mode runs entirely at rest (no daemon integration yet) — see
-[docs/status.md](status.md).
+returned to the agent as the tool result, not a transport-level error.
+
+Agent-initiated forks carry a TTL by default: `offshoot_fork` applies
+`-default-ttl` (default `24h`) to any call that omits its own `ttl`
+argument, so a branch an agent forks and forgets is eligible for reaping
+instead of accumulating forever. `-default-ttl 0` or `-default-ttl none`
+disables the default; an individual `offshoot_fork` call can still override
+it either way — an explicit `ttl:"<duration>"` always wins, and
+`ttl:"none"` always yields no TTL even under a configured default. The
+fork tool's response echoes the applied TTL and, when there is one, the
+computed expiry timestamp, so both land in the agent's own transcript.
+**TTL alone does not reap anything**: reaping requires a running janitor
+(`offshoot serve`); this mode runs entirely at rest (no daemon integration
+yet — see [docs/status.md](status.md)), so a daemonless `offshoot mcp`
+setup only sweeps expired branches when `offshoot gc` is run by hand.
 
 ## `offshoot session open <db>[@branch] [-socket PATH]`
 

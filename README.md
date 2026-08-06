@@ -223,6 +223,22 @@ Destructive tools respect the same protected-branch rules as the CLI: an agent
 can fork and experiment freely, but promoting onto or destroying `main`
 requires an explicit force, and the refusal tells the agent so.
 
+Agent-created forks expire by default, so an agent that forks and forgets
+doesn't leak branches forever: `offshoot_fork` applies `offshoot mcp
+-default-ttl` (default `24h`) to any call that omits its own `ttl`; pass
+`ttl:"<duration>"` on the call to override it, or `ttl:"none"` to fork a
+branch that never expires even under a configured default:
+
+    offshoot mcp -default-ttl 12h        # forks default to 12h unless overridden
+    offshoot mcp -default-ttl none       # forks are immortal unless a call sets ttl
+
+The tool's response echoes the TTL it applied and, when there is one, the
+computed expiry timestamp, so both are visible in the agent's own
+transcript. **A TTL alone does not reap anything** — reaping is the
+janitor's job (`offshoot serve`), and MCP mode runs entirely at rest with no
+daemon of its own, so a daemonless `offshoot mcp` setup only sweeps expired
+branches when `offshoot gc` is run by hand.
+
 ### Python SDK
 
 `sdk/python` is a stdlib-only, thin client over the daemon's lifecycle API —
