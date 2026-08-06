@@ -255,10 +255,24 @@ behind it — on every session open. But a checkout that *does* get
 re-materialized (dirty, stale, or destroyed/reaped while an earlier open's
 descriptor still points at its now-unlinked inode) still strands one
 descriptor, and the disk behind it, for the life of the daemon process —
-there is no reclamation path for that yet. In practice: a daemon that keeps
-reopening the same clean branches stays flat; one that churns through many
-short-lived or dirty checkouts accumulates orphaned disk over its uptime.
-Restarting the daemon reclaims everything a fresh process never opened.
+there is no reclamation path for that yet.
+
+That skip only fires when the checkout's `.sum` sidecar still matches the
+branch ref's current head txid, and nothing today keeps it matching across a
+session's whole lifetime under the default daemon config: the settling flush
+(above) advances the ref's head txid roughly `-flush-every` (30s by default)
+after `session open`, but a clean `Session.Close` never rewrites the sidecar
+to catch up — only `Checkout`, `Checkpoint`, `Rollback`, and `Promote` do. So
+in practice, "stays flat" only holds for a session that closes *before* its
+settling flush lands; a daemon that keeps reopening the same branch across
+sessions that outlive that ~30s window re-materializes (one stranded
+descriptor and one full disk copy) on every single reopen, not just on
+dirty/stale ones. See [docs/status.md](docs/status.md)'s "Sidecar refresh on
+clean Close" row for the ledgered follow-up. Meanwhile: a daemon whose
+sessions all close within the settling-flush window stays flat; one that
+churns through many short-lived-but-past-that-window or dirty checkouts
+accumulates orphaned disk over its uptime. Restarting the daemon reclaims
+everything a fresh process never opened.
 
 Design: docs/superpowers/specs/2026-07-29-offshoot-design.md
 Capture-spike evidence: docs/superpowers/specs/2026-07-29-offshoot-spike-report.md

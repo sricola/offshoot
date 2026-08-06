@@ -68,7 +68,11 @@ of work, leak branches forever, or take the slow path by default.*
   first "settling" flush still uploads a full snapshot unconditionally, even
   when nothing changed since open; a checksum-compare-and-skip refinement is
   scoped but not built — see status.md's "Settling-flush checksum-compare
-  suppression" row.*
+  suppression" row. Related follow-up: that same settling flush advances the
+  branch ref's head txid, but no clean `Session.Close` refreshes the
+  checkout's `.sum` sidecar to match, so any session outliving its own
+  settling flush leaves the next `session open` re-materializing the
+  checkout — see status.md's "Sidecar refresh on clean Close" row.*
 - **MCP forks get TTLs.** The MCP `fork` tool currently cannot set a TTL, so
   every agent-initiated fork is immortal — the exact orphan-leak class the
   design calls launch-killing. Add the tool argument plus a server-side
