@@ -15,8 +15,7 @@ import (
 // fork before risky work, checkpoint on success, roll back on failure,
 // promote a winning attempt, destroy a losing one.
 type OffshootTools struct {
-	ws   *ops.Workspace
-	spec string
+	ws *ops.Workspace
 	// socket is the daemon socket every tool call probes fresh (see
 	// daemonStatus/openSession) — never cached, since the daemon may start
 	// or stop between calls. Always concrete (never ""): NewOffshootTools
@@ -56,39 +55,142 @@ func NewOffshootTools(ws *ops.Workspace, spec string, defaultTTL time.Duration, 
 			socket = p
 		}
 	}
-	return &OffshootTools{ws: ws, spec: spec, socket: socket, defaultTTL: defaultTTL}
+	return &OffshootTools{ws: ws, socket: socket, defaultTTL: defaultTTL}
 }
+
+// statusProbeTimeout bounds daemonStatus's wait for a "status" reply.
+// daemon.Call's own dial timeout (2s, see internal/daemon/client.go) only
+// bounds connecting; once connected, its Decode blocks until the daemon
+// actually writes a response, with no timeout of its own. Every tool call
+// probes status fresh (see NewOffshootTools's per-call, never-cached
+// contract), so a daemon that accepts connections but never answers —
+// wedged, deadlocked, whatever — would otherwise hang every subsequent MCP
+// call at this detection step alone. The bound lives here, local to this
+// one probe, rather than as a client.go change: an actual flush/fork
+// request (see checkpoint/fork below) is a real operation the agent is
+// waiting on the result of and must not be truncated the same way.
+const statusProbeTimeout = 2 * time.Second
 
 // daemonStatus probes the daemon at t.socket, fresh on every call — the
 // daemon may start after this tool set was constructed, so this is never
 // cached. ok is false whenever the daemon isn't reachable (not running,
-// still starting, a dial timeout, anything) or answers with ok=false;
-// callers treat that uniformly as a silent fallback to at-rest behavior,
-// never as an error surfaced to the agent.
+// still starting, a dial timeout, doesn't answer within statusProbeTimeout,
+// anything) or answers with ok=false; callers treat that uniformly as a
+// silent fallback to at-rest behavior, never as an error surfaced to the
+// agent. On a timeout, the underlying daemon.Call goroutine is abandoned
+// (daemon.Call itself has no cancellation) rather than joined — an
+// acceptable leak against a daemon this wedged, bounded by that goroutine's
+// own eventual connection close or process exit.
 func (t *OffshootTools) daemonStatus() (resp daemon.Response, ok bool) {
-	resp, err := daemon.Call(t.socket, daemon.Request{Op: "status"})
-	if err != nil || !resp.OK {
+	type result struct {
+		resp daemon.Response
+		err  error
+	}
+	done := make(chan result, 1)
+	go func() {
+		resp, err := daemon.Call(t.socket, daemon.Request{Op: "status"})
+		done <- result{resp, err}
+	}()
+	select {
+	case r := <-done:
+		if r.err != nil || !r.resp.OK {
+			return daemon.Response{}, false
+		}
+		return r.resp, true
+	case <-time.After(statusProbeTimeout):
 		return daemon.Response{}, false
 	}
-	return resp, true
 }
 
-// openSession reports the daemon's SessionInfo for db@branch, or ok=false
-// if the daemon isn't reachable at all OR is reachable but has no session
-// open on that exact branch — checkpoint and checkout both collapse those
-// two "no" cases into the same at-rest fallback, per this package's
-// silent-detection-failure contract.
-func (t *OffshootTools) openSession(db, branch string) (info daemon.SessionInfo, ok bool) {
-	resp, up := t.daemonStatus()
-	if !up {
-		return daemon.SessionInfo{}, false
-	}
+// findSession scans an already-fetched status resp for db@branch's
+// SessionInfo, regardless of health — present covers a live session AND a
+// fenced/unhealthy one (SessionInfo.Error != "", which stays in the
+// daemon's session map rather than disappearing — see server.go's
+// opStatus). Callers that need "trustworthy for live capture" must use
+// healthySession instead; callers that only need "the daemon has SOME
+// claim on this branch" (refuseIfSessionOpen) use this directly.
+func findSession(resp daemon.Response, db, branch string) (info daemon.SessionInfo, ok bool) {
 	for _, s := range resp.Sessions {
 		if s.DB == db && s.Branch == branch {
 			return s, true
 		}
 	}
 	return daemon.SessionInfo{}, false
+}
+
+// healthySession is findSession filtered to a session actually trustworthy
+// for live capture: present AND not fenced/unhealthy. A session that lost
+// its lease (fenced — e.g. another writer reclaimed it) stops writing but
+// stays listed in "status" until it's closed, so its mere presence in
+// findSession is not enough: handing an agent that session's checkout path
+// as "live" (checkout) or routing a checkpoint through it (checkpoint)
+// would promise continuous capture from a session that has actually
+// stopped.
+func healthySession(resp daemon.Response, db, branch string) (info daemon.SessionInfo, ok bool) {
+	info, ok = findSession(resp, db, branch)
+	if !ok || info.Error != "" {
+		return daemon.SessionInfo{}, false
+	}
+	return info, true
+}
+
+// openSession reports the daemon's SessionInfo for db@branch if the daemon
+// is reachable and has a HEALTHY session open there (see healthySession);
+// ok=false covers every other case — daemon unreachable, no session at
+// all, or a session that's fenced/unhealthy — uniformly, per this
+// package's at-rest-fallback contract. checkpoint uses this directly, since
+// falling back to an at-rest checkpoint is always safe here regardless of
+// why (ops.Workspace.Checkpoint's raw open/close only risks a live
+// in-process session, and MCP and the daemon are always separate
+// processes — see Checkpoint's own doc comment); checkout needs the raw
+// (error-included) lookup too, to explain a fenced-session fallback, so it
+// calls daemonStatus/findSession/healthySession itself instead of this.
+func (t *OffshootTools) openSession(db, branch string) (info daemon.SessionInfo, ok bool) {
+	resp, up := t.daemonStatus()
+	if !up {
+		return daemon.SessionInfo{}, false
+	}
+	return healthySession(resp, db, branch)
+}
+
+// refuseIfSessionOpen refuses opName on db@branch (ok=true, with a
+// ToolResult naming the session) if the daemon has ANY session entry for
+// that branch — healthy or fenced — in its "status" response; ok=false
+// (proceed at rest) if the daemon isn't reachable or has no such entry.
+//
+// This mirrors internal/daemon's own refuseIfClaimed guard (server.go),
+// which the daemon already enforces against ITS OWN client for exactly
+// these kinds of ops (checkout/destroy/rollback/promote-target): they
+// repoint or delete a branch outright, so — unlike fork/checkpoint, which
+// flush an open session's writes first and proceed — there is no live
+// engine here to flush first; refusal is the only safe response. MCP calls
+// ops.Workspace directly for rollback/promote/destroy, bypassing the
+// daemon (and its refuseIfClaimed guard) entirely, so without this an
+// at-rest call from this package could clear a lease or repoint/delete a
+// branch out from under a session the daemon still believes it owns.
+//
+// A session still "reserved" (an in-flight daemon "open" not yet resolved
+// into a live session) is invisible here: the daemon's "status" op only
+// reports fully-open (or since-fenced) sessions, never a bare reservation
+// (see opStatus) — narrower than the daemon's own in-process
+// refuseIfClaimed, and a gap this package shares with any other
+// out-of-band store client.
+func (t *OffshootTools) refuseIfSessionOpen(db, branch, opName string) (ToolResult, bool) {
+	resp, up := t.daemonStatus()
+	if !up {
+		return ToolResult{}, false
+	}
+	info, found := findSession(resp, db, branch)
+	if !found {
+		return ToolResult{}, false
+	}
+	if info.Error != "" {
+		return ErrorResult("a daemon session (holder %q) is open on %s@%s but unhealthy (%s); "+
+			"close it before %s — e.g. `offshoot session close %s@%s`",
+			info.Holder, db, branch, info.Error, opName, db, branch), true
+	}
+	return ErrorResult("a daemon session (holder %q) is open on %s@%s; close it before %s — "+
+		"e.g. `offshoot session close %s@%s`", info.Holder, db, branch, opName, db, branch), true
 }
 
 // prop describes one property of a tool's JSON Schema input: its argument
@@ -323,11 +425,22 @@ type checkoutArgs struct {
 }
 
 // checkout materializes db@branch, or — if a daemon session is already open
-// on that exact branch — reports the session's own live checkout path
-// instead of materializing a fresh at-rest copy. No MCP tool ever opens a
-// session itself (see openSession): this only takes the live path when
+// AND HEALTHY on that exact branch — reports the session's own live
+// checkout path instead of materializing a fresh at-rest copy. No MCP tool
+// ever opens a session itself: this only takes the live path when
 // something else (a harness, the SDKs, `offshoot session open`) already
-// has. Detection is per call, never cached — see daemonStatus/openSession.
+// has. A session that's present but fenced/unhealthy (lost its lease, e.g.
+// to another writer — see healthySession) is deliberately NOT handed over:
+// its checkout path is no longer being captured, so returning it would
+// promise a durability guarantee that session can no longer keep. That case
+// falls to the same at-rest materialization as "no session," but the
+// response says why, naming the session's error, rather than silently
+// looking identical to "no daemon at all."
+//
+// Detection is per call, never cached (daemonStatus), and this issues at
+// most one status round trip for the whole call — both the live-session
+// check above and the at-rest note below read the same resp — so a slow
+// daemon costs one probe here, not two.
 func (t *OffshootTools) checkout(args json.RawMessage) (ToolResult, error) {
 	var a checkoutArgs
 	if err := json.Unmarshal(args, &a); err != nil {
@@ -340,13 +453,18 @@ func (t *OffshootTools) checkout(args json.RawMessage) (ToolResult, error) {
 	if r, bad := validateNames(namedArg("database", a.Database), namedArg("branch", branch)); bad {
 		return r, nil
 	}
-	if info, ok := t.openSession(a.Database, branch); ok {
-		msg := fmt.Sprintf("%s@%s has an open daemon session; its live checkout is %s",
-			a.Database, branch, info.Checkout)
-		msg += "\nwrite there directly — the daemon captures every commit continuously; " +
-			"call offshoot_checkpoint to name a point you can roll back to or fork from"
-		return TextResult("%s", msg), nil
+
+	resp, up := t.daemonStatus()
+	if up {
+		if info, ok := healthySession(resp, a.Database, branch); ok {
+			msg := fmt.Sprintf("%s@%s has an open daemon session; its live checkout is %s",
+				a.Database, branch, info.Checkout)
+			msg += "\nwrite there directly — the daemon captures every commit continuously; " +
+				"call offshoot_checkpoint to name a point you can roll back to or fork from"
+			return TextResult("%s", msg), nil
+		}
 	}
+
 	path, err := t.ws.Checkout(a.Database, branch)
 	if err != nil {
 		return ErrorResult("%v", err), nil
@@ -354,10 +472,16 @@ func (t *OffshootTools) checkout(args json.RawMessage) (ToolResult, error) {
 	msg := fmt.Sprintf("checked out %s@%s at %s", a.Database, branch, path)
 	msg += "\nthis checkout is not yet checkpointed: nothing written here can be rolled " +
 		"back to or forked from until you call offshoot_checkpoint"
-	if _, up := t.daemonStatus(); up {
-		msg += "\na daemon is running for this store, but no session is open on this " +
-			"branch, so this checkout is at rest: offshoot_checkpoint here will write a " +
-			"full snapshot, not a live flush, until something opens a session on it"
+	if up {
+		if info, found := findSession(resp, a.Database, branch); found && info.Error != "" {
+			msg += fmt.Sprintf("\nwarning: a daemon session (holder %q) is open on this branch "+
+				"but unhealthy (%s); this is an at-rest checkout, not that fenced session's file, "+
+				"until a new session replaces it", info.Holder, info.Error)
+		} else {
+			msg += "\na daemon is running for this store, but no session is open on this " +
+				"branch, so this checkout is at rest: offshoot_checkpoint here will write a " +
+				"full snapshot, not a live flush, until something opens a session on it"
+		}
 	}
 	return TextResult("%s", msg), nil
 }
@@ -560,6 +684,13 @@ type rollbackArgs struct {
 	To       string `json:"to"`
 }
 
+// rollback repoints db@branch at checkpoint `to`, entirely at rest —
+// unlike fork/checkpoint, there is no daemon op this could ride, and
+// unlike checkout there's no live path to hand back either: a rollback
+// repoints the branch's lineage outright. If the daemon has ANY session
+// (healthy or fenced) open on branch, this refuses rather than proceeding
+// (see refuseIfSessionOpen) — an at-rest rollback would repoint the branch
+// out from under a session the daemon still believes owns its checkout.
 func (t *OffshootTools) rollback(args json.RawMessage) (ToolResult, error) {
 	var a rollbackArgs
 	if err := json.Unmarshal(args, &a); err != nil {
@@ -571,6 +702,9 @@ func (t *OffshootTools) rollback(args json.RawMessage) (ToolResult, error) {
 	branch := branchOr(a.Branch)
 	if r, bad := validateNames(namedArg("database", a.Database), namedArg("branch", branch),
 		namedArg("to", a.To)); bad {
+		return r, nil
+	}
+	if r, refused := t.refuseIfSessionOpen(a.Database, branch, "rolling it back"); refused {
 		return r, nil
 	}
 	path, err := t.ws.Rollback(a.Database, branch, a.To)
@@ -587,6 +721,17 @@ type promoteArgs struct {
 	Force    bool   `json:"force"`
 }
 
+// promote repoints db@target at db@source's head, entirely at rest. If the
+// daemon has ANY session (healthy or fenced) open on the TARGET, this
+// refuses rather than proceeding (see refuseIfSessionOpen) — promote
+// clears/repoints the target's ref outright, which would fence a session
+// the daemon still believes owns it. The SOURCE is deliberately not
+// guarded the same way: promote only reads its current head, and an
+// unflushed write sitting in an open source session is a staleness
+// quirk (identical to promote's pre-existing at-rest behavior), not a
+// fencing hazard — there's nothing here for the daemon's own "flush the
+// source first" semantics (opPromote) to ride, since this path never
+// touches the daemon at all.
 func (t *OffshootTools) promote(args json.RawMessage) (ToolResult, error) {
 	var a promoteArgs
 	if err := json.Unmarshal(args, &a); err != nil {
@@ -597,6 +742,9 @@ func (t *OffshootTools) promote(args json.RawMessage) (ToolResult, error) {
 	}
 	if r, bad := validateNames(namedArg("database", a.Database), namedArg("source", a.Source),
 		namedArg("target", a.Target)); bad {
+		return r, nil
+	}
+	if r, refused := t.refuseIfSessionOpen(a.Database, a.Target, "promoting onto it"); refused {
 		return r, nil
 	}
 	txid, err := t.ws.Promote(a.Database, a.Source, a.Target, a.Force)
@@ -612,6 +760,11 @@ type destroyArgs struct {
 	Force    bool   `json:"force"`
 }
 
+// destroy deletes db@branch entirely at rest. If the daemon has ANY
+// session (healthy or fenced) open on branch, this refuses rather than
+// proceeding (see refuseIfSessionOpen) — an at-rest destroy would delete
+// the branch (and, per ops.Destroy, clear its lease) out from under a
+// session the daemon still believes owns it.
 func (t *OffshootTools) destroy(args json.RawMessage) (ToolResult, error) {
 	var a destroyArgs
 	if err := json.Unmarshal(args, &a); err != nil {
@@ -621,6 +774,9 @@ func (t *OffshootTools) destroy(args json.RawMessage) (ToolResult, error) {
 		return ErrorResult("database and branch are required"), nil
 	}
 	if r, bad := validateNames(namedArg("database", a.Database), namedArg("branch", a.Branch)); bad {
+		return r, nil
+	}
+	if r, refused := t.refuseIfSessionOpen(a.Database, a.Branch, "destroying it"); refused {
 		return r, nil
 	}
 	if err := t.ws.Destroy(a.Database, a.Branch, a.Force); err != nil {

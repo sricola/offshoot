@@ -26,13 +26,24 @@ version if you depend on format stability.
   source session first so an unflushed write always lands in the new
   branch; `offshoot_checkout` on a branch with an open session returns
   that session's own live checkout path instead of materializing a
-  separate at-rest copy. No MCP tool opens a session itself — the good
-  path requires a harness (the SDKs, `offshoot session open`, or your own
-  loop) to have opened one already; without that, MCP checkpoints stay
+  separate at-rest copy — but not a FENCED session's path: a session that
+  lost its lease (e.g. to another writer) stays listed until closed, so
+  `offshoot_checkout` checks its health and falls back to at-rest with a
+  warning naming the session's error rather than handing over a path
+  nothing is capturing anymore. No MCP tool opens a session itself — the
+  good path requires a harness (the SDKs, `offshoot session open`, or your
+  own loop) to have opened one already; without that, MCP checkpoints stay
   at-rest even with a daemon running. `offshoot mcp` gains `-socket PATH`
   (default: the same derivation `offshoot serve` uses for the store), so
   an MCP server and a daemon started against the same store agree on
-  where to look without either hardcoding the path.
+  where to look without either hardcoding the path. `offshoot_rollback`,
+  `offshoot_promote` (on its target), and `offshoot_destroy` now refuse
+  (rather than silently fencing a live daemon session) when the daemon has
+  any session — healthy or fenced — open on the affected branch: those
+  ops repoint or delete a branch's ref outright at rest, bypassing the
+  daemon entirely, so without the refusal they could clear a lease or
+  repoint storage out from under a session the daemon still believes it
+  owns.
 
 - MCP forks expire by default: `offshoot_fork` gains a `ttl` argument (a Go
   duration string, or `"none"` for a branch that never expires) and falls
