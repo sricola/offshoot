@@ -33,7 +33,7 @@ a:hover{color:var(--shoot-bright); border-bottom-color:var(--shoot-bright)}
 ::selection{background:#a9cd7c33}
 .wrap{max-width:1060px; margin:0 auto; padding:0 28px}
 code,pre,kbd{font-family:var(--mono)}
-code{font-size:.82em; background:#ffffff0d; border:1px solid var(--rule); border-radius:4px; padding:.12em .4em; color:var(--shoot-bright)}
+code{font-size:.82em; background:#ffffff0d; border:1px solid var(--rule); border-radius:4px; padding:.12em .4em; color:var(--shoot-bright); overflow-wrap:anywhere}
 pre code{background:none;border:none;padding:0;color:inherit}
 
 /* ---------- nav ---------- */
@@ -92,7 +92,7 @@ h1 em{font-style:italic; font-weight:340; color:var(--shoot)}
   .term .row:nth-child(5){animation-delay:1.6s}.term .row:nth-child(6){animation-delay:1.95s}
   .term .row:nth-child(7){animation-delay:2.3s}.term .row:nth-child(8){animation-delay:2.65s}
   .term .row:nth-child(9){animation-delay:3.0s}.term .row:nth-child(10){animation-delay:3.35s}
-  .term .row:nth-child(11){animation-delay:3.7s}
+  .term .row:nth-child(11){animation-delay:3.7s}.term .row:nth-child(12){animation-delay:4.05s}
   @keyframes type{to{opacity:1;transform:none}}
 }
 
@@ -140,10 +140,12 @@ h2 em{font-style:italic; color:var(--shoot)}
 .guarantees dd strong{color:var(--ink); font-weight:500}
 
 /* big stat strip */
-.stats{margin-top:40px; display:grid; grid-template-columns:repeat(3,1fr); gap:14px}
-@media(max-width:700px){.stats{grid-template-columns:1fr}}
+.stats{margin-top:40px; display:grid; grid-template-columns:repeat(4,1fr); gap:14px}
+@media(max-width:900px){.stats{grid-template-columns:repeat(2,1fr)}}
+@media(max-width:480px){.stats{grid-template-columns:1fr}}
 .stat{border:1px solid var(--rule); border-radius:10px; padding:20px; background:linear-gradient(180deg,#1d1812,#16120e)}
 .stat .n{font-size:34px; font-weight:430; color:var(--shoot-bright); letter-spacing:-.01em; font-variant-numeric:tabular-nums}
+.stat .n.small{font-size:23px}
 .stat .l{font-family:var(--mono); font-size:11px; color:var(--ink-faint); letter-spacing:.08em; margin-top:6px; text-transform:lowercase}
 
 /* honest limits */
@@ -163,7 +165,7 @@ footer a{color:var(--ink-dim); border:none}
     <a href="#quickstart">quickstart</a>
     <a href="#how">how it works</a>
     <a href="#agents">for agents</a>
-    <span class="gh" style="color:var(--ink-dim);opacity:.55;cursor:default" title="Private repo — opens publicly with the v0.1 release">github ↗</span>
+    <span class="gh" style="color:var(--ink-dim);opacity:.55;cursor:default" title="Private repo, currently v0.1.3 — opens publicly with the launch">github ↗</span>
   </div>
 </div></nav>
 
@@ -185,13 +187,13 @@ footer a{color:var(--ink-dim); border:none}
       stock SQLite files, your local disk or S3 bucket, one binary.</p>
       <div class="hero-ctas">
         <a class="btn solid" href="#quickstart">60-second quickstart</a>
-        <span class="btn" style="opacity:.55;cursor:default" title="Private repo — public source lands with the v0.1 release">source opens with v0.1</span>
+        <span class="btn" style="opacity:.55;cursor:default" title="Private repo, currently v0.1.3 — code opens with the public launch">source opens with the public launch</span>
       </div>
-      <p class="hero-note">go 1.24+ · linux &amp; macos · apache-2.0 · pre-release</p>
+      <p class="hero-note">go 1.24+ · linux &amp; macos · apache-2.0 · pre-release · v0.1.3</p>
     </div>
     <div class="term" aria-label="terminal demo">
       <div class="term-bar"><i></i><i></i><i></i><span>the 60-second version</span></div>
-      <pre><span class="row"><span class="p">$</span> offshoot create app</span><span class="row"><span class="p">$</span> sqlite3 "$(offshoot checkout app)" <span class="o">"INSERT INTO users VALUES ('ada')"</span></span><span class="row"><span class="p">$</span> offshoot checkpoint app v1</span><span class="row"><span class="c"># try something destructive — on a branch</span></span><span class="row"><span class="p">$</span> offshoot fork app attempt-1</span><span class="row"><span class="p">$</span> sqlite3 "$(offshoot checkout app@attempt-1)" <span class="o">"DELETE FROM users"</span></span><span class="row"><span class="c"># it went badly. undo the world:</span></span><span class="row"><span class="p">$</span> offshoot rollback app@attempt-1 --to fork</span><span class="row"><span class="c"># …or it went well. ship it:</span></span><span class="row"><span class="p">$</span> offshoot promote app@attempt-1 --onto main --force</span><span class="row"><span class="p">$</span> offshoot status</span></pre>
+      <pre><span class="row"><span class="p">$</span> offshoot init</span><span class="row"><span class="p">$</span> offshoot create app</span><span class="row"><span class="p">$</span> sqlite3 "$(offshoot checkout app)" <span class="o">"CREATE TABLE users (name); INSERT INTO users VALUES ('ada');"</span></span><span class="row"><span class="p">$</span> offshoot checkpoint app v1</span><span class="row"><span class="c"># try something destructive — on a branch</span></span><span class="row"><span class="p">$</span> offshoot fork app attempt-1</span><span class="row"><span class="p">$</span> sqlite3 "$(offshoot checkout app@attempt-1)" <span class="o">"DELETE FROM users"</span></span><span class="row"><span class="c"># it went badly. undo the world:</span></span><span class="row"><span class="p">$</span> offshoot rollback app@attempt-1 --to fork</span><span class="row"><span class="c"># …or it went well. ship it:</span></span><span class="row"><span class="p">$</span> offshoot promote app@attempt-1 --onto main --force</span><span class="row"><span class="p">$</span> offshoot status</span></pre>
     </div>
   </div>
 </header>
@@ -214,7 +216,9 @@ footer a{color:var(--ink-dim); border:none}
         no special VFS on the read path. Branches are cheap enough to be disposable:
         fork per attempt, keep the winner, let TTLs reap the rest.</p>
         <p>Try three migrations in parallel against three forks. Promote the one whose tests pass.
-        The demo in <code>examples/parallel-attempts/</code> does exactly that.</p>
+        The demo in <code>examples/parallel-attempts/</code> does exactly that — watch
+        <span style="opacity:.7;cursor:default" title="Private repo — asciinema recording opens with the public launch">the recording ↗</span>
+        or read <span style="opacity:.7;cursor:default" title="Private repo — MCP walkthrough transcript opens with the public launch">an agent doing it over MCP ↗</span>.</p>
       </div>
     </div>
   </div>
@@ -256,6 +260,11 @@ footer a{color:var(--ink-dim); border:none}
       <p>Same binary against a bucket: <code>offshoot -store s3://my-bucket/offshoot init</code> —
       S3, R2, Tigris, and MinIO via conditional writes. At attach time offshoot <strong>probes the
       store</strong> and refuses to run if compare-and-swap isn't enforced, rather than silently degrading.</p>
+      <p>Building from source (<code>go build</code>, above) is the fast path today. Four tagged
+      releases so far — <span style="opacity:.7;cursor:default" title="Private repo — releases page opens with the public launch">v0.1.0 through v0.1.3 ↗</span> —
+      already carry prebuilt binaries for linux/darwin × amd64/arm64; <code>go install
+      github.com/sricola/offshoot/cmd/offshoot@latest</code> resolves the moment the repo goes public,
+      since the module path is already <code>github.com/sricola/offshoot</code>, not an aspirational org.</p>
     </div>
   </div>
 </section>
@@ -279,13 +288,25 @@ footer a{color:var(--ink-dim); border:none}
       <div class="g"><dt>ttl reaping</dt><dd><strong>Attempt branches clean up after themselves.</strong> TTL counts from the last durable write or lease renewal; a live lease is never reaped; protected branches never reap regardless.</dd></div>
     </dl>
     <div class="stats">
-      <div class="stat"><div class="n">2,233</div><div class="l">torture rounds, latest run</div></div>
-      <div class="stat"><div class="n">223 / 223</div><div class="l">kill&nbsp;-9 bounces resumed cleanly</div></div>
-      <div class="stat"><div class="n">0</div><div class="l">divergences, ever, across all runs</div></div>
+      <div class="stat"><div class="n small">2.87s → ~200ms</div><div class="l">fork a 512mb db, local disk</div></div>
+      <div class="stat"><div class="n">2,309</div><div class="l">torture rounds, latest run</div></div>
+      <div class="stat"><div class="n">230 / 230</div><div class="l">capture-engine bounces resumed cleanly</div></div>
+      <div class="stat"><div class="n">0</div><div class="l">divergences, this run</div></div>
     </div>
-    <div class="prose"><p>The capture engine is validated by a kill&nbsp;-9 torture harness: a writer hammers
-    the database while the capture process is killed mid-write, hundreds of times per run, and the replica
-    must match the source byte-for-byte after every bounce. It re-runs on every change to the capture path.</p></div>
+    <div class="prose">
+      <p>The capture engine is validated by a torture harness: a stock <code>sqlite3</code> writer is
+      <code>kill&nbsp;-9</code>'d mid-write on roughly half of every round, while the capture engine itself
+      is bounced — a graceful restart that exercises its resume-vs-rebase logic, not a crash — every tenth
+      round; the replica must converge to a byte-identical dump of the source after every round or the run
+      fails immediately. <code>make test-torture</code> reproduces it; the numbers above are this repo's
+      latest run, not a historical best.</p>
+      <p>The fork numbers are the other headline numbers: <strong>2.87s → 198ms</strong> forking a 512MB
+      database on local disk (a reflink/clonefile object copy instead of decode-then-re-encode; ~9.3ms for
+      the copy alone, in isolation from an unrelated size-scaling check), and <strong>4.57s → 1.03s</strong>
+      over S3 via a server-side <code>CopyObject</code> call that never downloads or re-uploads the
+      snapshot. Full methodology and every raw number: <span style="opacity:.7;cursor:default"
+      title="Private repo — docs/benchmarks.md opens with the public launch">docs/benchmarks.md ↗</span>.</p>
+    </div>
   </div>
 </section>
 
@@ -294,28 +315,49 @@ footer a{color:var(--ink-dim); border:none}
     <div class="commit"><b>04</b> · the integration surface</div>
     <h2>Built to be driven <em>by the agent itself.</em></h2>
     <div class="cards">
+      <div class="card"><h3>pytest fixture + ts testkit</h3>
+        <p><code>pip install "offshoot-db[pytest]"</code> wires three fixtures — <code>offshoot_daemon</code>,
+        <code>offshoot_db</code>, <code>offshoot_fork</code> — into seed-once-fork-many: one seed checkpoint,
+        a fresh forked branch per test, TTL-backstopped teardown — and xdist-safe: one daemon per worker
+        under <code>pytest-xdist -n</code>. <code>@offshoot-db/client/testkit</code> is the same shape for vitest/jest/<code>node:test</code>.
+        The full tutorial, install to CI, is in the eval-harness doc.</p></div>
       <div class="card"><h3>mcp server</h3>
         <p>One command: <code>claude mcp add offshoot -- offshoot mcp</code>. Seven tools with descriptions a model
-        can act on — fork before risky work, checkpoint when tests pass, roll back when they fail.
-        Protected branches mean the agent can experiment freely but can't vaporize <code>main</code> unforced.</p></div>
-      <div class="card"><h3>python + typescript</h3>
-        <p>Thin, dependency-free clients over the daemon's lifecycle API — <code>pip</code>-shaped and
-        <code>npm</code>-shaped packages in-repo, tested end-to-end against a real daemon, including
-        daemon-death-mid-call. Stdlib sockets, zero runtime deps.</p></div>
+        can act on — fork before risky work, checkpoint when tests pass, roll back when they fail. Forks expire
+        in 24h by default, so an agent that forks and forgets doesn't leak branches forever; when a harness
+        already has a session open on a branch, MCP rides that live daemon session instead of going through disk.</p></div>
       <div class="card"><h3>langgraph companion</h3>
         <p><code>ThreadForks</code> maps agent threads to branches: checkpoint the database under the
         conversation's checkpoint id, and when you rewind the thread, fork the world at that exact state.
         <code>examples/langgraph-rewind/</code> runs it end to end.</p></div>
     </div>
-    <div class="block" style="max-width:620px">
-      <div class="label">python · fork a live agent's world mid-conversation</div>
-      <pre><code><span class="k">import</span> offshoot
-
-<span class="k">with</span> offshoot.connect(<span class="s">"offshoot.sock"</span>) <span class="k">as</span> c:
+    <div class="split">
+      <div class="block">
+        <div class="label">python · offshoot_fork, one branch per test</div>
+        <pre><code><span class="k">def</span> test_agent_spends_credits(offshoot_fork):
+    forked = offshoot_fork()  <span class="c"># fresh branch, seed's checkpoint</span>
+    conn = sqlite3.connect(forked.path)
+    conn.execute(<span class="s">"UPDATE users SET credits = credits - 10 ..."</span>)
+    conn.commit()
+    <span class="k">assert</span> credits_now(conn) == 90  <span class="c"># torn down + TTL-backstopped after</span></code></pre>
+      </div>
+      <div class="block">
+        <div class="label">python · fork a live agent's world mid-conversation</div>
+        <pre><code><span class="k">with</span> offshoot.connect(<span class="s">"offshoot.sock"</span>) <span class="k">as</span> c:
     s = c.open(<span class="s">"app"</span>)          <span class="c"># leased, live-captured checkout</span>
     agent_writes_to(s.path)      <span class="c"># stock sqlite3, no wrapper</span>
     s.flush(<span class="s">"before-migration"</span>) <span class="c"># named, durable checkpoint</span>
     c.fork(<span class="s">"app"</span>, <span class="s">"main"</span>, <span class="s">"attempt-1"</span>, ttl=<span class="s">"2h"</span>)</code></pre>
+      </div>
+    </div>
+    <div class="prose">
+      <p><strong>Operable, not orchestrated.</strong> A fifth surface rides alongside the four above without
+      changing any of them: <code>serve -http ADDR</code> exposes a hand-rolled Prometheus <code>/metrics</code>
+      endpoint, a token-authed <code>POST /rpc</code>, <code>/healthz</code>, and an <code>/events</code> stream
+      (SSE) over HTTP, alongside the unix socket. Every branch reports one of six computed states — active,
+      dirty, detached, idle, pending, error — and a <code>checkouts-ro</code> disk budget LRU-evicts read-only
+      checkouts once it fills. One daemon, one host, no cluster — see the operations doc and the Kubernetes
+      sidecar recipe for running it as exactly that.</p>
     </div>
   </div>
 </section>
@@ -329,7 +371,7 @@ footer a{color:var(--ink-dim); border:none}
       <li><strong>Pre-release.</strong> The storage format and CLI may still change. Not yet recommended for data you can't regenerate.</li>
       <li><strong>Linux and macOS only.</strong> The capture path and lock probing are POSIX-dependent; Windows is unsupported in v1.</li>
       <li><strong>Not a cluster.</strong> Nodes sharing a bucket won't corrupt each other — fencing guarantees that — but there is no placement, failover, or cross-node routing.</li>
-      <li><strong>Materialized forks cost real bytes.</strong> N forks of a G-byte database cost up to N×G in the bucket. That's the price of GC simplicity and parent-independence; TTLs are the mitigation, page-level dedupe is the v2 arc.</li>
+      <li><strong>Materialized forks cost real bytes.</strong> N forks of a G-byte database cost up to N×G in the bucket. That's the price of GC simplicity and parent-independence — a fork never references its parent's storage, so destroying either one never endangers the other. TTLs are the operational mitigation; reflink/clonefile locally and server-side <code>CopyObject</code> on S3 avoid a real re-upload when they apply, but neither reduces the bytes actually stored. Page-level dedupe is the v2 arc, if TTLs and fast-fork together turn out not to be enough.</li>
       <li><strong>At-rest checkpoints are full snapshots.</strong> Only the daemon writes incremental segments — it's the one that knows which pages changed. Checkpointing large databases in a loop? Run the daemon.</li>
     </ul>
   </div>
@@ -337,7 +379,7 @@ footer a{color:var(--ink-dim); border:none}
 
 <footer><div class="wrap">
   <span><span style="color:var(--shoot)">⑂</span> offshoot</span>
-  <span>code opens with the first public release</span>
+  <span>code opens with the public launch · v0.1.3</span>
   <span>apache-2.0</span>
   <span style="margin-left:auto">stock sqlite · your storage · one binary</span>
 </div></footer>
