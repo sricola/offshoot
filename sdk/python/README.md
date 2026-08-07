@@ -43,6 +43,15 @@ checkpoints, TTL) and `dbs()` (every database name in the store).
 
 ## pytest fixture plugin
 
+**This section is the condensed reference.** For the full tutorial —
+install, the named-seed factory, fork-per-test, `pytest-xdist` parallelism
+with the measured per-worker cost, mid-test flush checkpoints, golden
+assertions via `offshoot_dump` (never byte-compare, and why), export for
+handoff/debug, `offshoot diff` for the failed-vs-passed loop, TTL hygiene,
+and a CI recipe — see
+[docs/eval-harness.md](https://github.com/offshoot-db/offshoot/blob/main/docs/eval-harness.md)
+in the main repo.
+
 ```
 pip install "offshoot-db[pytest]"
 ```
