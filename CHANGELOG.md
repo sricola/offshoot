@@ -154,6 +154,72 @@ version if you depend on format stability.
   flips to shipped-and-tested; `docs/reference.md` gains the `-http`
   flag/route table and `OFFSHOOT_TOKEN`.
 
+- **Eventing: bus + socket `subscribe` + SSE** (Milestone 4 Task 4a):
+  `internal/daemon/events.go` adds an in-daemon event bus and two ways to
+  drain it — the unix socket's new `subscribe` op and HTTP's `GET
+  /events` (Server-Sent Events) — both streaming the exact same versioned
+  JSON (PM Amendment 4: one schema, one encoder): `{v:1, ts, type, db,
+  branch, detail{}}`, `type` one of `session_opened` / `flushed` /
+  `flush_failed` / `fenced` / `session_closed` (all five fed from the
+  SAME `internal/session` transition-callback call site Milestone 4 Task
+  2 already hooked — `internal/session` itself is untouched, per this
+  task's "ride the existing callback" brief) / `reaped` (fed from the
+  janitor's `Reap` pass) / `evicted` (schema slot reserved now; nothing
+  emits it yet — Milestone 4 Task 5's ro-cache LRU eviction path is the
+  intended source and will publish to the bus at its own eviction call
+  site once it exists).
+
+  **Never blocks the daemon (Global Constraint):** `eventBus.publish` is a
+  non-blocking fan-out — a subscriber whose bounded buffer (64 events) is
+  already full is immediately dropped: removed from the subscriber set, sent
+  a single terminal `{type:"dropped_slow_consumer"}` event, and has its
+  channel closed, all without ever blocking the publisher (the session
+  transition callback or the janitor). `TestSlowSubscriberDroppedSessionKeepsFlushing`
+  proves this end to end — a subscriber that never reads its channel is
+  dropped with the terminal event while a concurrently write-heavy session
+  keeps flushing successfully throughout, unaffected.
+
+  **Socket `subscribe`:** acks, then the connection PERMANENTLY LEAVES
+  request/response mode and streams line-per-event JSON until the client
+  disconnects — `handle()`'s per-connection loop special-cases this op
+  exactly like it already special-cases `shutdown` (subscribing to the bus
+  happens *before* the ack is sent, closing a race where a transition could
+  fire in the gap between ack and subscription). **SDKs and any other
+  caller MUST use a fresh, DEDICATED connection for `subscribe`** — it is
+  unix-socket-only; a `subscribe` op sent over HTTP `POST /rpc` is refused
+  with a message pointing at `GET /events` instead.
+
+  **HTTP `GET /events`:** same Bearer auth as everything but `/healthz`;
+  `data: <event JSON>\n\n` per event, plus a periodic `: ping` SSE comment
+  (`sseKeepaliveInterval`, 15s default — PM Amendment 12: proxies/kubelets
+  kill silent streams) to keep the connection alive across anything sitting
+  in front of this daemon. **Clears its own write deadline**
+  (`http.NewResponseController(w).SetWriteDeadline(time.Time{})`) before
+  streaming — Task 3's `http.Server.WriteTimeout` (90s) covers a handler's
+  *entire* wall-clock run with no concept of "still legitimately sending,
+  just slowly," and would otherwise hard-cut every long-lived SSE stream at
+  90 seconds; this is the fix `http.go`'s Task 3 doc comment flagged and
+  loudly warned Task 4a to make. `TestSSEStreamSurvivesPastWriteTimeout`
+  proves it structurally and cheaply: `httpWriteTimeout` is a test-only var
+  shrunk to 150ms, and the stream is proven alive well past that shrunk
+  value via a real event delivered afterward — no test ever sleeps
+  anywhere near the real 90s.
+
+  Tested (`internal/daemon/events_test.go`, `-race`): a subscriber sees
+  `session_opened` → `flushed` → `session_closed` for a real session
+  lifecycle over the socket; the slow-subscriber-dropped-while-session-
+  keeps-flushing proof above; SSE/socket parity (both transports
+  subscribed before a real session lifecycle runs, asserted to observe the
+  identical event sequence); the keepalive ping; the write-deadline proof;
+  `/events` requires auth (401 without, plus a path-trick matrix
+  extension); `subscribe` over `POST /rpc` is refused; reusing a
+  subscribed connection for an ordinary op gets silence, never a Response.
+  No `internal/session` changes — bus is fed purely from the daemon-side
+  callback composition, so no torture run was required for this task.
+  `docs/status.md`'s eventing row flips to shipped-and-tested;
+  `docs/reference.md` gains the `subscribe` op and `GET /events` route,
+  with the dedicated-connection warning restated for operators.
+
 ## [0.1.2] - 2026-08-06
 
 Milestone 3: the eval-harness release. The target persona's first hour is

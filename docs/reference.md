@@ -589,6 +589,7 @@ listener alongside the unix socket, exposing:
 | `POST` | `/rpc` | Bearer | The same `Request`/`Response` JSON the unix socket speaks, one op per POST (`Content-Type: application/json` required; body capped at 1MiB, oversized -> `413`) |
 | `GET` | `/metrics` | Bearer | Prometheus text exposition of the locked `offshoot_*` metric set (see [docs/status.md](status.md)'s metrics row for the full name list) |
 | `GET` | `/healthz` | **none** | `{"ok":true,"sessions":N}` — the one endpoint that needs no token, for liveness probes |
+| `GET` | `/events` | Bearer | Server-Sent Events: the daemon's event stream (Milestone 4 Task 4a — see [Eventing](#eventing-subscribe-op--get-events) below) |
 | `GET` | `/debug/pprof/*` | Bearer | `net/http/pprof`'s standard handlers (index, cmdline, profile, symbol, trace) |
 
 **Token:** `-token TOKEN` or `OFFSHOOT_TOKEN` sets it explicitly; if
@@ -637,6 +638,76 @@ shorter window or profile out-of-band), `IdleTimeout` 2 minutes.
 
 **Errors:** everything `offshoot serve` can already error on, plus: HTTP
 address already in use; the two non-loopback-bind errors above.
+
+## Eventing (subscribe op / GET /events)
+
+The daemon publishes one versioned JSON event per state transition it
+observes, drainable two ways — the unix socket protocol's `subscribe` op,
+and HTTP's `GET /events` (Server-Sent Events) — both carrying the exact
+same JSON, encoded by the same function daemon-side (PM Amendment 4: one
+schema, one encoder). There is no history/replay: a subscriber only ever
+sees events published *after* it subscribes.
+
+**Event shape:**
+
+```json
+{"v":1,"ts":"2026-08-07T12:00:00Z","type":"flushed","db":"app","branch":"main","detail":{"kind":"manual","txid":7,"duration_seconds":0.017}}
+```
+
+`v` is the schema version (currently always `1`); `ts` is RFC3339 UTC.
+`type` is one of:
+
+| `type` | Fired when | `detail` |
+|---|---|---|
+| `session_opened` | A session opens (daemon `open` op) | `holder`, `epoch` |
+| `flushed` | A flush succeeds (manual `flush` op or background auto-flush) | `kind` (`manual`/`auto`), `txid`, `duration_seconds` |
+| `flush_failed` | A flush fails | `kind`, `error`, `duration_seconds` |
+| `fenced` | A session is fenced out by a lease it no longer holds | `cause` |
+| `session_closed` | A session closes (daemon `close` op, or `shutdown`) | `error` (only if the close itself errored) |
+| `reaped` | The janitor destroys a branch whose TTL expired | *(none)* |
+| `evicted` | *(reserved — not yet emitted; see [docs/status.md](status.md))* | Milestone 4 Task 5's ro-cache LRU eviction path |
+| `dropped_slow_consumer` | Sent to a subscriber being dropped (see below), never to anyone else | *(none)* |
+
+**Slow-subscriber drop:** publishing never blocks the daemon (a session
+transition or the janitor). A subscriber whose bounded buffer (64 events)
+is full when an event is published is dropped immediately: removed from
+the subscriber set, sent exactly one terminal `dropped_slow_consumer`
+event, and has its stream closed. This can never slow down or fail a
+session's own progress or the janitor's own cadence — see
+[docs/status.md](status.md)'s eventing row for the test that proves a
+write-heavy session keeps flushing successfully while a subscriber that
+never reads its channel gets dropped.
+
+### Unix socket: the `subscribe` op
+
+```jsonc
+{"op": "subscribe"}
+```
+
+The daemon acks (`{"ok":true}`) and the connection then **permanently
+leaves request/response mode**: from that point on it streams one JSON
+event per line until the client disconnects. No further op can ever be
+sent on that same connection — the daemon stops reading it entirely.
+
+> **Use a dedicated connection.** `subscribe` is unix-socket-only and
+> takes over the whole connection for the life of the subscription — open
+> a *fresh* socket connection for it and keep your original connection (or
+> another fresh one) for ordinary `open`/`flush`/`status`/... ops. Sending
+> `subscribe` over HTTP `POST /rpc` is refused outright (with a message
+> pointing at `GET /events`), since an HTTP request/response cycle has no
+> way to switch modes mid-stream the way a raw socket connection can.
+
+### HTTP: `GET /events`
+
+Same Bearer auth as everything but `/healthz`. Response is
+`Content-Type: text/event-stream`; each event is `data: <event JSON>\n\n`.
+A `: ping` comment line is written every 15 seconds to keep the connection
+alive across any proxy/load balancer/kubelet that kills silent streams
+(PM Amendment 12) — ordinary SSE clients ignore comment lines
+automatically. Unlike the other `-http` routes, this handler explicitly
+clears its own per-connection write deadline so Task 3's `http.Server`
+`WriteTimeout` (90s, sized for `/rpc`/`/metrics`/`/debug/pprof/*`, see
+above) never hard-cuts a long-lived subscription.
 
 ## `offshoot mcp`
 
@@ -828,7 +899,6 @@ check it against an allow-list beyond requiring it be absolute.
 
 ## What's not here
 
-Eventing (a `subscribe` op / `GET /events` SSE stream) and the ro-cache
-disk budget do not exist yet — see [docs/status.md](status.md) for the
-full implemented/deferred matrix and links to the roadmap milestones
-tracking each.
+The ro-cache disk budget does not exist yet — see
+[docs/status.md](status.md) for the full implemented/deferred matrix and
+links to the roadmap milestones tracking each.

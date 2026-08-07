@@ -70,6 +70,14 @@ type Server struct {
 	// packages importing internal/metrics.
 	metrics *Metrics
 
+	// events is this daemon's in-memory event bus (Milestone 4 Task 4a) —
+	// always non-nil once NewServer returns. Fed from the session
+	// transition callback (wireEvents, composed alongside metrics'
+	// observer) and the janitor (janitorTick's "reaped" publish); drained
+	// by the unix socket "subscribe" op (streamEvents) and HTTP `GET
+	// /events` (handleEvents). See events.go.
+	events *eventBus
+
 	// httpSrv is the optional opt-in HTTP listener (Milestone 4 Task 3) —
 	// nil unless StartHTTP has been called. Written once, under s.mu, by
 	// StartHTTP before its handler goroutine is spawned (see StartHTTP's
@@ -120,12 +128,18 @@ func NewServer(ws *ops.Workspace, socketPath string) (*Server, error) {
 		conns:       map[net.Conn]struct{}{},
 		janitorStop: make(chan struct{}),
 		metrics:     newMetrics(),
+		events:      newEventBus(),
 	}
 	// Wired here, at construction, before Serve can ever accept a
 	// connection or StartJanitor can ever tick — see wireHooks/OnTransition/
 	// ObserveFork's doc comments for why process-wide assignment this early
 	// is safe and sufficient (one daemon Server per process in production).
 	srv.metrics.wireHooks(srv)
+	// wireEvents composes the event-bus feed onto session.OnTransition
+	// AFTER wireHooks above has already assigned it to the metrics
+	// observer — see wireEvents's doc comment (events.go) for why this
+	// ordering, not a replacement, is required.
+	srv.wireEvents()
 	return srv, nil
 }
 
@@ -222,6 +236,15 @@ func (s *Server) janitorTick(grace time.Duration) {
 	}
 	if len(reaped) > 0 {
 		s.metrics.ReapTotal.Add(float64(len(reaped)))
+		// Milestone 4 Task 4a: one "reaped" event per branch the janitor
+		// just destroyed, fed straight to the bus — publish is non-
+		// blocking (see eventBus.publish's doc comment), so this can never
+		// stall the janitor loop regardless of how many (or how slow)
+		// subscribers exist.
+		for _, k := range reaped {
+			db, branch := splitKey(k)
+			s.events.publish(newEvent("reaped", db, branch, nil))
+		}
 	}
 
 	tombstoned, deleted, gcErr := s.ws.GC(grace)
@@ -281,6 +304,20 @@ func (s *Server) handle(c net.Conn) {
 		if err := dec.Decode(&req); err != nil {
 			return // client hung up or sent garbage
 		}
+		// "subscribe" (Milestone 4 Task 4a) is handle()'s SECOND special-
+		// cased op, alongside "shutdown" below: like shutdown, it cannot be
+		// answered by dispatch()'s ordinary one-Request-in-one-Response-out
+		// shape — this connection is about to leave request/response mode
+		// for good. See handleSubscribeOp's doc comment (events.go) for why
+		// the subscription is registered before the ack is even sent, and
+		// for the loud "dedicated connection" warning SDKs must follow.
+		// This connection never returns to this dec.Decode loop once
+		// handleSubscribeOp is called — it returns straight to handle's
+		// caller (Serve's per-connection goroutine) when the stream ends.
+		if req.Op == "subscribe" {
+			s.handleSubscribeOp(c, enc)
+			return
+		}
 		resp := s.dispatch(req)
 		if req.Op == "shutdown" && shutdownRespondDelay != nil {
 			shutdownRespondDelay() // test hook; nil (a no-op) in production
@@ -337,6 +374,20 @@ func (s *Server) dispatch(req Request) Response {
 		// this response — see handle's shutdown handling and
 		// TestShutdownRespondsBeforeClosingRequestingConn.
 		return Response{OK: true}
+	case "subscribe":
+		// Real subscribe handling (registering with the event bus, then
+		// streaming) happens in handle() BEFORE dispatch is ever called
+		// for this op (see handle's special-case, mirroring how
+		// "shutdown" is split between this ack-shaped case above and
+		// handle's real side effect) — unix-socket-only, since a
+		// request/response connection cannot switch modes mid-stream. A
+		// "subscribe" op that reaches dispatch at all can only have
+		// arrived via HTTP POST /rpc (handleRPC calls dispatch directly,
+		// with no equivalent special-case), so this refuses it and points
+		// the caller at the HTTP-native equivalent.
+		return errResp(fmt.Errorf(
+			"daemon: \"subscribe\" is a unix-socket-only op (streams line-per-event JSON on a dedicated connection); " +
+				"HTTP clients must use GET /events for the same event stream"))
 	case "create":
 		return s.opCreate(req)
 	case "checkout":

@@ -14,7 +14,20 @@ package daemon
 type Request struct {
 	// Op is one of: "open" | "flush" | "status" | "close" | "shutdown" |
 	// "create" | "checkout" | "fork" | "destroy" | "rollback" | "promote" |
-	// "touch" | "branches" | "dbs" | "export" | "checkout-at".
+	// "touch" | "branches" | "dbs" | "export" | "checkout-at" | "subscribe".
+	//
+	// "subscribe" (Milestone 4 Task 4a) is unlike every other op: it is
+	// UNIX-SOCKET-ONLY (a POST /rpc "subscribe" is refused — HTTP clients
+	// use GET /events for the same event stream instead), and once it is
+	// acked, the connection it was sent on PERMANENTLY LEAVES
+	// request/response mode and streams line-per-event JSON (one JSON
+	// value per line) until the client disconnects — no further Request
+	// can ever be sent on that same connection. Callers MUST use a fresh,
+	// DEDICATED connection for "subscribe", keeping their original
+	// connection (or another fresh one) for ordinary ops. See
+	// internal/daemon/events.go's handleSubscribeOp/streamEvents for the
+	// implementation and docs/reference.md's `subscribe` section for the
+	// operator-facing version of this same warning.
 	Op     string `json:"op"`
 	DB     string `json:"db,omitempty"`
 	Branch string `json:"branch,omitempty"` // also: fork/promote source branch
