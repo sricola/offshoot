@@ -55,6 +55,50 @@ version if you depend on format stability.
   - MCP tool metadata exposure is explicitly out of scope for this task —
     `offshoot_fork`/`offshoot_checkpoint` pass `nil` meta; see
     `docs/status.md`.
+- **Publish pipeline, prepared and gated** (Milestone 3 Task 7): the SDKs
+  are ready to publish; actual publication needs the user to claim the
+  `offshoot-db` PyPI name and `@offshoot-db` npm scope first (see
+  CONTRIBUTING.md's new Release process section).
+  - `.github/workflows/publish.yml`: triggered on `sdk-v*` tags or
+    `workflow_dispatch`. Two jobs, PyPI (`pypa/gh-action-pypi-publish`,
+    Trusted Publishing/OIDC, `id-token: write`) and npm (`npm publish
+    --provenance`, registry auth via `NPM_TOKEN` today — npm's own OIDC
+    Trusted Publishing is documented as the future swap). Both gated on
+    the `PUBLISH_ENABLED` repository variable: off (the default) runs a
+    full dry run — real sdist/wheel + `twine check` + wheel install/import
+    test; real `npm pack` tarball + install/import test — everything short
+    of the upload step. The same dry-run tier now runs in `ci.yml`'s
+    `sdks` job on every PR (`make dry-run-sdks`), so a manifest mistake is
+    caught long before a release tag exists.
+  - `sdk/python/pyproject.toml` filled out for real publication: readme,
+    `project.urls` (Homepage/Repository/Issues/Changelog/Documentation),
+    authors, classifiers, SPDX `license = "Apache-2.0"` (no redundant
+    `License ::` classifier — current PEP 639 practice), reserved
+    `[pytest]` extra ahead of Milestone 3 Task 4's fixture plugin.
+    `sdk/python/README.md` added (PyPI landing page).
+  - `sdk/typescript/package.json` filled out: `repository`/`bugs`/
+    `homepage`, `files` whitelist (`dist`, `README.md` — excludes tests/
+    tsconfig from the published tarball, verified with `npm pack
+    --dry-run`), `publishConfig.access: public` (required for a scoped
+    package to publish non-private), `prepublishOnly` builds `dist/`
+    before packing. `sdk/typescript/README.md` added.
+  - **Version discipline:** both SDKs publish in lockstep from one
+    `sdk-v<version>` tag (not two `sdk-py-v`/`sdk-ts-v` tags) — simplest
+    scheme for two SDKs on one wire protocol and one review cadence.
+    `sdk/VERSION` is the single source of truth; `pyproject.toml`'s and
+    `package.json`'s literal version fields are checked against it by the
+    new `scripts/check_sdk_versions.py` (`make check-sdk-versions`, and
+    the first step of `make dry-run-python-sdk`/CI); `scripts/
+    check_sdk_tag_version.py` checks a pushed tag against the same file.
+  - `server.json` (repo root): draft MCP registry manifest built only from
+    fields this repo's own MCP docs establish (name/description/version/
+    repository/command/args) — not submitted; the exact registry schema
+    was deliberately not assumed from outside the repo, see
+    `docs/launch/mcp-registry.md` and the TODO row in `docs/status.md`.
+  - `docs/launch/langgraph-listing.md`: LangGraph community-integration PR
+    text (title, description, listing-table entry) for
+    `offshoot.langgraph.ThreadForks` — drafted, clearly marked not
+    submitted (blocked on PyPI).
 
 ### Fixed
 

@@ -29,7 +29,7 @@ go vet ./...
 
 ## Test tiers
 
-There are four, and they cost very different amounts of time. Run the tier
+There are five, and they cost very different amounts of time. Run the tier
 that matches what you touched — don't run torture on a docs typo, and don't
 skip it on a capture-engine change.
 
@@ -39,6 +39,7 @@ skip it on a capture-engine change.
 | Torture (kill-9) | `make test-torture` | ~5 minutes | Touching `internal/capture` or `internal/session` flush paths |
 | S3 conformance | `make test-s3` | needs a real S3-compatible provider or MinIO running | Touching `internal/store`'s S3 backend or the CAS probe |
 | SDKs | `make test-sdks` | needs `python3` + Node 20+ | Touching `sdk/python`, `sdk/typescript`, or the daemon API surface they depend on |
+| SDK publish dry-run | `make dry-run-sdks` | needs `python3` (+ `pip install build twine`) and `npm` | Touching either SDK's manifest (`pyproject.toml`, `package.json`, `sdk/VERSION`) or `.github/workflows/publish.yml` — see "Release process" below |
 
 `go test ./... -race` is hermetic and needs only the `sqlite3` CLI — that's
 the bar for "does this even work," and CI runs it on every PR. `make test`
@@ -91,6 +92,89 @@ behavior, which is what the whole compare-and-swap safety story rests on.
   otherwise have the right to submit it under the project's license
   (Apache-2.0), not a copyright assignment to anyone. Unsigned commits will
   get bounced back for a rebase with `-s`, not silently merged.
+
+## Release process
+
+There are two independent release tracks — the `offshoot` binary and the
+two SDKs — with two independent versioning schemes, on purpose: the SDKs
+are thin wrappers over a stable daemon wire protocol and can move on their
+own cadence, while the binary's `v0.1.x` tags govern the on-disk storage
+format. They currently both happen to read `0.1.0` because both are still
+at their first pre-release; that's a coincidence, not a coupling.
+
+### Binary releases
+
+Tag `v0.1.<n>` and push it. `.github/workflows/release.yml` builds
+Linux/macOS binaries for both architectures, creates a GitHub release, and
+publishes a `ghcr.io` Docker image. `workflow_dispatch` builds the same
+artifacts under a `dev-<short-sha>` name without tagging, for a
+pre-release smoke check.
+
+### SDK releases
+
+**Both SDKs publish together, from one tag, at one version number** —
+`sdk-v<version>` (e.g. `sdk-v0.1.0`), never `sdk-py-v...`/`sdk-ts-v...`
+separately. This is the simplest scheme for a two-SDK repo where both
+clients track the same daemon wire protocol and ship from the same
+PR/review cadence; splitting them into independently-versioned tags would
+mean two release processes to keep straight for no benefit either SDK
+currently needs. Revisit only if one SDK ever needs to ship a fix the other
+genuinely doesn't.
+
+**`sdk/VERSION` is the single source of truth for the SDK version number.**
+Both manifests spell the version out literally (PyPI and npm both require
+a real version string in their own manifest — neither supports pulling it
+from an external file at publish time without extra tooling this repo
+doesn't carry), so a release bump is three edits kept in lockstep by hand:
+
+1. `sdk/VERSION`
+2. `sdk/python/pyproject.toml`'s `[project].version`
+3. `sdk/typescript/package.json`'s `version`
+
+`python3 scripts/check_sdk_versions.py` (also `make check-sdk-versions`)
+fails loudly, listing every mismatch, if any of the three disagree — this
+runs as the first step of `make dry-run-python-sdk` and again in
+`.github/workflows/publish.yml`'s `check` job before either publish job
+does anything. Tagging `sdk-v<version>` is a fourth place the same number
+has to agree; `scripts/check_sdk_tag_version.py <tag>` (run automatically
+on a tag push) catches a tag cut against a stale `sdk/VERSION`.
+
+### Publishing gate
+
+`.github/workflows/publish.yml` triggers on `sdk-v*` tags and
+`workflow_dispatch`, and always builds + validates both SDKs' real publish
+artifacts (sdist/wheel + `twine check` + install-test for PyPI; `npm pack`
++ install-test for npm). It only **uploads** them when the `PUBLISH_ENABLED`
+repository variable (Settings > Secrets and variables > Actions >
+Variables) is exactly `"true"` — unset or anything else runs the same job
+in dry-run mode (build + check + install-test, no upload). The same
+build-and-check tier also runs on every PR via `make dry-run-sdks` in
+`ci.yml`'s `sdks` job, so a manifest mistake is caught long before a
+release tag exists, not discovered the first time `PUBLISH_ENABLED` flips
+on.
+
+**Turning it on requires, at minimum:**
+
+- The `offshoot-db` name claimed on PyPI, with Trusted Publishing (OIDC)
+  configured for this repo + `publish.yml` + the `pypi` job — no PyPI
+  secret is stored in this repo; `pypa/gh-action-pypi-publish` authenticates
+  via the job's `id-token: write` permission alone.
+- The `@offshoot-db` scope claimed on npm, and registry auth configured:
+  today that means an automation token in the `NPM_TOKEN` repository
+  secret (used as `NODE_AUTH_TOKEN` for `npm publish --provenance`). npm
+  has since shipped OIDC-based Trusted Publishing for GitHub Actions,
+  which would remove the need for a stored token the same way PyPI's does
+  — adopting it means confirming the npm CLI version on the runner
+  supports it and configuring `@offshoot-db/client` as a Trusted Publisher
+  on npmjs.com for this exact repo + workflow, then deleting the
+  `NODE_AUTH_TOKEN` env var from the `npm` job. Not done yet; `NPM_TOKEN`
+  is the working path today.
+- `PUBLISH_ENABLED=true` set as a repository variable.
+
+Claiming both names is a manual, one-time, user-side action tracked as a
+deliberately-out-of-band item in [ROADMAP.md](ROADMAP.md) and
+[docs/status.md](docs/status.md) — not something a PR against this repo
+can do on its own.
 
 ## What's most welcome right now
 

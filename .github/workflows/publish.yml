@@ -1,0 +1,165 @@
+name: publish
+
+# Publishes the two SDKs (sdk/python -> PyPI, sdk/typescript -> npm) in
+# lockstep from one `sdk-v<version>` tag — see CONTRIBUTING.md's "Release
+# process" for why lockstep and why one tag, not two.
+#
+# Gated on the `PUBLISH_ENABLED` repository variable (Settings > Secrets and
+# variables > Actions > Variables), which defaults unset/false. While it is
+# not exactly "true", BOTH jobs still run in full — building the real
+# sdist/wheel and npm tarball, checking them, and install-testing them —
+# they just skip the final upload step instead of the whole job. This is
+# deliberate: the gate is a publish-authorization switch, not a
+# build-verification switch, so flipping it on for the first time is never
+# also the first time the build/package steps are exercised.
+#
+# workflow_dispatch lets a maintainer run the same build-and-check (dry-run,
+# unless PUBLISH_ENABLED is "true") on demand without cutting a tag — see
+# ci.yml's sdks job for the other place this same check runs (every PR
+# touching sdk/**, via `make dry-run-sdks`, so a manifest mistake is caught
+# long before a release tag is ever pushed).
+on:
+  push:
+    tags:
+      - "sdk-v*"
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  # check resolves the publish gate once and (on a tag push) verifies the
+  # tag's version agrees with sdk/VERSION before either publish job does any
+  # work, so a stale sdk/VERSION at tag time fails fast with one clear error
+  # instead of two divergent PyPI/npm publishes.
+  check:
+    runs-on: ubuntu-latest
+    outputs:
+      publish_enabled: ${{ steps.gate.outputs.enabled }}
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Verify tag matches sdk/VERSION
+        if: startsWith(github.ref, 'refs/tags/sdk-v')
+        run: python3 scripts/check_sdk_tag_version.py "${GITHUB_REF_NAME}"
+
+      - name: Verify sdk/VERSION, pyproject.toml, package.json agree
+        run: python3 scripts/check_sdk_versions.py
+
+      - name: Resolve publish gate
+        id: gate
+        run: |
+          if [ "${{ vars.PUBLISH_ENABLED }}" = "true" ]; then
+            echo "publish gate is ON (PUBLISH_ENABLED=true) — real upload steps will run"
+            echo "enabled=true" >> "$GITHUB_OUTPUT"
+          else
+            echo "publish gate is OFF — running in dry-run mode (build+check+install-test, no upload)"
+            echo "enabled=false" >> "$GITHUB_OUTPUT"
+          fi
+
+  pypi:
+    needs: check
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      # Required for PyPI Trusted Publishing (OIDC) even though this
+      # permission is a no-op in dry-run mode — declared unconditionally so
+      # the job's permission set doesn't change shape between dry-run and
+      # real runs (a gate flip should never also be a permissions diff).
+      id-token: write
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
+      - name: Install build tooling
+        run: python3 -m pip install --upgrade build twine
+
+      - name: Build sdist + wheel
+        run: python3 -m build sdk/python
+
+      - name: twine check (validates metadata/README render before any upload)
+        run: python3 -m twine check sdk/python/dist/*
+
+      - name: Install the built wheel into a throwaway venv and import-test it
+        # Runs unconditionally — dry-run or real — since it's the actual
+        # proof this job's own build output installs and imports, not a
+        # publish-only step.
+        run: |
+          python3 -m venv /tmp/offshoot-pypi-install-test
+          /tmp/offshoot-pypi-install-test/bin/pip install --quiet sdk/python/dist/*.whl
+          /tmp/offshoot-pypi-install-test/bin/python3 -c "import offshoot; print('import offshoot: ok')"
+
+      - name: Publish to PyPI (Trusted Publishing / OIDC)
+        if: needs.check.outputs.publish_enabled == 'true'
+        uses: pypa/gh-action-pypi-publish@release/v1
+        with:
+          packages-dir: sdk/python/dist
+
+      - name: Dry-run notice
+        if: needs.check.outputs.publish_enabled != 'true'
+        run: |
+          echo "PUBLISH_ENABLED repository variable is not 'true' — the sdist/wheel"
+          echo "above were built, twine-checked, and install-tested, but nothing was"
+          echo "uploaded to PyPI. Set PUBLISH_ENABLED=true (repo Settings > Actions >"
+          echo "Variables) once the offshoot-db PyPI project exists and Trusted"
+          echo "Publishing is configured for this repo+workflow — see CONTRIBUTING.md."
+
+  npm:
+    needs: check
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      # id-token: write is for npm provenance's Sigstore attestation
+      # (--provenance), which is independent of *registry authentication*
+      # below — see the NPM_TOKEN note on the publish step.
+      id-token: write
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: "22"
+          registry-url: "https://registry.npmjs.org"
+
+      - name: Install + build
+        run: cd sdk/typescript && npm install --no-audit --no-fund && npm run build
+
+      - name: npm pack (the exact tarball a real publish would upload)
+        run: cd sdk/typescript && npm pack --pack-destination dry-run-pack
+
+      - name: Install the packed tarball into a throwaway project and import-test it
+        # Runs unconditionally — dry-run or real — same reasoning as the
+        # PyPI job's install-test step above.
+        run: |
+          mkdir -p sdk/typescript/dry-run-install
+          cd sdk/typescript/dry-run-install
+          npm init -y --silent >/dev/null
+          npm install --no-audit --no-fund --silent ../dry-run-pack/offshoot-db-client-*.tgz
+          node -e "import('@offshoot-db/client').then((m) => { if (typeof m.connect !== 'function') throw new Error('connect export missing from published package'); console.log('import @offshoot-db/client: ok'); })"
+
+      - name: Publish to npm (provenance)
+        if: needs.check.outputs.publish_enabled == 'true'
+        working-directory: sdk/typescript
+        run: npm publish --provenance --access public
+        env:
+          # Registry auth: a classic automation token in the NPM_TOKEN repo
+          # secret. npm shipped OIDC-based Trusted Publishing (no long-lived
+          # token) for GitHub Actions after this workflow was first written;
+          # switching to it means removing NODE_AUTH_TOKEN/NPM_TOKEN here,
+          # confirming the npm CLI on this runner is new enough, and
+          # configuring @offshoot-db/client as a Trusted Publisher for this
+          # exact repo+workflow file on npmjs.com — see CONTRIBUTING.md's
+          # Release process for the up-to-date decision.
+          NODE_AUTH_TOKEN: ${{ secrets.NPM_TOKEN }}
+
+      - name: Dry-run notice
+        if: needs.check.outputs.publish_enabled != 'true'
+        run: |
+          echo "PUBLISH_ENABLED repository variable is not 'true' — the package above"
+          echo "was built, packed, and install-tested, but nothing was uploaded to npm."
+          echo "Set PUBLISH_ENABLED=true (repo Settings > Actions > Variables) once the"
+          echo "@offshoot-db npm scope exists and registry auth (NPM_TOKEN secret, or"
+          echo "Trusted Publishing once adopted) is configured — see CONTRIBUTING.md."

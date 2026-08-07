@@ -61,6 +61,25 @@ jobs:
       - name: make test-sdks
         run: make test-sdks
 
+      # dry-run-sdks builds the real sdist/wheel and npm tarball, runs twine
+      # check, and install-tests both — the same build-verification tier
+      # .github/workflows/publish.yml runs in dry-run mode (PUBLISH_ENABLED
+      # off) or right before a real upload (PUBLISH_ENABLED on). Running it
+      # here, on every PR, is the simplest way to prove the SDKs still
+      # build and install correctly without duplicating any of publish.yml's
+      # upload logic or adding a second trigger to reason about — see
+      # publish.yml's top comment for the fuller rationale. --break-system-
+      # packages is needed because Ubuntu's system python3 (PEP 668) refuses
+      # a bare `pip install`; this is an ephemeral CI container, not a dev
+      # machine, so that's the right call here (contrast: publish.yml's own
+      # jobs use actions/setup-python, which isn't externally managed and
+      # doesn't need this flag).
+      - name: Install SDK build/publish check tooling
+        run: python3 -m pip install --break-system-packages --quiet build twine
+
+      - name: make dry-run-sdks
+        run: make dry-run-sdks
+
   s3-conformance:
     runs-on: ubuntu-latest
     # MinIO is started with a plain `docker run` (see "Start MinIO" below)
