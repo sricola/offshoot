@@ -445,6 +445,29 @@ test("checkoutAt: requires a checkpoint name", async (t: TestContext) => {
   }
 });
 
+test("checkoutAt: rejects a path-traversal checkpoint", async (t: TestContext) => {
+  if (!canRun) {
+    t.skip("go and/or sqlite3 not on PATH");
+    return;
+  }
+  // The SDK forwards `checkpoint` verbatim as the daemon's `name` field;
+  // the server-side ops.Workspace.CheckoutAt fix must reject a crafted
+  // value before it ever reaches CheckoutAtPath's filepath.Join, not just
+  // an empty one.
+  const c = await connect(fixture!.sock);
+  try {
+    await c.create("checkout-at-traversal-app");
+    const s = await c.open("checkout-at-traversal-app");
+    sqlite3(s.path, "CREATE TABLE t (v); INSERT INTO t VALUES ('writable');");
+    await s.close();
+    for (const bad of ["../../../etc/passwd", "..", "a/b", "../../checkouts/app/main"]) {
+      await assert.rejects(() => c.checkoutAt("checkout-at-traversal-app", "main", bad), OffshootError);
+    }
+  } finally {
+    await c.close();
+  }
+});
+
 test("daemon death mid-call raises OffshootError", async (t: TestContext) => {
   if (!canRun) {
     t.skip("go and/or sqlite3 not on PATH");

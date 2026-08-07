@@ -435,3 +435,114 @@ func TestCheckoutAtForceRematerializesAndCanFail(t *testing.T) {
 		t.Fatal("force=true must re-read the store and fail once the branch is gone")
 	}
 }
+
+// TestCheckoutAtRejectsPathTraversalCheckpoint is the fix for a CRITICAL
+// finding: CheckoutAt used to validate db and branch but not checkpoint
+// before handing it straight to CheckoutAtPath's filepath.Join. A crafted
+// checkpoint value containing ".." segments could resolve OUTSIDE
+// checkouts-ro entirely — including onto the branch's own WRITABLE
+// checkout path — and, worse, the force=false fast path would return that
+// path as a "cache hit" purely because something existed there, before
+// ref.Checkpoints was ever consulted. store.ValidateName must reject every
+// such value before CheckoutAtPath is ever computed.
+func TestCheckoutAtRejectsPathTraversalCheckpoint(t *testing.T) {
+	requireSQLite3(t)
+	w := newWS(t)
+	if err := w.Create("app"); err != nil {
+		t.Fatal(err)
+	}
+	// Give the branch a real, writable checkout with known content, so a
+	// traversal that reached it would be observable.
+	path, err := w.Checkout("app", "main")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if out, err := exec.Command("sqlite3", path,
+		"CREATE TABLE t (v); INSERT INTO t VALUES ('writable-checkout');").CombinedOutput(); err != nil {
+		t.Fatalf("%v: %s", err, out)
+	}
+
+	malicious := []string{
+		"../../../etc/passwd",
+		"..",
+		"a/b",
+		"/etc/passwd",
+		// Crafted to walk back out of checkouts-ro/app/ and land on
+		// CheckoutPath's own file: checkouts-ro/app/main@<X>.db where X =
+		// "../../checkouts/app/main" resolves (Join+Clean) to
+		// checkouts/app/main.db — the writable checkout computed above.
+		"../../checkouts/app/main",
+	}
+
+	for _, cp := range malicious {
+		if _, err := w.CheckoutAt("app", "main", cp, false); err == nil {
+			t.Fatalf("checkout-at with checkpoint %q must be refused (path traversal)", cp)
+		}
+	}
+
+	// The writable checkout must be completely untouched by every attempt
+	// above: same content, and — the sharpest possible check — it must
+	// still be writable (a traversal that succeeded in "caching" onto it
+	// would have chmod'd it 0444).
+	if got := rowCount(t, path); got != 1 {
+		t.Fatalf("writable checkout rows = %d, want 1 (a traversal attempt corrupted it)", got)
+	}
+	fi, err := os.Stat(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if fi.Mode().Perm()&0o200 == 0 {
+		t.Fatal("the writable checkout must still be writable — a path-traversal checkout-at must not have chmod'd it read-only")
+	}
+}
+
+// TestCheckoutAtChmodFailureRemovesFileSoLaterCallsRematerialize is the fix
+// for a MINOR finding: if the post-materialize os.Chmod(path, 0o444) call
+// fails, the file it was trying to lock down must not be left in place —
+// the force=false fast path is a bare os.Stat (existence only, never a
+// mode re-check), so a leftover writable file would be silently served as
+// a "read-only checkout" by every future force=false call. Forces the
+// chmod to fail via the checkoutAtChmod test hook and proves: (1) the call
+// itself errors, (2) no file is left at the cache path, (3) a subsequent
+// call (chmod restored) succeeds cleanly rather than tripping over a
+// leftover.
+func TestCheckoutAtChmodFailureRemovesFileSoLaterCallsRematerialize(t *testing.T) {
+	requireSQLite3(t)
+	w := newWS(t)
+	if err := w.Create("app"); err != nil {
+		t.Fatal(err)
+	}
+	path, _ := w.Checkout("app", "main")
+	exec.Command("sqlite3", path, "CREATE TABLE t (v);").Run()
+	if _, err := w.Checkpoint("app", "main", "v1", nil); err != nil {
+		t.Fatal(err)
+	}
+
+	orig := checkoutAtChmod
+	checkoutAtChmod = func(string, os.FileMode) error { return os.ErrPermission }
+	t.Cleanup(func() { checkoutAtChmod = orig })
+
+	if _, err := w.CheckoutAt("app", "main", "v1", false); err == nil {
+		t.Fatal("checkout-at must surface a chmod failure as an error")
+	}
+	roPath := w.CheckoutAtPath("app", "main", "v1")
+	if _, err := os.Stat(roPath); !os.IsNotExist(err) {
+		t.Fatalf("a chmod failure must leave no file at the cache path, got stat err=%v", err)
+	}
+
+	checkoutAtChmod = orig
+	got, err := w.CheckoutAt("app", "main", "v1", false)
+	if err != nil {
+		t.Fatalf("a retry after the chmod hook is restored must succeed: %v", err)
+	}
+	if got != roPath {
+		t.Fatalf("path = %q, want %q", got, roPath)
+	}
+	fi, err := os.Stat(got)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if perm := fi.Mode().Perm(); perm != 0o444 {
+		t.Fatalf("perm = %o, want 0444", perm)
+	}
+}

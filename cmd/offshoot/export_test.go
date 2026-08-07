@@ -156,3 +156,37 @@ func TestCheckoutAtCLIMaterializesSeparateReadOnlyPath(t *testing.T) {
 		t.Fatalf("checkout --at --read-only --force: %v", err)
 	}
 }
+
+// TestCheckoutAtCLIRejectsPathTraversalCheckpoint pins the CRITICAL fix at
+// the CLI boundary: a --at value crafted to escape checkouts-ro (e.g. onto
+// the branch's own writable checkout path) must be refused, not served as
+// a "cache hit".
+func TestCheckoutAtCLIRejectsPathTraversalCheckpoint(t *testing.T) {
+	requireSQLite3ForCLI(t)
+	store := filepath.Join(t.TempDir(), "s")
+	call(t, store, "init")
+	call(t, store, "create", "app")
+	path := strings.TrimSpace(call(t, store, "checkout", "app"))
+	if out, err := exec.Command("sqlite3", path,
+		"CREATE TABLE users (name); INSERT INTO users VALUES ('writable');").CombinedOutput(); err != nil {
+		t.Fatalf("%v: %s", err, out)
+	}
+
+	for _, cp := range []string{"../../../etc/passwd", "..", "a/b", "../../checkouts/app/main"} {
+		if err := run([]string{"-store", store, "checkout", "app", "--at", cp, "--read-only"}); err == nil {
+			t.Fatalf("checkout --at %q --read-only must be refused (path traversal)", cp)
+		}
+	}
+
+	// The writable checkout must be untouched: still writable, same content.
+	fi, err := os.Stat(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if fi.Mode().Perm()&0o200 == 0 {
+		t.Fatal("the writable checkout must still be writable")
+	}
+	if got := sqliteRows(t, path); got != "1" {
+		t.Fatalf("writable checkout rows = %s, want 1", got)
+	}
+}

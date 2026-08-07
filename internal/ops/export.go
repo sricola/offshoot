@@ -84,10 +84,18 @@ func (w *Workspace) Export(db, branch, checkpoint, dstPath string, force bool) e
 // checkpoint: <Root>/checkouts-ro/<db>/<branch>@<checkpoint>.db — distinct
 // from CheckoutPath's writable <Root>/checkouts/<db>/<branch>.db, both in
 // directory (checkouts-ro vs checkouts) and in filename (it encodes the
-// checkpoint too, since more than one can be cached per branch). Safe to
-// build from db/branch/checkpoint alone: none of the three can contain '@'
-// or '/' (store.ValidateName's charset), so this join is never ambiguous
-// and never escapes the checkouts-ro tree.
+// checkpoint too, since more than one can be cached per branch).
+//
+// This is a pure path computation — it does NOT validate db/branch/
+// checkpoint itself. The join is only guaranteed to stay inside the
+// checkouts-ro tree (and, specifically, never resolve onto CheckoutPath's
+// WRITABLE tree via a "../" checkpoint value) when every argument has
+// already passed store.ValidateName (charset [a-z0-9-_.], never "..",
+// never containing "/" or "@") — which CheckoutAt, this function's only
+// production caller, does for all three before ever calling this. A new
+// caller passing an unvalidated checkpoint straight through would reopen
+// exactly the path-traversal hole CheckoutAt's own validation closes; see
+// its doc comment.
 func (w *Workspace) CheckoutAtPath(db, branch, checkpoint string) string {
 	return filepath.Join(w.Root, "checkouts-ro", db, branch+"@"+checkpoint+".db")
 }
@@ -113,7 +121,11 @@ func (w *Workspace) CheckoutAtPath(db, branch, checkpoint string) string {
 // the next CheckoutAt call for anything under it simply rebuilds what it
 // needs. The result is chmod 0444 after materializing, reinforcing in the
 // filesystem itself what the name already promises: nothing should write
-// through this path.
+// through this path. If that chmod itself fails, the freshly-materialized
+// file is removed (best-effort) rather than left behind at whatever
+// (writable) permission it had — the force=false fast path below only
+// ever Stats for existence, never re-checks the mode, so a wrongly-
+// permissioned leftover would otherwise be served as "read-only" forever.
 //
 // Repeat calls for the SAME (db, branch, checkpoint) are cheap by design:
 // if the cache file already exists, force is false returns it as-is with
@@ -146,6 +158,22 @@ func (w *Workspace) CheckoutAt(db, branch, checkpoint string, force bool) (strin
 	if checkpoint == "" {
 		return "", fmt.Errorf("ops: checkout-at requires a checkpoint name")
 	}
+	// SECURITY: checkpoint must be validated BEFORE it ever reaches
+	// CheckoutAtPath's filepath.Join, and before the force=false cache-hit
+	// Stat below — both run before ref.Checkpoints is ever consulted. An
+	// unvalidated checkpoint containing '/' or '..' segments (e.g.
+	// "../../checkouts/db/branch") lets filepath.Join's Clean resolve the
+	// joined path OUTSIDE checkouts-ro entirely, including onto the
+	// branch's own WRITABLE checkout path — and the cache-hit fast path
+	// would then hand that path back as a "read-only checkout" without
+	// ever checking whether such a checkpoint exists, reachable from the
+	// CLI's --at flag and the daemon's checkout-at op. store.ValidateName's
+	// charset ([a-z0-9-_.], no "/", no ".." substring) closes this off the
+	// same way ParseExportTarget already validates the identical third
+	// component for Export's CLI target string.
+	if err := store.ValidateName(checkpoint); err != nil {
+		return "", err
+	}
 	path := w.CheckoutAtPath(db, branch, checkpoint)
 	if !force {
 		if _, err := os.Stat(path); err == nil {
@@ -166,11 +194,38 @@ func (w *Workspace) CheckoutAt(db, branch, checkpoint string, force bool) (strin
 	if _, err := w.materializeAt(ref, cp, path); err != nil {
 		return "", fmt.Errorf("ops: checkout-at %s@%s@%s: %w", db, branch, checkpoint, err)
 	}
-	if err := os.Chmod(path, 0o444); err != nil {
-		return "", fmt.Errorf("ops: checkout-at %s@%s@%s materialized but could not be marked read-only: %w", db, branch, checkpoint, err)
+	if err := checkoutAtChmod(path, 0o444); err != nil {
+		// The force=false fast path above is a bare os.Stat — it trusts mere
+		// EXISTENCE, never re-checks the mode. Left in place, a file that
+		// materialized correctly but failed this chmod would sit at
+		// whatever permission os.CreateTemp's rename target inherited
+		// (typically 0600, i.e. writable) and get served as a "read-only
+		// checkout" by every subsequent force=false call forever, silently
+		// contradicting this function's own read-only guarantee. Removing
+		// it instead means the next call (force=false or true) sees no
+		// cached file and re-materializes cleanly rather than trusting a
+		// half-finished one.
+		rmErr := os.Remove(path)
+		if rmErr != nil && !os.IsNotExist(rmErr) {
+			return "", fmt.Errorf("ops: checkout-at %s@%s@%s materialized but could not be marked read-only, and cleanup of the wrongly-permissioned file also failed (do not trust force=false on this path until it is removed manually): chmod: %v; remove: %w",
+				db, branch, checkpoint, err, rmErr)
+		}
+		return "", fmt.Errorf("ops: checkout-at %s@%s@%s materialized but could not be marked read-only (the file was removed; retry will re-materialize): %w", db, branch, checkpoint, err)
 	}
 	return path, nil
 }
+
+// checkoutAtChmod is CheckoutAt's read-only chmod call, indirected only so
+// a test can force it to fail deterministically — an ordinary os.Chmod on a
+// file this process just created essentially never fails, so exercising
+// the chmod-error cleanup path without this hook would mean relying on
+// brittle, platform-specific permission tricks (e.g. a read-only parent
+// directory, which behaves differently across filesystems/CI). Always
+// os.Chmod in production; a test in this same package may reassign it
+// temporarily (and must restore it, e.g. via t.Cleanup — it is
+// process-global state, matching forkSlowPathForTest's existing
+// convention in ops.go).
+var checkoutAtChmod = os.Chmod
 
 // ParseExportTarget parses export's <db>[@branch[@checkpoint]] target form:
 // up to three '@'-separated components (branch defaults to "main",
