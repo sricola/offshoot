@@ -10,6 +10,7 @@ import (
 	"fmt"
 	"net"
 	"os"
+	"path/filepath"
 	"sort"
 	"sync"
 	"time"
@@ -220,6 +221,10 @@ func (s *Server) dispatch(req Request) Response {
 		return s.opBranches(req)
 	case "dbs":
 		return s.opDbs()
+	case "export":
+		return s.opExport(req)
+	case "checkout-at":
+		return s.opCheckoutAt(req)
 	default:
 		return errResp(fmt.Errorf("daemon: unknown op %q", req.Op))
 	}
@@ -763,6 +768,57 @@ func (s *Server) opDbs() Response {
 	}
 	sort.Strings(dbs)
 	return Response{OK: true, Databases: dbs}
+}
+
+// opExport materializes db@branch's state at checkpoint req.Name ("" =
+// head) to a plain SQLite file at req.Path (ops.Workspace.Export — refuses
+// to overwrite an existing file there unless req.Force; writes atomically,
+// no sidecar, no lease — see Export's own doc comment for the exact
+// semantics). req.Path must be ABSOLUTE (see Request.Path's doc comment for
+// the trust model this enforces); a relative path is refused outright
+// rather than resolved against the daemon's own working directory.
+//
+// Deliberately UNGUARDED by refuseIfClaimed, unlike opCheckoutAtRest/
+// opRollback/opPromote: Export reads the STORE (the branch's last durable
+// chain), never the live checkout, so an open session on db@branch runs
+// concurrently with an export of that same branch with no conflict — but
+// also with a real consequence worth stating plainly: that session's
+// UNFLUSHED writes are invisible to this export. Export always reflects
+// the branch's last DURABLE state; a caller that needs in-flight session
+// writes included must flush (or checkpoint) first.
+func (s *Server) opExport(req Request) Response {
+	branch := req.Branch
+	if branch == "" {
+		branch = "main"
+	}
+	if !filepath.IsAbs(req.Path) {
+		return errResp(fmt.Errorf("daemon: export path %q must be absolute", req.Path))
+	}
+	if err := s.ws.Export(req.DB, branch, req.Name, req.Path, req.Force); err != nil {
+		return errResp(err)
+	}
+	return Response{OK: true}
+}
+
+// opCheckoutAt materializes db@branch's state at checkpoint req.Name into
+// its dedicated read-only cache file (ops.Workspace.CheckoutAt) — a path
+// distinct from, and never touching, the writable checkout a live session
+// or opCheckoutAtRest owns. That separation is exactly why this handler,
+// unlike opCheckoutAtRest/opRollback/opPromote, needs no refuseIfClaimed
+// guard: it is safe to run alongside an open session on the SAME branch.
+// req.Force re-materializes an already-cached file (and re-reads the
+// store to do it); otherwise a cache hit is returned as-is with no store
+// access at all — see CheckoutAt's own doc comment.
+func (s *Server) opCheckoutAt(req Request) Response {
+	branch := req.Branch
+	if branch == "" {
+		branch = "main"
+	}
+	path, err := s.ws.CheckoutAt(req.DB, branch, req.Name, req.Force)
+	if err != nil {
+		return errResp(err)
+	}
+	return Response{OK: true, Checkout: path}
 }
 
 // Shutdown stops the janitor, stops accepting, refuses any further opens,

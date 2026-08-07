@@ -28,6 +28,17 @@ Usage:
   offshoot init                      create a store in ./.offshoot
   offshoot create <db> [--from f]    new database (branch main), or import file f
   offshoot checkout <db>[@branch]    materialize a working copy; prints its path
+  offshoot checkout <db>[@branch] --at <checkpoint> --read-only [--force]
+                                     materialize a checkpoint into a separate,
+                                     immutable read-only cache path (never the
+                                     writable checkout); repeat calls are a
+                                     cache hit unless --force re-materializes
+  offshoot export <db>[@branch[@checkpoint]] <out.db> [--force]
+                                     copy a checkpoint (or head) out to a
+                                     plain SQLite file anywhere; refuses to
+                                     overwrite an existing out.db unless
+                                     --force; no sidecar, no lease — out.db
+                                     has no ongoing relationship to the store
   offshoot checkpoint <db>[@branch] <name> [--meta k=v ...]
                                      snapshot the checkout as a named checkpoint
   offshoot fork <db>[@branch] <new> [--at cp] [--ttl duration] [--meta k=v ...]
@@ -149,6 +160,24 @@ func extractFlag(args []string, name string) (value string, rest []string, ok bo
 		out = append(out, args[i])
 	}
 	return value, out, ok, nil
+}
+
+// extractBoolFlag pulls every occurrence of a bare boolean flag (e.g.
+// "--force", "--read-only") out of args, in any position, mirroring
+// extractFlag's parsing style but for a flag that takes no value. Returns
+// whether it was present at all, and the remaining args with every
+// occurrence removed.
+func extractBoolFlag(args []string, name string) (bool, []string) {
+	found := false
+	out := args[:0]
+	for _, a := range args {
+		if a == name {
+			found = true
+			continue
+		}
+		out = append(out, a)
+	}
+	return found, out
 }
 
 // extractMetaFlags pulls every repeatable "--meta k=v" pair out of args, in
@@ -405,23 +434,65 @@ func run(args []string) error {
 		}
 		fmt.Printf("promoted %s@%s -> %s@%s at txid %d\n", db, srcBranch, db, fs[2], txid)
 		return nil
-	case "checkout", "path":
+	case "path":
 		if len(rest) != 1 {
-			return fmt.Errorf("usage: offshoot %s <db>[@branch]", cmd)
+			return fmt.Errorf("usage: offshoot path <db>[@branch]")
 		}
 		db, branch, err := ops.ParseTarget(rest[0])
 		if err != nil {
 			return err
 		}
-		if cmd == "path" {
-			fmt.Println(w.CheckoutPath(db, branch))
-			return nil
+		fmt.Println(w.CheckoutPath(db, branch))
+		return nil
+	case "checkout":
+		usageErr := fmt.Errorf("usage: offshoot checkout <db>[@branch] [--at checkpoint --read-only [--force]]")
+		fs := rest
+		at, fs, _, err := extractFlag(fs, "--at")
+		if err != nil {
+			return fmt.Errorf("usage: offshoot checkout <db>[@branch] [--at checkpoint --read-only [--force]]: %w", err)
 		}
-		path, err := w.Checkout(db, branch)
+		readOnly, fs := extractBoolFlag(fs, "--read-only")
+		force, fs := extractBoolFlag(fs, "--force")
+		if len(fs) != 1 {
+			return usageErr
+		}
+		db, branch, err := ops.ParseTarget(fs[0])
 		if err != nil {
 			return err
 		}
-		fmt.Println(path)
+		switch {
+		case at != "" && readOnly:
+			path, err := w.CheckoutAt(db, branch, at, force)
+			if err != nil {
+				return err
+			}
+			fmt.Println(path)
+			return nil
+		case at != "" || readOnly:
+			return fmt.Errorf("offshoot checkout: --at and --read-only must be given together")
+		case force:
+			return fmt.Errorf("offshoot checkout: --force only applies alongside --at --read-only")
+		default:
+			path, err := w.Checkout(db, branch)
+			if err != nil {
+				return err
+			}
+			fmt.Println(path)
+			return nil
+		}
+	case "export":
+		force, rest := extractBoolFlag(rest, "--force")
+		if len(rest) != 2 {
+			return fmt.Errorf("usage: offshoot export <db>[@branch[@checkpoint]] <out.db> [--force]")
+		}
+		db, branch, checkpoint, err := ops.ParseExportTarget(rest[0])
+		if err != nil {
+			return err
+		}
+		if err := w.Export(db, branch, checkpoint, rest[1], force); err != nil {
+			return err
+		}
+		fmt.Println(rest[1])
 		return nil
 	case "destroy":
 		force := false

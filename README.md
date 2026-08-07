@@ -325,6 +325,24 @@ ordinary session's clean close. See
 [docs/status.md](docs/status.md)'s "Clean-and-current checkout served
 without chain validation" row.
 
+**Read-only historical checkouts** (`offshoot checkout --at <checkpoint>
+--read-only`, `Client.checkout_at`/`checkoutAt`) live in a completely
+separate tree from the writable-checkout cache described above:
+`<store-root>/checkouts-ro/<db>/<branch>@<checkpoint>.db`, one file per
+`(db, branch, checkpoint)` ever materialized this way, `chmod 0444`. This
+cache has none of the above's costs or caveats: no `.sum` sidecar, no lease,
+no stranded `dbfile` descriptor (nothing in this codebase ever opens a
+`checkouts-ro` file through a live capture engine, so the stray-close lock
+hazard that motivates `internal/dbfile` in the first place doesn't apply to
+it), and no reclamation problem to solve later — **it is safe to `rm -rf`
+the entire `checkouts-ro` directory at any time**; the next call for
+anything under it just rebuilds what it needs from the store. A repeat call
+for the same checkpoint is a cheap cache hit (the file already exists, a
+checkpoint's content never changes, so it's returned as-is with no store
+access at all) unless `--force`/`force=True` is given. `offshoot export`'s
+output has the identical zero-ongoing-relationship property, just written
+wherever the caller pointed it rather than under a fixed cache path.
+
 Design: docs/superpowers/specs/2026-07-29-offshoot-design.md
 Capture-spike evidence: docs/superpowers/specs/2026-07-29-offshoot-spike-report.md
 

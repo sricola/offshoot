@@ -102,6 +102,23 @@ export interface TouchOptions {
   ttl?: string;
 }
 
+/** Options for {@link Client.export}. */
+export interface ExportOptions {
+  /** Checkpoint to export; omitted (or "") means the branch's head. */
+  checkpoint?: string;
+  /** Overwrite an existing file at outPath. Without this, export refuses
+   * to overwrite. */
+  force?: boolean;
+}
+
+/** Options for {@link Client.checkoutAt}. */
+export interface CheckoutAtOptions {
+  /** Re-materialize an already-cached read-only checkout file. Without
+   * this, an existing cache file for the same (db, branch, checkpoint) is
+   * returned as-is with no store access. */
+  force?: boolean;
+}
+
 /** Open a connection to the offshoot daemon listening on socketPath. */
 export async function connect(socketPath: string): Promise<Client> {
   const sock = createConnection(socketPath);
@@ -277,6 +294,41 @@ export class Client {
   async dbs(): Promise<string[]> {
     const resp = await this._call("dbs");
     return resp.databases ?? [];
+  }
+
+  /** Materialize db@branch's state at opts.checkpoint (omitted = head) to a
+   * plain SQLite file at outPath, server-side, on the daemon's own host/
+   * filesystem — outPath must be an ABSOLUTE path (same-host/same-user
+   * unix-socket trust model; see internal/daemon/protocol.go's
+   * `Request.Path`). Refuses to overwrite an existing outPath unless
+   * opts.force. No sidecar, no lease — outPath has no ongoing relationship
+   * to the store.
+   *
+   * This reads the branch's last DURABLE state from the store, never a
+   * live session's checkout: if a session on db@branch has unflushed
+   * writes, they are NOT in the export. Flush (or checkpoint) first if you
+   * need them included. */
+  async export(db: string, branch: string, outPath: string, opts: ExportOptions = {}): Promise<void> {
+    await this._call("export", {
+      db,
+      branch,
+      name: opts.checkpoint ?? "",
+      path: outPath,
+      force: opts.force ?? false,
+    });
+  }
+
+  /** Materialize db@branch's state at checkpoint into a dedicated
+   * read-only cache file, distinct from (and never touching) the branch's
+   * writable checkout — safe to call alongside an open session on the
+   * same branch. Repeat calls with opts.force unset (or false) return the
+   * cached path as-is (a checkpoint's content is immutable, so no store
+   * access is needed); opts.force re-materializes.
+   *
+   * Returns the read-only cache file's path. */
+  async checkoutAt(db: string, branch: string, checkpoint: string, opts: CheckoutAtOptions = {}): Promise<string> {
+    const resp = await this._call("checkout-at", { db, branch, name: checkpoint, force: opts.force ?? false });
+    return resp.checkout ?? "";
   }
 
   /** List every session open in the daemon. */
