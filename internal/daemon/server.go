@@ -184,11 +184,36 @@ func (s *Server) handle(c net.Conn) {
 			return // client hung up or sent garbage
 		}
 		resp := s.dispatch(req)
-		if err := enc.Encode(resp); err != nil {
+		if req.Op == "shutdown" && shutdownRespondDelay != nil {
+			shutdownRespondDelay() // test hook; nil (a no-op) in production
+		}
+		// encErr is deliberately not checked before triggering Shutdown
+		// below: a "shutdown" request must shut the daemon down whether or
+		// not we could tell the requester so (e.g. it already hung up).
+		// What matters is ORDER, not the outcome of the write: Shutdown's
+		// connection-close pass must never start until the attempt to
+		// write this very response has already finished. See dispatch's
+		// "shutdown" case for why that attempt is no longer allowed to
+		// race Shutdown itself.
+		encErr := enc.Encode(resp)
+		if req.Op == "shutdown" {
+			go s.Shutdown(context.Background())
+			return
+		}
+		if encErr != nil {
 			return
 		}
 	}
 }
+
+// shutdownRespondDelay, when non-nil, is invoked by handle after
+// dispatching a "shutdown" request but before writing that request's
+// response. It exists purely for tests: forcing a delay here lets a test
+// prove (or, against the pre-fix code, disprove) that Shutdown's
+// connection-close pass cannot run until after the shutdown response has
+// actually been written -- see TestShutdownRespondsBeforeClosingRequestingConn.
+// Nil (the default) is a no-op and imposes no cost in production.
+var shutdownRespondDelay func()
 
 func (s *Server) dispatch(req Request) Response {
 	switch req.Op {
@@ -201,7 +226,18 @@ func (s *Server) dispatch(req Request) Response {
 	case "close":
 		return s.opClose(req)
 	case "shutdown":
-		go s.Shutdown(context.Background())
+		// Do NOT trigger Shutdown here. It used to be `go s.Shutdown(...)`
+		// followed by returning this response, which raced Shutdown's
+		// connection-close pass (it force-closes every live connection,
+		// including this request's own) against handle's write of this
+		// very response on that same connection. Under normal scheduling
+		// the write usually won, so the bug only showed up as an
+		// occasional CI flake on a loaded runner: the CLI would see
+		// "daemon: reading response: EOF" instead of {OK: true}, because
+		// Shutdown closed the socket before (or during) the write. handle
+		// now triggers Shutdown itself, strictly after attempting to write
+		// this response — see handle's shutdown handling and
+		// TestShutdownRespondsBeforeClosingRequestingConn.
 		return Response{OK: true}
 	case "create":
 		return s.opCreate(req)
