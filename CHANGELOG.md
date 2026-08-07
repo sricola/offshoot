@@ -13,6 +13,25 @@ version if you depend on format stability.
 
 ## [Unreleased]
 
+### Fixed
+
+- Settling-flush checksum-compare suppression (Milestone 2 follow-up):
+  `rebaseline`'s first call now skips a session's mandatory startup settling
+  flush when the checkout `Open` received was already proven byte-identical
+  to the branch's current head — a read-only daemon session reopened against
+  an unmodified checkout no longer uploads a full snapshot (previously
+  measured 541.9MB at a 512MB db) for doing nothing. A first-ever open, or
+  one against a dirty/stale checkout, still settles exactly as before.
+- Sidecar refresh on clean Close (Milestone 2 follow-up): `Session.Close`
+  now re-stamps the checkout's `.sum` sidecar when the close is provably
+  clean (no session error, nothing left unflushed, at least one flush
+  succeeded, the branch head hasn't moved past what was flushed, and the
+  replica was never rebuilt by anything beyond its own startup rebase), so
+  the next `Open`/`Checkout` against the same db@branch clean-skips instead
+  of re-materializing — restoring, for the daemon-reopen pattern, the
+  disk/descriptor win Milestone 2 Task 1 already established for
+  `Checkout`/`Checkpoint`/`Rollback`/`Promote`.
+
 ## [0.1.1] - 2026-08-06
 
 Milestone 2: safe defaults for an unattended agent. The daemon now ships

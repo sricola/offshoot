@@ -64,26 +64,33 @@
 //
 // Tracked follow-ups, in order of how much they buy:
 //
-//   - MITIGATED, not removed: ops.Checkout now skips materialization when
-//     checkoutState reports the checkout is already clean and current,
-//     instead of re-materializing regardless. This genuinely removes the
-//     per-session-open stranding above for at-rest/CLI-style reopen
-//     patterns — anything that closes (or never opens under a daemon at
-//     all) before the checkout's `.sum` sidecar goes stale. It does NOT
-//     remove it for the daemon's own default config: the settling flush
-//     (internal/session's first auto-flush after open, landing ~30s later
-//     under `-flush-every`'s default) advances the branch ref's head txid,
-//     but no clean Session.Close rewrites the sidecar to match — only
-//     Checkout/Checkpoint/Rollback/Promote do (see ops.go's writeSum call
-//     sites) — so a session that outlives its own settling flush leaves the
-//     sidecar stale the moment it closes, and the NEXT session.Open on that
-//     branch re-materializes exactly as before this mitigation landed. Two
-//     ledgered follow-ups, neither built this pass: suppressing the
-//     settling flush's own re-baseline cost when content is provably
-//     unchanged (docs/status.md's "Settling-flush checksum-compare
-//     suppression" row), and refreshing the sidecar on a clean Close so
-//     reopen-after-settling stays clean too (docs/status.md's "Sidecar
-//     refresh on clean Close" row).
+//   - MITIGATED for real now, including the daemon's default config:
+//     ops.Checkout skips materialization when checkoutState reports the
+//     checkout is already clean and current, instead of re-materializing
+//     regardless. This originally only genuinely removed the per-session-
+//     open stranding above for at-rest/CLI-style reopen patterns, because
+//     nothing kept the checkout's `.sum` sidecar current across a daemon
+//     session's own writes: the settling flush (internal/session's first
+//     auto-flush after open) advances the branch ref's head txid, but no
+//     clean Session.Close rewrote the sidecar to match, so a session that
+//     outlived its own settling flush left the sidecar stale the moment it
+//     closed and the NEXT session.Open re-materialized anyway. Two ledgered
+//     follow-ups have since landed and close that gap: (1) the settling
+//     flush itself is now skipped when Open's checkout was already proven
+//     clean-and-current (rebaseline's checksum-suppression, see
+//     internal/session/session.go), so a read-only reopen of an unmodified
+//     checkout never even reaches a flush that could go stale; (2) a clean
+//     Session.Close now refreshes the sidecar itself (Session.
+//     commitSidecarRefresh), so a session that DID write still leaves the
+//     next reopen clean. Real limits remain, deliberately conservative
+//     rather than risking a false "clean": a Close after a failed flush, a
+//     fenced session, or a session that ever took a mid-session
+//     rebase-on-divergence (its replica's provenance is no longer a
+//     straight line back to the checkout Open seeded it from — see
+//     Session.singleStartupRebase) does not refresh the sidecar, so that
+//     one reopen still pays the full re-materialize-and-strand cost above.
+//     Outside those cases, the daemon's default config now stays flat on
+//     reopen the same way at-rest/CLI reopen already did.
 //   - Reclaim map entries for paths that no longer exist, so deletion stops
 //     being permanent. (Closing the stranded descriptor is the part that
 //     needs care: it is only safe once nothing in the process can still hold
