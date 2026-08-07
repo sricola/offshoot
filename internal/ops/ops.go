@@ -306,36 +306,64 @@ func (w *Workspace) CheckoutProven(db, branch string) (CheckoutResult, error) {
 	return CheckoutResult{Path: path, Clean: false, Ref: ref}, nil
 }
 
-// RefreshSum quiesces path (checkpoints any pending WAL content into the
-// main file — see quiesce) and re-stamps its .sum sidecar to record it as
-// current for (lineage, epoch, txid) — see writeSum. Exported for
-// Session.Close's clean-close sidecar refresh (M2 follow-up): the session
-// package knows its own db/branch/checkout path and, from its last
-// successful flush, the exact ref identity that checkout now durably
-// reflects, but sidecar writing itself (content hash + JSON shape) is ops'
-// concern, not session's — see writeSum's doc comment for the format and
-// sumRecord's for why epoch is load-bearing in it.
-//
-// The quiesce step is not optional: writeSum's hash is a raw byte hash of
-// the file on disk, and a just-committed write can sit in a WAL-mode
-// database's -wal file with the main file's own bytes still reflecting the
-// state before it. Every other writeSum call site in this file (Checkout's
-// materialize path, Checkpoint, Rollback/Promote's refresh) is naturally
-// already checkpoint-consistent — a fresh materialize or checkpoint's own
-// encode always produces a plain, non-WAL file — so this is the one caller
-// for which stamping a possibly-WAL-dirty file is a real risk: a live
-// checkout's WAL is exactly what this is stamping. Callers MUST only invoke
-// this when it is safe to open a fresh, independent SQLite connection on
-// path — i.e., nothing else in this process still holds SQLite state open
-// on the same inode (see quiesce's own busy-timeout behavior, and dbfile's
-// package comment for why a naive open/close pair is unsafe otherwise;
-// Session.commitSidecarRefresh's doc comment works through exactly this for
-// its own call site).
-func RefreshSum(path, lineage string, epoch, txid uint64) error {
-	if err := quiesce(path); err != nil {
+// StampSum writes path's .sum sidecar directly from a hash the caller
+// already obtained independently, skipping writeSum's own read-and-hash of
+// path entirely — see sumRecord's doc comment for the on-disk shape.
+// Exported for Session.Close's clean-close sidecar refresh (M2 follow-up):
+// Session.commitSidecarRefresh has the capture engine's own post-shutdown
+// MainHash fingerprint (capture.State — a SHA-256 of the checkout's main
+// file, computed by the engine itself immediately after its shutdown
+// verified everything captured was cleanly folded in, see that type's doc
+// comment) and reuses that number directly rather than re-deriving one.
+// That is a deliberate choice, not just an optimization: an independent
+// hash pass here would need its own fresh SQLite connection on path, and
+// this checkout may still have the capture engine's own connection state
+// nearby in the same process — see commitSidecarRefresh's doc comment for
+// why trusting the engine's already-verified fingerprint, rather than
+// re-deriving one, is what keeps this call site off that hazard (and, as a
+// second-order benefit, off the risk of folding in content the engine's own
+// shutdown verification specifically refused to vouch for).
+func StampSum(path, hash, lineage string, epoch, txid uint64) error {
+	data, err := json.Marshal(sumRecord{Hash: hash, Lineage: lineage, Epoch: epoch, TXID: txid})
+	if err != nil {
 		return err
 	}
-	return writeSum(path, lineage, epoch, txid)
+	return os.WriteFile(path+".sum", data, 0o644)
+}
+
+// HeadPostApplyChecksum fetches ref's CURRENT head's LTX postApplyChecksum.
+// Only the LAST member of head's materialization chain (see store.Chain)
+// needs fetching and decoding — its trailer already declares the checksum
+// of the FULL resulting database, by the same invariant every LTX chain
+// member's postApplyChecksum always satisfies regardless of chain length
+// (see ltxio.TrailerPostApplyChecksum's doc comment) — not the whole chain.
+//
+// This is a real store fetch: cheap in the common case (the last member is
+// usually a small segment — see internal/session's SnapshotEvery cadence),
+// larger only when the head IS itself a full snapshot (e.g. right after
+// Create, or every SnapshotEvery'th flush). Session.Open is the one caller,
+// calling this ONCE, synchronously, from its own goroutine — never from the
+// capture engine's — as part of the settling-flush suppression's proof; see
+// Session.rebaseline's doc comment for the full condition this feeds.
+func (w *Workspace) HeadPostApplyChecksum(ref store.Ref) (uint64, error) {
+	members, err := w.Store.Chain(ref.Lineage, ref.HeadTXID)
+	if err != nil {
+		return 0, fmt.Errorf("ops: resolve head chain for lineage %s at txid %d: %w",
+			ref.Lineage, ref.HeadTXID, err)
+	}
+	if len(members) == 0 {
+		return 0, fmt.Errorf("ops: empty chain for lineage %s at txid %d", ref.Lineage, ref.HeadTXID)
+	}
+	last := members[len(members)-1]
+	data, _, err := w.Store.B.Get(last.Key)
+	if err != nil {
+		return 0, fmt.Errorf("ops: fetch head chain member %s: %w", last.Key, err)
+	}
+	sum, err := ltxio.TrailerPostApplyChecksum(data)
+	if err != nil {
+		return 0, fmt.Errorf("ops: decode head chain member %s: %w", last.Key, err)
+	}
+	return sum, nil
 }
 
 // sumRecord is the on-disk shape of a checkout's .sum sidecar: a content hash

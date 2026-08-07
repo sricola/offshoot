@@ -171,25 +171,45 @@ func (s *Session) flush(name string, auto bool) (txid uint64, err error) {
 	// fraction of the database that a segment buys little over just
 	// re-snapshotting.
 	//
-	// In practice this snapshot check is never reached by forceSnapshot alone
-	// on a session's first-ever Flush call — it's already covered above,
-	// unconditionally: every Open() leaves forceSnapshot true by the time
-	// any Flush can run. On the ordinary path (a branch that already has
-	// history — the common case, since ops.Create already wrote TXID 1
-	// before any session ever exists) the capture engine's mandatory startup
-	// Rebase runs before Open returns and calls replicaSink.Rebase, which
-	// sets it. On a session that instead resumed cleanly from a reused
-	// Options.Dir — where the engine deliberately skips that startup Rebase,
-	// see capture.Engine.Resumed's doc comment — Open calls rebaseline()
-	// itself for exactly this reason (see Open's comment). Either way,
-	// forceSnapshot is true and the pending pageSet is empty going into this
-	// session's first Flush, so txid==1 and the cadence/fraction checks
-	// above are redundant with it there, not the deciding factor. Kept
-	// listed anyway (rather than collapsed into "just forceSnapshot") because
-	// each remains independently sufficient reasoning on its own — txid==1
-	// in particular is a hard EncodeSegment-level invariant, true regardless
-	// of whether this session's own forceSnapshot bookkeeping is ever
-	// involved at all.
+	// This snapshot check is reached by forceSnapshot alone on a session's
+	// first-ever Flush call in the common case, but — since the
+	// settling-flush suppression, M2 follow-up, see rebaseline's doc
+	// comment — no longer unconditionally. A session whose startup rebase
+	// proved the checkout was already clean-and-unchanged against the
+	// durable head (cleanAtOpen && headPostApplyChecksum matched) has
+	// forceSnapshot cleared by that same rebaseline call: for THAT session,
+	// forceSnapshot is false, flushesSinceSnapshot is still 0, and txid is
+	// NOT 1 (cleanAtOpen requires an existing durable head to have been
+	// clean against, so the branch already has history) going into its
+	// first real Flush — whichever the session's own first actual write
+	// eventually triggers. None of the conditions in the list above force a
+	// snapshot there, so that flush takes the SEGMENT path, continuing
+	// directly from the branch's pre-session head with no intervening
+	// settle-snapshot at all. This is a real, exercised shape, not a
+	// theoretical corner — see TestCleanAtOpenSessionsFirstRealFlushIsASegment
+	// — and it is exactly why headPostApplyChecksum has to be the TRUE
+	// durable head's checksum (fetched from the store) rather than anything
+	// weaker: a segment declared here has preApplyChecksum = s.flushChecksum,
+	// which is only correct if the checkout genuinely never diverged from
+	// that durable head during the suppressed rebase.
+	//
+	// On every OTHER path — a brand-new lineage (ops.Create's own txid==1),
+	// any checkout that was not clean-at-open, or a resumed session where
+	// the suppression's proof didn't hold — forceSnapshot IS still
+	// unconditionally true going into the first Flush, exactly as before
+	// this suppression existed: on the ordinary path (a branch that already
+	// has history — the common non-suppressed case) the capture engine's
+	// mandatory startup Rebase runs before Open returns and calls
+	// replicaSink.Rebase, which sets forceSnapshot true (and the
+	// suppression did not clear it, not being eligible); on a resumed
+	// session, Open's own direct rebaseline() call does the same. Either
+	// way, txid==1 or forceSnapshot alone already forces a snapshot there,
+	// so the cadence/fraction checks above are redundant with it, not the
+	// deciding factor. Kept listed anyway (rather than collapsed into "just
+	// forceSnapshot") because each remains independently sufficient
+	// reasoning on its own — txid==1 in particular is a hard
+	// EncodeSegment-level invariant, true regardless of any session's own
+	// forceSnapshot bookkeeping.
 	//
 	// s.pageSize == 0 belongs in this same list, not handled separately
 	// below: it means recordApply has never run (a Flush racing session

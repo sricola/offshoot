@@ -76,21 +76,41 @@
 //     outlived its own settling flush left the sidecar stale the moment it
 //     closed and the NEXT session.Open re-materialized anyway. Two ledgered
 //     follow-ups have since landed and close that gap: (1) the settling
-//     flush itself is now skipped when Open's checkout was already proven
-//     clean-and-current (rebaseline's checksum-suppression, see
-//     internal/session/session.go), so a read-only reopen of an unmodified
-//     checkout never even reaches a flush that could go stale; (2) a clean
-//     Session.Close now refreshes the sidecar itself (Session.
-//     commitSidecarRefresh), so a session that DID write still leaves the
-//     next reopen clean. Real limits remain, deliberately conservative
-//     rather than risking a false "clean": a Close after a failed flush, a
-//     fenced session, or a session that ever took a mid-session
-//     rebase-on-divergence (its replica's provenance is no longer a
-//     straight line back to the checkout Open seeded it from — see
-//     Session.singleStartupRebase) does not refresh the sidecar, so that
-//     one reopen still pays the full re-materialize-and-strand cost above.
+//     flush itself is now skipped, but only when BOTH Open's checkout was
+//     already proven clean-and-current at the moment Open checked AND a
+//     checksum fetched independently from the store at that same moment —
+//     the durable head's own recorded checksum — exactly matches what the
+//     checkout actually contains once the session's real startup rebase
+//     finishes running (rebaseline's checksum-suppression, see
+//     internal/session/session.go's rebaseline doc comment for why the
+//     second check is load-bearing, not redundant: Open can return before
+//     its own startup rebase finishes, so a write landing in that window
+//     needs the checksum comparison to be caught at all). When both hold, a
+//     read-only reopen of an unmodified checkout never even reaches a flush
+//     that could go stale. (2) a clean Session.Close now refreshes the
+//     sidecar itself (Session.commitSidecarRefresh), but ONLY by reusing the
+//     capture engine's OWN post-shutdown fingerprint — persisted only once
+//     its shutdown fully verifies the checkout's WAL was cleanly and
+//     completely folded in (capture.State.Clean/MainHash) — never an
+//     independently re-derived one; a session that DID write still leaves
+//     the next reopen clean, but shutdown's own unmet verification (a
+//     foreign write racing its final checkpoint, most directly) leaves the
+//     sidecar unstamped rather than risk fingerprinting content shutdown
+//     itself refused to vouch for. Further real limits, all deliberately
+//     conservative rather than risking a false "clean": a Close after a
+//     failed flush, a fenced session, or a session that ever took a
+//     mid-session rebase-on-divergence (its replica's provenance is no
+//     longer a straight line back to the checkout Open seeded it from — see
+//     Session.singleStartupRebase) does not refresh the sidecar, so that one
+//     reopen still pays the full re-materialize-and-strand cost above.
 //     Outside those cases, the daemon's default config now stays flat on
-//     reopen the same way at-rest/CLI reopen already did.
+//     reopen the same way at-rest/CLI reopen already did. One accepted,
+//     ledgered tradeoff of the clean-skip mechanism itself (not new here,
+//     just now reachable via this path too): a clean-and-current checkout
+//     is served without ever consulting the object store's chain, so a
+//     chain corrupted after the sidecar was stamped goes undetected until
+//     something else forces a re-materialize — see docs/status.md's
+//     "Clean-and-current checkout served without chain validation" row.
 //   - Reclaim map entries for paths that no longer exist, so deletion stops
 //     being permanent. (Closing the stranded descriptor is the part that
 //     needs care: it is only safe once nothing in the process can still hold

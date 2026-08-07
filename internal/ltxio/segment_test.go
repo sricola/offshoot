@@ -142,6 +142,58 @@ func TestSegmentAppliedToSnapshotEqualsTheLaterDatabase(t *testing.T) {
 	}
 }
 
+// TestTrailerPostApplyChecksumMatchesEncodedValue pins
+// TrailerPostApplyChecksum against both object shapes it must handle: a
+// snapshot (MinTXID 1) and a segment (MinTXID > 1) — internal/ops's
+// HeadPostApplyChecksum, and through it internal/session's settling-flush
+// suppression, decode whichever the branch's head chain's last member
+// happens to be.
+func TestTrailerPostApplyChecksumMatchesEncodedValue(t *testing.T) {
+	if _, err := exec.LookPath("sqlite3"); err != nil {
+		t.Skip("sqlite3 CLI not on PATH")
+	}
+	v1 := buildDB(t, "CREATE TABLE t (id INTEGER PRIMARY KEY, v TEXT)",
+		"INSERT INTO t (v) VALUES ('a'), ('b')")
+	var snap bytes.Buffer
+	if err := EncodeSnapshot(v1, 1, &snap); err != nil {
+		t.Fatal(err)
+	}
+	wantSnap := checksumOf(t, v1)
+	if got, err := TrailerPostApplyChecksum(snap.Bytes()); err != nil {
+		t.Fatal(err)
+	} else if got != wantSnap {
+		t.Fatalf("snapshot trailer checksum = %d, want %d", got, wantSnap)
+	}
+
+	_, _, before := readPages(t, v1)
+	v2 := filepath.Join(t.TempDir(), "v2.sqlite")
+	if err := copyFileForTest(v1, v2); err != nil {
+		t.Fatal(err)
+	}
+	if out, err := exec.Command("sqlite3", v2,
+		"INSERT INTO t (v) VALUES ('c'); UPDATE t SET v='A' WHERE id=1;").CombinedOutput(); err != nil {
+		t.Fatalf("%v: %s", err, out)
+	}
+	pageSize, commit, after := readPages(t, v2)
+	var changed []Page
+	for i, p := range after {
+		if i >= len(before) || !bytes.Equal(p.Data, before[i].Data) {
+			changed = append(changed, p)
+		}
+	}
+	preApply := checksumOf(t, v1)
+	wantSeg := checksumOf(t, v2)
+	var seg bytes.Buffer
+	if err := EncodeSegment(pageSize, commit, 2, 2, preApply, wantSeg, changed, &seg); err != nil {
+		t.Fatal(err)
+	}
+	if got, err := TrailerPostApplyChecksum(seg.Bytes()); err != nil {
+		t.Fatal(err)
+	} else if got != wantSeg {
+		t.Fatalf("segment trailer checksum = %d, want %d", got, wantSeg)
+	}
+}
+
 func TestMaterializeChainWithNoSegmentsIsJustTheSnapshot(t *testing.T) {
 	if _, err := exec.LookPath("sqlite3"); err != nil {
 		t.Skip("sqlite3 CLI not on PATH")

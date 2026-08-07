@@ -203,20 +203,30 @@ A session's very first auto-flush after `session open` used to be an
 unconditional full snapshot, no matter where that landed in the
 sixteen-flush cadence — even for a session that never wrote anything —
 because closing a startup-rebase race required treating the checkout as
-though it might have changed. It no longer does, when it provably hasn't:
-if the checkout `Open` received was already proven byte-identical to the
-branch's current head (the same `.sum` sidecar clean-and-current fast path
-["Resource behavior"](#resource-behavior) below describes), the startup
-rebase has nothing to reconcile and this settling flush is skipped
-entirely — no object write, no ref write. A read-only daemon session
-reopened against an already-current checkout — the common reopen case —
-now uploads nothing at all, ever. A session whose checkout instead had to
-be (re)materialized first (a branch's first-ever open, a dirty/stale local
-checkout, or one another writer moved past) still pays the settling flush
-exactly as before: one full-snapshot upload sized to the database, not
-fixed — measured at 541.9MB uploaded for a 512MB source database. It
-happens at most once per session either way, not on every tick after that —
-see [docs/benchmarks.md](docs/benchmarks.md#settling-flush-cost-task-2-controller-decision)
+though it might have changed. It no longer does, when TWO things are both
+provably true: the checkout `Open` received was already byte-identical to
+the branch's head at the moment `Open` checked (the same `.sum` sidecar
+clean-and-current fast path ["Resource behavior"](#resource-behavior) below
+describes), AND a checksum fetched independently from the store at that
+same moment — the durable head's own recorded checksum, not anything
+derived from the local checkout — exactly matches what the checkout
+actually contains once the session's real startup rebase finishes running.
+That second check is not redundant with the first: `Open` can return to
+its caller before its own startup rebase has actually finished (closing a
+different, older race — see `internal/session/session.go`'s `rebaseline`
+doc comment), so a write landing in that narrow window is folded into the
+checkout without the first check ever seeing it; the checksum comparison
+is what catches exactly that case and forces a real settle instead of
+silently losing the write. Only when both hold — the common case for a
+read-only daemon session reopened against a checkout nothing has touched
+since — does this settling flush upload nothing at all. A session whose
+checkout instead had to be (re)materialized first (a branch's first-ever
+open, a dirty/stale local checkout, or one another writer moved past)
+still pays the settling flush exactly as before: one full-snapshot upload
+sized to the database, not fixed — measured at 541.9MB uploaded for a
+512MB source database. It happens at most once per session either way, not
+on every tick after that — see
+[docs/benchmarks.md](docs/benchmarks.md#settling-flush-cost-task-2-controller-decision)
 for the measurement and `internal/session/session.go`'s `rebaseline` doc
 comment for the exact suppression condition and its proof obligation.
 
@@ -287,12 +297,28 @@ rebase-on-divergence (a real WAL discontinuity, not the ordinary startup
 rebase): the replica's provenance is no longer a straight, unbroken line
 back to the checkout `Open` originally seeded it from, so `Close`
 conservatively leaves the sidecar alone rather than risk stamping content
-the checkout's own bytes never physically received. Outside those cases —
-the overwhelming majority of sessions in practice — a daemon that keeps
-reopening the same branch stays flat: no re-materialize, no stranded
-descriptor, on any reopen of a checkout nothing else touched since the
-prior session's clean close. Restarting the daemon reclaims everything a
-fresh process never opened.
+the checkout's own bytes never physically received. And the stamp itself
+is only ever taken from the capture engine's OWN post-shutdown fingerprint
+(computed only once its shutdown fully verifies the checkout's WAL was
+cleanly and completely folded in) rather than re-derived independently — a
+foreign write landing in the narrow window around the engine's final
+checkpoint leaves that verification unmet, and `Close` correctly leaves the
+sidecar unstamped rather than risk fingerprinting content the engine itself
+refused to vouch for. Outside those cases — the overwhelming majority of
+sessions in practice — a daemon that keeps reopening the same branch stays
+flat: no re-materialize, no stranded descriptor, on any reopen of a
+checkout nothing else touched since the prior session's clean close.
+Restarting the daemon reclaims everything a fresh process never opened.
+
+One more property worth naming explicitly, not a limit but a tradeoff: once
+a checkout's sidecar is clean-and-current (however it got that way), the
+next `Checkout` is served straight from disk without ever consulting the
+object store's chain — including if that chain has since been corrupted.
+This was already true for a sidecar stamped by `Checkout`/`Checkpoint`/
+`Rollback`/`Promote` (Milestone 2 Task 1); it now also applies after an
+ordinary session's clean close. See
+[docs/status.md](docs/status.md)'s "Clean-and-current checkout served
+without chain validation" row.
 
 Design: docs/superpowers/specs/2026-07-29-offshoot-design.md
 Capture-spike evidence: docs/superpowers/specs/2026-07-29-offshoot-spike-report.md
