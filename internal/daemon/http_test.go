@@ -17,7 +17,7 @@ import (
 	"testing"
 	"time"
 
-	"github.com/offshoot-db/offshoot/internal/ops"
+	"github.com/sricola/offshoot/internal/ops"
 )
 
 // testHTTPToken is a fixed, obviously-a-test-fixture token used by every

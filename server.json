@@ -4,7 +4,7 @@
   "version": "0.1.0",
   "repository": {
     "type": "git",
-    "url": "https://github.com/offshoot-db/offshoot"
+    "url": "https://github.com/sricola/offshoot"
   },
   "command": "offshoot",
   "args": ["-store", "./.offshoot", "mcp"]

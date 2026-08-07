@@ -22,10 +22,15 @@ reserved for the storage-format freeze.
 *Bar: a stranger can install offshoot without a Go toolchain, read the repo
 without tripping over internal artifacts, and watch CI prove the claims.*
 
-- **Fix the module-path/org mismatch.** `go.mod` already declares
-  `github.com/offshoot-db/offshoot`; the repo lives elsewhere. Create the
-  `offshoot-db` org, transfer, sweep links. Until then `go install` — the only
-  install path — 404s.
+- **Fix the module-path/org mismatch.** Done — `go.mod` used to declare a
+  module path under the aspirational `offshoot-db` GitHub org while the repo
+  actually lived at `github.com/sricola/offshoot`; rather than transfer the
+  repo into an org that doesn't exist, the module path and every
+  import/doc/workflow reference were retargeted to
+  `github.com/sricola/offshoot` to match where the code already lives. `go
+  install github.com/sricola/offshoot/cmd/offshoot@latest` resolves.
+  PyPI/npm package names are unaffected by this — see "Claim the names"
+  below.
 - **Claim the names.** `offshoot-db` on PyPI, the `@offshoot-db` npm scope,
   brew formula name; collision + trademark check on "offshoot" in dev tools;
   buy a domain.

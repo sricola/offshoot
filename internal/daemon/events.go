@@ -24,7 +24,7 @@ import (
 	"sync"
 	"time"
 
-	"github.com/offshoot-db/offshoot/internal/session"
+	"github.com/sricola/offshoot/internal/session"
 )
 
 // eventSchemaVersion is Event's "v" field (PM Amendment 4/8: "event schema

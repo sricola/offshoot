@@ -3,8 +3,8 @@ package session
 import (
 	"sort"
 
-	"github.com/offshoot-db/offshoot/internal/ltxio"
-	"github.com/offshoot-db/offshoot/internal/wal"
+	"github.com/sricola/offshoot/internal/ltxio"
+	"github.com/sricola/offshoot/internal/wal"
 )
 
 // pageSet accumulates the latest content of every page changed since the last

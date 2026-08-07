@@ -7,9 +7,9 @@ import (
 	"fmt"
 	"time"
 
-	"github.com/offshoot-db/offshoot/internal/ltxio"
-	"github.com/offshoot-db/offshoot/internal/ops"
-	"github.com/offshoot-db/offshoot/internal/store"
+	"github.com/sricola/offshoot/internal/ltxio"
+	"github.com/sricola/offshoot/internal/ops"
+	"github.com/sricola/offshoot/internal/store"
 )
 
 // ErrFenced reports that the session's lease was lost: its epoch is dead, so

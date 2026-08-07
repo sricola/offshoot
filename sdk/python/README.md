@@ -1,6 +1,6 @@
 # offshoot-db
 
-Python client for [offshoot](https://github.com/offshoot-db/offshoot):
+Python client for [offshoot](https://github.com/sricola/offshoot):
 git-like branching for SQLite databases, built for agent workloads (fork a
 DB per attempt, checkpoint on success, roll back on failure).
 
@@ -17,7 +17,7 @@ pip install offshoot-db
 ## Quickstart
 
 Start a store and a daemon (the `offshoot` binary — see the main repo's
-[README](https://github.com/offshoot-db/offshoot#readme) for install
+[README](https://github.com/sricola/offshoot#readme) for install
 options):
 
 ```
@@ -58,7 +58,7 @@ with offshoot.connect("/tmp/o.sock") as c:
 connection — never `c`'s own connection. The daemon's `subscribe` op
 permanently takes a connection out of request/response mode the instant
 it acks (see the main repo's
-[docs/reference.md](https://github.com/offshoot-db/offshoot/blob/main/docs/reference.md#eventing-subscribe-op--get-events)),
+[docs/reference.md](https://github.com/sricola/offshoot/blob/main/docs/reference.md#eventing-subscribe-op--get-events)),
 so this method handles opening (and closing) that dedicated connection for
 you — keep using `c` for ordinary `open`/`flush`/... calls exactly as
 before.
@@ -81,7 +81,7 @@ with the measured per-worker cost, mid-test flush checkpoints, golden
 assertions via `offshoot_dump` (never byte-compare, and why), export for
 handoff/debug, `offshoot diff` for the failed-vs-passed loop, TTL hygiene,
 and a CI recipe — see
-[docs/eval-harness.md](https://github.com/offshoot-db/offshoot/blob/main/docs/eval-harness.md)
+[docs/eval-harness.md](https://github.com/sricola/offshoot/blob/main/docs/eval-harness.md)
 in the main repo.
 
 ```
@@ -161,8 +161,8 @@ including why wrapping a multi-statement seed in one transaction matters
 
 ## Links
 
-- [Full docs, CLI reference, architecture](https://github.com/offshoot-db/offshoot)
-- [Changelog](https://github.com/offshoot-db/offshoot/blob/main/CHANGELOG.md)
-- [Issues](https://github.com/offshoot-db/offshoot/issues)
+- [Full docs, CLI reference, architecture](https://github.com/sricola/offshoot)
+- [Changelog](https://github.com/sricola/offshoot/blob/main/CHANGELOG.md)
+- [Issues](https://github.com/sricola/offshoot/issues)
 
 Apache-2.0.

@@ -15,10 +15,10 @@ import (
 	"testing"
 	"time"
 
-	"github.com/offshoot-db/offshoot/internal/capture"
-	"github.com/offshoot-db/offshoot/internal/ltxio"
-	"github.com/offshoot-db/offshoot/internal/ops"
-	"github.com/offshoot-db/offshoot/internal/store"
+	"github.com/sricola/offshoot/internal/capture"
+	"github.com/sricola/offshoot/internal/ltxio"
+	"github.com/sricola/offshoot/internal/ops"
+	"github.com/sricola/offshoot/internal/store"
 )
 
 func TestFlushMakesWritesDurableWithoutPausingTheWriter(t *testing.T) {

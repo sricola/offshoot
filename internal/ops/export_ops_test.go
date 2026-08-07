@@ -9,8 +9,8 @@ import (
 	"strings"
 	"testing"
 
-	"github.com/offshoot-db/offshoot/internal/ltxio"
-	"github.com/offshoot-db/offshoot/internal/store"
+	"github.com/sricola/offshoot/internal/ltxio"
+	"github.com/sricola/offshoot/internal/store"
 )
 
 // requireSQLite3 skips the test if the sqlite3 CLI isn't on PATH — every

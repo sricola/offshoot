@@ -6,7 +6,7 @@ import (
 	"fmt"
 	"time"
 
-	"github.com/offshoot-db/offshoot/internal/store"
+	"github.com/sricola/offshoot/internal/store"
 )
 
 // renewLoop keeps the session's lease fresh. It closes s.renewDone exactly

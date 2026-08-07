@@ -10,7 +10,7 @@ import (
 	"testing"
 
 	_ "github.com/mattn/go-sqlite3"
-	"github.com/offshoot-db/offshoot/internal/dbfile"
+	"github.com/sricola/offshoot/internal/dbfile"
 )
 
 // sqlite3UnlinksWALOnExit reports whether the sqlite3 CLI on PATH does the

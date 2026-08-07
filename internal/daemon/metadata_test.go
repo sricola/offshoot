@@ -8,7 +8,7 @@ import (
 	"testing"
 	"time"
 
-	"github.com/offshoot-db/offshoot/internal/ops"
+	"github.com/sricola/offshoot/internal/ops"
 )
 
 // TestOpDbsListsSortedDatabases exercises the new "dbs" op end to end: every

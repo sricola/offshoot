@@ -17,8 +17,8 @@ import (
 	"time"
 
 	_ "github.com/mattn/go-sqlite3"
-	"github.com/offshoot-db/offshoot/internal/dbfile"
-	"github.com/offshoot-db/offshoot/internal/wal"
+	"github.com/sricola/offshoot/internal/dbfile"
+	"github.com/sricola/offshoot/internal/wal"
 )
 
 // Sink receives capture output. Implementations: replay.Replica satisfies

@@ -10,8 +10,8 @@ import (
 	"testing"
 	"time"
 
-	"github.com/offshoot-db/offshoot/internal/daemon"
-	"github.com/offshoot-db/offshoot/internal/ops"
+	"github.com/sricola/offshoot/internal/daemon"
+	"github.com/sricola/offshoot/internal/ops"
 )
 
 // newDaemonTools starts a real daemon server (daemon.NewServer, the exact

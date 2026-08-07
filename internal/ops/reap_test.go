@@ -6,7 +6,7 @@ import (
 	"testing"
 	"time"
 
-	"github.com/offshoot-db/offshoot/internal/store"
+	"github.com/sricola/offshoot/internal/store"
 )
 
 func setTTLAt(t *testing.T, w *Workspace, db, branch, ttl, touchedAt string) {

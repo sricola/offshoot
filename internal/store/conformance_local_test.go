@@ -3,8 +3,8 @@ package store_test
 import (
 	"testing"
 
-	"github.com/offshoot-db/offshoot/internal/store"
-	"github.com/offshoot-db/offshoot/internal/store/storetest"
+	"github.com/sricola/offshoot/internal/store"
+	"github.com/sricola/offshoot/internal/store/storetest"
 )
 
 func TestLocalConformance(t *testing.T) {

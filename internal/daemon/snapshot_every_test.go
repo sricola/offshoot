@@ -5,7 +5,7 @@ import (
 	"testing"
 	"time"
 
-	"github.com/offshoot-db/offshoot/internal/store"
+	"github.com/sricola/offshoot/internal/store"
 )
 
 // TestServeSnapshotEveryWiringDrivesCadence proves -snapshot-every's daemon

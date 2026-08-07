@@ -9,7 +9,7 @@ import (
 	"sync"
 	"testing"
 
-	"github.com/offshoot-db/offshoot/internal/store"
+	"github.com/sricola/offshoot/internal/store"
 )
 
 // RunConformance exercises the full Backend contract.

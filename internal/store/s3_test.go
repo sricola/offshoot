@@ -7,8 +7,8 @@ import (
 	"strings"
 	"testing"
 
-	"github.com/offshoot-db/offshoot/internal/store"
-	"github.com/offshoot-db/offshoot/internal/store/storetest"
+	"github.com/sricola/offshoot/internal/store"
+	"github.com/sricola/offshoot/internal/store/storetest"
 )
 
 // newFakeBacked returns an S3 backend pointed at a fresh in-process fake.
