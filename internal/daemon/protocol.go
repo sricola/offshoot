@@ -14,12 +14,14 @@ package daemon
 type Request struct {
 	// Op is one of: "open" | "flush" | "status" | "close" | "shutdown" |
 	// "create" | "checkout" | "fork" | "destroy" | "rollback" | "promote" |
-	// "touch" | "branches" | "dbs".
+	// "touch" | "branches" | "dbs" | "export" | "checkout-at".
 	Op     string `json:"op"`
 	DB     string `json:"db,omitempty"`
 	Branch string `json:"branch,omitempty"` // also: fork/promote source branch
-	// Name is overloaded by op: checkpoint name (flush, rollback),
-	// new-branch name (fork), or promote target branch.
+	// Name is overloaded by op: checkpoint name (flush, rollback), new-branch
+	// name (fork), promote target branch, or the checkpoint to materialize
+	// (export — "" means the branch's head; checkout-at — required, no head
+	// alias).
 	Name string `json:"name,omitempty"`
 	// From is fork's source checkpoint name ("" = source branch's head).
 	From string `json:"from,omitempty"`
@@ -28,8 +30,19 @@ type Request struct {
 	// "none" to clear the TTL.
 	TTL string `json:"ttl,omitempty"`
 	// Force overrides protected-branch/live-lease refusals for destroy and
-	// promote (passed through to ops.Destroy/ops.Promote).
+	// promote (passed through to ops.Destroy/ops.Promote); for export and
+	// checkout-at it instead overrides their own overwrite/cache-hit
+	// refusals (ops.Workspace.Export/CheckoutAt).
 	Force bool `json:"force,omitempty"`
+	// Path is export's destination file path — server-side, on the daemon's
+	// own host/filesystem. Trust model: the daemon speaks only a local unix
+	// socket, reachable only by a process that can already open that socket
+	// file (same host, same user); Path is trusted as an ordinary
+	// filesystem path this process can write, with exactly one guard
+	// enforced at the RPC boundary (opExport): it must be ABSOLUTE. A
+	// relative path is refused rather than resolved against the daemon's
+	// own working directory, which the client cannot see or control.
+	Path string `json:"path,omitempty"`
 	// Meta is a small string->string map (capped by ops.ValidateMeta; see
 	// its doc comment for the exact limits), used by "fork" (stored on the
 	// new branch's Ref.Meta) and "flush" WHEN Name is also set (stored on

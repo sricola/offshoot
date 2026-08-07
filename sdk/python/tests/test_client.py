@@ -230,6 +230,122 @@ class TestClient(unittest.TestCase):
             self.assertGreater(txid, 0)
             s.close()
 
+    def test_export_head_and_named_checkpoint(self):
+        with offshoot.connect(self.d.sock) as c:
+            c.create("export-app")
+            s = c.open("export-app")
+            db = sqlite3.connect(s.path)
+            db.execute("CREATE TABLE t (v)")
+            db.execute("INSERT INTO t VALUES ('one')")
+            db.commit()
+            s.flush("v1")
+            db.execute("INSERT INTO t VALUES ('two')")
+            db.commit()
+            s.flush("v2")
+            s.close()
+
+            out1 = os.path.join(self.d.dir, "export-v1.db")
+            c.export("export-app", "main", out1, checkpoint="v1")
+            conn = sqlite3.connect(out1)
+            self.assertEqual(conn.execute("SELECT count(*) FROM t").fetchone()[0], 1)
+            conn.close()
+
+            out2 = os.path.join(self.d.dir, "export-head.db")
+            c.export("export-app", "main", out2)
+            conn = sqlite3.connect(out2)
+            self.assertEqual(conn.execute("SELECT count(*) FROM t").fetchone()[0], 2)
+            conn.close()
+
+    def test_export_refuses_overwrite_then_force(self):
+        with offshoot.connect(self.d.sock) as c:
+            c.create("export-force-app")
+            s = c.open("export-force-app")
+            db = sqlite3.connect(s.path)
+            db.execute("CREATE TABLE t (v)")
+            db.commit()
+            db.close()
+            s.flush("v1")
+            s.close()
+
+            out = os.path.join(self.d.dir, "export-force.db")
+            c.export("export-force-app", "main", out)
+            with self.assertRaises(OffshootError):
+                c.export("export-force-app", "main", out)
+            c.export("export-force-app", "main", out, force=True)  # must not raise
+
+    def test_export_rejects_relative_path(self):
+        with offshoot.connect(self.d.sock) as c:
+            c.create("export-relpath-app")
+            with self.assertRaises(OffshootError):
+                c.export("export-relpath-app", "main", "relative-out.db")
+
+    def test_export_misses_unflushed_session_writes(self):
+        # The load-bearing Milestone 3 Task 2 assertion: export reads the
+        # store's last DURABLE state, never a live session's unflushed
+        # writes.
+        with offshoot.connect(self.d.sock) as c:
+            c.create("export-unflushed-app")
+            s = c.open("export-unflushed-app")
+            db = sqlite3.connect(s.path)
+            db.execute("CREATE TABLE t (v)")
+            db.execute("INSERT INTO t VALUES ('durable')")
+            db.commit()
+            s.flush("v1")
+
+            db.execute("INSERT INTO t VALUES ('unflushed')")
+            db.commit()  # committed to the checkout's WAL, never flushed to the store
+
+            out = os.path.join(self.d.dir, "export-unflushed.db")
+            c.export("export-unflushed-app", "main", out)
+            conn = sqlite3.connect(out)
+            rows = conn.execute("SELECT count(*) FROM t").fetchone()[0]
+            conn.close()
+            self.assertEqual(rows, 1, "export must not include a session's unflushed write")
+
+            s.flush()  # now durable
+            out2 = os.path.join(self.d.dir, "export-after-flush.db")
+            c.export("export-unflushed-app", "main", out2)
+            conn = sqlite3.connect(out2)
+            rows = conn.execute("SELECT count(*) FROM t").fetchone()[0]
+            conn.close()
+            self.assertEqual(rows, 2)
+            db.close()
+            s.close()
+
+    def test_checkout_at_materializes_separate_readonly_path(self):
+        with offshoot.connect(self.d.sock) as c:
+            c.create("checkout-at-app")
+            s = c.open("checkout-at-app")
+            db = sqlite3.connect(s.path)
+            db.execute("CREATE TABLE t (v)")
+            db.execute("INSERT INTO t VALUES ('one')")
+            db.commit()
+            s.flush("v1")
+            db.execute("INSERT INTO t VALUES ('two')")
+            db.commit()
+            s.flush("v2")
+            db.close()
+
+            ro_path = c.checkout_at("checkout-at-app", "main", "v1")
+            self.assertNotEqual(ro_path, s.path)
+            conn = sqlite3.connect(ro_path)
+            self.assertEqual(conn.execute("SELECT count(*) FROM t").fetchone()[0], 1)
+            conn.close()
+            mode = os.stat(ro_path).st_mode & 0o777
+            self.assertEqual(mode, 0o444)
+
+            # Repeat call is a cache hit: same path, no error.
+            again = c.checkout_at("checkout-at-app", "main", "v1")
+            self.assertEqual(again, ro_path)
+
+            s.close()
+
+    def test_checkout_at_requires_a_checkpoint_name(self):
+        with offshoot.connect(self.d.sock) as c:
+            c.create("checkout-at-empty-app")
+            with self.assertRaises(OffshootError):
+                c.checkout_at("checkout-at-empty-app", "main", "")
+
     def test_daemon_death_mid_call_raises_offshoot_error(self):
         # A dedicated, short-lived daemon (not the shared class fixture) so
         # killing it doesn't disturb the other tests. Reuses the already-

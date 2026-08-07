@@ -125,6 +125,61 @@ are about to be overwritten.
 **Errors:** no such `db@branch`; checkout is busy (a live connection is
 holding it) — closes connections and retry.
 
+### Read-only historical checkout: `--at <checkpoint> --read-only [--force]`
+
+```
+offshoot checkout app@main --at v1 --read-only
+```
+
+Materializes a NAMED checkpoint (never the head, and never omitted — `--at`
+has no "current head" alias the way `export` does) into a SEPARATE,
+dedicated read-only cache path — `<store-root>/checkouts-ro/<db>/<branch>@<checkpoint>.db`
+— and prints that path. `--at` and `--read-only` must be given together;
+either alone is refused as a malformed command. This path is never the
+writable `checkouts/<db>/<branch>.db` path `checkout` (without `--at`) uses,
+and this command never touches that path, its `.sum` sidecar, or a live
+session's open file descriptors on it — safe to run alongside `offshoot mcp`
+or a daemon session on the same branch.
+
+The result is `chmod 0444` (read-only) and has no `.sum` sidecar and no
+lease — it has no ongoing relationship to the store once written, and the
+whole `checkouts-ro` tree is safe to `rm -rf` at any time; the next call for
+anything under it just rebuilds what it needs. A repeat call for the same
+`db@branch@checkpoint` is a cache hit (returned as-is, no store access at
+all) unless `--force` is given, which re-materializes unconditionally — see
+[docs/status.md](status.md) for the exact staleness caveat this cache
+convenience accepts (a branch destroyed and recreated with a
+same-named checkpoint can leave a stale cache entry; `--force` or deleting
+the cache file clears it).
+
+**Errors:** `--at` without `--read-only` or vice versa; no such checkpoint on
+`db@branch`.
+
+## `offshoot export <db>[@branch[@checkpoint]] <out.db> [--force]`
+
+```
+offshoot export app out.db
+offshoot export app@attempt-1 out.db
+offshoot export app@attempt-1@v1 out.db --force
+```
+
+Copies `db@branch`'s state at `checkpoint` (third `@`-separated component;
+omitted means the branch's current head) out to a plain SQLite file at
+`out.db`, anywhere on the local filesystem. Unlike `checkout`, the result has
+ZERO ongoing relationship to the store afterward: no `.sum` sidecar, no
+lease, nothing else in this codebase will ever look at `out.db` again — it's
+a one-shot copy-out, not a checkout.
+
+Refuses to overwrite an existing `out.db` unless `--force`. The write itself
+is always atomic regardless of `--force`: it's built via a temp file in
+`out.db`'s OWN directory, renamed into place only once every chain member
+has been fetched and its checksum verified — a failed export (a fetch
+error, a checksum mismatch) never leaves a truncated or partial file at
+`out.db`, and the rename is guaranteed same-filesystem (same directory).
+
+**Errors:** no such `db@branch`; no such checkpoint; `out.db` already exists
+and `--force` was not given.
+
 ## `offshoot checkpoint <db>[@branch] <name> [--meta k=v ...]`
 
 ```
@@ -551,6 +606,33 @@ SDKs' `dbs()` calls. Useful for cleanup jobs that need to enumerate what
 exists without shelling out to a store-directory listing. An empty store
 prints nothing and is not an error (unlike `branches`, which errors on an
 unrecognized `db` name — there's no single db to name here).
+
+## Daemon protocol ops with no CLI `session` subcommand: `export`, `checkout-at`
+
+The daemon protocol's `export` and `checkout-at` ops (Python `Client.export`/
+`checkout_at`, TypeScript `Client.export`/`checkoutAt`) are reachable only
+through an SDK client today — there is no `offshoot session export`/
+`offshoot session checkout-at` CLI subcommand; use the top-level `offshoot
+export` / `offshoot checkout --at --read-only` commands above for CLI/at-rest
+access to the same underlying `ops.Workspace.Export`/`CheckoutAt` functions.
+
+`export`'s destination is a path on the **daemon's own host**, not the
+client's — it must be given as an absolute path (a relative one is refused
+outright) and is written with the same refuse/`force`/atomic-temp+rename
+semantics as the CLI command above. It reads the branch's last **durable**
+state from the store, never a live session's checkout: an open session's
+unflushed writes are not in the export (flush first if you need them
+included). `checkout-at` materializes into the same `checkouts-ro` cache
+path the CLI command above uses, and is safe to call even while this same
+daemon has a live session open on the target branch (unlike `checkout`/
+`rollback`/`promote`, which all refuse in that case) — it never touches the
+writable checkout.
+
+**Threat model:** the daemon speaks only a local unix socket (mode `0600`);
+any process able to open that socket already runs as the same user on the
+same host, so `export`'s destination path is trusted as an ordinary
+filesystem path that process can write — the daemon does not sandbox it or
+check it against an allow-list beyond requiring it be absolute.
 
 ---
 

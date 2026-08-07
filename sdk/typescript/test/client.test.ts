@@ -9,7 +9,7 @@
 import { test, before, after, type TestContext } from "node:test";
 import assert from "node:assert/strict";
 import { execFileSync, spawn, type ChildProcess } from "node:child_process";
-import { existsSync, mkdtempSync, rmSync } from "node:fs";
+import { existsSync, mkdtempSync, rmSync, statSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { fileURLToPath } from "node:url";
@@ -302,6 +302,144 @@ test("flush without meta still works", async (t: TestContext) => {
     const txid = await s.flush("v1");
     assert.ok(txid > 0);
     await s.close();
+  } finally {
+    await c.close();
+  }
+});
+
+test("export: head and named checkpoint", async (t: TestContext) => {
+  if (!canRun) {
+    t.skip("go and/or sqlite3 not on PATH");
+    return;
+  }
+  const c = await connect(fixture!.sock);
+  try {
+    await c.create("export-app");
+    const s = await c.open("export-app");
+    sqlite3(s.path, "CREATE TABLE t (v); INSERT INTO t VALUES ('one');");
+    await s.flush("v1");
+    sqlite3(s.path, "INSERT INTO t VALUES ('two');");
+    await s.flush("v2");
+    await s.close();
+
+    const out1 = join(fixture!.dir, "export-v1.db");
+    await c.export("export-app", "main", out1, { checkpoint: "v1" });
+    assert.equal(sqlite3(out1, "SELECT count(*) FROM t;").trim(), "1");
+
+    const out2 = join(fixture!.dir, "export-head.db");
+    await c.export("export-app", "main", out2);
+    assert.equal(sqlite3(out2, "SELECT count(*) FROM t;").trim(), "2");
+  } finally {
+    await c.close();
+  }
+});
+
+test("export: refuses overwrite without force, then force succeeds", async (t: TestContext) => {
+  if (!canRun) {
+    t.skip("go and/or sqlite3 not on PATH");
+    return;
+  }
+  const c = await connect(fixture!.sock);
+  try {
+    await c.create("export-force-app");
+    const s = await c.open("export-force-app");
+    sqlite3(s.path, "CREATE TABLE t (v);");
+    await s.flush("v1");
+    await s.close();
+
+    const out = join(fixture!.dir, "export-force.db");
+    await c.export("export-force-app", "main", out);
+    await assert.rejects(() => c.export("export-force-app", "main", out), OffshootError);
+    await c.export("export-force-app", "main", out, { force: true });
+  } finally {
+    await c.close();
+  }
+});
+
+test("export: rejects a relative path", async (t: TestContext) => {
+  if (!canRun) {
+    t.skip("go and/or sqlite3 not on PATH");
+    return;
+  }
+  const c = await connect(fixture!.sock);
+  try {
+    await c.create("export-relpath-app");
+    await assert.rejects(() => c.export("export-relpath-app", "main", "relative-out.db"), OffshootError);
+  } finally {
+    await c.close();
+  }
+});
+
+test("export: misses a session's unflushed writes", async (t: TestContext) => {
+  if (!canRun) {
+    t.skip("go and/or sqlite3 not on PATH");
+    return;
+  }
+  const c = await connect(fixture!.sock);
+  try {
+    await c.create("export-unflushed-app");
+    const s = await c.open("export-unflushed-app");
+    sqlite3(s.path, "CREATE TABLE t (v); INSERT INTO t VALUES ('durable');");
+    await s.flush("v1");
+    sqlite3(s.path, "INSERT INTO t VALUES ('unflushed');"); // never flushed
+
+    const out = join(fixture!.dir, "export-unflushed.db");
+    await c.export("export-unflushed-app", "main", out);
+    assert.equal(
+      sqlite3(out, "SELECT count(*) FROM t;").trim(),
+      "1",
+      "export must not include a session's unflushed write",
+    );
+
+    await s.flush();
+    const out2 = join(fixture!.dir, "export-after-flush.db");
+    await c.export("export-unflushed-app", "main", out2);
+    assert.equal(sqlite3(out2, "SELECT count(*) FROM t;").trim(), "2");
+    await s.close();
+  } finally {
+    await c.close();
+  }
+});
+
+test("checkoutAt: materializes a separate read-only path", async (t: TestContext) => {
+  if (!canRun) {
+    t.skip("go and/or sqlite3 not on PATH");
+    return;
+  }
+  const c = await connect(fixture!.sock);
+  try {
+    await c.create("checkout-at-app");
+    const s = await c.open("checkout-at-app");
+    sqlite3(s.path, "CREATE TABLE t (v); INSERT INTO t VALUES ('one');");
+    await s.flush("v1");
+    sqlite3(s.path, "INSERT INTO t VALUES ('two');");
+    await s.flush("v2");
+
+    const roPath = await c.checkoutAt("checkout-at-app", "main", "v1");
+    assert.notEqual(roPath, s.path);
+    assert.equal(sqlite3(roPath, "SELECT count(*) FROM t;").trim(), "1");
+    const mode = statSync(roPath).mode & 0o777;
+    assert.equal(mode, 0o444);
+
+    // Repeat call is a cache hit: same path, no error.
+    const again = await c.checkoutAt("checkout-at-app", "main", "v1");
+    assert.equal(again, roPath);
+
+    await s.close();
+  } finally {
+    await c.close();
+  }
+});
+
+test("checkoutAt: requires a checkpoint name", async (t: TestContext) => {
+  if (!canRun) {
+    t.skip("go and/or sqlite3 not on PATH");
+    return;
+  }
+  const c = await connect(fixture!.sock);
+  try {
+    await c.create("checkout-at-empty-app");
+    await assert.rejects(() => c.checkoutAt("checkout-at-empty-app", "main", ""), OffshootError);
   } finally {
     await c.close();
   }

@@ -155,6 +155,33 @@ func TestParseTarget(t *testing.T) {
 	}
 }
 
+func TestParseExportTarget(t *testing.T) {
+	db, br, cp, err := ParseExportTarget("app")
+	if err != nil || db != "app" || br != "main" || cp != "" {
+		t.Fatalf("%s %s %s %v", db, br, cp, err)
+	}
+	db, br, cp, err = ParseExportTarget("app@x-1")
+	if err != nil || db != "app" || br != "x-1" || cp != "" {
+		t.Fatalf("%s %s %s %v", db, br, cp, err)
+	}
+	db, br, cp, err = ParseExportTarget("app@x-1@v1")
+	if err != nil || db != "app" || br != "x-1" || cp != "v1" {
+		t.Fatalf("%s %s %s %v", db, br, cp, err)
+	}
+	if _, _, _, err := ParseExportTarget("a@b@c@d"); err == nil {
+		t.Fatal("want error on a 4th '@'-separated component")
+	}
+	if _, _, _, err := ParseExportTarget("Bad@x@v1"); err == nil {
+		t.Fatal("want db name validation error")
+	}
+	if _, _, _, err := ParseExportTarget("app@Bad@v1"); err == nil {
+		t.Fatal("want branch name validation error")
+	}
+	if _, _, _, err := ParseExportTarget("app@x@Bad"); err == nil {
+		t.Fatal("want checkpoint name validation error")
+	}
+}
+
 func TestCheckpointAndRematerialize(t *testing.T) {
 	if _, err := exec.LookPath("sqlite3"); err != nil {
 		t.Skip("sqlite3 CLI not on PATH")

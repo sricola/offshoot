@@ -99,6 +99,47 @@ version if you depend on format stability.
     text (title, description, listing-table entry) for
     `offshoot.langgraph.ThreadForks` — drafted, clearly marked not
     submitted (blocked on PyPI).
+- **Export + read-only historical checkouts** (Milestone 3 Task 2):
+  - `ops.Workspace.Export(db, branch, checkpoint, dstPath, force)`
+    materializes any checkpoint (or head, when `checkpoint == ""`) to a
+    plain SQLite file at `dstPath`, anywhere on the local filesystem, with
+    zero ongoing relationship to the store afterward: no `.sum` sidecar,
+    no lease. Refuses to overwrite an existing `dstPath` unless `force`.
+    Reuses `materializeChainAt`/`materializeAt`'s existing atomic
+    temp-file-in-the-destination's-own-directory + rename, so a failed
+    export (fetch error, checksum mismatch) never leaves a partial or
+    truncated file, and discards the `PostApplyChecksum` that machinery
+    now threads through (Task 3) since there is no sidecar to stamp with
+    it.
+  - CLI: `offshoot export <db>[@branch[@checkpoint]] <out.db> [--force]`
+    (`ops.ParseExportTarget` parses the triple-`@` target form).
+  - Daemon `export` op: `db`/`branch`/`name` (checkpoint)/`path`
+    (destination)/`force`. `path` must be an ABSOLUTE path — refused
+    otherwise — per the same-host/same-user unix-socket trust model
+    documented in `docs/reference.md`'s new daemon-ops section. Reads the
+    branch's last DURABLE state from the store, never a live session's
+    checkout: an open session's unflushed writes are NOT included, proven
+    directly over the wire (`internal/daemon/export_test.go`'s
+    `TestOpExportMissesUnflushedSessionWrites`).
+  - `ops.Workspace.CheckoutAt(db, branch, checkpoint, force) (string,
+    error)` materializes a NAMED checkpoint (no head alias) into a
+    dedicated read-only cache path, `<store-root>/checkouts-ro/<db>/
+    <branch>@<checkpoint>.db`, `chmod 0444`, distinct from and never
+    touching the writable checkout path, its sidecar, or a live capture
+    engine's file descriptors on it — safe alongside an open daemon
+    session on the SAME branch. A repeat call with `force=false` is a pure
+    cache hit (no store access at all — a checkpoint's content is
+    immutable); `force=true` re-materializes and re-reads the store.
+  - CLI: `offshoot checkout <db>[@branch] --at <checkpoint> --read-only
+    [--force]` (must be given together).
+  - Daemon `checkout-at` op: same semantics, server-side cache path.
+  - SDK parity (Python + TypeScript): `Client.export(db, branch, out_path,
+    checkpoint=None, force=False)`, `Client.checkout_at(db, branch,
+    checkpoint, force=False)` (TypeScript: `checkoutAt`, options-object
+    style matching the rest of that client).
+  - README's Resource behavior section gains the read-only-checkout-cache
+    paragraph, including the explicit "safe to `rm -rf` the entire
+    `checkouts-ro` directory at any time" guarantee.
 
 ### Fixed
 

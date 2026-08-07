@@ -215,6 +215,37 @@ class Client:
         resp = self._call("dbs")
         return resp.get("databases", [])
 
+    def export(self, db: str, branch: str, out_path: str,
+               checkpoint: str | None = None, force: bool = False) -> None:
+        """Materialize db@branch's state at checkpoint (None = head) to a
+        plain SQLite file at out_path, server-side, on the daemon's own
+        host/filesystem — out_path must be an ABSOLUTE path (same-host/
+        same-user unix-socket trust model; see
+        internal/daemon/protocol.go's ``Request.Path``). Refuses to
+        overwrite an existing out_path unless force=True. No sidecar, no
+        lease — out_path has no ongoing relationship to the store.
+
+        This reads the branch's last DURABLE state from the store, never a
+        live session's checkout: if a session on db@branch has unflushed
+        writes, they are NOT in the export. Flush (or checkpoint) first if
+        you need them included.
+        """
+        self._call("export", db=db, branch=branch, name=checkpoint or "",
+                    path=out_path, force=force)
+
+    def checkout_at(self, db: str, branch: str, checkpoint: str, force: bool = False) -> str:
+        """Materialize db@branch's state at checkpoint into a dedicated
+        read-only cache file, distinct from (and never touching) the
+        branch's writable checkout — safe to call alongside an open
+        session on the same branch. Repeat calls with force=False return
+        the cached path as-is (a checkpoint's content is immutable, so no
+        store access is needed); force=True re-materializes.
+
+        Returns the read-only cache file's path.
+        """
+        resp = self._call("checkout-at", db=db, branch=branch, name=checkpoint, force=force)
+        return resp.get("checkout", "")
+
     def status(self) -> list[dict]:
         """List every session open in the daemon, as raw dicts."""
         resp = self._call("status")
