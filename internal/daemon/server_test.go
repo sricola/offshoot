@@ -279,6 +279,81 @@ func TestShutdownDuringInFlightOpenLeavesNoLease(t *testing.T) {
 	}
 }
 
+// TestShutdownRespondsBeforeClosingRequestingConn exercises the fix for a
+// race between the "shutdown" response write and Shutdown's own connection-
+// close pass: dispatch's "shutdown" case used to trigger Shutdown (which
+// force-closes every live connection, including the one that just asked for
+// the shutdown) via `go s.Shutdown(...)` and then immediately return, with
+// no ordering between that goroutine and handle's subsequent write of this
+// very response. Under normal scheduling the write usually won, so the bug
+// only surfaced as an occasional CI flake on a loaded/CPU-constrained
+// runner: the CLI's `session shutdown` would see "daemon: reading response:
+// EOF" instead of the {OK: true} the server did send -- because Shutdown's
+// connection-close won the race and tore down the socket before (or during)
+// the write.
+//
+// Reproducing that interleaving through real socket timing is exactly the
+// kind of narrow, load-dependent window that made this flake so rare
+// locally. Instead this test uses the shutdownRespondDelay hook to force
+// the losing interleaving deterministically: it delays handle's write of
+// the shutdown response for a while after dispatch has already returned
+// (and, pre-fix, already launched Shutdown). That gives Shutdown a
+// generous head start to close every live connection, including this
+// request's own, before the delayed write is allowed to run.
+//
+// Pre-fix, this reliably reproduces the bug: Shutdown wins the race, the
+// delayed write fails against an already-closed connection, and the client
+// sees an error instead of {OK: true} (verified by re-running this test
+// against a checkout of the pre-fix server.go: it fails on every
+// iteration). Post-fix, Shutdown is not triggered until after the response
+// has actually been written, so the delay hook has nothing left to race:
+// the client always gets its {OK: true}.
+func TestShutdownRespondsBeforeClosingRequestingConn(t *testing.T) {
+	srv, _ := newServer(t)
+	sock := srv.SocketPath()
+
+	// entered is closed from inside the hook closure itself, after the
+	// package-level shutdownRespondDelay var has already been read and
+	// invoked by handle -- so, per the same reasoning as openDelay's tests
+	// (see TestShutdownDuringInFlightOpenLeavesNoLease), waiting on it
+	// before this goroutine later nils the var out gives a real
+	// happens-before edge instead of racing handle's read of it.
+	entered := make(chan struct{})
+	release := make(chan struct{})
+	shutdownRespondDelay = func() {
+		close(entered)
+		<-release
+	}
+	defer func() { shutdownRespondDelay = nil }()
+
+	c, err := net.Dial("unix", sock)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer c.Close()
+	if err := json.NewEncoder(c).Encode(Request{Op: "shutdown"}); err != nil {
+		t.Fatal(err)
+	}
+	<-entered // handle has dispatched the request and is about to write its response
+
+	// Give a pre-fix Shutdown -- already launched by dispatch, before this
+	// response is written -- a generous head start to close every live
+	// connection, including this one, before the delayed write is allowed
+	// to proceed.
+	time.Sleep(200 * time.Millisecond)
+	close(release)
+
+	var resp Response
+	if err := json.NewDecoder(bufio.NewReader(c)).Decode(&resp); err != nil {
+		t.Fatalf("shutdown response: %v (the daemon must finish writing the "+
+			"shutdown response before Shutdown's connection-close pass can "+
+			"touch this connection)", err)
+	}
+	if !resp.OK {
+		t.Fatalf("shutdown response = %+v, want OK", resp)
+	}
+}
+
 // TestConcurrentFlushAndCloseIsSafe exercises the fix for a race between
 // Close and a concurrent Flush on the same session: Close's os.RemoveAll of
 // the scratch dir used to run with no coordination against Flush's read of
