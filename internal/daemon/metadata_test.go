@@ -158,6 +158,56 @@ func TestForkRejectsMetaOverCapOverDaemon(t *testing.T) {
 	}
 }
 
+// TestOpForkValidatesMetaBeforeFlushingAnOpenSession pins opFork's
+// validate-then-flush ordering: ops.ValidateMeta(req.Meta) must run BEFORE
+// flushIfOpen, so an over-cap fork against a branch with a live, unflushed
+// session is refused without ever flushing that session — the fork is going
+// to fail regardless of what flushIfOpen would have done, and ValidateMeta
+// is cheap, in-memory, and needs no store I/O to run first. Before the fix,
+// flushIfOpen ran first, so an over-cap fork against an open session still
+// paid for (and produced the durable side effect of) a flush before opFork
+// ever looked at Meta.
+func TestOpForkValidatesMetaBeforeFlushingAnOpenSession(t *testing.T) {
+	srv, w := newServer(t)
+	sock := srv.SocketPath()
+
+	open := call(t, sock, Request{Op: "open", DB: "app", Branch: "main"})
+	if !open.OK {
+		t.Fatalf("open = %+v", open)
+	}
+	t.Cleanup(func() { call(t, sock, Request{Op: "close", DB: "app", Branch: "main"}) })
+	// A write the caller never flushes: if flushIfOpen ran, this is exactly
+	// what it would carry into a durable flush.
+	sqliteExec(t, open.Checkout, "CREATE TABLE t (v); INSERT INTO t VALUES (1);")
+
+	before, _, err := w.Store.GetRef("app", "main")
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	tooMany := map[string]string{}
+	for i := 0; i < ops.MaxMetaKeys+1; i++ {
+		tooMany[string(rune('a'+i%26))+string(rune('0'+i/26))] = "v"
+	}
+	r := call(t, sock, Request{Op: "fork", DB: "app", Branch: "main", Name: "over-cap-child", Meta: tooMany})
+	if r.OK {
+		t.Fatal("fork with over-cap meta against an open session must be refused")
+	}
+
+	after, _, err := w.Store.GetRef("app", "main")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if after.HeadTXID != before.HeadTXID {
+		t.Fatalf("an over-cap fork must not flush the open session: main's head_txid went from %d to %d",
+			before.HeadTXID, after.HeadTXID)
+	}
+
+	if _, _, err := w.Store.GetRef("app", "over-cap-child"); err == nil {
+		t.Fatal("a refused fork must not create the child branch")
+	}
+}
+
 // TestFlushMetaCreatesCheckpointWithMeta exercises the daemon "flush" op's
 // new Meta field: a live session's named flush IS how a checkpoint is
 // created against it (see server.opFlush's doc comment), so meta rides

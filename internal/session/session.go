@@ -1232,7 +1232,7 @@ func (s *Session) recordApply(pageSize uint32, frames []wal.Frame) error {
 // all, in particular no download of the head object itself — an earlier
 // version of this DID fetch it fresh from the store on every Open, which
 // defeated the whole suppression's purpose for a read-only session against
-// a snapshot head; see ops.TrailerPostApplyChecksum's doc comment for that
+// a snapshot head; see ltxio.TrailerPostApplyChecksum's doc comment for that
 // history). sum, by contrast, necessarily reflects T1 — whatever the
 // checkout actually contained by the time the real rebase ran, race-window
 // write or not. If one landed, the two values differ (folding in even one

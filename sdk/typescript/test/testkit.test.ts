@@ -146,6 +146,54 @@ test("startDaemon: resolves the binary via PATH when OFFSHOOT_BIN is unset (succ
 });
 
 // --------------------------------------------------------------------------
+// stop(): must not hold the process open past resolving.
+// --------------------------------------------------------------------------
+
+test(
+  "stop(): the internal exit-wait timer is unref'd, so it never holds the process open once stop() resolves",
+  async (t: TestContext) => {
+    if (!canRun) {
+      t.skip("go and/or sqlite3 not on PATH");
+      return;
+    }
+    // Runs in a genuinely separate child process, not in-process: the bug
+    // this guards against (stop()'s losing `sleep(stopTimeoutMs)` race
+    // branch left as a live, non-unref'd timer) only manifests as "the
+    // process doesn't exit," which is only observable from outside that
+    // process — an in-process assertion has no way to see it.
+    const testkitJsUrl = new URL("../src/testkit.js", import.meta.url);
+    const dir = mkdtempSync(join(tmpdir(), "offshoot-testkit-stoptimer-"));
+    try {
+      const scriptPath = join(dir, "child.mjs");
+      writeFileSync(
+        scriptPath,
+        [
+          `import { startDaemon } from ${JSON.stringify(testkitJsUrl.href)};`,
+          `const daemon = await startDaemon({ bin: ${JSON.stringify(bin)} });`,
+          `await daemon.stop();`,
+          `// Deliberately nothing else: a live, non-unref'd timer left over`,
+          `// from stop()'s internal race would keep this process alive for`,
+          `// up to its 10s default even though stop() already resolved.`,
+        ].join("\n"),
+      );
+      const start = Date.now();
+      try {
+        execFileSync(process.execPath, [scriptPath], { timeout: 4_000 });
+      } catch (e: any) {
+        assert.fail(
+          `child process did not exit within 4s of stop() resolving — its internal timer is ` +
+            `likely not unref'd, holding the event loop open: ${e.message}`,
+        );
+      }
+      const elapsed = Date.now() - start;
+      assert.ok(elapsed < 4_000, `stop() held the process open for ${elapsed}ms after resolving`);
+    } finally {
+      rmSync(dir, { recursive: true, force: true });
+    }
+  },
+);
+
+// --------------------------------------------------------------------------
 // dump: golden-file framing + clear error when the sqlite3 CLI is missing.
 // --------------------------------------------------------------------------
 
@@ -222,6 +270,34 @@ test("seedOnce: memoizes per name and detects a mismatched re-seed", async (t: T
         return true;
       },
     );
+  });
+});
+
+test("seedOnce: concurrent calls for the same name share one seed run, not two", async (t: TestContext) => {
+  if (!canRun) {
+    t.skip("go and/or sqlite3 not on PATH");
+    return;
+  }
+  await withDaemon(async (daemon) => {
+    let runs = 0;
+    const seed = async (dbPath: string) => {
+      runs++;
+      // A small delay so both calls are genuinely in flight together, not
+      // accidentally "serialized for free" by synchronous call-stack
+      // ordering alone — this is what would catch seedOnce checking its
+      // cache before starting, but only memoizing the SETTLED result (the
+      // bug: two concurrent calls both see no cache entry yet, both start
+      // seeding, and the loser's `cache.set` clobbers the winner's entry).
+      await new Promise((resolve) => setTimeout(resolve, 50));
+      execFileSync("sqlite3", [dbPath, "CREATE TABLE t (v); INSERT INTO t VALUES ('once');"]);
+    };
+    const [h1, h2] = await Promise.all([
+      seedOnce(daemon, { name: "concurrent", seed }),
+      seedOnce(daemon, { name: "concurrent", seed }),
+    ]);
+    assert.equal(runs, 1, "the seed callable must run exactly once for two concurrent same-name calls");
+    assert.equal(h1, h2, "both concurrent calls resolve to the identical handle object");
+    assert.equal(h1.db, "eval-concurrent");
   });
 });
 

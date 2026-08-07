@@ -115,13 +115,39 @@ everything depending on it) is **skipped**, with install instructions, not
 failed — a machine without the binary shouldn't red the whole suite for
 tests that need it (set ``offshoot_require_binary = true`` in ini to make
 this a hard failure instead, e.g. in CI). If the daemon dies (crash,
-OOM-kill, a bug) — whether before a fixture's first connection or mid-
-session — every daemon-facing call in this plugin (the initial `connect`,
-not just later requests on an already-open connection, which
-`offshoot.client.Client` already wraps) raises
-:class:`~offshoot.client.OffshootError` with the daemon's own stderr tail
-appended, so the failure names what actually happened instead of a bare
-`ConnectionRefusedError`/`FileNotFoundError`.
+OOM-kill, a bug), the stderr tail is appended ONLY on the two paths that
+actually have a handle on it: the ``offshoot_db``/``offshoot_fork``
+fixtures' own initial connection (the module-private ``_connect``, which
+turns a dead/unreachable daemon's bare `ConnectionRefusedError`/
+`FileNotFoundError` into an :class:`~offshoot.client.OffshootError` with
+the tail appended), and ``offshoot_fork``'s per-call fork+open (inside
+``_ForkFactory.__call__``, which catches `OffshootError` and re-raises with
+the tail appended). Everything ELSE that talks to the daemon —
+``offshoot_db``'s seed-time `create`/`open` and the seed's own
+`flush("seed")` (all inside `_SeedFactory.__call__`/`_run_seed`),
+``ForkedSession.flush()``, and every teardown call (`session.close()`,
+`client.destroy()` in `_ForkFactory.teardown`) — goes through bare
+`offshoot.client.Client._call`, which still raises `OffshootError` on a
+dead connection but WITHOUT a stderr tail: `Client` has no handle on the
+daemon subprocess's stderr at all — only this module's `DaemonHandle` does,
+and these calls never pass through the two wrapping points above. If a
+daemon death surfaces through one of these calls instead, the error names
+what happened (daemon connection failed/closed) but not why; check
+`offshoot_daemon`'s own stderr separately in that case.
+
+A related but distinct failure mode, unrelated to daemon death: a
+SQL-string seed whose FIRST statement isn't `BEGIN` (so
+`_seed_opens_own_transaction` doesn't detect it) but which opens its OWN
+transaction somewhere in the MIDDLE of the script still gets double-wrapped
+— `_run_seed` has already prepended its own `BEGIN;` by the time the
+seed's later `BEGIN` runs, and SQLite rejects a transaction started inside
+one that's already open. The error you'll see is SQLite's own "cannot
+start a transaction within a transaction". If a seed fails with that
+message, the fix is either to move that `BEGIN` (and its matching
+`COMMIT`) to the very top of the script — so `_seed_opens_own_transaction`
+sees it and skips the auto-wrap entirely — or to remove the seed's own
+`BEGIN`/`COMMIT` and let `_run_seed`'s wrap own the whole script's
+transaction boundary instead.
 """
 from __future__ import annotations
 
@@ -519,6 +545,13 @@ class _SeedFactory:
         self._default_seed_path = default_seed_path or None
         self._seeded: dict[str, SeedHandle] = {}
         self._fingerprints: dict[str, str] = {}
+        # Strong references to every callable seed that has ever fingerprinted
+        # a name, keyed by name: `_fingerprint_seed` fingerprints a callable
+        # by `id()`, which is only unique while the object is alive — without
+        # this, a seed callable could be GC'd and a later, UNRELATED object
+        # could be allocated at the same id(), producing a false "matches"
+        # against the stale fingerprint.
+        self._seed_refs: dict[str, object] = {}
 
     def __call__(self, name: str = "default", seed=None) -> SeedHandle:
         cached = self._seeded.get(name)
@@ -554,6 +587,7 @@ class _SeedFactory:
         handle = SeedHandle(db=db, checkpoint="seed", name=name)
         self._seeded[name] = handle
         self._fingerprints[name] = _fingerprint_seed(effective_seed)
+        self._seed_refs[name] = effective_seed  # keep alive — see __init__'s comment
         return handle
 
 

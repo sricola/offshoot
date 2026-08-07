@@ -22,6 +22,7 @@ Run via `make test-pytest-plugin` (needs the `[pytest]` extra installed —
 see pyproject.toml — unlike test_client.py/test_langgraph.py, which run
 under plain `unittest` and must stay pytest-free).
 """
+import gc
 import json
 import shutil
 import sqlite3
@@ -29,6 +30,7 @@ import sys
 import tempfile
 import textwrap
 import warnings
+import weakref
 from pathlib import Path
 
 import pytest
@@ -288,6 +290,36 @@ def test_seed_factory_allows_seed_none_on_an_already_cached_name(client):
     h1 = factory("cached", seed="CREATE TABLE t (v)")
     h2 = factory("cached")  # seed=None: no mismatch check, pure memoization
     assert h1 is h2
+
+
+def test_seed_factory_retains_a_strong_reference_to_a_callable_seed(client):
+    # _fingerprint_seed identifies a callable seed by id(), which is only a
+    # reliable identity while the object stays alive: CPython is free to
+    # reuse a freed object's id() for an unrelated later allocation. If
+    # _SeedFactory only remembered the fingerprint string and let the
+    # winning callable itself get garbage collected, a later, wholly
+    # unrelated callable could coincidentally get allocated at the same
+    # id() and be treated as a fingerprint MATCH by the mismatch check in
+    # __call__ — silently defeating the "same name, different seed" guard
+    # this class exists to enforce. Verified directly via a weakref: the
+    # seed callable a factory has fingerprinted must not be collectible for
+    # as long as that factory (and its fingerprint) is still alive.
+    def seed(path):
+        conn = sqlite3.connect(path)
+        conn.execute("CREATE TABLE t (v)")
+        conn.commit()
+        conn.close()
+
+    factory = _SeedFactory(client, default_seed_path=None)
+    factory("ref-retained", seed=seed)
+    alive = weakref.ref(seed)
+    del seed
+    gc.collect()
+    assert alive() is not None, (
+        "the seed callable was garbage collected while the factory that "
+        "fingerprinted it (by id()) is still alive — its id() could now be "
+        "reused by an unrelated object, producing a false fingerprint match"
+    )
 
 
 def test_seed_factory_runs_sql_string_seed(client):

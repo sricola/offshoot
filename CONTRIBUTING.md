@@ -179,6 +179,21 @@ on.
   `NODE_AUTH_TOKEN` env var from the `npm` job. Not done yet; `NPM_TOKEN`
   is the working path today.
 - `PUBLISH_ENABLED=true` set as a repository variable.
+- **The org transfer must have happened.** `sdk/python/pyproject.toml`'s
+  `[project.urls]`, `sdk/typescript/package.json`'s `repository`/`homepage`/
+  `bugs`, and `server.json`'s `repository.url` all currently point at
+  `github.com/offshoot-db/offshoot` — the repo's actual remote today is
+  `github.com/sricola/offshoot` (`git remote -v`); `offshoot-db` is the
+  planned org this repo will be transferred into, not yet where it lives.
+  `npm publish --provenance` independently verifies that `package.json`'s
+  `repository.url` matches the repo the publish is actually running from (it
+  builds the provenance attestation from the real GitHub OIDC claims) — so
+  publishing from `sricola/offshoot` with the manifest still pointing at
+  `offshoot-db/offshoot` **hard-fails the npm publish step**, not just
+  "publishes with a wrong link." Do NOT edit these URLs to `sricola/offshoot`
+  as a workaround — the org transfer is the actual plan; update the
+  manifests (and re-verify `server.json`, since MCP clients resolve it by
+  the same slug) once the transfer has happened, then publish.
 
 Claiming both names is a manual, one-time, user-side action tracked as a
 deliberately-out-of-band item in [ROADMAP.md](ROADMAP.md) and
@@ -186,14 +201,19 @@ deliberately-out-of-band item in [ROADMAP.md](ROADMAP.md) and
 can do on its own.
 
 **`PUBLISH_ENABLED=true` alone is not enough to publish anything.** A real
-upload additionally requires the workflow run itself to be an `sdk-v*` tag
-push — `workflow_dispatch` (a manual "Run workflow" click) is *always*
-dry-run, unconditionally, even with the gate on, because a dispatch run has
-no tag to publish and would otherwise burn whatever version `sdk/VERSION`
-happens to read on the branch it was run against. Both the `pypi` and `npm`
-jobs' actual upload steps check this directly (`startsWith(github.ref,
-'refs/tags/sdk-v')`), not just the `check` job's resolved output, so the
-guard survives even a bug in that job's own gating logic.
+upload additionally requires the workflow run itself to be an actual
+`sdk-v*` tag **push** — `workflow_dispatch` (a manual "Run workflow" click)
+is *always* dry-run, unconditionally, even with the gate on. Note that a
+ref check alone (`startsWith(github.ref, 'refs/tags/sdk-v')`) is NOT
+sufficient to establish that: GitHub's "Use workflow from" picker lets a
+maintainer dispatch a `workflow_dispatch` run against a tag ref, which makes
+`github.ref` match `refs/tags/sdk-v*` too, even though nothing was pushed.
+Both the `pypi` and `npm` jobs' actual upload steps therefore check
+`github.event_name == 'push'` as well (`startsWith(github.ref,
+'refs/tags/sdk-v') && github.event_name == 'push'`), not just the ref
+pattern and not just the `check` job's resolved output, so the guard
+survives both a dispatch-against-a-tag-ref run and a bug in that job's own
+gating logic.
 
 **Optional extra gate: GitHub Environments.** `publish.yml`'s `pypi` and
 `npm` jobs each target a GitHub Environment (`pypi-publish`,
