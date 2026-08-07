@@ -58,6 +58,7 @@ file, IAM role).
 | `OFFSHOOT_STORE` | Default store spec when `-store` isn't passed |
 | `OFFSHOOT_CHECKOUTS` | Where checkouts are materialized, for a *remote* (`s3://`) store; local stores always keep checkouts under the store directory itself. Defaults to a per-store directory under the user cache dir, keyed by the store's resolved identity (endpoint/region/path-style included, not just the literal spec string) |
 | `OFFSHOOT_SOCKET` | Overrides the daemon socket path for `offshoot serve`, `offshoot session ...`, and `offshoot mcp`; if unset, all three derive the same default path from the store spec, so they agree without it |
+| `OFFSHOOT_TOKEN` | The Bearer token for `offshoot serve -http`, in place of `-token`; see [`-http ADDR`](#-http-addr--opt-in-http-listener-milestone-4-task-3) below |
 
 **Naming rules**, enforced on every database name, branch name, and
 checkpoint name: 1–128 characters, charset `[a-z0-9-_.]`, and never exactly
@@ -536,12 +537,14 @@ Releases the branch's current lease (looked up first via the same listing
 
 **Errors:** no lease currently held on that branch.
 
-## `offshoot serve [-socket PATH] [-reap-every DURATION] [-gc-grace DURATION] [-flush-every DURATION]`
+## `offshoot serve [-socket PATH] [-reap-every DURATION] [-gc-grace DURATION] [-flush-every DURATION] [-http ADDR] [-token TOKEN] [-http-allow-non-loopback]`
 
 ```
 offshoot serve
 offshoot serve -socket /tmp/o.sock
 offshoot serve -reap-every 1m -gc-grace 15m -flush-every 30s   # all three are the defaults
+offshoot serve -http 127.0.0.1:8080                            # opt-in HTTP: token auto-generated, printed once
+OFFSHOOT_TOKEN=$(openssl rand -hex 32) offshoot serve -http 127.0.0.1:8080
 ```
 
 Starts the daemon: a long-running process that serves a unix socket (mode
@@ -549,7 +552,8 @@ Starts the daemon: a long-running process that serves a unix socket (mode
 committed WAL transaction continuously, and runs the janitor. Blocks until
 `SIGINT`/`SIGTERM`, at which point it releases every lease and shuts down
 cleanly (closing live sessions, draining in-flight opens, removing the
-socket) rather than leaving stale leases behind.
+socket, and closing any HTTP listener) rather than leaving stale leases
+behind.
 
 `-socket PATH` overrides the default socket location (see `OFFSHOOT_SOCKET`
 above); if a `session` command needs to reach this daemon, it must be given
@@ -574,6 +578,65 @@ flush (and every session's mandatory first "settling" flush) actually cost.
 
 **Errors:** socket path already in use by another listener; underlying
 store-attach failure; `-flush-every` given a negative duration.
+
+### `-http ADDR` — opt-in HTTP listener (Milestone 4 Task 3)
+
+Off by default. `-http ADDR` (e.g. `127.0.0.1:8080`) starts an HTTP
+listener alongside the unix socket, exposing:
+
+| Method | Path | Auth | Body |
+|---|---|---|---|
+| `POST` | `/rpc` | Bearer | The same `Request`/`Response` JSON the unix socket speaks, one op per POST (`Content-Type: application/json` required; body capped at 1MiB, oversized -> `413`) |
+| `GET` | `/metrics` | Bearer | Prometheus text exposition of the locked `offshoot_*` metric set (see [docs/status.md](status.md)'s metrics row for the full name list) |
+| `GET` | `/healthz` | **none** | `{"ok":true,"sessions":N}` — the one endpoint that needs no token, for liveness probes |
+| `GET` | `/debug/pprof/*` | Bearer | `net/http/pprof`'s standard handlers (index, cmdline, profile, symbol, trace) |
+
+**Token:** `-token TOKEN` or `OFFSHOOT_TOKEN` sets it explicitly; if
+neither is given, one is generated and printed to stderr **exactly once**
+at startup — treat that line, and your terminal scrollback/shell history,
+as sensitive. Every request but `/healthz` requires `Authorization: Bearer
+<token>`, compared in constant time; the token is never logged again after
+that one startup line — only an 8-character fingerprint (`offshoot: http
+listening on ... (token fingerprint XXXXXXXX)`) appears in any later
+output.
+
+**Binding beyond localhost:** a loopback bind (`127.0.0.1`, `::1`,
+`localhost`) needs nothing further. Any other address requires BOTH
+`-http-allow-non-loopback` (an explicit acknowledgment) AND an explicit
+`-token`/`OFFSHOOT_TOKEN` — the auto-generated, printed-once token is a
+loopback-only convenience. Missing either is a distinct startup error (the
+daemon never starts, rather than starting under-acknowledged):
+
+```
+$ offshoot serve -http 0.0.0.0:8080
+offshoot: daemon: -http "0.0.0.0:8080" binds a non-loopback address; this requires
+-http-allow-non-loopback (an explicit acknowledgment that this endpoint will be
+reachable beyond localhost)
+
+$ offshoot serve -http 0.0.0.0:8080 -http-allow-non-loopback
+offshoot: daemon: -http "0.0.0.0:8080" with -http-allow-non-loopback also requires
+an explicit -token or OFFSHOOT_TOKEN; the auto-generated, printed-once token is a
+loopback-only convenience
+```
+
+**Threat model:** the token is a shared secret for a single-tenant,
+same-host-or-trusted-network deployment — anyone holding it can do
+everything any daemon client can do (identical to anyone able to open the
+unix socket today), not a multi-tenant isolation boundary. There is no TLS;
+a non-loopback bind should sit behind a trusted network boundary (VPN,
+private subnet) of its own. **Treat stderr as sensitive at daemon
+startup**: it is the only place a freshly auto-generated token is ever
+printed in full.
+
+`http.Server` runs explicit timeouts rather than the stdlib's unbounded
+defaults: `ReadHeaderTimeout` 5s (slow-header protection), `ReadTimeout`
+30s, `WriteTimeout` 90s (sized to leave headroom for
+`/debug/pprof/profile`'s/`trace`'s default 30s capture window — a longer
+`?seconds=` capture than that budget allows will be cut off; request a
+shorter window or profile out-of-band), `IdleTimeout` 2 minutes.
+
+**Errors:** everything `offshoot serve` can already error on, plus: HTTP
+address already in use; the two non-loopback-bind errors above.
 
 ## `offshoot mcp`
 
@@ -765,7 +828,7 @@ check it against an allow-list beyond requiring it be absolute.
 
 ## What's not here
 
-`offshoot version`, HTTP endpoints, an auth flag, and a metrics endpoint do
-not exist in the CLI today — see [docs/status.md](status.md) for the full
-implemented/deferred matrix and links to the roadmap milestones tracking
-each.
+Eventing (a `subscribe` op / `GET /events` SSE stream) and the ro-cache
+disk budget do not exist yet — see [docs/status.md](status.md) for the
+full implemented/deferred matrix and links to the roadmap milestones
+tracking each.

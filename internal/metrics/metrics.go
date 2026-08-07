@@ -52,6 +52,36 @@ type Registry struct {
 	families   []*family
 	names      map[string]bool
 	collectors []func()
+
+	// scrapeMu serializes WritePrometheus end to end (collector run AND
+	// family render), across the WHOLE call, not just the family-list
+	// snapshot mu already protects. This is load-bearing, not defensive:
+	// a Collect callback (see Collect's doc comment) is allowed to be a
+	// multi-step update — daemon's collectSessionGauges, for instance,
+	// Resets two GaugeVecs and then repopulates them from a fresh session
+	// snapshot — and that sequence is only "atomic" in effect if no other
+	// scrape's run of the SAME callback can interleave with it. Each
+	// individual GaugeVec operation (Reset/WithLabelValues/render) is
+	// already safe under its own mutex, so `go test -race` would not catch
+	// this: the hazard is a LOGICAL tear, not a data race. Without
+	// scrapeMu, two concurrent WritePrometheus calls both running
+	// collectSessionGauges could land a Reset from one scrape in between
+	// the other scrape's own populate loop and the render that reads it
+	// back, producing an internally inconsistent sample — e.g.
+	// offshoot_sessions_open reporting N while offshoot_capture_lag_bytes
+	// carries fewer than N samples in that SAME response body, even though
+	// collectSessionGauges's own loop always emits exactly one
+	// capture-lag line per session it counted. Serializing at this single
+	// choke point (rather than making every multi-step collector
+	// internally concurrency-safe against other collectors, which would
+	// need its own new lock per collector and break Collect's "no Registry
+	// lock held, free to do real work" contract) is the minimal fix: at
+	// most one scrape's collect-then-render ever runs at a time, so a
+	// collector can assume no concurrent run of itself (or anything else
+	// touching the same metrics) is interleaved with its own updates.
+	// Concurrent scrapers simply queue — acceptable at ordinary Prometheus
+	// scrape cadences (15s+).
+	scrapeMu sync.Mutex
 }
 
 // family is one registered metric (Counter/Gauge/Histogram/*Vec), holding
@@ -116,7 +146,17 @@ func (r *Registry) Collect(f func()) {
 // comments) — holding r.mu across collector execution would serve no
 // purpose here (the family list itself never changes after startup
 // registration) while adding a lock-ordering hazard for no benefit.
+//
+// The whole call (collector run AND render) is additionally serialized
+// against any other concurrent WritePrometheus call via scrapeMu — see its
+// doc comment on the Registry struct for why r.mu's brief snapshot-only
+// hold is not enough on its own (concurrent HTTP scrapes are exactly the
+// caller this matters for; Milestone 4 Task 3's GET /metrics handler calls
+// this directly, possibly from several scraper goroutines at once).
 func (r *Registry) WritePrometheus(w io.Writer) error {
+	r.scrapeMu.Lock()
+	defer r.scrapeMu.Unlock()
+
 	r.mu.Lock()
 	collectors := append([]func(){}, r.collectors...)
 	families := append([]*family{}, r.families...)
