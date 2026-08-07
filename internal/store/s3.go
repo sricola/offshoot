@@ -311,6 +311,16 @@ func (s *S3) CopyObject(dst, src string) error {
 	return nil
 }
 
+// Delete removes key unconditionally. S3 deliberately does NOT implement
+// store.ConditionalDeleter here: DeleteObject has no compare-and-delete
+// precondition in the S3 API (If-Match/If-None-Match only apply to
+// GetObject/PutObject; DeleteObject accepts no conditional headers at all),
+// so there is no honest way to make this a true CAS delete the way Local's
+// DeleteIf is. Callers that need delete-time safety on this backend (Task
+// 6b's Destroy claim-guard, in particular) get it from the claim-marker
+// pattern instead — a CAS-written Ref.Deleting claim that a concurrent
+// AcquireLease is taught to refuse — not from this method; see
+// store.DeleteRefIf's doc comment for the full reasoning.
 func (s *S3) Delete(key string) error {
 	fk, err := s.full(key)
 	if err != nil {

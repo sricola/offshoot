@@ -4,9 +4,11 @@ package main
 import (
 	"context"
 	"fmt"
+	"math"
 	"os"
 	"os/signal"
 	"runtime"
+	"strconv"
 	"strings"
 	"syscall"
 	"time"
@@ -14,6 +16,7 @@ import (
 	"github.com/offshoot-db/offshoot/internal/daemon"
 	"github.com/offshoot-db/offshoot/internal/mcp"
 	"github.com/offshoot-db/offshoot/internal/ops"
+	"github.com/offshoot-db/offshoot/internal/session"
 	"github.com/offshoot-db/offshoot/internal/store"
 )
 
@@ -64,15 +67,44 @@ Usage:
   offshoot destroy <db>[@branch] [--force]   delete a branch (requires --force for protected)
   offshoot gc [--grace duration]     garbage collect unreachable lineages (default grace: 1h)
   offshoot path <db>[@branch]        print the checkout path
-  offshoot status                    print all branches and their state
+  offshoot status [-ro-cache-budget BYTES]
+                                     print all branches and their state, plus
+                                     a checkouts-ro usage summary; -ro-cache-budget
+                                     is display-only (echoes serve's own flag;
+                                     not persisted anywhere)
   offshoot lease list                       list every branch's lease
   offshoot lease acquire <db>[@branch] [--ttl 30s]   claim or renew a lease
   offshoot lease release <db>[@branch]      release a lease
   offshoot serve [-socket PATH] [-reap-every d] [-gc-grace d] [-flush-every d]
+                 [-snapshot-every N] [-ro-cache-budget BYTES] [-http ADDR] [-token TOKEN] [-http-allow-non-loopback]
                                              run the daemon until SIGINT/SIGTERM;
                                              -flush-every ships every open session's
                                              work on a cadence even if it's never
-                                             flushed explicitly (default 30s; 0 disables)
+                                             flushed explicitly (default 30s; 0 disables);
+                                             -snapshot-every N sets every open session's
+                                             full-snapshot cadence (default 16, unchanged
+                                             if omitted; must be >= 1) — more segments per
+                                             snapshot means cheaper flushes but more replay
+                                             per read, see docs/reference.md
+                                             -ro-cache-budget bounds checkouts-ro
+                                             (default 0 = unlimited); the janitor
+                                             LRU-evicts (by a .last-used touch-on-hit
+                                             marker) once usage exceeds it, on the
+                                             same -reap-every cadence; a bare integer
+                                             is bytes, or use a K/M/G/T suffix
+                                             (power-of-1024); checkouts/ (writable,
+                                             leased) is never evicted
+                                             -http ADDR (e.g. 127.0.0.1:8080) additionally
+                                             starts an HTTP listener (POST /rpc, GET
+                                             /metrics, GET /healthz, GET /debug/pprof/*,
+                                             all but /healthz requiring "Authorization:
+                                             Bearer <token>"); off by default. -token
+                                             (or OFFSHOOT_TOKEN) sets the token; omitted,
+                                             one is generated and printed ONCE to stderr
+                                             (loopback binds only — treat that output as
+                                             sensitive). -http-allow-non-loopback
+                                             acknowledges binding beyond localhost, and
+                                             additionally REQUIRES an explicit token
   offshoot mcp [-default-ttl d|none] [-socket PATH]
                                              serve the MCP tool set on stdio for an agent;
                                              forked branches get this TTL unless the fork
@@ -274,6 +306,65 @@ func parseDefaultTTLFlag(args []string) (time.Duration, []string, error) {
 		return 0, nil, fmt.Errorf("-default-ttl %q must be zero, \"none\" (both disable it), or positive", raw)
 	}
 	return d, rest, nil
+}
+
+// parseByteSize parses a -ro-cache-budget-shaped flag value: "" (the flag
+// omitted) is 0 (unlimited, that flag's own default); otherwise a bare
+// non-negative integer is taken as a byte count directly — bytes are the
+// CONTRACT this flag and offshoot_ro_cache_bytes/EvictROCache all speak, and
+// the only form ever guaranteed stable. As a convenience, a trailing
+// power-of-1024 size suffix is also accepted, case-insensitively: "K"/"KB",
+// "M"/"MB", "G"/"GB", "T"/"TB" (each multiplies by 1024^n — NOT the SI
+// decimal 1000-based convention some tools use for the same letters; when
+// in doubt, pass raw bytes). A bare trailing "B" (no K/M/G/T prefix) is
+// also accepted as a no-op multiplier, purely so "500B" and "500" parse
+// identically rather than one of them erroring on a redundant unit.
+func parseByteSize(raw string) (int64, error) {
+	if raw == "" {
+		return 0, nil
+	}
+	s := strings.TrimSpace(raw)
+	upper := strings.ToUpper(s)
+	mult := int64(1)
+	for _, suf := range []struct {
+		suffix string
+		mult   int64
+	}{
+		{"TB", 1 << 40}, {"T", 1 << 40},
+		{"GB", 1 << 30}, {"G", 1 << 30},
+		{"MB", 1 << 20}, {"M", 1 << 20},
+		{"KB", 1 << 10}, {"K", 1 << 10},
+		{"B", 1},
+	} {
+		if strings.HasSuffix(upper, suf.suffix) {
+			mult = suf.mult
+			s = s[:len(s)-len(suf.suffix)]
+			break
+		}
+	}
+	s = strings.TrimSpace(s)
+	if s == "" {
+		return 0, fmt.Errorf("%q: missing a numeric value", raw)
+	}
+	n, err := strconv.ParseInt(s, 10, 64)
+	if err != nil {
+		return 0, fmt.Errorf("%q: %w", raw, err)
+	}
+	if n < 0 {
+		return 0, fmt.Errorf("%q: must be zero or positive (zero means unlimited)", raw)
+	}
+	// n * mult on int64 can overflow: e.g. "8388608T" (n=8388608,
+	// mult=1<<40) wraps past MaxInt64 into a negative value, which callers
+	// treat as "unlimited" — the opposite of what an operator asking for a
+	// huge-but-finite budget meant. Other magnitudes wrap into small
+	// positive values, silently producing a tiny budget and surprise
+	// eviction instead of any error at all. Catch it before multiplying
+	// rather than after, since the wrapped product itself no longer carries
+	// any signal that it wrapped.
+	if n > math.MaxInt64/mult {
+		return 0, fmt.Errorf("%q: size too large", raw)
+	}
+	return n * mult, nil
 }
 
 func main() {
@@ -550,6 +641,18 @@ func run(args []string) error {
 		if reapErr != nil {
 			fmt.Fprintf(os.Stderr, "offshoot: gc: reap: %v\n", reapErr)
 		}
+		// Milestone 4 Task 6b: self-heal any Destroy claim (Ref.Deleting)
+		// stranded by a crashed `destroy`/`gc` call, same "report and press
+		// on" convention as the reap failure above — this is at-rest cleanup
+		// independent of everything else `gc` does, so one branch's stale
+		// claim must not block it either.
+		healed, healErr := w.ClearStaleDeleteClaims(time.Now())
+		if len(healed) > 0 {
+			fmt.Printf("gc: cleared stale delete claim(s) %v\n", healed)
+		}
+		if healErr != nil {
+			fmt.Fprintf(os.Stderr, "offshoot: gc: clear stale delete claims: %v\n", healErr)
+		}
 		tombstoned, deleted, err := w.GC(grace)
 		if err != nil {
 			return err
@@ -557,6 +660,25 @@ func run(args []string) error {
 		fmt.Printf("gc: tombstoned %d, deleted %d lineages\n", tombstoned, deleted)
 		return nil
 	case "status":
+		// -ro-cache-budget is purely for DISPLAY here — like every other
+		// serve-time tuning knob (-reap-every, -gc-grace, -flush-every), the
+		// budget itself is never persisted to the store, so this at-rest
+		// command (no daemon involved — see below) has no other way to know
+		// what a running daemon was actually started with. Passing the same
+		// value here as the daemon's own -ro-cache-budget lets an operator
+		// see usage against it without a live daemon connection; omitted
+		// (the common case) just reports usage with no budget context.
+		roCacheBudgetStr, rest, _, err := extractFlag(rest, "-ro-cache-budget")
+		if err != nil {
+			return err
+		}
+		roCacheBudget, err := parseByteSize(roCacheBudgetStr)
+		if err != nil {
+			return fmt.Errorf("-ro-cache-budget: %w", err)
+		}
+		if len(rest) != 0 {
+			return fmt.Errorf("usage: offshoot status [-ro-cache-budget BYTES]")
+		}
 		sts, err := w.Status()
 		if err != nil {
 			return err
@@ -569,12 +691,25 @@ func run(args []string) error {
 			if s.CheckedOut {
 				flags += " checked-out"
 			}
-			line := fmt.Sprintf("%s@%s txid=%d checkpoints=[%s]%s",
-				s.DB, s.Branch, s.HeadTXID, strings.Join(s.Checkpoints, ","), flags)
+			line := fmt.Sprintf("%s@%s state=%s txid=%d checkpoints=[%s]%s",
+				s.DB, s.Branch, s.State, s.HeadTXID, strings.Join(s.Checkpoints, ","), flags)
 			if s.TTL != "" {
 				line += fmt.Sprintf(" ttl=%s remaining=%s", s.TTL, s.TTLRemaining)
 			}
 			fmt.Println(line)
+		}
+		// Milestone 4 Task 5: ro-cache usage summary. Computed directly off
+		// checkouts-ro (ops.Workspace.ROCacheUsage), the same at-rest read
+		// every other line above already uses — no daemon required, exactly
+		// like the rest of this command.
+		roBytes, roCount, err := w.ROCacheUsage()
+		if err != nil {
+			return err
+		}
+		if roCacheBudget > 0 {
+			fmt.Printf("ro-cache: %d entries, %d bytes used, budget %d bytes\n", roCount, roBytes, roCacheBudget)
+		} else {
+			fmt.Printf("ro-cache: %d entries, %d bytes used (budget: unlimited)\n", roCount, roBytes)
 		}
 		return nil
 	case "lease":
@@ -668,9 +803,11 @@ func run(args []string) error {
 		srv := mcp.NewServer(os.Stdin, os.Stdout, ts)
 		return srv.Serve(context.Background())
 	case "serve":
+		const serveUsage = "usage: offshoot serve [-socket PATH] [-reap-every DURATION] [-gc-grace DURATION] " +
+			"[-flush-every DURATION] [-snapshot-every N] [-ro-cache-budget BYTES] [-http ADDR] [-token TOKEN] [-http-allow-non-loopback]"
 		sock, rest, err := socketOverride(rest)
 		if err != nil {
-			return fmt.Errorf("usage: offshoot serve [-socket PATH] [-reap-every DURATION] [-gc-grace DURATION] [-flush-every DURATION]: %w", err)
+			return fmt.Errorf("%s: %w", serveUsage, err)
 		}
 		reapEveryStr, rest, _, err := extractFlag(rest, "-reap-every")
 		if err != nil {
@@ -709,9 +846,84 @@ func run(args []string) error {
 			return fmt.Errorf("-flush-every %q must be zero or positive; zero disables auto-flush "+
 				"(there is no \"none\" alias — a negative value is almost certainly a mistake)", flushEveryStr)
 		}
-		if len(rest) != 0 {
-			return fmt.Errorf("usage: offshoot serve [-socket PATH] [-reap-every DURATION] [-gc-grace DURATION] [-flush-every DURATION]")
+		snapshotEveryStr, rest, snapshotEveryGiven, err := extractFlag(rest, "-snapshot-every")
+		if err != nil {
+			return err
 		}
+		var snapshotEvery int
+		if snapshotEveryGiven {
+			n, err := strconv.Atoi(snapshotEveryStr)
+			if err != nil {
+				return fmt.Errorf("-snapshot-every: %w", err)
+			}
+			if n < 1 {
+				return fmt.Errorf("-snapshot-every %d must be >= 1 (there is no \"unlimited\" — "+
+					"omit the flag for the default of %d)", n, session.DefaultSnapshotEvery)
+			}
+			snapshotEvery = n
+		}
+		roCacheBudgetStr, rest, _, err := extractFlag(rest, "-ro-cache-budget")
+		if err != nil {
+			return err
+		}
+		roCacheBudget, err := parseByteSize(roCacheBudgetStr)
+		if err != nil {
+			return fmt.Errorf("-ro-cache-budget: %w", err)
+		}
+		httpAddr, rest, _, err := extractFlag(rest, "-http")
+		if err != nil {
+			return err
+		}
+		tokenFlag, rest, _, err := extractFlag(rest, "-token")
+		if err != nil {
+			return err
+		}
+		allowNonLoopback, rest := extractBoolFlag(rest, "-http-allow-non-loopback")
+		if len(rest) != 0 {
+			return fmt.Errorf(serveUsage)
+		}
+		// -token/-http-allow-non-loopback only mean anything alongside
+		// -http; given without it, they'd otherwise be silently ignored —
+		// almost certainly a mistake (e.g. a typo'd or dropped -http ADDR
+		// in a script), and one that would be surprising to notice only by
+		// its ABSENCE (no auth, no HTTP listener at all) rather than an
+		// explicit error at startup.
+		if httpAddr == "" {
+			if tokenFlag != "" {
+				return fmt.Errorf("-token given without -http; it has no effect unless -http ADDR is also set")
+			}
+			if allowNonLoopback {
+				return fmt.Errorf("-http-allow-non-loopback given without -http; it has no effect unless -http ADDR is also set")
+			}
+		}
+
+		// Milestone 4 Task 3: HTTP is off by default (httpAddr == ""); when
+		// requested, validate the bind BEFORE touching the socket/daemon at
+		// all, so a misconfigured -http fails fast as a startup error and
+		// never leaves a half-started daemon behind. Token precedence:
+		// -token, then OFFSHOOT_TOKEN, else auto-generated (loopback binds
+		// only — see daemon.ValidateHTTPBind, called both here and again,
+		// defensively, inside StartHTTP itself).
+		token := tokenFlag
+		if token == "" {
+			token = os.Getenv("OFFSHOOT_TOKEN")
+		}
+		hasExplicitToken := token != ""
+		autoGenerated := false
+		if httpAddr != "" {
+			if err := daemon.ValidateHTTPBind(httpAddr, allowNonLoopback, hasExplicitToken); err != nil {
+				return err
+			}
+			if !hasExplicitToken {
+				t, err := daemon.GenerateToken()
+				if err != nil {
+					return err
+				}
+				token = t
+				autoGenerated = true
+			}
+		}
+
 		if sock == "" {
 			p, err := daemon.DefaultSocketPath(spec)
 			if err != nil {
@@ -723,12 +935,35 @@ func run(args []string) error {
 		if err != nil {
 			return err
 		}
+		srv.SetVersion(version)
 		srv.StartJanitor(reapEvery, gcGrace)
 		// safe-by-default cadence: the daemon ships work on a cadence even
 		// if the agent it's serving never calls flush; -flush-every 0
 		// disables this, restoring manual-only (session.Options' own
 		// default).
 		srv.SetFlushEvery(flushEvery)
+		// Milestone 4 Task 6a: 0 (the default, -snapshot-every not given)
+		// means "let session.Open apply its own default" — see
+		// Server.SetSnapshotEvery's doc comment. Only set when the flag was
+		// actually given (snapshotEveryGiven), so a bare `offshoot serve`
+		// keeps behaving exactly as it did before this flag existed.
+		if snapshotEveryGiven {
+			srv.SetSnapshotEvery(snapshotEvery)
+		}
+		// Milestone 4 Task 5: 0 (the default, unset) means unlimited — the
+		// janitor still computes and reports checkouts-ro usage every pass,
+		// it just never evicts. See SetROCacheBudget's doc comment.
+		srv.SetROCacheBudget(roCacheBudget)
+		if httpAddr != "" {
+			if err := srv.StartHTTP(daemon.HTTPConfig{
+				Addr:             httpAddr,
+				Token:            token,
+				AllowNonLoopback: allowNonLoopback,
+				AutoGenerated:    autoGenerated,
+			}); err != nil {
+				return err
+			}
+		}
 		fmt.Println("offshoot serving on", sock)
 		sigc := make(chan os.Signal, 1)
 		signal.Notify(sigc, os.Interrupt, syscall.SIGTERM)

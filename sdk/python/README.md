@@ -41,6 +41,38 @@ with offshoot.connect("/tmp/o.sock") as c:
 `Client` also exposes `branches()` (per-branch head txid, protected flag,
 checkpoints, TTL) and `dbs()` (every database name in the store).
 
+## Eventing: `Client.events()`
+
+The daemon (`offshoot serve`) publishes one versioned JSON event per state
+transition — `session_opened`, `flushed`, `flush_failed`, `fenced`,
+`session_closed`, `reaped`, `evicted` (reserved), and the terminal
+`dropped_slow_consumer`. `Client.events()` is a thin generator over it:
+
+```python
+with offshoot.connect("/tmp/o.sock") as c:
+    for ev in c.events():
+        print(ev.type, ev.db, ev.branch, ev.detail)
+```
+
+**Dedicated connection:** `events()` opens its own fresh unix-socket
+connection — never `c`'s own connection. The daemon's `subscribe` op
+permanently takes a connection out of request/response mode the instant
+it acks (see the main repo's
+[docs/reference.md](https://github.com/offshoot-db/offshoot/blob/main/docs/reference.md#eventing-subscribe-op--get-events)),
+so this method handles opening (and closing) that dedicated connection for
+you — keep using `c` for ordinary `open`/`flush`/... calls exactly as
+before.
+
+`events()` is lazy (nothing is opened until you start iterating) and
+yields `Event(v, ts, type, db, branch, detail)` dataclass instances in
+publish order, forever, until the connection ends. Stop early with
+`break` (or call `.close()` on the generator) to close the dedicated
+socket — no file descriptor is leaked. If this consumer ever falls behind
+the daemon's bounded per-subscriber buffer, the daemon drops it: the
+terminal `dropped_slow_consumer` event is yielded like any other event and
+the generator then simply stops (not raised as an error) — check
+`ev.type` on the last event you saw if you care whether that happened.
+
 ## pytest fixture plugin
 
 **This section is the condensed reference.** For the full tutorial —

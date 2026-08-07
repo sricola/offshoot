@@ -17,7 +17,6 @@ import (
 	"net/url"
 	"os"
 	"path/filepath"
-	"sort"
 	"strings"
 	"sync/atomic"
 	"time"
@@ -485,12 +484,8 @@ func writeSum(path string, lineage string, epoch, txid, postApplyChecksum uint64
 //     corrupt files). Provenance can't be determined, so callers should
 //     stay silent rather than warn spuriously.
 func checkoutState(path string, ref store.Ref) (string, uint64) {
-	raw, err := os.ReadFile(path + ".sum")
-	if err != nil {
-		return "unknown", 0
-	}
-	var rec sumRecord
-	if err := json.Unmarshal(raw, &rec); err != nil || rec.Hash == "" {
+	rec, ok := readSidecar(path)
+	if !ok {
 		return "unknown", 0
 	}
 	if rec.Lineage != ref.Lineage || rec.Epoch != ref.HeadEpoch || rec.TXID != ref.HeadTXID {
@@ -504,6 +499,29 @@ func checkoutState(path string, ref store.Ref) (string, uint64) {
 		return "modified", 0
 	}
 	return "clean", rec.PostApplyChecksum
+}
+
+// readSidecar reads and parses path's .sum sidecar (see sumRecord's doc
+// comment) into rec, with ok=false if the file is absent or doesn't decode
+// as a valid current-format record (including a legacy bare-hash sidecar or
+// a corrupt file) — the same "nothing readable" bucket checkoutState's own
+// "unknown" verdict already treats as unknown. Shared by checkoutState and
+// ops.BranchStateAt (status.go) so the two can never disagree on what
+// counts as a readable sidecar; BranchStateAt needs the raw record (not
+// just checkoutState's collapsed stale/modified/clean verdict) to tell a
+// lineage mismatch (its "detached" state) apart from a same-lineage
+// epoch/txid mismatch (its "idle" — needs re-materialize, not orphaned) —
+// see BranchStateAt's doc comment.
+func readSidecar(path string) (sumRecord, bool) {
+	raw, err := os.ReadFile(path + ".sum")
+	if err != nil {
+		return sumRecord{}, false
+	}
+	var rec sumRecord
+	if err := json.Unmarshal(raw, &rec); err != nil || rec.Hash == "" {
+		return sumRecord{}, false
+	}
+	return rec, true
 }
 
 // fileSum is the SHA-256 of a checkout file's bytes, used by checkoutState
@@ -591,6 +609,7 @@ func copyFile(from, to string) error {
 // branch's Ref.Meta, which Fork's meta param sets instead. Rejected (before
 // any store I/O) if it exceeds the caps.
 func (w *Workspace) Checkpoint(db, branch, name string, meta map[string]string) (uint64, error) {
+	start := time.Now()
 	if err := store.ValidateName(db); err != nil {
 		return 0, err
 	}
@@ -686,10 +705,29 @@ func (w *Workspace) Checkpoint(db, branch, name string, meta map[string]string) 
 	if err := writeSum(path, ref.Lineage, ref.HeadEpoch, txid, checksum); err != nil {
 		return 0, fmt.Errorf("ops: checkpoint %q committed (txid %d), but the checkout fingerprint could not be refreshed: %w", name, txid, err)
 	}
+	if ObserveCheckpoint != nil {
+		ObserveCheckpoint(time.Since(start))
+	}
 	return txid, nil
 }
 
-// quiesce checkpoints the WAL fully, failing cleanly on a busy database.
+// errQuiesceBusy is quiesce's error specifically for wal_checkpoint(TRUNCATE)
+// reporting busy != 0 — a live connection (reader or writer) is preventing a
+// full checkpoint right now. Distinct from every other quiesce failure
+// (sql.Open failure, a path that isn't a valid SQLite file at all): a caller
+// that needs to tell "someone is actively using this file right this
+// instant" apart from "this file can't be quiesced for some other reason"
+// checks errors.Is against this sentinel — see ops.BranchStateAt, which
+// treats a busy checkout as itself evidence of un-checkpointed activity
+// ("dirty") rather than an absence of evidence ("idle"). The wrapped message
+// text is unchanged from before this sentinel existed, so every existing
+// caller that only logs/propagates quiesce's error (Checkpoint,
+// CheckoutProven, Rollback's refresh, Promote's refresh,
+// warnIfUncheckpointed) sees byte-identical output.
+var errQuiesceBusy = errors.New("ops: database is busy (live writer or reader); close connections and retry")
+
+// quiesce checkpoints the WAL fully, failing cleanly on a busy database (see
+// errQuiesceBusy).
 func quiesce(path string) error {
 	conn, err := sql.Open("sqlite3", path+"?_busy_timeout=3000")
 	if err != nil {
@@ -701,7 +739,7 @@ func quiesce(path string) error {
 		return fmt.Errorf("ops: checkpoint: %w", err)
 	}
 	if busy != 0 {
-		return fmt.Errorf("ops: database is busy (live writer or reader); close connections and retry")
+		return errQuiesceBusy
 	}
 	return nil
 }
@@ -796,8 +834,57 @@ var forkSlowPathForTest bool
 // itself just because it is test instrumentation.
 var forkFastPathHits atomic.Int64
 
+// ObserveFork, when non-nil, is invoked by Fork immediately before it
+// returns successfully (never on error — a failed fork has no meaningful
+// "how long did this take", and the metric it feeds,
+// offshoot_fork_duration_seconds, is defined as successful-fork latency)
+// with the wall-clock duration of the whole call and whether it took the
+// fast (single-snapshot backend-level object copy — see
+// copySnapshotToNewLineage's doc comment) or slow (materialize + re-encode)
+// path. It is also this package's source for offshoot_fork_total{path};
+// unlike forkFastPathHits (test-only, package-internal, never reset), this
+// hook is the real production signal.
+//
+// Injection shape: a package-level, nil-checked func var — the same pattern
+// this file already uses for its own test hooks (forkSlowPathForTest,
+// FlushEncodeHook/FlushUploadHook over in flush.go) — rather than an
+// Observer interface with Fork/Checkpoint methods. Two independent,
+// stateless, single-call callbacks with no shared lifecycle between them
+// don't benefit from being bundled behind one interface; doing so would
+// only force this package to name and depend on a type whose one real
+// implementation lives in internal/metrics, for no gain over two funcs.
+// ops must not import internal/metrics (the M4 plan's explicit constraint,
+// so a later swap of the metrics backend never touches this package) — the
+// daemon assigns both hooks once, at server construction, closing over its
+// own *metrics.Registry-backed counters/histograms so ops never needs to
+// know metrics exists.
+var ObserveFork func(dur time.Duration, fast bool)
+
+// ObserveCheckpoint, when non-nil, is invoked by Checkpoint immediately
+// before it returns successfully (never on error, matching ObserveFork's
+// same reasoning) with the call's wall-clock duration. See ObserveFork's
+// doc comment for the injection-shape rationale, which applies identically
+// here.
+//
+// In today's architecture this hook only ever fires from a process that
+// calls ops.Workspace.Checkpoint directly — the CLI and MCP tool processes
+// (see Checkpoint's own doc comment: it is "NOT SAFE against a live
+// in-process session's checkout", so the daemon has no "checkpoint" op and
+// never calls this method itself; a live session's checkpoint is a NAMED
+// Flush instead, observed separately via offshoot_flush_total/
+// offshoot_flush_duration_seconds — see internal/session's OnTransition
+// hook). So although the daemon registers offshoot_checkpoint_duration_seconds
+// and assigns this hook at startup (per this task's brief), that histogram
+// reads as all-zero on a daemon that never gains a direct checkpoint op —
+// a known, documented gap, not a bug; see this task's report.
+var ObserveCheckpoint func(dur time.Duration)
+
 // copySnapshotToNewLineage copies the snapshot identified by cp (in src's
-// lineage) into a brand-new lineage (epoch 1) and returns the lineage id.
+// lineage) into a brand-new lineage (epoch 1) and returns the lineage id,
+// plus whether it took the fast path (see below) — the latter is
+// ObserveFork's "fast bool" straight from its one caller that reports it,
+// Fork; Rollback and Promote call this too but neither is reflected in any
+// locked metric, so they simply discard the second return value.
 //
 // Fast path (Task 6a): when src's chain at cp resolves to EXACTLY ONE
 // member and that member is itself a snapshot, the child's seed is a
@@ -822,7 +909,7 @@ var forkFastPathHits atomic.Int64
 // CopyObject in general, but S3's is gated to objects at or under its 5GB
 // single-request CopyObject limit, so the sentinel still fires for anything
 // larger — see store.S3.CopyObject's doc comment.
-func (w *Workspace) copySnapshotToNewLineage(src store.Ref, cp store.Checkpoint) (string, error) {
+func (w *Workspace) copySnapshotToNewLineage(src store.Ref, cp store.Checkpoint) (string, bool, error) {
 	lineage := store.NewLineageID()
 	// Resolved once, up front, and threaded through both the fast-path
 	// attempt and the slow-path fallback — see materializeMembersAt's doc
@@ -830,21 +917,21 @@ func (w *Workspace) copySnapshotToNewLineage(src store.Ref, cp store.Checkpoint)
 	// path resolving its own) matters on a remote backend.
 	members, err := w.Store.Chain(src.Lineage, cp.TXID)
 	if err != nil {
-		return "", fmt.Errorf("ops: resolving chain for lineage %s to txid %d: %w", src.Lineage, cp.TXID, err)
+		return "", false, fmt.Errorf("ops: resolving chain for lineage %s to txid %d: %w", src.Lineage, cp.TXID, err)
 	}
 	if !forkSlowPathForTest {
 		ok, err := w.tryFastForkCopy(members, cp, lineage)
 		if err != nil {
-			return "", err
+			return "", false, err
 		}
 		if ok {
-			return lineage, nil
+			return lineage, true, nil
 		}
 	}
 	if _, err := w.copySnapshotIntoLineageFromChain(src.Lineage, members, cp, lineage); err != nil {
-		return "", err
+		return "", false, err
 	}
-	return lineage, nil
+	return lineage, false, nil
 }
 
 // tryFastForkCopy attempts the fast object-copy fork path into lineage,
@@ -901,6 +988,7 @@ func (w *Workspace) tryFastForkCopy(members []store.ChainMember, cp store.Checkp
 // lineage is the grain, not per-checkpoint (see Checkpoint's own meta param
 // for that). Rejected (before any store I/O) if it exceeds the caps.
 func (w *Workspace) Fork(db, srcBranch, newBranch, at string, ttl time.Duration, meta map[string]string) (uint64, error) {
+	start := time.Now()
 	if ttl < 0 {
 		return 0, fmt.Errorf("ops: fork ttl must be zero (no TTL) or positive, got %s", ttl)
 	}
@@ -927,7 +1015,7 @@ func (w *Workspace) Fork(db, srcBranch, newBranch, at string, ttl time.Duration,
 	txid := cp.TXID
 	// Materialized fork point: copy the source snapshot into the child's own
 	// lineage so the child never references parent storage.
-	childLineage, err := w.copySnapshotToNewLineage(src, cp)
+	childLineage, fast, err := w.copySnapshotToNewLineage(src, cp)
 	if err != nil {
 		return 0, err
 	}
@@ -945,6 +1033,9 @@ func (w *Workspace) Fork(db, srcBranch, newBranch, at string, ttl time.Duration,
 		// Branch already exists (or lost a race): remove the orphan snapshot.
 		w.Store.B.Delete(store.SnapshotKey(childLineage, 1, txid))
 		return 0, fmt.Errorf("ops: fork %s@%s: %w", db, newBranch, err)
+	}
+	if ObserveFork != nil {
+		ObserveFork(time.Since(start), fast)
 	}
 	return txid, nil
 }
@@ -988,7 +1079,7 @@ func (w *Workspace) Rollback(db, branch, to string) (string, error) {
 		return "", fmt.Errorf("ops: no checkpoint %q on %s@%s", to, db, branch)
 	}
 	txid := cp.TXID
-	lineage, err := w.copySnapshotToNewLineage(ref, cp)
+	lineage, _, err := w.copySnapshotToNewLineage(ref, cp)
 	if err != nil {
 		return "", err
 	}
@@ -1112,7 +1203,7 @@ func (w *Workspace) Promote(db, source, target string, force bool) (uint64, erro
 	}
 	cp := headCheckpoint(src)
 	txid := cp.TXID
-	lineage, err := w.copySnapshotToNewLineage(src, cp)
+	lineage, _, err := w.copySnapshotToNewLineage(src, cp)
 	if err != nil {
 		return 0, err
 	}
@@ -1150,106 +1241,4 @@ func (w *Workspace) Promote(db, source, target string, force bool) (uint64, erro
 		}
 	}
 	return txid, nil
-}
-
-type BranchStatus struct {
-	DB, Branch  string
-	HeadTXID    uint64
-	Checkpoints []string
-	Protected   bool
-	Parent      string
-	CheckedOut  bool
-	// TTL is the branch's TTL verbatim from the ref ("" if none).
-	TTL string
-	// TTLRemaining is how long until the branch is eligible for reaping,
-	// measured from the later of TouchedAt and LeaseExpiry ("" if TTL is
-	// unset; "expired" once past the deadline).
-	TTLRemaining string
-}
-
-// ReapDeadline computes when ref's TTL expires, measured from the later of
-// its activity clock (TouchedAt) and its lease expiry — either kind of
-// activity defers reaping. ok is false when ref has no TTL, its TTL is
-// non-positive (a negative or zero duration string is not a real TTL — fail
-// closed rather than compute a deadline already in the past), or its TTL or
-// timestamps fail to parse.
-func ReapDeadline(ref store.Ref) (time.Time, bool) {
-	if ref.TTL == "" {
-		return time.Time{}, false
-	}
-	d, err := time.ParseDuration(ref.TTL)
-	if err != nil || d <= 0 {
-		return time.Time{}, false
-	}
-	base, ok := parseRefTime(ref.TouchedAt)
-	if !ok {
-		return time.Time{}, false
-	}
-	if lease, ok := parseRefTime(ref.LeaseExpiry); ok && lease.After(base) {
-		base = lease
-	}
-	return base.Add(d), true
-}
-
-// FormatTTLRemaining renders ref's time-to-reap as of now, for display:
-// "" if ref has no (real) TTL, "expired" once past ReapDeadline, otherwise
-// the remaining time.Duration's String(). Shared by Status and the daemon's
-// "branches" op so the two report identical numbers computed the same way,
-// rather than each formatting ReapDeadline's result independently.
-func FormatTTLRemaining(ref store.Ref, now time.Time) string {
-	deadline, ok := ReapDeadline(ref)
-	if !ok {
-		return ""
-	}
-	if now.After(deadline) {
-		return "expired"
-	}
-	return deadline.Sub(now).String()
-}
-
-// parseRefTime parses an RFC3339Nano ref timestamp field (TouchedAt or
-// LeaseExpiry), which is empty when unset.
-func parseRefTime(s string) (time.Time, bool) {
-	if s == "" {
-		return time.Time{}, false
-	}
-	t, err := time.Parse(time.RFC3339Nano, s)
-	if err != nil {
-		return time.Time{}, false
-	}
-	return t, true
-}
-
-func (w *Workspace) Status() ([]BranchStatus, error) {
-	refs, err := w.Store.ListRefs()
-	if err != nil {
-		return nil, err
-	}
-	var dbs []string
-	for db := range refs {
-		dbs = append(dbs, db)
-	}
-	sort.Strings(dbs)
-	now := time.Now()
-	var out []BranchStatus
-	for _, db := range dbs {
-		for _, br := range refs[db] {
-			r, _, err := w.Store.GetRef(db, br)
-			if err != nil {
-				return nil, err
-			}
-			var cps []string
-			for name := range r.Checkpoints {
-				cps = append(cps, name)
-			}
-			sort.Strings(cps)
-			_, coErr := os.Stat(w.CheckoutPath(db, br))
-			out = append(out, BranchStatus{
-				DB: db, Branch: br, HeadTXID: r.HeadTXID, Checkpoints: cps,
-				Protected: r.Protected, Parent: r.Parent, CheckedOut: coErr == nil,
-				TTL: r.TTL, TTLRemaining: FormatTTLRemaining(r, now),
-			})
-		}
-	}
-	return out, nil
 }

@@ -2,6 +2,7 @@ package main
 
 import (
 	"fmt"
+	"math"
 	"os"
 	"os/exec"
 	"path/filepath"
@@ -192,6 +193,209 @@ func TestServeNegativeFlushEveryIsRejected(t *testing.T) {
 	}
 	if err := run([]string{"-store", dir, "serve", "-flush-every", "-5s"}); err == nil {
 		t.Fatal("serve -flush-every -5s must be rejected, not silently disable auto-flush")
+	}
+}
+
+// TestServeNonPositiveSnapshotEveryIsRejected pins -snapshot-every's own
+// usage-error rule (Milestone 4 Task 6a): unlike -flush-every, there is no
+// "0 means disabled" sentinel for the snapshot cadence — every flush must
+// still eventually snapshot, so 0 and negative values are both rejected
+// rather than silently aliased to "unlimited" or the default. run() must
+// return before ever starting to serve, so this needs no daemon lifecycle
+// (mirrors TestServeNegativeFlushEveryIsRejected's shape).
+func TestServeNonPositiveSnapshotEveryIsRejected(t *testing.T) {
+	dir := filepath.Join(t.TempDir(), "s")
+	if err := run([]string{"-store", dir, "init"}); err != nil {
+		t.Fatal(err)
+	}
+	if err := run([]string{"-store", dir, "create", "app"}); err != nil {
+		t.Fatal(err)
+	}
+	for _, v := range []string{"0", "-1", "-4"} {
+		if err := run([]string{"-store", dir, "serve", "-snapshot-every", v}); err == nil {
+			t.Fatalf("serve -snapshot-every %s must be rejected", v)
+		}
+	}
+	if err := run([]string{"-store", dir, "serve", "-snapshot-every", "not-a-number"}); err == nil {
+		t.Fatal("serve -snapshot-every not-a-number must be rejected")
+	}
+}
+
+// TestParseByteSize pins -ro-cache-budget's value grammar (Milestone 4 Task
+// 5): bare integers are bytes (the contract), a trailing power-of-1024
+// K/M/G/T(B) suffix is a convenience multiplier, "" (flag omitted) is 0
+// (unlimited), and a negative or garbage value is rejected outright rather
+// than silently coerced to 0 or ignored.
+func TestParseByteSize(t *testing.T) {
+	cases := []struct {
+		in      string
+		want    int64
+		wantErr bool
+	}{
+		{"", 0, false},
+		{"0", 0, false},
+		{"1", 1, false},
+		{"1024", 1024, false},
+		{"500", 500, false},
+		{"1K", 1024, false},
+		{"1KB", 1024, false},
+		{"1kb", 1024, false},
+		{"1M", 1 << 20, false},
+		{"500MB", 500 * (1 << 20), false},
+		{"2G", 2 << 30, false},
+		{"1GB", 1 << 30, false},
+		{"1T", 1 << 40, false},
+		{"1TB", 1 << 40, false},
+		{"500B", 500, false},
+		{"-1", 0, true},
+		{"-1MB", 0, true},
+		{"abc", 0, true},
+		{"MB", 0, true},
+		{"1.5MB", 0, true},
+		{"100GB", 100 * (1 << 30), false},
+		// 8388608T = 2^23 * 2^40 = 2^63, one past math.MaxInt64: on int64
+		// this overflows to a negative product, which pre-fix was silently
+		// treated as 0/"unlimited" — the opposite of what a huge-but-finite
+		// budget request meant. Must be a clear error, not a wrapped value.
+		{"8388608T", 0, true},
+		{"9223372036854775807", math.MaxInt64, false},
+	}
+	for _, c := range cases {
+		got, err := parseByteSize(c.in)
+		if c.wantErr {
+			if err == nil {
+				t.Errorf("parseByteSize(%q) = %d, <nil>, want an error", c.in, got)
+			}
+			continue
+		}
+		if err != nil {
+			t.Errorf("parseByteSize(%q) unexpected error: %v", c.in, err)
+			continue
+		}
+		if got != c.want {
+			t.Errorf("parseByteSize(%q) = %d, want %d", c.in, got, c.want)
+		}
+	}
+}
+
+// TestServeNegativeROCacheBudgetIsRejected mirrors
+// TestServeNegativeFlushEveryIsRejected's shape for the new flag: a
+// negative -ro-cache-budget is refused at startup, before any socket/daemon
+// is touched, rather than silently treated as 0 (unlimited) or something
+// else surprising.
+func TestServeNegativeROCacheBudgetIsRejected(t *testing.T) {
+	dir := filepath.Join(t.TempDir(), "s")
+	if err := run([]string{"-store", dir, "init"}); err != nil {
+		t.Fatal(err)
+	}
+	if err := run([]string{"-store", dir, "create", "app"}); err != nil {
+		t.Fatal(err)
+	}
+	if err := run([]string{"-store", dir, "serve", "-ro-cache-budget", "-5"}); err == nil {
+		t.Fatal("serve -ro-cache-budget -5 must be rejected, not silently treated as unlimited")
+	}
+}
+
+// TestStatusShowsROCacheUsageAndBudget exercises `offshoot status`'s
+// ro-cache summary line end to end through the CLI: an empty store reports
+// zero usage with "unlimited" when -ro-cache-budget is omitted, and echoes
+// back a given -ro-cache-budget (including its size-suffix parsing) when
+// one is passed.
+func TestStatusShowsROCacheUsageAndBudget(t *testing.T) {
+	dir := filepath.Join(t.TempDir(), "s")
+	if err := run([]string{"-store", dir, "init"}); err != nil {
+		t.Fatal(err)
+	}
+	if err := run([]string{"-store", dir, "create", "app"}); err != nil {
+		t.Fatal(err)
+	}
+
+	out := call(t, dir, "status")
+	if !strings.Contains(out, "ro-cache: 0 entries, 0 bytes used (budget: unlimited)") {
+		t.Fatalf("status without -ro-cache-budget:\n%s", out)
+	}
+
+	out = call(t, dir, "status", "-ro-cache-budget", "1MB")
+	if !strings.Contains(out, fmt.Sprintf("budget %d bytes", int64(1<<20))) {
+		t.Fatalf("status -ro-cache-budget 1MB:\n%s", out)
+	}
+}
+
+// TestServeTokenWithoutHTTPIsRejected and
+// TestServeAllowNonLoopbackWithoutHTTPIsRejected pin Milestone 4 Task 3's
+// review-fold item: -token/-http-allow-non-loopback only mean anything
+// alongside -http, so giving either one without it must fail as a startup
+// error (almost certainly a typo'd or dropped -http ADDR) rather than
+// silently doing nothing — the surprising alternative would be an operator
+// noticing only by ABSENCE (no HTTP listener, no auth) instead of an
+// explicit error. Both run() before ever touching the socket/daemon, same
+// shape as TestServeNegativeFlushEveryIsRejected.
+func TestServeTokenWithoutHTTPIsRejected(t *testing.T) {
+	dir := filepath.Join(t.TempDir(), "s")
+	if err := run([]string{"-store", dir, "init"}); err != nil {
+		t.Fatal(err)
+	}
+	err := run([]string{"-store", dir, "serve", "-token", "some-token-value-0123456789"})
+	if err == nil {
+		t.Fatal("serve -token without -http must be rejected, not silently ignored")
+	}
+	if !strings.Contains(err.Error(), "-token given without -http") {
+		t.Fatalf("unexpected error: %v", err)
+	}
+}
+
+func TestServeAllowNonLoopbackWithoutHTTPIsRejected(t *testing.T) {
+	dir := filepath.Join(t.TempDir(), "s")
+	if err := run([]string{"-store", dir, "init"}); err != nil {
+		t.Fatal(err)
+	}
+	err := run([]string{"-store", dir, "serve", "-http-allow-non-loopback"})
+	if err == nil {
+		t.Fatal("serve -http-allow-non-loopback without -http must be rejected, not silently ignored")
+	}
+	if !strings.Contains(err.Error(), "-http-allow-non-loopback given without -http") {
+		t.Fatalf("unexpected error: %v", err)
+	}
+}
+
+// TestServeHTTPNonLoopbackStartupErrorsAreDistinct exercises PM Amendment
+// 10's two-distinct-errors requirement through the CLI end to end (not
+// just daemon.ValidateHTTPBind directly, which internal/daemon's own tests
+// already cover) — missing -http-allow-non-loopback vs. (ack given but) no
+// explicit token must fail with different messages, both before run() ever
+// creates a socket/daemon.
+func TestServeHTTPNonLoopbackStartupErrorsAreDistinct(t *testing.T) {
+	dir := filepath.Join(t.TempDir(), "s")
+	if err := run([]string{"-store", dir, "init"}); err != nil {
+		t.Fatal(err)
+	}
+	errNoAck := run([]string{"-store", dir, "serve", "-http", "0.0.0.0:0"})
+	if errNoAck == nil {
+		t.Fatal("serve -http on a non-loopback address without -http-allow-non-loopback must be rejected")
+	}
+	errNoToken := run([]string{"-store", dir, "serve", "-http", "0.0.0.0:0", "-http-allow-non-loopback"})
+	if errNoToken == nil {
+		t.Fatal("serve -http-allow-non-loopback without an explicit token must be rejected")
+	}
+	if errNoAck.Error() == errNoToken.Error() {
+		t.Fatalf("the two non-loopback startup errors must be distinct, both were: %q", errNoAck.Error())
+	}
+}
+
+// TestServeShortTokenIsRejected exercises the minHTTPTokenLen guard through
+// the CLI: an explicit -token under 16 characters must be a startup error,
+// not something only internal/daemon.StartHTTP's own tests catch.
+func TestServeShortTokenIsRejected(t *testing.T) {
+	dir := filepath.Join(t.TempDir(), "s")
+	if err := run([]string{"-store", dir, "init"}); err != nil {
+		t.Fatal(err)
+	}
+	err := run([]string{"-store", dir, "serve", "-http", "127.0.0.1:0", "-token", "short"})
+	if err == nil {
+		t.Fatal("serve -http with a short -token must be rejected")
+	}
+	if !strings.Contains(err.Error(), "at least") {
+		t.Fatalf("unexpected error: %v", err)
 	}
 }
 

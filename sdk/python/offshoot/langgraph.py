@@ -68,7 +68,7 @@ from __future__ import annotations
 import hashlib
 import re
 
-from .client import Client, OffshootError, Session
+from .client import Client, OffshootError, Session, _TTL
 
 __all__ = ["ThreadForks"]
 
@@ -81,7 +81,7 @@ _MAX_BODY = 40
 _HASH_LEN = 8
 
 
-def _sanitize(raw) -> str:
+def _sanitize(raw: object) -> str:
     """Map an arbitrary id to a `store.ValidateName`-safe, [a-z0-9-] string.
 
     Deterministic: the same raw id always sanitizes to the same output. A
@@ -107,7 +107,7 @@ class ThreadForks:
     """
 
     def __init__(self, client: Client, db: str, base_branch: str = "main",
-                 ttl="24h", prefix: str = "thread-"):
+                 ttl: _TTL = "24h", prefix: str = "thread-"):
         self._client = client
         self._db = db
         self._base_branch = base_branch
@@ -115,14 +115,14 @@ class ThreadForks:
         self._prefix = prefix
         self._sessions: dict[object, Session] = {}
 
-    def branch_for(self, thread_id) -> str:
+    def branch_for(self, thread_id: object) -> str:
         """The deterministic, sanitized offshoot branch name for thread_id."""
         return self._prefix + _sanitize(thread_id)
 
     def _branch_names(self) -> set[str]:
         return {b.branch for b in self._client.branches(self._db)}
 
-    def _session(self, thread_id) -> Session:
+    def _session(self, thread_id: object) -> Session:
         session = self._sessions.get(thread_id)
         if session is not None:
             return session
@@ -133,18 +133,18 @@ class ThreadForks:
         self._sessions[thread_id] = session
         return session
 
-    def path(self, thread_id) -> str:
+    def path(self, thread_id: object) -> str:
         """Open (forking from base_branch if this thread is new) and return
         the writable sqlite path for thread_id."""
         return self._session(thread_id).path
 
-    def checkpoint(self, thread_id, checkpoint_id) -> int:
+    def checkpoint(self, thread_id: object, checkpoint_id: object) -> int:
         """Flush thread_id's session to a checkpoint named after
         checkpoint_id; returns the flush's txid."""
         name = _sanitize(checkpoint_id)
         return self._session(thread_id).flush(name=name)
 
-    def fork_thread(self, from_thread, at_checkpoint, new_thread) -> str:
+    def fork_thread(self, from_thread: object, at_checkpoint: object, new_thread: object) -> str:
         """Fork new_thread's database off from_thread's, at at_checkpoint.
 
         at_checkpoint must have previously been named via
@@ -189,7 +189,7 @@ class ThreadForks:
                            from_checkpoint=ckpt_name, ttl=self._ttl)
         return self._session(new_thread).path
 
-    def close(self, thread_id=None) -> None:
+    def close(self, thread_id: object | None = None) -> None:
         """Close thread_id's session, or every open session if thread_id is
         None."""
         if thread_id is None:

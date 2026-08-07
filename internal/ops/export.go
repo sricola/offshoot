@@ -148,6 +148,45 @@ func (w *Workspace) CheckoutAtPath(db, branch, checkpoint string) string {
 // pure cache hit, and will surface a real error (e.g. "no checkpoint") if
 // the checkpoint has since become unreachable, rather than silently
 // serving the stale cache the force=false path would have returned.
+//
+// Unbounded growth: checkouts-ro grows by one file per distinct
+// (db, branch, checkpoint) ever cached and nothing here reclaims it —
+// Milestone 4 Task 5's `-ro-cache-budget` janitor pass (EvictROCache,
+// rocache.go) is the bound, LRU-evicting entries when the whole tree
+// exceeds a configured byte budget (default 0 = unlimited, matching this
+// function's own unbounded-by-default behavior). A force=false cache HIT
+// here also touches this entry's `.last-used` marker (touchLastUsed) —
+// that eviction's LRU clock, so a repeatedly-hit checkpoint stays hot even
+// under a tight budget.
+//
+// TOCTOU under a budget: once a budget is configured, the path this call
+// returns — whether from a fresh materialize or a force=false cache HIT —
+// is NOT a guarantee that the file still exists by the time the caller
+// gets around to opening it: a janitor pass running concurrently, under a
+// tight-enough budget, can evict this exact entry in the window between
+// this call returning and the caller's own open. This is not a bug to
+// work around defensively so much as the accepted cost of an automatic
+// background reclaimer sitting on top of what used to be a purely
+// caller-driven, manual-`rm -rf`-safe cache (see the "safe to `rm -rf`"
+// paragraph above, which already promised exactly this rebuildability —
+// EvictROCache is just the first thing in this codebase that exercises it
+// automatically and unpredictably, rather than only ever at an operator's
+// own hand). Practical guidance for a caller under a configured budget:
+//   - A file that vanishes AFTER you have already opened it is safe to keep
+//     reading — POSIX unlink-of-an-open-file semantics; the content you
+//     already have an fd on does not corrupt or truncate out from under
+//     you, it simply won't be visible to a future os.Stat/open on that path.
+//   - A file that is gone by the time you TRY to open it (ENOENT) is not a
+//     hard error to propagate — it means "evicted since your CheckoutAt
+//     call returned this path"; the fix is to call CheckoutAt again (this
+//     checkpoint's content is immutable, so a re-materialize produces
+//     byte-identical content to what would have been there), not to treat
+//     it as data loss or a corrupted store.
+//
+// See EvictROCache's own doc comment (rocache.go) for the eviction-side
+// half of this same race, including why a touch landing exactly inside the
+// window does (usually) or doesn't (rarely, but still safely) save an
+// entry from this pass.
 func (w *Workspace) CheckoutAt(db, branch, checkpoint string, force bool) (string, error) {
 	if err := store.ValidateName(db); err != nil {
 		return "", err
@@ -177,6 +216,13 @@ func (w *Workspace) CheckoutAt(db, branch, checkpoint string, force bool) (strin
 	path := w.CheckoutAtPath(db, branch, checkpoint)
 	if !force {
 		if _, err := os.Stat(path); err == nil {
+			// Milestone 4 Task 5: touch-on-HIT for the LRU eviction clock
+			// (PM Amendment 11) — see touchLastUsed's doc comment (rocache.go)
+			// for why a separate `.last-used` marker exists at all rather
+			// than trusting this file's own mtime (which only ever reflects
+			// when it was last MATERIALIZED, never when it was last served
+			// as a cache hit). Best-effort: never fails this call.
+			touchLastUsed(path)
 			return path, nil
 		}
 	}

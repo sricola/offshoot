@@ -58,6 +58,7 @@ file, IAM role).
 | `OFFSHOOT_STORE` | Default store spec when `-store` isn't passed |
 | `OFFSHOOT_CHECKOUTS` | Where checkouts are materialized, for a *remote* (`s3://`) store; local stores always keep checkouts under the store directory itself. Defaults to a per-store directory under the user cache dir, keyed by the store's resolved identity (endpoint/region/path-style included, not just the literal spec string) |
 | `OFFSHOOT_SOCKET` | Overrides the daemon socket path for `offshoot serve`, `offshoot session ...`, and `offshoot mcp`; if unset, all three derive the same default path from the store spec, so they agree without it |
+| `OFFSHOOT_TOKEN` | The Bearer token for `offshoot serve -http`, in place of `-token`; see [`-http ADDR`](#-http-addr--opt-in-http-listener-milestone-4-task-3) below |
 
 **Naming rules**, enforced on every database name, branch name, and
 checkpoint name: 1–128 characters, charset `[a-z0-9-_.]`, and never exactly
@@ -380,7 +381,52 @@ under an active lease (a live holder may still be mid-write; without
 `--force` this is refused outright).
 
 **Errors:** protected without `--force`; live lease without `--force`;
-checkout is busy (close connections first).
+checkout is busy (close connections first); the destroy lost a race to a
+concurrent `AcquireLease` on the same branch (retry — see below).
+
+### Claim-guarded delete (Milestone 4 Task 6b)
+
+Between checking a branch's lease and actually deleting its ref sits a
+window: a lease could be acquired in that gap and have its brand-new
+holder's branch deleted out from under it moments later. Destroy closes
+this by CAS-writing a `Deleting` claim on the ref *before* it does anything
+irreversible — the same shape as `offshoot gc`'s reap claim (`Reaping`),
+generalized to every `destroy` call, not just TTL reaping. A concurrent
+`AcquireLease` (CLI `lease acquire`, the daemon `open` op, or the
+embeddable library directly) checks for this claim and refuses outright
+(retryable — the claim is always transient) rather than racing it. This
+closes the exact TOCTOU an earlier design review documented for the M2
+Destroy path.
+
+`--force` still claim-guards: it bypasses the protected/live-lease checks
+above — an operator's explicit override of *those* — never the claim
+itself. A lease acquired a moment before a forced destroy lands still wins
+the underlying compare-and-swap on the ref, and the forced destroy reports
+a retryable race loss exactly like an unforced one would.
+
+**Backend-specific mechanics** (PM Amendment 5: do not pretend S3
+`DeleteObject` has preconditions it doesn't):
+
+- **Local** gets a TRUE conditional delete on top of the claim: the same
+  per-key lock file `PutIf` already uses to implement compare-and-swap also
+  backs a compare-and-delete (`Local.DeleteIf`) — belt-and-suspenders, since
+  the claim above already serializes concurrent destroys/acquires on its
+  own.
+- **S3** has no compare-and-delete precondition in its API at all
+  (`DeleteObject` ignores `If-Match`/`If-None-Match`; those headers only
+  apply to `GetObject`/`PutObject`). Its delete stays unconditional; the
+  CAS-written `Deleting` claim marker is the entire safety mechanism on this
+  backend, not a supplement to a conditional delete that doesn't exist.
+
+A Destroy call that crashes after landing its claim but before finishing
+the delete leaves the claim stranded — the branch is untouched (no partial
+delete), but a naive read of the claim alone would block it forever. The
+daemon's janitor self-heals this on the same cadence as reap/GC: a
+`Deleting` claim older than 30 seconds (destroy is a handful of local
+filesystem operations plus at most one checkout quiesce — anything stuck
+longer means the process that claimed it is gone) is cleared, and the
+branch becomes destroyable/leasable again. `offshoot gc` triggers the same
+self-heal on demand, same as it does for a stranded reap claim.
 
 ## `offshoot gc [--grace duration]`
 
@@ -404,19 +450,112 @@ disabling collection.
 Prints which branches were reaped, and how many lineages were tombstoned vs.
 actually deleted.
 
-## `offshoot status`
+## `offshoot status [-ro-cache-budget BYTES]`
 
 ```
 offshoot status
+offshoot status -ro-cache-budget 500MB
 ```
 
-Prints every branch across every database: head transaction id, named
-checkpoints, `protected` and `checked-out` flags (when applicable), and —
-for a branch with a TTL — the TTL itself and time remaining until it's
-reap-eligible (`remaining=expired` once past the deadline). TTL remaining is
-computed from the later of the branch's last-touch time and its lease
-expiry, whichever is later — matching exactly what the janitor's reap logic
-uses, so `status` never disagrees with what will actually happen.
+Prints every branch across every database: its computed **state** (see
+below), head transaction id, named checkpoints, `protected` and
+`checked-out` flags (when applicable), and — for a branch with a TTL — the
+TTL itself and time remaining until it's reap-eligible
+(`remaining=expired` once past the deadline). TTL remaining is computed
+from the later of the branch's last-touch time and its lease expiry,
+whichever is later — matching exactly what the janitor's reap logic uses,
+so `status` never disagrees with what will actually happen.
+
+After the branch listing, a final `ro-cache: N entries, B bytes used
+(budget: unlimited)` line (Milestone 4 Task 5) reports `checkouts-ro`'s
+current usage (`ops.Workspace.ROCacheUsage`, an at-rest read — no daemon
+required, exactly like the rest of this command). `-ro-cache-budget` is
+**display-only** here: it echoes back `serve -ro-cache-budget`'s own value
+and grammar (see below) so an operator can see usage against the budget
+they intend to run with, without needing a live daemon connection — the
+budget itself is never persisted anywhere (like every other `serve` tuning
+flag), so this at-rest command has no other way to know what a *running*
+daemon was actually started with. Omitted, the line reads
+`(budget: unlimited)` regardless of what any running daemon's own
+`-ro-cache-budget` is actually set to.
+
+### Branch states
+
+Every branch is in exactly one of six states, computed fresh on every call
+— nothing about state is persisted anywhere. `offshoot status`
+(`ops.Workspace.Status`, CLI/at-rest — see above) and the daemon's
+`branches` op (`BranchInfo.state`; Python `Client.branches()`'s
+`Branch.state`, TypeScript `Client.branches()`'s `Branch.state`) report the
+identical computation for the states both can see; a daemon additionally
+knows two states no at-rest computation can, since they depend on its own
+in-memory session map:
+
+| State | Meaning | Who can report it |
+|---|---|---|
+| `active` | The branch's ref carries a live lease — someone (in or out of a daemon) holds it right now. | Both |
+| `pending` | This daemon has reserved a session slot for the branch and is still inside its (slow) `session.Open` — no live session yet, but the branch is spoken for. | Daemon only |
+| `error` | A session is open here and its `Err()` is non-nil (lease loss, a capture failure, any terminal session failure). | Daemon only |
+| `dirty` | No live lease; a checkout exists whose sidecar-recorded identity (lineage/epoch/txid) matches the ref but whose content hash doesn't — un-checkpointed local edits. | Both |
+| `detached` | No live lease; a checkout exists whose sidecar-recorded **lineage** doesn't match the ref's current lineage — a checkout orphaned by a `rollback`/`promote` that repointed the branch at a new lineage before (or without) refreshing this checkout (their own checkout refresh is best-effort and can be skipped by a busy checkout at repoint time). | Both |
+| `idle` | None of the above. | Both |
+
+**Precedence** when more than one condition technically holds, most to
+least specific: `error` > `pending` > `active` > `dirty` > `detached` >
+`idle`. In practice `error` and `pending` can never both apply to the same
+branch at once (a daemon's session map holds at most one entry per
+`db@branch`, either a reservation or a live session, never both) — the
+ordering matters for `active` vs. `dirty`/`detached`: a branch can be both
+leased AND locally modified/orphaned at the file level, and `active` wins
+the report.
+
+**`idle` is a deliberate addition, not in the original design spec.** The
+spec's branch-state taxonomy (`active`/`pending`/`dirty`/`detached`/
+`error`) assumed a daemon was always running to layer a state over every
+branch. `offshoot status`'s CLI/at-rest mode has no daemon and no session
+map, so a branch with nothing going on (never checked out, never leased)
+still needs a name to report — `idle` is that name. It also covers a
+case checkout-staleness detection can't cleanly attribute to `detached`:
+a checkout whose sidecar-recorded lineage still matches the ref, but whose
+epoch/txid lags behind (the branch advanced within the SAME lineage — e.g.
+a daemon session's flush — since this checkout was last refreshed), isn't
+orphaned, just stale; it needs a re-materialize (`offshoot checkout`), not
+a warning that its parent branch moved out from under it. That case reads
+`idle`, not `detached`.
+
+**`dirty` and `detached` are structurally mutually exclusive** on any
+single evaluation: a lineage mismatch reports `detached` immediately,
+before the identity/hash comparison that could ever produce `dirty` runs
+at all.
+
+**Known blind spot:** a checkout with no readable `.sum` sidecar at all
+(never stamped, or corrupt/legacy) always reads `idle`, even if its
+content has actually diverged from the ref — there's no sidecar to detect
+that against. This is a deliberate "no evidence, stay silent" stance
+(mirrors the sidecar mechanism's own internal "unknown" verdict for the
+identical input), not an oversight; it's only reachable via a checkout
+materialized entirely outside `offshoot checkout`/`checkpoint`/`rollback`/
+`promote`, all of which always stamp a sidecar.
+
+**Cost:** determining `dirty` (once a checkout's sidecar identity already
+matches the ref) requires a real WAL checkpoint (`wal_checkpoint(TRUNCATE)`,
+up to a 3-second busy timeout) followed by a full SHA-256 hash of the
+checkout's content — a committed write can sit in a checkout's WAL,
+invisible to a bare hash of the main file, until something folds it in, so
+skipping the checkpoint step would misreport a genuinely dirty checkout as
+idle. This runs **per branch**, on every `offshoot status` / `branches`
+call, for every branch that is checked out, unleased, and not already
+`detached` — i.e. exactly the branches where "is it dirty" is still an
+open question. A store with many large, checked-out, unleased branches
+will feel this on every call. There is no cheap short-circuit: file
+size/mtime cannot substitute for a real hash (mtime is exactly what this
+codebase's own `.last-used`-style touch-file conventions elsewhere work
+around, not something trustworthy for content identity). If the checkpoint
+attempt itself reports busy — a live connection is actively using that
+unleased checkout right now — the state is reported as `dirty` directly
+(without a hash), on the reasoning that active, untracked use of an
+unleased checkout IS itself the kind of activity `dirty` exists to
+surface, even though the exact byte diff can't be observed at that
+instant.
 
 ## `offshoot lease list`
 
@@ -457,12 +596,15 @@ Releases the branch's current lease (looked up first via the same listing
 
 **Errors:** no lease currently held on that branch.
 
-## `offshoot serve [-socket PATH] [-reap-every DURATION] [-gc-grace DURATION] [-flush-every DURATION]`
+## `offshoot serve [-socket PATH] [-reap-every DURATION] [-gc-grace DURATION] [-flush-every DURATION] [-snapshot-every N] [-ro-cache-budget BYTES] [-http ADDR] [-token TOKEN] [-http-allow-non-loopback]`
 
 ```
 offshoot serve
 offshoot serve -socket /tmp/o.sock
 offshoot serve -reap-every 1m -gc-grace 15m -flush-every 30s   # all three are the defaults
+offshoot serve -snapshot-every 4                                # snapshot every 4th flush instead of every 16th
+offshoot serve -http 127.0.0.1:8080                            # opt-in HTTP: token auto-generated, printed once
+OFFSHOOT_TOKEN=$(openssl rand -hex 32) offshoot serve -http 127.0.0.1:8080
 ```
 
 Starts the daemon: a long-running process that serves a unix socket (mode
@@ -470,7 +612,8 @@ Starts the daemon: a long-running process that serves a unix socket (mode
 committed WAL transaction continuously, and runs the janitor. Blocks until
 `SIGINT`/`SIGTERM`, at which point it releases every lease and shuts down
 cleanly (closing live sessions, draining in-flight opens, removing the
-socket) rather than leaving stale leases behind.
+socket, and closing any HTTP listener) rather than leaving stale leases
+behind.
 
 `-socket PATH` overrides the default socket location (see `OFFSHOOT_SOCKET`
 above); if a `session` command needs to reach this daemon, it must be given
@@ -493,8 +636,323 @@ of everything since the last manual flush. See [What a flush
 costs](../README.md#what-a-flush-costs) in the README for what a background
 flush (and every session's mandatory first "settling" flush) actually cost.
 
+`-snapshot-every N` sets the full-snapshot cadence
+(`session.Options.SnapshotEvery`) applied to every session this daemon
+opens (default `16`, unchanged if the flag is omitted; must be `>= 1` —
+there is no "unlimited"/"disabled" sentinel the way `-flush-every 0`
+disables auto-flush, since every flush must eventually snapshot).
+`Options.SnapshotEvery` has been configurable in the embeddable session
+library since Milestone 2; this flag is what exposes the same knob to a
+daemon-managed session, closing the gap the design spec's original
+taxonomy left open. See [What a flush
+costs](../README.md#what-a-flush-costs) in the README for the cost
+trade-off this cadence controls: a **lower** N (more frequent snapshots)
+means cheaper, bounded reads (a chain never replays more than N-1
+segments past its snapshot) at the cost of shipping a full-database
+upload on every Nth flush instead of an incremental segment; a **higher**
+N amortizes that upload cost across more flushes but lets read-side
+replay grow proportionally longer between snapshots. There is no single
+right answer — it is a bandwidth/write-cost vs. read-latency trade-off
+tuned to a workload's actual write-vs-read ratio, the same trade-off
+[docs/benchmarks.md](../docs/benchmarks.md) measures at the library's
+default of 16.
+
 **Errors:** socket path already in use by another listener; underlying
-store-attach failure; `-flush-every` given a negative duration.
+store-attach failure; `-flush-every` given a negative duration;
+`-snapshot-every` given a value less than 1, or a non-integer;
+`-ro-cache-budget` given a negative value.
+
+### `-ro-cache-budget BYTES` — checkouts-ro disk budget (Milestone 4 Task 5)
+
+```
+offshoot serve -ro-cache-budget 0            # unlimited (the default)
+offshoot serve -ro-cache-budget 536870912    # 512 MiB, in bytes
+offshoot serve -ro-cache-budget 500MB        # same idea, via a size suffix
+```
+
+Bounds `checkouts-ro` — the read-only cache `offshoot checkout --at
+--read-only` / the daemon's `checkout-at` op materializes into (see
+[above](#read-only-historical-checkout---at-checkpoint---read-only---force))
+— which otherwise grows without bound: one file per distinct
+`db@branch@checkpoint` ever cached, never reclaimed on its own. **Never
+`checkouts/`** (the writable, leased tree `checkout`/`session open` use) —
+see the writable-never-evicted guarantee below.
+
+Default `0` means unlimited, matching `CheckoutAt`'s own unbounded-by-default
+behavior — the janitor still computes and reports usage every pass (see
+below), it just never evicts. A bare integer is bytes, the contract this
+flag, `offshoot_ro_cache_bytes`, and every eviction event/log line all
+speak; as a convenience, a trailing power-of-1024 size suffix is also
+accepted, case-insensitively: `K`/`KB`, `M`/`MB`, `G`/`GB`, `T`/`TB` (each
+multiplies by 1024^n — **not** the SI decimal 1000-based convention some
+tools use for the same letters; pass raw bytes if that distinction
+matters to you). `offshoot status`'s own `-ro-cache-budget` flag accepts
+the identical grammar, purely for display (see `offshoot status` above) —
+it is never persisted, so that at-rest command has no other way to know
+what a running daemon was actually started with.
+
+**When it runs:** on the same cadence as reap/GC — every `-reap-every`
+tick (the janitor loop; `-reap-every 0` disables the janitor entirely, so
+no ro-cache pass runs either, exactly like reap/GC). Each pass:
+
+1. Computes `checkouts-ro`'s total current size and sets
+   `offshoot_ro_cache_bytes` to it — **always**, even when the budget is
+   `0` or usage is already under it. This is a once-per-janitor-pass
+   gauge, not a scrape-time one: between passes it can lag real usage by
+   up to `-reap-every`'s interval (e.g. a `CheckoutAt` call materializing a
+   large new entry moments after a pass won't be reflected until the
+   next one).
+2. If usage exceeds the budget, evicts entries **oldest-by-LRU-clock
+   first** (see below) until usage is back at or under it.
+
+**The LRU clock (PM Amendment 11, pre-decided): a `.last-used`
+touch-on-HIT marker file, not the cache file's own mtime.** Every
+force=false `CheckoutAt` cache HIT (a repeat call for an already-cached
+`db@branch@checkpoint`) touches a `<cachefile>.last-used` sidecar file to
+the current time. This exists because the cache file's own mtime is set
+exactly once, by the materialize that created it — a cache HIT is a pure
+read of an already-`chmod 0444` file and must never write through it again
+— so without a separate marker, "least recently used" would silently
+collapse to "least recently created," exactly backwards for a cache whose
+entire purpose is that a checkpoint hit over and over stays hot. Ranking:
+the marker's mtime when one exists, falling back to the cache file's own
+mtime (the materialize timestamp) as the floor for an entry that has never
+been hit since it was created. A cache file with **no** marker therefore
+ranks no more recently than its own creation time — the correct, and only
+sensible, floor.
+
+**`checkouts/` is never evicted — by construction, not a runtime check.**
+The eviction pass only ever lists and removes files under `checkouts-ro`
+(a directory tree, and a filename shape — `<branch>@<checkpoint>.db` — that
+`checkouts/<db>/<branch>.db` can never collide with; see the read-only
+checkout section above for the same separation stated from `CheckoutAt`'s
+side). There is no code path in the eviction pass that can construct, or
+be handed, a `checkouts/` path at all — a leased, currently-open session's
+writable checkout survives even the most aggressive budget (e.g. `1`, which
+forces every `checkouts-ro` entry out) untouched, by the same guarantee.
+
+**Eviction is loud**: one `offshoot: janitor: ro-cache: evicted
+<db>@<branch>@<checkpoint> (<bytes> bytes)` line to stderr per entry
+removed, `offshoot_ro_cache_evictions_total` (a counter) incremented once
+per entry, and an `evicted` event published on the [event
+bus](#eventing-subscribe-op--get-events) (`{type:"evicted", db, branch,
+detail:{checkpoint, bytes}}`) — subscribe (socket or `GET /events`) to
+watch evictions happen in real time. Each eviction removes both the cache
+file and its `.last-used` marker together.
+
+**TOCTOU under a configured budget:** a path `checkout --at --read-only` /
+`checkout-at` returns — from a fresh materialize OR a cache hit — is not a
+guarantee the file still exists by the time you open it once a nonzero
+budget is running: a concurrent janitor pass can evict that exact entry
+in the window between the call returning and your own open. This is the
+accepted cost of turning what used to be a purely caller/operator-driven,
+manually-`rm -rf`-safe cache into one an automatic background reclaimer
+also touches. Two rules cover it completely:
+
+- Already opened the file? Keep reading — POSIX unlink-of-an-open-file
+  semantics mean an eviction racing your open connection never corrupts
+  or truncates what you already have a handle on; it just stops being
+  visible to a future `open`/`stat` on that path.
+- Get `ENOENT` trying to open a path you were just handed? That's not
+  data loss or a corrupted store — it means "evicted since that call
+  returned." Re-call `checkout --at --read-only` (or the `checkout-at`
+  op): the checkpoint's content is immutable, so re-materializing
+  produces byte-identical content, not stale or different data.
+
+A `.last-used` touch (a cache hit) landing during the SAME pass that's
+about to evict that exact entry usually spares it (the janitor re-checks
+the marker immediately before removing anything); a touch landing in the
+last, microscopic instant right before the actual delete does not save
+it that round, but is still safe per the two rules above — the entry
+simply gets re-hit as a fresh materialize on the next `checkout-at` call,
+and self-heals into staying hot from then on.
+
+`checkouts-ro` remains safe to `rm -rf` at any time regardless of the
+budget (see the read-only checkout section above) — a budget just
+automates what that manual cleanup would otherwise require doing by hand.
+
+### `-http ADDR` — opt-in HTTP listener (Milestone 4 Task 3)
+
+Off by default. `-http ADDR` (e.g. `127.0.0.1:8080`) starts an HTTP
+listener alongside the unix socket, exposing:
+
+See [docs/operations.md](operations.md) for the operator-facing view of
+this whole surface (metrics reference table, HTTP/auth threat model,
+tuning-flag trade-offs) and [docs/recipes/kubernetes.md](recipes/kubernetes.md)
+for a real sidecar manifest — this section stays the flag-by-flag command
+reference.
+
+| Method | Path | Auth | Body |
+|---|---|---|---|
+| `POST` | `/rpc` | Bearer | The same `Request`/`Response` JSON the unix socket speaks, one op per POST (`Content-Type: application/json` required; body capped at 1MiB, oversized -> `413`) |
+| `GET` | `/metrics` | Bearer | Prometheus text exposition of the locked `offshoot_*` metric set — see [docs/operations.md](operations.md#metrics) for the full name/type/label reference table |
+| `GET` | `/healthz` | **none** | `{"ok":true,"sessions":N}` — the one endpoint that needs no token, for liveness probes |
+| `GET` | `/events` | Bearer | Server-Sent Events: the daemon's event stream (Milestone 4 Task 4a — see [Eventing](#eventing-subscribe-op--get-events) below) |
+| `GET` | `/debug/pprof/*` | Bearer | `net/http/pprof`'s standard handlers (index, cmdline, profile, symbol, trace) |
+
+**Token:** `-token TOKEN` or `OFFSHOOT_TOKEN` sets it explicitly; if
+neither is given, one is generated and printed to stderr **exactly once**
+at startup — treat that line, and your terminal scrollback/shell history,
+as sensitive. Every request but `/healthz` requires `Authorization: Bearer
+<token>`, compared in constant time; the token is never logged again after
+that one startup line — only an 8-character fingerprint (`offshoot: http
+listening on ... (token fingerprint XXXXXXXX)`) appears in any later
+output.
+
+**Binding beyond localhost:** a loopback bind (`127.0.0.1`, `::1`,
+`localhost`) needs nothing further. Any other address requires BOTH
+`-http-allow-non-loopback` (an explicit acknowledgment) AND an explicit
+`-token`/`OFFSHOOT_TOKEN` — the auto-generated, printed-once token is a
+loopback-only convenience. Missing either is a distinct startup error (the
+daemon never starts, rather than starting under-acknowledged):
+
+```
+$ offshoot serve -http 0.0.0.0:8080
+offshoot: daemon: -http "0.0.0.0:8080" binds a non-loopback address; this requires
+-http-allow-non-loopback (an explicit acknowledgment that this endpoint will be
+reachable beyond localhost)
+
+$ offshoot serve -http 0.0.0.0:8080 -http-allow-non-loopback
+offshoot: daemon: -http "0.0.0.0:8080" with -http-allow-non-loopback also requires
+an explicit -token or OFFSHOOT_TOKEN; the auto-generated, printed-once token is a
+loopback-only convenience
+```
+
+**Threat model:** the token is a shared secret for a single-tenant,
+same-host-or-trusted-network deployment — anyone holding it can do
+everything any daemon client can do (identical to anyone able to open the
+unix socket today), not a multi-tenant isolation boundary. There is no TLS;
+a non-loopback bind should sit behind a trusted network boundary (VPN,
+private subnet) of its own. **Treat stderr as sensitive at daemon
+startup**: it is the only place a freshly auto-generated token is ever
+printed in full.
+
+`http.Server` runs explicit timeouts rather than the stdlib's unbounded
+defaults: `ReadHeaderTimeout` 5s (slow-header protection), `ReadTimeout`
+30s, `WriteTimeout` 90s (sized to leave headroom for
+`/debug/pprof/profile`'s/`trace`'s default 30s capture window — a longer
+`?seconds=` capture than that budget allows will be cut off; request a
+shorter window or profile out-of-band), `IdleTimeout` 2 minutes.
+
+**Errors:** everything `offshoot serve` can already error on, plus: HTTP
+address already in use; the two non-loopback-bind errors above.
+
+## Eventing (subscribe op / GET /events)
+
+See [docs/operations.md](operations.md#eventing) for the operator summary
+(drop-slow-consumer semantics, what to do when a subscriber disappears,
+the SDK helpers to reach for) — this section is the wire-level reference.
+
+The daemon publishes one versioned JSON event per state transition it
+observes, drainable two ways — the unix socket protocol's `subscribe` op,
+and HTTP's `GET /events` (Server-Sent Events) — both carrying the exact
+same JSON, encoded by the same function daemon-side (PM Amendment 4: one
+schema, one encoder). There is no history/replay: a subscriber only ever
+sees events published *after* it subscribes.
+
+**Event shape:**
+
+```json
+{"v":1,"ts":"2026-08-07T12:00:00Z","type":"flushed","db":"app","branch":"main","detail":{"kind":"manual","txid":7,"duration_seconds":0.017}}
+```
+
+`v` is the schema version (currently always `1`); `ts` is RFC3339 UTC.
+`type` is one of:
+
+| `type` | Fired when | `detail` |
+|---|---|---|
+| `session_opened` | A session opens (daemon `open` op) | `holder`, `epoch` |
+| `flushed` | A flush succeeds (manual `flush` op or background auto-flush) | `kind` (`manual`/`auto`), `txid`, `duration_seconds` |
+| `flush_failed` | A flush fails | `kind`, `error`, `duration_seconds` |
+| `fenced` | A session is fenced out by a lease it no longer holds | `cause` |
+| `session_closed` | A session closes (daemon `close` op, or `shutdown`) | `error` (only if the close itself errored) |
+| `reaped` | The janitor destroys a branch whose TTL expired | *(none)* |
+| `evicted` | The janitor evicts a `checkouts-ro` entry over `-ro-cache-budget` | `checkpoint`, `bytes` |
+| `dropped_slow_consumer` | Sent to a subscriber being dropped (see below), never to anyone else | *(none)* |
+
+**Slow-subscriber drop:** publishing never blocks the daemon (a session
+transition or the janitor). A subscriber whose bounded buffer (64 events)
+is full when an event is published is dropped immediately: removed from
+the subscriber set, sent exactly one terminal `dropped_slow_consumer`
+event, and has its stream closed. This can never slow down or fail a
+session's own progress or the janitor's own cadence — see
+[docs/status.md](status.md)'s eventing row for the test that proves a
+write-heavy session keeps flushing successfully while a subscriber that
+never reads its channel gets dropped.
+
+**Stalled (still-connected) subscriber:** the drop above handles a
+subscriber's *bus-side* buffer filling up, but not a subscriber that stays
+connected and simply stops reading its socket/HTTP connection at all — the
+daemon's write to that connection could otherwise block forever once the
+kernel's own send buffer fills. Every write to a subscriber's connection
+(both transports) is bounded by a per-write deadline, re-armed immediately
+before each send (default 45s); a write that cannot complete within that
+window means the reader is genuinely stuck, and the daemon gives up on
+that subscriber — closing the connection (socket) or ending the handler
+(SSE) — rather than leaking the goroutine and file descriptor. A live
+stream re-arms this deadline forward on every successful send (and, for
+SSE, at least every keepalive tick), so it never affects a merely slow but
+still-draining subscriber.
+
+### Unix socket: the `subscribe` op
+
+```jsonc
+{"op": "subscribe"}
+```
+
+The daemon acks (`{"ok":true}`) and the connection then **permanently
+leaves request/response mode**: from that point on it streams one JSON
+event per line until the client disconnects. No further op can ever be
+sent on that same connection — the daemon stops reading it entirely.
+
+> **Use a dedicated connection.** `subscribe` is unix-socket-only and
+> takes over the whole connection for the life of the subscription — open
+> a *fresh* socket connection for it and keep your original connection (or
+> another fresh one) for ordinary `open`/`flush`/`status`/... ops. Sending
+> `subscribe` over HTTP `POST /rpc` is refused outright (with a message
+> pointing at `GET /events`), since an HTTP request/response cycle has no
+> way to switch modes mid-stream the way a raw socket connection can.
+
+**SDK helpers** (Milestone 4 Task 4b): both SDKs ship a thin `events()`
+helper that does exactly this — opens its own fresh, dedicated socket
+connection (never the caller's own `Client`/`Session` connection), sends
+`subscribe`, reads the ack, and yields one parsed event per line:
+
+```python
+for ev in client.events():
+    print(ev.type, ev.db, ev.branch, ev.detail)
+```
+
+```ts
+for await (const ev of client.events()) {
+  console.log(ev.type, ev.db, ev.branch, ev.detail);
+}
+```
+
+Python's `events()` is a generator (nothing is opened until the first
+iteration); TS's is an `AsyncGenerator<OffshootEvent>`. Both close their
+dedicated socket cleanly when the caller stops iterating early (Python:
+`break`/`generator.close()`, delivered as `GeneratorExit`; TS: `break`/
+`.return()`, delivered through the async-iterator return protocol) — no
+file descriptor is leaked by stopping mid-stream. The terminal
+`dropped_slow_consumer` event (see above) is yielded like any other event
+and then the stream simply ends (no exception) — a caller that cares
+whether it was dropped checks the last event's `type`.
+
+### HTTP: `GET /events`
+
+Same Bearer auth as everything but `/healthz`. Response is
+`Content-Type: text/event-stream`; each event is `data: <event JSON>\n\n`.
+A `: ping` comment line is written every 15 seconds to keep the connection
+alive across any proxy/load balancer/kubelet that kills silent streams
+(PM Amendment 12) — ordinary SSE clients ignore comment lines
+automatically. Unlike the other `-http` routes, this handler manages its
+own per-connection write deadline (re-armed before every write, see
+"Stalled (still-connected) subscriber" above) rather than being bound by
+Task 3's `http.Server` `WriteTimeout` (90s, sized for
+`/rpc`/`/metrics`/`/debug/pprof/*`, see above) — a live subscription is
+never hard-cut by that 90s bound, while a stalled one is still cleaned up
+promptly rather than left open indefinitely.
 
 ## `offshoot mcp`
 
@@ -616,7 +1074,11 @@ offshoot session status
 Lists every session currently open on this daemon: `db@branch`, durable
 transaction id, epoch, lease holder, checkout path, and — if the session has
 hit an error (e.g. fenced by a lost lease, or a contract violation) — that
-error inline.
+error inline. This is per-session detail; for the computed branch-state
+taxonomy (`active`/`pending`/`error`/`dirty`/`detached`/`idle`) across
+EVERY branch of a db — including ones with no session open at all — see
+[Branch states](#branch-states) above and the daemon `branches` op (SDK
+`Client.branches()`; no CLI `session branches` subcommand exists yet).
 
 ## `offshoot session close <db>[@branch] [-socket PATH]`
 
@@ -682,7 +1144,7 @@ check it against an allow-list beyond requiring it be absolute.
 
 ## What's not here
 
-`offshoot version`, HTTP endpoints, an auth flag, and a metrics endpoint do
-not exist in the CLI today — see [docs/status.md](status.md) for the full
-implemented/deferred matrix and links to the roadmap milestones tracking
-each.
+See [docs/status.md](status.md) for the full implemented/deferred matrix
+and links to the roadmap milestones tracking each — e.g. the FD budget
+with idle-checkout eviction, still not yet implemented as of this page's
+last update.
