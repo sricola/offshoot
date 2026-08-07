@@ -137,17 +137,24 @@ class DaemonFixture:
 
 
 @contextlib.contextmanager
-def fake_subscribe_daemon(lines: list[str], ack: dict | None = None):
+def fake_subscribe_daemon(lines: list[str], ack: dict | None = None, close_without_ack: bool = False):
     """A minimal one-shot fake daemon: accepts exactly one connection on a
     fresh temp unix socket, discards the `{"op":"subscribe"}` request line
     it's sent, writes `ack` (default `{"ok": true}`) then each of `lines`
     (newline-terminated, in order), then closes.
 
+    close_without_ack=True short-circuits all of that: after reading (and
+    discarding) the request line, it closes the connection immediately,
+    WITHOUT ever writing an ack line — simulating a daemon that accepted
+    the connection and read the request but crashed/raced-a-shutdown/hit a
+    transport hiccup before acking. `lines`/`ack` are ignored in this mode.
+
     Used to drive Client.events()'s decode path end to end — including the
-    `dropped_slow_consumer` terminal event — against a scripted server that
-    speaks the exact same line-per-event wire shape the real daemon does,
-    without needing to force a real daemon's buffer-overflow/slow-consumer
-    mechanics deterministically from the SDK side (hard to do reliably; see
+    `dropped_slow_consumer` terminal event and the close-before-ack failure
+    mode — against a scripted server that speaks the exact same
+    line-per-event wire shape the real daemon does, without needing to
+    force a real daemon's buffer-overflow/slow-consumer mechanics
+    deterministically from the SDK side (hard to do reliably; see
     internal/daemon/events_test.go's TestEventBusDropsSlowSubscriberWithTerminalEvent
     for that proof against the real bus instead). Yields the fake socket's
     path.
@@ -166,6 +173,8 @@ def fake_subscribe_daemon(lines: list[str], ack: dict | None = None):
             return  # srv closed before a client ever connected
         try:
             conn.makefile("rb").readline()  # the subscribe request; discarded
+            if close_without_ack:
+                return  # closes without ever writing an ack line
             conn.sendall(json.dumps(ack).encode() + b"\n")
             for line in lines:
                 conn.sendall(line.encode() + b"\n")
@@ -243,6 +252,18 @@ class TestEventsDecodePath(unittest.TestCase):
         with fake_subscribe_daemon(["not json"]) as sock_path:
             with self.assertRaises(OffshootError):
                 list(fake_events_client(sock_path).events())
+
+    def test_daemon_closing_before_ever_acking_raises_offshoot_error(self):
+        # The daemon accepted the connection and read the subscribe
+        # request, then closed WITHOUT ever writing an ack (a crash, a
+        # shutdown race, a transport hiccup) -- NOT a legitimate empty
+        # stream (that's only "acked, then disconnected with zero
+        # events"). Must raise, per events()'s own documented contract
+        # ("only a genuine transport/protocol failure ... raises").
+        with fake_subscribe_daemon([], close_without_ack=True) as sock_path:
+            with self.assertRaises(OffshootError) as cm:
+                list(fake_events_client(sock_path).events())
+        self.assertIn("closed the connection", str(cm.exception))
 
     def test_generator_close_before_first_next_is_a_harmless_noop(self):
         # events() is lazy -- calling it alone opens no socket. Closing

@@ -216,11 +216,18 @@ async function openUntilSubscribed(
  * it's sent, writes `ack` (default `{ok: true}`) then each of `lines`
  * (newline-terminated, in order), then ends the connection.
  *
+ * `closeWithoutAck: true` short-circuits all of that: after reading (and
+ * discarding) the request line, it ends the connection immediately,
+ * WITHOUT ever writing an ack line -- simulating a daemon that accepted
+ * the connection and read the request but crashed/raced-a-shutdown/hit a
+ * transport hiccup before acking. `lines`/`ack` are ignored in this mode.
+ *
  * Used to drive Client.events()'s decode path end to end -- including the
- * `dropped_slow_consumer` terminal event -- against a scripted server that
- * speaks the exact same line-per-event wire shape the real daemon does,
- * without needing to force a real daemon's buffer-overflow/slow-consumer
- * mechanics deterministically from the SDK side (hard to do reliably; see
+ * `dropped_slow_consumer` terminal event and the close-before-ack failure
+ * mode -- against a scripted server that speaks the exact same
+ * line-per-event wire shape the real daemon does, without needing to
+ * force a real daemon's buffer-overflow/slow-consumer mechanics
+ * deterministically from the SDK side (hard to do reliably; see
  * internal/daemon/events_test.go's
  * TestEventBusDropsSlowSubscriberWithTerminalEvent for that proof against
  * the real bus instead).
@@ -228,6 +235,7 @@ async function openUntilSubscribed(
 async function fakeSubscribeDaemon(
   lines: string[],
   ack: Record<string, unknown> = { ok: true },
+  closeWithoutAck = false,
 ): Promise<{ sockPath: string; close: () => Promise<void> }> {
   const dir = mkdtempSync(join(tmpdir(), "offshoot-fake-daemon-"));
   const sockPath = join(dir, "d.sock");
@@ -238,6 +246,10 @@ async function fakeSubscribeDaemon(
       buf += chunk;
       if (buf.includes("\n")) {
         conn.off("data", onData);
+        if (closeWithoutAck) {
+          conn.end();
+          return;
+        }
         conn.write(JSON.stringify(ack) + "\n");
         for (const line of lines) conn.write(line + "\n");
         conn.end();
@@ -738,6 +750,34 @@ test("events(): a malformed event line raises OffshootError", async () => {
         // unreachable
       }
     }, OffshootError);
+  } finally {
+    await fake.close();
+  }
+});
+
+test("events(): the daemon closing before ever acking raises OffshootError", async () => {
+  // The daemon accepted the connection and read the subscribe request,
+  // then closed WITHOUT ever writing an ack (a crash, a shutdown race, a
+  // transport hiccup) -- NOT a legitimate empty stream (that's only
+  // "acked, then disconnected with zero events"). Must throw, per
+  // events()'s own documented contract ("only a genuine transport/
+  // protocol failure ... throws") -- mirrors Python's identical
+  // `test_daemon_closing_before_ever_acking_raises_offshoot_error`.
+  const fake = await fakeSubscribeDaemon([], { ok: true }, true);
+  try {
+    const client = fakeEventsClient(fake.sockPath);
+    await assert.rejects(
+      async () => {
+        for await (const _ev of client.events()) {
+          // unreachable
+        }
+      },
+      (err: unknown) => {
+        assert.ok(err instanceof OffshootError);
+        assert.match(err.message, /closed the connection/);
+        return true;
+      },
+    );
   } finally {
     await fake.close();
   }

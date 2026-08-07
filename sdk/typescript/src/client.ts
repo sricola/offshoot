@@ -478,6 +478,21 @@ export class Client {
           if (ev.type === "dropped_slow_consumer") return;
         }
       }
+      // The stream ended (remote closed) without ever throwing above. If
+      // that happened before the subscribe ack was ever consumed, this is
+      // NOT a legitimate empty stream (a subscriber that acked, then saw
+      // zero events before a real disconnect, is fine and returns
+      // normally) -- it's the daemon accepting the connection, reading
+      // the subscribe request, and closing without ever acking (a crash,
+      // a shutdown race, a transport hiccup). Silently completing here
+      // would contradict this method's own contract ("only a genuine
+      // transport/protocol failure ... throws") and mask a real daemon
+      // failure as a successful-looking empty stream -- mirrors Python's
+      // events()'s identical `if not line: raise OffshootError(...)`
+      // check on the ack read.
+      if (!sawAck) {
+        throw new OffshootError("daemon closed the connection");
+      }
     } catch (e) {
       if (e instanceof OffshootError) throw e;
       throw new OffshootError(`daemon connection failed: ${(e as Error).message}`);
