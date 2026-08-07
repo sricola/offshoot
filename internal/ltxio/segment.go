@@ -108,10 +108,23 @@ func EncodeSegment(pageSize, commit uint32, minTXID, maxTXID uint64, preApplyChe
 // truncated or bit-flipped download) before the trailer is trusted; this
 // does NOT re-derive the checksum from the page content the way
 // MaterializeChain does when it needs to catch a WRITER's bug (a declared
-// value that doesn't match what the pages actually produce) — this
-// function's one caller (ops.Workspace.HeadPostApplyChecksum) only needs
-// "what does the store currently say the head's checksum is", which the
-// trailer alone already answers.
+// value that doesn't match what the pages actually produce) — a caller
+// needing "what does this object's trailer say the checksum is" doesn't
+// need that stronger, more expensive verification.
+//
+// No production caller remains: an earlier version of the settling-flush
+// suppression (internal/session) used this indirectly, via a now-deleted
+// ops.Workspace.HeadPostApplyChecksum, to fetch and decode the branch
+// head's chain member on every session Open — which meant downloading the
+// FULL head object whenever it happened to be a snapshot, defeating the
+// suppression's own purpose for exactly the read-only-reopen case it
+// targeted. That was replaced with reading the checksum out of the
+// checkout's local .sum sidecar instead (see ops.CheckoutResult.
+// PostApplyChecksum), which needs no store read and therefore no decoding
+// at all. Kept as a tested primitive (see
+// TestTrailerPostApplyChecksumMatchesEncodedValue) for decoding a trailer
+// without materializing content, in case a future caller needs exactly
+// that.
 //
 // Works uniformly for both object shapes: a segment's pages are sparse and
 // order-independent from a decode-and-discard perspective (unlike
@@ -289,12 +302,17 @@ func UpdateChecksum(running uint64, pgno uint32, oldData, newData []byte) uint64
 // re-checksum — the incremental and full-scan checksums are provably the
 // same rolling XOR-fold, just computed by different paths (see
 // TestMaterializeChainIncrementalChecksumMatchesFullRescan). Returns the
-// resulting MaxTXID.
-func MaterializeChain(snapshot io.Reader, segments []io.Reader, dbPath string) (uint64, error) {
+// resulting MaxTXID and the resulting content's checksum (the same value
+// ltxio.ChecksumDatabase would compute over dbPath afterward) — the second
+// is a byproduct of verification this function already does at every step
+// (runningChecksum, below), so a caller that also needs to fingerprint the
+// materialized content (e.g. ops' checkout-sidecar stamping) doesn't have
+// to pay a second full-file pass to get it.
+func MaterializeChain(snapshot io.Reader, segments []io.Reader, dbPath string) (txid uint64, checksum uint64, err error) {
 	dir := filepath.Dir(dbPath)
 	tmp, err := os.CreateTemp(dir, filepath.Base(dbPath)+".tmp-*")
 	if err != nil {
-		return 0, fmt.Errorf("ltxio: create temp file: %w", err)
+		return 0, 0, fmt.Errorf("ltxio: create temp file: %w", err)
 	}
 	tmpPath := tmp.Name()
 	ok := false
@@ -307,7 +325,7 @@ func MaterializeChain(snapshot io.Reader, segments []io.Reader, dbPath string) (
 
 	hdr, trailer, err := decodeSnapshot(snapshot, tmp)
 	if err != nil {
-		return 0, err
+		return 0, 0, err
 	}
 
 	pageSize := hdr.PageSize
@@ -318,20 +336,20 @@ func MaterializeChain(snapshot io.Reader, segments []io.Reader, dbPath string) (
 	for i, segR := range segments {
 		dec := ltx.NewDecoder(segR)
 		if err := dec.DecodeHeader(); err != nil {
-			return 0, fmt.Errorf("ltxio: decode segment %d header: %w", i, err)
+			return 0, 0, fmt.Errorf("ltxio: decode segment %d header: %w", i, err)
 		}
 		shdr := dec.Header()
 		if shdr.IsSnapshot() {
-			return 0, fmt.Errorf("ltxio: segment %d is a snapshot (MinTXID=1), expected an incremental segment", i)
+			return 0, 0, fmt.Errorf("ltxio: segment %d is a snapshot (MinTXID=1), expected an incremental segment", i)
 		}
 		if shdr.PageSize != pageSize {
-			return 0, fmt.Errorf("ltxio: segment %d page size %d does not match chain page size %d", i, shdr.PageSize, pageSize)
+			return 0, 0, fmt.Errorf("ltxio: segment %d page size %d does not match chain page size %d", i, shdr.PageSize, pageSize)
 		}
 		if uint64(shdr.MinTXID) != prevMaxTXID+1 {
-			return 0, fmt.Errorf("ltxio: segment %d has a TXID gap: chain is at %d, segment starts at %d", i, prevMaxTXID, shdr.MinTXID)
+			return 0, 0, fmt.Errorf("ltxio: segment %d has a TXID gap: chain is at %d, segment starts at %d", i, prevMaxTXID, shdr.MinTXID)
 		}
 		if shdr.PreApplyChecksum != runningChecksum {
-			return 0, fmt.Errorf("ltxio: segment %d pre-apply checksum %s does not match chain state %s", i, shdr.PreApplyChecksum, runningChecksum)
+			return 0, 0, fmt.Errorf("ltxio: segment %d pre-apply checksum %s does not match chain state %s", i, shdr.PreApplyChecksum, runningChecksum)
 		}
 
 		lockPgno := shdr.LockPgno()
@@ -345,7 +363,7 @@ func MaterializeChain(snapshot io.Reader, segments []io.Reader, dbPath string) (
 			if err := dec.DecodePage(&pageHeader, buf); err == io.EOF {
 				break
 			} else if err != nil {
-				return 0, fmt.Errorf("ltxio: decode segment %d page: %w", i, err)
+				return 0, 0, fmt.Errorf("ltxio: decode segment %d page: %w", i, err)
 			}
 			pgno := pageHeader.Pgno
 			touched[pgno] = true
@@ -356,13 +374,13 @@ func MaterializeChain(snapshot io.Reader, segments []io.Reader, dbPath string) (
 			var oldData []byte
 			if pgno <= prevCommit && pgno != lockPgno {
 				if _, err := tmp.ReadAt(oldBuf, int64(pgno-1)*int64(pageSize)); err != nil {
-					return 0, fmt.Errorf("ltxio: read old page %d: %w", pgno, err)
+					return 0, 0, fmt.Errorf("ltxio: read old page %d: %w", pgno, err)
 				}
 				oldData = oldBuf
 			}
 
 			if _, err := tmp.WriteAt(buf, int64(pgno-1)*int64(pageSize)); err != nil {
-				return 0, fmt.Errorf("ltxio: write page %d: %w", pgno, err)
+				return 0, 0, fmt.Errorf("ltxio: write page %d: %w", pgno, err)
 			}
 
 			// A page this segment writes may still end up truncated away
@@ -378,7 +396,7 @@ func MaterializeChain(snapshot io.Reader, segments []io.Reader, dbPath string) (
 		// Close verifies the segment's own whole-file CRC64 checksum
 		// (catches a mid-file bit flip) and populates Trailer().
 		if err := dec.Close(); err != nil {
-			return 0, fmt.Errorf("ltxio: close segment %d: %w", i, err)
+			return 0, 0, fmt.Errorf("ltxio: close segment %d: %w", i, err)
 		}
 
 		// A shrinking commit drops trailing pages the segment had no reason
@@ -392,14 +410,14 @@ func MaterializeChain(snapshot io.Reader, segments []io.Reader, dbPath string) (
 					continue
 				}
 				if _, err := tmp.ReadAt(oldBuf, int64(pgno-1)*int64(pageSize)); err != nil {
-					return 0, fmt.Errorf("ltxio: read dropped page %d: %w", pgno, err)
+					return 0, 0, fmt.Errorf("ltxio: read dropped page %d: %w", pgno, err)
 				}
 				running = UpdateChecksum(running, pgno, oldBuf, nil)
 			}
 		}
 
 		if err := tmp.Truncate(int64(shdr.Commit) * int64(pageSize)); err != nil {
-			return 0, fmt.Errorf("ltxio: truncate to commit size: %w", err)
+			return 0, 0, fmt.Errorf("ltxio: truncate to commit size: %w", err)
 		}
 
 		// A growing commit can, in principle, extend past what the segment
@@ -413,7 +431,7 @@ func MaterializeChain(snapshot io.Reader, segments []io.Reader, dbPath string) (
 					continue
 				}
 				if _, err := tmp.ReadAt(oldBuf, int64(pgno-1)*int64(pageSize)); err != nil {
-					return 0, fmt.Errorf("ltxio: read new page %d: %w", pgno, err)
+					return 0, 0, fmt.Errorf("ltxio: read new page %d: %w", pgno, err)
 				}
 				running = UpdateChecksum(running, pgno, nil, oldBuf)
 			}
@@ -421,7 +439,7 @@ func MaterializeChain(snapshot io.Reader, segments []io.Reader, dbPath string) (
 
 		declared := dec.Trailer().PostApplyChecksum
 		if actual := ltx.Checksum(running); actual != declared {
-			return 0, fmt.Errorf("ltxio: segment %d post-apply checksum mismatch: computed %s, declared %s", i, actual, declared)
+			return 0, 0, fmt.Errorf("ltxio: segment %d post-apply checksum mismatch: computed %s, declared %s", i, actual, declared)
 		}
 
 		runningChecksum = declared
@@ -430,8 +448,8 @@ func MaterializeChain(snapshot io.Reader, segments []io.Reader, dbPath string) (
 	}
 
 	if err := finalizeDestination(tmp, tmpPath, dbPath); err != nil {
-		return 0, err
+		return 0, 0, err
 	}
 	ok = true
-	return prevMaxTXID, nil
+	return prevMaxTXID, uint64(runningChecksum), nil
 }

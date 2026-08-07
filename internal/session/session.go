@@ -267,18 +267,25 @@ type Session struct {
 	// though cleanAtOpen, describing only T0, has no way to know that
 	// happened.
 	//
-	// headPostApplyChecksum closes that gap: the durable head's TRUE
-	// content checksum, fetched from the store once, synchronously, in Open
-	// (ops.Workspace.HeadPostApplyChecksum) — independent of, and not
-	// derived from, the local checkout at all. rebaseline compares its own
+	// headPostApplyChecksum closes that gap: the durable head's checksum as
+	// recorded in the checkout's own .sum sidecar at T0 (see
+	// ops.CheckoutResult.PostApplyChecksum — CheckoutProven's checkoutState
+	// call already parses this sidecar to decide cleanAtOpen in the first
+	// place, so reading the checksum out of it too costs nothing extra: no
+	// store read, and in particular no download of the head object itself
+	// — see that field's doc comment for why an EARLIER version of this
+	// suppression that DID fetch the checksum fresh from the store on every
+	// Open was reverted: it defeated the suppression's own purpose for a
+	// permanently-idle read-only session against a snapshot head, the
+	// exact case this whole mechanism targets). rebaseline compares its own
 	// freshly-computed checksum (necessarily reflecting T1, whatever
 	// actually ended up in the checkout by the time the real rebase ran)
 	// against this value: if a race-window write folded in, the two differ
 	// and the settle correctly proceeds; only an exact match proves nothing
-	// happened in the gap. headPostApplyValid is false whenever that fetch
-	// (or the ref-stability check guarding it — see Open) didn't succeed,
-	// which conservatively disables the suppression rather than trusting an
-	// incomplete proof.
+	// happened in the gap. headPostApplyValid is false whenever the sidecar
+	// simply never recorded a checksum (an older-format sidecar predating
+	// this field, or cleanAtOpen itself was false) — no number to compare
+	// against means no suppression, fail-toward-settling by construction.
 	//
 	// Read-only after Open; no lock needed for the reads in rebaseline,
 	// which already holds replicaMu for everything else it touches. Safe
@@ -397,33 +404,31 @@ func Open(ctx context.Context, o Options) (*Session, error) {
 	}
 
 	// Settling-flush suppression's proof (M2 follow-up, ledgered — see
-	// rebaseline's doc comment for the full gate this feeds and exactly why
-	// checkoutRes.Clean ALONE is not sufficient). Fetched only when
-	// checkoutRes.Clean (no point otherwise: the suppression can never
-	// fire), and only here — once, synchronously, in Open's own goroutine,
-	// strictly before the capture engine's startup rebase can run.
+	// rebaseline's doc comment for the full gate this feeds). Read straight
+	// out of checkoutRes — CheckoutProven's own checkoutState call already
+	// parsed the checkout's .sum sidecar to decide Clean, and the sidecar
+	// carries its own recorded PostApplyChecksum (see
+	// ops.CheckoutResult.PostApplyChecksum's doc comment for the full
+	// argument for why trusting a LOCAL value here is sound, not a new
+	// hazard) — so this adds NO store read of its own: no GetRef, no Chain
+	// listing, and critically no object Get, which would mean downloading
+	// the entire head object whenever it happens to be a full snapshot
+	// (post-Create, post-Fork, every SnapshotEvery'th flush, and
+	// PERMANENTLY for a read-only branch that never flushes at all — the
+	// exact workload this whole suppression exists to help). An earlier
+	// version of this fetched the checksum independently from the store on
+	// every Open; that defeated its own purpose for exactly that case and
+	// was replaced with this sidecar-read design.
 	//
-	// A SECOND, independent GetRef — not a reuse of checkoutRes.Ref — is
-	// deliberate: it confirms the ref genuinely had not moved between
-	// CheckoutProven's own read and this one, closing the (narrow, but
-	// real, since these are two separate store calls) gap between them.
-	// Any mismatch, or any error along the way, simply leaves
-	// headPostApplyValid false rather than failing Open — this checksum is
-	// a proof for an optimization, never something Open's own correctness
-	// depends on.
-	var headPostApplyChecksum uint64
-	var headPostApplyValid bool
-	if checkoutRes.Clean {
-		if ref2, _, rerr := o.WS.Store.GetRef(o.DB, o.Branch); rerr == nil &&
-			ref2.Lineage == checkoutRes.Ref.Lineage &&
-			ref2.HeadEpoch == checkoutRes.Ref.HeadEpoch &&
-			ref2.HeadTXID == checkoutRes.Ref.HeadTXID {
-			if sum, herr := o.WS.HeadPostApplyChecksum(ref2); herr == nil {
-				headPostApplyChecksum, headPostApplyValid = sum, true
-			}
-		}
-	}
-
+	// headPostApplyValid is true only when checkoutRes.Clean AND the
+	// sidecar recorded a non-zero checksum (an older-format sidecar, or one
+	// written before commitSidecarRefresh/writeSum started recording one,
+	// reads back as 0 — see sumRecord's doc comment — and 0 always means
+	// "absent" here, matching this codebase's existing zero-means-absent
+	// LTX checksum convention, e.g. EncodeSegment's own preApplyChecksum/
+	// postApplyChecksum == 0 checks). Fail-toward-settling: no valid
+	// checksum simply means the suppression never fires for this session,
+	// never that Open fails or falls back to a store read to get one.
 	s := &Session{
 		ws: o.WS, db: o.DB, branch: o.Branch, dir: dir, ownsDir: ownsDir,
 		checkoutPath:          checkoutRes.Path,
@@ -432,8 +437,8 @@ func Open(ctx context.Context, o Options) (*Session, error) {
 		pages:                 newPageSet(),
 		snapshotEvery:         o.SnapshotEvery,
 		cleanAtOpen:           checkoutRes.Clean,
-		headPostApplyChecksum: headPostApplyChecksum,
-		headPostApplyValid:    headPostApplyValid,
+		headPostApplyChecksum: checkoutRes.PostApplyChecksum,
+		headPostApplyValid:    checkoutRes.Clean && checkoutRes.PostApplyChecksum != 0,
 	}
 
 	cctx, cancel := context.WithCancel(ctx)
@@ -918,6 +923,15 @@ func (s *Session) commitSidecarRefresh() {
 	s.mu.Lock()
 	durable := s.durable
 	s.mu.Unlock()
+	// The engine has already fully exited by this point (commitSidecarRefresh
+	// only ever runs after Close has joined engDone — see this function's
+	// doc comment), so nothing else can be concurrently mutating
+	// replicaMu-guarded fields; taking the lock here anyway matches every
+	// other read of them elsewhere in this file rather than relying on that
+	// timing argument alone.
+	s.replicaMu.Lock()
+	flushChecksum := s.flushChecksum
+	s.replicaMu.Unlock()
 	lease := s.Lease()
 	ref, _, err := s.ws.Store.GetRef(s.db, s.branch)
 	if err != nil {
@@ -930,7 +944,13 @@ func (s *Session) commitSidecarRefresh() {
 		return // a concurrent writer elsewhere moved the head past what we flushed
 	}
 
-	if err := ops.StampSum(s.checkoutPath, st.MainHash, ref.Lineage, ref.HeadEpoch, ref.HeadTXID); err != nil {
+	// flushChecksum is this session's last successful flush's content
+	// checksum (see Flush's checksumAtEncode) — exactly the durable head's
+	// TRUE postApplyChecksum at (ref.Lineage, ref.HeadEpoch, ref.HeadTXID)
+	// just confirmed above, and exactly what a future Open's settling-flush
+	// suppression needs to read back out of this stamp — see
+	// ops.CheckoutResult.PostApplyChecksum's doc comment.
+	if err := ops.StampSum(s.checkoutPath, st.MainHash, ref.Lineage, ref.HeadEpoch, ref.HeadTXID, flushChecksum); err != nil {
 		s.logTransition("sidecar-refresh-skipped", "reason", err.Error())
 	}
 }
@@ -1204,26 +1224,31 @@ func (s *Session) recordApply(pageSize uint32, frames []wal.Frame) error {
 // for everyone materializing this branch from then on.
 //
 // The `sum == s.headPostApplyChecksum` comparison is what actually closes
-// this: headPostApplyChecksum is the durable head's TRUE content checksum,
-// fetched from the store independently of the local checkout (Open calls
-// ops.Workspace.HeadPostApplyChecksum once, synchronously, before the
-// engine's startup rebase can run — see Open's own comment at that call
-// site). sum, by contrast, necessarily reflects T1 — whatever the checkout
-// actually contained by the time the real rebase ran, race-window write or
-// not. If one landed, the two values differ (folding in even one changed
-// page changes the rolling checksum — see ltxio.UpdateChecksum) and this
-// gate correctly leaves forceSnapshot true, so the settle proceeds and
+// this: headPostApplyChecksum is the durable head's checksum as recorded in
+// the checkout's OWN .sum sidecar (ops.CheckoutResult.PostApplyChecksum),
+// read by Open at T0 — see Open's own comment at that field's assignment
+// for why trusting a value read from a LOCAL file is exactly as sound as an
+// independent store fetch would be here, and cheaper (no store read at
+// all, in particular no download of the head object itself — an earlier
+// version of this DID fetch it fresh from the store on every Open, which
+// defeated the whole suppression's purpose for a read-only session against
+// a snapshot head; see ops.TrailerPostApplyChecksum's doc comment for that
+// history). sum, by contrast, necessarily reflects T1 — whatever the
+// checkout actually contained by the time the real rebase ran, race-window
+// write or not. If one landed, the two values differ (folding in even one
+// changed page changes the rolling checksum — see ltxio.UpdateChecksum) and
+// this gate correctly leaves forceSnapshot true, so the settle proceeds and
 // ships that write for real. Only an exact match is proof nothing happened
-// in the gap. headPostApplyValid guards the case where that store fetch (or
-// the ref-stability re-check guarding it, in Open) didn't succeed: no
-// number to compare against means no suppression, full stop — conservative
-// by construction, never a false "nothing to do."
+// in the gap. headPostApplyValid guards the case where the sidecar simply
+// never recorded a checksum (an older-format sidecar, or Clean was false to
+// begin with): no number to compare against means no suppression, full
+// stop — conservative by construction (fail-toward-settling), never a
+// false "nothing to do."
 //
-// No store read is added here, in the engine goroutine: headPostApplyChecksum
-// was already fetched, once, synchronously, inside Open — see Open's own
-// comment at that call site for why a SECOND independent GetRef there,
-// rather than reusing CheckoutProven's ref, is itself part of this same
-// proof.
+// No store read is added here, in the engine goroutine, OR in Open: the
+// checksum comes entirely from the sidecar CheckoutProven's own
+// checkoutState call already parsed to decide cleanAtOpen in the first
+// place — see Open's own comment at the struct-literal assignment site.
 //
 // When cleanAtOpen is false (the checkout was freshly (re)materialized —
 // stale, locally modified, or simply didn't exist yet), this suppression

@@ -77,17 +77,22 @@
 //     closed and the NEXT session.Open re-materialized anyway. Two ledgered
 //     follow-ups have since landed and close that gap: (1) the settling
 //     flush itself is now skipped, but only when BOTH Open's checkout was
-//     already proven clean-and-current at the moment Open checked AND a
-//     checksum fetched independently from the store at that same moment —
-//     the durable head's own recorded checksum — exactly matches what the
-//     checkout actually contains once the session's real startup rebase
-//     finishes running (rebaseline's checksum-suppression, see
-//     internal/session/session.go's rebaseline doc comment for why the
-//     second check is load-bearing, not redundant: Open can return before
-//     its own startup rebase finishes, so a write landing in that window
-//     needs the checksum comparison to be caught at all). When both hold, a
-//     read-only reopen of an unmodified checkout never even reaches a flush
-//     that could go stale. (2) a clean Session.Close now refreshes the
+//     already proven clean-and-current at the moment Open checked AND the
+//     LTX checksum recorded in that SAME checkout's .sum sidecar — never
+//     fetched fresh from the store; an earlier, since-reverted version of
+//     this fix did fetch it fresh on every Open, which meant downloading
+//     the entire head object whenever it happened to be a full snapshot,
+//     defeating the point for exactly the read-only-reopen case this
+//     targets — exactly matches what the checkout actually contains once
+//     the session's real startup rebase finishes running (rebaseline's
+//     checksum-suppression, see internal/session/session.go's rebaseline
+//     doc comment for why the second check is load-bearing, not redundant:
+//     Open can return before its own startup rebase finishes, so a write
+//     landing in that window needs the checksum comparison to be caught at
+//     all). When both hold, a read-only reopen of an unmodified checkout
+//     never even reaches a flush that could go stale, and Open pays no
+//     store call beyond the two tiny ref-metadata reads it always needed.
+//     (2) a clean Session.Close now refreshes the
 //     sidecar itself (Session.commitSidecarRefresh), but ONLY by reusing the
 //     capture engine's OWN post-shutdown fingerprint — persisted only once
 //     its shutdown fully verifies the checkout's WAL was cleanly and

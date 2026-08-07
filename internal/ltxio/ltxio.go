@@ -35,9 +35,15 @@ func readDBHeader(r io.Reader) (pageSize, nPages uint32, err error) {
 }
 
 // EncodeSnapshot writes a full-snapshot LTX of the SQLite main database at
-// dbPath, covering TXIDs [1, txid]. Caller must have fully checkpointed the
-// WAL (TRUNCATE) first; EncodeSnapshot returns an error if a non-empty -wal
-// file exists next to dbPath.
+// dbPath, covering TXIDs [1, txid], and returns the checksum it embedded as
+// the snapshot's postApplyChecksum — the same value ltxio.ChecksumDatabase
+// would compute over dbPath's content, handed back here as a byproduct of
+// the encode this function already does, so a caller that also needs to
+// fingerprint this exact content (e.g. ops.Checkpoint stamping a checkout's
+// .sum sidecar) doesn't have to pay a second full-file pass to get it.
+// Caller must have fully checkpointed the WAL (TRUNCATE) first;
+// EncodeSnapshot returns an error if a non-empty -wal file exists next to
+// dbPath.
 //
 // Caller contract (POSIX lock hazard): this reads dbPath with an ordinary
 // os.Open/Close, which is safe ONLY because it is called on files no SQLite
@@ -48,24 +54,24 @@ func readDBHeader(r io.Reader) (pageSize, nPages uint32, err error) {
 // unlocks it and loses every subsequent write. See internal/dbfile. Do not
 // call this on a database another goroutine may have open; route raw reads
 // of live databases through dbfile instead.
-func EncodeSnapshot(dbPath string, txid uint64, w io.Writer) error {
+func EncodeSnapshot(dbPath string, txid uint64, w io.Writer) (uint64, error) {
 	if fi, err := os.Stat(dbPath + "-wal"); err == nil && fi.Size() > 0 {
-		return fmt.Errorf("ltxio: %s has a non-empty WAL; checkpoint(TRUNCATE) first", dbPath)
+		return 0, fmt.Errorf("ltxio: %s has a non-empty WAL; checkpoint(TRUNCATE) first", dbPath)
 	}
 	f, err := os.Open(dbPath)
 	if err != nil {
-		return err
+		return 0, err
 	}
 	defer f.Close()
 
 	pageSize, nPages, err := readDBHeader(f)
 	if err != nil {
-		return err
+		return 0, err
 	}
 
 	enc, err := ltx.NewEncoder(w)
 	if err != nil {
-		return fmt.Errorf("ltxio: new encoder: %w", err)
+		return 0, fmt.Errorf("ltxio: new encoder: %w", err)
 	}
 	lhdr := ltx.Header{
 		Version:   ltx.Version,
@@ -76,7 +82,7 @@ func EncodeSnapshot(dbPath string, txid uint64, w io.Writer) error {
 		Timestamp: time.Now().UnixMilli(),
 	}
 	if err := enc.EncodeHeader(lhdr); err != nil {
-		return fmt.Errorf("ltxio: encode header: %w", err)
+		return 0, fmt.Errorf("ltxio: encode header: %w", err)
 	}
 
 	lockPgno := lhdr.LockPgno()
@@ -88,15 +94,18 @@ func EncodeSnapshot(dbPath string, txid uint64, w io.Writer) error {
 			continue
 		}
 		if _, err := f.ReadAt(buf, int64(pgno-1)*int64(pageSize)); err != nil {
-			return fmt.Errorf("ltxio: read page %d: %w", pgno, err)
+			return 0, fmt.Errorf("ltxio: read page %d: %w", pgno, err)
 		}
 		if err := enc.EncodePage(ltx.PageHeader{Pgno: pgno}, buf); err != nil {
-			return fmt.Errorf("ltxio: encode page %d: %w", pgno, err)
+			return 0, fmt.Errorf("ltxio: encode page %d: %w", pgno, err)
 		}
 		chksum = ltx.ChecksumFlag | (chksum ^ ltx.ChecksumPage(pgno, buf))
 	}
 	enc.SetPostApplyChecksum(chksum)
-	return enc.Close()
+	if err := enc.Close(); err != nil {
+		return 0, err
+	}
+	return uint64(chksum), nil
 }
 
 // Materialize decodes a full-snapshot LTX from r into dbPath, verifying the

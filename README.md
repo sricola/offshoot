@@ -207,21 +207,26 @@ though it might have changed. It no longer does, when TWO things are both
 provably true: the checkout `Open` received was already byte-identical to
 the branch's head at the moment `Open` checked (the same `.sum` sidecar
 clean-and-current fast path ["Resource behavior"](#resource-behavior) below
-describes), AND a checksum fetched independently from the store at that
-same moment — the durable head's own recorded checksum, not anything
-derived from the local checkout — exactly matches what the checkout
-actually contains once the session's real startup rebase finishes running.
-That second check is not redundant with the first: `Open` can return to
-its caller before its own startup rebase has actually finished (closing a
-different, older race — see `internal/session/session.go`'s `rebaseline`
-doc comment), so a write landing in that narrow window is folded into the
-checkout without the first check ever seeing it; the checksum comparison
-is what catches exactly that case and forces a real settle instead of
-silently losing the write. Only when both hold — the common case for a
-read-only daemon session reopened against a checkout nothing has touched
-since — does this settling flush upload nothing at all. A session whose
-checkout instead had to be (re)materialized first (a branch's first-ever
-open, a dirty/stale local checkout, or one another writer moved past)
+describes), AND the LTX checksum recorded in that SAME sidecar — stamped
+there by `Checkout`/`Checkpoint`/`Rollback`/`Promote`, or by a session's
+own clean `Close` — exactly matches what the checkout actually contains
+once the session's real startup rebase finishes running. That second check
+is not redundant with the first: `Open` can return to its caller before
+its own startup rebase has actually finished (closing a different, older
+race — see `internal/session/session.go`'s `rebaseline` doc comment), so a
+write landing in that narrow window is folded into the checkout without
+the first check ever seeing it; the checksum comparison is what catches
+exactly that case and forces a real settle instead of silently losing the
+write. Reading that checksum out of the local sidecar rather than fetching
+it fresh from the store costs `Open` nothing extra — no store round trip
+at all, and specifically no download of the head object itself, which is
+exactly what an earlier, since-reverted version of this fix did on every
+single `Open`, undoing its own benefit for a read-only session against a
+snapshot head. Only when both hold — the common case for a read-only
+daemon session reopened against a checkout nothing has touched since —
+does this settling flush upload nothing at all. A session whose checkout
+instead had to be (re)materialized first (a branch's first-ever open, a
+dirty/stale local checkout, or one another writer moved past)
 still pays the settling flush exactly as before: one full-snapshot upload
 sized to the database, not fixed — measured at 541.9MB uploaded for a
 512MB source database. It happens at most once per session either way, not

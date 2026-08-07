@@ -18,32 +18,43 @@ version if you depend on format stability.
 - Settling-flush checksum-compare suppression (Milestone 2 follow-up):
   `rebaseline`'s first call now skips a session's mandatory startup settling
   flush when BOTH the checkout `Open` received was already proven
-  byte-identical to the branch's head at the moment `Open` checked AND a
-  checksum fetched independently from the store at that same moment (the
-  durable head's own recorded LTX checksum) exactly matches what the
-  checkout actually contains once the session's real startup rebase
-  finishes running — the second check catches a write landing in the window
-  between `Open` returning and its own startup rebase actually finishing,
-  which the first check alone cannot see. A read-only daemon session
-  reopened against an unmodified checkout no longer uploads a full snapshot
-  (previously measured 541.9MB at a 512MB db) for doing nothing. A
-  first-ever open, or one against a dirty/stale checkout, still settles
-  exactly as before.
+  byte-identical to the branch's head at the moment `Open` checked AND the
+  LTX checksum recorded in that same checkout's `.sum` sidecar exactly
+  matches what the checkout actually contains once the session's real
+  startup rebase finishes running — the second check catches a write
+  landing in the window between `Open` returning and its own startup
+  rebase actually finishing, which the first check alone cannot see.
+  Reading the checksum out of the local sidecar, rather than fetching it
+  fresh from the store, costs `Open` no extra store call at all — critically,
+  no download of the head object itself, which a full snapshot can be
+  (post-Create, post-Fork, every 16th flush, and permanently for a
+  read-only branch that never flushes, exactly defeating this
+  optimization's own purpose). `ops.Checkout`/`Checkpoint`/`Rollback`/
+  `Promote` all now record this checksum when they stamp a sidecar
+  (`sumRecord.PostApplyChecksum`, `ltxio.EncodeSnapshot`/`MaterializeChain`
+  now return it as a byproduct of work they already do); a sidecar that
+  never recorded one settles exactly as before ("fail toward settling"). A
+  read-only daemon session reopened against an unmodified checkout no
+  longer uploads a full snapshot (previously measured 541.9MB at a 512MB
+  db) for doing nothing. A first-ever open, or one against a dirty/stale
+  checkout, still settles exactly as before.
 - Sidecar refresh on clean Close (Milestone 2 follow-up): `Session.Close`
-  now re-stamps the checkout's `.sum` sidecar when the close is provably
-  clean (no session error, nothing left unflushed, at least one flush
-  succeeded, the branch head hasn't moved past what was flushed, the
-  replica was never rebuilt by anything beyond its own startup rebase, and —
-  the stamped hash itself — the capture engine's own post-shutdown
-  fingerprint, persisted only once its shutdown fully verified the
-  checkout's WAL was cleanly folded in, is reused directly rather than
-  independently re-derived), so the next `Open`/`Checkout` against the same
-  db@branch clean-skips instead of re-materializing — restoring, for the
-  daemon-reopen pattern, the disk/descriptor win Milestone 2 Task 1 already
-  established for `Checkout`/`Checkpoint`/`Rollback`/`Promote`. Ledgered as
-  a documented tradeoff, not a regression: a clean-and-current checkout is
-  now served without chain validation across a session's clean close too,
-  not only across those four `ops` entry points (see docs/status.md).
+  now re-stamps the checkout's `.sum` sidecar — including its LTX checksum
+  (the row above is what reads it back on the next `Open`) — when the
+  close is provably clean (no session error, nothing left unflushed, at
+  least one flush succeeded, the branch head hasn't moved past what was
+  flushed, the replica was never rebuilt by anything beyond its own
+  startup rebase, and — the stamped hash itself — the capture engine's own
+  post-shutdown fingerprint, persisted only once its shutdown fully
+  verified the checkout's WAL was cleanly folded in, is reused directly
+  rather than independently re-derived), so the next `Open`/`Checkout`
+  against the same db@branch clean-skips instead of re-materializing —
+  restoring, for the daemon-reopen pattern, the disk/descriptor win
+  Milestone 2 Task 1 already established for `Checkout`/`Checkpoint`/
+  `Rollback`/`Promote`. Ledgered as a documented tradeoff, not a
+  regression: a clean-and-current checkout is now served without chain
+  validation across a session's clean close too, not only across those
+  four `ops` entry points (see docs/status.md).
 
 ## [0.1.1] - 2026-08-06
 

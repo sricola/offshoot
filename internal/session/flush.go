@@ -253,7 +253,13 @@ func (s *Session) flush(name string, auto bool) (txid uint64, err error) {
 	s.forceSnapshot = true
 
 	if snapshot {
-		err = ltxio.EncodeSnapshot(s.replica.Path(), txid, &buf)
+		// The returned checksum is discarded: Session already tracks its
+		// own running checksum incrementally (s.checksum, maintained by
+		// recordApply/rebaseline) and checksumAtEncode below is captured
+		// from exactly that — it necessarily already equals whatever
+		// EncodeSnapshot independently (re-)computes over this same replica
+		// file, so there is nothing new to learn from asking again here.
+		_, err = ltxio.EncodeSnapshot(s.replica.Path(), txid, &buf)
 	} else {
 		// pageSizeAtEncode is guaranteed non-zero here: snapshot's own
 		// condition above already covers s.pageSize == 0, so this branch is
