@@ -462,6 +462,41 @@ orphaned, just stale; it needs a re-materialize (`offshoot checkout`), not
 a warning that its parent branch moved out from under it. That case reads
 `idle`, not `detached`.
 
+**`dirty` and `detached` are structurally mutually exclusive** on any
+single evaluation: a lineage mismatch reports `detached` immediately,
+before the identity/hash comparison that could ever produce `dirty` runs
+at all.
+
+**Known blind spot:** a checkout with no readable `.sum` sidecar at all
+(never stamped, or corrupt/legacy) always reads `idle`, even if its
+content has actually diverged from the ref — there's no sidecar to detect
+that against. This is a deliberate "no evidence, stay silent" stance
+(mirrors the sidecar mechanism's own internal "unknown" verdict for the
+identical input), not an oversight; it's only reachable via a checkout
+materialized entirely outside `offshoot checkout`/`checkpoint`/`rollback`/
+`promote`, all of which always stamp a sidecar.
+
+**Cost:** determining `dirty` (once a checkout's sidecar identity already
+matches the ref) requires a real WAL checkpoint (`wal_checkpoint(TRUNCATE)`,
+up to a 3-second busy timeout) followed by a full SHA-256 hash of the
+checkout's content — a committed write can sit in a checkout's WAL,
+invisible to a bare hash of the main file, until something folds it in, so
+skipping the checkpoint step would misreport a genuinely dirty checkout as
+idle. This runs **per branch**, on every `offshoot status` / `branches`
+call, for every branch that is checked out, unleased, and not already
+`detached` — i.e. exactly the branches where "is it dirty" is still an
+open question. A store with many large, checked-out, unleased branches
+will feel this on every call. There is no cheap short-circuit: file
+size/mtime cannot substitute for a real hash (mtime is exactly what this
+codebase's own `.last-used`-style touch-file conventions elsewhere work
+around, not something trustworthy for content identity). If the checkpoint
+attempt itself reports busy — a live connection is actively using that
+unleased checkout right now — the state is reported as `dirty` directly
+(without a hash), on the reasoning that active, untracked use of an
+unleased checkout IS itself the kind of activity `dirty` exists to
+surface, even though the exact byte diff can't be observed at that
+instant.
+
 ## `offshoot lease list`
 
 ```

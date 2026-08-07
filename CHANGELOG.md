@@ -31,6 +31,14 @@ version if you depend on format stability.
   `omitempty`), and both SDKs' `Branch.state` (Python dataclass field,
   TypeScript interface field; both default to `""` against an older
   daemon that never sends it, so existing SDK code is unaffected).
+  **Disclosed cost:** determining `dirty` for a checked-out, unleased
+  branch whose sidecar identity already matches the ref requires a real
+  WAL checkpoint (quiesce, up to a 3s busy timeout) followed by a full
+  SHA-256 hash of the checkout — per branch, per `status`/`branches` call;
+  a checkout that's busy during that checkpoint attempt is itself reported
+  `dirty` rather than `idle` — see
+  [docs/reference.md](docs/reference.md#branch-states)'s Cost/Known
+  blind spot notes.
 
 ## [0.1.2] - 2026-08-06
 

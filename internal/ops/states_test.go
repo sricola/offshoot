@@ -1,6 +1,7 @@
 package ops
 
 import (
+	"database/sql"
 	"os"
 	"os/exec"
 	"testing"
@@ -83,6 +84,110 @@ func TestBranchStateDirtyAfterUncheckpointedEdit(t *testing.T) {
 	}
 	if state != "dirty" {
 		t.Fatalf("state = %q, want dirty", state)
+	}
+}
+
+// TestBranchStateDirtyForCommittedButUncheckpointedWAL pins the CRITICAL
+// fix: a committed write can sit in a checkout's WAL, invisible to a bare
+// hash of the main file, until something folds it in. BranchStateAt must
+// quiesce (checkpoint) before hashing, the same step every other identity/
+// hash comparison in this package already takes (checkoutState's own
+// callers, CheckoutProven/warnIfUncheckpointed, always quiesce first) — a
+// version that skipped it would hash only the stale main-file bytes here
+// and misreport "idle".
+//
+// Reproduction: a SECOND, unleased connection (db2) sets
+// wal_autocheckpoint=0, commits a write, and — critically — stays OPEN
+// through the BranchState call. SQLite normally runs an implicit
+// checkpoint when the LAST connection to a WAL database closes; keeping
+// db2 open is what defeats that and isolates the bug this test exists to
+// catch from that unrelated close-time behavior.
+func TestBranchStateDirtyForCommittedButUncheckpointedWAL(t *testing.T) {
+	w := newWS(t)
+	if err := w.Create("app"); err != nil {
+		t.Fatal(err)
+	}
+	path, err := w.Checkout("app", "main")
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	db2, err := sql.Open("sqlite3", path+"?_busy_timeout=3000")
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { db2.Close() })
+	db2.SetMaxOpenConns(1)
+	if _, err := db2.Exec("PRAGMA journal_mode=WAL; PRAGMA wal_autocheckpoint=0;"); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := db2.Exec("CREATE TABLE t (v); INSERT INTO t VALUES (1);"); err != nil {
+		t.Fatal(err)
+	}
+	// db2 is deliberately left open here, not closed — see doc comment.
+
+	state, err := w.BranchState("app", "main")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if state != "dirty" {
+		t.Fatalf("state = %q, want dirty (a bare hash without quiescing first would wrongly see idle)", state)
+	}
+}
+
+// TestBranchStateBusyCheckoutIsDirty pins the defined fallback for
+// BranchStateAt's own quiesce call reporting busy (errQuiesceBusy): a live
+// connection actively using an UNLEASED checkout right now is itself
+// treated as "dirty" rather than "idle" — there's a real, current chance
+// of un-checkpointed content this check can't directly observe while
+// blocked, and idle would understate that.
+//
+// A TRUNCATE checkpoint only reports busy when a blocked reader's pinned
+// snapshot is actually standing between it and completion — pinning a
+// reader against an otherwise-idle, nothing-to-checkpoint database (as
+// internal/session/stress_test.go's "blocker" pattern does, but ahead of a
+// separate writer that goes on to add the backlog the pinned reader then
+// blocks the checkpoint from truncating past) does not by itself force
+// busy=1. So this test pins the read snapshot FIRST, exactly as that
+// pattern does, then commits new content on a separate connection — now
+// the pinned reader's snapshot predates that commit, which is what
+// actually blocks the TRUNCATE checkpoint quiesce attempts.
+func TestBranchStateBusyCheckoutIsDirty(t *testing.T) {
+	w := newWS(t)
+	if err := w.Create("app"); err != nil {
+		t.Fatal(err)
+	}
+	path, err := w.Checkout("app", "main")
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	blocker, err := sql.Open("sqlite3", path+"?_busy_timeout=3000")
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { blocker.Close() })
+	blocker.SetMaxOpenConns(1)
+	if _, err := blocker.Exec("BEGIN; SELECT count(*) FROM sqlite_master;"); err != nil {
+		t.Fatal(err)
+	}
+
+	writer, err := sql.Open("sqlite3", path+"?_busy_timeout=3000")
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { writer.Close() })
+	writer.SetMaxOpenConns(1)
+	if _, err := writer.Exec("CREATE TABLE t (v); INSERT INTO t VALUES (1);"); err != nil {
+		t.Fatal(err)
+	}
+
+	state, err := w.BranchState("app", "main")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if state != "dirty" {
+		t.Fatalf("state = %q, want dirty (a busy, unleased checkout is itself evidence of activity)", state)
 	}
 }
 

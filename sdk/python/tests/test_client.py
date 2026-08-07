@@ -44,6 +44,46 @@ class TestTtlStr(unittest.TestCase):
             _ttl_str(3600)
 
 
+class TestBranchesWireCompat(unittest.TestCase):
+    """Pure-logic tests for Client.branches()'s response parsing; no daemon
+    needed — Client.__new__ skips __init__ (which opens a real socket) and
+    _call is monkeypatched to return a canned dict, exactly as if it had
+    come back over the wire.
+    """
+
+    def _client_with_response(self, resp: dict) -> offshoot.Client:
+        client = offshoot.Client.__new__(offshoot.Client)
+        client._call = lambda op, **fields: resp
+        return client
+
+    def test_missing_state_key_defaults_to_empty_string(self):
+        # Milestone 4 Task 1 added BranchInfo.state to the wire protocol.
+        # An older daemon predating that field sends a "branches" response
+        # with no "state" key at all -- Client.branches() must not raise or
+        # fabricate a value; Branch.state must default to "" (additive,
+        # backward-compatible field; see docs/reference.md's Branch states
+        # section).
+        client = self._client_with_response({
+            "ok": True,
+            "branches": [{
+                "branch": "main",
+                "head_txid": 1,
+                # deliberately no "state" key -- pre-Milestone-4 daemon shape.
+            }],
+        })
+        branches = client.branches("app")
+        self.assertEqual(len(branches), 1)
+        self.assertEqual(branches[0].state, "")
+
+    def test_present_state_key_is_passed_through(self):
+        client = self._client_with_response({
+            "ok": True,
+            "branches": [{"branch": "main", "head_txid": 1, "state": "active"}],
+        })
+        branches = client.branches("app")
+        self.assertEqual(branches[0].state, "active")
+
+
 def build_binary(tmp: Path) -> Path:
     binpath = os.environ.get("OFFSHOOT_BIN")
     if binpath:
