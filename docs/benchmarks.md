@@ -423,6 +423,18 @@ Task 1's separate O(size) check.
 
 ## Settling-flush cost (Task 2 controller decision)
 
+> **Update (Milestone 2 follow-up, shipped):** the measurements below still
+> describe the upload's *size* accurately for the case where it happens, but
+> it is no longer unconditional. `rebaseline` now skips this flush entirely
+> when the checkout `Open` received was already proven byte-identical to the
+> branch's current head — a read-only agent reopening an unmodified checkout
+> uploads nothing at all. See [docs/status.md](status.md)'s "Settling-flush
+> checksum-compare suppression" row and `internal/session/session.go`'s
+> `rebaseline` doc comment for the exact condition. Everything below
+> describes the remaining case: a session whose checkout had to be
+> (re)materialized first (first-ever open, or a dirty/stale checkout) still
+> pays exactly this cost.
+
 Every daemon session's first auto-flush tick after `Open` uploads a **full
 snapshot** — the `forceSnapshot` path — even for a session that never
 writes anything (a read-only agent that only queries). This was a ledgered

@@ -199,15 +199,26 @@ segments. (That cadence is configurable when embedding the session library
 directly — `Options.SnapshotEvery` — but the daemon does not currently
 expose it, so every daemon-managed session uses the default of sixteen.)
 
-A session's very first auto-flush after `session open` is always a full
-snapshot too, no matter where that lands in the sixteen-flush cadence —
-closing a startup-rebase race requires it — so **every** daemon-managed
-session pays for one full-snapshot upload shortly after opening, even a
-read-only one that never writes anything. That upload is sized to the
-database, not fixed: measured at 541.9MB uploaded for a 512MB source
-database. It happens once per session (the "settling flush"), not on every
-tick after that — see [docs/benchmarks.md](docs/benchmarks.md#settling-flush-cost-task-2-controller-decision)
-for the measurement and how it was taken.
+A session's very first auto-flush after `session open` used to be an
+unconditional full snapshot, no matter where that landed in the
+sixteen-flush cadence — even for a session that never wrote anything —
+because closing a startup-rebase race required treating the checkout as
+though it might have changed. It no longer does, when it provably hasn't:
+if the checkout `Open` received was already proven byte-identical to the
+branch's current head (the same `.sum` sidecar clean-and-current fast path
+["Resource behavior"](#resource-behavior) below describes), the startup
+rebase has nothing to reconcile and this settling flush is skipped
+entirely — no object write, no ref write. A read-only daemon session
+reopened against an already-current checkout — the common reopen case —
+now uploads nothing at all, ever. A session whose checkout instead had to
+be (re)materialized first (a branch's first-ever open, a dirty/stale local
+checkout, or one another writer moved past) still pays the settling flush
+exactly as before: one full-snapshot upload sized to the database, not
+fixed — measured at 541.9MB uploaded for a 512MB source database. It
+happens at most once per session either way, not on every tick after that —
+see [docs/benchmarks.md](docs/benchmarks.md#settling-flush-cost-task-2-controller-decision)
+for the measurement and `internal/session/session.go`'s `rebaseline` doc
+comment for the exact suppression condition and its proof obligation.
 
 Under continuous writing, the daemon's default `-flush-every 30s` combined
 with the default sixteen-flush snapshot cadence means a full snapshot ships
@@ -257,22 +268,31 @@ descriptor still points at its now-unlinked inode) still strands one
 descriptor, and the disk behind it, for the life of the daemon process —
 there is no reclamation path for that yet.
 
-That skip only fires when the checkout's `.sum` sidecar still matches the
-branch ref's current head txid, and nothing today keeps it matching across a
-session's whole lifetime under the default daemon config: the settling flush
-(above) advances the ref's head txid roughly `-flush-every` (30s by default)
-after `session open`, but a clean `Session.Close` never rewrites the sidecar
-to catch up — only `Checkout`, `Checkpoint`, `Rollback`, and `Promote` do. So
-in practice, "stays flat" only holds for a session that closes *before* its
-settling flush lands; a daemon that keeps reopening the same branch across
-sessions that outlive that ~30s window re-materializes (one stranded
-descriptor and one full disk copy) on every single reopen, not just on
-dirty/stale ones. See [docs/status.md](docs/status.md)'s "Sidecar refresh on
-clean Close" row for the ledgered follow-up. Meanwhile: a daemon whose
-sessions all close within the settling-flush window stays flat; one that
-churns through many short-lived-but-past-that-window or dirty checkouts
-accumulates orphaned disk over its uptime. Restarting the daemon reclaims
-everything a fresh process never opened.
+That skip fires whenever the checkout's `.sum` sidecar matches the branch
+ref's current head — and that now stays true across the daemon's default
+config too: a session's clean `Close` refreshes the sidecar to whatever it
+last durably flushed (not just `Checkout`, `Checkpoint`, `Rollback`, and
+`Promote` anymore), and the paired settling-flush suppression above means a
+reopened, unmodified session doesn't even need that flush to happen for the
+sidecar to already be current — a session that only ever read never needs a
+refresh at all, since nothing about the checkout changed since `Open`.
+
+"Clean" has real limits, though. A `Close` after a flush that failed, or on
+a session whose lease was fenced, does not stamp the sidecar — the
+checkout's true durable state is ambiguous at that point, and guessing
+"clean" would risk a later reopen silently skipping content that was never
+actually saved — so that session's checkout re-materializes on the next
+open, once. So does a session that ever took a mid-session
+rebase-on-divergence (a real WAL discontinuity, not the ordinary startup
+rebase): the replica's provenance is no longer a straight, unbroken line
+back to the checkout `Open` originally seeded it from, so `Close`
+conservatively leaves the sidecar alone rather than risk stamping content
+the checkout's own bytes never physically received. Outside those cases —
+the overwhelming majority of sessions in practice — a daemon that keeps
+reopening the same branch stays flat: no re-materialize, no stranded
+descriptor, on any reopen of a checkout nothing else touched since the
+prior session's clean close. Restarting the daemon reclaims everything a
+fresh process never opened.
 
 Design: docs/superpowers/specs/2026-07-29-offshoot-design.md
 Capture-spike evidence: docs/superpowers/specs/2026-07-29-offshoot-spike-report.md
