@@ -330,27 +330,66 @@ func TestEngineTakeoverUnderConcurrentWrites(t *testing.T) {
 }
 
 // TestEngineTakeoverExpectedRestartIsNotRebase is a deterministic companion
-// to TestEngineTakeoverUnderConcurrentWrites: 70 transactions are written
-// serially, each with a minimal pacing sleep so the engine's 10ms poll loop
-// can interleave and capture them incrementally (a true no-pacing burst
-// races the engine's own initial rebase and checkpoint machinery — writes
-// contend with checkpoint locks and land in one clump instead, which starves
-// the poll loop of the chance to drain mid-stream and never exercises the
-// path this test exists for). A brief pause after crossing the 64-txn
-// threshold lets a takeover fire and complete against an already-quiet WAL.
-// A few more writes then force SQLite's deferred WAL-header rewrite (new
-// salts) to actually land, driving the engine through the
-// wal.ErrWALRestarted path this fix changes: it must be absorbed as an
-// expected continuation, not counted as a rebase.
+// to TestEngineTakeoverUnderConcurrentWrites: transactions are written
+// serially, each with a minimal pacing sleep, crossing the 64-txn takeover
+// threshold partway through. A few more writes at the end force SQLite's
+// deferred WAL-header rewrite (new salts) to actually land, driving the
+// engine through the wal.ErrWALRestarted path this fix changes: it must be
+// absorbed as an expected continuation, not counted as a rebase.
 //
 // (The idle-takeover trigger — >5s with no writes — would exercise the same
 // code path but is too slow for a test; crossing the 64-txn threshold is
 // equivalent for this purpose and fast.)
+//
+// Getting the writer provably out of the way before the 64-txn threshold is
+// crossed matters more than it looks. takeover()'s clean-vs-rebase decision
+// hinges on whether a foreign write lands in the gap between endRead() and
+// checkpoint(RESTART) — landing there is exactly what a straddling write
+// looks like, and rebasing in response is the CORRECT, data-preserving
+// reaction to that race (see takeover()'s doc comment). afterDrain fires
+// takeover() synchronously the instant `captured` reaches 64 — there is no
+// extra tick, no settling time to rely on. An earlier version of this test
+// ran with the engine's default 10ms poll ticker: it wrote 70 txns in one
+// paced loop, then just slept, hoping the threshold would happen to be
+// crossed only after the loop returned. But the free-running ticker can
+// notice captured>=64 and fire takeover() on ANY tick, including one that
+// lands while the test's own loop still has commits left to issue — the
+// loop's own remaining writes are then indistinguishable from a genuinely
+// foreign writer straddling the gap. On a fast, idle machine the
+// endRead()->checkpoint() gap is a few microseconds wide and rarely catches
+// one; under GitHub Actions ubuntu's CI load (scheduler delays widen the gap,
+// or delay the ticker itself) it can and did — producing a legitimate extra
+// rebase (Rebased()==2) that this test misread as a bug.
+//
+// The fix has two parts, both needed together:
+//
+//  1. Poll is set to an hour, so the free-running ticker never fires within
+//     the test's lifetime — the ONLY thing that can ever invoke drain /
+//     afterDrain / takeover is an explicit DrainNow call this test makes
+//     itself (see TestDrainNowCapturesPendingTransaction for the same
+//     pattern). This removes the race at its root: there is no longer a
+//     background goroutine that can decide, unprompted, to run takeover()
+//     while this test's writer loop is still mid-flight.
+//  2. The writes are split into a below-threshold phase and an
+//     over-threshold phase, with a DrainNow — Run's own synchronous
+//     catch-up-to-a-real-target request (see its doc comment) — forced
+//     between them and after the second phase. DrainNow is serviced by
+//     Run's single goroutine and only returns once that service completes,
+//     so a DrainNow call made after this test's writer loop has already
+//     returned is proof — not a probabilistic bet — that every commit
+//     issued so far is captured and that nothing else is being written
+//     concurrently. The final DrainNow call is therefore the one and only
+//     place takeover() can run: `captured` has just crossed 64, and the
+//     writer is provably idle, so there is no foreign write left anywhere
+//     to possibly land in the endRead()->checkpoint(RESTART) gap. The
+//     verified-clean (log==consumed) path is not just likely but
+//     guaranteed.
 func TestEngineTakeoverExpectedRestartIsNotRebase(t *testing.T) {
 	if _, err := exec.LookPath("sqlite3"); err != nil {
 		t.Skip("sqlite3 CLI not on PATH")
 	}
-	src := filepath.Join(t.TempDir(), "src.db")
+	dir := t.TempDir()
+	src := filepath.Join(dir, "src.db")
 	db, err := sql.Open("sqlite3", src+"?_busy_timeout=5000")
 	if err != nil {
 		t.Fatal(err)
@@ -363,7 +402,16 @@ func TestEngineTakeoverExpectedRestartIsNotRebase(t *testing.T) {
 		t.Fatal(err)
 	}
 
-	e, rep, cancel, done := startEngine(t, src)
+	rep := replay.New(filepath.Join(dir, "replica.db"))
+	e := NewEngine(Options{
+		DBPath:   src,
+		StateDir: dir,
+		Sink:     replicaSink{rep},
+		Poll:     time.Hour, // long enough that only DrainNow can trigger a poll here
+	})
+	ctx, cancel := context.WithCancel(context.Background())
+	done := make(chan error, 1)
+	go func() { done <- e.Run(ctx) }()
 	defer func() { cancel(); <-done }()
 
 	// Let the engine's own initial rebase (checkpoint TRUNCATE + snapshot
@@ -375,31 +423,57 @@ func TestEngineTakeoverExpectedRestartIsNotRebase(t *testing.T) {
 	// exists to exercise — never fires.
 	time.Sleep(300 * time.Millisecond)
 
-	// 70 txns, serial, crossing the 64-txn threshold.
-	for i := 0; i < 70; i++ {
-		if _, err := db.Exec("INSERT INTO t (v) VALUES (randomblob(128))"); err != nil {
-			t.Fatal(err)
+	insertTxns := func(n int) {
+		t.Helper()
+		for i := 0; i < n; i++ {
+			if _, err := db.Exec("INSERT INTO t (v) VALUES (randomblob(128))"); err != nil {
+				t.Fatal(err)
+			}
+			time.Sleep(time.Millisecond)
 		}
-		time.Sleep(time.Millisecond)
+	}
+	drainNow := func() {
+		t.Helper()
+		dctx, dcancel := context.WithTimeout(context.Background(), 10*time.Second)
+		defer dcancel()
+		if err := e.DrainNow(dctx); err != nil {
+			t.Fatalf("DrainNow() = %v, want nil", err)
+		}
 	}
 
-	// Let the poll loop notice captured >= 64 and run takeover against the
-	// now-quiet WAL: checkpoint(RESTART)'s log count should equal exactly
-	// what we'd already consumed, taking the verified-clean path. Generous
-	// relative to the ~10ms poll interval for the same reason as the
-	// analogous wait in TestEngineTakeoverUnderConcurrentWrites above — see
-	// that comment.
-	time.Sleep(2 * time.Second)
+	// Phase 1: 60 txns, serial and paced — safely under the 64-txn
+	// threshold regardless of scheduling, since with Poll disabled nothing
+	// observes `captured` until the DrainNow below is called, and 60 < 64
+	// even then.
+	insertTxns(60)
+
+	// Force a full synchronous catch-up and wait for it before writing
+	// another byte: by the time this returns, all 60 txns above are
+	// captured (captured == 60, still under threshold, so no takeover fires
+	// here) and this goroutine — the only writer, and the only thing that
+	// can trigger a drain at all with Poll disabled — is provably doing
+	// nothing else.
+	drainNow()
+
+	// Phase 2: 10 more txns, serial and paced, crossing the 64-txn
+	// threshold. With Poll disabled, nothing services these until the
+	// DrainNow below is explicitly called — no background ticker can fire
+	// takeover() mid-loop the way it could before this fix.
+	insertTxns(10)
+
+	// Drain again, synchronously, with the writer loop already fully
+	// returned — every one of phase 2's commits is durable before this call
+	// is even issued. This is the one and only place `captured` can cross
+	// 64 and takeover() can run, and it does so with zero concurrent writer
+	// activity anywhere in the process: no foreign write can land in the
+	// endRead()->checkpoint(RESTART) gap.
+	drainNow()
 
 	// A few more commits force SQLite to actually rewrite the WAL header
 	// with new salts (the lazy part of RESTART), which is what makes the
 	// engine's reader observe wal.ErrWALRestarted on its next drain.
-	for i := 0; i < 5; i++ {
-		if _, err := db.Exec("INSERT INTO t (v) VALUES (randomblob(128))"); err != nil {
-			t.Fatal(err)
-		}
-		time.Sleep(time.Millisecond)
-	}
+	insertTxns(5)
+	drainNow()
 
 	waitEqual(t, src, rep, 10*time.Second)
 	t.Logf("rebased=%d", e.Rebased())
