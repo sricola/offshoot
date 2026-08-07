@@ -26,10 +26,18 @@ jobs:
         if: runner.os == 'Linux'
         run: |
           sudo apt-get update
-          sudo apt-get install -y sqlite3
+          # sqlite3-tools is a SEPARATE package from sqlite3 (verified against
+          # the ubuntu-latest image: `apt-cache show sqlite3-tools` lists
+          # /usr/bin/sqldiff, /usr/bin/sqlite3_analyzer, /usr/bin/sqlite3_rsync)
+          # — offshoot diff's default (non --summary) mode needs sqldiff on
+          # PATH; the CLI tests that exercise it (cmd/offshoot/diff_test.go)
+          # gate on exec.LookPath("sqldiff") the same way requireSQLite3
+          # gates on sqlite3 itself, so this install is what turns those
+          # tests on in CI rather than silently skipping them.
+          sudo apt-get install -y sqlite3 sqlite3-tools
 
       - name: Verify sqlite3 CLI is present
-        run: sqlite3 --version
+        run: sqlite3 --version && sqldiff --help >/dev/null
 
       - name: go vet
         run: go vet ./...
@@ -60,6 +68,40 @@ jobs:
 
       - name: make test-sdks
         run: make test-sdks
+
+      # test-pytest-plugin exercises the offshoot.pytest_plugin fixture plugin
+      # (the `offshoot-db[pytest]` extra) — its own suite, separate from
+      # test-sdks above, because it genuinely needs pytest + pytest-xdist
+      # installed (unlike the plain-unittest suites test-sdks just proved
+      # pass WITHOUT pytest on PATH — see Milestone 3 Task 4's status.md
+      # row for why that separation is load-bearing: the base SDK must stay
+      # stdlib-only). Installed editable so its `pytest11` entry point
+      # registration is exercised for real, exactly as an installed
+      # `offshoot-db[pytest]` would be.
+      - name: Install offshoot-db[pytest] + pytest-xdist
+        run: python3 -m pip install --break-system-packages --quiet -e "sdk/python[pytest]" pytest-xdist
+
+      - name: make test-pytest-plugin
+        run: make test-pytest-plugin
+
+      # dry-run-sdks builds the real sdist/wheel and npm tarball, runs twine
+      # check, and install-tests both — the same build-verification tier
+      # .github/workflows/publish.yml runs in dry-run mode (PUBLISH_ENABLED
+      # off) or right before a real upload (PUBLISH_ENABLED on). Running it
+      # here, on every PR, is the simplest way to prove the SDKs still
+      # build and install correctly without duplicating any of publish.yml's
+      # upload logic or adding a second trigger to reason about — see
+      # publish.yml's top comment for the fuller rationale. --break-system-
+      # packages is needed because Ubuntu's system python3 (PEP 668) refuses
+      # a bare `pip install`; this is an ephemeral CI container, not a dev
+      # machine, so that's the right call here (contrast: publish.yml's own
+      # jobs use actions/setup-python, which isn't externally managed and
+      # doesn't need this flag).
+      - name: Install SDK build/publish check tooling
+        run: python3 -m pip install --break-system-packages --quiet build twine
+
+      - name: make dry-run-sdks
+        run: make dry-run-sdks
 
   s3-conformance:
     runs-on: ubuntu-latest

@@ -278,6 +278,46 @@ func (e *Engine) Lag() int64 {
 // production.
 var lagRaceHook func()
 
+// ShutdownRaceHook, when non-nil, is invoked by shutdown() immediately
+// after it releases its final read transaction (e.endRead) and immediately
+// before it issues checkpoint(RESTART) — exactly the window
+// walRacedSinceRestart's doc comment and the "KNOWN RESIDUAL RISK" block
+// above shutdown describe: a foreign write landing here makes RESTART fold
+// (and report, as logN) a frame drain() never consumed, so the
+// `int64(logN) != consumed` check correctly leaves the persisted State at
+// Clean=false rather than record a clean marker over content the replica
+// never saw. nil (the default) is a no-op and imposes no cost in
+// production.
+//
+// TEST-ONLY. Not part of this package's API contract, and — unlike every
+// other field/var in this file — never read or written by any production
+// code path; the sole reason it is exported at all (matching
+// lagRaceHook's purpose but not its unexported visibility) is that
+// internal/session's tests need to deterministically land a write in this
+// window to verify Session.commitSidecarRefresh's gate on State.Clean,
+// without winning a real, sub-millisecond race against wall-clock timing —
+// a cross-package need lagRaceHook's tests (same-package only) never had.
+// A production caller has NO reason to ever read or set this; if you are
+// tempted to, you are almost certainly looking for a real engine
+// configuration knob, not a test seam — see Options instead. Considered
+// moving this into Options (a per-Engine-instance field instead of a
+// shared package var, which would also close the "a test that panics
+// before its defer runs leaves this set for every OTHER test in the
+// package" class of bug this global still has) but Options is a
+// production-facing configuration struct (DBPath, StateDir, Sink, Poll —
+// every field on it is something a real caller might legitimately set),
+// and every OTHER same-package test hook in this codebase
+// (lagRaceHook here; FlushEncodeHook/FlushUploadHook in
+// internal/session/flush.go) already uses this exact
+// package-level-var-with-a-doc-comment shape, not an Options field — kept
+// consistent with that established pattern rather than introducing a new
+// one for this single cross-package case. Every test that sets this MUST
+// restore it to nil (e.g. via `defer func() { ShutdownRaceHook = nil }()`,
+// registered immediately after setting it) before returning, precisely
+// because it IS a shared global and a leftover non-nil value would corrupt
+// every subsequent test's engine shutdown in the same test binary run.
+var ShutdownRaceHook func()
+
 // armDeadTailBaseline stats the WAL file's current on-disk size and records
 // it as e.deadTail — see e.deadTail's doc comment for why this must run at
 // exactly the same two points e.consumed resets to 0 for a fresh generation
@@ -321,8 +361,18 @@ func (e *Engine) WaitReady(ctx context.Context) error {
 	}
 }
 
-func (e *Engine) statePath() string    { return filepath.Join(e.o.StateDir, "capture-state.json") }
+func (e *Engine) statePath() string    { return StatePath(e.o.StateDir) }
 func (e *Engine) snapshotPath() string { return filepath.Join(e.o.StateDir, "snapshot.db") }
+
+// StatePath is the resume-state file's path within a given StateDir —
+// exported so a caller that has an Engine's StateDir (e.g.
+// internal/session's scratch Options.Dir) but not the Engine itself can
+// still read its persisted State (see LoadState) without duplicating this
+// filename. Session.commitSidecarRefresh is the one external caller: it
+// needs to know whether the engine's own shutdown fully verified the
+// checkout clean before trusting anything about the checkout's on-disk
+// bytes — see that function's doc comment.
+func StatePath(dir string) string { return filepath.Join(dir, "capture-state.json") }
 
 // DrainNow requests an immediate, out-of-band poll and blocks until it has
 // been serviced: every transaction already committed to the checkout's WAL
@@ -824,6 +874,10 @@ func (e *Engine) shutdown() {
 		consumed = (off - wal.HeaderSize) / frameSize
 	}
 	e.endRead(sctx)
+
+	if ShutdownRaceHook != nil {
+		ShutdownRaceHook() // test hook; nil (a no-op) in production
+	}
 
 	logN, err := e.checkpoint(sctx, "RESTART")
 	if err != nil || int64(logN) != consumed {

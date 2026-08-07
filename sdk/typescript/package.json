@@ -6,9 +6,44 @@
   "type": "module",
   "main": "dist/client.js",
   "types": "dist/client.d.ts",
+  "exports": {
+    ".": {
+      "types": "./dist/client.d.ts",
+      "import": "./dist/client.js"
+    },
+    "./testkit": {
+      "types": "./dist/testkit.d.ts",
+      "import": "./dist/testkit.js"
+    }
+  },
+  "files": [
+    "dist",
+    "README.md"
+  ],
   "engines": { "node": ">=20" },
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/offshoot-db/offshoot.git",
+    "directory": "sdk/typescript"
+  },
+  "homepage": "https://github.com/offshoot-db/offshoot#readme",
+  "bugs": {
+    "url": "https://github.com/offshoot-db/offshoot/issues"
+  },
+  "keywords": [
+    "sqlite",
+    "branching",
+    "agents",
+    "eval",
+    "testing",
+    "checkpoint"
+  ],
+  "publishConfig": {
+    "access": "public"
+  },
   "scripts": {
     "build": "tsc -p tsconfig.build.json",
+    "prepublishOnly": "rm -rf dist && npm run build",
     "test": "tsc && node --test test-dist/test/*.test.js"
   },
   "devDependencies": {

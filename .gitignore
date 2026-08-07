@@ -5,4 +5,10 @@
 sdk/typescript/node_modules/
 sdk/typescript/dist/
 sdk/typescript/test-dist/
+sdk/typescript/dry-run-pack/
+sdk/typescript/dry-run-install/
+sdk/python/dist/
+sdk/python/*.egg-info/
+sdk/python/.dry-run-venv/
 __pycache__/
+

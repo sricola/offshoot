@@ -54,7 +54,7 @@ func TestSnapshotRoundTrip(t *testing.T) {
 	}
 	src := makeDB(t, 50)
 	var buf bytes.Buffer
-	if err := EncodeSnapshot(src, 7, &buf); err != nil {
+	if _, err := EncodeSnapshot(src, 7, &buf); err != nil {
 		t.Fatal(err)
 	}
 	dst := filepath.Join(t.TempDir(), "restored.db")
@@ -82,7 +82,7 @@ func TestEncodeRefusesDirtyWAL(t *testing.T) {
 		t.Fatal(err)
 	}
 	var buf bytes.Buffer
-	if err := EncodeSnapshot(src, 2, &buf); err == nil {
+	if _, err := EncodeSnapshot(src, 2, &buf); err == nil {
 		t.Fatal("want error on non-empty WAL")
 	}
 }
@@ -90,7 +90,7 @@ func TestEncodeRefusesDirtyWAL(t *testing.T) {
 func TestMaterializeFailsClosedOnCorruption(t *testing.T) {
 	src := makeDB(t, 20)
 	var buf bytes.Buffer
-	if err := EncodeSnapshot(src, 3, &buf); err != nil {
+	if _, err := EncodeSnapshot(src, 3, &buf); err != nil {
 		t.Fatal(err)
 	}
 	b := buf.Bytes()

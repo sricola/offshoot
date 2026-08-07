@@ -30,7 +30,7 @@ func TestCheckoutReadsASnapshotPlusSegments(t *testing.T) {
 		"CREATE TABLE t (v); INSERT INTO t VALUES ('base');").CombinedOutput(); err != nil {
 		t.Fatalf("%v: %s", err, out)
 	}
-	if _, err := w.Checkpoint("app", "main", "base"); err != nil {
+	if _, err := w.Checkpoint("app", "main", "base", nil); err != nil {
 		t.Fatal(err)
 	}
 
@@ -93,10 +93,10 @@ func TestForkFromAChainProducesASingleSnapshot(t *testing.T) {
 	}
 	path, _ := w.Checkout("app", "main")
 	exec.Command("sqlite3", path, "CREATE TABLE t (v); INSERT INTO t VALUES ('base');").Run()
-	if _, err := w.Checkpoint("app", "main", "base"); err != nil {
+	if _, err := w.Checkpoint("app", "main", "base", nil); err != nil {
 		t.Fatal(err)
 	}
-	if _, err := w.Fork("app", "main", "child", "", 0); err != nil {
+	if _, err := w.Fork("app", "main", "child", "", 0, nil); err != nil {
 		t.Fatal(err)
 	}
 	cref, _, err := w.Store.GetRef("app", "child")
@@ -132,7 +132,7 @@ func TestForkAtHeadAfterASegmentProducesASingleSnapshot(t *testing.T) {
 		t.Fatal(err)
 	}
 	exec.Command("sqlite3", path, "CREATE TABLE t (v); INSERT INTO t VALUES ('base');").Run()
-	if _, err := w.Checkpoint("app", "main", "base"); err != nil {
+	if _, err := w.Checkpoint("app", "main", "base", nil); err != nil {
 		t.Fatal(err)
 	}
 
@@ -172,7 +172,7 @@ func TestForkAtHeadAfterASegmentProducesASingleSnapshot(t *testing.T) {
 	}
 
 	// Fork at HEAD, which now sits past the last snapshot on the segment.
-	if _, err := w.Fork("app", "main", "child", "", 0); err != nil {
+	if _, err := w.Fork("app", "main", "child", "", 0, nil); err != nil {
 		t.Fatalf("fork at head across a chain: %v", err)
 	}
 	cref, _, err := w.Store.GetRef("app", "child")
@@ -267,7 +267,7 @@ func TestCheckoutIgnoresAFencedWritersObject(t *testing.T) {
 		"CREATE TABLE t (v); INSERT INTO t VALUES ('live');").CombinedOutput(); err != nil {
 		t.Fatalf("%v: %s", err, out)
 	}
-	if _, err := w.Checkpoint("app", "main", "live"); err != nil {
+	if _, err := w.Checkpoint("app", "main", "live", nil); err != nil {
 		t.Fatal(err)
 	}
 	ref, etag, err := w.Store.GetRef("app", "main")
@@ -283,7 +283,7 @@ func TestCheckoutIgnoresAFencedWritersObject(t *testing.T) {
 		t.Fatalf("%v: %s", err, out)
 	}
 	var buf bytes.Buffer
-	if err := ltxio.EncodeSnapshot(orphan, ref.HeadTXID, &buf); err != nil {
+	if _, err := ltxio.EncodeSnapshot(orphan, ref.HeadTXID, &buf); err != nil {
 		t.Fatal(err)
 	}
 	if ref.HeadEpoch < 2 {

@@ -172,6 +172,198 @@ class TestClient(unittest.TestCase):
             txid = c.promote("rp", "feature", "main", force=True)
             self.assertGreater(txid, 0)
 
+    def test_dbs_lists_every_database_sorted(self):
+        with offshoot.connect(self.d.sock) as c:
+            c.create("dbs-zeta")
+            c.create("dbs-alpha")
+            names = c.dbs()
+            self.assertIn("dbs-zeta", names)
+            self.assertIn("dbs-alpha", names)
+            self.assertEqual(names, sorted(names))
+
+    def test_fork_meta_and_checkpoints_v2_touched_at(self):
+        with offshoot.connect(self.d.sock) as c:
+            c.create("meta-app")
+            c.fork("meta-app", "main", "with-meta", meta={"eval_run": "42"})
+            info = {b.branch: b for b in c.branches("meta-app")}
+            self.assertIn("with-meta", info)
+            branch = info["with-meta"]
+            # touched_at is populated for a freshly forked branch.
+            self.assertTrue(branch.touched_at)
+            # checkpoints (old field) and checkpoints_v2 (new field) agree on
+            # membership: both must list the "fork" checkpoint.
+            self.assertIn("fork", branch.checkpoints)
+            names_v2 = {cp.name: cp for cp in branch.checkpoints_v2}
+            self.assertIn("fork", names_v2)
+            self.assertTrue(names_v2["fork"].txid > 0)
+            self.assertTrue(names_v2["fork"].created_at)
+
+    def test_fork_without_meta_still_works(self):
+        # Old-client-shaped call: no meta kwarg at all.
+        with offshoot.connect(self.d.sock) as c:
+            c.create("meta-app-2")
+            txid = c.fork("meta-app-2", "main", "no-meta")
+            self.assertGreater(txid, 0)
+
+    def test_flush_meta_creates_checkpoint_with_meta(self):
+        with offshoot.connect(self.d.sock) as c:
+            c.create("meta-app-3")
+            s = c.open("meta-app-3")
+            db = sqlite3.connect(s.path)
+            db.execute("CREATE TABLE t (v)")
+            db.commit()
+            txid = s.flush("v1", meta={"agent": "claude"})
+            self.assertGreater(txid, 0)
+            info = {b.branch: b for b in c.branches("meta-app-3")}
+            names_v2 = {cp.name: cp for cp in info["main"].checkpoints_v2}
+            self.assertIn("v1", names_v2)
+            self.assertTrue(names_v2["v1"].created_at)
+            db.close()
+            s.close()
+
+    def test_flush_without_meta_still_works(self):
+        # Old-client-shaped call: no meta kwarg at all.
+        with offshoot.connect(self.d.sock) as c:
+            c.create("meta-app-4")
+            s = c.open("meta-app-4")
+            txid = s.flush("v1")
+            self.assertGreater(txid, 0)
+            s.close()
+
+    def test_export_head_and_named_checkpoint(self):
+        with offshoot.connect(self.d.sock) as c:
+            c.create("export-app")
+            s = c.open("export-app")
+            db = sqlite3.connect(s.path)
+            db.execute("CREATE TABLE t (v)")
+            db.execute("INSERT INTO t VALUES ('one')")
+            db.commit()
+            s.flush("v1")
+            db.execute("INSERT INTO t VALUES ('two')")
+            db.commit()
+            s.flush("v2")
+            s.close()
+
+            out1 = os.path.join(self.d.dir, "export-v1.db")
+            c.export("export-app", "main", out1, checkpoint="v1")
+            conn = sqlite3.connect(out1)
+            self.assertEqual(conn.execute("SELECT count(*) FROM t").fetchone()[0], 1)
+            conn.close()
+
+            out2 = os.path.join(self.d.dir, "export-head.db")
+            c.export("export-app", "main", out2)
+            conn = sqlite3.connect(out2)
+            self.assertEqual(conn.execute("SELECT count(*) FROM t").fetchone()[0], 2)
+            conn.close()
+
+    def test_export_refuses_overwrite_then_force(self):
+        with offshoot.connect(self.d.sock) as c:
+            c.create("export-force-app")
+            s = c.open("export-force-app")
+            db = sqlite3.connect(s.path)
+            db.execute("CREATE TABLE t (v)")
+            db.commit()
+            db.close()
+            s.flush("v1")
+            s.close()
+
+            out = os.path.join(self.d.dir, "export-force.db")
+            c.export("export-force-app", "main", out)
+            with self.assertRaises(OffshootError):
+                c.export("export-force-app", "main", out)
+            c.export("export-force-app", "main", out, force=True)  # must not raise
+
+    def test_export_rejects_relative_path(self):
+        with offshoot.connect(self.d.sock) as c:
+            c.create("export-relpath-app")
+            with self.assertRaises(OffshootError):
+                c.export("export-relpath-app", "main", "relative-out.db")
+
+    def test_export_misses_unflushed_session_writes(self):
+        # The load-bearing Milestone 3 Task 2 assertion: export reads the
+        # store's last DURABLE state, never a live session's unflushed
+        # writes.
+        with offshoot.connect(self.d.sock) as c:
+            c.create("export-unflushed-app")
+            s = c.open("export-unflushed-app")
+            db = sqlite3.connect(s.path)
+            db.execute("CREATE TABLE t (v)")
+            db.execute("INSERT INTO t VALUES ('durable')")
+            db.commit()
+            s.flush("v1")
+
+            db.execute("INSERT INTO t VALUES ('unflushed')")
+            db.commit()  # committed to the checkout's WAL, never flushed to the store
+
+            out = os.path.join(self.d.dir, "export-unflushed.db")
+            c.export("export-unflushed-app", "main", out)
+            conn = sqlite3.connect(out)
+            rows = conn.execute("SELECT count(*) FROM t").fetchone()[0]
+            conn.close()
+            self.assertEqual(rows, 1, "export must not include a session's unflushed write")
+
+            s.flush()  # now durable
+            out2 = os.path.join(self.d.dir, "export-after-flush.db")
+            c.export("export-unflushed-app", "main", out2)
+            conn = sqlite3.connect(out2)
+            rows = conn.execute("SELECT count(*) FROM t").fetchone()[0]
+            conn.close()
+            self.assertEqual(rows, 2)
+            db.close()
+            s.close()
+
+    def test_checkout_at_materializes_separate_readonly_path(self):
+        with offshoot.connect(self.d.sock) as c:
+            c.create("checkout-at-app")
+            s = c.open("checkout-at-app")
+            db = sqlite3.connect(s.path)
+            db.execute("CREATE TABLE t (v)")
+            db.execute("INSERT INTO t VALUES ('one')")
+            db.commit()
+            s.flush("v1")
+            db.execute("INSERT INTO t VALUES ('two')")
+            db.commit()
+            s.flush("v2")
+            db.close()
+
+            ro_path = c.checkout_at("checkout-at-app", "main", "v1")
+            self.assertNotEqual(ro_path, s.path)
+            conn = sqlite3.connect(ro_path)
+            self.assertEqual(conn.execute("SELECT count(*) FROM t").fetchone()[0], 1)
+            conn.close()
+            mode = os.stat(ro_path).st_mode & 0o777
+            self.assertEqual(mode, 0o444)
+
+            # Repeat call is a cache hit: same path, no error.
+            again = c.checkout_at("checkout-at-app", "main", "v1")
+            self.assertEqual(again, ro_path)
+
+            s.close()
+
+    def test_checkout_at_requires_a_checkpoint_name(self):
+        with offshoot.connect(self.d.sock) as c:
+            c.create("checkout-at-empty-app")
+            with self.assertRaises(OffshootError):
+                c.checkout_at("checkout-at-empty-app", "main", "")
+
+    def test_checkout_at_rejects_path_traversal_checkpoint(self):
+        # The SDK forwards `checkpoint` verbatim as the daemon's `name`
+        # field; the server-side ops.Workspace.CheckoutAt fix must reject a
+        # crafted value before it ever reaches CheckoutAtPath's
+        # filepath.Join, not just an empty one.
+        with offshoot.connect(self.d.sock) as c:
+            c.create("checkout-at-traversal-app")
+            s = c.open("checkout-at-traversal-app")
+            db = sqlite3.connect(s.path)
+            db.execute("CREATE TABLE t (v)")
+            db.execute("INSERT INTO t VALUES ('writable')")
+            db.commit()
+            db.close()
+            s.close()
+            for bad in ("../../../etc/passwd", "..", "a/b", "../../checkouts/app/main"):
+                with self.assertRaises(OffshootError):
+                    c.checkout_at("checkout-at-traversal-app", "main", bad)
+
     def test_daemon_death_mid_call_raises_offshoot_error(self):
         # A dedicated, short-lived daemon (not the shared class fixture) so
         # killing it doesn't disturb the other tests. Reuses the already-

@@ -22,6 +22,14 @@ Optional, only needed for the SDK test tier:
 - `python3` (Python SDK tests)
 - Node 20+ (TypeScript SDK tests)
 
+Optional, only needed for the pytest fixture plugin's OWN test tier
+(`sdk/python/offshoot/pytest_plugin.py` — the `offshoot-db[pytest]` extra;
+the base SDK's plain-`unittest` suites above need none of this):
+
+```
+pip install -e "sdk/python[pytest]" pytest-xdist
+```
+
 ```
 go build -o offshoot ./cmd/offshoot
 go vet ./...
@@ -29,7 +37,7 @@ go vet ./...
 
 ## Test tiers
 
-There are four, and they cost very different amounts of time. Run the tier
+There are five, and they cost very different amounts of time. Run the tier
 that matches what you touched — don't run torture on a docs typo, and don't
 skip it on a capture-engine change.
 
@@ -39,6 +47,8 @@ skip it on a capture-engine change.
 | Torture (kill-9) | `make test-torture` | ~5 minutes | Touching `internal/capture` or `internal/session` flush paths |
 | S3 conformance | `make test-s3` | needs a real S3-compatible provider or MinIO running | Touching `internal/store`'s S3 backend or the CAS probe |
 | SDKs | `make test-sdks` | needs `python3` + Node 20+ | Touching `sdk/python`, `sdk/typescript`, or the daemon API surface they depend on |
+| pytest fixture plugin | `make test-pytest-plugin` | needs `pip install -e "sdk/python[pytest]" pytest-xdist` | Touching `sdk/python/offshoot/pytest_plugin.py` or its test suite — kept OUT of `test-sdks` on purpose, since that tier proves the base SDK works with no pytest installed at all |
+| SDK publish dry-run | `make dry-run-sdks` | needs `python3` (+ `pip install build twine`) and `npm` | Touching either SDK's manifest (`pyproject.toml`, `package.json`, `sdk/VERSION`) or `.github/workflows/publish.yml` — see "Release process" below |
 
 `go test ./... -race` is hermetic and needs only the `sqlite3` CLI — that's
 the bar for "does this even work," and CI runs it on every PR. `make test`
@@ -91,6 +101,131 @@ behavior, which is what the whole compare-and-swap safety story rests on.
   otherwise have the right to submit it under the project's license
   (Apache-2.0), not a copyright assignment to anyone. Unsigned commits will
   get bounced back for a rebase with `-s`, not silently merged.
+
+## Release process
+
+There are two independent release tracks — the `offshoot` binary and the
+two SDKs — with two independent versioning schemes, on purpose: the SDKs
+are thin wrappers over a stable daemon wire protocol and can move on their
+own cadence, while the binary's `v0.1.x` tags govern the on-disk storage
+format. They currently both happen to read `0.1.0` because both are still
+at their first pre-release; that's a coincidence, not a coupling.
+
+### Binary releases
+
+Tag `v0.1.<n>` and push it. `.github/workflows/release.yml` builds
+Linux/macOS binaries for both architectures, creates a GitHub release, and
+publishes a `ghcr.io` Docker image. `workflow_dispatch` builds the same
+artifacts under a `dev-<short-sha>` name without tagging, for a
+pre-release smoke check.
+
+### SDK releases
+
+**Both SDKs publish together, from one tag, at one version number** —
+`sdk-v<version>` (e.g. `sdk-v0.1.0`), never `sdk-py-v...`/`sdk-ts-v...`
+separately. This is the simplest scheme for a two-SDK repo where both
+clients track the same daemon wire protocol and ship from the same
+PR/review cadence; splitting them into independently-versioned tags would
+mean two release processes to keep straight for no benefit either SDK
+currently needs. Revisit only if one SDK ever needs to ship a fix the other
+genuinely doesn't.
+
+**`sdk/VERSION` is the single source of truth for the SDK version number.**
+Both manifests spell the version out literally (PyPI and npm both require
+a real version string in their own manifest — neither supports pulling it
+from an external file at publish time without extra tooling this repo
+doesn't carry), so a release bump is three edits kept in lockstep by hand:
+
+1. `sdk/VERSION`
+2. `sdk/python/pyproject.toml`'s `[project].version`
+3. `sdk/typescript/package.json`'s `version`
+
+`python3 scripts/check_sdk_versions.py` (also `make check-sdk-versions`)
+fails loudly, listing every mismatch, if any of the three disagree — this
+runs as the first step of `make dry-run-python-sdk` and again in
+`.github/workflows/publish.yml`'s `check` job before either publish job
+does anything. Tagging `sdk-v<version>` is a fourth place the same number
+has to agree; `scripts/check_sdk_tag_version.py <tag>` (run automatically
+on a tag push) catches a tag cut against a stale `sdk/VERSION`.
+
+### Publishing gate
+
+`.github/workflows/publish.yml` triggers on `sdk-v*` tags and
+`workflow_dispatch`, and always builds + validates both SDKs' real publish
+artifacts (sdist/wheel + `twine check` + install-test for PyPI; `npm pack`
++ install-test for npm). It only **uploads** them when the `PUBLISH_ENABLED`
+repository variable (Settings > Secrets and variables > Actions >
+Variables) is exactly `"true"` — unset or anything else runs the same job
+in dry-run mode (build + check + install-test, no upload). The same
+build-and-check tier also runs on every PR via `make dry-run-sdks` in
+`ci.yml`'s `sdks` job, so a manifest mistake is caught long before a
+release tag exists, not discovered the first time `PUBLISH_ENABLED` flips
+on.
+
+**Turning it on requires, at minimum:**
+
+- The `offshoot-db` name claimed on PyPI, with Trusted Publishing (OIDC)
+  configured for this repo + `publish.yml` + the `pypi` job — no PyPI
+  secret is stored in this repo; `pypa/gh-action-pypi-publish` authenticates
+  via the job's `id-token: write` permission alone.
+- The `@offshoot-db` scope claimed on npm, and registry auth configured:
+  today that means an automation token in the `NPM_TOKEN` repository
+  secret (used as `NODE_AUTH_TOKEN` for `npm publish --provenance`). npm
+  has since shipped OIDC-based Trusted Publishing for GitHub Actions,
+  which would remove the need for a stored token the same way PyPI's does
+  — adopting it means confirming the npm CLI version on the runner
+  supports it and configuring `@offshoot-db/client` as a Trusted Publisher
+  on npmjs.com for this exact repo + workflow, then deleting the
+  `NODE_AUTH_TOKEN` env var from the `npm` job. Not done yet; `NPM_TOKEN`
+  is the working path today.
+- `PUBLISH_ENABLED=true` set as a repository variable.
+- **The org transfer must have happened.** `sdk/python/pyproject.toml`'s
+  `[project.urls]`, `sdk/typescript/package.json`'s `repository`/`homepage`/
+  `bugs`, and `server.json`'s `repository.url` all currently point at
+  `github.com/offshoot-db/offshoot` — the repo's actual remote today is
+  `github.com/sricola/offshoot` (`git remote -v`); `offshoot-db` is the
+  planned org this repo will be transferred into, not yet where it lives.
+  `npm publish --provenance` independently verifies that `package.json`'s
+  `repository.url` matches the repo the publish is actually running from (it
+  builds the provenance attestation from the real GitHub OIDC claims) — so
+  publishing from `sricola/offshoot` with the manifest still pointing at
+  `offshoot-db/offshoot` **hard-fails the npm publish step**, not just
+  "publishes with a wrong link." Do NOT edit these URLs to `sricola/offshoot`
+  as a workaround — the org transfer is the actual plan; update the
+  manifests (and re-verify `server.json`, since MCP clients resolve it by
+  the same slug) once the transfer has happened, then publish.
+
+Claiming both names is a manual, one-time, user-side action tracked as a
+deliberately-out-of-band item in [ROADMAP.md](ROADMAP.md) and
+[docs/status.md](docs/status.md) — not something a PR against this repo
+can do on its own.
+
+**`PUBLISH_ENABLED=true` alone is not enough to publish anything.** A real
+upload additionally requires the workflow run itself to be an actual
+`sdk-v*` tag **push** — `workflow_dispatch` (a manual "Run workflow" click)
+is *always* dry-run, unconditionally, even with the gate on. Note that a
+ref check alone (`startsWith(github.ref, 'refs/tags/sdk-v')`) is NOT
+sufficient to establish that: GitHub's "Use workflow from" picker lets a
+maintainer dispatch a `workflow_dispatch` run against a tag ref, which makes
+`github.ref` match `refs/tags/sdk-v*` too, even though nothing was pushed.
+Both the `pypi` and `npm` jobs' actual upload steps therefore check
+`github.event_name == 'push'` as well (`startsWith(github.ref,
+'refs/tags/sdk-v') && github.event_name == 'push'`), not just the ref
+pattern and not just the `check` job's resolved output, so the guard
+survives both a dispatch-against-a-tag-ref run and a bug in that job's own
+gating logic.
+
+**Optional extra gate: GitHub Environments.** `publish.yml`'s `pypi` and
+`npm` jobs each target a GitHub Environment (`pypi-publish`,
+`npm-publish` respectively). Both exist with no protection rules the first
+time the workflow runs, until a maintainer adds one — configuring required
+reviewers on either (repo Settings > Environments > `pypi-publish` /
+`npm-publish` > required reviewers) is a one-click way to require a human
+approval on top of the tag+`PUBLISH_ENABLED` gate before that job's steps
+run at all. Like the two name claims and the `PUBLISH_ENABLED` flip, this is
+a manual, user-side action this repo's PRs can't do on their own — worth
+doing before the first real release, not required for the pipeline to be
+correct without it.
 
 ## What's most welcome right now
 

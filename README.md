@@ -15,7 +15,12 @@ with the first 0.1.x release. No package-manager install yet.
 
 **Docs:** [FAQ](docs/faq.md) (why not Litestream / LiteFS / Turso / Dolt / `cp`) ·
 [CLI reference](docs/reference.md) · [architecture](docs/architecture.md) ·
-[implemented/deferred status](docs/status.md) · [roadmap](ROADMAP.md)
+[branch diff](docs/diff.md) ·
+[implemented/deferred status](docs/status.md) · [roadmap](ROADMAP.md) ·
+[**the eval-harness tutorial**](docs/eval-harness.md) (seed-once-fork-many
+for pytest/vitest/`node:test`, from install to CI) ·
+[framework recipes](docs/recipes/) (Claude Code hooks, OpenAI Agents SDK,
+LlamaIndex/CrewAI)
 
 **Contributing:** [CONTRIBUTING.md](CONTRIBUTING.md) has dev setup and the
 test tiers; [SECURITY.md](SECURITY.md) covers vulnerability reporting.
@@ -47,6 +52,17 @@ Runnable demo: [`examples/parallel-attempts/`](examples/parallel-attempts/)
 forks a database three ways, races three migrations against the forks,
 promotes the one that's actually correct, and discards the other two —
 `./examples/parallel-attempts/run.sh`.
+
+Building an eval harness or a test suite around this instead of a one-off
+script? [docs/eval-harness.md](docs/eval-harness.md) is the paved road:
+seed once, fork per test, xdist/vitest parallelism, golden-file assertions,
+TTL cleanup, and a CI recipe — for Python (`offshoot.pytest_plugin`) and
+TypeScript (`testkit`) alike. Two more commands round out the inspect/debug
+loop that tutorial builds on: `offshoot export <db>@<branch>[@checkpoint]
+out.db` copies a checkpoint out to a plain file for handoff, and `offshoot
+diff a@x b@y [--summary]` answers "what changed between these two attempts"
+— see [docs/diff.md](docs/diff.md) and
+[docs/reference.md](docs/reference.md).
 
 At rest (no daemon running): checkpoints are full snapshots; checkout paths
 are fixed at `<store>/checkouts/{db}/{branch}.db`; operations require the
@@ -199,15 +215,41 @@ segments. (That cadence is configurable when embedding the session library
 directly — `Options.SnapshotEvery` — but the daemon does not currently
 expose it, so every daemon-managed session uses the default of sixteen.)
 
-A session's very first auto-flush after `session open` is always a full
-snapshot too, no matter where that lands in the sixteen-flush cadence —
-closing a startup-rebase race requires it — so **every** daemon-managed
-session pays for one full-snapshot upload shortly after opening, even a
-read-only one that never writes anything. That upload is sized to the
-database, not fixed: measured at 541.9MB uploaded for a 512MB source
-database. It happens once per session (the "settling flush"), not on every
-tick after that — see [docs/benchmarks.md](docs/benchmarks.md#settling-flush-cost-task-2-controller-decision)
-for the measurement and how it was taken.
+A session's very first auto-flush after `session open` used to be an
+unconditional full snapshot, no matter where that landed in the
+sixteen-flush cadence — even for a session that never wrote anything —
+because closing a startup-rebase race required treating the checkout as
+though it might have changed. It no longer does, when TWO things are both
+provably true: the checkout `Open` received was already byte-identical to
+the branch's head at the moment `Open` checked (the same `.sum` sidecar
+clean-and-current fast path ["Resource behavior"](#resource-behavior) below
+describes), AND the LTX checksum recorded in that SAME sidecar — stamped
+there by `Checkout`/`Checkpoint`/`Rollback`/`Promote`, or by a session's
+own clean `Close` — exactly matches what the checkout actually contains
+once the session's real startup rebase finishes running. That second check
+is not redundant with the first: `Open` can return to its caller before
+its own startup rebase has actually finished (closing a different, older
+race — see `internal/session/session.go`'s `rebaseline` doc comment), so a
+write landing in that narrow window is folded into the checkout without
+the first check ever seeing it; the checksum comparison is what catches
+exactly that case and forces a real settle instead of silently losing the
+write. Reading that checksum out of the local sidecar rather than fetching
+it fresh from the store costs `Open` nothing extra — no store round trip
+at all, and specifically no download of the head object itself, which is
+exactly what an earlier, since-reverted version of this fix did on every
+single `Open`, undoing its own benefit for a read-only session against a
+snapshot head. Only when both hold — the common case for a read-only
+daemon session reopened against a checkout nothing has touched since —
+does this settling flush upload nothing at all. A session whose checkout
+instead had to be (re)materialized first (a branch's first-ever open, a
+dirty/stale local checkout, or one another writer moved past)
+still pays the settling flush exactly as before: one full-snapshot upload
+sized to the database, not fixed — measured at 541.9MB uploaded for a
+512MB source database. It happens at most once per session either way, not
+on every tick after that — see
+[docs/benchmarks.md](docs/benchmarks.md#settling-flush-cost-task-2-controller-decision)
+for the measurement and `internal/session/session.go`'s `rebaseline` doc
+comment for the exact suppression condition and its proof obligation.
 
 Under continuous writing, the daemon's default `-flush-every 30s` combined
 with the default sixteen-flush snapshot cadence means a full snapshot ships
@@ -257,22 +299,65 @@ descriptor still points at its now-unlinked inode) still strands one
 descriptor, and the disk behind it, for the life of the daemon process —
 there is no reclamation path for that yet.
 
-That skip only fires when the checkout's `.sum` sidecar still matches the
-branch ref's current head txid, and nothing today keeps it matching across a
-session's whole lifetime under the default daemon config: the settling flush
-(above) advances the ref's head txid roughly `-flush-every` (30s by default)
-after `session open`, but a clean `Session.Close` never rewrites the sidecar
-to catch up — only `Checkout`, `Checkpoint`, `Rollback`, and `Promote` do. So
-in practice, "stays flat" only holds for a session that closes *before* its
-settling flush lands; a daemon that keeps reopening the same branch across
-sessions that outlive that ~30s window re-materializes (one stranded
-descriptor and one full disk copy) on every single reopen, not just on
-dirty/stale ones. See [docs/status.md](docs/status.md)'s "Sidecar refresh on
-clean Close" row for the ledgered follow-up. Meanwhile: a daemon whose
-sessions all close within the settling-flush window stays flat; one that
-churns through many short-lived-but-past-that-window or dirty checkouts
-accumulates orphaned disk over its uptime. Restarting the daemon reclaims
-everything a fresh process never opened.
+That skip fires whenever the checkout's `.sum` sidecar matches the branch
+ref's current head — and that now stays true across the daemon's default
+config too: a session's clean `Close` refreshes the sidecar to whatever it
+last durably flushed (not just `Checkout`, `Checkpoint`, `Rollback`, and
+`Promote` anymore), and the paired settling-flush suppression above means a
+reopened, unmodified session doesn't even need that flush to happen for the
+sidecar to already be current — a session that only ever read never needs a
+refresh at all, since nothing about the checkout changed since `Open`.
+
+"Clean" has real limits, though. A `Close` after a flush that failed, or on
+a session whose lease was fenced, does not stamp the sidecar — the
+checkout's true durable state is ambiguous at that point, and guessing
+"clean" would risk a later reopen silently skipping content that was never
+actually saved — so that session's checkout re-materializes on the next
+open, once. So does a session that ever took a mid-session
+rebase-on-divergence (a real WAL discontinuity, not the ordinary startup
+rebase): the replica's provenance is no longer a straight, unbroken line
+back to the checkout `Open` originally seeded it from, so `Close`
+conservatively leaves the sidecar alone rather than risk stamping content
+the checkout's own bytes never physically received. And the stamp itself
+is only ever taken from the capture engine's OWN post-shutdown fingerprint
+(computed only once its shutdown fully verifies the checkout's WAL was
+cleanly and completely folded in) rather than re-derived independently — a
+foreign write landing in the narrow window around the engine's final
+checkpoint leaves that verification unmet, and `Close` correctly leaves the
+sidecar unstamped rather than risk fingerprinting content the engine itself
+refused to vouch for. Outside those cases — the overwhelming majority of
+sessions in practice — a daemon that keeps reopening the same branch stays
+flat: no re-materialize, no stranded descriptor, on any reopen of a
+checkout nothing else touched since the prior session's clean close.
+Restarting the daemon reclaims everything a fresh process never opened.
+
+One more property worth naming explicitly, not a limit but a tradeoff: once
+a checkout's sidecar is clean-and-current (however it got that way), the
+next `Checkout` is served straight from disk without ever consulting the
+object store's chain — including if that chain has since been corrupted.
+This was already true for a sidecar stamped by `Checkout`/`Checkpoint`/
+`Rollback`/`Promote` (Milestone 2 Task 1); it now also applies after an
+ordinary session's clean close. See
+[docs/status.md](docs/status.md)'s "Clean-and-current checkout served
+without chain validation" row.
+
+**Read-only historical checkouts** (`offshoot checkout --at <checkpoint>
+--read-only`, `Client.checkout_at`/`checkoutAt`) live in a completely
+separate tree from the writable-checkout cache described above:
+`<store-root>/checkouts-ro/<db>/<branch>@<checkpoint>.db`, one file per
+`(db, branch, checkpoint)` ever materialized this way, `chmod 0444`. This
+cache has none of the above's costs or caveats: no `.sum` sidecar, no lease,
+no stranded `dbfile` descriptor (nothing in this codebase ever opens a
+`checkouts-ro` file through a live capture engine, so the stray-close lock
+hazard that motivates `internal/dbfile` in the first place doesn't apply to
+it), and no reclamation problem to solve later — **it is safe to `rm -rf`
+the entire `checkouts-ro` directory at any time**; the next call for
+anything under it just rebuilds what it needs from the store. A repeat call
+for the same checkpoint is a cheap cache hit (the file already exists, a
+checkpoint's content never changes, so it's returned as-is with no store
+access at all) unless `--force`/`force=True` is given. `offshoot export`'s
+output has the identical zero-ongoing-relationship property, just written
+wherever the caller pointed it rather than under a fixed cache path.
 
 Design: docs/superpowers/specs/2026-07-29-offshoot-design.md
 Capture-spike evidence: docs/superpowers/specs/2026-07-29-offshoot-spike-report.md
@@ -378,6 +463,17 @@ with offshoot.connect("/tmp/o.sock") as c:
     s.close()
 ```
 
+`Client` also exposes `branches()`, `dbs()`, `export()` (materialize a
+checkpoint or head to a plain file), and `checkout_at()` (a read-only
+historical checkout).
+
+**Testing with pytest?** `pip install "offshoot-db[pytest]"` registers
+`offshoot_daemon`/`offshoot_db`/`offshoot_fork` fixtures automatically —
+seed once, fork a fresh isolated branch per test, TTL-backstopped cleanup,
+`pytest-xdist` parallelism (one daemon per worker). Full tutorial:
+[docs/eval-harness.md](docs/eval-harness.md); condensed reference:
+`sdk/python/README.md`'s pytest-fixture-plugin section.
+
 ### TypeScript SDK
 
 `sdk/typescript` is the same thin client, zero runtime dependencies. Also not
@@ -399,6 +495,16 @@ await s.close();
 await c.close();
 ```
 
+`Client` also exposes `branches()`, `dbs()`, `export()`, and
+`checkoutAt()` — the same surface as the Python client above.
+
+**Testing with vitest/jest/`node:test`?** `@offshoot-db/client/testkit`
+(`startDaemon`/`seedOnce`/`forkPerTest`/`dump`) is the framework-agnostic
+counterpart of the pytest fixtures above — same seed-once-fork-many
+semantics, wired into whatever `beforeAll`/`afterEach` hooks your test
+runner calls. See [docs/eval-harness.md](docs/eval-harness.md)'s
+TypeScript section and `sdk/typescript/README.md`'s testkit section.
+
 Both SDKs are exercised against a real daemon by `make test-sdks` (needs
 `python3` and `node`/`npm` on PATH — not part of the default `make test`,
 which stays hermetic to the Go suite).
@@ -413,3 +519,14 @@ the original attempt wrote after it. See
 [`examples/langgraph-rewind/`](examples/langgraph-rewind/), runnable with
 `python3 examples/langgraph-rewind/agent.py` — no server or bucket needed
 (it builds `offshoot` and starts its own private daemon).
+
+### Other agent frameworks
+
+LangGraph is the one framework with a real companion package; everyone
+else gets a short recipe instead of an adapter — see
+[docs/recipes/](docs/recipes/): Claude Code's MCP config and hooks pattern
+([claude-agent-sdk.md](docs/recipes/claude-agent-sdk.md)), the OpenAI
+Agents SDK's `SQLiteSession` pointed at an offshoot checkout path
+([openai-agents.md](docs/recipes/openai-agents.md)), and short honest notes
+on LlamaIndex and CrewAI
+([frameworks.md](docs/recipes/frameworks.md)).

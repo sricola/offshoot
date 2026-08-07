@@ -1,9 +1,12 @@
 package session
 
 import (
+	"bytes"
 	"context"
+	"encoding/json"
 	"errors"
 	"fmt"
+	"os"
 	"os/exec"
 	"path/filepath"
 	"strings"
@@ -12,6 +15,8 @@ import (
 	"testing"
 	"time"
 
+	"github.com/offshoot-db/offshoot/internal/capture"
+	"github.com/offshoot-db/offshoot/internal/ltxio"
 	"github.com/offshoot-db/offshoot/internal/ops"
 	"github.com/offshoot-db/offshoot/internal/store"
 )
@@ -44,7 +49,7 @@ func TestFlushMakesWritesDurableWithoutPausingTheWriter(t *testing.T) {
 		t.Fatalf("%v: %s", err, out)
 	}
 
-	txid, err := s.Flush("v1")
+	txid, err := s.Flush("v1", nil)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -90,7 +95,7 @@ func TestFlushedStateIsRecoverableByAnotherWorkspace(t *testing.T) {
 		out, err := exec.Command("sqlite3", s.ReplicaPath(), "SELECT count(*) FROM t;").Output()
 		return err == nil && string(out) == "1\n"
 	})
-	if _, err := s.Flush(""); err != nil {
+	if _, err := s.Flush("", nil); err != nil {
 		t.Fatal(err)
 	}
 	if err := s.Close(); err != nil {
@@ -128,7 +133,7 @@ func TestFlushAfterFencingIsRefused(t *testing.T) {
 	if _, err := w.AcquireLease("app", "main", "thief", ops.DefaultLeaseTTL); err != nil {
 		t.Fatal(err)
 	}
-	if _, err := s.Flush(""); !errors.Is(err, ErrFenced) {
+	if _, err := s.Flush("", nil); !errors.Is(err, ErrFenced) {
 		t.Fatalf("want ErrFenced, got %v", err)
 	}
 	if !errors.Is(s.Err(), ErrFenced) {
@@ -197,7 +202,7 @@ func TestFlushDoesNotDeleteSnapshotOnNonCASRefFailure(t *testing.T) {
 	orig := w.Store.B
 	w.Store.B = failRefPutIf{orig}
 
-	_, err = s.Flush("")
+	_, err = s.Flush("", nil)
 	if err == nil {
 		t.Fatal("Flush must fail when the ref write fails")
 	}
@@ -237,7 +242,7 @@ func TestFlushWritesASegmentThenSnapshotsOnCadence(t *testing.T) {
 			"INSERT INTO t (v) VALUES ('row');").CombinedOutput(); err != nil {
 			t.Fatalf("%v: %s", err, out)
 		}
-		if _, err := s.Flush(""); err != nil {
+		if _, err := s.Flush("", nil); err != nil {
 			t.Fatalf("flush %d: %v", i, err)
 		}
 	}
@@ -306,7 +311,7 @@ func TestSnapshotEveryOneKeepsOldBehavior(t *testing.T) {
 	exec.Command("sqlite3", s.CheckoutPath(), "CREATE TABLE t (v);").Run()
 	for i := 0; i < 3; i++ {
 		exec.Command("sqlite3", s.CheckoutPath(), "INSERT INTO t VALUES ('x');").Run()
-		if _, err := s.Flush(""); err != nil {
+		if _, err := s.Flush("", nil); err != nil {
 			t.Fatal(err)
 		}
 	}
@@ -381,7 +386,7 @@ func TestFlushSegmentAcrossAShrinkingCommit(t *testing.T) {
 	if out, err := exec.Command("sqlite3", s.CheckoutPath(), insertBulk).CombinedOutput(); err != nil {
 		t.Fatalf("bulk insert: %v: %s", err, out)
 	}
-	if _, err := s.Flush(""); err != nil {
+	if _, err := s.Flush("", nil); err != nil {
 		t.Fatalf("baseline flush: %v", err)
 	}
 
@@ -398,7 +403,7 @@ func TestFlushSegmentAcrossAShrinkingCommit(t *testing.T) {
 		"VACUUM;").CombinedOutput(); err != nil {
 		t.Fatalf("vacuum: %v: %s", err, out)
 	}
-	shrinkTxid, err := s.Flush("")
+	shrinkTxid, err := s.Flush("", nil)
 	if err != nil {
 		t.Fatalf("shrink flush: %v", err)
 	}
@@ -487,7 +492,7 @@ func TestConcurrentFlushIsSerialized(t *testing.T) {
 		wg.Add(1)
 		go func(i int) {
 			defer wg.Done()
-			txids[i], errs[i] = s.Flush("")
+			txids[i], errs[i] = s.Flush("", nil)
 		}(i)
 	}
 	wg.Wait()
@@ -561,8 +566,9 @@ func mustExec(t *testing.T, path, sql string) {
 // the PM-review blocking amendment this task exists to satisfy.
 type countingBackend struct {
 	store.Backend
-	mu     sync.Mutex
-	writes int
+	mu          sync.Mutex
+	writes      int
+	gets, lists int
 }
 
 func (c *countingBackend) Put(key string, data []byte) error {
@@ -586,10 +592,49 @@ func (c *countingBackend) Delete(key string) error {
 	return c.Backend.Delete(key)
 }
 
+// Get and List are counted SEPARATELY from writes (gets/lists, not folded
+// into c.writes) — TestReadOnlySessionWithCleanCheckoutMakesNoStoreWrites
+// and TestCleanReopenReadsChecksumFromSidecarNotTheStore need to assert
+// zero of EACH independently: a settling-flush suppression that avoided
+// every write but still fetched the head object to read its checksum would
+// pass the writes-only assertion while still doing exactly the full-object
+// download I2 (review round 3) exists to prevent.
+func (c *countingBackend) Get(key string) ([]byte, string, error) {
+	c.mu.Lock()
+	c.gets++
+	c.mu.Unlock()
+	return c.Backend.Get(key)
+}
+
+func (c *countingBackend) List(prefix string) ([]string, error) {
+	c.mu.Lock()
+	c.lists++
+	c.mu.Unlock()
+	return c.Backend.List(prefix)
+}
+
 func (c *countingBackend) Count() int {
 	c.mu.Lock()
 	defer c.mu.Unlock()
 	return c.writes
+}
+
+// GetCount reports Get calls observed so far — see Get's doc comment.
+func (c *countingBackend) GetCount() int {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	return c.gets
+}
+
+// ListCount reports List calls observed so far — see Get's doc comment
+// (Chain resolution, ops.Workspace.HeadPostApplyChecksum's now-deleted
+// caller, went through List before Get; counting both makes the
+// zero-store-read assertion unambiguous about which RPC, if any, crept
+// back in).
+func (c *countingBackend) ListCount() int {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	return c.lists
 }
 
 // TestAutoFlushShipsWritesWithoutManualFlush pins Options.FlushEvery: a
@@ -1088,5 +1133,802 @@ func TestFlushLoopRetriesAfterRebaseDuringUpload(t *testing.T) {
 	out, err := exec.Command("sqlite3", path, "SELECT v FROM raced;").Output()
 	if err != nil || string(out) != "raced\n" {
 		t.Fatalf("raced rebase content missing after retry: %q err=%v", out, err)
+	}
+}
+
+// TestReadOnlySessionWithCleanCheckoutMakesNoStoreWrites pins the
+// settling-flush suppression (M2 follow-up, ledgered — see rebaseline's doc
+// comment): a session opened against a checkout that is ALREADY proven
+// clean-and-current (materialized here via a bare w.Checkout call before the
+// session ever exists — this test deliberately does not depend on Commit
+// B's Close-time sidecar refresh, so it stays meaningful even if that half
+// is deferred separately) must perform literally zero backend writes, ever
+// — not even the one-PUT-per-lifetime settling flush every prior session
+// performed. Extends TestIdleAutoFlushWritesNothing's countingBackend
+// pattern; the difference from that test is entirely in the setup (a
+// pre-existing clean checkout here vs. a brand-new one there) and in
+// asserting zero writes from the moment Open returns, not just after the
+// session has already settled.
+func TestReadOnlySessionWithCleanCheckoutMakesNoStoreWrites(t *testing.T) {
+	requireSQLite(t)
+	w := newWS(t)
+	if err := w.Create("app"); err != nil {
+		t.Fatal(err)
+	}
+	// Materialize + sidecar-stamp the checkout against the current head
+	// BEFORE wrapping the backend in a counter: this write must not be
+	// counted, and it is what makes ops.CheckoutProven report Clean=true
+	// once Open calls it below.
+	if _, err := w.Checkout("app", "main"); err != nil {
+		t.Fatal(err)
+	}
+
+	cb := &countingBackend{Backend: w.Store.B}
+	w.Store.B = cb
+
+	s, err := Open(context.Background(), Options{
+		WS: w, DB: "app", Branch: "main",
+		FlushEvery: 40 * time.Millisecond,
+		// Long enough that lease renewal (which also writes the ref) cannot
+		// fire during this test's short observation window — see
+		// TestIdleAutoFlushWritesNothing's identical choice.
+		LeaseTTL: 30 * time.Second,
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer s.Close()
+
+	if !s.cleanAtOpen {
+		t.Fatal("expected cleanAtOpen: the checkout was materialized fresh against the current head just before Open")
+	}
+	if !s.headPostApplyValid {
+		t.Fatal("expected headPostApplyValid: the checkout's fresh materialize just stamped a checksum-bearing sidecar")
+	}
+	// Open itself must have made exactly two backend Gets, both tiny ref
+	// metadata reads (AcquireLease's own GetRef, then CheckoutProven's) —
+	// never a Get on a "data/" object key, which is what a head-checksum
+	// fetch would have needed. This is the direct, positive proof: review
+	// round 2's version of this suppression fetched the head chain's LAST
+	// object on this exact path, a full download whenever the head was a
+	// snapshot; review round 3 replaced it with reading the checksum out of
+	// the LOCAL sidecar CheckoutProven's own GetRef-driven checkoutState
+	// call already parsed, so this count must stay at exactly the two ref
+	// reads Open always needed anyway, regardless of what the head object
+	// is or how large it is.
+	if got := cb.GetCount(); got != 2 {
+		t.Fatalf("Open performed %d backend Get(s), want exactly 2 (AcquireLease's + CheckoutProven's own GetRef) — anything more means a head object was fetched", got)
+	}
+	if got := cb.ListCount(); got != 0 {
+		t.Fatalf("Open performed %d backend List(s), want 0 (no chain resolution needed for a clean-at-open checkout)", got)
+	}
+
+	// baseline excludes AcquireLease's own ref write and CheckoutProven's
+	// own GetRef (both legitimate, unavoidable parts of any Open call,
+	// unrelated to the settling-flush suppression under test) — same
+	// reasoning as TestIdleAutoFlushWritesNothing's baseline, just captured
+	// right after Open returns instead of after the session settles, since
+	// here nothing past this point should ever touch the backend at all —
+	// GetCount/ListCount included: review round 3's whole point is that
+	// reading headPostApplyChecksum out of the LOCAL sidecar (see
+	// ops.CheckoutResult.PostApplyChecksum) must add no Get (the previous,
+	// since-reverted design fetched the head chain's last object — a full
+	// DOWNLOAD whenever the head is a snapshot, exactly the case a
+	// permanently-idle read-only session like this one always has) and no
+	// List (Store.Chain resolution) beyond whatever Open already needed.
+	baseline, baselineGets, baselineLists := cb.Count(), cb.GetCount(), cb.ListCount()
+	// Spans the startup rebase, its (suppressed) settle decision, and
+	// several idle flushLoop ticks — ~12 at 40ms.
+	time.Sleep(500 * time.Millisecond)
+	if got := cb.Count(); got != baseline {
+		t.Fatalf("a read-only session with a clean-at-open checkout performed %d backend write(s) after Open returned (baseline %d, now %d), want 0 (no settling flush, no idle-tick writes)",
+			got-baseline, baseline, got)
+	}
+	if got := cb.GetCount(); got != baselineGets {
+		t.Fatalf("a read-only session with a clean-at-open checkout performed %d backend Get(s) after Open returned (baseline %d, now %d), want 0 (the settling-flush suppression must read its checksum from the local .sum sidecar, never fetch the head object)",
+			got-baselineGets, baselineGets, got)
+	}
+	if got := cb.ListCount(); got != baselineLists {
+		t.Fatalf("a read-only session with a clean-at-open checkout performed %d backend List(s) after Open returned (baseline %d, now %d), want 0",
+			got-baselineLists, baselineLists, got)
+	}
+	if s.autoFlushPending() {
+		t.Fatal("expected the suppressed startup rebase to leave nothing pending")
+	}
+}
+
+// TestSettleStillHappensWhenCheckoutWasStaleAtOpen guards the suppression's
+// safety boundary from the other side: a checkout whose on-disk content
+// differs from the branch head when Open runs — simulated here by dirtying
+// a materialized checkout directly, bypassing ops entirely, exactly the
+// kind of un-checkpointed local edit a stray sqlite3 client or an unclean
+// prior shutdown can leave behind — must NOT be treated as clean-at-open,
+// and the settling flush must still happen, same as before this change.
+func TestSettleStillHappensWhenCheckoutWasStaleAtOpen(t *testing.T) {
+	requireSQLite(t)
+	w := newWS(t)
+	if err := w.Create("app"); err != nil {
+		t.Fatal(err)
+	}
+	path, err := w.Checkout("app", "main")
+	if err != nil {
+		t.Fatal(err)
+	}
+	// Dirties the checkout without touching its .sum sidecar: checkoutState
+	// will read this as "modified" (sidecar identity still matches ref, but
+	// the file's content no longer matches the recorded hash).
+	mustExec(t, path, "CREATE TABLE stray (v); INSERT INTO stray VALUES ('predates-session');")
+
+	s, err := Open(context.Background(), Options{
+		WS: w, DB: "app", Branch: "main", FlushEvery: 40 * time.Millisecond,
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer s.Close()
+
+	if s.cleanAtOpen {
+		t.Fatal("expected a stray-edited checkout to NOT be recognized clean at open")
+	}
+
+	waitFor(t, 5*time.Second, "the settling flush", func() bool {
+		ref, _, err := w.Store.GetRef("app", "main")
+		return err == nil && ref.HeadTXID > 1
+	})
+}
+
+// TestSettleStillHappensWithOldFormatSidecarLackingChecksum pins review
+// round 3's fail-toward-settling contract: a sidecar written before
+// PostApplyChecksum existed (or, equivalently, one from a store backend
+// that never records it) still decodes — sumRecord.PostApplyChecksum's
+// `omitempty` JSON tag means the field just isn't there, and Go decodes a
+// missing field to its zero value, 0, exactly the "absent" sentinel this
+// whole mechanism already uses everywhere else (see
+// CheckoutResult.PostApplyChecksum's doc comment). The checkout is
+// genuinely, fully clean by every OTHER measure (hash and identity both
+// match) — cleanAtOpen must still be true — but with no checksum to trust,
+// headPostApplyValid must be false and the settle must proceed exactly as
+// it always did before this suppression existed.
+func TestSettleStillHappensWithOldFormatSidecarLackingChecksum(t *testing.T) {
+	requireSQLite(t)
+	w := newWS(t)
+	if err := w.Create("app"); err != nil {
+		t.Fatal(err)
+	}
+	path, err := w.Checkout("app", "main")
+	if err != nil {
+		t.Fatal(err)
+	}
+	ref, _, err := w.Store.GetRef("app", "main")
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	// Rewrite the sidecar to the pre-review-round-3 format: same
+	// hash/lineage/epoch/txid Checkout just stamped — still fully "clean"
+	// by checkoutState's own identity+hash check — but with no
+	// "post_apply_checksum" field at all. The hash is read back out of the
+	// sidecar Checkout just wrote (not recomputed here) so this test
+	// doesn't duplicate fileSum's own hashing logic.
+	raw, err := os.ReadFile(path + ".sum")
+	if err != nil {
+		t.Fatal(err)
+	}
+	var rec struct {
+		Hash string `json:"hash"`
+	}
+	if err := json.Unmarshal(raw, &rec); err != nil {
+		t.Fatal(err)
+	}
+	oldFormat := fmt.Sprintf(`{"hash":%q,"lineage":%q,"epoch":%d,"txid":%d}`,
+		rec.Hash, ref.Lineage, ref.HeadEpoch, ref.HeadTXID)
+	if err := os.WriteFile(path+".sum", []byte(oldFormat), 0o644); err != nil {
+		t.Fatal(err)
+	}
+
+	s, err := Open(context.Background(), Options{
+		WS: w, DB: "app", Branch: "main", FlushEvery: 40 * time.Millisecond,
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer s.Close()
+
+	if !s.cleanAtOpen {
+		t.Fatal("expected cleanAtOpen: the old-format sidecar's hash and identity still fully match — the checkout genuinely IS clean, it just predates checksum-recording")
+	}
+	if s.headPostApplyValid {
+		t.Fatal("expected headPostApplyValid == false: an old-format sidecar has no post_apply_checksum to trust (decodes to 0, treated as absent)")
+	}
+
+	waitFor(t, 5*time.Second, "the settling flush despite cleanAtOpen (no checksum available to suppress on)", func() bool {
+		ref, _, err := w.Store.GetRef("app", "main")
+		return err == nil && ref.HeadTXID > 1
+	})
+}
+
+// TestSettlingSuppressionCatchesRaceWindowFold pins CRITICAL fix 1 from code
+// review: cleanAtOpen alone proves the checkout's content at T0 (the moment
+// Open's synchronous CheckoutProven call ran), NOT at T1 (the moment the
+// engine's actual startup rebase — the one that seeds the replica —
+// physically runs, asynchronously, possibly after Open has already
+// returned to its caller: see the WaitReady/Resumed comment in Open and
+// cleanAtOpen's own doc comment). A write landing in the T0..T1 window
+// gets folded into the checkout's main file by the real rebase's
+// checkpoint(TRUNCATE) without ever passing through Apply, so a
+// suppression gated on cleanAtOpen alone would silently believe there was
+// nothing to settle and that write would never become durable.
+//
+// This is exercised via white-box rewind rather than by racing real
+// wall-clock timing (inherently flaky for a window this narrow): let
+// Open's REAL startup rebase land first and settle normally (proving
+// cleanAtOpen/headPostApplyValid are set correctly for this checkout), then
+// manually rewind rebaseGen/flushedRebaseGen back to 0 and re-drive
+// rebaseline via replicaSink.Rebase — the SAME technique
+// TestFlushLoopFlushesRebaseFoldedContentWhenOtherwiseIdle uses for a
+// mid-session rebase — but targeting the 0->1 transition specifically, with
+// content headPostApplyChecksum (fetched once, in Open, before any of this)
+// knows nothing about. This directly models "the fold happened between the
+// checksum fetch and the real rebase" without needing to actually win that
+// race.
+//
+// Fail-verified: against the pre-fix code (suppression gated on
+// `first && s.cleanAtOpen` alone, no checksum comparison), this test times
+// out — the rewound "first" rebase is suppressed again regardless of its
+// content, and the settle this test waits for never happens.
+func TestSettlingSuppressionCatchesRaceWindowFold(t *testing.T) {
+	requireSQLite(t)
+	w := newWS(t)
+	if err := w.Create("app"); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := w.Checkout("app", "main"); err != nil {
+		t.Fatal(err)
+	}
+
+	s, err := Open(context.Background(), Options{
+		WS: w, DB: "app", Branch: "main", FlushEvery: 40 * time.Millisecond,
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer s.Close()
+
+	if !s.cleanAtOpen || !s.headPostApplyValid {
+		t.Fatal("expected cleanAtOpen and headPostApplyValid for a checkout materialized fresh against head")
+	}
+	waitFor(t, 5*time.Second, "the (suppressed) startup rebase to land with nothing pending", func() bool {
+		s.replicaMu.Lock()
+		gen := s.rebaseGen
+		s.replicaMu.Unlock()
+		return gen == 1 && !s.autoFlushPending()
+	})
+	before, _, err := w.Store.GetRef("app", "main")
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	// White-box rewind: pretend this is still the FIRST rebase, and drive it
+	// with content headPostApplyChecksum (fetched once, at Open, describing
+	// the ORIGINAL "init" content) knows nothing about — modeling a write
+	// that raced into the checkpoint before the real rebase ran.
+	s.replicaMu.Lock()
+	s.rebaseGen = 0
+	s.flushedRebaseGen = 0
+	s.replicaMu.Unlock()
+
+	snapPath := filepath.Join(t.TempDir(), "race-window-fold.db")
+	mustExec(t, snapPath, "CREATE TABLE raced (v); INSERT INTO raced VALUES ('race-window-fold');")
+	if err := (replicaSink{s}).Rebase(snapPath); err != nil {
+		t.Fatal(err)
+	}
+
+	waitFor(t, 5*time.Second, "the settling flush despite cleanAtOpen (checksum mismatch must block suppression)", func() bool {
+		ref, _, err := w.Store.GetRef("app", "main")
+		return err == nil && ref.HeadTXID > before.HeadTXID
+	})
+
+	// Verify what actually got durably uploaded by materializing the
+	// object the branch's ref now points to DIRECTLY — not via
+	// s.Close()+w.Checkout(). This white-box test's fake rebase above
+	// touched only s.replica, never the real checkout file, so Close's own
+	// (separately and independently tested — see
+	// TestCloseRefreshesSidecarSoReopenCleanSkips et al.) sidecar-refresh
+	// logic would otherwise stamp the checkout's OWN stale, untouched bytes
+	// as "clean" for this new txid and mask exactly the thing this test
+	// needs to prove; going straight at the store's own object sidesteps
+	// that entirely and is the more direct proof anyway.
+	ref, _, err := w.Store.GetRef("app", "main")
+	if err != nil {
+		t.Fatal(err)
+	}
+	snapKey := store.SnapshotKey(ref.Lineage, ref.HeadEpoch, ref.HeadTXID)
+	data, _, err := w.Store.B.Get(snapKey)
+	if err != nil {
+		t.Fatalf("expected the settling flush to have written a snapshot at %s: %v", snapKey, err)
+	}
+	dst := filepath.Join(t.TempDir(), "materialized.db")
+	if _, err := ltxio.Materialize(bytes.NewReader(data), dst); err != nil {
+		t.Fatal(err)
+	}
+	out, err := exec.Command("sqlite3", dst, "SELECT v FROM raced;").Output()
+	if err != nil || string(out) != "race-window-fold\n" {
+		t.Fatalf("race-window-folded content missing from the settled snapshot: %q err=%v", out, err)
+	}
+
+	if err := s.Close(); err != nil {
+		t.Fatal(err)
+	}
+}
+
+// TestCleanAtOpenSessionsFirstRealFlushIsASegment pins a consequence of the
+// settling-flush suppression that wasn't previously reachable: with the
+// settle skipped, a clean-at-open session's very FIRST real flush (the one
+// its own write triggers) continues DIRECTLY from the branch's pre-session
+// head as a SEGMENT — not a snapshot — since there is no intervening
+// settle-snapshot to reset flushesSinceSnapshot/forceSnapshot first (see
+// flush.go's updated comment on the snapshot-vs-segment decision). The
+// chain must still resolve correctly end to end.
+func TestCleanAtOpenSessionsFirstRealFlushIsASegment(t *testing.T) {
+	requireSQLite(t)
+	w := newWS(t)
+	if err := w.Create("app"); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := w.Checkout("app", "main"); err != nil {
+		t.Fatal(err)
+	}
+
+	s, err := Open(context.Background(), Options{WS: w, DB: "app", Branch: "main"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !s.cleanAtOpen {
+		t.Fatal("expected cleanAtOpen for a checkout materialized fresh against head")
+	}
+	waitFor(t, 5*time.Second, "the (suppressed) startup rebase to settle with nothing pending", func() bool {
+		return !s.autoFlushPending()
+	})
+
+	mustExec(t, s.CheckoutPath(), "CREATE TABLE t (v); INSERT INTO t VALUES (1);")
+	txid, err := s.Flush("", nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if txid != 2 {
+		t.Fatalf("expected the first real flush to be txid 2 (continuing directly from Create's txid 1, no intervening settle snapshot), got %d", txid)
+	}
+
+	ref, _, err := w.Store.GetRef("app", "main")
+	if err != nil {
+		t.Fatal(err)
+	}
+	keys, err := w.Store.B.List(store.LineagePrefix(ref.Lineage))
+	if err != nil {
+		t.Fatal(err)
+	}
+	foundSegment := false
+	for _, k := range keys {
+		if m, ok := store.ParseMemberKey(k); ok && !m.Snapshot && m.MaxTXID == txid {
+			foundSegment = true
+		}
+	}
+	if !foundSegment {
+		t.Fatal("expected the first real flush to be written as a SEGMENT, not a snapshot")
+	}
+
+	if err := s.Close(); err != nil {
+		t.Fatal(err)
+	}
+	path, err := w.Checkout("app", "main")
+	if err != nil {
+		t.Fatal(err)
+	}
+	out, err := exec.Command("sqlite3", path, "SELECT v FROM t;").Output()
+	if err != nil || string(out) != "1\n" {
+		t.Fatalf("chain did not resolve correctly after a clean-at-open session's first real flush: %q err=%v", out, err)
+	}
+}
+
+// TestCloseRefreshesSidecarSoReopenCleanSkips pins Commit B (sidecar refresh
+// on clean Close, M2 follow-up, ledgered): open, write, flush, close — a
+// textbook clean shutdown — then reopen the SAME db@branch and confirm the
+// checkout is clean-skipped rather than re-materialized. Extends
+// internal/ops's TestCheckoutSkipsRematerializeWhenCleanAndCurrent same-inode
+// pattern into the session layer, where the "clean" stamp now has to survive
+// a real session's Close rather than only ops.Checkout/Checkpoint's own
+// in-line refresh.
+func TestCloseRefreshesSidecarSoReopenCleanSkips(t *testing.T) {
+	requireSQLite(t)
+	w := newWS(t)
+	if err := w.Create("app"); err != nil {
+		t.Fatal(err)
+	}
+
+	s, err := Open(context.Background(), Options{WS: w, DB: "app", Branch: "main"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	checkoutPath := s.CheckoutPath()
+	mustExec(t, checkoutPath, "CREATE TABLE t (v); INSERT INTO t VALUES (1);")
+	if _, err := s.Flush("", nil); err != nil {
+		t.Fatal(err)
+	}
+	if err := s.Close(); err != nil {
+		t.Fatal(err)
+	}
+
+	st1, err := os.Stat(checkoutPath)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	s2, err := Open(context.Background(), Options{WS: w, DB: "app", Branch: "main"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer s2.Close()
+
+	if !s2.cleanAtOpen {
+		t.Fatal("expected the reopen to see a checkout the prior session's clean Close already stamped current")
+	}
+	st2, err := os.Stat(s2.CheckoutPath())
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !os.SameFile(st1, st2) {
+		t.Fatal("reopen after a clean close should clean-skip re-materializing the checkout (same inode expected)")
+	}
+}
+
+// TestCleanCheckoutServedWithoutChainValidationAcrossClose pins, as an
+// intentional and now-ledgered tradeoff (controller sign-off — see
+// docs/status.md's "Clean-and-current checkout served without chain
+// validation" row and TestMissingSegmentIsLoud's own modification), the
+// consequence of Commit B's sidecar refresh: once a session's clean Close
+// has stamped the checkout sidecar, a LATER Checkout call for that SAME
+// clean-and-current checkout is served straight from disk without ever
+// touching the chain — including when the chain itself has since been
+// corrupted (e.g. a segment deleted out from under it). This is not new in
+// kind (ops.Checkout's clean-skip fast path already had this property for
+// Checkout/Checkpoint/Rollback/Promote-produced sidecars — see Milestone 2
+// Task 1), only in reach: it now also persists across an ordinary session's
+// clean Close, not just those four ops entry points.
+func TestCleanCheckoutServedWithoutChainValidationAcrossClose(t *testing.T) {
+	requireSQLite(t)
+	w := newWS(t)
+	if err := w.Create("app"); err != nil {
+		t.Fatal(err)
+	}
+	s, err := Open(context.Background(), Options{WS: w, DB: "app", Branch: "main"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	mustExec(t, s.CheckoutPath(), "CREATE TABLE t (v); INSERT INTO t VALUES (1);")
+	if _, err := s.Flush("", nil); err != nil {
+		t.Fatal(err)
+	}
+	// A second flush guarantees a SEGMENT gets written (the first flush on
+	// a fresh branch is always a snapshot — txid==1 forces it), giving this
+	// test a chain member deleting is meaningful to break.
+	mustExec(t, s.CheckoutPath(), "INSERT INTO t VALUES (2);")
+	if _, err := s.Flush("", nil); err != nil {
+		t.Fatal(err)
+	}
+	if err := s.Close(); err != nil {
+		t.Fatal(err)
+	}
+
+	ref, _, err := w.Store.GetRef("app", "main")
+	if err != nil {
+		t.Fatal(err)
+	}
+	keys, err := w.Store.B.List(store.LineagePrefix(ref.Lineage))
+	if err != nil {
+		t.Fatal(err)
+	}
+	var victim string
+	for _, k := range keys {
+		if m, ok := store.ParseMemberKey(k); ok && !m.Snapshot {
+			victim = k
+		}
+	}
+	if victim == "" {
+		t.Skip("no segment was written; nothing to corrupt for this test")
+	}
+	if err := w.Store.B.Delete(victim); err != nil {
+		t.Fatal(err)
+	}
+
+	// The checkout on disk is untouched and still clean-and-current — this
+	// must succeed even though the chain behind it is now broken, because
+	// Checkout correctly never consults it.
+	path, err := w.Checkout("app", "main")
+	if err != nil {
+		t.Fatalf("a clean-and-current checkout must be served without touching the (now-broken) chain: %v", err)
+	}
+	out, err := exec.Command("sqlite3", path, "SELECT v FROM t ORDER BY v;").Output()
+	if err != nil || string(out) != "1\n2\n" {
+		t.Fatalf("clean-skip must still serve correct, already-on-disk content: %q err=%v", out, err)
+	}
+}
+
+// TestCloseAfterFailedFlushDoesNotStampSidecar guards Commit B's safety
+// guard from the other side: a session that writes, then hits a flush
+// failure that leaves that write unflushed (an injected non-CAS ref-write
+// error, same fault as TestFlushDoesNotDeleteSnapshotOnNonCASRefFailure —
+// NOT a fencing failure, so s.Err() stays nil and the pending check below is
+// what actually has to catch this), must NOT stamp the sidecar on Close: a
+// later Checkout must still see this checkout as needing re-materialization,
+// not incorrectly treat the unflushed write as durable.
+func TestCloseAfterFailedFlushDoesNotStampSidecar(t *testing.T) {
+	requireSQLite(t)
+	w := newWS(t)
+	if err := w.Create("app"); err != nil {
+		t.Fatal(err)
+	}
+	s, err := Open(context.Background(), Options{WS: w, DB: "app", Branch: "main"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	checkoutPath := s.CheckoutPath()
+	stBefore, err := os.Stat(checkoutPath)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	mustExec(t, checkoutPath, "CREATE TABLE t (v); INSERT INTO t VALUES (1);")
+
+	// Inject a non-CAS failure on the ref write, same fault
+	// TestFlushDoesNotDeleteSnapshotOnNonCASRefFailure uses — installed only
+	// AFTER Open (whose own AcquireLease also writes a "refs/" key) and
+	// restored right after the failed Flush, so Close's later ReleaseLease
+	// call isn't hit by it too.
+	orig := w.Store.B
+	w.Store.B = failRefPutIf{orig}
+	_, err = s.Flush("", nil)
+	w.Store.B = orig
+	if err == nil {
+		t.Fatal("expected the injected ref-write failure to fail Flush")
+	}
+	if s.Err() != nil {
+		t.Fatalf("a non-CAS ref failure must not fence the session, got %v", s.Err())
+	}
+	if err := s.Close(); err != nil {
+		t.Fatal(err)
+	}
+
+	p2, err := w.Checkout("app", "main")
+	if err != nil {
+		t.Fatal(err)
+	}
+	stAfter, err := os.Stat(p2)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if os.SameFile(stBefore, stAfter) {
+		t.Fatal("a checkout left with unflushed content after a failed flush must not be treated as clean on the next Checkout (expected a fresh inode from re-materializing)")
+	}
+}
+
+// TestCloseDoesNotStampSidecarAfterUnverifiedShutdown pins CRITICAL fix 2
+// from code review: commitSidecarRefresh must gate its stamp on the capture
+// engine's OWN shutdown having verified the checkout clean
+// (capture.State.Clean — see engine.go's shutdown and commitSidecarRefresh's
+// doc comment), not on independently re-quiescing and re-hashing the
+// checkout itself. An earlier version of this function did the latter,
+// which could stamp content folded in by that independent quiesce even
+// when shutdown's own verification (drain, checkpoint(RESTART) matching
+// what was consumed, no WAL race, checkpoint(TRUNCATE)) had explicitly
+// refused to vouch for it.
+//
+// Forces one of shutdown's four early-return paths — the
+// `int64(logN) != consumed` check right after checkpoint(RESTART) — for
+// real: capture.ShutdownRaceHook lands a foreign write in the exact window
+// shutdown() leaves open between releasing its final read lock and issuing
+// RESTART, deterministically, the same mechanism
+// TestEngineShutdownLeavesUnverifiedStateAfterRacedRestart (internal/capture)
+// uses to pin that the engine itself leaves Clean=false there. This session
+// must then NOT stamp the sidecar, even though everything the session
+// itself was ever asked to flush WAS successfully flushed.
+func TestCloseDoesNotStampSidecarAfterUnverifiedShutdown(t *testing.T) {
+	requireSQLite(t)
+	w := newWS(t)
+	if err := w.Create("app"); err != nil {
+		t.Fatal(err)
+	}
+	s, err := Open(context.Background(), Options{WS: w, DB: "app", Branch: "main"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	checkoutPath := s.CheckoutPath()
+	stBefore, err := os.Stat(checkoutPath)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	mustExec(t, checkoutPath, "CREATE TABLE t (v); INSERT INTO t VALUES (1);")
+	if _, err := s.Flush("", nil); err != nil {
+		t.Fatal(err)
+	}
+
+	capture.ShutdownRaceHook = func() {
+		if out, err := exec.Command("sqlite3", checkoutPath,
+			"PRAGMA busy_timeout=5000; INSERT INTO t VALUES (2);").CombinedOutput(); err != nil {
+			t.Errorf("hook write: %v: %s", err, out)
+		}
+	}
+	defer func() { capture.ShutdownRaceHook = nil }()
+
+	if err := s.Close(); err != nil {
+		t.Fatal(err)
+	}
+
+	p2, err := w.Checkout("app", "main")
+	if err != nil {
+		t.Fatal(err)
+	}
+	stAfter, err := os.Stat(p2)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if os.SameFile(stBefore, stAfter) {
+		t.Fatal("a close whose shutdown never verified the checkout's final state clean must not stamp the sidecar (expected a fresh inode from re-materializing)")
+	}
+}
+
+// TestSidecarNotStampedAfterMidSessionRebase pins singleStartupRebase's
+// gate directly: a session that took a mid-session rebase — driven here the
+// same way TestFlushLoopFlushesRebaseFoldedContentWhenOtherwiseIdle does,
+// with content unrelated to the actual checkout — must not stamp its
+// checkout's sidecar on Close, even though everything IS otherwise flushed
+// and settled (autoFlushPending() is false). Without this gate, the
+// checkout — which the fake rebase never touched — would be stamped as
+// matching durable content it doesn't actually contain, and a later
+// Checkout would silently clean-skip instead of re-materializing the real
+// (rebase-folded) content.
+func TestSidecarNotStampedAfterMidSessionRebase(t *testing.T) {
+	requireSQLite(t)
+	w := newWS(t)
+	if err := w.Create("app"); err != nil {
+		t.Fatal(err)
+	}
+	s, err := Open(context.Background(), Options{
+		WS: w, DB: "app", Branch: "main", FlushEvery: 40 * time.Millisecond,
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	checkoutPath := s.CheckoutPath()
+	stBefore, err := os.Stat(checkoutPath)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	waitFor(t, 5*time.Second, "the session to settle after startup", func() bool {
+		_, _, ok := s.LastFlush()
+		return ok && !s.autoFlushPending()
+	})
+
+	snapPath := filepath.Join(t.TempDir(), "rebase-snapshot.db")
+	mustExec(t, snapPath, "CREATE TABLE rebased (v); INSERT INTO rebased VALUES ('rebase-only');")
+	if err := (replicaSink{s}).Rebase(snapPath); err != nil {
+		t.Fatal(err)
+	}
+	waitFor(t, 5*time.Second, "flushLoop to ship the rebase-folded content", func() bool {
+		return !s.autoFlushPending() && s.LastFlushErr() == nil
+	})
+
+	if err := s.Close(); err != nil {
+		t.Fatal(err)
+	}
+
+	p2, err := w.Checkout("app", "main")
+	if err != nil {
+		t.Fatal(err)
+	}
+	stAfter, err := os.Stat(p2)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if os.SameFile(stBefore, stAfter) {
+		t.Fatal("a checkout that never physically received a mid-session rebase's content must not be treated as clean on the next Checkout (expected a fresh inode from re-materializing)")
+	}
+	out, err := exec.Command("sqlite3", p2, "SELECT v FROM rebased;").Output()
+	if err != nil || string(out) != "rebase-only\n" {
+		t.Fatalf("rebase-folded content missing after re-materializing: %q err=%v", out, err)
+	}
+}
+
+// TestNamedFlushStampsCheckpointMetaAndCreatedAt is the live-session
+// equivalent of ops.TestCheckpointStampsCreatedAtAndMeta: a daemon session's
+// named Flush is how a checkpoint gets created against an open session (see
+// server.opFlush's doc comment for why there is no separate daemon
+// "checkpoint" op), so it needs the identical meta/CreatedAt behavior.
+func TestNamedFlushStampsCheckpointMetaAndCreatedAt(t *testing.T) {
+	requireSQLite(t)
+	w := newWS(t)
+	if err := w.Create("app"); err != nil {
+		t.Fatal(err)
+	}
+	s, err := Open(context.Background(), Options{WS: w, DB: "app", Branch: "main"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer s.Close()
+
+	if out, err := exec.Command("sqlite3", s.CheckoutPath(),
+		"CREATE TABLE t (v); INSERT INTO t VALUES (1);").CombinedOutput(); err != nil {
+		t.Fatalf("%v: %s", err, out)
+	}
+
+	txid, err := s.Flush("v1", map[string]string{"eval_run": "42"})
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	ref, _, err := w.Store.GetRef("app", "main")
+	if err != nil {
+		t.Fatal(err)
+	}
+	cp, ok := ref.Checkpoints["v1"]
+	if !ok || cp.TXID != txid {
+		t.Fatalf("checkpoint v1 = %+v ok=%v, want txid %d", cp, ok, txid)
+	}
+	if cp.CreatedAt == "" {
+		t.Fatal("named flush must stamp the checkpoint's CreatedAt")
+	}
+	if cp.Meta["eval_run"] != "42" {
+		t.Fatalf("named flush's meta did not round-trip onto the checkpoint: %+v", cp.Meta)
+	}
+}
+
+// TestFlushRejectsMetaWithoutAName guards the "meta needs a checkpoint to
+// attach to" rule: an unnamed (auto or manual) flush creates no checkpoint,
+// so metadata passed alongside one would otherwise be silently dropped.
+func TestFlushRejectsMetaWithoutAName(t *testing.T) {
+	requireSQLite(t)
+	w := newWS(t)
+	if err := w.Create("app"); err != nil {
+		t.Fatal(err)
+	}
+	s, err := Open(context.Background(), Options{WS: w, DB: "app", Branch: "main"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer s.Close()
+
+	if _, err := s.Flush("", map[string]string{"eval_run": "42"}); err == nil {
+		t.Fatal("Flush must reject non-empty meta with an empty checkpoint name")
+	}
+}
+
+// TestFlushRejectsMetaOverCap mirrors ops.TestCheckpointRejectsMetaOverCap
+// for the live-session path.
+func TestFlushRejectsMetaOverCap(t *testing.T) {
+	requireSQLite(t)
+	w := newWS(t)
+	if err := w.Create("app"); err != nil {
+		t.Fatal(err)
+	}
+	s, err := Open(context.Background(), Options{WS: w, DB: "app", Branch: "main"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer s.Close()
+
+	tooMany := map[string]string{}
+	for i := 0; i < ops.MaxMetaKeys+1; i++ {
+		tooMany[fmt.Sprintf("k%d", i)] = "v"
+	}
+	if _, err := s.Flush("v1", tooMany); err == nil {
+		t.Fatal("Flush must reject metadata over the cap")
+	}
+	ref, _, err := w.Store.GetRef("app", "main")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, exists := ref.Checkpoints["v1"]; exists {
+		t.Fatal("a rejected named flush must not have created the checkpoint")
 	}
 }

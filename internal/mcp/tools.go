@@ -537,7 +537,12 @@ func (t *OffshootTools) checkpoint(args json.RawMessage) (ToolResult, error) {
 		return TextResult("checkpointed %s@%s as %q at txid %d — captured live from the open daemon session, no pause in writes",
 			a.Database, branch, a.Name, resp.TXID), nil
 	}
-	txid, err := t.ws.Checkpoint(a.Database, branch, a.Name)
+	// meta is nil: MCP tool exposure of checkpoint/fork metadata is
+	// deliberately out of scope for Milestone 3 Task 1 (see ROADMAP's M3
+	// metadata note) — the ops.Workspace.Checkpoint/Fork surface supports
+	// it, but no offshoot_* tool argument threads a caller-supplied map
+	// through to it yet.
+	txid, err := t.ws.Checkpoint(a.Database, branch, a.Name, nil)
 	if err != nil {
 		return ErrorResult("%v", err), nil
 	}
@@ -687,7 +692,9 @@ func (t *OffshootTools) fork(args json.RawMessage) (ToolResult, error) {
 		}
 		txid = resp.TXID
 	} else {
-		txid, err = t.ws.Fork(a.Database, branch, a.NewBranch, a.At, ttl)
+		// meta is nil — see the identical note on t.ws.Checkpoint's call site
+		// above: MCP metadata exposure is out of scope for Milestone 3 Task 1.
+		txid, err = t.ws.Fork(a.Database, branch, a.NewBranch, a.At, ttl, nil)
 		if err != nil {
 			return ErrorResult("%v", err), nil
 		}

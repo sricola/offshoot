@@ -28,7 +28,7 @@ func TestStaleWriterCannotCorruptLineage(t *testing.T) {
 		"CREATE TABLE t (v); INSERT INTO t VALUES ('good');").CombinedOutput(); err != nil {
 		t.Fatalf("%v: %s", err, out)
 	}
-	if _, err := w.Checkpoint("app", "main", "good"); err != nil {
+	if _, err := w.Checkpoint("app", "main", "good", nil); err != nil {
 		t.Fatal(err)
 	}
 

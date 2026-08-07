@@ -65,7 +65,7 @@ func TestFlushesUnderContinuousWritesAreConsistent(t *testing.T) {
 	flushes := 0
 	deadline := time.Now().Add(10 * time.Second)
 	for time.Now().Before(deadline) && flushes < 8 {
-		txid, err := s.Flush(fmt.Sprintf("f%d", flushes))
+		txid, err := s.Flush(fmt.Sprintf("f%d", flushes), nil)
 		if err != nil {
 			close(stop)
 			<-done
@@ -219,7 +219,7 @@ func TestFlushIncludesEverythingCommittedBeforeIt(t *testing.T) {
 			t.Fatalf("round %d: insert marker: %v", i, err)
 		}
 
-		txid, err := s.Flush(fmt.Sprintf("marker-flush-%d", i))
+		txid, err := s.Flush(fmt.Sprintf("marker-flush-%d", i), nil)
 		flushErr := err
 
 		// Release the blocker regardless of outcome, so the engine can

@@ -83,7 +83,7 @@ func TestSegmentAppliedToSnapshotEqualsTheLaterDatabase(t *testing.T) {
 	v1 := buildDB(t, "CREATE TABLE t (id INTEGER PRIMARY KEY, v TEXT)",
 		"INSERT INTO t (v) VALUES ('a'), ('b')")
 	var snap bytes.Buffer
-	if err := EncodeSnapshot(v1, 1, &snap); err != nil {
+	if _, err := EncodeSnapshot(v1, 1, &snap); err != nil {
 		t.Fatal(err)
 	}
 	_, _, before := readPages(t, v1)
@@ -129,7 +129,7 @@ func TestSegmentAppliedToSnapshotEqualsTheLaterDatabase(t *testing.T) {
 	}
 
 	out := filepath.Join(t.TempDir(), "rebuilt.sqlite")
-	txid, err := MaterializeChain(bytes.NewReader(snap.Bytes()),
+	txid, _, err := MaterializeChain(bytes.NewReader(snap.Bytes()),
 		[]io.Reader{bytes.NewReader(seg.Bytes())}, out)
 	if err != nil {
 		t.Fatal(err)
@@ -142,17 +142,69 @@ func TestSegmentAppliedToSnapshotEqualsTheLaterDatabase(t *testing.T) {
 	}
 }
 
+// TestTrailerPostApplyChecksumMatchesEncodedValue pins
+// TrailerPostApplyChecksum against both object shapes it must handle: a
+// snapshot (MinTXID 1) and a segment (MinTXID > 1). No production caller
+// remains (see TrailerPostApplyChecksum's own doc comment for why) — kept
+// as a tested primitive for decoding a trailer without materializing
+// content.
+func TestTrailerPostApplyChecksumMatchesEncodedValue(t *testing.T) {
+	if _, err := exec.LookPath("sqlite3"); err != nil {
+		t.Skip("sqlite3 CLI not on PATH")
+	}
+	v1 := buildDB(t, "CREATE TABLE t (id INTEGER PRIMARY KEY, v TEXT)",
+		"INSERT INTO t (v) VALUES ('a'), ('b')")
+	var snap bytes.Buffer
+	if _, err := EncodeSnapshot(v1, 1, &snap); err != nil {
+		t.Fatal(err)
+	}
+	wantSnap := checksumOf(t, v1)
+	if got, err := TrailerPostApplyChecksum(snap.Bytes()); err != nil {
+		t.Fatal(err)
+	} else if got != wantSnap {
+		t.Fatalf("snapshot trailer checksum = %d, want %d", got, wantSnap)
+	}
+
+	_, _, before := readPages(t, v1)
+	v2 := filepath.Join(t.TempDir(), "v2.sqlite")
+	if err := copyFileForTest(v1, v2); err != nil {
+		t.Fatal(err)
+	}
+	if out, err := exec.Command("sqlite3", v2,
+		"INSERT INTO t (v) VALUES ('c'); UPDATE t SET v='A' WHERE id=1;").CombinedOutput(); err != nil {
+		t.Fatalf("%v: %s", err, out)
+	}
+	pageSize, commit, after := readPages(t, v2)
+	var changed []Page
+	for i, p := range after {
+		if i >= len(before) || !bytes.Equal(p.Data, before[i].Data) {
+			changed = append(changed, p)
+		}
+	}
+	preApply := checksumOf(t, v1)
+	wantSeg := checksumOf(t, v2)
+	var seg bytes.Buffer
+	if err := EncodeSegment(pageSize, commit, 2, 2, preApply, wantSeg, changed, &seg); err != nil {
+		t.Fatal(err)
+	}
+	if got, err := TrailerPostApplyChecksum(seg.Bytes()); err != nil {
+		t.Fatal(err)
+	} else if got != wantSeg {
+		t.Fatalf("segment trailer checksum = %d, want %d", got, wantSeg)
+	}
+}
+
 func TestMaterializeChainWithNoSegmentsIsJustTheSnapshot(t *testing.T) {
 	if _, err := exec.LookPath("sqlite3"); err != nil {
 		t.Skip("sqlite3 CLI not on PATH")
 	}
 	v1 := buildDB(t, "CREATE TABLE t (v)", "INSERT INTO t VALUES ('only')")
 	var snap bytes.Buffer
-	if err := EncodeSnapshot(v1, 5, &snap); err != nil {
+	if _, err := EncodeSnapshot(v1, 5, &snap); err != nil {
 		t.Fatal(err)
 	}
 	out := filepath.Join(t.TempDir(), "rebuilt.sqlite")
-	txid, err := MaterializeChain(bytes.NewReader(snap.Bytes()), nil, out)
+	txid, _, err := MaterializeChain(bytes.NewReader(snap.Bytes()), nil, out)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -170,7 +222,7 @@ func TestChainRejectsAGap(t *testing.T) {
 	}
 	v1 := buildDB(t, "CREATE TABLE t (v)", "INSERT INTO t VALUES ('x')")
 	var snap bytes.Buffer
-	if err := EncodeSnapshot(v1, 1, &snap); err != nil {
+	if _, err := EncodeSnapshot(v1, 1, &snap); err != nil {
 		t.Fatal(err)
 	}
 	pageSize, commit, pages := readPages(t, v1)
@@ -183,7 +235,7 @@ func TestChainRejectsAGap(t *testing.T) {
 		t.Fatal(err)
 	}
 	out := filepath.Join(t.TempDir(), "rebuilt.sqlite")
-	if _, err := MaterializeChain(bytes.NewReader(snap.Bytes()),
+	if _, _, err := MaterializeChain(bytes.NewReader(snap.Bytes()),
 		[]io.Reader{bytes.NewReader(seg.Bytes())}, out); err == nil {
 		t.Fatal("a TXID gap in the chain must be an error, never a silent skip")
 	}
@@ -211,7 +263,7 @@ func TestCorruptSegmentFailsClosed(t *testing.T) {
 	}
 	v1 := buildDB(t, "CREATE TABLE t (v)", "INSERT INTO t VALUES ('x')")
 	var snap bytes.Buffer
-	if err := EncodeSnapshot(v1, 1, &snap); err != nil {
+	if _, err := EncodeSnapshot(v1, 1, &snap); err != nil {
 		t.Fatal(err)
 	}
 	pageSize, commit, pages := readPages(t, v1)
@@ -223,7 +275,7 @@ func TestCorruptSegmentFailsClosed(t *testing.T) {
 	b := seg.Bytes()
 	b[len(b)/2] ^= 0xFF
 	out := filepath.Join(t.TempDir(), "rebuilt.sqlite")
-	if _, err := MaterializeChain(bytes.NewReader(snap.Bytes()),
+	if _, _, err := MaterializeChain(bytes.NewReader(snap.Bytes()),
 		[]io.Reader{bytes.NewReader(b)}, out); err == nil {
 		t.Fatal("a corrupt segment must fail closed")
 	}
@@ -363,7 +415,7 @@ func TestMaterializeChainIncrementalChecksumMatchesFullRescan(t *testing.T) {
 	v1 := buildDB(t, "CREATE TABLE t (id INTEGER PRIMARY KEY, v BLOB)",
 		"INSERT INTO t (v) VALUES (randomblob(50))")
 	var snap bytes.Buffer
-	if err := EncodeSnapshot(v1, 1, &snap); err != nil {
+	if _, err := EncodeSnapshot(v1, 1, &snap); err != nil {
 		t.Fatal(err)
 	}
 	_, commit0, before1 := readPages(t, v1)
@@ -410,7 +462,7 @@ func TestMaterializeChainIncrementalChecksumMatchesFullRescan(t *testing.T) {
 	}
 
 	out := filepath.Join(t.TempDir(), "rebuilt.sqlite")
-	txid, err := MaterializeChain(bytes.NewReader(snap.Bytes()),
+	txid, _, err := MaterializeChain(bytes.NewReader(snap.Bytes()),
 		[]io.Reader{bytes.NewReader(seg1.Bytes()), bytes.NewReader(seg2.Bytes())}, out)
 	if err != nil {
 		t.Fatal(err)

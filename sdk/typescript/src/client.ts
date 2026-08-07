@@ -14,12 +14,29 @@ export class OffshootError extends Error {
   override readonly name = "OffshootError";
 }
 
+/** One checkpoint's entry within {@link Branch.checkpoints_v2}.
+ *
+ * Mirrors `internal/daemon/protocol.go`'s `CheckpointInfo`. `created_at` is
+ * RFC3339 UTC, empty for a checkpoint that predates per-checkpoint
+ * timestamps.
+ */
+export interface CheckpointInfo {
+  name: string;
+  txid: number;
+  created_at: string;
+}
+
 /** One branch of one db, as returned by {@link Client.branches}.
  *
  * Mirrors `internal/daemon/protocol.go`'s `BranchInfo`. `ttl` is the
  * canonical `time.Duration.String()` re-render (e.g. a fork requested with
  * ttl "1h" reads back here as "1h0m0s") — safe to echo straight back into a
  * future {@link Client.fork}/{@link Client.touch} call.
+ *
+ * `checkpoints` (bare names) and `checkpoints_v2` (name/txid/created_at)
+ * describe the exact same set of checkpoints — `checkpoints` stays for
+ * wire/API compat with code written before `checkpoints_v2` existed; new
+ * code should prefer `checkpoints_v2`.
  */
 export interface Branch {
   branch: string;
@@ -29,6 +46,8 @@ export interface Branch {
   ttl_remaining: string;
   lease_holder: string;
   checkpoints: string[];
+  touched_at: string;
+  checkpoints_v2: CheckpointInfo[];
 }
 
 /** One session open in the daemon, as returned by {@link Client.status}. */
@@ -48,6 +67,20 @@ export interface ForkOptions {
   from?: string;
   /** A Go duration string (e.g. "1h"); omitted means no TTL. */
   ttl?: string;
+  /** A small string->string map describing the new branch's lineage (e.g.
+   * eval run id, git SHA, agent id), capped server-side (ops.ValidateMeta:
+   * at most 32 keys, keys <= 64 bytes, values <= 512 bytes) and stored on
+   * the new branch's ref. Omitted means no metadata. */
+  meta?: Record<string, string>;
+}
+
+/** Options for {@link Session.flush}. */
+export interface FlushOptions {
+  /** A small string->string map, meaningful only alongside a non-empty
+   * checkpoint name — it is stored on the resulting named checkpoint
+   * (same caps as {@link ForkOptions.meta}). Passing meta with no name is
+   * rejected by the daemon — there is no checkpoint for it to attach to. */
+  meta?: Record<string, string>;
 }
 
 /** Options for {@link Client.destroy}. */
@@ -67,6 +100,23 @@ export interface TouchOptions {
   /** A Go duration string to set the TTL, "none" to clear it, or omitted to
    * keep the branch's current TTL. */
   ttl?: string;
+}
+
+/** Options for {@link Client.export}. */
+export interface ExportOptions {
+  /** Checkpoint to export; omitted (or "") means the branch's head. */
+  checkpoint?: string;
+  /** Overwrite an existing file at outPath. Without this, export refuses
+   * to overwrite. */
+  force?: boolean;
+}
+
+/** Options for {@link Client.checkoutAt}. */
+export interface CheckoutAtOptions {
+  /** Re-materialize an already-cached read-only checkout file. Without
+   * this, an existing cache file for the same (db, branch, checkpoint) is
+   * returned as-is with no store access. */
+  force?: boolean;
 }
 
 /** Open a connection to the offshoot daemon listening on socketPath. */
@@ -188,6 +238,7 @@ export class Client {
       name: newBranch,
       from: opts.from ?? "",
       ttl: opts.ttl ?? "",
+      meta: opts.meta,
     });
     return resp.txid ?? 0;
   }
@@ -230,7 +281,54 @@ export class Client {
       ttl_remaining: b.ttl_remaining ?? "",
       lease_holder: b.lease_holder ?? "",
       checkpoints: b.checkpoints ?? [],
+      touched_at: b.touched_at ?? "",
+      checkpoints_v2: (b.checkpoints_v2 ?? []).map((cp: any) => ({
+        name: cp.name,
+        txid: cp.txid ?? 0,
+        created_at: cp.created_at ?? "",
+      })),
     }));
+  }
+
+  /** List every database this store has at least one ref for, sorted. */
+  async dbs(): Promise<string[]> {
+    const resp = await this._call("dbs");
+    return resp.databases ?? [];
+  }
+
+  /** Materialize db@branch's state at opts.checkpoint (omitted = head) to a
+   * plain SQLite file at outPath, server-side, on the daemon's own host/
+   * filesystem — outPath must be an ABSOLUTE path (same-host/same-user
+   * unix-socket trust model; see internal/daemon/protocol.go's
+   * `Request.Path`). Refuses to overwrite an existing outPath unless
+   * opts.force. No sidecar, no lease — outPath has no ongoing relationship
+   * to the store.
+   *
+   * This reads the branch's last DURABLE state from the store, never a
+   * live session's checkout: if a session on db@branch has unflushed
+   * writes, they are NOT in the export. Flush (or checkpoint) first if you
+   * need them included. */
+  async export(db: string, branch: string, outPath: string, opts: ExportOptions = {}): Promise<void> {
+    await this._call("export", {
+      db,
+      branch,
+      name: opts.checkpoint ?? "",
+      path: outPath,
+      force: opts.force ?? false,
+    });
+  }
+
+  /** Materialize db@branch's state at checkpoint into a dedicated
+   * read-only cache file, distinct from (and never touching) the branch's
+   * writable checkout — safe to call alongside an open session on the
+   * same branch. Repeat calls with opts.force unset (or false) return the
+   * cached path as-is (a checkpoint's content is immutable, so no store
+   * access is needed); opts.force re-materializes.
+   *
+   * Returns the read-only cache file's path. */
+  async checkoutAt(db: string, branch: string, checkpoint: string, opts: CheckoutAtOptions = {}): Promise<string> {
+    const resp = await this._call("checkout-at", { db, branch, name: checkpoint, force: opts.force ?? false });
+    return resp.checkout ?? "";
   }
 
   /** List every session open in the daemon. */
@@ -256,8 +354,8 @@ export class Session {
   ) {}
 
   /** Flush the checkout to a durable snapshot; returns its txid. */
-  async flush(name = ""): Promise<number> {
-    const r = await this.client._call("flush", { db: this.db, branch: this.branch, name });
+  async flush(name = "", opts: FlushOptions = {}): Promise<number> {
+    const r = await this.client._call("flush", { db: this.db, branch: this.branch, name, meta: opts.meta });
     return r.txid ?? 0;
   }
 

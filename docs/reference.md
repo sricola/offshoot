@@ -5,6 +5,11 @@ strings and command dispatch — flags, arities, and defaults are taken from
 the code, not from memory. If this doc and `offshoot`'s own `-h`-style usage
 text ever disagree, the code wins; please file an issue.
 
+Looking for the narrative walkthrough instead of a flag-by-flag reference —
+install, seed-once-fork-many with the pytest/testkit fixtures, xdist/vitest
+parallelism, golden-file assertions, CI — see
+[docs/eval-harness.md](eval-harness.md).
+
 ## Global
 
 ```
@@ -125,10 +130,105 @@ are about to be overwritten.
 **Errors:** no such `db@branch`; checkout is busy (a live connection is
 holding it) — closes connections and retry.
 
-## `offshoot checkpoint <db>[@branch] <name>`
+### Read-only historical checkout: `--at <checkpoint> --read-only [--force]`
+
+```
+offshoot checkout app@main --at v1 --read-only
+```
+
+Materializes a NAMED checkpoint (never the head, and never omitted — `--at`
+has no "current head" alias the way `export` does) into a SEPARATE,
+dedicated read-only cache path — `<store-root>/checkouts-ro/<db>/<branch>@<checkpoint>.db`
+— and prints that path. `--at` and `--read-only` must be given together;
+either alone is refused as a malformed command. This path is never the
+writable `checkouts/<db>/<branch>.db` path `checkout` (without `--at`) uses,
+and this command never touches that path, its `.sum` sidecar, or a live
+session's open file descriptors on it — safe to run alongside `offshoot mcp`
+or a daemon session on the same branch.
+
+The result is `chmod 0444` (read-only) and has no `.sum` sidecar and no
+lease — it has no ongoing relationship to the store once written, and the
+whole `checkouts-ro` tree is safe to `rm -rf` at any time; the next call for
+anything under it just rebuilds what it needs. A repeat call for the same
+`db@branch@checkpoint` is a cache hit (returned as-is, no store access at
+all) unless `--force` is given, which re-materializes unconditionally — see
+[docs/status.md](status.md) for the exact staleness caveat this cache
+convenience accepts (a branch destroyed and recreated with a
+same-named checkpoint can leave a stale cache entry; `--force` or deleting
+the cache file clears it).
+
+**Errors:** `--at` without `--read-only` or vice versa; no such checkpoint on
+`db@branch`.
+
+## `offshoot export <db>[@branch[@checkpoint]] <out.db> [--force]`
+
+```
+offshoot export app out.db
+offshoot export app@attempt-1 out.db
+offshoot export app@attempt-1@v1 out.db --force
+```
+
+Copies `db@branch`'s state at `checkpoint` (third `@`-separated component;
+omitted means the branch's current head) out to a plain SQLite file at
+`out.db`, anywhere on the local filesystem. Unlike `checkout`, the result has
+ZERO ongoing relationship to the store afterward: no `.sum` sidecar, no
+lease, nothing else in this codebase will ever look at `out.db` again — it's
+a one-shot copy-out, not a checkout.
+
+Refuses to overwrite an existing `out.db` unless `--force`. The write itself
+is always atomic regardless of `--force`: it's built via a temp file in
+`out.db`'s OWN directory, renamed into place only once every chain member
+has been fetched and its checksum verified — a failed export (a fetch
+error, a checksum mismatch) never leaves a truncated or partial file at
+`out.db`, and the rename is guaranteed same-filesystem (same directory).
+
+**Errors:** no such `db@branch`; no such checkpoint; `out.db` already exists
+and `--force` was not given.
+
+## `offshoot diff <db>[@branch[@checkpoint]] <db>[@branch[@checkpoint]] [--summary]`
+
+```
+offshoot diff app@attempt-1@v1 app@attempt-2@v1
+offshoot diff app@attempt-1@v1 app@attempt-2@v1 --summary
+offshoot diff app@attempt-1 app@attempt-2                # both at head
+offshoot diff evals@golden@v1 candidate@main@final       # cross-db is legit
+```
+
+Materializes both sides READ-ONLY through the same primitives `export`/
+`checkout --at --read-only` use (never a live checkout, never a lease — safe
+alongside an open daemon session on either branch) and either streams
+`sqldiff`'s output over them (default) or prints a stdlib-only table-level
+row-count summary (`--summary`, no `sqldiff` dependency at all;
+row-counts-only — equal counts with different values still report `same`,
+use the default `sqldiff` mode for content). Each target uses the same
+triple-`@` form `export` does — `db` alone means `db@main` head, `db@branch`
+means that branch's head, `db@branch@checkpoint` means that named
+checkpoint. The two targets may name the same `db` or two different ones.
+Full walkthrough, the raw by-hand recipe, and the exact staleness rule for a
+head-side (no-checkpoint) target: [docs/diff.md](diff.md).
+
+Before either mode's own output, a header line names which raw target
+string is which side: `left:  <target1> right: <target2>` (verbatim, using
+exactly what was typed on the command line — not a normalized/expanded
+form). `--summary`'s own table header row reuses those same two strings as
+its count columns instead of bare `LEFT`/`RIGHT`, so the table stays
+self-describing even scrolled away from the header line above it.
+
+**Default mode** requires the separate `sqldiff` binary on PATH (NOT
+included by installing plain `sqlite3` on every platform) — its absence is a
+clear, per-OS-hinted error (`sudo apt-get install sqlite3-tools` on Debian/
+Ubuntu, `brew install sqldiff` on macOS — both verified, not guessed; see
+[docs/diff.md](diff.md#default-mode-sqldiff)) naming `--summary` as the
+`sqldiff`-free alternative.
+
+**Errors:** no such `db@branch` or checkpoint on either side; `sqldiff` not
+on PATH (default mode only — `--summary` never needs it).
+
+## `offshoot checkpoint <db>[@branch] <name> [--meta k=v ...]`
 
 ```
 offshoot checkpoint app v1
+offshoot checkpoint app v1 --meta eval_run=42 --meta git_sha=abc123
 ```
 
 Snapshots the *current checkout's* state (not just the ref) as a named
@@ -141,19 +241,29 @@ capture engine tracking which pages changed since the last one; the daemon's
 `session flush` writes incremental segments instead (see [What a flush
 costs](../README.md#what-a-flush-costs) in the README).
 
+Every checkpoint records a creation timestamp (`created_at`, RFC3339 UTC)
+automatically. `--meta k=v` is repeatable and attaches a small string→string
+map to *this specific checkpoint* (e.g. an eval run id, a git SHA, an agent
+id) — capped at 32 keys, 64-byte keys, 512-byte values, enforced before
+anything is written; a rejected `--meta` leaves the branch untouched. This is
+branch/checkpoint-level metadata, not row-level provenance — see the design
+spec's metadata note.
+
 Children never inherit a parent's checkpoints — a fork's storage begins at
 its fork point, so a checkpoint made before the fork isn't materializable
 from the child; resolve it on the parent instead.
 
 **Errors:** checkpoint name already exists on this branch; no checkout
-exists yet (run `checkout` first); checkout is busy.
+exists yet (run `checkout` first); checkout is busy; `--meta` over a cap
+(key count, key length, or value length).
 
-## `offshoot fork <db>[@branch] <new-branch> [--at checkpoint] [--ttl duration]`
+## `offshoot fork <db>[@branch] <new-branch> [--at checkpoint] [--ttl duration] [--meta k=v ...]`
 
 ```
 offshoot fork app attempt-1
 offshoot fork app attempt-1 --at v1
 offshoot fork app attempt-1 --ttl 2h
+offshoot fork app attempt-1 --meta eval_run=42 --meta git_sha=abc123
 ```
 
 Creates `new-branch` as an independent branch from `db@branch`'s head, or
@@ -175,8 +285,17 @@ duration (`0s`, a negative value, or the literal string `none`) is refused
 outright rather than silently treated as "no TTL," since that would let a
 caller believe they set a TTL when they didn't.
 
+`--meta k=v` (repeatable, same caps as `checkpoint`'s) attaches a small
+string→string map to the **new branch's own lineage** — this describes the
+branch, not the auto-created `fork` checkpoint (which still gets its own
+`created_at`, but no metadata of its own). This is the same knob
+`branches`/the daemon `fork` op and SDK `fork()` calls expose; `branches`
+output surfaces each checkpoint's `created_at`/`txid` (`checkpoints_v2`) but
+not raw metadata values today — read them back via the store directly, or a
+future op, if you need to query by value.
+
 **Errors:** `new-branch` already exists; unknown `--at` checkpoint name;
-non-positive or `"none"` `--ttl` value.
+non-positive or `"none"` `--ttl` value; `--meta` over a cap.
 
 ## `offshoot touch <db>[@branch] [--ttl duration|none]`
 
@@ -470,13 +589,23 @@ Flushes the session's pending WAL to a durable snapshot or incremental
 segment in the store — writes since the last flush are committed to SQLite
 but not durable in the bucket until this runs. An optional `name` also
 records a named checkpoint at the resulting transaction id (same checkpoint
-namespace as `offshoot checkpoint`). Prints the transaction id now durable.
-The daemon writes a full snapshot every 16th flush and an incremental
-segment (only the changed pages) otherwise, so materializing state never
-replays more than one snapshot plus fifteen segments.
+namespace as `offshoot checkpoint`, and stamped with the same `created_at`).
+Prints the transaction id now durable. The daemon writes a full snapshot
+every 16th flush and an incremental segment (only the changed pages)
+otherwise, so materializing state never replays more than one snapshot plus
+fifteen segments.
+
+There is no separate daemon "checkpoint" op — a live session's named flush
+*is* how its checkpoints are created; the underlying daemon protocol's
+`flush` op also accepts a `meta` map (same caps as `checkpoint`'s `--meta`),
+which the Python/TypeScript SDKs' `flush(name, meta=...)` expose. This CLI
+subcommand does not have a `--meta` flag today — use an SDK client for
+metadata on a live-session checkpoint.
 
 **Errors:** `db@branch` is not open here; the session has lost its lease
-(fenced — it will not write under a dead epoch).
+(fenced — it will not write under a dead epoch); `meta` given with no
+checkpoint `name`; `meta` over a cap (SDK-only, since this CLI subcommand
+has no `--meta` flag).
 
 ## `offshoot session status [-socket PATH]`
 
@@ -508,6 +637,46 @@ offshoot session shutdown
 Asks the daemon to shut down gracefully (equivalent to sending it
 `SIGINT`/`SIGTERM`): releases every lease, closes every session, removes the
 socket.
+
+## `offshoot session dbs [-socket PATH]`
+
+```
+offshoot session dbs
+```
+
+Lists every database this store has at least one ref for (one per line,
+sorted) — the daemon protocol's `dbs` op, the same one the Python/TypeScript
+SDKs' `dbs()` calls. Useful for cleanup jobs that need to enumerate what
+exists without shelling out to a store-directory listing. An empty store
+prints nothing and is not an error (unlike `branches`, which errors on an
+unrecognized `db` name — there's no single db to name here).
+
+## Daemon protocol ops with no CLI `session` subcommand: `export`, `checkout-at`
+
+The daemon protocol's `export` and `checkout-at` ops (Python `Client.export`/
+`checkout_at`, TypeScript `Client.export`/`checkoutAt`) are reachable only
+through an SDK client today — there is no `offshoot session export`/
+`offshoot session checkout-at` CLI subcommand; use the top-level `offshoot
+export` / `offshoot checkout --at --read-only` commands above for CLI/at-rest
+access to the same underlying `ops.Workspace.Export`/`CheckoutAt` functions.
+
+`export`'s destination is a path on the **daemon's own host**, not the
+client's — it must be given as an absolute path (a relative one is refused
+outright) and is written with the same refuse/`force`/atomic-temp+rename
+semantics as the CLI command above. It reads the branch's last **durable**
+state from the store, never a live session's checkout: an open session's
+unflushed writes are not in the export (flush first if you need them
+included). `checkout-at` materializes into the same `checkouts-ro` cache
+path the CLI command above uses, and is safe to call even while this same
+daemon has a live session open on the target branch (unlike `checkout`/
+`rollback`/`promote`, which all refuse in that case) — it never touches the
+writable checkout.
+
+**Threat model:** the daemon speaks only a local unix socket (mode `0600`);
+any process able to open that socket already runs as the same user on the
+same host, so `export`'s destination path is trusted as an ordinary
+filesystem path that process can write — the daemon does not sandbox it or
+check it against an allow-list beyond requiring it be absolute.
 
 ---
 
