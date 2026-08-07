@@ -371,6 +371,36 @@ version if you depend on format stability.
   and reiterates the writable-never-evicted guarantee; the `evicted` event
   row in the events table loses its "reserved" caveat.
 
+- **`serve -snapshot-every N`** (Milestone 4 Task 6a): plumbs the
+  embeddable session library's existing `Options.SnapshotEvery` cadence
+  into every session `offshoot serve` opens, the same way `-flush-every`
+  already plumbs `FlushEvery` — `Server.SetSnapshotEvery`
+  (`internal/daemon/server.go`), read by `opOpen` under the same single-
+  writer-before-`Serve` contract. Default `16`, unchanged if the flag is
+  omitted (`SetSnapshotEvery` is simply never called, so `snapshotEvery`
+  stays its zero value and `session.Open` applies its own default); rejects
+  a value `< 1` at the flag-parsing layer — unlike `-flush-every 0`, there
+  is no "disabled" sentinel, since every flush must eventually snapshot.
+  `internal/session.DefaultSnapshotEvery` is now exported so
+  `cmd/offshoot`'s error message references the same number rather than a
+  second hardcoded copy of it.
+
+  Tests: `internal/daemon/snapshot_every_test.go`
+  (`TestServeSnapshotEveryWiringDrivesCadence`) drives 9 flushes over the
+  socket with `SetSnapshotEvery(4)` and asserts a bounded `store.Chain`
+  (≤4 members) plus more than one snapshot object across the lineage
+  listing, proving the cadence recurs under daemon wiring and not just at
+  session start; `cmd/offshoot/main_test.go`
+  (`TestServeNonPositiveSnapshotEveryIsRejected`) pins `0`/negative/
+  non-integer as usage errors. `go test ./internal/ops ./internal/store
+  ./internal/daemon ./cmd/offshoot -count=1 -race` clean; no
+  `internal/session`/`internal/capture` changes, so no torture run was
+  required. `docs/status.md`'s bounded-replay and tuning-surface rows flip
+  to shipped-and-tested; `docs/reference.md` gains `-snapshot-every` and
+  documents the flush-cost trade-off (fewer segments per snapshot = more
+  frequent full-database uploads but cheaper/bounded reads, and vice
+  versa); README's "What a flush costs" section updated to match.
+
 ## [0.1.2] - 2026-08-06
 
 Milestone 3: the eval-harness release. The target persona's first hour is

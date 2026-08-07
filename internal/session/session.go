@@ -20,9 +20,12 @@ import (
 	"github.com/offshoot-db/offshoot/internal/wal"
 )
 
-// defaultSnapshotEvery is Options.SnapshotEvery's default: a full snapshot
-// every 16 flushes, with incremental segments in between.
-const defaultSnapshotEvery = 16
+// DefaultSnapshotEvery is Options.SnapshotEvery's default: a full snapshot
+// every 16 flushes, with incremental segments in between. Exported so
+// cmd/offshoot's `serve -snapshot-every` flag can reference the same number
+// in its own error messages/docs rather than hardcoding a second copy of it
+// (Milestone 4 Task 6a).
+const DefaultSnapshotEvery = 16
 
 type Options struct {
 	WS         *ops.Workspace
@@ -371,7 +374,7 @@ func Open(ctx context.Context, o Options) (*Session, error) {
 		}
 	}
 	if o.SnapshotEvery <= 0 {
-		o.SnapshotEvery = defaultSnapshotEvery
+		o.SnapshotEvery = DefaultSnapshotEvery
 	}
 	dir, ownsDir := o.Dir, false
 	if dir == "" {

@@ -195,6 +195,31 @@ func TestServeNegativeFlushEveryIsRejected(t *testing.T) {
 	}
 }
 
+// TestServeNonPositiveSnapshotEveryIsRejected pins -snapshot-every's own
+// usage-error rule (Milestone 4 Task 6a): unlike -flush-every, there is no
+// "0 means disabled" sentinel for the snapshot cadence — every flush must
+// still eventually snapshot, so 0 and negative values are both rejected
+// rather than silently aliased to "unlimited" or the default. run() must
+// return before ever starting to serve, so this needs no daemon lifecycle
+// (mirrors TestServeNegativeFlushEveryIsRejected's shape).
+func TestServeNonPositiveSnapshotEveryIsRejected(t *testing.T) {
+	dir := filepath.Join(t.TempDir(), "s")
+	if err := run([]string{"-store", dir, "init"}); err != nil {
+		t.Fatal(err)
+	}
+	if err := run([]string{"-store", dir, "create", "app"}); err != nil {
+		t.Fatal(err)
+	}
+	for _, v := range []string{"0", "-1", "-4"} {
+		if err := run([]string{"-store", dir, "serve", "-snapshot-every", v}); err == nil {
+			t.Fatalf("serve -snapshot-every %s must be rejected", v)
+		}
+	}
+	if err := run([]string{"-store", dir, "serve", "-snapshot-every", "not-a-number"}); err == nil {
+		t.Fatal("serve -snapshot-every not-a-number must be rejected")
+	}
+}
+
 // TestParseByteSize pins -ro-cache-budget's value grammar (Milestone 4 Task
 // 5): bare integers are bytes (the contract), a trailing power-of-1024
 // K/M/G/T(B) suffix is a convenience multiplier, "" (flag omitted) is 0

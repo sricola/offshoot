@@ -53,6 +53,16 @@ type Server struct {
 	// flushEvery's own single-writer-before-Serve contract; cmd/offshoot's
 	// `serve` command sets it from -ro-cache-budget (default 0).
 	roCacheBudget int64
+	// snapshotEvery is passed as Options.SnapshotEvery to every session
+	// opOpen opens (Milestone 4 Task 6a). 0 (the zero value, matching
+	// session.Options' own default) means "let the session library apply
+	// its own default" (defaultSnapshotEvery = 16) — this daemon does not
+	// impose a different default of its own the way SetFlushEvery does; it
+	// only overrides when cmd/offshoot's `serve -snapshot-every N` is
+	// explicitly given. Set via SetSnapshotEvery before Serve starts
+	// accepting connections, mirroring flushEvery's own single-writer-
+	// before-Serve contract.
+	snapshotEvery int
 	// openWG counts in-flight opOpen calls: Add(1) happens under mu at the
 	// moment a slot is reserved, Done() happens once that call's bookkeeping
 	// has fully resolved (map updated and, if it self-closed, the session
@@ -183,6 +193,21 @@ func (s *Server) SetFlushEvery(d time.Duration) {
 func (s *Server) SetROCacheBudget(bytes int64) {
 	s.mu.Lock()
 	s.roCacheBudget = bytes
+	s.mu.Unlock()
+}
+
+// SetSnapshotEvery sets the snapshot cadence (session.Options.SnapshotEvery)
+// applied to every session opOpen opens from now on (Milestone 4 Task 6a).
+// Call before Serve starts accepting connections, mirroring SetFlushEvery's
+// own single-writer-before-Serve contract. n <= 0 means "unset" — opOpen
+// passes 0 through and session.Open applies its own default (16), so a
+// daemon that never calls this behaves exactly as before this flag existed.
+// cmd/offshoot's `serve` command rejects a non-positive -snapshot-every N at
+// the flag-parsing layer (a mistake, not a supported "unlimited" value) and
+// only calls this method when N was actually given.
+func (s *Server) SetSnapshotEvery(n int) {
+	s.mu.Lock()
+	s.snapshotEvery = n
 	s.mu.Unlock()
 }
 
@@ -536,6 +561,7 @@ func (s *Server) opOpen(req Request) Response {
 	s.sessions[k] = nil // reserve the slot
 	s.openWG.Add(1)
 	flushEvery := s.flushEvery
+	snapshotEvery := s.snapshotEvery
 	s.mu.Unlock()
 
 	if openDelay != nil {
@@ -544,6 +570,7 @@ func (s *Server) opOpen(req Request) Response {
 
 	sess, err := session.Open(context.Background(), session.Options{
 		WS: s.ws, DB: req.DB, Branch: branch, FlushEvery: flushEvery,
+		SnapshotEvery: snapshotEvery,
 	})
 
 	s.mu.Lock()

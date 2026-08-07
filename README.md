@@ -211,9 +211,14 @@ A daemon flush writes only the pages that changed since the previous flush —
 the capture engine already knows exactly which those are. Every sixteenth
 flush writes a full snapshot instead, so materializing a branch never replays
 an unbounded chain: a read applies one snapshot plus at most fifteen
-segments. (That cadence is configurable when embedding the session library
-directly — `Options.SnapshotEvery` — but the daemon does not currently
-expose it, so every daemon-managed session uses the default of sixteen.)
+segments. That cadence is `Options.SnapshotEvery` in the embeddable session
+library, and `offshoot serve -snapshot-every N` (Milestone 4 Task 6a) plumbs
+the same knob to every daemon-managed session (default 16, unchanged if
+omitted; must be `>= 1`). A lower N means cheaper, more tightly bounded reads
+at the cost of shipping a full-database upload more often; a higher N
+amortizes that upload cost across more flushes at the cost of longer
+per-read replay — see `offshoot serve`'s entry in
+[docs/reference.md](docs/reference.md) for the full trade-off.
 
 A session's very first auto-flush after `session open` used to be an
 unconditional full snapshot, no matter where that landed in the
