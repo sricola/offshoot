@@ -13,8 +13,91 @@ version if you depend on format stability.
 
 ## [Unreleased]
 
+## [0.1.2] - 2026-08-06
+
+Milestone 3: the eval-harness release. The target persona's first hour is
+now paved end to end — install, seed once, fork per test, inspect, export,
+clean up — from Python (`offshoot.pytest_plugin`) or TypeScript
+(`testkit`), with [docs/eval-harness.md](docs/eval-harness.md) as the
+serious tutorial and framework recipes for Claude Code, the OpenAI Agents
+SDK, LlamaIndex, and CrewAI in [docs/recipes/](docs/recipes/). New protocol
+surface (`dbs`, metadata/timestamps, `export`, read-only historical
+checkouts) lands first, the fixture plugin and TS testkit are built on top
+of it, and `offshoot diff` closes the daily "what changed between these two
+attempts" loop. Two Milestone-2 performance follow-ups (settling-flush
+suppression; sidecar refresh on clean close) ride along because the
+fixture's session-per-test pattern is exactly the workload they fix. SDK
+publishing is prepared (workflows, manifests) but actual PyPI/npm
+publication, and the MCP registry/LangGraph listing submissions, stay
+user-gated — see [docs/status.md](docs/status.md) and
+[ROADMAP.md](ROADMAP.md)'s Milestone 3 section for exactly what shipped vs.
+what's a stated, pre-written deferral.
+
 ### Added
 
+- **Docs sweep** (Milestone 3 Task 8): [docs/eval-harness.md](docs/eval-harness.md),
+  the serious tutorial — install, the pytest plugin end to end (named-seed
+  factory, fork-per-test, `pytest-xdist` with the measured per-worker
+  number, mid-test flush checkpoints, golden assertions via `offshoot_dump`
+  — never byte-compare, why), export for handoff/debug, `offshoot diff` for
+  the failed-vs-passed loop, TTL hygiene, a CI recipe (this repo's own
+  `ci.yml` `sdks` job as a live example), what it costs, and the TypeScript
+  `testkit` section mirroring the same semantics for vitest/jest/`node:test`.
+  Every pytest example in it was actually run against a real daemon while
+  writing it (a scratch project, real output pasted in, not invented); the
+  TypeScript `testkit` section's `node:test` example was likewise run
+  against a real build of `sdk/typescript`. `sdk/python/README.md`'s
+  pytest-fixture-plugin section is superseded by the tutorial as the
+  primary teaching surface and now points to it, staying as the
+  PyPI-landing-page-sized condensed reference.
+  - `docs/recipes/claude-agent-sdk.md`: `claude mcp add` config for
+    `offshoot mcp`, and a hooks pattern (fork on `SessionStart`, checkpoint
+    on `Stop`, roll back on failure) — explicitly checked against the MCP
+    daemon-mode reality documented in the README's MCP section and
+    `docs/reference.md`: `offshoot mcp` never opens a session itself, so
+    the recipe's actual content is opening the session via the CLI/SDK
+    *before* the agent's first tool call, with the hooks shown as one way
+    to automate that open/close, not a substitute for it. The hooks JSON
+    shape itself is marked illustrative (Claude Code's own surface, not
+    offshoot's, and outside what this task could pin the way the rest of
+    this repo's docs are).
+  - `docs/recipes/openai-agents.md`: the OpenAI Agents SDK's
+    `SQLiteSession(session_id, db_path)` pointed at an offshoot checkout
+    path, fork-per-attempt via the Python SDK. Actually run end to end
+    against a real `pip install openai-agents` (no API key needed to prove
+    the storage integration — `add_items`/`get_items` stand in for
+    `Runner.run`); real output pasted in, including two forked attempts'
+    histories staying independent after diverging from a shared checkpoint.
+  - `docs/recipes/frameworks.md`: short, honest LlamaIndex/CrewAI notes —
+    recipes, not adapters, per the plan's stance. Explicitly marked
+    unverified against a live install this pass (LlamaIndex's SQL chat
+    store needs the `aiosqlite` extra; CrewAI's package failed to build
+    locally — `tiktoken`, one of its transitive dependencies, has no
+    prebuilt wheel for this Python/platform combination) rather than
+    presented with false confidence.
+  - README: integration-surface refresh — pytest plugin, TypeScript
+    `testkit`, `export`/`checkout_at`/`dbs` all get their own lines under
+    the Python/TypeScript SDK sections; a new "Other agent frameworks"
+    section points at `docs/recipes/`; the Docs line and Quickstart section
+    both gain pointers to the new tutorial.
+  - `docs/reference.md`: verified complete for `export`/`diff`/
+    `checkout --at` (documented per-task already; no gaps found) — added
+    one pointer line at the top to the tutorial for readers who want the
+    narrative walkthrough instead of the flag-by-flag reference.
+  - `docs/status.md`: two new deferral rows, both pre-written per PM
+    Amendment — `create --from` daemon/SDK/MCP reach (needs an upload
+    channel or a same-host path-trust story like `export`'s; CLI remains
+    the import path) and MCP session open/close (the fixture plugin and TS
+    testkit are now real lifecycle owners for their own harness workload,
+    but neither is an MCP tool pair — the no-natural-owner reasoning from
+    Milestone 2's amendment stands, confirmed rather than just carried
+    forward).
+  - `ROADMAP.md`: Milestone 3 checked off item-by-item against what
+    actually shipped, with the two deferrals above plus listings
+    submission and actual SDK publication called out as pre-written,
+    user-gated deferral rows rather than silently-dropped scope; Milestone
+    2's "MCP rides the daemon" bullet updated to note the fixture/testkit
+    now exist without overclaiming they closed the MCP-tool-pair gap.
 - **List databases** (Milestone 3 Task 1): new daemon protocol op `dbs`
   returns every database the store has at least one ref for
   (`store.Store.ListRefs`'s keys, sorted). CLI: `offshoot session dbs`.
