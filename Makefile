@@ -1,5 +1,6 @@
 .PHONY: test test-torture build test-s3 bench bench-s3 test-python-sdk test-ts-sdk test-sdks \
-	check-sdk-versions dry-run-python-sdk dry-run-ts-sdk dry-run-sdks test-pytest-plugin
+	check-sdk-versions dry-run-python-sdk dry-run-ts-sdk dry-run-sdks test-pytest-plugin \
+	ci-local ci-local-host ci-local-linux ci-local-minio ci-local-sdks
 test:
 	go test ./... -count=1
 test-torture:
@@ -131,6 +132,24 @@ dry-run-ts-sdk:
 # sdk/** (see ci.yml's sdks job) so PUBLISH_ENABLED flipping on is never the
 # first time a manifest mistake is discovered.
 dry-run-sdks: dry-run-python-sdk dry-run-ts-sdk
+
+# ci-local mirrors .github/workflows/ci.yml's job matrix locally, so
+# CI-equivalent signal lands in minutes instead of waiting on a runner. Each
+# job is also runnable alone (`make ci-local-host`, etc.) for a tighter
+# loop while iterating on one thing. `ci-local` runs all four in sequence
+# and prints a pass/fail-per-job summary table; see scripts/ci-local.sh's
+# header and CONTRIBUTING.md's "Local CI" section for exactly what this
+# does and does NOT prove versus a real GitHub Actions run.
+ci-local:
+	./scripts/ci-local.sh all
+ci-local-host:
+	./scripts/ci-local.sh host
+ci-local-linux:
+	./scripts/ci-local.sh linux
+ci-local-minio:
+	./scripts/ci-local.sh minio
+ci-local-sdks:
+	./scripts/ci-local.sh sdks
 
 .PHONY: third-party-licenses
 # third-party-licenses regenerates THIRD_PARTY_LICENSES.csv from the current

@@ -23,8 +23,10 @@ for pytest/vitest/`node:test`, from install to CI) ·
 LlamaIndex/CrewAI)
 
 **Contributing:** [CONTRIBUTING.md](CONTRIBUTING.md) has dev setup and the
-test tiers; [SECURITY.md](SECURITY.md) covers vulnerability reporting.
-Release notes live in [CHANGELOG.md](CHANGELOG.md).
+test tiers, including `make ci-local` (mirrors CI's job matrix locally —
+fast pre-merge signal, not a substitute for the real CI gate);
+[SECURITY.md](SECURITY.md) covers vulnerability reporting. Release notes
+live in [CHANGELOG.md](CHANGELOG.md).
 
 ## Versioning
 
