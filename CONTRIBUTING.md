@@ -68,6 +68,49 @@ faith.
 used by the unit tests proves nothing about a real bucket's conditional-write
 behavior, which is what the whole compare-and-swap safety story rests on.
 
+## Local CI
+
+`make ci-local` runs `.github/workflows/ci.yml`'s four jobs locally, in
+minutes instead of waiting on a runner:
+
+| Target | Mirrors | What it needs |
+|---|---|---|
+| `make ci-local-host` | the `test` job's matrix, run on this host | `sqlite3`/`sqldiff` on PATH (dev-setup prerequisite above) |
+| `make ci-local-linux` | the `test` job's ubuntu leg, in Docker | Docker; module/build caches live in named volumes so repeat runs are fast |
+| `make ci-local-minio` | the `s3-conformance` job | Docker (spins up MinIO, runs `make test-s3`, always tears down) |
+| `make ci-local-sdks` | the `sdks` job | `python3`, Node 20+, and optionally `pip install build twine` for the `dry-run-sdks` step (skipped loudly, not silently, if absent) |
+
+`make ci-local` runs all four in sequence and prints a pass/fail-per-job
+summary table with timings; a single job is runnable alone too. See
+`scripts/ci-local.sh`'s header comment for the job-by-job detail.
+
+**What it does NOT replicate — CI remains the merge gate, this is pre-merge
+signal:**
+
+- **GHA runner image drift.** `ci.yml`'s macOS leg broke without a version
+  bump on our side because `macos-latest` rolled to a new image
+  ("macos-26") that had quietly dropped the `sqlite3` CLI from PATH — see
+  `ci.yml`'s "Install sqlite3 CLI (macos)" step comment. `ci-local-host`
+  runs on whatever your machine's own Homebrew/PATH state already is; it
+  cannot catch a runner image regression like that, only a real
+  `macos-latest` run can.
+- **Runner pip/HOME layout.** The `sdks` job's pytest-plugin step installs
+  into a venv instead of `pip install --break-system-packages` onto system
+  Python specifically because, on the actual (non-root, no-sudo) GHA
+  runner, that flag falls back to a *user*-site install under `$HOME` —
+  and pytest's `pytester` fixture repoints `HOME` for its subprocess runs,
+  making pytest invisible to them (`ValueError: Pytest terminal summary
+  report not found`). `ci-local-sdks` uses a venv from the start, so it
+  can't reproduce the runner-layout failure mode it was written in
+  response to — see `ci.yml`'s `sdks` job comment for the full incident.
+- **Actions-specific behavior** — `actions/checkout`, `actions/setup-go`,
+  caching, `GITHUB_PATH`, etc. — none of it runs locally; `ci-local` calls
+  the same underlying commands (`go vet`, `go test`, `make test-s3`, ...)
+  directly.
+
+A green `ci-local` is strong local evidence, not a substitute for the real
+GitHub Actions run — push and let CI have the final word.
+
 ## Code style
 
 - Match the patterns already in the file you're editing over anything you'd
