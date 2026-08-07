@@ -12,7 +12,7 @@
 
 ## Global Constraints
 
-- Module `github.com/offshoot-db/offshoot`; Go 1.23+; cgo (mattn); Linux/macOS only
+- Module `github.com/sricola/offshoot`; Go 1.23+; cgo (mattn); Linux/macOS only
 - Name charset for db/branch/checkpoint: `[a-z0-9-_.]`, max 128 chars (spec § Naming model); default branch `main`
 - Ref invariant: **a lineage is only ever written by one branch, for its entire life** (spec § Core model)
 - All ref mutations go through CAS (`PutIf`); all new objects use create-only puts (`ifMatch=""` ⇒ must-not-exist)
@@ -1068,7 +1068,7 @@ import (
 	"testing"
 
 	_ "github.com/mattn/go-sqlite3"
-	"github.com/offshoot-db/offshoot/internal/store"
+	"github.com/sricola/offshoot/internal/store"
 )
 
 func newWS(t *testing.T) *Workspace {
@@ -1192,8 +1192,8 @@ import (
 	"strings"
 
 	_ "github.com/mattn/go-sqlite3"
-	"github.com/offshoot-db/offshoot/internal/ltxio"
-	"github.com/offshoot-db/offshoot/internal/store"
+	"github.com/sricola/offshoot/internal/ltxio"
+	"github.com/sricola/offshoot/internal/store"
 )
 
 type Workspace struct {
@@ -1386,7 +1386,7 @@ import (
 	"fmt"
 	"os"
 
-	"github.com/offshoot-db/offshoot/internal/ops"
+	"github.com/sricola/offshoot/internal/ops"
 )
 
 const usage = `offshoot — branch SQLite like git (local mode)
@@ -2213,7 +2213,7 @@ import (
 	"testing"
 	"time"
 
-	"github.com/offshoot-db/offshoot/internal/store"
+	"github.com/sricola/offshoot/internal/store"
 )
 
 func TestDestroyAndGC(t *testing.T) {
@@ -2298,7 +2298,7 @@ import (
 	"strings"
 	"time"
 
-	"github.com/offshoot-db/offshoot/internal/store"
+	"github.com/sricola/offshoot/internal/store"
 )
 
 const tombstoneKey = "gc/tombstones"

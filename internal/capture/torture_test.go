@@ -11,8 +11,8 @@ import (
 	"testing"
 	"time"
 
-	"github.com/offshoot-db/offshoot/internal/replay"
-	"github.com/offshoot-db/offshoot/internal/wal"
+	"github.com/sricola/offshoot/internal/replay"
+	"github.com/sricola/offshoot/internal/wal"
 )
 
 const writerSQL = `PRAGMA busy_timeout=5000;

@@ -6,8 +6,8 @@ import (
 	"strings"
 	"testing"
 
-	"github.com/offshoot-db/offshoot/internal/store"
-	"github.com/offshoot-db/offshoot/internal/store/storetest"
+	"github.com/sricola/offshoot/internal/store"
+	"github.com/sricola/offshoot/internal/store/storetest"
 )
 
 func TestOpenBackendLocalPath(t *testing.T) {

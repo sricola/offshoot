@@ -12,7 +12,7 @@ import (
 	"testing"
 	"time"
 
-	"github.com/offshoot-db/offshoot/internal/ops"
+	"github.com/sricola/offshoot/internal/ops"
 )
 
 // newTools builds a tool set with no default fork TTL, unless a single

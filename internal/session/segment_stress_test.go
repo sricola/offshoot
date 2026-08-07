@@ -7,8 +7,8 @@ import (
 	"os/exec"
 	"testing"
 
-	"github.com/offshoot-db/offshoot/internal/ltxio"
-	"github.com/offshoot-db/offshoot/internal/store"
+	"github.com/sricola/offshoot/internal/ltxio"
+	"github.com/sricola/offshoot/internal/store"
 )
 
 // TestCleanResumeRebaselinesBeforeFirstSegment guards fix 1 of the

@@ -96,7 +96,7 @@ export interface StartDaemonOptions {
 const INSTALL_INSTRUCTIONS =
   "offshoot binary not found. Set OFFSHOOT_BIN to its path, or put " +
   "`offshoot` on PATH. Install: see " +
-  "https://github.com/offshoot-db/offshoot#install (from a source " +
+  "https://github.com/sricola/offshoot#install (from a source " +
   "checkout: `go build -o /path/to/offshoot ./cmd/offshoot`, then " +
   "`export OFFSHOOT_BIN=/path/to/offshoot`).";
 

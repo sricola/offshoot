@@ -8,7 +8,7 @@ import (
 	"runtime"
 	"text/tabwriter"
 
-	"github.com/offshoot-db/offshoot/internal/ops"
+	"github.com/sricola/offshoot/internal/ops"
 )
 
 // sqldiffNotFoundError is runDiff's error when the `sqldiff` binary isn't on

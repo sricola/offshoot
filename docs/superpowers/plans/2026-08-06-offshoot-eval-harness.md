@@ -10,7 +10,7 @@
 
 ## Global Constraints
 
-- Module `github.com/offshoot-db/offshoot`; cgo; Linux/macOS; **no new Go module dependencies**
+- Module `github.com/sricola/offshoot`; cgo; Linux/macOS; **no new Go module dependencies**
 - Base Python SDK stays **stdlib-only**; pytest integration ships as an optional extra (`offshoot-db[pytest]`), never a hard dependency; TS SDK keeps zero runtime deps
 - Wire-protocol additions are backward compatible: new optional request fields / new ops only; existing SDK methods keep working against the new daemon and vice versa (new SDKs against an old daemon fail with clear "unknown op" errors, not hangs)
 - Read-only materializations must be UNAMBIGUOUSLY read-only in the API's language and never hold a lease; nothing about them may weaken the one-writer-per-lineage invariant

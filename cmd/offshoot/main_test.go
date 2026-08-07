@@ -11,7 +11,7 @@ import (
 	"testing"
 	"time"
 
-	"github.com/offshoot-db/offshoot/internal/daemon"
+	"github.com/sricola/offshoot/internal/daemon"
 )
 
 // call runs the CLI's run() with -store pointing at dir, capturing stdout.

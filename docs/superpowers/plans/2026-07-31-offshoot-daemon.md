@@ -12,7 +12,7 @@
 
 ## Global Constraints
 
-- Module `github.com/offshoot-db/offshoot`; Go 1.24+; cgo (mattn); Linux/macOS only
+- Module `github.com/sricola/offshoot`; Go 1.24+; cgo (mattn); Linux/macOS only
 - **The connection contract from the spec is binding:** daemon and agent must share a kernel and a local POSIX filesystem; checkouts are WAL-mode SQLite files the daemon does not own connections to
 - A session's writes go under its **lease epoch**; losing the lease ends the session loudly — never a silent retry, never a write under a dead epoch
 - Flush must never quiesce or lock the agent's checkout; the agent writes throughout
@@ -104,7 +104,7 @@ import (
 	"testing"
 	"time"
 
-	"github.com/offshoot-db/offshoot/internal/ops"
+	"github.com/sricola/offshoot/internal/ops"
 )
 
 func newWS(t *testing.T) *ops.Workspace {
@@ -249,11 +249,11 @@ import (
 	"sync"
 	"time"
 
-	"github.com/offshoot-db/offshoot/internal/capture"
-	"github.com/offshoot-db/offshoot/internal/ops"
-	"github.com/offshoot-db/offshoot/internal/replay"
-	"github.com/offshoot-db/offshoot/internal/store"
-	"github.com/offshoot-db/offshoot/internal/wal"
+	"github.com/sricola/offshoot/internal/capture"
+	"github.com/sricola/offshoot/internal/ops"
+	"github.com/sricola/offshoot/internal/replay"
+	"github.com/sricola/offshoot/internal/store"
+	"github.com/sricola/offshoot/internal/wal"
 )
 
 type Options struct {
@@ -471,8 +471,8 @@ import (
 	"testing"
 	"time"
 
-	"github.com/offshoot-db/offshoot/internal/ops"
-	"github.com/offshoot-db/offshoot/internal/store"
+	"github.com/sricola/offshoot/internal/ops"
+	"github.com/sricola/offshoot/internal/store"
 )
 
 func TestFlushMakesWritesDurableWithoutPausingTheWriter(t *testing.T) {
@@ -619,8 +619,8 @@ import (
 	"errors"
 	"fmt"
 
-	"github.com/offshoot-db/offshoot/internal/ltxio"
-	"github.com/offshoot-db/offshoot/internal/store"
+	"github.com/sricola/offshoot/internal/ltxio"
+	"github.com/sricola/offshoot/internal/store"
 )
 
 // ErrFenced reports that the session's lease was lost: its epoch is dead, so
@@ -748,7 +748,7 @@ import (
 	"testing"
 	"time"
 
-	"github.com/offshoot-db/offshoot/internal/ops"
+	"github.com/sricola/offshoot/internal/ops"
 )
 
 func TestRenewKeepsLeaseAliveBeyondTTL(t *testing.T) {
@@ -833,7 +833,7 @@ import (
 	"fmt"
 	"time"
 
-	"github.com/offshoot-db/offshoot/internal/store"
+	"github.com/sricola/offshoot/internal/store"
 )
 
 // renewLoop keeps the session's lease fresh. Losing the lease is terminal:
@@ -962,7 +962,7 @@ import (
 	"testing"
 	"time"
 
-	"github.com/offshoot-db/offshoot/internal/ops"
+	"github.com/sricola/offshoot/internal/ops"
 )
 
 func newServer(t *testing.T) (*Server, *ops.Workspace) {
@@ -1137,8 +1137,8 @@ import (
 	"sort"
 	"sync"
 
-	"github.com/offshoot-db/offshoot/internal/ops"
-	"github.com/offshoot-db/offshoot/internal/session"
+	"github.com/sricola/offshoot/internal/ops"
+	"github.com/sricola/offshoot/internal/session"
 )
 
 type Server struct {
@@ -1729,8 +1729,8 @@ import (
 	"testing"
 	"time"
 
-	"github.com/offshoot-db/offshoot/internal/ops"
-	"github.com/offshoot-db/offshoot/internal/session"
+	"github.com/sricola/offshoot/internal/ops"
+	"github.com/sricola/offshoot/internal/session"
 )
 
 // TestAbandonedLeaseIsReclaimableAfterExpiry simulates a daemon killed without
@@ -1876,8 +1876,8 @@ import (
 	"testing"
 	"time"
 
-	"github.com/offshoot-db/offshoot/internal/ltxio"
-	"github.com/offshoot-db/offshoot/internal/store"
+	"github.com/sricola/offshoot/internal/ltxio"
+	"github.com/sricola/offshoot/internal/store"
 )
 
 // TestFlushesUnderContinuousWritesAreConsistent runs an agent writing in a

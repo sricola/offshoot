@@ -14,9 +14,9 @@ import (
 	"syscall"
 	"time"
 
-	"github.com/offshoot-db/offshoot/internal/capture"
-	"github.com/offshoot-db/offshoot/internal/replay"
-	"github.com/offshoot-db/offshoot/internal/wal"
+	"github.com/sricola/offshoot/internal/capture"
+	"github.com/sricola/offshoot/internal/replay"
+	"github.com/sricola/offshoot/internal/wal"
 )
 
 const writerSQL = `PRAGMA busy_timeout=5000;

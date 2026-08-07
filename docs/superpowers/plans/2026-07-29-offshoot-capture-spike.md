@@ -12,7 +12,7 @@
 
 ## Global Constraints
 
-- Module path: `github.com/offshoot-db/offshoot`
+- Module path: `github.com/sricola/offshoot`
 - Go 1.23+; cgo required (mattn/go-sqlite3)
 - Platforms: Linux and macOS only; no Windows code paths
 - License: Apache-2.0 (LICENSE file in Task 1)
@@ -55,13 +55,13 @@ docs/superpowers/specs/2026-07-29-offshoot-spike-report.md  (Task 8 output)
 
 **Interfaces:**
 - Consumes: nothing
-- Produces: buildable module `github.com/offshoot-db/offshoot`; `make test` runs `go test ./...`
+- Produces: buildable module `github.com/sricola/offshoot`; `make test` runs `go test ./...`
 
 - [ ] **Step 1: Initialize module and files**
 
 ```bash
 cd /Users/sray/gits/sql
-go mod init github.com/offshoot-db/offshoot
+go mod init github.com/sricola/offshoot
 go get github.com/mattn/go-sqlite3@latest
 ```
 
@@ -713,7 +713,7 @@ import (
 	"testing"
 
 	_ "github.com/mattn/go-sqlite3"
-	"github.com/offshoot-db/offshoot/internal/wal"
+	"github.com/sricola/offshoot/internal/wal"
 )
 
 func TestReplayMatchesSource(t *testing.T) {
@@ -821,7 +821,7 @@ import (
 	"os"
 	"os/exec"
 
-	"github.com/offshoot-db/offshoot/internal/wal"
+	"github.com/sricola/offshoot/internal/wal"
 )
 
 type Replica struct {
@@ -979,8 +979,8 @@ import (
 	"time"
 
 	_ "github.com/mattn/go-sqlite3"
-	"github.com/offshoot-db/offshoot/internal/replay"
-	"github.com/offshoot-db/offshoot/internal/wal"
+	"github.com/sricola/offshoot/internal/replay"
+	"github.com/sricola/offshoot/internal/wal"
 )
 
 type replicaSink struct{ r *replay.Replica }
@@ -1158,7 +1158,7 @@ import (
 	"time"
 
 	_ "github.com/mattn/go-sqlite3"
-	"github.com/offshoot-db/offshoot/internal/wal"
+	"github.com/sricola/offshoot/internal/wal"
 )
 
 type Sink interface {
@@ -1414,8 +1414,8 @@ import (
 	"testing"
 	"time"
 
-	"github.com/offshoot-db/offshoot/internal/replay"
-	"github.com/offshoot-db/offshoot/internal/wal"
+	"github.com/sricola/offshoot/internal/replay"
+	"github.com/sricola/offshoot/internal/wal"
 )
 
 const writerSQL = `PRAGMA busy_timeout=5000;
@@ -1513,9 +1513,9 @@ import (
 	"syscall"
 	"time"
 
-	"github.com/offshoot-db/offshoot/internal/capture"
-	"github.com/offshoot-db/offshoot/internal/replay"
-	"github.com/offshoot-db/offshoot/internal/wal"
+	"github.com/sricola/offshoot/internal/capture"
+	"github.com/sricola/offshoot/internal/replay"
+	"github.com/sricola/offshoot/internal/wal"
 )
 
 const writerSQL = `PRAGMA busy_timeout=5000;
