@@ -40,6 +40,51 @@ version if you depend on format stability.
   [docs/reference.md](docs/reference.md#branch-states)'s Cost/Known
   blind spot notes.
 
+- **Metrics registry + instrumentation** (Milestone 4 Task 2):
+  `internal/metrics` is a hand-rolled, zero-dependency, concurrent-safe
+  Prometheus text-exposition registry — `Counter`/`Gauge`/`Histogram` (fixed
+  buckets, cumulative `_bucket`/`+Inf`/`_sum`/`_count`), `CounterVec`/
+  `GaugeVec` for bounded label sets, `Registry.WritePrometheus(io.Writer)`.
+  Kept `internal` and zero-dep by design (one-sentence rationale on the
+  package doc comment, per PM Amendment 7) so a later `client_golang` swap
+  is a call-site-only change. `internal/daemon`'s `newMetrics` registers
+  every metric on the plan's LOCKED name list: `offshoot_build_info{version}`,
+  `offshoot_sessions_open`, `offshoot_capture_lag_bytes{db,branch}` /
+  `offshoot_durable_age_seconds{db,branch}` (open sessions only, computed at
+  SCRAPE TIME from the sessions map via a `Registry.Collect` callback, never
+  continuously), `offshoot_flush_total{result,kind}` /
+  `offshoot_flush_duration_seconds`, `offshoot_fork_total{path}` /
+  `offshoot_fork_duration_seconds`, `offshoot_checkpoint_duration_seconds`,
+  `offshoot_reap_total`, `offshoot_gc_tombstoned_total` /
+  `offshoot_gc_deleted_total` / `offshoot_gc_backlog`,
+  `offshoot_ro_cache_bytes` / `offshoot_ro_cache_evictions_total`
+  (registered now at zero — Task 5 wires real numbers),
+  `offshoot_janitor_runs_total{result}`. Instrumentation: `internal/ops`
+  gained `ObserveFork`/`ObserveCheckpoint`, package-level nil-checked
+  injected-hook vars (ops must not import `internal/metrics`) the daemon
+  assigns once at `NewServer` construction; `internal/session` gained an
+  `OnTransition` hook fired from the SAME `logTransition` call site
+  Milestone 2 already used for its transition logs (not a new call site —
+  Task 2's brief was explicit: hook the existing sites, don't restructure),
+  which the daemon uses to drive flush counters/durations from the existing
+  "flushed"/"flush-failed" events (and `flush()` now times itself and
+  reports `duration_seconds` in that same kv). Janitor-loop metrics
+  (reap/GC/backlog/`janitor_runs_total`) are updated from
+  `Server.janitorTick`, split out of `StartJanitor`'s ticker body so a test
+  can drive one tick deterministically. **PM Amendment 7 hard gate:**
+  `WritePrometheus` output is golden-file-tested
+  (`internal/metrics/testdata/golden.txt`) and validated against Prometheus's
+  own `promtool check metrics` linter (`TestPromtoolCheckMetrics` in
+  `internal/metrics`, `TestPromtoolCheckRealMetrics` in `internal/daemon`
+  against the real, fully-wired registry) — both skip loudly (not silently)
+  when `promtool` isn't on `PATH`; `.github/workflows/ci.yml` gained a new
+  `metrics-lint` job that downloads a pinned `promtool` release and runs
+  both. `internal/daemon/metrics_test.go`'s `TestMetricsSmokeOpenWriteFlushFork`
+  opens a session, writes, flushes, and forks over the real unix-socket RPC
+  path, then scrapes the registry directly (no HTTP yet — that's Task 3) and
+  asserts the counters moved. Not yet exposed over HTTP (`GET /metrics`,
+  Task 3) — see [docs/status.md](docs/status.md) for the exact split.
+
 ## [0.1.2] - 2026-08-06
 
 Milestone 3: the eval-harness release. The target persona's first hour is

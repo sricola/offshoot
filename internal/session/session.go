@@ -548,6 +548,16 @@ func (s *Session) fail(err error) {
 // able to take a session down over a caller's own bug. String values are
 // %q-quoted (so an error message containing spaces stays a single token for
 // anything parsing key=value pairs); everything else uses %v.
+//
+// After writing the log line, this is ALSO the single call site that feeds
+// OnTransition (see its doc comment) the identical (event, kv) a daemon-side
+// observer needs — every transition this package ever logs necessarily
+// routes through here, so hooking this one function, rather than each of
+// its callers individually, can never miss a future transition kind added
+// here without a matching hook-site update. Milestone 4 Task 2's brief is
+// explicit about this: "hook the same call sites the logs use, do not
+// restructure" — this is that hook, added to the existing call site rather
+// than introducing a parallel notification path.
 func (s *Session) logTransition(event string, kv ...any) {
 	line := fmt.Sprintf("offshoot: session: %s@%s: %s", s.db, s.branch, event)
 	for i := 0; i+1 < len(kv); i += 2 {
@@ -558,7 +568,37 @@ func (s *Session) logTransition(event string, kv ...any) {
 		}
 	}
 	fmt.Fprintln(os.Stderr, line)
+	if OnTransition != nil {
+		OnTransition(s.db, s.branch, event, kv)
+	}
 }
+
+// OnTransition, when non-nil, is invoked by every logTransition call (see
+// its doc comment) with the same (db, branch, event, kv) it just logged to
+// stderr — kv in the same flat key/value shape logTransition itself
+// documents ("kind", "manual", "duration_seconds", 0.012, ...). This is
+// Milestone 4 Task 2's session-side instrumentation seam: the daemon reads
+// kv's "kind"/"error"/"duration_seconds" entries off "flushed"/
+// "flush-failed" events to drive offshoot_flush_total/
+// offshoot_flush_duration_seconds, without this package importing
+// internal/metrics (the M4 plan's explicit constraint) or the daemon
+// reaching into session internals.
+//
+// Milestone 4 Task 4a ("eventing") will give session transitions a real,
+// versioned, typed event schema over the daemon's event bus; this hook is
+// deliberately NOT that — it is the minimum seam Task 2 needs, riding the
+// EXISTING ad-hoc kv shape the M2 transition logs already established,
+// rather than inventing (and then having to migrate off of) a second
+// interim shape. Injection is a package-level, nil-checked func var, the
+// same idiom this package and internal/ops already use for their own hooks
+// (FlushEncodeHook, FlushUploadHook, openDelay, ops.ObserveFork) — assigned
+// once by the daemon at server construction, so this package never needs to
+// know metrics (or any other observer) exists. A single process only ever
+// runs one daemon Server, so the "last assignment wins" nature of a
+// package-level var is not a real hazard in production; tests that
+// construct multiple Servers rely on each one's construction reassigning it
+// before that server's own sessions can transition.
+var OnTransition func(db, branch, event string, kv []any)
 
 func (s *Session) CheckoutPath() string { return s.checkoutPath }
 

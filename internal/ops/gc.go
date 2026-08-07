@@ -70,6 +70,18 @@ func (w *Workspace) loadTombstones() (map[string]string, string, error) {
 	return m, etag, nil
 }
 
+// TombstoneBacklog reports how many lineages are currently tombstoned and
+// awaiting GC's grace period before deletion — offshoot_gc_backlog's data
+// source. A plain len() of loadTombstones' map: cheap (one store.Get), no
+// separate bookkeeping to keep in sync with GC's own phase-1/phase-2 logic.
+func (w *Workspace) TombstoneBacklog() (int, error) {
+	m, _, err := w.loadTombstones()
+	if err != nil {
+		return 0, err
+	}
+	return len(m), nil
+}
+
 func (w *Workspace) tombstone(m map[string]string) error {
 	cur, etag, err := w.loadTombstones()
 	if err != nil {

@@ -609,6 +609,7 @@ func copyFile(from, to string) error {
 // branch's Ref.Meta, which Fork's meta param sets instead. Rejected (before
 // any store I/O) if it exceeds the caps.
 func (w *Workspace) Checkpoint(db, branch, name string, meta map[string]string) (uint64, error) {
+	start := time.Now()
 	if err := store.ValidateName(db); err != nil {
 		return 0, err
 	}
@@ -703,6 +704,9 @@ func (w *Workspace) Checkpoint(db, branch, name string, meta map[string]string) 
 	// identity, rather than claiming a commit that never landed.
 	if err := writeSum(path, ref.Lineage, ref.HeadEpoch, txid, checksum); err != nil {
 		return 0, fmt.Errorf("ops: checkpoint %q committed (txid %d), but the checkout fingerprint could not be refreshed: %w", name, txid, err)
+	}
+	if ObserveCheckpoint != nil {
+		ObserveCheckpoint(time.Since(start))
 	}
 	return txid, nil
 }
@@ -830,8 +834,57 @@ var forkSlowPathForTest bool
 // itself just because it is test instrumentation.
 var forkFastPathHits atomic.Int64
 
+// ObserveFork, when non-nil, is invoked by Fork immediately before it
+// returns successfully (never on error — a failed fork has no meaningful
+// "how long did this take", and the metric it feeds,
+// offshoot_fork_duration_seconds, is defined as successful-fork latency)
+// with the wall-clock duration of the whole call and whether it took the
+// fast (single-snapshot backend-level object copy — see
+// copySnapshotToNewLineage's doc comment) or slow (materialize + re-encode)
+// path. It is also this package's source for offshoot_fork_total{path};
+// unlike forkFastPathHits (test-only, package-internal, never reset), this
+// hook is the real production signal.
+//
+// Injection shape: a package-level, nil-checked func var — the same pattern
+// this file already uses for its own test hooks (forkSlowPathForTest,
+// FlushEncodeHook/FlushUploadHook over in flush.go) — rather than an
+// Observer interface with Fork/Checkpoint methods. Two independent,
+// stateless, single-call callbacks with no shared lifecycle between them
+// don't benefit from being bundled behind one interface; doing so would
+// only force this package to name and depend on a type whose one real
+// implementation lives in internal/metrics, for no gain over two funcs.
+// ops must not import internal/metrics (the M4 plan's explicit constraint,
+// so a later swap of the metrics backend never touches this package) — the
+// daemon assigns both hooks once, at server construction, closing over its
+// own *metrics.Registry-backed counters/histograms so ops never needs to
+// know metrics exists.
+var ObserveFork func(dur time.Duration, fast bool)
+
+// ObserveCheckpoint, when non-nil, is invoked by Checkpoint immediately
+// before it returns successfully (never on error, matching ObserveFork's
+// same reasoning) with the call's wall-clock duration. See ObserveFork's
+// doc comment for the injection-shape rationale, which applies identically
+// here.
+//
+// In today's architecture this hook only ever fires from a process that
+// calls ops.Workspace.Checkpoint directly — the CLI and MCP tool processes
+// (see Checkpoint's own doc comment: it is "NOT SAFE against a live
+// in-process session's checkout", so the daemon has no "checkpoint" op and
+// never calls this method itself; a live session's checkpoint is a NAMED
+// Flush instead, observed separately via offshoot_flush_total/
+// offshoot_flush_duration_seconds — see internal/session's OnTransition
+// hook). So although the daemon registers offshoot_checkpoint_duration_seconds
+// and assigns this hook at startup (per this task's brief), that histogram
+// reads as all-zero on a daemon that never gains a direct checkpoint op —
+// a known, documented gap, not a bug; see this task's report.
+var ObserveCheckpoint func(dur time.Duration)
+
 // copySnapshotToNewLineage copies the snapshot identified by cp (in src's
-// lineage) into a brand-new lineage (epoch 1) and returns the lineage id.
+// lineage) into a brand-new lineage (epoch 1) and returns the lineage id,
+// plus whether it took the fast path (see below) — the latter is
+// ObserveFork's "fast bool" straight from its one caller that reports it,
+// Fork; Rollback and Promote call this too but neither is reflected in any
+// locked metric, so they simply discard the second return value.
 //
 // Fast path (Task 6a): when src's chain at cp resolves to EXACTLY ONE
 // member and that member is itself a snapshot, the child's seed is a
@@ -856,7 +909,7 @@ var forkFastPathHits atomic.Int64
 // CopyObject in general, but S3's is gated to objects at or under its 5GB
 // single-request CopyObject limit, so the sentinel still fires for anything
 // larger — see store.S3.CopyObject's doc comment.
-func (w *Workspace) copySnapshotToNewLineage(src store.Ref, cp store.Checkpoint) (string, error) {
+func (w *Workspace) copySnapshotToNewLineage(src store.Ref, cp store.Checkpoint) (string, bool, error) {
 	lineage := store.NewLineageID()
 	// Resolved once, up front, and threaded through both the fast-path
 	// attempt and the slow-path fallback — see materializeMembersAt's doc
@@ -864,21 +917,21 @@ func (w *Workspace) copySnapshotToNewLineage(src store.Ref, cp store.Checkpoint)
 	// path resolving its own) matters on a remote backend.
 	members, err := w.Store.Chain(src.Lineage, cp.TXID)
 	if err != nil {
-		return "", fmt.Errorf("ops: resolving chain for lineage %s to txid %d: %w", src.Lineage, cp.TXID, err)
+		return "", false, fmt.Errorf("ops: resolving chain for lineage %s to txid %d: %w", src.Lineage, cp.TXID, err)
 	}
 	if !forkSlowPathForTest {
 		ok, err := w.tryFastForkCopy(members, cp, lineage)
 		if err != nil {
-			return "", err
+			return "", false, err
 		}
 		if ok {
-			return lineage, nil
+			return lineage, true, nil
 		}
 	}
 	if _, err := w.copySnapshotIntoLineageFromChain(src.Lineage, members, cp, lineage); err != nil {
-		return "", err
+		return "", false, err
 	}
-	return lineage, nil
+	return lineage, false, nil
 }
 
 // tryFastForkCopy attempts the fast object-copy fork path into lineage,
@@ -935,6 +988,7 @@ func (w *Workspace) tryFastForkCopy(members []store.ChainMember, cp store.Checkp
 // lineage is the grain, not per-checkpoint (see Checkpoint's own meta param
 // for that). Rejected (before any store I/O) if it exceeds the caps.
 func (w *Workspace) Fork(db, srcBranch, newBranch, at string, ttl time.Duration, meta map[string]string) (uint64, error) {
+	start := time.Now()
 	if ttl < 0 {
 		return 0, fmt.Errorf("ops: fork ttl must be zero (no TTL) or positive, got %s", ttl)
 	}
@@ -961,7 +1015,7 @@ func (w *Workspace) Fork(db, srcBranch, newBranch, at string, ttl time.Duration,
 	txid := cp.TXID
 	// Materialized fork point: copy the source snapshot into the child's own
 	// lineage so the child never references parent storage.
-	childLineage, err := w.copySnapshotToNewLineage(src, cp)
+	childLineage, fast, err := w.copySnapshotToNewLineage(src, cp)
 	if err != nil {
 		return 0, err
 	}
@@ -979,6 +1033,9 @@ func (w *Workspace) Fork(db, srcBranch, newBranch, at string, ttl time.Duration,
 		// Branch already exists (or lost a race): remove the orphan snapshot.
 		w.Store.B.Delete(store.SnapshotKey(childLineage, 1, txid))
 		return 0, fmt.Errorf("ops: fork %s@%s: %w", db, newBranch, err)
+	}
+	if ObserveFork != nil {
+		ObserveFork(time.Since(start), fast)
 	}
 	return txid, nil
 }
@@ -1022,7 +1079,7 @@ func (w *Workspace) Rollback(db, branch, to string) (string, error) {
 		return "", fmt.Errorf("ops: no checkpoint %q on %s@%s", to, db, branch)
 	}
 	txid := cp.TXID
-	lineage, err := w.copySnapshotToNewLineage(ref, cp)
+	lineage, _, err := w.copySnapshotToNewLineage(ref, cp)
 	if err != nil {
 		return "", err
 	}
@@ -1146,7 +1203,7 @@ func (w *Workspace) Promote(db, source, target string, force bool) (uint64, erro
 	}
 	cp := headCheckpoint(src)
 	txid := cp.TXID
-	lineage, err := w.copySnapshotToNewLineage(src, cp)
+	lineage, _, err := w.copySnapshotToNewLineage(src, cp)
 	if err != nil {
 		return 0, err
 	}
