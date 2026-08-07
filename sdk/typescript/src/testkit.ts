@@ -274,24 +274,6 @@ function cacheFor(daemon: DaemonHandle): Map<string, SeedCacheEntry> {
   return m;
 }
 
-/** A cheap identity for a seed value, used to catch "same name, silently
- * different seed" mistakes — see {@link seedOnce}'s doc comment. SQL/path
- * strings are fingerprinted by content hash of the RAW argument (before any
- * `.sql`-path resolution — resolving first would make a changed-on-disk
- * seed file silently pass, which is the opposite of this check's point);
- * callables are fingerprinted by identity. */
-function fingerprintSeed(seed: Seed): string {
-  if (typeof seed === "function") {
-    let id = callableIds.get(seed);
-    if (id === undefined) {
-      id = nextCallableId++;
-      callableIds.set(seed, id);
-    }
-    return `callable:${id}`;
-  }
-  return `sql:${createHash("sha256").update(seed, "utf8").digest("hex")}`;
-}
-
 /** True if s looks like a path to an existing `.sql` file rather than
  * inline SQL text: no newline, ends in `.sql`, and a file actually exists
  * there. A seed string containing a newline is never treated as a path —
@@ -379,13 +361,41 @@ function runSeedSql(dbPath: string, sql: string): void {
   execSqlite3([dbPath], wrapped);
 }
 
-async function runSeed(session: Session, seed: Seed): Promise<void> {
+/** A seed value, resolved once into a fingerprint (for `seedOnce`'s
+ * memoization mismatch check) and a `run` step (what actually writes the
+ * seed) — resolving both from a single pass over `seed` so a `.sql`-path
+ * seed is read from disk exactly once per `seedOnce` call, not twice (once
+ * to fingerprint, once to run).
+ *
+ * Fingerprinting: string seeds are fingerprinted by content hash of the
+ * RESOLVED SQL text — i.e. a `.sql`-path seed is read from disk FIRST,
+ * then hashed — not the raw argument. Hashing the raw path string instead
+ * would fingerprint only the path's own text, so editing the file on disk
+ * between two `seedOnce` calls for the same name and path would leave the
+ * fingerprint unchanged and the mismatch would silently pass — exactly the
+ * class of bug this check exists to catch. Callables are fingerprinted by
+ * identity (mirrors Python's `id()`-based fingerprint). */
+async function resolveSeed(seed: Seed): Promise<{ fingerprint: string; run: (session: Session) => Promise<void> }> {
   if (typeof seed === "function") {
-    await seed(session.path);
-  } else {
-    runSeedSql(session.path, await resolveSeedSql(seed));
+    let id = callableIds.get(seed);
+    if (id === undefined) {
+      id = nextCallableId++;
+      callableIds.set(seed, id);
+    }
+    return {
+      fingerprint: `callable:${id}`,
+      run: async (session) => {
+        await seed(session.path);
+      },
+    };
   }
-  await session.flush("seed");
+  const sql = await resolveSeedSql(seed);
+  return {
+    fingerprint: `sql:${createHash("sha256").update(sql, "utf8").digest("hex")}`,
+    run: async (session) => {
+      runSeedSql(session.path, sql);
+    },
+  };
 }
 
 /** Session-scoped-in-spirit named-seed factory: `seedOnce(daemon, {name,
@@ -393,18 +403,19 @@ async function runSeed(session: Session, seed: Seed): Promise<void> {
  * `eval-{name}`, runs seed, and checkpoints it "seed"; later calls for the
  * same name are a pure memoization hit and return the same handle —
  * UNLESS a later call passes a seed that doesn't match what actually
- * seeded that name (fingerprinted: SQL/path text by content hash, callables
- * by identity), which throws {@link OffshootError} rather than silently
- * keeping the first seed. Mirrors `offshoot.pytest_plugin.offshoot_db`,
- * minus the ini-file default-seed convenience (there's no pytest.ini
- * equivalent here — every call names its seed explicitly). */
+ * seeded that name (fingerprinted: SQL/path text by RESOLVED content hash
+ * — see {@link resolveSeed}'s doc comment — callables by identity), which
+ * throws {@link OffshootError} rather than silently keeping the first
+ * seed. Mirrors `offshoot.pytest_plugin.offshoot_db`, minus the ini-file
+ * default-seed convenience (there's no pytest.ini equivalent here — every
+ * call names its seed explicitly). */
 export async function seedOnce(daemon: DaemonHandle, opts: SeedOnceOptions): Promise<SeedHandle> {
   const name = opts.name ?? "default";
   const cache = cacheFor(daemon);
-  const fingerprint = fingerprintSeed(opts.seed);
+  const resolved = await resolveSeed(opts.seed);
   const cached = cache.get(name);
   if (cached) {
-    if (cached.fingerprint !== fingerprint) {
+    if (cached.fingerprint !== resolved.fingerprint) {
       throw new OffshootError(
         `seedOnce(name=${JSON.stringify(name)}): called again with a DIFFERENT seed than the ` +
           `one that already seeded ${cached.handle.db} earlier. seedOnce memoizes by name, not ` +
@@ -420,12 +431,13 @@ export async function seedOnce(daemon: DaemonHandle, opts: SeedOnceOptions): Pro
     await client.create(db);
     const session = await client.open(db, "main");
     try {
-      await runSeed(session, opts.seed);
+      await resolved.run(session);
+      await session.flush("seed");
     } finally {
       await session.close();
     }
     const handle: SeedHandle = { db, checkpoint: "seed", name };
-    cache.set(name, { handle, fingerprint });
+    cache.set(name, { handle, fingerprint: resolved.fingerprint });
     return handle;
   } finally {
     await client.close();
