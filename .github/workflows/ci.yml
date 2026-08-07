@@ -61,7 +61,7 @@ jobs:
       - name: make test-sdks
         run: make test-sdks
 
-      # test-pytest-plugin exercises the offshoot.pytest fixture plugin
+      # test-pytest-plugin exercises the offshoot.pytest_plugin fixture plugin
       # (the `offshoot-db[pytest]` extra) — its own suite, separate from
       # test-sdks above, because it genuinely needs pytest + pytest-xdist
       # installed (unlike the plain-unittest suites test-sdks just proved

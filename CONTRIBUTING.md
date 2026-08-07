@@ -22,6 +22,14 @@ Optional, only needed for the SDK test tier:
 - `python3` (Python SDK tests)
 - Node 20+ (TypeScript SDK tests)
 
+Optional, only needed for the pytest fixture plugin's OWN test tier
+(`sdk/python/offshoot/pytest_plugin.py` — the `offshoot-db[pytest]` extra;
+the base SDK's plain-`unittest` suites above need none of this):
+
+```
+pip install -e "sdk/python[pytest]" pytest-xdist
+```
+
 ```
 go build -o offshoot ./cmd/offshoot
 go vet ./...
@@ -39,6 +47,7 @@ skip it on a capture-engine change.
 | Torture (kill-9) | `make test-torture` | ~5 minutes | Touching `internal/capture` or `internal/session` flush paths |
 | S3 conformance | `make test-s3` | needs a real S3-compatible provider or MinIO running | Touching `internal/store`'s S3 backend or the CAS probe |
 | SDKs | `make test-sdks` | needs `python3` + Node 20+ | Touching `sdk/python`, `sdk/typescript`, or the daemon API surface they depend on |
+| pytest fixture plugin | `make test-pytest-plugin` | needs `pip install -e "sdk/python[pytest]" pytest-xdist` | Touching `sdk/python/offshoot/pytest_plugin.py` or its test suite — kept OUT of `test-sdks` on purpose, since that tier proves the base SDK works with no pytest installed at all |
 | SDK publish dry-run | `make dry-run-sdks` | needs `python3` (+ `pip install build twine`) and `npm` | Touching either SDK's manifest (`pyproject.toml`, `package.json`, `sdk/VERSION`) or `.github/workflows/publish.yml` — see "Release process" below |
 
 `go test ./... -race` is hermetic and needs only the `sqlite3` CLI — that's

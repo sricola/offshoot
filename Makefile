@@ -45,8 +45,8 @@ bench-s3:
 	docker rm -f offshoot-bench-minio >/dev/null 2>&1; \
 	exit $$status
 # Named explicitly (not `discover -s tests`, which globs test_*.py) because
-# tests/test_pytest_plugin.py — the offshoot.pytest fixture plugin's own
-# suite — imports pytest at module level and must NOT be picked up here:
+# tests/test_pytest_plugin.py — the offshoot.pytest_plugin fixture plugin's
+# own suite — imports pytest at module level and must NOT be picked up here:
 # this target proves the base SDK's plain-unittest suites pass with no
 # pytest installed at all. See `make test-pytest-plugin` for that file.
 test-python-sdk:

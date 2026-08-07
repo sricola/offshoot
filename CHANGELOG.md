@@ -140,7 +140,7 @@ version if you depend on format stability.
   - README's Resource behavior section gains the read-only-checkout-cache
     paragraph, including the explicit "safe to `rm -rf` the entire
     `checkouts-ro` directory at any time" guarantee.
-- **`offshoot.pytest` fixture plugin** (Milestone 3 Task 4): the
+- **`offshoot.pytest_plugin` fixture plugin** (Milestone 3 Task 4): the
   seed-once-fork-many paved road for pytest-based eval/test suites, shipped
   as the `offshoot-db[pytest]` package extra and registered via a
   `pytest11` entry point (`sdk/python/offshoot/pytest_plugin.py`) — nothing
