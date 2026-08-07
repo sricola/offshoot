@@ -49,7 +49,7 @@ func TestFlushMakesWritesDurableWithoutPausingTheWriter(t *testing.T) {
 		t.Fatalf("%v: %s", err, out)
 	}
 
-	txid, err := s.Flush("v1")
+	txid, err := s.Flush("v1", nil)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -95,7 +95,7 @@ func TestFlushedStateIsRecoverableByAnotherWorkspace(t *testing.T) {
 		out, err := exec.Command("sqlite3", s.ReplicaPath(), "SELECT count(*) FROM t;").Output()
 		return err == nil && string(out) == "1\n"
 	})
-	if _, err := s.Flush(""); err != nil {
+	if _, err := s.Flush("", nil); err != nil {
 		t.Fatal(err)
 	}
 	if err := s.Close(); err != nil {
@@ -133,7 +133,7 @@ func TestFlushAfterFencingIsRefused(t *testing.T) {
 	if _, err := w.AcquireLease("app", "main", "thief", ops.DefaultLeaseTTL); err != nil {
 		t.Fatal(err)
 	}
-	if _, err := s.Flush(""); !errors.Is(err, ErrFenced) {
+	if _, err := s.Flush("", nil); !errors.Is(err, ErrFenced) {
 		t.Fatalf("want ErrFenced, got %v", err)
 	}
 	if !errors.Is(s.Err(), ErrFenced) {
@@ -202,7 +202,7 @@ func TestFlushDoesNotDeleteSnapshotOnNonCASRefFailure(t *testing.T) {
 	orig := w.Store.B
 	w.Store.B = failRefPutIf{orig}
 
-	_, err = s.Flush("")
+	_, err = s.Flush("", nil)
 	if err == nil {
 		t.Fatal("Flush must fail when the ref write fails")
 	}
@@ -242,7 +242,7 @@ func TestFlushWritesASegmentThenSnapshotsOnCadence(t *testing.T) {
 			"INSERT INTO t (v) VALUES ('row');").CombinedOutput(); err != nil {
 			t.Fatalf("%v: %s", err, out)
 		}
-		if _, err := s.Flush(""); err != nil {
+		if _, err := s.Flush("", nil); err != nil {
 			t.Fatalf("flush %d: %v", i, err)
 		}
 	}
@@ -311,7 +311,7 @@ func TestSnapshotEveryOneKeepsOldBehavior(t *testing.T) {
 	exec.Command("sqlite3", s.CheckoutPath(), "CREATE TABLE t (v);").Run()
 	for i := 0; i < 3; i++ {
 		exec.Command("sqlite3", s.CheckoutPath(), "INSERT INTO t VALUES ('x');").Run()
-		if _, err := s.Flush(""); err != nil {
+		if _, err := s.Flush("", nil); err != nil {
 			t.Fatal(err)
 		}
 	}
@@ -386,7 +386,7 @@ func TestFlushSegmentAcrossAShrinkingCommit(t *testing.T) {
 	if out, err := exec.Command("sqlite3", s.CheckoutPath(), insertBulk).CombinedOutput(); err != nil {
 		t.Fatalf("bulk insert: %v: %s", err, out)
 	}
-	if _, err := s.Flush(""); err != nil {
+	if _, err := s.Flush("", nil); err != nil {
 		t.Fatalf("baseline flush: %v", err)
 	}
 
@@ -403,7 +403,7 @@ func TestFlushSegmentAcrossAShrinkingCommit(t *testing.T) {
 		"VACUUM;").CombinedOutput(); err != nil {
 		t.Fatalf("vacuum: %v: %s", err, out)
 	}
-	shrinkTxid, err := s.Flush("")
+	shrinkTxid, err := s.Flush("", nil)
 	if err != nil {
 		t.Fatalf("shrink flush: %v", err)
 	}
@@ -492,7 +492,7 @@ func TestConcurrentFlushIsSerialized(t *testing.T) {
 		wg.Add(1)
 		go func(i int) {
 			defer wg.Done()
-			txids[i], errs[i] = s.Flush("")
+			txids[i], errs[i] = s.Flush("", nil)
 		}(i)
 	}
 	wg.Wait()
@@ -1491,7 +1491,7 @@ func TestCleanAtOpenSessionsFirstRealFlushIsASegment(t *testing.T) {
 	})
 
 	mustExec(t, s.CheckoutPath(), "CREATE TABLE t (v); INSERT INTO t VALUES (1);")
-	txid, err := s.Flush("")
+	txid, err := s.Flush("", nil)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -1551,7 +1551,7 @@ func TestCloseRefreshesSidecarSoReopenCleanSkips(t *testing.T) {
 	}
 	checkoutPath := s.CheckoutPath()
 	mustExec(t, checkoutPath, "CREATE TABLE t (v); INSERT INTO t VALUES (1);")
-	if _, err := s.Flush(""); err != nil {
+	if _, err := s.Flush("", nil); err != nil {
 		t.Fatal(err)
 	}
 	if err := s.Close(); err != nil {
@@ -1605,14 +1605,14 @@ func TestCleanCheckoutServedWithoutChainValidationAcrossClose(t *testing.T) {
 		t.Fatal(err)
 	}
 	mustExec(t, s.CheckoutPath(), "CREATE TABLE t (v); INSERT INTO t VALUES (1);")
-	if _, err := s.Flush(""); err != nil {
+	if _, err := s.Flush("", nil); err != nil {
 		t.Fatal(err)
 	}
 	// A second flush guarantees a SEGMENT gets written (the first flush on
 	// a fresh branch is always a snapshot — txid==1 forces it), giving this
 	// test a chain member deleting is meaningful to break.
 	mustExec(t, s.CheckoutPath(), "INSERT INTO t VALUES (2);")
-	if _, err := s.Flush(""); err != nil {
+	if _, err := s.Flush("", nil); err != nil {
 		t.Fatal(err)
 	}
 	if err := s.Close(); err != nil {
@@ -1686,7 +1686,7 @@ func TestCloseAfterFailedFlushDoesNotStampSidecar(t *testing.T) {
 	// call isn't hit by it too.
 	orig := w.Store.B
 	w.Store.B = failRefPutIf{orig}
-	_, err = s.Flush("")
+	_, err = s.Flush("", nil)
 	w.Store.B = orig
 	if err == nil {
 		t.Fatal("expected the injected ref-write failure to fail Flush")
@@ -1748,7 +1748,7 @@ func TestCloseDoesNotStampSidecarAfterUnverifiedShutdown(t *testing.T) {
 	}
 
 	mustExec(t, checkoutPath, "CREATE TABLE t (v); INSERT INTO t VALUES (1);")
-	if _, err := s.Flush(""); err != nil {
+	if _, err := s.Flush("", nil); err != nil {
 		t.Fatal(err)
 	}
 
@@ -1837,5 +1837,98 @@ func TestSidecarNotStampedAfterMidSessionRebase(t *testing.T) {
 	out, err := exec.Command("sqlite3", p2, "SELECT v FROM rebased;").Output()
 	if err != nil || string(out) != "rebase-only\n" {
 		t.Fatalf("rebase-folded content missing after re-materializing: %q err=%v", out, err)
+	}
+}
+
+// TestNamedFlushStampsCheckpointMetaAndCreatedAt is the live-session
+// equivalent of ops.TestCheckpointStampsCreatedAtAndMeta: a daemon session's
+// named Flush is how a checkpoint gets created against an open session (see
+// server.opFlush's doc comment for why there is no separate daemon
+// "checkpoint" op), so it needs the identical meta/CreatedAt behavior.
+func TestNamedFlushStampsCheckpointMetaAndCreatedAt(t *testing.T) {
+	requireSQLite(t)
+	w := newWS(t)
+	if err := w.Create("app"); err != nil {
+		t.Fatal(err)
+	}
+	s, err := Open(context.Background(), Options{WS: w, DB: "app", Branch: "main"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer s.Close()
+
+	if out, err := exec.Command("sqlite3", s.CheckoutPath(),
+		"CREATE TABLE t (v); INSERT INTO t VALUES (1);").CombinedOutput(); err != nil {
+		t.Fatalf("%v: %s", err, out)
+	}
+
+	txid, err := s.Flush("v1", map[string]string{"eval_run": "42"})
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	ref, _, err := w.Store.GetRef("app", "main")
+	if err != nil {
+		t.Fatal(err)
+	}
+	cp, ok := ref.Checkpoints["v1"]
+	if !ok || cp.TXID != txid {
+		t.Fatalf("checkpoint v1 = %+v ok=%v, want txid %d", cp, ok, txid)
+	}
+	if cp.CreatedAt == "" {
+		t.Fatal("named flush must stamp the checkpoint's CreatedAt")
+	}
+	if cp.Meta["eval_run"] != "42" {
+		t.Fatalf("named flush's meta did not round-trip onto the checkpoint: %+v", cp.Meta)
+	}
+}
+
+// TestFlushRejectsMetaWithoutAName guards the "meta needs a checkpoint to
+// attach to" rule: an unnamed (auto or manual) flush creates no checkpoint,
+// so metadata passed alongside one would otherwise be silently dropped.
+func TestFlushRejectsMetaWithoutAName(t *testing.T) {
+	requireSQLite(t)
+	w := newWS(t)
+	if err := w.Create("app"); err != nil {
+		t.Fatal(err)
+	}
+	s, err := Open(context.Background(), Options{WS: w, DB: "app", Branch: "main"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer s.Close()
+
+	if _, err := s.Flush("", map[string]string{"eval_run": "42"}); err == nil {
+		t.Fatal("Flush must reject non-empty meta with an empty checkpoint name")
+	}
+}
+
+// TestFlushRejectsMetaOverCap mirrors ops.TestCheckpointRejectsMetaOverCap
+// for the live-session path.
+func TestFlushRejectsMetaOverCap(t *testing.T) {
+	requireSQLite(t)
+	w := newWS(t)
+	if err := w.Create("app"); err != nil {
+		t.Fatal(err)
+	}
+	s, err := Open(context.Background(), Options{WS: w, DB: "app", Branch: "main"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer s.Close()
+
+	tooMany := map[string]string{}
+	for i := 0; i < ops.MaxMetaKeys+1; i++ {
+		tooMany[fmt.Sprintf("k%d", i)] = "v"
+	}
+	if _, err := s.Flush("v1", tooMany); err == nil {
+		t.Fatal("Flush must reject metadata over the cap")
+	}
+	ref, _, err := w.Store.GetRef("app", "main")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, exists := ref.Checkpoints["v1"]; exists {
+		t.Fatal("a rejected named flush must not have created the checkpoint")
 	}
 }

@@ -28,8 +28,14 @@ Usage:
   offshoot init                      create a store in ./.offshoot
   offshoot create <db> [--from f]    new database (branch main), or import file f
   offshoot checkout <db>[@branch]    materialize a working copy; prints its path
-  offshoot checkpoint <db>[@branch] <name>   snapshot the checkout as a named checkpoint
-  offshoot fork <db>[@branch] <new> [--at cp] [--ttl duration]   branch from head or a checkpoint
+  offshoot checkpoint <db>[@branch] <name> [--meta k=v ...]
+                                     snapshot the checkout as a named checkpoint
+  offshoot fork <db>[@branch] <new> [--at cp] [--ttl duration] [--meta k=v ...]
+                                     branch from head or a checkpoint;
+                                     --meta is repeatable (capped: 32 keys,
+                                     64-byte keys, 512-byte values) and is
+                                     stored on the checkpoint (checkpoint) or
+                                     the new branch (fork)
   offshoot touch <db>[@branch] [--ttl duration|none]   reset a branch's activity clock, optionally (re)setting its TTL
   offshoot rollback <db>[@branch] --to <cp>       repoint a branch at a checkpoint
   offshoot promote <db>@<src> --onto <target> [--force]   repoint target at src's head
@@ -62,6 +68,7 @@ Usage:
   offshoot session status [-socket PATH]                  list open sessions and their durable txid
   offshoot session close <db>[@branch] [-socket PATH]     close a session, releasing its lease
   offshoot session shutdown [-socket PATH]                ask the daemon to shut down gracefully
+  offshoot session dbs [-socket PATH]                     list every database this store has
   offshoot version                   print the offshoot version and Go runtime info
 
   -socket PATH on a session subcommand must match the -socket PATH (if any)
@@ -142,6 +149,36 @@ func extractFlag(args []string, name string) (value string, rest []string, ok bo
 		out = append(out, args[i])
 	}
 	return value, out, ok, nil
+}
+
+// extractMetaFlags pulls every repeatable "--meta k=v" pair out of args, in
+// any position, mirroring extractFlag's parsing style. Returns nil (not an
+// empty map) when no --meta flag was given, so a caller can pass the result
+// straight through as ops.Workspace.Fork/Checkpoint's meta param, where nil
+// means "no metadata" — the same convention those functions themselves use.
+func extractMetaFlags(args []string) (map[string]string, []string, error) {
+	var meta map[string]string
+	out := args[:0]
+	for i := 0; i < len(args); i++ {
+		if args[i] == "--meta" {
+			if i+1 >= len(args) {
+				return nil, nil, fmt.Errorf("--meta requires a k=v argument")
+			}
+			kv := args[i+1]
+			eq := strings.IndexByte(kv, '=')
+			if eq < 0 {
+				return nil, nil, fmt.Errorf("--meta %q: want k=v", kv)
+			}
+			if meta == nil {
+				meta = map[string]string{}
+			}
+			meta[kv[:eq]] = kv[eq+1:]
+			i++
+			continue
+		}
+		out = append(out, args[i])
+	}
+	return meta, out, nil
 }
 
 // parseTTLFlag turns a --ttl flag's raw value into a duration: "none" means
@@ -245,14 +282,18 @@ func run(args []string) error {
 			return fmt.Errorf("usage: offshoot create <db> [--from file]")
 		}
 	case "checkpoint":
+		meta, rest, err := extractMetaFlags(rest)
+		if err != nil {
+			return fmt.Errorf("usage: offshoot checkpoint <db>[@branch] <name> [--meta k=v ...]: %w", err)
+		}
 		if len(rest) != 2 {
-			return fmt.Errorf("usage: offshoot checkpoint <db>[@branch] <name>")
+			return fmt.Errorf("usage: offshoot checkpoint <db>[@branch] <name> [--meta k=v ...]")
 		}
 		db, branch, err := ops.ParseTarget(rest[0])
 		if err != nil {
 			return err
 		}
-		txid, err := w.Checkpoint(db, branch, rest[1])
+		txid, err := w.Checkpoint(db, branch, rest[1], meta)
 		if err != nil {
 			return err
 		}
@@ -262,11 +303,15 @@ func run(args []string) error {
 		fs := rest
 		at, fs, _, err := extractFlag(fs, "--at")
 		if err != nil {
-			return fmt.Errorf("usage: offshoot fork <db>[@branch] <new-branch> [--at checkpoint] [--ttl duration]: %w", err)
+			return fmt.Errorf("usage: offshoot fork <db>[@branch] <new-branch> [--at checkpoint] [--ttl duration] [--meta k=v ...]: %w", err)
 		}
 		ttlRaw, fs, hasTTL, err := extractFlag(fs, "--ttl")
 		if err != nil {
-			return fmt.Errorf("usage: offshoot fork <db>[@branch] <new-branch> [--at checkpoint] [--ttl duration]: %w", err)
+			return fmt.Errorf("usage: offshoot fork <db>[@branch] <new-branch> [--at checkpoint] [--ttl duration] [--meta k=v ...]: %w", err)
+		}
+		meta, fs, err := extractMetaFlags(fs)
+		if err != nil {
+			return fmt.Errorf("usage: offshoot fork <db>[@branch] <new-branch> [--at checkpoint] [--ttl duration] [--meta k=v ...]: %w", err)
 		}
 		ttl := time.Duration(0)
 		if hasTTL {
@@ -280,13 +325,13 @@ func run(args []string) error {
 			}
 		}
 		if len(fs) != 2 {
-			return fmt.Errorf("usage: offshoot fork <db>[@branch] <new-branch> [--at checkpoint] [--ttl duration]")
+			return fmt.Errorf("usage: offshoot fork <db>[@branch] <new-branch> [--at checkpoint] [--ttl duration] [--meta k=v ...]")
 		}
 		db, branch, err := ops.ParseTarget(fs[0])
 		if err != nil {
 			return err
 		}
-		txid, err := w.Fork(db, branch, fs[1], at, ttl)
+		txid, err := w.Fork(db, branch, fs[1], at, ttl, meta)
 		if err != nil {
 			return err
 		}
@@ -692,6 +737,15 @@ func run(args []string) error {
 		case "shutdown":
 			_, err := daemon.Call(sock, daemon.Request{Op: "shutdown"})
 			return err
+		case "dbs":
+			resp, err := daemon.Call(sock, daemon.Request{Op: "dbs"})
+			if err != nil {
+				return err
+			}
+			for _, db := range resp.Databases {
+				fmt.Println(db)
+			}
+			return nil
 		default:
 			return fmt.Errorf("unknown session subcommand %q", sub)
 		}

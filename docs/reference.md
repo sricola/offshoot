@@ -125,10 +125,11 @@ are about to be overwritten.
 **Errors:** no such `db@branch`; checkout is busy (a live connection is
 holding it) — closes connections and retry.
 
-## `offshoot checkpoint <db>[@branch] <name>`
+## `offshoot checkpoint <db>[@branch] <name> [--meta k=v ...]`
 
 ```
 offshoot checkpoint app v1
+offshoot checkpoint app v1 --meta eval_run=42 --meta git_sha=abc123
 ```
 
 Snapshots the *current checkout's* state (not just the ref) as a named
@@ -141,19 +142,29 @@ capture engine tracking which pages changed since the last one; the daemon's
 `session flush` writes incremental segments instead (see [What a flush
 costs](../README.md#what-a-flush-costs) in the README).
 
+Every checkpoint records a creation timestamp (`created_at`, RFC3339 UTC)
+automatically. `--meta k=v` is repeatable and attaches a small string→string
+map to *this specific checkpoint* (e.g. an eval run id, a git SHA, an agent
+id) — capped at 32 keys, 64-byte keys, 512-byte values, enforced before
+anything is written; a rejected `--meta` leaves the branch untouched. This is
+branch/checkpoint-level metadata, not row-level provenance — see the design
+spec's metadata note.
+
 Children never inherit a parent's checkpoints — a fork's storage begins at
 its fork point, so a checkpoint made before the fork isn't materializable
 from the child; resolve it on the parent instead.
 
 **Errors:** checkpoint name already exists on this branch; no checkout
-exists yet (run `checkout` first); checkout is busy.
+exists yet (run `checkout` first); checkout is busy; `--meta` over a cap
+(key count, key length, or value length).
 
-## `offshoot fork <db>[@branch] <new-branch> [--at checkpoint] [--ttl duration]`
+## `offshoot fork <db>[@branch] <new-branch> [--at checkpoint] [--ttl duration] [--meta k=v ...]`
 
 ```
 offshoot fork app attempt-1
 offshoot fork app attempt-1 --at v1
 offshoot fork app attempt-1 --ttl 2h
+offshoot fork app attempt-1 --meta eval_run=42 --meta git_sha=abc123
 ```
 
 Creates `new-branch` as an independent branch from `db@branch`'s head, or
@@ -175,8 +186,17 @@ duration (`0s`, a negative value, or the literal string `none`) is refused
 outright rather than silently treated as "no TTL," since that would let a
 caller believe they set a TTL when they didn't.
 
+`--meta k=v` (repeatable, same caps as `checkpoint`'s) attaches a small
+string→string map to the **new branch's own lineage** — this describes the
+branch, not the auto-created `fork` checkpoint (which still gets its own
+`created_at`, but no metadata of its own). This is the same knob
+`branches`/the daemon `fork` op and SDK `fork()` calls expose; `branches`
+output surfaces each checkpoint's `created_at`/`txid` (`checkpoints_v2`) but
+not raw metadata values today — read them back via the store directly, or a
+future op, if you need to query by value.
+
 **Errors:** `new-branch` already exists; unknown `--at` checkpoint name;
-non-positive or `"none"` `--ttl` value.
+non-positive or `"none"` `--ttl` value; `--meta` over a cap.
 
 ## `offshoot touch <db>[@branch] [--ttl duration|none]`
 
@@ -470,13 +490,23 @@ Flushes the session's pending WAL to a durable snapshot or incremental
 segment in the store — writes since the last flush are committed to SQLite
 but not durable in the bucket until this runs. An optional `name` also
 records a named checkpoint at the resulting transaction id (same checkpoint
-namespace as `offshoot checkpoint`). Prints the transaction id now durable.
-The daemon writes a full snapshot every 16th flush and an incremental
-segment (only the changed pages) otherwise, so materializing state never
-replays more than one snapshot plus fifteen segments.
+namespace as `offshoot checkpoint`, and stamped with the same `created_at`).
+Prints the transaction id now durable. The daemon writes a full snapshot
+every 16th flush and an incremental segment (only the changed pages)
+otherwise, so materializing state never replays more than one snapshot plus
+fifteen segments.
+
+There is no separate daemon "checkpoint" op — a live session's named flush
+*is* how its checkpoints are created; the underlying daemon protocol's
+`flush` op also accepts a `meta` map (same caps as `checkpoint`'s `--meta`),
+which the Python/TypeScript SDKs' `flush(name, meta=...)` expose. This CLI
+subcommand does not have a `--meta` flag today — use an SDK client for
+metadata on a live-session checkpoint.
 
 **Errors:** `db@branch` is not open here; the session has lost its lease
-(fenced — it will not write under a dead epoch).
+(fenced — it will not write under a dead epoch); `meta` given with no
+checkpoint `name`; `meta` over a cap (SDK-only, since this CLI subcommand
+has no `--meta` flag).
 
 ## `offshoot session status [-socket PATH]`
 
@@ -508,6 +538,19 @@ offshoot session shutdown
 Asks the daemon to shut down gracefully (equivalent to sending it
 `SIGINT`/`SIGTERM`): releases every lease, closes every session, removes the
 socket.
+
+## `offshoot session dbs [-socket PATH]`
+
+```
+offshoot session dbs
+```
+
+Lists every database this store has at least one ref for (one per line,
+sorted) — the daemon protocol's `dbs` op, the same one the Python/TypeScript
+SDKs' `dbs()` calls. Useful for cleanup jobs that need to enumerate what
+exists without shelling out to a store-directory listing. An empty store
+prints nothing and is not an error (unlike `branches`, which errors on an
+unrecognized `db` name — there's no single db to name here).
 
 ---
 

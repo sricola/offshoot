@@ -74,14 +74,14 @@ func TestForkRejectsNegativeTTL(t *testing.T) {
 	if err := w.Create("app"); err != nil {
 		t.Fatal(err)
 	}
-	if _, err := w.Fork("app", "main", "kid", "", -time.Hour); err == nil {
+	if _, err := w.Fork("app", "main", "kid", "", -time.Hour, nil); err == nil {
 		t.Fatal("Fork must reject a negative ttl")
 	}
 	if _, _, err := w.Store.GetRef("app", "kid"); err == nil {
 		t.Fatal("a rejected fork must not create the branch")
 	}
 	// ttl == 0 remains the documented "no TTL" spelling.
-	if _, err := w.Fork("app", "main", "kid", "", 0); err != nil {
+	if _, err := w.Fork("app", "main", "kid", "", 0, nil); err != nil {
 		t.Fatalf("ttl == 0 must still mean no TTL: %v", err)
 	}
 }
@@ -98,7 +98,7 @@ func TestDurableWritesStampTheClock(t *testing.T) {
 		t.Fatal(err)
 	}
 	mustExecSQL(t, path, "CREATE TABLE t (v);")
-	if _, err := w.Checkpoint("app", "main", "cp1"); err != nil {
+	if _, err := w.Checkpoint("app", "main", "cp1", nil); err != nil {
 		t.Fatal(err)
 	}
 	ref, _, err := w.Store.GetRef("app", "main")
@@ -111,7 +111,7 @@ func TestDurableWritesStampTheClock(t *testing.T) {
 	// Fork stamps the CHILD and does not touch the parent (spec: creating a
 	// child does not extend the parent).
 	before := ref.TouchedAt
-	if _, err := w.Fork("app", "main", "kid", "", 2*time.Hour); err != nil {
+	if _, err := w.Fork("app", "main", "kid", "", 2*time.Hour, nil); err != nil {
 		t.Fatal(err)
 	}
 	kid, _, err := w.Store.GetRef("app", "kid")

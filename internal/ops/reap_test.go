@@ -29,7 +29,7 @@ func TestReapDestroysOnlyExpiredUnprotectedUnleased(t *testing.T) {
 	now := time.Now().UTC()
 	old := now.Add(-3 * time.Hour).Format(time.RFC3339Nano)
 	for _, br := range []string{"expired", "fresh", "shielded", "leased", "immortal"} {
-		if _, err := w.Fork("app", "main", br, "", 0); err != nil {
+		if _, err := w.Fork("app", "main", br, "", 0, nil); err != nil {
 			t.Fatal(err)
 		}
 	}
@@ -75,7 +75,7 @@ func TestExpiredLeaseDefersToTTLNotBlocksForever(t *testing.T) {
 	if err := w.Create("app"); err != nil {
 		t.Fatal(err)
 	}
-	if _, err := w.Fork("app", "main", "wedged", "", 0); err != nil {
+	if _, err := w.Fork("app", "main", "wedged", "", 0, nil); err != nil {
 		t.Fatal(err)
 	}
 	now := time.Now().UTC()
@@ -92,7 +92,7 @@ func TestExpiredLeaseDefersToTTLNotBlocksForever(t *testing.T) {
 		t.Fatalf("reaped = %v, want [app@wedged]", reaped)
 	}
 	// But if the lease expired RECENTLY, TTL counts from that expiry.
-	if _, err := w.Fork("app", "main", "recent", "", 0); err != nil {
+	if _, err := w.Fork("app", "main", "recent", "", 0, nil); err != nil {
 		t.Fatal(err)
 	}
 	setTTLAt(t, w, "app", "recent", "1h", now.Add(-5*time.Hour).Format(time.RFC3339Nano))
@@ -114,7 +114,7 @@ func TestConcurrentTouchAndReapHaveExactlyOneWinner(t *testing.T) {
 		if err := w.Create("app"); err != nil {
 			t.Fatal(err)
 		}
-		if _, err := w.Fork("app", "main", "contested", "", 0); err != nil {
+		if _, err := w.Fork("app", "main", "contested", "", 0, nil); err != nil {
 			t.Fatal(err)
 		}
 		now := time.Now().UTC()
@@ -158,7 +158,7 @@ func TestReapSelfHealsStaleReapingClaim(t *testing.T) {
 	if err := w.Create("app"); err != nil {
 		t.Fatal(err)
 	}
-	if _, err := w.Fork("app", "main", "crashed", "", 0); err != nil {
+	if _, err := w.Fork("app", "main", "crashed", "", 0, nil); err != nil {
 		t.Fatal(err)
 	}
 	now := time.Now().UTC()
@@ -210,7 +210,7 @@ func TestReapSelfHealsStaleReapingClaim(t *testing.T) {
 
 	// A genuinely-expired Reaping ref (deadline still in the past) must
 	// still proceed to Destroy, unaffected by the self-heal path above.
-	if _, err := w.Fork("app", "main", "genuinely-expired", "", 0); err != nil {
+	if _, err := w.Fork("app", "main", "genuinely-expired", "", 0, nil); err != nil {
 		t.Fatal(err)
 	}
 	setTTLAt(t, w, "app", "genuinely-expired", "1h", now.Add(-2*time.Hour).Format(time.RFC3339Nano))
@@ -239,7 +239,7 @@ func TestReapedLineageIsCollectableByGC(t *testing.T) {
 	if err := w.Create("app"); err != nil {
 		t.Fatal(err)
 	}
-	if _, err := w.Fork("app", "main", "doomed", "", 0); err != nil {
+	if _, err := w.Fork("app", "main", "doomed", "", 0, nil); err != nil {
 		t.Fatal(err)
 	}
 	ref, _, err := w.Store.GetRef("app", "doomed")

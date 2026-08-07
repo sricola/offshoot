@@ -31,7 +31,7 @@ func captureStderr(t *testing.T, fn func()) string {
 func seedBranch(t *testing.T, s *Store) {
 	t.Helper()
 	r := Ref{Lineage: NewLineageID(), Epoch: 1, HeadTXID: 1, HeadEpoch: 1}
-	r.SetCheckpoint("init", 1, 1)
+	r.SetCheckpoint("init", Checkpoint{TXID: 1, Epoch: 1})
 	if _, err := s.PutRef("app", "main", r, ""); err != nil {
 		t.Fatal(err)
 	}
@@ -198,7 +198,7 @@ func TestAcquireOverCorruptExpiryWarnsAndSucceeds(t *testing.T) {
 	s := newStore(t)
 	r := Ref{Lineage: NewLineageID(), Epoch: 1, HeadTXID: 1, HeadEpoch: 1,
 		LeaseHolder: "daemon-a", LeaseExpiry: "not-a-timestamp"}
-	r.SetCheckpoint("init", 1, 1)
+	r.SetCheckpoint("init", Checkpoint{TXID: 1, Epoch: 1})
 	if _, err := s.PutRef("app", "main", r, ""); err != nil {
 		t.Fatal(err)
 	}

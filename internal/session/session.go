@@ -630,8 +630,8 @@ func (s *Session) autoFlushPending() bool {
 	return s.appliedGen != s.flushedGen || s.rebaseGen != s.flushedRebaseGen
 }
 
-// flushLoop calls flush("", true) — the auto-tagged path Flush("") itself is
-// a thin wrapper around, see flush's doc comment — on a fixed cadence for as
+// flushLoop calls flush("", nil, true) — the auto-tagged path Flush("", nil)
+// itself is a thin wrapper around, see flush's doc comment — on a fixed cadence for as
 // long as the session is open, so a caller that never calls Flush manually
 // still gets bounded data loss on crash. Mirrors renewLoop's shutdown
 // discipline exactly: it exits when ctx is cancelled (Close, or a terminal
@@ -704,7 +704,7 @@ func (s *Session) flushLoop(ctx context.Context, every time.Duration) {
 		beforeAt, beforeTXID := s.lastFlushAt, s.lastFlushTXID
 		s.mu.Unlock()
 
-		if _, err := s.flush("", true); err != nil {
+		if _, err := s.flush("", nil, true); err != nil {
 			if errors.Is(err, ErrClosed) {
 				continue
 			}

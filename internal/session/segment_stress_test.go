@@ -52,7 +52,7 @@ func TestCleanResumeRebaselinesBeforeFirstSegment(t *testing.T) {
 		if out, err := exec.Command("sqlite3", s1.CheckoutPath(), "INSERT INTO t VALUES ('a');").CombinedOutput(); err != nil {
 			t.Fatalf("%v: %s", err, out)
 		}
-		if _, err := s1.Flush(""); err != nil {
+		if _, err := s1.Flush("", nil); err != nil {
 			t.Fatalf("flush %d: %v", i, err)
 		}
 	}
@@ -77,7 +77,7 @@ func TestCleanResumeRebaselinesBeforeFirstSegment(t *testing.T) {
 		if out, err := exec.Command("sqlite3", s2.CheckoutPath(), "INSERT INTO t VALUES ('b');").CombinedOutput(); err != nil {
 			t.Fatalf("%v: %s", err, out)
 		}
-		if _, err := s2.Flush(""); err != nil {
+		if _, err := s2.Flush("", nil); err != nil {
 			t.Fatalf("flush after resume %d: %v", i, err)
 		}
 	}
@@ -126,13 +126,13 @@ func TestEveryFlushIsExactlyMaterializable(t *testing.T) {
 			t.Fatalf("%v: %s", err, out)
 		}
 		name := fmt.Sprintf("cp%d", i)
-		if _, err := s.Flush(name); err != nil {
+		if _, err := s.Flush(name, nil); err != nil {
 			t.Fatalf("flush %d: %v", i, err)
 		}
 		// Every checkpoint so far must still materialize to the right row count.
 		for j := 0; j <= i; j++ {
 			br := fmt.Sprintf("check-%d-%d", i, j)
-			if _, err := w.Fork("app", "main", br, fmt.Sprintf("cp%d", j), 0); err != nil {
+			if _, err := w.Fork("app", "main", br, fmt.Sprintf("cp%d", j), 0, nil); err != nil {
 				t.Fatalf("fork at cp%d: %v", j, err)
 			}
 			p, err := w.Checkout("app", br)
@@ -208,7 +208,7 @@ func TestChainSurvivesSessionRestart(t *testing.T) {
 		if out, err := exec.Command("sqlite3", s1.CheckoutPath(), "INSERT INTO t VALUES ('a');").CombinedOutput(); err != nil {
 			t.Fatalf("%v: %s", err, out)
 		}
-		if _, err := s1.Flush(""); err != nil {
+		if _, err := s1.Flush("", nil); err != nil {
 			t.Fatal(err)
 		}
 	}
@@ -230,7 +230,7 @@ func TestChainSurvivesSessionRestart(t *testing.T) {
 	if out, err := exec.Command("sqlite3", s2.CheckoutPath(), "INSERT INTO t VALUES ('b');").CombinedOutput(); err != nil {
 		t.Fatalf("%v: %s", err, out)
 	}
-	if _, err := s2.Flush(""); err != nil {
+	if _, err := s2.Flush("", nil); err != nil {
 		t.Fatalf("flush after restart: %v", err)
 	}
 	// w.Checkout materializes to the same fixed checkout path s2 already has
@@ -276,7 +276,7 @@ func TestMissingSegmentIsLoud(t *testing.T) {
 		if out, err := exec.Command("sqlite3", s.CheckoutPath(), "INSERT INTO t VALUES ('x');").CombinedOutput(); err != nil {
 			t.Fatalf("%v: %s", err, out)
 		}
-		if _, err := s.Flush(""); err != nil {
+		if _, err := s.Flush("", nil); err != nil {
 			t.Fatal(err)
 		}
 	}

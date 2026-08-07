@@ -218,6 +218,8 @@ func (s *Server) dispatch(req Request) Response {
 		return s.opTouch(req)
 	case "branches":
 		return s.opBranches(req)
+	case "dbs":
+		return s.opDbs()
 	default:
 		return errResp(fmt.Errorf("daemon: unknown op %q", req.Op))
 	}
@@ -337,12 +339,21 @@ func (s *Server) lookup(db, branch string) (*session.Session, error) {
 	return sess, nil
 }
 
+// opFlush ships the session's current state, optionally as a named
+// checkpoint (req.Name), optionally carrying req.Meta on that checkpoint
+// (Session.Flush rejects a non-empty Meta with an empty Name — there's no
+// checkpoint for it to attach to). There is deliberately no separate
+// "checkpoint" daemon op: a live session's checkpoint IS a named flush (see
+// ops.Workspace.Checkpoint's own doc comment on why its raw checkout access
+// is unsafe against a live session) — this is also why req.Meta rides here
+// rather than a dedicated op, giving the daemon-session path parity with
+// ops.Workspace.Checkpoint's own meta param.
 func (s *Server) opFlush(req Request) Response {
 	sess, err := s.lookup(req.DB, req.Branch)
 	if err != nil {
 		return errResp(err)
 	}
-	txid, err := sess.Flush(req.Name)
+	txid, err := sess.Flush(req.Name, req.Meta)
 	if err != nil {
 		return errResp(err)
 	}
@@ -492,7 +503,7 @@ func (s *Server) refuseIfClaimed(db, branch string) error {
 func (s *Server) flushIfOpen(db, branch, opName string) error {
 	switch st, sess := s.lookupSessionState(db, branch); st {
 	case sessionOpen:
-		if _, err := sess.Flush(""); err != nil {
+		if _, err := sess.Flush("", nil); err != nil {
 			return fmt.Errorf("daemon: flush %s before %s: %w", key(db, branch), opName, err)
 		}
 	case sessionReserved:
@@ -532,8 +543,10 @@ func (s *Server) opCheckoutAtRest(req Request) Response {
 
 // opFork creates req.Name as a new branch forked from req.Branch (source)
 // at checkpoint req.From ("" = source's head), with TTL req.TTL ("" = no
-// TTL; else a Go duration). A non-positive duration (<= 0) is refused: fork
-// has no "none" sentinel the way touch does (a brand-new branch has no
+// TTL; else a Go duration), and req.Meta (nil = none) stored on the new
+// branch's Ref.Meta (see ops.Workspace.Fork's doc comment for the cap). A
+// non-positive duration (<= 0) is refused: fork has no "none" sentinel the
+// way touch does (a brand-new branch has no
 // existing TTL to explicitly clear), so a caller that means "no TTL" omits
 // req.TTL entirely rather than sending a zero or negative one — sending one
 // anyway is almost certainly a mistake (e.g. an unintended negative
@@ -563,7 +576,7 @@ func (s *Server) opFork(req Request) Response {
 	if err := s.flushIfOpen(req.DB, branch, "fork"); err != nil {
 		return errResp(err)
 	}
-	txid, err := s.ws.Fork(req.DB, branch, req.Name, req.From, ttl)
+	txid, err := s.ws.Fork(req.DB, branch, req.Name, req.From, ttl, req.Meta)
 	if err != nil {
 		return errResp(err)
 	}
@@ -715,14 +728,41 @@ func (s *Server) opBranches(req Request) Response {
 			cps = append(cps, name)
 		}
 		sort.Strings(cps)
+		// CheckpointsV2 carries the same names, in the same sorted order, as
+		// Checkpoints above, plus each one's txid/created_at — built from the
+		// same cps slice so the two can never disagree on membership or order.
+		cpsV2 := make([]CheckpointInfo, 0, len(cps))
+		for _, name := range cps {
+			cp := ref.Checkpoints[name]
+			cpsV2 = append(cpsV2, CheckpointInfo{Name: name, TXID: cp.TXID, CreatedAt: cp.CreatedAt})
+		}
 		infos = append(infos, BranchInfo{
 			Branch: br, HeadTXID: ref.HeadTXID, Protected: ref.Protected,
 			TTL: ref.TTL, TTLRemaining: ops.FormatTTLRemaining(ref, now), LeaseHolder: ref.LeaseHolder,
-			Checkpoints: cps,
+			Checkpoints: cps, TouchedAt: ref.TouchedAt, CheckpointsV2: cpsV2,
 		})
 	}
 	sort.Slice(infos, func(i, j int) bool { return infos[i].Branch < infos[j].Branch })
 	return Response{OK: true, Branches: infos}
+}
+
+// opDbs lists every database this store has at least one ref for —
+// store.Store.ListRefs's keys, sorted. Unlike opBranches, an empty result is
+// not an error: a fresh store with nothing created yet legitimately has no
+// databases, and a cleanup job enumerating what exists (the motivating case
+// for this op — see the design spec's list-databases note) needs to be able
+// to tell "nothing here" from a failure.
+func (s *Server) opDbs() Response {
+	refs, err := s.ws.Store.ListRefs()
+	if err != nil {
+		return errResp(err)
+	}
+	dbs := make([]string, 0, len(refs))
+	for db := range refs {
+		dbs = append(dbs, db)
+	}
+	sort.Strings(dbs)
+	return Response{OK: true, Databases: dbs}
 }
 
 // Shutdown stops the janitor, stops accepting, refuses any further opens,

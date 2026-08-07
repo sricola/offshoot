@@ -131,7 +131,7 @@ func TestCheckpointCapturesUnflushedWriteViaDaemon(t *testing.T) {
 		t.Fatalf("checkpoint: %s", text(r))
 	}
 
-	if _, err := w.Fork("app", "main", "verify", "v1", 0); err != nil {
+	if _, err := w.Fork("app", "main", "verify", "v1", 0, nil); err != nil {
 		t.Fatal(err)
 	}
 	verifyPath, err := w.Checkout("app", "verify")
@@ -369,7 +369,7 @@ func TestCheckoutSkipsFencedSession(t *testing.T) {
 // a session the daemon still believes owns the branch.
 func TestRollbackRefusesWhenSessionOpen(t *testing.T) {
 	ts, w, sock := newDaemonTools(t)
-	if _, err := w.Fork("app", "main", "attempt-1", "", 0); err != nil {
+	if _, err := w.Fork("app", "main", "attempt-1", "", 0, nil); err != nil {
 		t.Fatal(err)
 	}
 	openSession(t, sock, "app", "attempt-1")
@@ -395,7 +395,7 @@ func TestRollbackRefusesWhenSessionOpen(t *testing.T) {
 // rest exactly as it always has.
 func TestRollbackProceedsAtRestWhenNoSessionOpen(t *testing.T) {
 	ts, w, _ := newDaemonTools(t)
-	if _, err := w.Fork("app", "main", "attempt-1", "", 0); err != nil {
+	if _, err := w.Fork("app", "main", "attempt-1", "", 0, nil); err != nil {
 		t.Fatal(err)
 	}
 	if _, err := w.Checkout("app", "attempt-1"); err != nil {
@@ -417,7 +417,7 @@ func TestRollbackProceedsAtRestWhenNoSessionOpen(t *testing.T) {
 // TestRollbackRefusesWhenSessionOpen for offshoot_destroy.
 func TestDestroyRefusesWhenSessionOpen(t *testing.T) {
 	ts, w, sock := newDaemonTools(t)
-	if _, err := w.Fork("app", "main", "attempt-1", "", 0); err != nil {
+	if _, err := w.Fork("app", "main", "attempt-1", "", 0, nil); err != nil {
 		t.Fatal(err)
 	}
 	openSession(t, sock, "app", "attempt-1")
@@ -435,7 +435,7 @@ func TestDestroyRefusesWhenSessionOpen(t *testing.T) {
 // TestRollbackProceedsAtRestWhenNoSessionOpen for offshoot_destroy.
 func TestDestroyProceedsAtRestWhenNoSessionOpen(t *testing.T) {
 	ts, w, _ := newDaemonTools(t)
-	if _, err := w.Fork("app", "main", "attempt-1", "", 0); err != nil {
+	if _, err := w.Fork("app", "main", "attempt-1", "", 0, nil); err != nil {
 		t.Fatal(err)
 	}
 
@@ -451,10 +451,10 @@ func TestDestroyProceedsAtRestWhenNoSessionOpen(t *testing.T) {
 // guarded the same way).
 func TestPromoteRefusesWhenTargetSessionOpen(t *testing.T) {
 	ts, w, sock := newDaemonTools(t)
-	if _, err := w.Fork("app", "main", "attempt-1", "", 0); err != nil {
+	if _, err := w.Fork("app", "main", "attempt-1", "", 0, nil); err != nil {
 		t.Fatal(err)
 	}
-	if _, err := w.Fork("app", "main", "attempt-2", "", 0); err != nil {
+	if _, err := w.Fork("app", "main", "attempt-2", "", 0, nil); err != nil {
 		t.Fatal(err)
 	}
 	openSession(t, sock, "app", "attempt-2") // the promote TARGET
@@ -473,10 +473,10 @@ func TestPromoteRefusesWhenTargetSessionOpen(t *testing.T) {
 // TestRollbackProceedsAtRestWhenNoSessionOpen for offshoot_promote.
 func TestPromoteProceedsAtRestWhenNoSessionOpen(t *testing.T) {
 	ts, w, _ := newDaemonTools(t)
-	if _, err := w.Fork("app", "main", "attempt-1", "", 0); err != nil {
+	if _, err := w.Fork("app", "main", "attempt-1", "", 0, nil); err != nil {
 		t.Fatal(err)
 	}
-	if _, err := w.Fork("app", "main", "attempt-2", "", 0); err != nil {
+	if _, err := w.Fork("app", "main", "attempt-2", "", 0, nil); err != nil {
 		t.Fatal(err)
 	}
 
@@ -501,10 +501,10 @@ func TestPromoteProceedsAtRestWhenNoSessionOpen(t *testing.T) {
 // without a test failing to call it out.
 func TestPromoteFromOpenSourceProceedsAtRest(t *testing.T) {
 	ts, w, sock := newDaemonTools(t)
-	if _, err := w.Fork("app", "main", "attempt-1", "", 0); err != nil {
+	if _, err := w.Fork("app", "main", "attempt-1", "", 0, nil); err != nil {
 		t.Fatal(err)
 	}
-	if _, err := w.Fork("app", "main", "attempt-2", "", 0); err != nil {
+	if _, err := w.Fork("app", "main", "attempt-2", "", 0, nil); err != nil {
 		t.Fatal(err)
 	}
 	checkoutPath := openSession(t, sock, "app", "attempt-1") // the promote SOURCE
