@@ -199,6 +199,75 @@ version if you depend on format stability.
     measured). New `make test-pytest-plugin` target (needs
     `offshoot-db[pytest]` + `pytest-xdist`, wired into `ci.yml`'s `sdks`
     job after `make test-sdks` already proved the base SDK pytest-free).
+- **TypeScript testkit** (Milestone 3 Task 5): `sdk/typescript/src/testkit.ts`
+  — the vitest/jest counterpart of `offshoot.pytest_plugin`, exported as a
+  new subpath, `@offshoot-db/client/testkit` (package.json `exports` map
+  added; previously only a bare `main`/`types` pair). Framework-agnostic
+  FUNCTIONS, not fixtures — no vitest/jest runtime dependency (this SDK
+  stays zero-runtime-deps) and nothing is registered automatically; wire
+  them into your own `beforeAll`/`afterEach`.
+  - `startDaemon(opts?) -> Promise<DaemonHandle>`: locates the `offshoot`
+    binary (`OFFSHOOT_BIN` env, else `PATH` — a clear error naming both
+    when neither has one; there is no skip tier here, unlike the pytest
+    plugin, since this module has no test-framework integration to skip
+    through), starts it on a fresh temp store + socket. Returns
+    `{ sock, store, proc, stderrTail(), stop() }`; the caller stops it
+    themselves (typically from a top-level `afterAll`).
+  - `seedOnce(daemon, {name?, seed}) -> Promise<SeedHandle>`: a NAMED-SEED
+    memoization cache keyed on `(daemon, name)`. `seed` is a SQL string, a
+    path to a `.sql` file (detected: no newline, ends in `.sql`, and the
+    file exists — there's no pytest.ini-style config file here to hold that
+    decision separately), or an async `(dbPath) => void` callback. The
+    first call for a name creates database `eval-{name}`, runs the seed,
+    and checkpoints it `seed`; a later call for the same name with a
+    *different* seed (fingerprinted: SQL/path text by content hash,
+    callables by identity) throws a clear error rather than silently
+    keeping the first one — same mismatch semantics as the pytest plugin's
+    `offshoot_db`. Ports `_skip_leading_noise`/`_seed_opens_own_transaction`
+    verbatim: a SQL-string seed is wrapped in one transaction unless it
+    already opens its own (so a `sqlite3 .dump`'s text — `PRAGMA` before
+    `BEGIN TRANSACTION` — works verbatim as a seed, and so a plain
+    multi-statement seed doesn't pay one autocommit-transaction-per-
+    statement). Since this SDK ships no SQLite driver, seeding (and
+    `dump`, below) shells out to the `sqlite3` CLI, same as
+    `test/client.test.ts` already does.
+  - `forkPerTest(daemon, seedHandleOrName, opts?) -> Promise<ForkedSession>`:
+    forks a fresh, worker-safe-named branch
+    (`t-{worker}-{sanitized-hint}-{n}`; worker id from `VITEST_POOL_ID` or
+    `JEST_WORKER_ID` when present, else `"local"`) from the seed's
+    checkpoint with a TTL (default `"1h"`, `opts.ttl` overrides), opens a
+    session, and returns `{ path, db, branch, client, flush(name?),
+    close() }`. `seedHandleOrName` may be a `SeedHandle` or a plain string
+    naming an already-`seedOnce`d name. `close()` closes the session and
+    destroys the branch; either failing is a `console.warn`, never a
+    throw — call it from `afterEach` with no surrounding try/catch. Each
+    `ForkedSession` owns its own connection and teardown independently, so
+    (unlike the pytest plugin's shared-per-test `_ForkFactory.teardown()`
+    loop) one fork's cleanup trouble can never block another's by
+    construction, not by an explicit try/except around each step.
+  - `dump(path) -> Promise<string>`: `sqlite3 <path> .dump`'s text — THE
+    golden-comparison method. SQLite's on-disk bytes are not deterministic
+    across writes with identical logical content — never byte-compare two
+    exported/checked-out `.db` files; compare `await dump(a) === await
+    dump(b)` instead.
+  - Tests: `sdk/typescript/test/testkit.test.ts`, run via `node:test`
+    against a real daemon (mirroring the pytest plugin's direct-daemon
+    tier): binary resolution (`OFFSHOOT_BIN`/`PATH`/neither), naming,
+    TTL default+override, `seedOnce` memoization + fingerprint mismatch, a
+    `.dump`-shaped seed, a path-to-`.sql` seed, an async-callback seed,
+    fork-per-test isolation, the string-name shorthand, teardown-warn-not-
+    throw against a killed daemon, and a golden-file (`dump`, not bytes)
+    scenario — plus one integration test wiring `startDaemon`/`seedOnce`/
+    `forkPerTest` into `node:test`'s own `before`/`after`/`beforeEach`/
+    `afterEach`, the way a real suite would. Wired into the existing
+    `make test-ts-sdk` target (it already globs `test-dist/test/*.test.js`)
+    — same zero-extra-dependency constraint (`typescript`/`@types/node`
+    devDeps only).
+  - `make dry-run-ts-sdk`'s tarball exact-match assertion updated to expect
+    `dist/testkit.js`/`dist/testkit.d.ts` alongside the existing
+    `dist/client.*` files, and a second install-then-`import()` check
+    added for the new `@offshoot-db/client/testkit` subpath (not just the
+    package root).
 
 ### Fixed
 
