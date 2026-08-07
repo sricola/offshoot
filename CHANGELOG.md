@@ -290,6 +290,87 @@ version if you depend on format stability.
   `docs/reference.md` gains the `subscribe` op and `GET /events` route,
   with the dedicated-connection warning restated for operators.
 
+- **Ro-cache disk budget + LRU eviction** (Milestone 4 Task 5): `offshoot
+  serve -ro-cache-budget <bytes|0>` (default `0` = unlimited) bounds
+  `checkouts-ro`'s total size — the read-only cache `CheckoutAt` (Milestone
+  3 Task 2) materializes into and which, until now, grew without bound.
+  The janitor's `Server.janitorTick` (`internal/daemon/server.go`) runs a
+  new ro-cache pass on the same `-reap-every` cadence as reap/GC: it always
+  computes and republishes current usage (`offshoot_ro_cache_bytes`, the
+  T2-registered gauge, previously always 0) — a budget-less or
+  already-under-budget pass still reports a real number, it just never
+  evicts — and, once usage exceeds a configured budget, LRU-evicts entries
+  (oldest first) until it's back under. A bare integer is bytes (the
+  contract); `-ro-cache-budget` and `status`'s own display flag of the
+  same name also accept a trailing power-of-1024 size suffix (`K`/`KB`,
+  `M`/`MB`, `G`/`GB`, `T`/`TB`) as a convenience (`parseByteSize`,
+  `cmd/offshoot/main.go`) — tested directly (`TestParseByteSize`) since
+  the brief called out "if you add size parsing, test it."
+
+  **LRU clock (PM Amendment 11, pre-decided): a `.last-used` touch-on-HIT
+  marker file**, not the `.db` file's own mtime — `CheckoutAt`'s
+  force=false cache-hit path (`internal/ops/export.go`) now calls
+  `touchLastUsed`, which creates/`Chtimes`s a `<cachefile>.last-used`
+  sidecar to the current time on every cache HIT. This is necessary, not
+  cosmetic: `materializeAt`'s rename-into-place is the LAST thing that ever
+  touches the `.db` file's own mtime (a cache hit is a pure read — it must
+  never touch the `.db` file again), so without a separate marker "least
+  recently used" would collapse to "least recently created," exactly
+  backwards for a cache whose whole point is that a repeatedly-hit
+  checkpoint should stay hot. `internal/ops/rocache.go`'s `lruClock` ranks
+  by the marker's mtime when present, falling back to the `.db` file's own
+  mtime as the documented floor for an entry materialized but never since
+  hit. `TestEvictROCacheLastUsedTouchBeatsCreationOrder` and its daemon-level
+  counterpart `TestJanitorTickEvictsLRUUnderBudgetAndFiresEvictedEvent`
+  both prove this directly: an OLDER (by creation) entry that gets hit
+  survives eviction while a NEWER, never-hit entry is evicted instead.
+
+  **`checkouts/` (writable, leased) is never evicted — by construction, not
+  a runtime check**: `ops.Workspace.EvictROCache` only ever walks and
+  removes paths under the separate `checkouts-ro` tree (never joined with,
+  or reachable from, `checkouts/`'s own path shape — see `CheckoutAtPath`'s
+  existing doc comment on that separation); there is no code path here that
+  can construct or be handed a `checkouts/` path at all.
+  `TestEvictROCacheNeverTouchesWritableCheckout` (ops-level, budget=1 as
+  aggressive as it gets) and `TestJanitorROCacheEvictionNeverTouchesLeasedWritableCheckout`
+  (daemon-level: a real open, leased session survives an aggressive pass
+  and can still flush afterward) both confirm this end to end, not just by
+  code inspection.
+
+  **Eviction is LOUD**: one `offshoot: janitor: ro-cache: evicted
+  <db>@<branch>@<checkpoint> (<bytes> bytes)` stderr line per eviction,
+  `offshoot_ro_cache_evictions_total` (the T2-registered counter,
+  previously always 0) incremented, and Task 4a's reserved-but-unwired
+  `evicted` event type now has its emitter — `janitorTick` publishes
+  `{type:"evicted", db, branch, detail:{checkpoint, bytes}}` to the T4a bus
+  at the eviction call site (`eventBus.publish` is non-blocking, so this
+  can never stall the janitor loop). `offshoot status` gains an ro-cache
+  usage summary line (`ROCacheUsage`, `internal/ops/rocache.go`) plus an
+  optional `-ro-cache-budget` flag of its own — display-only, since (like
+  every other `serve` tuning flag) the budget is never persisted, so this
+  at-rest CLI command has no other way to show usage against it without a
+  live daemon connection.
+
+  Each eviction removes both the `.db` cache file and its `.last-used`
+  marker together. Partial-progress-plus-first-error on a mid-pass
+  `os.Remove` failure, matching `Reap`/`GC`'s own convention elsewhere in
+  `internal/ops`.
+
+  Tests: `go test ./internal/ops ./internal/daemon -count=1 -race` —
+  `internal/ops/rocache_test.go` (usage accounting, budget=0 never evicts,
+  already-under-budget never evicts, oldest-first eviction to under
+  budget, both files removed together, the writable-checkout and
+  touch-beats-creation-order proofs above) and
+  `internal/daemon/rocache_test.go` (the same LRU/budget-zero/writable-
+  checkout scenarios driven through a real `janitorTick` pass, plus the
+  metrics move and the `evicted` event fires with `db`/`branch`/
+  `checkpoint`/`bytes`). No `internal/session`/`internal/capture` changes
+  — janitor/ops only — so no torture run was required for this task.
+  `docs/status.md`'s Resource-behavior row flips to shipped-and-tested;
+  `docs/reference.md` gains `-ro-cache-budget`, the LRU-clock rationale,
+  and reiterates the writable-never-evicted guarantee; the `evicted` event
+  row in the events table loses its "reserved" caveat.
+
 ## [0.1.2] - 2026-08-06
 
 Milestone 3: the eval-harness release. The target persona's first hour is

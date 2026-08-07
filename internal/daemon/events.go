@@ -39,19 +39,16 @@ const eventSchemaVersion = 1
 // by the ONE shared encodeEvent function below.
 //
 // Type is one of: "session_opened", "flushed", "flush_failed", "fenced",
-// "session_closed" (all six sourced from the existing session
+// "session_closed" (all five sourced from the existing session
 // transition-callback call site — see sessionEventType), "reaped" (sourced
 // from the janitor's Reap pass — see Server.janitorTick), "evicted"
-// (RESERVED: registered here as a valid schema member, but nothing emits
-// it yet — Milestone 4 Task 5's ro-cache LRU eviction path is the intended
-// source and will call eventBus.publish("evicted", ...) at its own
-// eviction call site once that path exists; Task 4a deliberately does not
-// stub a dead call site for a feature that doesn't exist yet), and
-// "dropped_slow_consumer" (synthetic: the terminal event a subscriber's
-// own bus.publish delivers to IT ALONE, immediately before its channel is
-// closed — see eventBus.publish's doc comment. Never published to any
-// OTHER subscriber; not one of T4a's six "real" source types, but part of
-// the same one schema/one encoder discipline).
+// (Milestone 4 Task 5: sourced from the janitor's ro-cache LRU eviction
+// pass — see janitorTick's EvictROCache call; detail carries "checkpoint"
+// and "bytes"), and "dropped_slow_consumer" (synthetic: the terminal event
+// a subscriber's own bus.publish delivers to IT ALONE, immediately before
+// its channel is closed — see eventBus.publish's doc comment. Never
+// published to any OTHER subscriber; not one of the other seven "real"
+// source types, but part of the same one schema/one encoder discipline).
 type Event struct {
 	V      int            `json:"v"`
 	TS     string         `json:"ts"` // RFC3339, UTC

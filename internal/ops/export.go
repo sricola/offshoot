@@ -148,6 +148,16 @@ func (w *Workspace) CheckoutAtPath(db, branch, checkpoint string) string {
 // pure cache hit, and will surface a real error (e.g. "no checkpoint") if
 // the checkpoint has since become unreachable, rather than silently
 // serving the stale cache the force=false path would have returned.
+//
+// Unbounded growth: checkouts-ro grows by one file per distinct
+// (db, branch, checkpoint) ever cached and nothing here reclaims it —
+// Milestone 4 Task 5's `-ro-cache-budget` janitor pass (EvictROCache,
+// rocache.go) is the bound, LRU-evicting entries when the whole tree
+// exceeds a configured byte budget (default 0 = unlimited, matching this
+// function's own unbounded-by-default behavior). A force=false cache HIT
+// here also touches this entry's `.last-used` marker (touchLastUsed) —
+// that eviction's LRU clock, so a repeatedly-hit checkpoint stays hot even
+// under a tight budget.
 func (w *Workspace) CheckoutAt(db, branch, checkpoint string, force bool) (string, error) {
 	if err := store.ValidateName(db); err != nil {
 		return "", err
@@ -177,6 +187,13 @@ func (w *Workspace) CheckoutAt(db, branch, checkpoint string, force bool) (strin
 	path := w.CheckoutAtPath(db, branch, checkpoint)
 	if !force {
 		if _, err := os.Stat(path); err == nil {
+			// Milestone 4 Task 5: touch-on-HIT for the LRU eviction clock
+			// (PM Amendment 11) — see touchLastUsed's doc comment (rocache.go)
+			// for why a separate `.last-used` marker exists at all rather
+			// than trusting this file's own mtime (which only ever reflects
+			// when it was last MATERIALIZED, never when it was last served
+			// as a cache hit). Best-effort: never fails this call.
+			touchLastUsed(path)
 			return path, nil
 		}
 	}

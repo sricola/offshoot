@@ -7,6 +7,7 @@ import (
 	"os"
 	"os/signal"
 	"runtime"
+	"strconv"
 	"strings"
 	"syscall"
 	"time"
@@ -64,16 +65,28 @@ Usage:
   offshoot destroy <db>[@branch] [--force]   delete a branch (requires --force for protected)
   offshoot gc [--grace duration]     garbage collect unreachable lineages (default grace: 1h)
   offshoot path <db>[@branch]        print the checkout path
-  offshoot status                    print all branches and their state
+  offshoot status [-ro-cache-budget BYTES]
+                                     print all branches and their state, plus
+                                     a checkouts-ro usage summary; -ro-cache-budget
+                                     is display-only (echoes serve's own flag;
+                                     not persisted anywhere)
   offshoot lease list                       list every branch's lease
   offshoot lease acquire <db>[@branch] [--ttl 30s]   claim or renew a lease
   offshoot lease release <db>[@branch]      release a lease
   offshoot serve [-socket PATH] [-reap-every d] [-gc-grace d] [-flush-every d]
-                 [-http ADDR] [-token TOKEN] [-http-allow-non-loopback]
+                 [-ro-cache-budget BYTES] [-http ADDR] [-token TOKEN] [-http-allow-non-loopback]
                                              run the daemon until SIGINT/SIGTERM;
                                              -flush-every ships every open session's
                                              work on a cadence even if it's never
                                              flushed explicitly (default 30s; 0 disables);
+                                             -ro-cache-budget bounds checkouts-ro
+                                             (default 0 = unlimited); the janitor
+                                             LRU-evicts (by a .last-used touch-on-hit
+                                             marker) once usage exceeds it, on the
+                                             same -reap-every cadence; a bare integer
+                                             is bytes, or use a K/M/G/T suffix
+                                             (power-of-1024); checkouts/ (writable,
+                                             leased) is never evicted
                                              -http ADDR (e.g. 127.0.0.1:8080) additionally
                                              starts an HTTP listener (POST /rpc, GET
                                              /metrics, GET /healthz, GET /debug/pprof/*,
@@ -286,6 +299,54 @@ func parseDefaultTTLFlag(args []string) (time.Duration, []string, error) {
 		return 0, nil, fmt.Errorf("-default-ttl %q must be zero, \"none\" (both disable it), or positive", raw)
 	}
 	return d, rest, nil
+}
+
+// parseByteSize parses a -ro-cache-budget-shaped flag value: "" (the flag
+// omitted) is 0 (unlimited, that flag's own default); otherwise a bare
+// non-negative integer is taken as a byte count directly — bytes are the
+// CONTRACT this flag and offshoot_ro_cache_bytes/EvictROCache all speak, and
+// the only form ever guaranteed stable. As a convenience, a trailing
+// power-of-1024 size suffix is also accepted, case-insensitively: "K"/"KB",
+// "M"/"MB", "G"/"GB", "T"/"TB" (each multiplies by 1024^n — NOT the SI
+// decimal 1000-based convention some tools use for the same letters; when
+// in doubt, pass raw bytes). A bare trailing "B" (no K/M/G/T prefix) is
+// also accepted as a no-op multiplier, purely so "500B" and "500" parse
+// identically rather than one of them erroring on a redundant unit.
+func parseByteSize(raw string) (int64, error) {
+	if raw == "" {
+		return 0, nil
+	}
+	s := strings.TrimSpace(raw)
+	upper := strings.ToUpper(s)
+	mult := int64(1)
+	for _, suf := range []struct {
+		suffix string
+		mult   int64
+	}{
+		{"TB", 1 << 40}, {"T", 1 << 40},
+		{"GB", 1 << 30}, {"G", 1 << 30},
+		{"MB", 1 << 20}, {"M", 1 << 20},
+		{"KB", 1 << 10}, {"K", 1 << 10},
+		{"B", 1},
+	} {
+		if strings.HasSuffix(upper, suf.suffix) {
+			mult = suf.mult
+			s = s[:len(s)-len(suf.suffix)]
+			break
+		}
+	}
+	s = strings.TrimSpace(s)
+	if s == "" {
+		return 0, fmt.Errorf("%q: missing a numeric value", raw)
+	}
+	n, err := strconv.ParseInt(s, 10, 64)
+	if err != nil {
+		return 0, fmt.Errorf("%q: %w", raw, err)
+	}
+	if n < 0 {
+		return 0, fmt.Errorf("%q: must be zero or positive (zero means unlimited)", raw)
+	}
+	return n * mult, nil
 }
 
 func main() {
@@ -569,6 +630,25 @@ func run(args []string) error {
 		fmt.Printf("gc: tombstoned %d, deleted %d lineages\n", tombstoned, deleted)
 		return nil
 	case "status":
+		// -ro-cache-budget is purely for DISPLAY here — like every other
+		// serve-time tuning knob (-reap-every, -gc-grace, -flush-every), the
+		// budget itself is never persisted to the store, so this at-rest
+		// command (no daemon involved — see below) has no other way to know
+		// what a running daemon was actually started with. Passing the same
+		// value here as the daemon's own -ro-cache-budget lets an operator
+		// see usage against it without a live daemon connection; omitted
+		// (the common case) just reports usage with no budget context.
+		roCacheBudgetStr, rest, _, err := extractFlag(rest, "-ro-cache-budget")
+		if err != nil {
+			return err
+		}
+		roCacheBudget, err := parseByteSize(roCacheBudgetStr)
+		if err != nil {
+			return fmt.Errorf("-ro-cache-budget: %w", err)
+		}
+		if len(rest) != 0 {
+			return fmt.Errorf("usage: offshoot status [-ro-cache-budget BYTES]")
+		}
 		sts, err := w.Status()
 		if err != nil {
 			return err
@@ -587,6 +667,19 @@ func run(args []string) error {
 				line += fmt.Sprintf(" ttl=%s remaining=%s", s.TTL, s.TTLRemaining)
 			}
 			fmt.Println(line)
+		}
+		// Milestone 4 Task 5: ro-cache usage summary. Computed directly off
+		// checkouts-ro (ops.Workspace.ROCacheUsage), the same at-rest read
+		// every other line above already uses — no daemon required, exactly
+		// like the rest of this command.
+		roBytes, roCount, err := w.ROCacheUsage()
+		if err != nil {
+			return err
+		}
+		if roCacheBudget > 0 {
+			fmt.Printf("ro-cache: %d entries, %d bytes used, budget %d bytes\n", roCount, roBytes, roCacheBudget)
+		} else {
+			fmt.Printf("ro-cache: %d entries, %d bytes used (budget: unlimited)\n", roCount, roBytes)
 		}
 		return nil
 	case "lease":
@@ -681,7 +774,7 @@ func run(args []string) error {
 		return srv.Serve(context.Background())
 	case "serve":
 		const serveUsage = "usage: offshoot serve [-socket PATH] [-reap-every DURATION] [-gc-grace DURATION] " +
-			"[-flush-every DURATION] [-http ADDR] [-token TOKEN] [-http-allow-non-loopback]"
+			"[-flush-every DURATION] [-ro-cache-budget BYTES] [-http ADDR] [-token TOKEN] [-http-allow-non-loopback]"
 		sock, rest, err := socketOverride(rest)
 		if err != nil {
 			return fmt.Errorf("%s: %w", serveUsage, err)
@@ -722,6 +815,14 @@ func run(args []string) error {
 		if flushEvery < 0 {
 			return fmt.Errorf("-flush-every %q must be zero or positive; zero disables auto-flush "+
 				"(there is no \"none\" alias — a negative value is almost certainly a mistake)", flushEveryStr)
+		}
+		roCacheBudgetStr, rest, _, err := extractFlag(rest, "-ro-cache-budget")
+		if err != nil {
+			return err
+		}
+		roCacheBudget, err := parseByteSize(roCacheBudgetStr)
+		if err != nil {
+			return fmt.Errorf("-ro-cache-budget: %w", err)
 		}
 		httpAddr, rest, _, err := extractFlag(rest, "-http")
 		if err != nil {
@@ -795,6 +896,10 @@ func run(args []string) error {
 		// disables this, restoring manual-only (session.Options' own
 		// default).
 		srv.SetFlushEvery(flushEvery)
+		// Milestone 4 Task 5: 0 (the default, unset) means unlimited — the
+		// janitor still computes and reports checkouts-ro usage every pass,
+		// it just never evicts. See SetROCacheBudget's doc comment.
+		srv.SetROCacheBudget(roCacheBudget)
 		if httpAddr != "" {
 			if err := srv.StartHTTP(daemon.HTTPConfig{
 				Addr:             httpAddr,
