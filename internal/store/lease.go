@@ -24,6 +24,19 @@ var (
 	// claim stranded by a crashed reaper — the next Reap cycle's self-heal
 	// (see ops.reapOne). Retrying shortly is always the right move.
 	ErrReaping = errors.New("store: branch is being reaped")
+	// ErrDeleting reports that db@branch has an active Destroy claim
+	// (Ref.Deleting=true) — the generalization of ErrReaping's TOCTOU fix
+	// (Milestone 4 Task 6b) to every Destroy call, not just Reap's: a lease
+	// acquired in the window between Destroy's GetRef and its delete would
+	// otherwise have its branch deleted out from under it, so AcquireLease
+	// refuses outright here too. Transient exactly like ErrReaping: it
+	// clears when Destroy's own claim unwind runs (a failure after the
+	// claim landed), the branch is gone (success — GetRef itself then
+	// returns ErrNotFound instead of this), or — for a claim stranded by a
+	// crashed Destroy — ops.ClearStaleDeleteClaims's age-based self-heal
+	// (see Ref.Deleting's doc comment). Retrying shortly is always the
+	// right move, same as ErrReaping.
+	ErrDeleting = errors.New("store: branch is being deleted")
 )
 
 // Lease is a claim on a branch, valid until Expiry unless renewed.
@@ -67,8 +80,9 @@ func LeaseLive(ref Ref, now time.Time) bool {
 
 // AcquireLease claims db@branch for holder until now+ttl.
 //
-// A ref with an active reap claim (Reaping=true) refuses outright — see
-// ErrReaping — before any of the lease logic below even runs.
+// A ref with an active reap claim (Reaping=true) or an active Destroy claim
+// (Deleting=true, Milestone 4 Task 6b) refuses outright — see ErrReaping/
+// ErrDeleting — before any of the lease logic below even runs.
 //
 // A fresh acquisition, or a reclaim of an expired (or corrupt, see below)
 // lease, bumps the epoch so any previous holder's subsequent writes are
@@ -99,6 +113,9 @@ func (s *Store) AcquireLease(db, branch, holder string, ttl time.Duration, now t
 	}
 	if ref.Reaping {
 		return Lease{}, fmt.Errorf("%w: %s@%s; retry shortly", ErrReaping, db, branch)
+	}
+	if ref.Deleting {
+		return Lease{}, fmt.Errorf("%w: %s@%s; retry shortly", ErrDeleting, db, branch)
 	}
 	_, parseOK := parseExpiry(ref.LeaseExpiry)
 	if ref.LeaseExpiry != "" && !parseOK {

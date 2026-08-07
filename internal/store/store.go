@@ -70,6 +70,25 @@ type Ref struct {
 	TTL       string `json:"ttl,omitempty"`
 	TouchedAt string `json:"touched_at,omitempty"` // RFC3339Nano UTC
 	Reaping   bool   `json:"reaping,omitempty"`
+	// Deleting and DeletingAt are ops.Destroy's own CAS claim (Milestone 4
+	// Task 6b), the same shape as Reaping/TouchedAt above but a DELIBERATELY
+	// SEPARATE field, not a unification of the two: Destroy CAS-writes
+	// Deleting=true (stamping DeletingAt) before it does anything
+	// irreversible, so a lease acquired in the window between Destroy's
+	// initial GetRef and its actual delete refuses outright (AcquireLease
+	// checks this exactly like it already checks Reaping) instead of racing
+	// a branch out from under its new holder — the Destroy TOCTOU the M2
+	// review documented. This was scoped as a sibling to Reaping rather than
+	// a generalized {none,reaping,deleting} claim enum per Milestone 4 Task
+	// 6b's timebox (PM Amendment 9): Reaping's CAS mechanics are
+	// torture/race-tested and deliberately left untouched here. DeletingAt
+	// (RFC3339Nano UTC, stamped at claim time) is Deleting's own staleness
+	// clock — see ops.ClearStaleDeleteClaims — since a Deleting claim, unlike
+	// Reaping, has no TTL/activity deadline to recompute against; it just
+	// self-heals by age. Both omitempty: a ref decodes with Deleting false
+	// and DeletingAt empty exactly like every pre-Task-6b ref.
+	Deleting   bool   `json:"deleting,omitempty"`
+	DeletingAt string `json:"deleting_at,omitempty"`
 	// Meta is a small user-supplied string->string map describing this
 	// branch's lineage (e.g. eval run id, git SHA, agent id), set by Fork
 	// and capped at the ops layer (ops.ValidateMeta). Branch-level lineage
@@ -110,6 +129,8 @@ type refWire struct {
 	TTL         string                     `json:"ttl,omitempty"`
 	TouchedAt   string                     `json:"touched_at,omitempty"`
 	Reaping     bool                       `json:"reaping,omitempty"`
+	Deleting    bool                       `json:"deleting,omitempty"`
+	DeletingAt  string                     `json:"deleting_at,omitempty"`
 	Meta        map[string]string          `json:"meta,omitempty"`
 }
 
@@ -133,6 +154,7 @@ func decodeRef(data []byte) (Ref, error) {
 		Parent: w.Parent, Protected: w.Protected,
 		LeaseHolder: w.LeaseHolder, LeaseExpiry: w.LeaseExpiry,
 		TTL: w.TTL, TouchedAt: w.TouchedAt, Reaping: w.Reaping,
+		Deleting: w.Deleting, DeletingAt: w.DeletingAt,
 		Meta: w.Meta,
 	}
 	// A v1 ref predates per-checkpoint epochs: everything it references was
@@ -423,6 +445,40 @@ func (s *Store) PutRef(db, branch string, r Ref, ifMatch string) (string, error)
 
 func (s *Store) DeleteRef(db, branch string) error {
 	return s.B.Delete(RefKey(db, branch))
+}
+
+// ConditionalDeleter is an optional Backend capability: DeleteIf removes key
+// only if its current content still matches ifMatch's etag, refusing with
+// ErrCAS if the key has since changed or is already gone. It is the delete-
+// side counterpart to PutIf's CAS.
+//
+// Local implements this via the exact same per-key lock PutIf itself uses
+// (see local.go's DeleteIf) — a true conditional delete. S3's DeleteObject
+// API has no compare-and-delete precondition to give it (If-Match/If-None-
+// Match are PUT/GET-only headers there; DELETE ignores them entirely), so
+// S3 deliberately does NOT implement this interface rather than pretending
+// to honor a condition it cannot actually enforce — see s3.go's Delete doc
+// comment and DeleteRefIf below for what a caller gets instead.
+type ConditionalDeleter interface {
+	DeleteIf(key, ifMatch string) error
+}
+
+// DeleteRefIf deletes db@branch's ref, conditional on etag when the backend
+// can actually honor that (ConditionalDeleter — today, Local) and
+// unconditional otherwise (S3). Milestone 4 Task 6b's Destroy claim-guard
+// (ops.Workspace.Destroy) is what actually closes the GetRef -> lease-check
+// -> delete TOCTOU on EVERY backend, by CAS-writing a Deleting claim before
+// calling this — see Ref.Deleting's doc comment. DeleteRefIf's own
+// etag-conditioning is a belt-and-suspenders extra on a backend that can
+// give it for free, never the primary safety mechanism, precisely because
+// S3 cannot give it at all: pretending otherwise here would be the "pretend
+// S3 DeleteObject has preconditions" mistake the design review flagged.
+func (s *Store) DeleteRefIf(db, branch, etag string) error {
+	key := RefKey(db, branch)
+	if cd, ok := s.B.(ConditionalDeleter); ok {
+		return cd.DeleteIf(key, etag)
+	}
+	return s.B.Delete(key)
 }
 
 func (s *Store) ListRefs() (map[string][]string, error) {

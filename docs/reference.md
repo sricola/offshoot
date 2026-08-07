@@ -381,7 +381,52 @@ under an active lease (a live holder may still be mid-write; without
 `--force` this is refused outright).
 
 **Errors:** protected without `--force`; live lease without `--force`;
-checkout is busy (close connections first).
+checkout is busy (close connections first); the destroy lost a race to a
+concurrent `AcquireLease` on the same branch (retry — see below).
+
+### Claim-guarded delete (Milestone 4 Task 6b)
+
+Between checking a branch's lease and actually deleting its ref sits a
+window: a lease could be acquired in that gap and have its brand-new
+holder's branch deleted out from under it moments later. Destroy closes
+this by CAS-writing a `Deleting` claim on the ref *before* it does anything
+irreversible — the same shape as `offshoot gc`'s reap claim (`Reaping`),
+generalized to every `destroy` call, not just TTL reaping. A concurrent
+`AcquireLease` (CLI `lease acquire`, the daemon `open` op, or the
+embeddable library directly) checks for this claim and refuses outright
+(retryable — the claim is always transient) rather than racing it. This
+closes the exact TOCTOU an earlier design review documented for the M2
+Destroy path.
+
+`--force` still claim-guards: it bypasses the protected/live-lease checks
+above — an operator's explicit override of *those* — never the claim
+itself. A lease acquired a moment before a forced destroy lands still wins
+the underlying compare-and-swap on the ref, and the forced destroy reports
+a retryable race loss exactly like an unforced one would.
+
+**Backend-specific mechanics** (PM Amendment 5: do not pretend S3
+`DeleteObject` has preconditions it doesn't):
+
+- **Local** gets a TRUE conditional delete on top of the claim: the same
+  per-key lock file `PutIf` already uses to implement compare-and-swap also
+  backs a compare-and-delete (`Local.DeleteIf`) — belt-and-suspenders, since
+  the claim above already serializes concurrent destroys/acquires on its
+  own.
+- **S3** has no compare-and-delete precondition in its API at all
+  (`DeleteObject` ignores `If-Match`/`If-None-Match`; those headers only
+  apply to `GetObject`/`PutObject`). Its delete stays unconditional; the
+  CAS-written `Deleting` claim marker is the entire safety mechanism on this
+  backend, not a supplement to a conditional delete that doesn't exist.
+
+A Destroy call that crashes after landing its claim but before finishing
+the delete leaves the claim stranded — the branch is untouched (no partial
+delete), but a naive read of the claim alone would block it forever. The
+daemon's janitor self-heals this on the same cadence as reap/GC: a
+`Deleting` claim older than 30 seconds (destroy is a handful of local
+filesystem operations plus at most one checkout quiesce — anything stuck
+longer means the process that claimed it is gone) is cleared, and the
+branch becomes destroyable/leasable again. `offshoot gc` triggers the same
+self-heal on demand, same as it does for a stranded reap claim.
 
 ## `offshoot gc [--grace duration]`
 
