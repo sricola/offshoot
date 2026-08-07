@@ -64,19 +64,20 @@ const maxRPCBodyBytes = 1 << 20 // 1MiB
 //     documented tradeoff (docs/reference.md), not a bug: request a
 //     shorter window, or profile out-of-band.
 //
-//     *** MILESTONE 4 TASK 4a WARNING ***: this same 90s WriteTimeout will
-//     hard-cut a long-lived SSE `GET /events` stream (Task 4a's planned
-//     addition to this same http.Server/mux) at 90 seconds — WriteTimeout
-//     has no concept of "a stream that's still legitimately sending, just
-//     slowly," it only sees total handler wall-clock time. Task 4a's
-//     /events handler MUST clear the write deadline for its own connection
-//     before it starts streaming, e.g.
-//     `http.NewResponseController(w).SetWriteDeadline(time.Time{})` — do
-//     NOT raise this constant instead: every OTHER handler on this
-//     http.Server (/rpc, /metrics, /debug/pprof/*) still wants the 90s
-//     bound, and per-connection deadline overrides are exactly the
-//     mechanism net/http provides for a single long-lived handler to opt
-//     out without changing the server-wide default. See
+//     *** MILESTONE 4 TASK 4a ***: this same 90s WriteTimeout would
+//     hard-cut a long-lived SSE `GET /events` stream at 90 seconds —
+//     WriteTimeout has no concept of "a stream that's still legitimately
+//     sending, just slowly," it only sees total handler wall-clock time.
+//     ADDRESSED: handleEvents (events.go) clears the write deadline for
+//     its own connection before it starts streaming, via
+//     `http.NewResponseController(w).SetWriteDeadline(time.Time{})` —
+//     see that function's doc comment and TestSSEStreamSurvivesPastWriteTimeout
+//     (events_test.go). This constant itself was deliberately NOT raised:
+//     every OTHER handler on this http.Server (/rpc, /metrics,
+//     /debug/pprof/*) still wants the 90s bound, and per-connection
+//     deadline overrides are exactly the mechanism net/http provides for a
+//     single long-lived handler to opt out without changing the
+//     server-wide default. See
 //     https://pkg.go.dev/net/http#ResponseController.SetWriteDeadline.
 //
 //   - httpIdleTimeout closes idle keep-alive connections after 2 minutes so
@@ -85,9 +86,20 @@ const maxRPCBodyBytes = 1 << 20 // 1MiB
 const (
 	httpReadHeaderTimeout = 5 * time.Second
 	httpReadTimeout       = 30 * time.Second
-	httpWriteTimeout      = 90 * time.Second
 	httpIdleTimeout       = 2 * time.Minute
 )
+
+// httpWriteTimeout is 90s in production (see the timeout justification
+// block above) — a var, not a const alongside its siblings, purely so
+// events_test.go's TestSSEStreamSurvivesPastWriteTimeout can shrink it and
+// prove handleEvents's write-deadline-clear (events.go) actually works
+// WITHOUT the test itself sleeping past a real 90 seconds: lower this to a
+// few hundred milliseconds, start an SSE stream, keep it alive past that
+// shrunk duration, and assert it was NOT cut — the "honest cheap proof"
+// this task's brief asks for, structurally exercising the exact mechanism
+// (http.ResponseController.SetWriteDeadline) rather than only asserting it
+// was called.
+var httpWriteTimeout time.Duration = 90 * time.Second
 
 // httpShutdownRespondDelay, when non-nil, is invoked by handleRPC after
 // dispatching a "shutdown" request but before writing/flushing that
@@ -221,7 +233,8 @@ func isLoopbackAddr(addr string) (bool, error) {
 }
 
 // StartHTTP starts the opt-in HTTP listener: POST /rpc, GET /metrics, GET
-// /healthz, GET /debug/pprof/* (Milestone 4 Task 3). Returns once the
+// /healthz, GET /events (Milestone 4 Task 4a — SSE, see events.go), GET
+// /debug/pprof/* (Milestone 4 Task 3). Returns once the
 // listener is bound (so a caller sees a bind failure — e.g. address already
 // in use — synchronously); request serving happens on a background
 // goroutine. Safe to call at most once per Server (a second call returns an
@@ -283,6 +296,11 @@ func (s *Server) StartHTTP(cfg HTTPConfig) error {
 	mux.HandleFunc("/rpc", s.requireAuth(s.handleRPC))
 	mux.HandleFunc("/metrics", s.requireAuth(s.handleMetrics))
 	mux.HandleFunc("/healthz", s.handleHealthz)
+	// /events (Milestone 4 Task 4a): SSE event stream, same Bearer auth as
+	// everything but /healthz. Handler lives in events.go alongside the
+	// unix socket's "subscribe" op and the shared encodeEvent — see that
+	// file's package doc comment.
+	mux.HandleFunc("/events", s.requireAuth(s.handleEvents))
 	mux.HandleFunc("/debug/pprof/", s.requireAuth(pprof.Index))
 	mux.HandleFunc("/debug/pprof/cmdline", s.requireAuth(pprof.Cmdline))
 	mux.HandleFunc("/debug/pprof/profile", s.requireAuth(pprof.Profile))
