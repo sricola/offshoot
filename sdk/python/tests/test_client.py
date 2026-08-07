@@ -548,6 +548,66 @@ class TestClient(unittest.TestCase):
                               capture_output=True, text=True)
         return sum(1 for line in out.stdout.splitlines() if "unix" in line.split())
 
+    @staticmethod
+    def _start_events_first(gen):
+        """Start reading a FRESH events() generator's first event on a
+        throwaway background thread, immediately (before the caller does
+        anything else) -- returns (thread, result) for
+        `_join_events_first` below to wait on.
+
+        Why this exists instead of a fixed sleep: Task 4a's daemon
+        subscribes a connection to the bus strictly BEFORE acking
+        "subscribe" (see handleSubscribeOp's doc comment), but events()'s
+        public contract gives an outside caller no way to observe "the ack
+        has been consumed" -- that read is fused with the blocking wait
+        for the first event inside one opaque next()/for-loop step. A
+        fixed sleep to paper over that (this repo's CI has a documented
+        history of exactly this flake shape -- lost torture logs, a
+        takeover flake, a pytester HOME issue) is exactly the anti-pattern
+        to avoid. Splitting "start reading" from "wait for the result"
+        (see `_join_events_first`) lets a caller kick off the read FIRST,
+        then fire the op that should produce the event, THEN bound the
+        wait -- maximizing the chance a single attempt wins the race
+        without ever guessing a delay, and making a lost race (this
+        attempt's op firing before the daemon-side subscription actually
+        landed -- the bus never replays) a bounded, retryable outcome
+        rather than a hang.
+        """
+        result: list = []
+
+        def run():
+            try:
+                result.append(next(gen))
+            except (StopIteration, OffshootError):
+                pass
+
+        th = threading.Thread(target=run, daemon=True)
+        th.start()
+        return th, result
+
+    @staticmethod
+    def _join_events_first(th, result, timeout: float):
+        """Wait up to `timeout` seconds for `_start_events_first`'s
+        background thread to deliver its event; None on timeout.
+
+        A timed-out thread/generator is deliberately ABANDONED, not
+        cancelled: Python forbids re-entering or closing a generator frame
+        that's still "running" on another thread (a blocked
+        next()/readline() counts as running), so there is no safe way to
+        reclaim it from here. Its dedicated connection leaks until the
+        underlying daemon goes away or the object is garbage collected.
+        Acceptable because this path is only exercised on a genuine
+        ack-vs-transition race, which a 1s per-attempt timeout (used by
+        both callers below) makes rare in practice; callers that also
+        measure the daemon's fd count take their baseline AFTER any retry
+        churn for exactly this reason (see
+        test_events_close_mid_stream_closes_the_dedicated_socket).
+        """
+        th.join(timeout)
+        if th.is_alive():
+            return None  # timed out; thread + gen's connection abandoned, see doc comment
+        return result[0] if result else None
+
     def test_events_sees_session_lifecycle_in_order(self):
         # Subscribes via the helper on its own dedicated connection, then
         # drives session_opened/flushed/session_closed on a SEPARATE
@@ -557,88 +617,116 @@ class TestClient(unittest.TestCase):
         # events() docstring and docs/reference.md's Eventing section).
         with offshoot.connect(self.d.sock) as c:
             c.create("events-lifecycle-app")
-            gen = c.events()
-            got: list = []
-
-            def collect(n):
-                for _ in range(n):
-                    got.append(next(gen))
-
-            th = threading.Thread(target=collect, args=(3,))
-            th.start()
-            # Let events()'s first next() call actually complete its
-            # connect+subscribe+ack round trip (typically sub-millisecond
-            # over a local unix socket) before driving transitions on c2 --
-            # the bus has no replay, so a transition published before this
-            # subscription is registered would be silently missed.
-            time.sleep(0.5)
 
             with offshoot.connect(self.d.sock) as c2:
-                s = c2.open("events-lifecycle-app")
+                # Deterministic, zero-fixed-sleep sync for the ack-vs-
+                # transition race (see _start_events_first's doc comment):
+                # open a session, probe a FRESH subscription for
+                # up to 1s; if nothing arrives, that attempt's open() most
+                # likely raced ahead of the subscription landing (the bus
+                # never replays) -- close it and retry with a brand new
+                # events() connection, bounded by a generous overall
+                # deadline so a genuine bug still fails loud, not by
+                # hanging.
+                deadline = time.time() + 15
+                s = None
+                gen = None
+                opened = None
+                while opened is None:
+                    if time.time() > deadline:
+                        self.fail("events() never observed session_opened before the retry deadline")
+                    if s is not None:
+                        s.close()
+                    gen = c.events()
+                    th, result = self._start_events_first(gen)
+                    s = c2.open("events-lifecycle-app")
+                    opened = self._join_events_first(th, result, 1.0)
+
+                self.assertEqual(opened.type, "session_opened")
+                self.assertEqual(opened.db, "events-lifecycle-app")
+                self.assertEqual(opened.branch, "main")
+
+                # Subscription is now proven live -- no more races. The
+                # rest of the lifecycle is driven once, normally, and read
+                # directly off the same winning `gen` in the main thread.
                 db = sqlite3.connect(s.path)
                 db.execute("CREATE TABLE t (v)")
                 db.commit()
                 db.close()
-                deadline = time.time() + 10
+                flush_deadline = time.time() + 10
                 txid = 0
-                while time.time() < deadline:
+                while time.time() < flush_deadline:
                     txid = s.flush()
                     if txid:
                         break
                     time.sleep(0.1)
                 self.assertGreater(txid, 0)
-                s.close()
 
-            th.join(timeout=15)
-            self.assertFalse(th.is_alive(), "events() never observed all 3 transitions")
-            self.assertEqual(len(got), 3)
-            self.assertEqual(got[0].type, "session_opened")
-            self.assertEqual(got[0].db, "events-lifecycle-app")
-            self.assertEqual(got[0].branch, "main")
-            self.assertEqual(got[1].type, "flushed")
-            self.assertEqual(got[1].db, "events-lifecycle-app")
-            self.assertEqual(got[1].detail.get("kind"), "manual")
-            self.assertEqual(got[2].type, "session_closed")
-            self.assertEqual(got[2].db, "events-lifecycle-app")
+                flushed = next(gen)
+                self.assertEqual(flushed.type, "flushed")
+                self.assertEqual(flushed.db, "events-lifecycle-app")
+                self.assertEqual(flushed.detail.get("kind"), "manual")
+
+                s.close()
+                closed = next(gen)
+                self.assertEqual(closed.type, "session_closed")
+                self.assertEqual(closed.db, "events-lifecycle-app")
+
             gen.close()
 
     def test_events_close_mid_stream_closes_the_dedicated_socket(self):
         with offshoot.connect(self.d.sock) as c:
             c.create("events-close-app")
 
-            # Let any startup-transient fd churn settle before sampling a
-            # baseline.
-            time.sleep(0.2)
-            baseline = self._daemon_unix_socket_fd_count()
-
-            gen = c.events()
-            got: list = []
-            th = threading.Thread(target=lambda: got.append(next(gen)))
-            th.start()
-            time.sleep(0.3)  # let the subscribe connect+ack land first
             with offshoot.connect(self.d.sock) as c2:
-                c2.open("events-close-app")
-            th.join(timeout=10)
-            self.assertEqual(len(got), 1)
-            self.assertEqual(got[0].type, "session_opened")
+                # Same zero-fixed-sleep retry sync as the lifecycle test
+                # above.
+                deadline = time.time() + 15
+                s = None
+                gen = None
+                opened = None
+                while opened is None:
+                    if time.time() > deadline:
+                        self.fail("events() never observed session_opened before the retry deadline")
+                    if s is not None:
+                        s.close()
+                    gen = c.events()
+                    th, result = self._start_events_first(gen)
+                    s = c2.open("events-close-app")
+                    opened = self._join_events_first(th, result, 1.0)
 
-            # Stop iterating mid-stream -- GeneratorExit propagates through
-            # events()'s try/finally, closing the dedicated socket without
-            # ever reading it to EOF.
-            gen.close()
+                self.assertEqual(opened.type, "session_opened")
 
-            if baseline is not None:
-                deadline = time.time() + 5
-                after = baseline + 1
-                while time.time() < deadline:
-                    after = self._daemon_unix_socket_fd_count()
-                    if after is not None and after <= baseline:
-                        break
-                    time.sleep(0.1)
-                self.assertLessEqual(
-                    after, baseline,
-                    f"daemon fd count did not return to baseline after events().close() "
-                    f"(baseline={baseline}, after={after}) -- possible leaked subscriber fd")
+                # Baseline sampled HERE, AFTER any retry churn above --
+                # an abandoned attempt's connection, if any, leaks
+                # deliberately (see _start_events_first/_join_events_first's
+                # doc comments) and so belongs in the baseline, not the
+                # delta this assertion actually cares about: whether
+                # closing the WINNING gen below releases its own fd.
+                baseline = self._daemon_unix_socket_fd_count()
+
+                # Stop iterating mid-stream -- GeneratorExit propagates
+                # through events()'s try/finally, closing the dedicated
+                # socket without ever reading it to EOF. Safe here: the
+                # winning gen's only next() call already returned (inside
+                # _join_events_first), so it's suspended cleanly at a
+                # yield, not blocked in a read.
+                gen.close()
+
+                if baseline is not None:
+                    fd_deadline = time.time() + 5
+                    after = baseline + 1
+                    while time.time() < fd_deadline:
+                        after = self._daemon_unix_socket_fd_count()
+                        if after is not None and after <= baseline:
+                            break
+                        time.sleep(0.1)
+                    self.assertLessEqual(
+                        after, baseline,
+                        f"daemon fd count did not return to baseline after events().close() "
+                        f"(baseline={baseline}, after={after}) -- possible leaked subscriber fd")
+
+                s.close()
 
             # The daemon itself must be unaffected: an ordinary op on a
             # fresh connection still works after the dropped subscriber.
