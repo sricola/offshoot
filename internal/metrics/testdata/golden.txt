@@ -1,0 +1,44 @@
+# HELP offshoot_build_info Always 1; identifies the running build.
+# TYPE offshoot_build_info gauge
+offshoot_build_info{version="0.1.3-test"} 1
+# HELP offshoot_sessions_open Number of sessions currently open in this daemon.
+# TYPE offshoot_sessions_open gauge
+offshoot_sessions_open 3
+# HELP offshoot_capture_lag_bytes WAL bytes committed but not yet applied, for currently open sessions.
+# TYPE offshoot_capture_lag_bytes gauge
+offshoot_capture_lag_bytes{db="app",branch="feature"} 0
+offshoot_capture_lag_bytes{db="app",branch="main"} 4096
+# HELP offshoot_flush_total Flushes by result and kind.
+# TYPE offshoot_flush_total counter
+offshoot_flush_total{result="error",kind="auto"} 1
+offshoot_flush_total{result="error",kind="manual"} 0
+offshoot_flush_total{result="ok",kind="auto"} 12
+offshoot_flush_total{result="ok",kind="manual"} 3
+# HELP offshoot_flush_duration_seconds Flush duration.
+# TYPE offshoot_flush_duration_seconds histogram
+offshoot_flush_duration_seconds_bucket{le="0.001"} 0
+offshoot_flush_duration_seconds_bucket{le="0.005"} 1
+offshoot_flush_duration_seconds_bucket{le="0.01"} 1
+offshoot_flush_duration_seconds_bucket{le="0.025"} 2
+offshoot_flush_duration_seconds_bucket{le="0.05"} 2
+offshoot_flush_duration_seconds_bucket{le="0.1"} 2
+offshoot_flush_duration_seconds_bucket{le="0.25"} 3
+offshoot_flush_duration_seconds_bucket{le="0.5"} 3
+offshoot_flush_duration_seconds_bucket{le="1"} 3
+offshoot_flush_duration_seconds_bucket{le="2.5"} 4
+offshoot_flush_duration_seconds_bucket{le="5"} 4
+offshoot_flush_duration_seconds_bucket{le="10"} 4
+offshoot_flush_duration_seconds_bucket{le="30"} 5
+offshoot_flush_duration_seconds_bucket{le="60"} 5
+offshoot_flush_duration_seconds_bucket{le="120"} 5
+offshoot_flush_duration_seconds_bucket{le="300"} 5
+offshoot_flush_duration_seconds_bucket{le="+Inf"} 5
+offshoot_flush_duration_seconds_sum 22.222
+offshoot_flush_duration_seconds_count 5
+# HELP offshoot_fork_total Forks by path.
+# TYPE offshoot_fork_total counter
+offshoot_fork_total{path="fast"} 9
+offshoot_fork_total{path="slow"} 1
+# HELP offshoot_reap_total Branches reaped.
+# TYPE offshoot_reap_total counter
+offshoot_reap_total 2

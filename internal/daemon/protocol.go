@@ -14,7 +14,20 @@ package daemon
 type Request struct {
 	// Op is one of: "open" | "flush" | "status" | "close" | "shutdown" |
 	// "create" | "checkout" | "fork" | "destroy" | "rollback" | "promote" |
-	// "touch" | "branches" | "dbs" | "export" | "checkout-at".
+	// "touch" | "branches" | "dbs" | "export" | "checkout-at" | "subscribe".
+	//
+	// "subscribe" (Milestone 4 Task 4a) is unlike every other op: it is
+	// UNIX-SOCKET-ONLY (a POST /rpc "subscribe" is refused — HTTP clients
+	// use GET /events for the same event stream instead), and once it is
+	// acked, the connection it was sent on PERMANENTLY LEAVES
+	// request/response mode and streams line-per-event JSON (one JSON
+	// value per line) until the client disconnects — no further Request
+	// can ever be sent on that same connection. Callers MUST use a fresh,
+	// DEDICATED connection for "subscribe", keeping their original
+	// connection (or another fresh one) for ordinary ops. See
+	// internal/daemon/events.go's handleSubscribeOp/streamEvents for the
+	// implementation and docs/reference.md's `subscribe` section for the
+	// operator-facing version of this same warning.
 	Op     string `json:"op"`
 	DB     string `json:"db,omitempty"`
 	Branch string `json:"branch,omitempty"` // also: fork/promote source branch
@@ -93,6 +106,18 @@ type BranchInfo struct {
 	// than replacing it, so an old client reading only Checkpoints keeps
 	// working unchanged (wire compat; Milestone 3 Task 1).
 	CheckpointsV2 []CheckpointInfo `json:"checkpoints_v2,omitempty"`
+	// State is this branch's computed state: "active", "pending", "error",
+	// "dirty", "detached", or "idle" — see ops.BranchStateAt's doc comment
+	// for the full taxonomy and precedence, and Server.branchState for how
+	// this daemon layers its session-map-derived pending/error on top of
+	// ops's lease/sidecar-derived active/dirty/detached/idle. Deliberately
+	// no `omitempty`: exactly one of these six names always applies to a
+	// branch, so an absent field would never mean anything ("state
+	// unknown") a client should have to handle — a pre-this-field client
+	// simply doesn't read the key, and its JSON decoding is unaffected
+	// either way (wire-additive field, old SDKs against a new daemon still
+	// work; Milestone 4 Task 1).
+	State string `json:"state"`
 }
 
 // CheckpointInfo is one checkpoint's wire shape within BranchInfo.CheckpointsV2.

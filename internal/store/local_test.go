@@ -107,6 +107,77 @@ func TestLocalListAndDelete(t *testing.T) {
 	}
 }
 
+// TestLocalDeleteIfConditionalDelete pins Local.DeleteIf as a TRUE
+// compare-and-delete (Milestone 4 Task 6b), the local-backend half of
+// ConditionalDeleter: a matching etag deletes, a stale etag or an absent key
+// both fail with ErrCAS and leave whatever's there (if anything) untouched.
+func TestLocalDeleteIfConditionalDelete(t *testing.T) {
+	b, _ := NewLocal(t.TempDir())
+
+	// Absent key: ErrCAS, not a silent no-op (unlike plain Delete).
+	if err := b.DeleteIf("refs/a/main", "whatever"); !errors.Is(err, ErrCAS) {
+		t.Fatalf("want ErrCAS deleting an absent key, got %v", err)
+	}
+
+	etag, err := b.PutIf("refs/a/main", []byte("v1"), "")
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	// Stale etag: refused, key still there.
+	if err := b.DeleteIf("refs/a/main", "wrong-etag"); !errors.Is(err, ErrCAS) {
+		t.Fatalf("want ErrCAS on stale etag, got %v", err)
+	}
+	if data, _, err := b.Get("refs/a/main"); err != nil || string(data) != "v1" {
+		t.Fatalf("a failed DeleteIf must not remove the key: data=%q err=%v", data, err)
+	}
+
+	// Matching etag: deletes.
+	if err := b.DeleteIf("refs/a/main", etag); err != nil {
+		t.Fatalf("DeleteIf with a matching etag must succeed: %v", err)
+	}
+	if _, _, err := b.Get("refs/a/main"); !errors.Is(err, ErrNotFound) {
+		t.Fatalf("key must be gone after DeleteIf, err=%v", err)
+	}
+
+	// A second DeleteIf with the SAME (now-stale, since the key is gone)
+	// etag must fail rather than succeed as a no-op — a fresh Put'd key
+	// under the same name racing this call must never be silently deleted
+	// by a stale-etag DeleteIf that just happens to target an absent path.
+	if err := b.DeleteIf("refs/a/main", etag); !errors.Is(err, ErrCAS) {
+		t.Fatalf("want ErrCAS deleting an already-absent key with a stale etag, got %v", err)
+	}
+}
+
+// TestStoreDeleteRefIfUsesConditionalDeleteOnLocal pins Store.DeleteRefIf's
+// dispatch (Milestone 4 Task 6b): against a backend implementing
+// ConditionalDeleter (Local), a stale etag must be refused with ErrCAS and
+// the ref left in place — proving the store-level API actually reaches
+// Local's true CAS delete, not just Local.DeleteIf in isolation.
+func TestStoreDeleteRefIfUsesConditionalDeleteOnLocal(t *testing.T) {
+	b, _ := NewLocal(t.TempDir())
+	s := &Store{B: b}
+	if err := s.InitManifest(); err != nil {
+		t.Fatal(err)
+	}
+	etag, err := s.PutRef("app", "main", Ref{Lineage: "l1", Epoch: 1}, "")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := s.DeleteRefIf("app", "main", "stale-etag"); !errors.Is(err, ErrCAS) {
+		t.Fatalf("want ErrCAS on a stale etag, got %v", err)
+	}
+	if _, _, err := s.GetRef("app", "main"); err != nil {
+		t.Fatalf("a failed DeleteRefIf must not remove the ref: %v", err)
+	}
+	if err := s.DeleteRefIf("app", "main", etag); err != nil {
+		t.Fatalf("DeleteRefIf with a matching etag must succeed: %v", err)
+	}
+	if _, _, err := s.GetRef("app", "main"); !errors.Is(err, ErrNotFound) {
+		t.Fatal("ref must be gone after DeleteRefIf")
+	}
+}
+
 func TestLocalBreaksStaleLock(t *testing.T) {
 	b, _ := NewLocal(t.TempDir())
 	p, err := b.path("refs/a/main")

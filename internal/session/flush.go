@@ -67,7 +67,15 @@ func (s *Session) flush(name string, meta map[string]string, auto bool) (txid ui
 	if auto {
 		flushKind = "auto"
 	}
+	// start times the WHOLE call (every path below: catch-up drain, encode,
+	// upload, ref CAS) — the same span the "flushed"/"flush-failed"
+	// transition below reports outcome for — so "duration_seconds" in that
+	// kv is this attempt's full observed latency, not just its encode or
+	// upload sub-step. Read only by the deferred transition log immediately
+	// below; nothing else in this function depends on it.
+	start := time.Now()
 	defer func() {
+		durationSeconds := time.Since(start).Seconds()
 		if err != nil {
 			if errors.Is(err, ErrClosed) {
 				// A Flush racing Close's own shutdown is not an operational
@@ -76,10 +84,10 @@ func (s *Session) flush(name string, meta map[string]string, auto bool) (txid ui
 				// moment.
 				return
 			}
-			s.logTransition("flush-failed", "kind", flushKind, "error", err.Error())
+			s.logTransition("flush-failed", "kind", flushKind, "error", err.Error(), "duration_seconds", durationSeconds)
 			return
 		}
-		s.logTransition("flushed", "kind", flushKind, "txid", txid)
+		s.logTransition("flushed", "kind", flushKind, "txid", txid, "duration_seconds", durationSeconds)
 	}()
 
 	s.flushMu.Lock()

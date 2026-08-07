@@ -13,6 +13,575 @@ version if you depend on format stability.
 
 ## [Unreleased]
 
+## [0.1.3] - 2026-08-07
+
+Milestone 4: operable at scale. A platform running hundreds of agent
+sessions can now see (a hand-rolled, zero-dependency Prometheus `/metrics`
+endpoint plus six computed branch states), bound (a `checkouts-ro` disk
+budget with LRU eviction), and automate (an opt-in, token-authenticated
+HTTP listener alongside the unix socket, plus an event bus drainable over
+either transport) offshoot — without any of it requiring multi-node
+anything; see [docs/operations.md](docs/operations.md)'s first paragraph
+and [ROADMAP.md](ROADMAP.md#non-goals-v1) for that standing scope
+boundary. **Metric names are locked as of this release: every
+`offshoot_*` name below is now API — renaming one after this tag is a
+breaking change** (this was the one free rename window; see PM Amendment
+2/12 in the Milestone 4 plan). Operator-facing docs land in this release
+too: [docs/operations.md](docs/operations.md) (the metrics/states/events/
+budgets/HTTP-auth reference in one page) and
+[docs/recipes/kubernetes.md](docs/recipes/kubernetes.md) (a real,
+schema-validated sidecar manifest). See
+[docs/status.md](docs/status.md)'s Standing nag section for what's still
+user-gated (PyPI/npm publication, the `offshoot-db` org transfer, registry
+listing submissions) — none of it is blocked on further engineering.
+
+### Added
+
+- **Branch state taxonomy** (Milestone 4 Task 1): `ops.BranchStateAt`
+  (`internal/ops/status.go`) computes a branch's state — `active`, `dirty`,
+  `detached`, `idle` — from its ref, lease liveness, and checkout `.sum`
+  sidecar alone, no daemon dependency; a daemon layers two more states
+  (`pending`, `error`) on top from its own in-memory session map
+  (`internal/daemon/server.go`'s `Server.branchState`), since only a daemon
+  knows which branches have a session reserved or errored. Precedence:
+  `error` > `pending` > `active` > `dirty` > `detached` > `idle`. `idle` is
+  a deliberate addition beyond the design spec's original taxonomy, which
+  assumed a daemon was always present — see
+  [docs/reference.md](docs/reference.md#branch-states) for the full table
+  and rationale. Surfaced in `offshoot status` (`BranchStatus.State`), the
+  daemon `branches` op (`BranchInfo.state`, always present — additive, not
+  `omitempty`), and both SDKs' `Branch.state` (Python dataclass field,
+  TypeScript interface field; both default to `""` against an older
+  daemon that never sends it, so existing SDK code is unaffected).
+  **Disclosed cost:** determining `dirty` for a checked-out, unleased
+  branch whose sidecar identity already matches the ref requires a real
+  WAL checkpoint (quiesce, up to a 3s busy timeout) followed by a full
+  SHA-256 hash of the checkout — per branch, per `status`/`branches` call;
+  a checkout that's busy during that checkpoint attempt is itself reported
+  `dirty` rather than `idle` — see
+  [docs/reference.md](docs/reference.md#branch-states)'s Cost/Known
+  blind spot notes.
+
+- **Metrics registry + instrumentation** (Milestone 4 Task 2):
+  `internal/metrics` is a hand-rolled, zero-dependency, concurrent-safe
+  Prometheus text-exposition registry — `Counter`/`Gauge`/`Histogram` (fixed
+  buckets, cumulative `_bucket`/`+Inf`/`_sum`/`_count`), `CounterVec`/
+  `GaugeVec` for bounded label sets, `Registry.WritePrometheus(io.Writer)`.
+  Kept `internal` and zero-dep by design (one-sentence rationale on the
+  package doc comment, per PM Amendment 7) so a later `client_golang` swap
+  is a call-site-only change. `internal/daemon`'s `newMetrics` registers
+  every metric on the plan's LOCKED name list: `offshoot_build_info{version}`,
+  `offshoot_sessions_open`, `offshoot_capture_lag_bytes{db,branch}` /
+  `offshoot_durable_age_seconds{db,branch}` (open sessions only, computed at
+  SCRAPE TIME from the sessions map via a `Registry.Collect` callback, never
+  continuously), `offshoot_flush_total{result,kind}` /
+  `offshoot_flush_duration_seconds`, `offshoot_fork_total{path}` /
+  `offshoot_fork_duration_seconds`, `offshoot_checkpoint_duration_seconds`,
+  `offshoot_reap_total`, `offshoot_gc_tombstoned_total` /
+  `offshoot_gc_deleted_total` / `offshoot_gc_backlog`,
+  `offshoot_ro_cache_bytes` / `offshoot_ro_cache_evictions_total`
+  (registered now at zero — Task 5 wires real numbers),
+  `offshoot_janitor_runs_total{result}`. Instrumentation: `internal/ops`
+  gained `ObserveFork`/`ObserveCheckpoint`, package-level nil-checked
+  injected-hook vars (ops must not import `internal/metrics`) the daemon
+  assigns once at `NewServer` construction; `internal/session` gained an
+  `OnTransition` hook fired from the SAME `logTransition` call site
+  Milestone 2 already used for its transition logs (not a new call site —
+  Task 2's brief was explicit: hook the existing sites, don't restructure),
+  which the daemon uses to drive flush counters/durations from the existing
+  "flushed"/"flush-failed" events (and `flush()` now times itself and
+  reports `duration_seconds` in that same kv). Janitor-loop metrics
+  (reap/GC/backlog/`janitor_runs_total`) are updated from
+  `Server.janitorTick`, split out of `StartJanitor`'s ticker body so a test
+  can drive one tick deterministically. **PM Amendment 7 hard gate:**
+  `WritePrometheus` output is golden-file-tested
+  (`internal/metrics/testdata/golden.txt`) and validated against Prometheus's
+  own `promtool check metrics` linter (`TestPromtoolCheckMetrics` in
+  `internal/metrics`, `TestPromtoolCheckRealMetrics` in `internal/daemon`
+  against the real, fully-wired registry) — both skip loudly (not silently)
+  when `promtool` isn't on `PATH`; `.github/workflows/ci.yml` gained a new
+  `metrics-lint` job that downloads a pinned `promtool` release and runs
+  both. `internal/daemon/metrics_test.go`'s `TestMetricsSmokeOpenWriteFlushFork`
+  opens a session, writes, flushes, and forks over the real unix-socket RPC
+  path, then scrapes the registry directly (no HTTP yet — that's Task 3) and
+  asserts the counters moved. Not yet exposed over HTTP (`GET /metrics`,
+  Task 3) — see [docs/status.md](docs/status.md) for the exact split.
+
+- **HTTP listener + token auth** (Milestone 4 Task 3): `offshoot serve
+  -http ADDR` (off by default) starts an opt-in HTTP listener
+  (`internal/daemon/http.go`) alongside the unix socket: `POST /rpc` (the
+  same `Request`/`Response` JSON and `Server.dispatch` the socket uses —
+  byte-identical semantics, `TestHTTPRPCParityWithSocket`; 1MiB body cap
+  via `http.MaxBytesReader`, `413` on overflow with the connection still
+  usable afterward; `Content-Type: application/json` required), `GET
+  /metrics` (the T2 registry's Prometheus text exposition), `GET /healthz`
+  (unauthenticated, `{"ok":true,"sessions":N}`), and `GET /debug/pprof/*`
+  (PM Amendment 6: `net/http/pprof`'s standard handlers, same auth as
+  everything else). Every route but `/healthz` requires `Authorization:
+  Bearer <token>`, compared with `crypto/subtle.ConstantTimeCompare`
+  (`checkAuth`) — never Go's built-in `==`. Token source: `-token` /
+  `OFFSHOOT_TOKEN`, else `GenerateToken` (32 random bytes, hex-encoded)
+  printed to stderr exactly once at startup (loopback binds only); ongoing
+  output (including a later status/log line) shows only an 8-character
+  `TokenFingerprint`, never the token again — `TestHTTPTokenRedaction`,
+  `TestHTTPAutoGeneratedTokenPrintedOnceThenOnlyFingerprint`. A non-loopback
+  bind additionally requires BOTH `-http-allow-non-loopback` (an explicit
+  ack) AND an explicit token — two distinct startup errors if either is
+  missing (`ValidateHTTPBind`, `TestValidateHTTPBindErrorsAreDistinct`),
+  checked before any listener is created. `http.Server` runs explicit,
+  justified timeouts (`ReadHeaderTimeout` 5s, `ReadTimeout` 30s,
+  `WriteTimeout` 90s — sized to leave headroom for `/debug/pprof/profile`'s
+  default 30s capture window, `IdleTimeout` 2m) instead of the stdlib's
+  unbounded defaults, per PM Amendment 6.
+
+  **Shutdown ordering:** the HTTP listener is closed (`http.Server.Close`,
+  immediate — matching the unix socket's own force-close-live-connections
+  philosophy, not a graceful drain) alongside the unix listener in
+  `Server.Shutdown`. An HTTP `op=shutdown` request over `/rpc` gets the
+  same respond-then-shutdown-trigger fix the unix socket's `handle` got in
+  Milestone 3 (dispatch, encode the response, **flush it to the wire**,
+  and only then trigger `Shutdown` in a fresh goroutine) —
+  `TestHTTPShutdownRespondsBeforeClosingRequestingConn`, using the same
+  delay-hook technique as the socket's own regression test, confirmed to
+  fail reliably against a build with the ordering reversed. A generic
+  hammer test (`TestHTTPShutdownWhileRequestsInFlightIsSafe`) proves no
+  panic or hang under `-race` while `Shutdown` races real in-flight
+  requests.
+
+  **T2 review carried item, closed:** concurrent `GET /metrics` scrapes
+  used to be able to tear the session-gauge collector's output — it
+  `Reset`s then repopulates two `GaugeVec`s (`offshoot_capture_lag_bytes`/
+  `offshoot_durable_age_seconds`) in two steps that were only atomic if no
+  OTHER concurrent scrape's run of the same collector interleaved with it.
+  Fixed by adding `scrapeMu` to `internal/metrics.Registry`, serializing
+  `WritePrometheus` end to end (collector run AND render) — chosen over a
+  Server-level scrape lock or making every collector independently
+  concurrency-safe, since it's the single minimal choke point and
+  concurrent scrapers simply queue at ordinary Prometheus scrape cadences.
+  `internal/metrics/metrics_test.go`'s
+  `TestWritePrometheusSerializesConcurrentCollectorRuns` (Registry-level,
+  synthetic) and `internal/daemon/http_test.go`'s
+  `TestConcurrentMetricsScrapesWithSessionChurn` (real HTTP, real session
+  open/close churn across several branches, 8 scraper goroutines x 40
+  scrapes) both assert the invariant that must hold in every single scrape
+  (`offshoot_sessions_open`'s value equals the count of
+  `offshoot_capture_lag_bytes` sample lines) and are both confirmed to
+  fail reliably with `scrapeMu` removed.
+
+  **Threat model** (PM Amendment 3, stated plainly in
+  [docs/reference.md](docs/reference.md)): single-tenant,
+  same-host-or-trusted-network auth — the token is a shared secret, not a
+  multi-tenant isolation boundary; no TLS (the operator-facing
+  `docs/operations.md` page itself is Task 8). `docs/status.md`'s HTTP row
+  flips to shipped-and-tested; `docs/reference.md` gains the `-http`
+  flag/route table and `OFFSHOOT_TOKEN`.
+
+- **Eventing: bus + socket `subscribe` + SSE** (Milestone 4 Task 4a):
+  `internal/daemon/events.go` adds an in-daemon event bus and two ways to
+  drain it — the unix socket's new `subscribe` op and HTTP's `GET
+  /events` (Server-Sent Events) — both streaming the exact same versioned
+  JSON (PM Amendment 4: one schema, one encoder): `{v:1, ts, type, db,
+  branch, detail{}}`, `type` one of `session_opened` / `flushed` /
+  `flush_failed` / `fenced` / `session_closed` (all five fed from the
+  SAME `internal/session` transition-callback call site Milestone 4 Task
+  2 already hooked — `internal/session` itself is untouched, per this
+  task's "ride the existing callback" brief) / `reaped` (fed from the
+  janitor's `Reap` pass) / `evicted` (schema slot reserved now; nothing
+  emits it yet — Milestone 4 Task 5's ro-cache LRU eviction path is the
+  intended source and will publish to the bus at its own eviction call
+  site once it exists).
+
+  **Never blocks the daemon (Global Constraint):** `eventBus.publish` is a
+  non-blocking fan-out — a subscriber whose bounded buffer (64 events) is
+  already full is immediately dropped: removed from the subscriber set, sent
+  a single terminal `{type:"dropped_slow_consumer"}` event, and has its
+  channel closed, all without ever blocking the publisher (the session
+  transition callback or the janitor). `TestSlowSubscriberDroppedSessionKeepsFlushing`
+  proves this end to end — a subscriber that never reads its channel is
+  dropped with the terminal event while a concurrently write-heavy session
+  keeps flushing successfully throughout, unaffected.
+
+  **Socket `subscribe`:** acks, then the connection PERMANENTLY LEAVES
+  request/response mode and streams line-per-event JSON until the client
+  disconnects — `handle()`'s per-connection loop special-cases this op
+  exactly like it already special-cases `shutdown` (subscribing to the bus
+  happens *before* the ack is sent, closing a race where a transition could
+  fire in the gap between ack and subscription). **SDKs and any other
+  caller MUST use a fresh, DEDICATED connection for `subscribe`** — it is
+  unix-socket-only; a `subscribe` op sent over HTTP `POST /rpc` is refused
+  with a message pointing at `GET /events` instead.
+
+  **HTTP `GET /events`:** same Bearer auth as everything but `/healthz`;
+  `data: <event JSON>\n\n` per event, plus a periodic `: ping` SSE comment
+  (`sseKeepaliveInterval`, 15s default — PM Amendment 12: proxies/kubelets
+  kill silent streams) to keep the connection alive across anything sitting
+  in front of this daemon. **Re-arms its own per-write deadline** before
+  every write (`http.NewResponseController(w).SetWriteDeadline(now +
+  eventWriteDeadline)`, 45s default) rather than clearing it once,
+  permanently — Task 3's `http.Server.WriteTimeout` (90s) covers a
+  handler's *entire* wall-clock run with no concept of "still legitimately
+  sending, just slowly," and would otherwise hard-cut every long-lived SSE
+  stream at 90 seconds; a live stream re-arms this deadline forward on
+  every successful write (and at least every keepalive tick), so it's
+  never affected, while a subscriber that's still connected but has
+  stopped reading entirely now gets its stream torn down within
+  `eventWriteDeadline` instead of pinning the handler goroutine and its
+  connection's file descriptor open forever. The unix socket's
+  `streamEvents` gets the identical per-write re-arm before every
+  `c.Write`, for the same reason. `TestSSEStreamSurvivesPastWriteTimeout`
+  proves the live-stream side structurally and cheaply: `httpWriteTimeout`
+  is a test-only var shrunk to 150ms, and the stream is proven alive well
+  past that shrunk value via a real event delivered afterward — no test
+  ever sleeps anywhere near the real 90s.
+
+  Tested (`internal/daemon/events_test.go`, `-race`): a subscriber sees
+  `session_opened` → `flushed` → `session_closed` for a real session
+  lifecycle over the socket; the slow-subscriber-dropped-while-session-
+  keeps-flushing proof above; SSE/socket parity (both transports
+  subscribed before a real session lifecycle runs, asserted to observe the
+  identical event sequence); the keepalive ping; the write-deadline proof;
+  a genuinely STALLED (still-connected, never-reading) subscriber on
+  either transport has its connection/handler torn down within
+  `eventWriteDeadline`, forced through the real write path with an
+  oversized event rather than merely asserted
+  (`TestStalledSocketSubscriberConnectionIsClosedWithinWriteDeadline`,
+  `TestStalledSSESubscriberConnectionIsClosedWithinWriteDeadline` — both
+  confirmed to fail reliably against the pre-fix code); `/events` requires
+  auth (401 without, plus a path-trick matrix extension); `subscribe` over
+  `POST /rpc` is refused; reusing a subscribed connection for an ordinary
+  op gets silence, never a Response.
+  No `internal/session` changes — bus is fed purely from the daemon-side
+  callback composition, so no torture run was required for this task.
+
+- **Eventing: SDK stream helpers** (Milestone 4 Task 4b): both SDKs ship a
+  thin `events()` helper over Task 4a's socket `subscribe` op — Python
+  `Client.events()` (`sdk/python/offshoot/client.py`) is a generator
+  yielding `Event(v, ts, type, db, branch, detail)` dataclass instances;
+  TypeScript `Client.events()` (`sdk/typescript/src/client.ts`) is an
+  `AsyncGenerator<OffshootEvent>` (a new versioned interface, mirroring the
+  wire schema). Both **open their own fresh, dedicated socket connection**
+  — never the caller's own `Client` connection, matching Task 4a's
+  MANDATORY "subscribe permanently takes over its connection" contract
+  (see both methods' doc comments and docs/reference.md's Eventing
+  section) — send `subscribe`, read the ack, then yield one parsed event
+  per line in publish order until the stream ends. Stdlib-only / zero-dep
+  on both sides (Python: only `json`/`socket`, already-imported stdlib;
+  TypeScript: only `node:net`, already-imported).
+
+  **`dropped_slow_consumer` contract, decided and documented**: yielded
+  like any other event, then the stream simply ends (Python: the generator
+  returns, no `StopIteration`-wrapped error; TypeScript: the async
+  iterator's `done: true`) — NOT raised/thrown as an `OffshootError`. A
+  drop ends the stream the same way an ordinary disconnect does; a caller
+  that cares whether it was dropped checks the last event's `type`. Only a
+  genuine transport/protocol failure (a connect error, a malformed line, a
+  daemon `ok:false` ack) raises/throws.
+
+  **Closing early, no leaked fd**: Python — `break`/`generator.close()`
+  delivers `GeneratorExit` at the suspended `yield`, caught by a `finally`
+  that closes the buffered reader and the socket. TypeScript — `break`/
+  `.return()` on the async iterator resumes the generator's suspended
+  `yield` as an abrupt completion, running an identical `finally` that
+  `sock.destroy()`s the dedicated connection. Both proved against a real
+  daemon: a helper connection sees one real event, then closes mid-stream,
+  and the daemon's open unix-domain-socket fd count (`lsof -p <pid>`
+  filtered to `TYPE unix` — a raw total-fd comparison would be confounded
+  by `internal/dbfile`'s deliberately-never-closed checkout descriptors)
+  returns to its pre-subscribe baseline, and the daemon keeps answering
+  ordinary ops on an unrelated connection throughout.
+
+  **Real end-to-end lifecycle tests** (`sdk/python/tests/test_client.py`'s
+  `test_events_sees_session_lifecycle_in_order`, `sdk/typescript/test/
+  client.test.ts`'s matching test): the helper subscribes on its own
+  connection; `session_opened` → `flushed` → `session_closed` is driven by
+  real ops on a SEPARATE connection and observed in order with correct
+  `db`/`branch`/`detail` fields. The `dropped_slow_consumer` path is hard
+  to force deterministically from the SDK side (it needs the real bus's
+  internal buffer-overflow timing — already proven server-side by Task
+  4a's `TestEventBusDropsSlowSubscriberWithTerminalEvent`); both SDKs
+  instead unit-test the helper's own decode/contract path end to end
+  against a small scripted fake daemon speaking the identical
+  line-per-event wire shape (`TestEventsDecodePath` / the `events():
+  dropped_slow_consumer ...` `node:test` cases), covering the terminal
+  event, a malformed line, and a not-ok ack.
+
+  Both SDK suites green under `make test-sdks`; both SDKs confirmed
+  stdlib-only/zero-dep (import inspection, no new dependency added to
+  either `pyproject.toml` or `package.json`).
+  `docs/status.md`'s eventing row flips to shipped-and-tested;
+  `docs/reference.md` gains the `subscribe` op and `GET /events` route,
+  with the dedicated-connection warning restated for operators.
+
+- **Ro-cache disk budget + LRU eviction** (Milestone 4 Task 5): `offshoot
+  serve -ro-cache-budget <bytes|0>` (default `0` = unlimited) bounds
+  `checkouts-ro`'s total size — the read-only cache `CheckoutAt` (Milestone
+  3 Task 2) materializes into and which, until now, grew without bound.
+  The janitor's `Server.janitorTick` (`internal/daemon/server.go`) runs a
+  new ro-cache pass on the same `-reap-every` cadence as reap/GC: it always
+  computes and republishes current usage (`offshoot_ro_cache_bytes`, the
+  T2-registered gauge, previously always 0) — a budget-less or
+  already-under-budget pass still reports a real number, it just never
+  evicts — and, once usage exceeds a configured budget, LRU-evicts entries
+  (oldest first) until it's back under. A bare integer is bytes (the
+  contract); `-ro-cache-budget` and `status`'s own display flag of the
+  same name also accept a trailing power-of-1024 size suffix (`K`/`KB`,
+  `M`/`MB`, `G`/`GB`, `T`/`TB`) as a convenience (`parseByteSize`,
+  `cmd/offshoot/main.go`) — tested directly (`TestParseByteSize`) since
+  the brief called out "if you add size parsing, test it."
+
+  **LRU clock (PM Amendment 11, pre-decided): a `.last-used` touch-on-HIT
+  marker file**, not the `.db` file's own mtime — `CheckoutAt`'s
+  force=false cache-hit path (`internal/ops/export.go`) now calls
+  `touchLastUsed`, which creates/`Chtimes`s a `<cachefile>.last-used`
+  sidecar to the current time on every cache HIT. This is necessary, not
+  cosmetic: `materializeAt`'s rename-into-place is the LAST thing that ever
+  touches the `.db` file's own mtime (a cache hit is a pure read — it must
+  never touch the `.db` file again), so without a separate marker "least
+  recently used" would collapse to "least recently created," exactly
+  backwards for a cache whose whole point is that a repeatedly-hit
+  checkpoint should stay hot. `internal/ops/rocache.go`'s `lruClock` ranks
+  by the marker's mtime when present, falling back to the `.db` file's own
+  mtime as the documented floor for an entry materialized but never since
+  hit. `TestEvictROCacheLastUsedTouchBeatsCreationOrder` and its daemon-level
+  counterpart `TestJanitorTickEvictsLRUUnderBudgetAndFiresEvictedEvent`
+  both prove this directly: an OLDER (by creation) entry that gets hit
+  survives eviction while a NEWER, never-hit entry is evicted instead.
+
+  **`checkouts/` (writable, leased) is never evicted — by construction, not
+  a runtime check**: `ops.Workspace.EvictROCache` only ever walks and
+  removes paths under the separate `checkouts-ro` tree (never joined with,
+  or reachable from, `checkouts/`'s own path shape — see `CheckoutAtPath`'s
+  existing doc comment on that separation); there is no code path here that
+  can construct or be handed a `checkouts/` path at all.
+  `TestEvictROCacheNeverTouchesWritableCheckout` (ops-level, budget=1 as
+  aggressive as it gets) and `TestJanitorROCacheEvictionNeverTouchesLeasedWritableCheckout`
+  (daemon-level: a real open, leased session survives an aggressive pass
+  and can still flush afterward) both confirm this end to end, not just by
+  code inspection.
+
+  **Eviction is LOUD**: one `offshoot: janitor: ro-cache: evicted
+  <db>@<branch>@<checkpoint> (<bytes> bytes)` stderr line per eviction,
+  `offshoot_ro_cache_evictions_total` (the T2-registered counter,
+  previously always 0) incremented, and Task 4a's reserved-but-unwired
+  `evicted` event type now has its emitter — `janitorTick` publishes
+  `{type:"evicted", db, branch, detail:{checkpoint, bytes}}` to the T4a bus
+  at the eviction call site (`eventBus.publish` is non-blocking, so this
+  can never stall the janitor loop). `offshoot status` gains an ro-cache
+  usage summary line (`ROCacheUsage`, `internal/ops/rocache.go`) plus an
+  optional `-ro-cache-budget` flag of its own — display-only, since (like
+  every other `serve` tuning flag) the budget is never persisted, so this
+  at-rest CLI command has no other way to show usage against it without a
+  live daemon connection.
+
+  Each eviction removes both the `.db` cache file and its `.last-used`
+  marker together. Partial-progress-plus-first-error on a mid-pass
+  `os.Remove` failure, matching `Reap`/`GC`'s own convention elsewhere in
+  `internal/ops`.
+
+  Tests: `go test ./internal/ops ./internal/daemon -count=1 -race` —
+  `internal/ops/rocache_test.go` (usage accounting, budget=0 never evicts,
+  already-under-budget never evicts, oldest-first eviction to under
+  budget, both files removed together, the writable-checkout and
+  touch-beats-creation-order proofs above) and
+  `internal/daemon/rocache_test.go` (the same LRU/budget-zero/writable-
+  checkout scenarios driven through a real `janitorTick` pass, plus the
+  metrics move and the `evicted` event fires with `db`/`branch`/
+  `checkpoint`/`bytes`). No `internal/session`/`internal/capture` changes
+  — janitor/ops only — so no torture run was required for this task.
+  `docs/status.md`'s Resource-behavior row flips to shipped-and-tested;
+  `docs/reference.md` gains `-ro-cache-budget`, the LRU-clock rationale,
+  and reiterates the writable-never-evicted guarantee; the `evicted` event
+  row in the events table loses its "reserved" caveat.
+
+- **`serve -snapshot-every N`** (Milestone 4 Task 6a): plumbs the
+  embeddable session library's existing `Options.SnapshotEvery` cadence
+  into every session `offshoot serve` opens, the same way `-flush-every`
+  already plumbs `FlushEvery` — `Server.SetSnapshotEvery`
+  (`internal/daemon/server.go`), read by `opOpen` under the same single-
+  writer-before-`Serve` contract. Default `16`, unchanged if the flag is
+  omitted (`SetSnapshotEvery` is simply never called, so `snapshotEvery`
+  stays its zero value and `session.Open` applies its own default); rejects
+  a value `< 1` at the flag-parsing layer — unlike `-flush-every 0`, there
+  is no "disabled" sentinel, since every flush must eventually snapshot.
+  `internal/session.DefaultSnapshotEvery` is now exported so
+  `cmd/offshoot`'s error message references the same number rather than a
+  second hardcoded copy of it.
+
+  Tests: `internal/daemon/snapshot_every_test.go`
+  (`TestServeSnapshotEveryWiringDrivesCadence`) drives 9 flushes over the
+  socket with `SetSnapshotEvery(4)` and asserts a bounded `store.Chain`
+  (≤4 members) plus more than one snapshot object across the lineage
+  listing, proving the cadence recurs under daemon wiring and not just at
+  session start; `cmd/offshoot/main_test.go`
+  (`TestServeNonPositiveSnapshotEveryIsRejected`) pins `0`/negative/
+  non-integer as usage errors. `go test ./internal/ops ./internal/store
+  ./internal/daemon ./cmd/offshoot -count=1 -race` clean; no
+  `internal/session`/`internal/capture` changes, so no torture run was
+  required. `docs/status.md`'s bounded-replay and tuning-surface rows flip
+  to shipped-and-tested; `docs/reference.md` gains `-snapshot-every` and
+  documents the flush-cost trade-off (fewer segments per snapshot = more
+  frequent full-database uploads but cheaper/bounded reads, and vice
+  versa); README's "What a flush costs" section updated to match.
+
+- **CAS-conditional ref delete** (Milestone 4 Task 6b): `ops.Workspace.Destroy`
+  now CAS-writes a `Deleting` claim (`store.Ref.Deleting`/`DeletingAt`) on
+  the ref before doing anything irreversible, closing the `GetRef` ->
+  lease-check -> unconditional-`DeleteRef` TOCTOU an earlier design review
+  documented for `Destroy` — a lease acquired in that window could
+  previously have its branch deleted out from under it. `store.AcquireLease`
+  refuses outright (`store.ErrDeleting`, retryable) once it sees the claim,
+  the same way it already refuses `Reap`'s `Reaping` claim. `--force`
+  bypasses the protected/live-lease pre-checks only, never the claim: a
+  lease that wins the underlying CAS still survives a concurrent forced
+  destroy.
+
+  Scoped per the task's own one-review-cycle timebox (PM Amendment 9) as a
+  **sibling claim field, not a unification with Reap's existing `Reaping`
+  claim** — `Reaping`'s CAS mechanics are torture/race-tested and
+  deliberately untouched (`internal/ops/reap.go`/its test files pass
+  unmodified).
+
+  Backend split (PM Amendment 5 — no pretending S3 `DeleteObject` has
+  preconditions it doesn't): a new `store.ConditionalDeleter` optional
+  capability interface (`DeleteIf(key, ifMatch) error`) backs
+  `Store.DeleteRefIf`. Local implements it for real (`Local.DeleteIf`, the
+  same per-key lock file `PutIf` already uses) — a true compare-and-delete,
+  belt-and-suspenders on top of the claim. S3 does not implement it at all
+  (`DeleteObject` ignores `If-Match`/`If-None-Match`; those headers are
+  GET/PUT-only there), so `DeleteRefIf` falls back to an unconditional
+  delete on S3 and the claim marker is the entire safety mechanism on that
+  backend — documented as such on `S3.Delete`, not silently pretended away.
+
+  A Destroy that crashes after claiming but before deleting leaves the
+  claim stranded (branch untouched, no partial delete); `ops.Workspace
+  .ClearStaleDeleteClaims` self-heals it by age (30s — a delete claim has no
+  TTL/deadline concept the way Reap's `ReapDeadline` gives its own claim
+  one), wired into both the daemon janitor (`janitorTick`) and the CLI
+  `offshoot gc`, same "report and press on" convention as a reap failure.
+
+  Tests: `internal/ops/destroy_claim_test.go`'s
+  `TestConcurrentDestroyAndAcquireLeaseHaveExactlyOneWinner` (20-iteration
+  race loop mirroring M2's `TestConcurrentTouchAndReapHaveExactlyOneWinner`:
+  exactly one of Destroy/AcquireLease wins, the branch is never left
+  half-deleted under a live lease), `TestForceDestroyStillClaimGuards` (same
+  race with `force=true`), `TestDestroySelfHealsStaleDeletingClaim`;
+  `internal/store/local_test.go`'s `TestLocalDeleteIfConditionalDelete`/
+  `TestStoreDeleteRefIfUsesConditionalDeleteOnLocal`; `internal/daemon
+  /destroy_claim_test.go`'s `TestJanitorTickClearsStaleDeleteClaim` through
+  a real janitor pass. `go test ./internal/ops ./internal/store
+  ./internal/daemon ./cmd/offshoot -count=1 -race` clean; no
+  `internal/session`/`internal/capture` changes, so no torture run was
+  required. `docs/status.md`'s TTL/GC/janitor table gains a
+  shipped-and-tested row; `docs/reference.md`'s `offshoot destroy` section
+  documents the claim-guard and the backend split.
+
+- **SDK typing polish** (Milestone 4 Task 7, pre-publish list) — behavior-
+  preserving, no public signature or wire changes.
+
+  TypeScript (`sdk/typescript/src/client.ts`): the internal `_call`
+  plumbing no longer returns `Promise<any>`. A module-private `RawResponse`
+  interface (plus `RawBranchInfo`/`RawCheckpointInfo`/`RawSessionInfo`/
+  `RawAck`/`RawEvent`) mirrors `internal/daemon/protocol.go`'s `Response`
+  and its embedded structs exactly as JSON arrives off the wire — every
+  `_call` consumer (`open`/`checkout`/`fork`/`rollback`/`promote`/
+  `branches`/`dbs`/`checkoutAt`/`status`/`Session.flush`, plus `events`'s
+  ack/event-line parsing) now reads a real, typed field instead of `any`,
+  with the exact same `??`/non-null-assertion defaulting each call site
+  already had (no behavior change — verified via a before/after `dist/
+  client.js` diff showing only added comments). `_call` itself is tagged
+  `@internal` and stripped from the published `.d.ts` via
+  `tsconfig.build.json`'s new `stripInternal: true` — it remains a real,
+  callable, fully-typed method at runtime and for this package's own test
+  files (which compile against source, not the stripped declaration
+  output), since `test/client.test.ts` overrides it directly as a test
+  double. Verified additive: a `dist/client.d.ts` before/after diff shows
+  exactly one removal (the now-`@internal` `_call` line) and zero changes
+  to any other exported symbol; `dist/testkit.d.ts` is byte-identical.
+
+  Python (`sdk/python`): added the PEP 561 `offshoot/py.typed` marker,
+  shipped via a new `[tool.setuptools.package-data]` entry in
+  `pyproject.toml` (verified present in the dry-run wheel via `unzip -l`).
+  `mypy --strict offshoot` is clean across all four modules
+  (`client.py`/`langgraph.py`/`pytest_plugin.py`/`__init__.py`) — fixed
+  with annotations only: missing parameter/return types, `dict`/`Popen`
+  generic type arguments, a module-private `_TTL`/`_Seed` type alias each
+  in `client.py`/`pytest_plugin.py`, `typing.cast()` (a no-op at runtime)
+  on JSON-derived returns that were otherwise widening to `Any`, and a
+  `Mapping[str, str]` narrowing for `_locate_binary`'s `env` parameter
+  (`os.environ` isn't literally a `dict`). `pytest_plugin.py`'s guarded
+  `import pytest` type-checks cleanly against pytest's own inline types
+  (pytest ships PEP 561 support; no stub package or `type: ignore` needed).
+
+  Tests: `make test-sdks` (Python 41/41, TypeScript 49/49) and
+  `make test-pytest-plugin` (58/58) all green; `tsc --noEmit` (both
+  `tsconfig.json` and `tsconfig.build.json`) clean; `mypy --strict offshoot`
+  clean; dry-run wheel/sdist (`make dry-run-python-sdk`) and tarball
+  (`make dry-run-ts-sdk`) both pass unchanged — no file-list updates
+  needed on either SDK. No Go changes.
+
+- **Operator docs + Kubernetes recipe + the M4 sweep** (Milestone 4 Task
+  8): [docs/operations.md](docs/operations.md) is the new operator-facing
+  page — a metrics reference table (all sixteen `offshoot_*` metric
+  families, grep-verified against `internal/daemon/metrics.go` and against
+  a real `curl /metrics` scrape of a locally built binary: sixteen `# TYPE`
+  lines, sixteen table rows, one-to-one), the six-state branch-state table
+  with precedence, the eight-type event schema and drop-slow-consumer
+  semantics, the `-ro-cache-budget` mechanics (LRU `.last-used` clock,
+  writable-never-evicted guarantee, the eviction-vs-`CheckoutAt` TOCTOU),
+  the HTTP/auth threat model (single-tenant same-host-or-trusted-network,
+  not multi-tenant isolation; constant-time token compare; loopback
+  default with an explicit non-loopback ack + token requirement; "treat
+  stderr as sensitive at startup"; `-token`'s argv-visible-via-`ps` gap and
+  why `OFFSHOOT_TOKEN` is preferred on a shared host; `/debug/pprof`
+  behind the same auth), and a tuning-flags table for all five `serve`
+  knobs including the `-flush-every`/`-snapshot-every` cost interaction.
+  Its first paragraph restates the single-node scope explicitly (PM
+  Amendment 12) and links the FAQ's no-cluster stance.
+
+  [docs/recipes/kubernetes.md](docs/recipes/kubernetes.md) is a new sidecar
+  recipe: one `offshoot serve` + one agent container per Pod, a shared
+  `emptyDir` for BOTH the unix socket and the checkout tree (restated why:
+  a checkout is a real SQLite file the agent process opens directly —
+  `OFFSHOOT_CHECKOUTS`/the socket path cannot cross a network filesystem),
+  `-http 127.0.0.1` for `/metrics`/`/healthz` with `exec`-based liveness/
+  readiness probes (an `httpGet` probe is dispatched against the Pod IP,
+  which a loopback-only bind never answers), a Prometheus scrape-annotation
+  example with the honest caveat that it needs a deliberate non-loopback
+  opt-in (`-http-allow-non-loopback` + a real token) to actually be
+  reachable from outside the Pod, and an explicit "no StatefulSet-for-HA
+  story" scope note linking the FAQ. The manifest
+  (`docs/recipes/k8s/offshoot-sidecar.yaml`) is real and apply-able, not
+  pseudocode: schema-validated with both `kubectl apply --dry-run=client`
+  and `--dry-run=server` against a disposable local `rancher/k3s` control
+  plane (no live cluster was otherwise available), both passing.
+
+  Sweep: README gained an operator paragraph under "Daemon mode" (metrics/
+  HTTP/events/budgets, linking both new docs) and a fifth "operator
+  surface" note in "Integration surface"; its stale "Resource behavior"
+  claim that "there are no resource budgets yet" is corrected now that
+  Task 5's `-ro-cache-budget` shipped. `docs/reference.md` cross-links
+  `docs/operations.md` from its `-http ADDR` and eventing sections rather
+  than duplicating the operator-focused tables. `docs/status.md` gained
+  three new deliberately-deferred rows this milestone's self-review named
+  but hadn't yet recorded (TLS, per-branch at-rest metrics by default,
+  metrics push/remote-write), reworded the FD-budget row from "not yet
+  implemented" to "deliberately deferred" with the `internal/dbfile`
+  reasoning, retired two stale forward-references to "the operator-facing
+  docs/operations.md page itself is Task 8" now that the page exists, and
+  gained a new "Standing nag: user-gated launch items" section consolidating
+  every button-press-only action (org transfer, PyPI/npm name claims,
+  registry listing submissions, domain/Homebrew/container-image claims)
+  that no further engineering resolves. `ROADMAP.md`'s Milestone 4 bullets
+  are checked off against what actually shipped.
+
+  Verification: every command in every changed/new doc was run verbatim,
+  not transcribed from memory — the metrics table's scrape example is a
+  real `go build` + `serve -http` + `curl /metrics` run; the Kubernetes
+  manifest was actually dry-run-applied (see above) rather than merely
+  YAML-parsed. `make test-sdks` and a full `go test ./... -count=1` both
+  green (no code changed this task — docs and CHANGELOG/ROADMAP/status.md
+  only).
+
 ## [0.1.2] - 2026-08-06
 
 Milestone 3: the eval-harness release. The target persona's first hour is

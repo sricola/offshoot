@@ -5,6 +5,7 @@
     "moduleResolution": "nodenext",
     "target": "es2022",
     "declaration": true,
+    "stripInternal": true,
     "outDir": "dist",
     "rootDir": "src",
     "esModuleInterop": true,

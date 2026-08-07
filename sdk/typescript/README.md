@@ -41,6 +41,40 @@ await s.close();
 `Client` also exposes `branches()` (per-branch head txid, protected flag,
 checkpoints, TTL) and `dbs()` (every database name in the store).
 
+## Eventing: `Client.events()`
+
+The daemon (`offshoot serve`) publishes one versioned JSON event per state
+transition — `session_opened`, `flushed`, `flush_failed`, `fenced`,
+`session_closed`, `reaped`, `evicted` (reserved), and the terminal
+`dropped_slow_consumer`. `Client.events()` is a thin async iterator over
+it:
+
+```ts
+const c = await connect("/tmp/o.sock");
+for await (const ev of c.events()) {
+  console.log(ev.type, ev.db, ev.branch, ev.detail);
+}
+```
+
+**Dedicated connection:** `events()` opens its own fresh unix-socket
+connection — never `c`'s own connection. The daemon's `subscribe` op
+permanently takes a connection out of request/response mode the instant
+it acks (see the main repo's
+[docs/reference.md](https://github.com/offshoot-db/offshoot/blob/main/docs/reference.md#eventing-subscribe-op--get-events)),
+so this method handles opening (and closing) that dedicated connection
+for you — keep using `c` for ordinary `open`/`flush`/... calls exactly as
+before.
+
+`events()` returns an `AsyncGenerator<OffshootEvent>` yielding events in
+publish order, forever, until the connection ends. `break` out of the
+`for await` loop (or call `.return()` on the iterator) to close the
+dedicated socket early — no file descriptor is leaked. If this consumer
+ever falls behind the daemon's bounded per-subscriber buffer, the daemon
+drops it: the terminal `dropped_slow_consumer` event is yielded like any
+other event and the iterator then simply ends (not thrown as an error) —
+check `ev.type` on the last event you saw if you care whether that
+happened.
+
 ## testkit: seed-once-fork-many for vitest/jest/node:test
 
 ```

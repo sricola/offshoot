@@ -8,7 +8,9 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"io"
 	"net"
+	"net/http"
 	"os"
 	"path/filepath"
 	"sort"
@@ -42,6 +44,25 @@ type Server struct {
 	// -flush-every (default 30s) — safe-by-default cadence lives at this
 	// daemon boundary, not in the session library's own default.
 	flushEvery time.Duration
+	// roCacheBudget is the checkouts-ro disk budget in bytes (Milestone 4
+	// Task 5): janitorTick calls ops.Workspace.EvictROCache with this value
+	// on every pass. 0 (the zero value, matching CheckoutAt's own unbounded-
+	// by-default behavior) means unlimited — the pass still computes and
+	// reports usage (offshoot_ro_cache_bytes), it just never evicts. Set via
+	// SetROCacheBudget before Serve starts accepting connections, mirroring
+	// flushEvery's own single-writer-before-Serve contract; cmd/offshoot's
+	// `serve` command sets it from -ro-cache-budget (default 0).
+	roCacheBudget int64
+	// snapshotEvery is passed as Options.SnapshotEvery to every session
+	// opOpen opens (Milestone 4 Task 6a). 0 (the zero value, matching
+	// session.Options' own default) means "let the session library apply
+	// its own default" (defaultSnapshotEvery = 16) — this daemon does not
+	// impose a different default of its own the way SetFlushEvery does; it
+	// only overrides when cmd/offshoot's `serve -snapshot-every N` is
+	// explicitly given. Set via SetSnapshotEvery before Serve starts
+	// accepting connections, mirroring flushEvery's own single-writer-
+	// before-Serve contract.
+	snapshotEvery int
 	// openWG counts in-flight opOpen calls: Add(1) happens under mu at the
 	// moment a slot is reserved, Done() happens once that call's bookkeeping
 	// has fully resolved (map updated and, if it self-closed, the session
@@ -60,6 +81,51 @@ type Server struct {
 	// called, so Shutdown's close+Wait is unconditionally safe.
 	janitorStop chan struct{}
 	janitorWG   sync.WaitGroup
+
+	// metrics is this daemon's metrics registry (Milestone 4 Task 2) —
+	// always non-nil once NewServer returns. See metrics.go's Metrics type
+	// and newMetrics/wireHooks for what gets registered and how ops/session
+	// instrumentation hooks get wired to it without either of those
+	// packages importing internal/metrics.
+	metrics *Metrics
+
+	// events is this daemon's in-memory event bus (Milestone 4 Task 4a) —
+	// always non-nil once NewServer returns. Fed from the session
+	// transition callback (wireEvents, composed alongside metrics'
+	// observer) and the janitor (janitorTick's "reaped" publish); drained
+	// by the unix socket "subscribe" op (streamEvents) and HTTP `GET
+	// /events` (handleEvents). See events.go.
+	events *eventBus
+
+	// httpSrv is the optional opt-in HTTP listener (Milestone 4 Task 3) —
+	// nil unless StartHTTP has been called. Written once, under s.mu, by
+	// StartHTTP before its handler goroutine is spawned (see StartHTTP's
+	// doc comment); Shutdown reads it under s.mu too, so a Shutdown racing
+	// a StartHTTP call sees either nil (nothing to close) or a fully
+	// initialized *http.Server, never a partially-constructed one. See
+	// http.go.
+	httpSrv *http.Server
+	// httpToken is the Bearer token every authenticated HTTP request must
+	// present (see http.go's requireAuth). Same single-writer-before-
+	// serving contract as httpSrv above.
+	httpToken string
+	// httpAddr is the HTTP listener's actual bound address (ln.Addr().String()),
+	// captured so a caller that bound to "host:0" can discover the
+	// OS-assigned port via HTTPAddr(). Same single-writer-before-serving
+	// contract as httpSrv/httpToken above.
+	httpAddr string
+	// httpLog is StartHTTP's resolved log writer (HTTPConfig.Log, or
+	// os.Stderr if that was nil) — stored so request-time handlers
+	// (handleMetrics's error path, in particular) log to the SAME
+	// destination StartHTTP's own startup lines went to, rather than a
+	// bare os.Stderr that would silently ignore a caller/test's redirected
+	// Log. Read under s.mu (unlike httpSrv/httpToken/httpAddr, which rely
+	// on the happens-before-Serve guarantee) since handleMetrics runs on a
+	// per-request goroutine with no such guarantee relative to a
+	// hypothetical concurrent StartHTTP retry; the read is cheap and rare
+	// (only on a WritePrometheus error) so this costs nothing in the
+	// common path.
+	httpLog io.Writer
 }
 
 func key(db, branch string) string { return db + "@" + branch }
@@ -76,14 +142,34 @@ func NewServer(ws *ops.Workspace, socketPath string) (*Server, error) {
 		ln.Close()
 		return nil, err
 	}
-	return &Server{ws: ws, ln: ln, sock: socketPath,
+	srv := &Server{ws: ws, ln: ln, sock: socketPath,
 		sessions:    map[string]*session.Session{},
 		conns:       map[net.Conn]struct{}{},
 		janitorStop: make(chan struct{}),
-	}, nil
+		metrics:     newMetrics(),
+		events:      newEventBus(),
+	}
+	// Wired here, at construction, before Serve can ever accept a
+	// connection or StartJanitor can ever tick — see wireHooks/OnTransition/
+	// ObserveFork's doc comments for why process-wide assignment this early
+	// is safe and sufficient (one daemon Server per process in production).
+	srv.metrics.wireHooks(srv)
+	// wireEvents composes the event-bus feed onto session.OnTransition
+	// AFTER wireHooks above has already assigned it to the metrics
+	// observer — see wireEvents's doc comment (events.go) for why this
+	// ordering, not a replacement, is required.
+	srv.wireEvents()
+	return srv, nil
 }
 
 func (s *Server) SocketPath() string { return s.sock }
+
+// SetVersion sets the version string reported by offshoot_build_info
+// (default "dev" if never called). Call before Serve starts accepting
+// connections, mirroring SetFlushEvery's own single-writer-before-Serve
+// contract — cmd/offshoot's `serve` command calls this with the same
+// -ldflags-embedded version string `offshoot version` prints.
+func (s *Server) SetVersion(v string) { s.metrics.setVersion(v) }
 
 // SetFlushEvery sets the background-flush cadence (session.Options.FlushEvery)
 // applied to every session opOpen opens from now on. Call before Serve
@@ -95,6 +181,33 @@ func (s *Server) SocketPath() string { return s.sock }
 func (s *Server) SetFlushEvery(d time.Duration) {
 	s.mu.Lock()
 	s.flushEvery = d
+	s.mu.Unlock()
+}
+
+// SetROCacheBudget sets the checkouts-ro disk budget in bytes (Milestone 4
+// Task 5), applied by janitorTick's ro-cache pass starting from the next
+// tick. Call before Serve starts accepting connections, mirroring
+// SetFlushEvery's own contract. bytes <= 0 means unlimited (the default) —
+// the janitor still computes and reports usage every pass, it just never
+// evicts anything.
+func (s *Server) SetROCacheBudget(bytes int64) {
+	s.mu.Lock()
+	s.roCacheBudget = bytes
+	s.mu.Unlock()
+}
+
+// SetSnapshotEvery sets the snapshot cadence (session.Options.SnapshotEvery)
+// applied to every session opOpen opens from now on (Milestone 4 Task 6a).
+// Call before Serve starts accepting connections, mirroring SetFlushEvery's
+// own single-writer-before-Serve contract. n <= 0 means "unset" — opOpen
+// passes 0 through and session.Open applies its own default (16), so a
+// daemon that never calls this behaves exactly as before this flag existed.
+// cmd/offshoot's `serve` command rejects a non-positive -snapshot-every N at
+// the flag-parsing layer (a mistake, not a supported "unlimited" value) and
+// only calls this method when N was actually given.
+func (s *Server) SetSnapshotEvery(n int) {
+	s.mu.Lock()
+	s.snapshotEvery = n
 	s.mu.Unlock()
 }
 
@@ -137,17 +250,130 @@ func (s *Server) StartJanitor(every, grace time.Duration) {
 			case <-s.janitorStop: // closed by Shutdown before it waits on janitorWG
 				return
 			case <-t.C:
-				if reaped, err := s.ws.Reap(time.Now()); err != nil {
-					fmt.Fprintf(os.Stderr, "offshoot: janitor: reap: %v\n", err)
-				} else if len(reaped) > 0 {
-					fmt.Fprintf(os.Stderr, "offshoot: janitor: reaped %v\n", reaped)
-				}
-				if _, _, err := s.ws.GC(grace); err != nil {
-					fmt.Fprintf(os.Stderr, "offshoot: janitor: gc: %v\n", err)
-				}
+				s.janitorTick(grace)
 			}
 		}
 	}()
+}
+
+// janitorTick runs one reap+GC+ro-cache+stale-delete-claim pass and updates every
+// janitor-sourced metric (offshoot_reap_total, offshoot_gc_tombstoned_total,
+// offshoot_gc_deleted_total, offshoot_gc_backlog, offshoot_ro_cache_bytes,
+// offshoot_ro_cache_evictions_total, offshoot_janitor_runs_total{result})
+// from its results — split out of StartJanitor's ticker loop so a test can
+// drive exactly one tick deterministically instead of waiting on a real
+// ticker. Reap/GC results are counted even when they also return an error:
+// both ops.Workspace.Reap and ops.Workspace.GC keep processing everything
+// they can and report a partial result alongside the first error they hit
+// (see their own doc comments), so len(reaped)/tombstoned/deleted are real
+// work actually done, not discarded just because something else in the same
+// pass failed. ops.Workspace.EvictROCache follows the identical convention
+// (see its own doc comment) for the same reason.
+// offshoot_janitor_runs_total{result} is "error" if ANY step failed, "ok"
+// only if all fully succeeded — a single counter per tick, not one per
+// step, matching the locked metric's one label (result), not two.
+func (s *Server) janitorTick(grace time.Duration) {
+	failed := false
+
+	reaped, reapErr := s.ws.Reap(time.Now())
+	if reapErr != nil {
+		fmt.Fprintf(os.Stderr, "offshoot: janitor: reap: %v\n", reapErr)
+		failed = true
+	} else if len(reaped) > 0 {
+		fmt.Fprintf(os.Stderr, "offshoot: janitor: reaped %v\n", reaped)
+	}
+	if len(reaped) > 0 {
+		s.metrics.ReapTotal.Add(float64(len(reaped)))
+		// Milestone 4 Task 4a: one "reaped" event per branch the janitor
+		// just destroyed, fed straight to the bus — publish is non-
+		// blocking (see eventBus.publish's doc comment), so this can never
+		// stall the janitor loop regardless of how many (or how slow)
+		// subscribers exist.
+		for _, k := range reaped {
+			db, branch := splitKey(k)
+			s.events.publish(newEvent("reaped", db, branch, nil))
+		}
+	}
+
+	// Milestone 4 Task 6b: self-heal any Destroy claim (Ref.Deleting)
+	// stranded by a crashed Destroy call, same cadence as reap/GC — see
+	// ops.Workspace.ClearStaleDeleteClaims's doc comment for why this needs
+	// its own age-based pass rather than piggybacking on Reap's own
+	// deadline-driven self-heal.
+	healed, healErr := s.ws.ClearStaleDeleteClaims(time.Now())
+	if healErr != nil {
+		fmt.Fprintf(os.Stderr, "offshoot: janitor: clear stale delete claims: %v\n", healErr)
+		failed = true
+	} else if len(healed) > 0 {
+		fmt.Fprintf(os.Stderr, "offshoot: janitor: cleared stale delete claim(s) %v\n", healed)
+	}
+
+	tombstoned, deleted, gcErr := s.ws.GC(grace)
+	if gcErr != nil {
+		fmt.Fprintf(os.Stderr, "offshoot: janitor: gc: %v\n", gcErr)
+		failed = true
+	}
+	if tombstoned > 0 {
+		s.metrics.GCTombstonedTotal.Add(float64(tombstoned))
+	}
+	if deleted > 0 {
+		s.metrics.GCDeletedTotal.Add(float64(deleted))
+	}
+	if backlog, err := s.ws.TombstoneBacklog(); err != nil {
+		fmt.Fprintf(os.Stderr, "offshoot: janitor: gc backlog: %v\n", err)
+	} else {
+		s.metrics.GCBacklog.Set(float64(backlog))
+	}
+
+	// Milestone 4 Task 5: ro-cache budget/eviction. s.roCacheBudget is read
+	// under s.mu (set once, before Serve starts accepting connections, via
+	// SetROCacheBudget — same single-writer-before-Serve contract as
+	// flushEvery), mirroring opOpen's own read of flushEvery.
+	s.mu.Lock()
+	budget := s.roCacheBudget
+	s.mu.Unlock()
+	evicted, usage, roErr := s.ws.EvictROCache(budget)
+	if roErr != nil {
+		fmt.Fprintf(os.Stderr, "offshoot: janitor: ro-cache: %v\n", roErr)
+		failed = true
+	}
+	// Always set, even when budget <= 0 (unlimited) or usage is already
+	// under budget: offshoot_ro_cache_bytes reports CURRENT usage every
+	// pass regardless of whether this pass evicted anything, matching
+	// GCBacklog's own always-set-even-at-zero treatment above. This is a
+	// janitor-pass-cadence gauge, not a scrape-time one (unlike
+	// SessionsOpen/CaptureLagBytes/DurableAgeSeconds in metrics.go's
+	// collectSessionGauges) — see EvictROCache's doc comment and
+	// docs/reference.md's `-ro-cache-budget` section for the staleness this
+	// implies between passes.
+	s.metrics.ROCacheBytes.Set(float64(usage))
+	if len(evicted) > 0 {
+		s.metrics.ROCacheEvictionsTotal.Add(float64(len(evicted)))
+	}
+	for _, e := range evicted {
+		// Eviction is LOUD by design (Global Constraints): a log line per
+		// eviction, on top of the counter/gauge above and the "evicted"
+		// event below — an operator watching stderr sees exactly what left
+		// disk and why, the same family as this function's other
+		// "offshoot: janitor: ..." lines.
+		fmt.Fprintf(os.Stderr, "offshoot: janitor: ro-cache: evicted %s@%s@%s (%d bytes)\n",
+			e.DB, e.Branch, e.Checkpoint, e.Bytes)
+		// Milestone 4 Task 4a reserved this event type with no emitter;
+		// this is that emitter. publish is non-blocking (see
+		// eventBus.publish's doc comment) — never stalls the janitor loop
+		// regardless of subscriber count/speed, exactly like the "reaped"
+		// publish above.
+		s.events.publish(newEvent("evicted", e.DB, e.Branch, map[string]any{
+			"checkpoint": e.Checkpoint,
+			"bytes":      e.Bytes,
+		}))
+	}
+
+	result := "ok"
+	if failed {
+		result = "error"
+	}
+	s.metrics.JanitorRunsTotal.WithLabelValues(result).Inc()
 }
 
 func (s *Server) Serve() error {
@@ -182,6 +408,20 @@ func (s *Server) handle(c net.Conn) {
 		var req Request
 		if err := dec.Decode(&req); err != nil {
 			return // client hung up or sent garbage
+		}
+		// "subscribe" (Milestone 4 Task 4a) is handle()'s SECOND special-
+		// cased op, alongside "shutdown" below: like shutdown, it cannot be
+		// answered by dispatch()'s ordinary one-Request-in-one-Response-out
+		// shape — this connection is about to leave request/response mode
+		// for good. See handleSubscribeOp's doc comment (events.go) for why
+		// the subscription is registered before the ack is even sent, and
+		// for the loud "dedicated connection" warning SDKs must follow.
+		// This connection never returns to this dec.Decode loop once
+		// handleSubscribeOp is called — it returns straight to handle's
+		// caller (Serve's per-connection goroutine) when the stream ends.
+		if req.Op == "subscribe" {
+			s.handleSubscribeOp(c, enc)
+			return
 		}
 		resp := s.dispatch(req)
 		if req.Op == "shutdown" && shutdownRespondDelay != nil {
@@ -239,6 +479,20 @@ func (s *Server) dispatch(req Request) Response {
 		// this response — see handle's shutdown handling and
 		// TestShutdownRespondsBeforeClosingRequestingConn.
 		return Response{OK: true}
+	case "subscribe":
+		// Real subscribe handling (registering with the event bus, then
+		// streaming) happens in handle() BEFORE dispatch is ever called
+		// for this op (see handle's special-case, mirroring how
+		// "shutdown" is split between this ack-shaped case above and
+		// handle's real side effect) — unix-socket-only, since a
+		// request/response connection cannot switch modes mid-stream. A
+		// "subscribe" op that reaches dispatch at all can only have
+		// arrived via HTTP POST /rpc (handleRPC calls dispatch directly,
+		// with no equivalent special-case), so this refuses it and points
+		// the caller at the HTTP-native equivalent.
+		return errResp(fmt.Errorf(
+			"daemon: \"subscribe\" is a unix-socket-only op (streams line-per-event JSON on a dedicated connection); " +
+				"HTTP clients must use GET /events for the same event stream"))
 	case "create":
 		return s.opCreate(req)
 	case "checkout":
@@ -320,6 +574,7 @@ func (s *Server) opOpen(req Request) Response {
 	s.sessions[k] = nil // reserve the slot
 	s.openWG.Add(1)
 	flushEvery := s.flushEvery
+	snapshotEvery := s.snapshotEvery
 	s.mu.Unlock()
 
 	if openDelay != nil {
@@ -328,6 +583,7 @@ func (s *Server) opOpen(req Request) Response {
 
 	sess, err := session.Open(context.Background(), session.Options{
 		WS: s.ws, DB: req.DB, Branch: branch, FlushEvery: flushEvery,
+		SnapshotEvery: snapshotEvery,
 	})
 
 	s.mu.Lock()
@@ -460,6 +716,21 @@ func (s *Server) opStatus() Response {
 	return Response{OK: true, Sessions: infos}
 }
 
+// sessionCount returns the number of FULLY OPEN sessions (a reserved-but-
+// nil in-flight-open slot does not count, matching opStatus's own
+// treatment) — backs GET /healthz's `sessions` field.
+func (s *Server) sessionCount() int {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	n := 0
+	for _, sess := range s.sessions {
+		if sess != nil {
+			n++
+		}
+	}
+	return n
+}
+
 func (s *Server) opClose(req Request) Response {
 	branch := req.Branch
 	if branch == "" {
@@ -516,6 +787,36 @@ func (s *Server) lookupSessionState(db, branch string) (sessionState, *session.S
 		return sessionReserved, nil
 	}
 	return sessionOpen, sess
+}
+
+// branchState computes db@branch's full state for opBranches: this is the
+// daemon half of the split ops.BranchStateAt's doc comment documents — ops
+// computes everything derivable from ref+sidecar alone (active/dirty/
+// detached/idle); only a daemon knows its own in-memory session map, so
+// only a daemon can additionally say "pending" (a slot is reserved, mid-
+// Open) or "error" (an open session's Err() has gone non-nil). ref is the
+// caller's already-fetched GetRef (opBranches always has one in hand) so
+// this never issues a second store read of its own.
+//
+// Precedence: error and pending are session-derived and, when either
+// applies, win outright over whatever ops.BranchStateAt would have said —
+// see BranchStateAt's doc comment for the full six-state precedence list.
+// The two can never both apply to the SAME db@branch at once: s.sessions
+// holds at most one entry per key, either a nil (reserved) or non-nil
+// (open) value, never both — so this is a simple switch, not a priority
+// comparison between the two. An OPEN, HEALTHY session needs no daemon-side
+// casing at all: its own live lease is exactly what already makes
+// ops.BranchStateAt itself report "active".
+func (s *Server) branchState(db, branch string, ref store.Ref) string {
+	switch state, sess := s.lookupSessionState(db, branch); state {
+	case sessionOpen:
+		if sess.Err() != nil {
+			return "error"
+		}
+	case sessionReserved:
+		return "pending"
+	}
+	return ops.BranchStateAt(ref, s.ws.CheckoutPath(db, branch), time.Now())
 }
 
 // refuseIfClaimed refuses (as a "close the session first" error) if this
@@ -789,6 +1090,7 @@ func (s *Server) opBranches(req Request) Response {
 			Branch: br, HeadTXID: ref.HeadTXID, Protected: ref.Protected,
 			TTL: ref.TTL, TTLRemaining: ops.FormatTTLRemaining(ref, now), LeaseHolder: ref.LeaseHolder,
 			Checkpoints: cps, TouchedAt: ref.TouchedAt, CheckpointsV2: cpsV2,
+			State: s.branchState(req.DB, br, ref),
 		})
 	}
 	sort.Slice(infos, func(i, j int) bool { return infos[i].Branch < infos[j].Branch })
@@ -933,6 +1235,35 @@ func (s *Server) Shutdown(ctx context.Context) error {
 		c.Close()
 	}
 	s.connMu.Unlock()
+
+	// The optional HTTP listener (Milestone 4 Task 3), if StartHTTP was ever
+	// called, is shed at this same point, right alongside the unix
+	// listener/conns above: http.Server.Close() immediately closes its
+	// listener AND every connection it currently holds, matching the unix
+	// side's philosophy of shedding fast rather than draining gracefully
+	// (http.Server.Shutdown would wait out in-flight handlers, which this
+	// daemon does not need — see below). This is safe for a request that is
+	// ITSELF the "shutdown" op arriving over HTTP: the HTTP rpc handler
+	// writes and flushes that request's response, on its own connection,
+	// strictly BEFORE it ever triggers this Shutdown call (see http.go's
+	// handleRPC, the HTTP analog of handle's own respond-then-shutdown
+	// ordering fix) — by the time Close() runs here, those bytes are
+	// already past the handler and into the kernel's send buffer, so
+	// Close() tearing down the connection immediately afterward cannot
+	// erase a response that was already written. Any OTHER HTTP request
+	// truly in flight when an unrelated Shutdown (e.g. SIGINT) fires simply
+	// sees its connection close — no panic, no hang; dispatch()'s own
+	// per-op s.closing checks (opOpen, etc.) already make a request that
+	// slips through in the narrow window before Close() takes effect fail
+	// safely with "daemon: shutting down" rather than corrupting state,
+	// exactly as they do for the unix socket. s.httpSrv is read under s.mu
+	// since StartHTTP writes it under the same lock (see its doc comment).
+	s.mu.Lock()
+	httpSrv := s.httpSrv
+	s.mu.Unlock()
+	if httpSrv != nil {
+		httpSrv.Close()
+	}
 
 	janitorWait := make(chan struct{})
 	go func() {

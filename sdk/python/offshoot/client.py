@@ -8,8 +8,16 @@ from __future__ import annotations
 
 import json
 import socket
+from collections.abc import Generator
 from dataclasses import dataclass, field
 from datetime import timedelta
+from typing import Any, TypeAlias, cast
+
+# The TTL argument shape every `ttl=`-accepting method on this client (and
+# offshoot.langgraph.ThreadForks) takes — see `_ttl_str`'s docstring for how
+# each variant renders onto the wire. Not exported (module-private): purely
+# a typing convenience, not part of the public API surface.
+_TTL: TypeAlias = timedelta | int | str | None
 
 
 class OffshootError(Exception):
@@ -43,6 +51,13 @@ class Branch:
     created_at) describe the exact same set of checkpoints — ``checkpoints``
     stays for wire/API compat with code written before ``checkpoints_v2``
     existed; new code should prefer ``checkpoints_v2``.
+
+    ``state`` is this branch's computed state — one of ``"active"``,
+    ``"pending"``, ``"error"``, ``"dirty"``, ``"detached"``, or ``"idle"``;
+    see ``internal/ops/status.go``'s ``BranchStateAt`` for the full
+    taxonomy and precedence. Defaults to ``""`` against a pre-Milestone-4
+    daemon that never sends this field at all (wire-additive: an old daemon
+    still answers every other field exactly as before).
     """
 
     branch: str
@@ -54,9 +69,37 @@ class Branch:
     checkpoints: list[str] = field(default_factory=list)
     touched_at: str = ""
     checkpoints_v2: list[CheckpointInfo] = field(default_factory=list)
+    state: str = ""
 
 
-def _ttl_str(ttl) -> str:
+@dataclass
+class Event:
+    """One event from the daemon's event stream — see :meth:`Client.events`.
+
+    Mirrors ``internal/daemon/events.go``'s ``Event``: the ONE versioned
+    JSON schema (``v`` is currently always ``1``) the daemon emits over
+    BOTH the unix socket ``subscribe`` op and HTTP ``GET /events`` (SSE) —
+    see ``docs/reference.md``'s Eventing section for the full ``type``
+    table (``session_opened``, ``flushed``, ``flush_failed``, ``fenced``,
+    ``session_closed``, ``reaped``, ``evicted`` (reserved — nothing emits
+    it yet), and the terminal ``dropped_slow_consumer`` — see
+    :meth:`Client.events`'s docstring for how that one is handled).
+
+    ``ts`` is RFC3339 UTC. ``db``/``branch`` are ``""`` for event types
+    that carry no branch (e.g. ``dropped_slow_consumer``). ``detail`` is
+    ``{}`` when the daemon omits it (events with no extra detail, e.g.
+    ``reaped``).
+    """
+
+    v: int
+    ts: str
+    type: str
+    db: str = ""
+    branch: str = ""
+    detail: dict[str, Any] = field(default_factory=dict)
+
+
+def _ttl_str(ttl: _TTL) -> str:
     """Render a Python TTL value into the wire's Go-duration-string form.
 
     None means "no change" (fork: no TTL; touch: keep the current TTL); 0 or
@@ -103,6 +146,7 @@ class Client:
     """
 
     def __init__(self, socket_path: str):
+        self._socket_path = socket_path
         self._sock = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
         try:
             self._sock.connect(socket_path)
@@ -114,10 +158,10 @@ class Client:
     def __enter__(self) -> "Client":
         return self
 
-    def __exit__(self, *exc_info) -> None:
+    def __exit__(self, *exc_info: object) -> None:
         self.close()
 
-    def _call(self, op: str, **fields) -> dict:
+    def _call(self, op: str, **fields: object) -> dict[str, Any]:
         req = {"op": op, **{k: v for k, v in fields.items() if v not in ("", None, False)}}
         try:
             self._sock.sendall(json.dumps(req).encode() + b"\n")
@@ -127,7 +171,7 @@ class Client:
         if not line:
             raise OffshootError("daemon closed the connection")
         try:
-            resp = json.loads(line)
+            resp: dict[str, Any] = json.loads(line)
         except json.JSONDecodeError as e:
             raise OffshootError(f"daemon sent a malformed response: {e}") from e
         if not resp.get("ok", False):
@@ -146,10 +190,10 @@ class Client:
     def checkout(self, db: str, branch: str) -> str:
         """Materialize db@branch's head snapshot at rest; returns its path."""
         resp = self._call("checkout", db=db, branch=branch)
-        return resp["checkout"]
+        return cast(str, resp["checkout"])
 
     def fork(self, db: str, source: str, new: str, from_checkpoint: str | None = None,
-              ttl=None, meta: dict[str, str] | None = None) -> int:
+              ttl: _TTL = None, meta: dict[str, str] | None = None) -> int:
         """Branch `new` off db@source (at from_checkpoint, or source's head).
 
         meta (None = no metadata) is a small string->string map describing
@@ -161,7 +205,7 @@ class Client:
         """
         resp = self._call("fork", db=db, branch=source, name=new, ttl=_ttl_str(ttl),
                             meta=meta or None, **{"from": from_checkpoint or ""})
-        return resp.get("txid", 0)
+        return cast(int, resp.get("txid", 0))
 
     def destroy(self, db: str, branch: str, force: bool = False) -> None:
         """Delete db@branch. force overrides the protected-branch refusal."""
@@ -170,14 +214,14 @@ class Client:
     def rollback(self, db: str, branch: str, to: str) -> str:
         """Repoint db@branch at checkpoint `to`; returns the refreshed checkout path."""
         resp = self._call("rollback", db=db, branch=branch, name=to)
-        return resp.get("checkout", "")
+        return cast(str, resp.get("checkout", ""))
 
     def promote(self, db: str, source: str, onto: str, force: bool = False) -> int:
         """Repoint db@onto at db@source's head; returns the promoted txid."""
         resp = self._call("promote", db=db, branch=source, name=onto, force=force)
-        return resp.get("txid", 0)
+        return cast(int, resp.get("txid", 0))
 
-    def touch(self, db: str, branch: str, ttl=None) -> None:
+    def touch(self, db: str, branch: str, ttl: _TTL = None) -> None:
         """Reset db@branch's activity clock, optionally setting/clearing its TTL.
 
         ttl: None keeps the current TTL, a timedelta/duration-string sets it,
@@ -206,6 +250,7 @@ class Client:
                     )
                     for cp in b.get("checkpoints_v2", [])
                 ],
+                state=b.get("state", ""),
             )
             for b in resp.get("branches", [])
         ]
@@ -213,7 +258,7 @@ class Client:
     def dbs(self) -> list[str]:
         """List every database this store has at least one ref for, sorted."""
         resp = self._call("dbs")
-        return resp.get("databases", [])
+        return cast(list[str], resp.get("databases", []))
 
     def export(self, db: str, branch: str, out_path: str,
                checkpoint: str | None = None, force: bool = False) -> None:
@@ -244,12 +289,118 @@ class Client:
         Returns the read-only cache file's path.
         """
         resp = self._call("checkout-at", db=db, branch=branch, name=checkpoint, force=force)
-        return resp.get("checkout", "")
+        return cast(str, resp.get("checkout", ""))
 
-    def status(self) -> list[dict]:
+    def events(self) -> Generator[Event, None, None]:
+        """Stream the daemon's event feed, yielding one :class:`Event` per
+        line, in publish order, until the stream ends.
+
+        *** OPENS ITS OWN, DEDICATED SOCKET CONNECTION *** — never this
+        Client's own ``self._sock``. The daemon's ``subscribe`` op
+        (``internal/daemon/events.go``/``server.go``) permanently takes a
+        connection out of request/response mode the instant it acks: no
+        further ``open``/``flush``/``status``/... call could ever get a
+        reply on that same connection again. This method dials a fresh
+        unix-socket connection to the same ``socket_path`` this Client was
+        constructed with, precisely so callers never have to think about
+        that — keep using ``self``/this ``Client`` for ordinary ops exactly
+        as before, and iterate the generator this method returns for
+        events; the two never share a socket.
+
+        This is a *generator function*: calling ``client.events()`` alone
+        does nothing yet (no socket is opened) — the connection is made,
+        ``subscribe`` sent, and the ack read on the FIRST ``next()``/loop
+        iteration. A connection failure or a daemon error response (e.g. an
+        ack the daemon returned ``ok: false`` for — not expected in
+        practice, but handled) surfaces as :class:`OffshootError` from
+        that first iteration, not from the ``events()`` call itself::
+
+            for ev in client.events():
+                print(ev.type, ev.db, ev.branch, ev.detail)
+
+        **``dropped_slow_consumer`` (this consumer fell behind the
+        daemon's bounded per-subscriber buffer and was dropped — see
+        ``docs/reference.md``'s Eventing section): yielded like any other
+        event, and then the generator stops** (a plain ``return``, not an
+        exception) — the daemon has already closed its end, there is
+        nothing more to read. This is the unambiguous contract: a caller
+        that cares whether it was dropped checks
+        ``ev.type == "dropped_slow_consumer"`` on the last event it
+        received; a caller that doesn't care just sees the loop end. It is
+        deliberately NOT raised as an :class:`OffshootError` — a drop ends
+        the stream the same way an ordinary disconnect does (the ``for``
+        loop simply finishes); only a genuine transport/protocol failure
+        (a connect error, a malformed line) raises.
+
+        **Closing early:** stop iterating — ``break`` out of the ``for``
+        loop, or call ``.close()`` on the generator object directly — to
+        close the dedicated socket. Python delivers this as
+        :class:`GeneratorExit` at the suspended ``yield``; the ``finally``
+        block below always runs in response (whether the generator is
+        garbage-collected, explicitly closed, or the loop breaks) and
+        closes both the buffered reader and the underlying socket, so no
+        file descriptor is leaked by stopping early. A bare ``break`` with
+        no explicit ``.close()`` relies on the generator being garbage
+        collected promptly to trigger that cleanup — immediate under
+        CPython's reference counting, but not guaranteed to be immediate
+        on a non-refcounting implementation (e.g. PyPy), where the socket
+        could stay open until the next GC cycle. Call ``gen.close()``
+        explicitly (rather than just letting a ``break``ed-out-of
+        generator go out of scope) for deterministic, implementation-
+        independent cleanup timing.
+        """
+        sock = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
+        try:
+            sock.connect(self._socket_path)
+        except OSError as e:
+            sock.close()
+            raise OffshootError(f"daemon connection failed: {e}") from e
+        rfile = sock.makefile("rb")
+        try:
+            try:
+                sock.sendall(json.dumps({"op": "subscribe"}).encode() + b"\n")
+                line = rfile.readline()
+            except OSError as e:
+                raise OffshootError(f"daemon connection failed: {e}") from e
+            if not line:
+                raise OffshootError("daemon closed the connection")
+            try:
+                ack: dict[str, Any] = json.loads(line)
+            except json.JSONDecodeError as e:
+                raise OffshootError(f"daemon sent a malformed response: {e}") from e
+            if not ack.get("ok", False):
+                raise OffshootError(ack.get("error", "unknown daemon error"))
+
+            while True:
+                try:
+                    line = rfile.readline()
+                except OSError as e:
+                    raise OffshootError(f"daemon connection failed: {e}") from e
+                if not line:
+                    return  # daemon closed the stream (unsubscribed, or shutdown)
+                try:
+                    raw: dict[str, Any] = json.loads(line)
+                except json.JSONDecodeError as e:
+                    raise OffshootError(f"daemon sent a malformed event: {e}") from e
+                ev = Event(
+                    v=raw.get("v", 0),
+                    ts=raw.get("ts", ""),
+                    type=raw.get("type", ""),
+                    db=raw.get("db", ""),
+                    branch=raw.get("branch", ""),
+                    detail=raw.get("detail") or {},
+                )
+                yield ev
+                if ev.type == "dropped_slow_consumer":
+                    return  # terminal: the daemon has already closed its end
+        finally:
+            rfile.close()
+            sock.close()
+
+    def status(self) -> list[dict[str, Any]]:
         """List every session open in the daemon, as raw dicts."""
         resp = self._call("status")
-        return resp.get("sessions", [])
+        return cast(list[dict[str, Any]], resp.get("sessions", []))
 
     def close(self) -> None:
         """Close the connection to the daemon."""
@@ -274,7 +425,7 @@ class Session:
         """
         resp = self._client._call("flush", db=self._db, branch=self._branch, name=name,
                                     meta=meta or None)
-        return resp.get("txid", 0)
+        return cast(int, resp.get("txid", 0))
 
     def close(self) -> None:
         """Close the session, releasing its lease."""

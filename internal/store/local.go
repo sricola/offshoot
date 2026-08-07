@@ -279,3 +279,38 @@ func (l *Local) Delete(key string) error {
 	}
 	return nil
 }
+
+// DeleteIf implements store.ConditionalDeleter: a true compare-and-delete,
+// using the exact same per-key O_CREAT|O_EXCL lock file PutIf uses to
+// implement its own compare-and-swap (see the package doc comment on Local).
+// Absent (already deleted, or never existed) or content that no longer
+// hashes to ifMatch both fail with ErrCAS — a caller (ops.Destroy) that
+// raced this against a concurrent write to the same key sees exactly the
+// same "your compare failed, retry" signal PutIf's own callers already
+// know how to handle.
+func (l *Local) DeleteIf(key, ifMatch string) error {
+	p, err := l.path(key)
+	if err != nil {
+		return err
+	}
+	release, err := l.lock(p)
+	if err != nil {
+		return err
+	}
+	defer release()
+
+	cur, err := os.ReadFile(p)
+	if os.IsNotExist(err) {
+		return fmt.Errorf("%w: key absent, expected etag %s", ErrCAS, ifMatch)
+	}
+	if err != nil {
+		return err
+	}
+	if etagOf(cur) != ifMatch {
+		return fmt.Errorf("%w: etag mismatch", ErrCAS)
+	}
+	if err := os.Remove(p); err != nil && !os.IsNotExist(err) {
+		return err
+	}
+	return nil
+}
