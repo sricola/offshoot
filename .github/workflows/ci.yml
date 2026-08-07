@@ -61,6 +61,21 @@ jobs:
       - name: make test-sdks
         run: make test-sdks
 
+      # test-pytest-plugin exercises the offshoot.pytest fixture plugin
+      # (the `offshoot-db[pytest]` extra) — its own suite, separate from
+      # test-sdks above, because it genuinely needs pytest + pytest-xdist
+      # installed (unlike the plain-unittest suites test-sdks just proved
+      # pass WITHOUT pytest on PATH — see Milestone 3 Task 4's status.md
+      # row for why that separation is load-bearing: the base SDK must stay
+      # stdlib-only). Installed editable so its `pytest11` entry point
+      # registration is exercised for real, exactly as an installed
+      # `offshoot-db[pytest]` would be.
+      - name: Install offshoot-db[pytest] + pytest-xdist
+        run: python3 -m pip install --break-system-packages --quiet -e "sdk/python[pytest]" pytest-xdist
+
+      - name: make test-pytest-plugin
+        run: make test-pytest-plugin
+
       # dry-run-sdks builds the real sdist/wheel and npm tarball, runs twine
       # check, and install-tests both — the same build-verification tier
       # .github/workflows/publish.yml runs in dry-run mode (PUBLISH_ENABLED

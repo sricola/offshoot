@@ -39,15 +39,20 @@ Issues = "https://github.com/offshoot-db/offshoot/issues"
 Changelog = "https://github.com/offshoot-db/offshoot/blob/main/CHANGELOG.md"
 Documentation = "https://github.com/offshoot-db/offshoot/blob/main/docs/eval-harness.md"
 
-# Reserved ahead of the pytest fixture plugin (Milestone 3 Task 4, not yet
-# landed on this branch — see docs/status.md): it will be an opt-in extra,
-# never a hard dependency of the base client, so `pip install offshoot-db`
-# stays stdlib-only. `pip install "offshoot-db[pytest]"` will pull in pytest
-# once the plugin module and its `pytest11` entry point exist; declaring the
-# extra now (with no entry point yet) is harmless and keeps this manifest
-# from needing another pass at publish time for that alone.
+# `offshoot-db[pytest]` is the only way pytest becomes a dependency: the
+# base client (`pip install offshoot-db`) stays stdlib-only. The pytest11
+# entry point below is registered UNCONDITIONALLY (every install, extra or
+# not) — that's harmless, because pytest only ever imports
+# offshoot.pytest_plugin when pytest itself is already running (i.e.
+# already installed); a bare `pip install offshoot-db` with no pytest on
+# the machine never triggers that import at all. The module itself still
+# import-guards `pytest` (see offshoot/pytest_plugin.py's docstring) as a
+# second line of defense for a stray direct import.
 [project.optional-dependencies]
 pytest = ["pytest>=7"]
+
+[project.entry-points.pytest11]
+offshoot = "offshoot.pytest_plugin"
 
 [tool.setuptools.packages.find]
 include = ["offshoot*"]
