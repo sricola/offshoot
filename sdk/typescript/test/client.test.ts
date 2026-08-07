@@ -19,8 +19,12 @@ import { connect, OffshootError, type Client } from "../src/client.js";
 // test-dist/test/client.test.js -> repo root is four levels up.
 const REPO = join(fileURLToPath(new URL(".", import.meta.url)), "..", "..", "..", "..");
 
+// unref()'d so a pending sleep() timer never by itself keeps the process's
+// event loop alive — see src/testkit.ts's identical `sleep` for why: without
+// it, DaemonFixture.stop()'s race below can hold the process open for up to
+// 10s after the daemon has already exited and stop() has logically finished.
 function sleep(ms: number): Promise<void> {
-  return new Promise((res) => setTimeout(res, ms));
+  return new Promise((res) => setTimeout(res, ms).unref());
 }
 
 function hasCmd(cmd: string): boolean {

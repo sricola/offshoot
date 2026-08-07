@@ -560,7 +560,12 @@ func (s *Server) opCheckoutAtRest(req Request) Response {
 // daemon has an open session on the source, that session is flushed
 // (unnamed) first so the fork point includes writes the caller never
 // explicitly flushed — matching Fork's semantics for a session that owns
-// the source's checkout. Returns the fork point's txid.
+// the source's checkout. req.Meta is validated (ops.ValidateMeta) BEFORE
+// that flush: an over-cap meta is a caller mistake that Fork would reject
+// anyway, and rejecting it before flushIfOpen means an over-cap fork
+// against an open session never triggers store I/O (and never advances the
+// session's flushed head) for a call that was only going to unwind on the
+// next line regardless. Returns the fork point's txid.
 func (s *Server) opFork(req Request) Response {
 	branch := req.Branch
 	if branch == "" {
@@ -577,6 +582,9 @@ func (s *Server) opFork(req Request) Response {
 				"daemon: fork ttl %q must be positive; fork has no \"none\" concept, omit ttl for no TTL", req.TTL))
 		}
 		ttl = d
+	}
+	if err := ops.ValidateMeta(req.Meta); err != nil {
+		return errResp(err)
 	}
 	if err := s.flushIfOpen(req.DB, branch, "fork"); err != nil {
 		return errResp(err)

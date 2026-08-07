@@ -140,8 +140,14 @@ function locateBinary(explicit?: string): string {
   return found;
 }
 
+// unref()'d so a pending sleep() timer never by itself keeps the process's
+// event loop alive — most load-bearing in stop()'s race below: once the
+// "exit" event has already resolved that race, the losing sleep(stopTimeoutMs)
+// timer (up to 10s) would otherwise still be armed and non-unref'd, holding
+// the process open for up to 10s after stop() has already returned even
+// though nothing is left to do.
 function sleep(ms: number): Promise<void> {
-  return new Promise((res) => setTimeout(res, ms));
+  return new Promise((res) => setTimeout(res, ms).unref());
 }
 
 /** Locate the `offshoot` binary, init a fresh store under a temp dir, and
@@ -259,13 +265,21 @@ interface SeedCacheEntry {
 // share (or leak into) each other's memoized seeds, and so the cache for a
 // stopped daemon is eligible for GC once nothing else references the
 // handle.
-const seedCaches = new WeakMap<DaemonHandle, Map<string, SeedCacheEntry>>();
+//
+// Maps to a PROMISE of the entry, not the settled entry itself: seedOnce
+// must memoize the in-flight seed operation, not just its eventual result,
+// so two concurrent calls for the same (daemon, name) — e.g. two
+// `test.concurrent` tests both calling `seedOnce(daemon, { name: "x", ... })`
+// — share the ONE seed run instead of a naive "check cache, see nothing yet,
+// both start seeding" race that would run the seed twice and let the
+// second write clobber the first's cache entry.
+const seedCaches = new WeakMap<DaemonHandle, Map<string, Promise<SeedCacheEntry>>>();
 // Function-identity fingerprints for callable seeds (mirrors Python's
 // id()-based fingerprint for a callable seed).
 const callableIds = new WeakMap<object, number>();
 let nextCallableId = 0;
 
-function cacheFor(daemon: DaemonHandle): Map<string, SeedCacheEntry> {
+function cacheFor(daemon: DaemonHandle): Map<string, Promise<SeedCacheEntry>> {
   let m = seedCaches.get(daemon);
   if (!m) {
     m = new Map();
@@ -409,22 +423,15 @@ async function resolveSeed(seed: Seed): Promise<{ fingerprint: string; run: (ses
  * seed. Mirrors `offshoot.pytest_plugin.offshoot_db`, minus the ini-file
  * default-seed convenience (there's no pytest.ini equivalent here — every
  * call names its seed explicitly). */
-export async function seedOnce(daemon: DaemonHandle, opts: SeedOnceOptions): Promise<SeedHandle> {
-  const name = opts.name ?? "default";
-  const cache = cacheFor(daemon);
-  const resolved = await resolveSeed(opts.seed);
-  const cached = cache.get(name);
-  if (cached) {
-    if (cached.fingerprint !== resolved.fingerprint) {
-      throw new OffshootError(
-        `seedOnce(name=${JSON.stringify(name)}): called again with a DIFFERENT seed than the ` +
-          `one that already seeded ${cached.handle.db} earlier. seedOnce memoizes by name, not ` +
-          `by seed content — pass a different name for a different seed, or the identical seed ` +
-          `on every call for ${JSON.stringify(name)}.`,
-      );
-    }
-    return cached.handle;
-  }
+/** Actually runs one seed against a fresh `eval-{name}` database and
+ * checkpoints it — the work `seedOnce` memoizes a PROMISE of, below, so two
+ * concurrent callers for the same name share this one call rather than each
+ * racing their own. */
+async function runSeedOnce(
+  daemon: DaemonHandle,
+  name: string,
+  resolved: { fingerprint: string; run: (session: Session) => Promise<void> },
+): Promise<SeedCacheEntry> {
   const client = await connectWithTail(daemon);
   try {
     const db = `eval-${name}`;
@@ -436,15 +443,47 @@ export async function seedOnce(daemon: DaemonHandle, opts: SeedOnceOptions): Pro
     } finally {
       await session.close();
     }
-    const handle: SeedHandle = { db, checkpoint: "seed", name };
-    cache.set(name, { handle, fingerprint: resolved.fingerprint });
-    return handle;
+    return { handle: { db, checkpoint: "seed", name }, fingerprint: resolved.fingerprint };
   } finally {
     await client.close();
   }
 }
 
-function requireCachedSeed(daemon: DaemonHandle, name: string): SeedHandle {
+export async function seedOnce(daemon: DaemonHandle, opts: SeedOnceOptions): Promise<SeedHandle> {
+  const name = opts.name ?? "default";
+  const cache = cacheFor(daemon);
+  const resolved = await resolveSeed(opts.seed);
+
+  // Memoize the PROMISE, not the settled result: if two calls for the same
+  // (daemon, name) land here before either has finished (e.g. two
+  // `test.concurrent` tests both calling seedOnce), the cache.get below must
+  // see the first call's in-flight promise on the SECOND call's turn, not
+  // `undefined` — otherwise both would run the seed themselves and the
+  // loser's cache.set would silently clobber the winner's entry.
+  let pending = cache.get(name);
+  if (!pending) {
+    pending = runSeedOnce(daemon, name, resolved);
+    cache.set(name, pending);
+    // A failed seed must not poison the cache forever: without this, every
+    // later call for the same name would keep re-awaiting (and rethrowing
+    // from) the same rejected promise instead of getting a fresh attempt.
+    pending.catch(() => {
+      if (cache.get(name) === pending) cache.delete(name);
+    });
+  }
+  const entry = await pending;
+  if (entry.fingerprint !== resolved.fingerprint) {
+    throw new OffshootError(
+      `seedOnce(name=${JSON.stringify(name)}): called again with a DIFFERENT seed than the ` +
+        `one that already seeded ${entry.handle.db} earlier. seedOnce memoizes by name, not ` +
+        `by seed content — pass a different name for a different seed, or the identical seed ` +
+        `on every call for ${JSON.stringify(name)}.`,
+    );
+  }
+  return entry.handle;
+}
+
+async function requireCachedSeed(daemon: DaemonHandle, name: string): Promise<SeedHandle> {
   const cached = cacheFor(daemon).get(name);
   if (!cached) {
     throw new OffshootError(
@@ -453,7 +492,7 @@ function requireCachedSeed(daemon: DaemonHandle, name: string): SeedHandle {
         `forkPerTest(daemon, ${JSON.stringify(name)}).`,
     );
   }
-  return cached.handle;
+  return (await cached).handle;
 }
 
 // --------------------------------------------------------------------------
@@ -563,7 +602,7 @@ export async function forkPerTest(
   seedHandleOrName: SeedHandle | string,
   opts: ForkPerTestOptions = {},
 ): Promise<ForkedSession> {
-  const seedHandle = typeof seedHandleOrName === "string" ? requireCachedSeed(daemon, seedHandleOrName) : seedHandleOrName;
+  const seedHandle = typeof seedHandleOrName === "string" ? await requireCachedSeed(daemon, seedHandleOrName) : seedHandleOrName;
   const client = await connectWithTail(daemon);
   const branch = branchName(workerId(), opts.name ?? seedHandle.name, nextForkIndex(daemon));
   const ttl = opts.ttl ?? DEFAULT_TTL;

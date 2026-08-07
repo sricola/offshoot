@@ -18,10 +18,14 @@ name: publish
 # same check runs (every PR touching sdk/**, via `make dry-run-sdks`, so a
 # manifest mistake is caught long before a release tag is ever pushed). A
 # workflow_dispatch run is ALWAYS dry-run, unconditionally, even if
-# PUBLISH_ENABLED is "true": the pypi/npm jobs' publish steps require the
-# run's ref to literally start with refs/tags/sdk-v, which a dispatch run's
-# ref never does. This is intentional and load-bearing — see the comment on
-# each publish step.
+# PUBLISH_ENABLED is "true": the pypi/npm jobs' publish steps require BOTH the
+# run's ref to literally start with refs/tags/sdk-v AND github.event_name ==
+# 'push'. The ref check alone is not enough — GitHub lets a maintainer
+# dispatch a workflow_dispatch run against a tag ref (the "Use workflow from"
+# picker accepts tags, not just branches), which would make github.ref equal
+# refs/tags/sdk-v* even though nothing was pushed; the event_name check is
+# what actually rules that case out. This is intentional and load-bearing —
+# see the comment on each publish step.
 #
 # The pypi/npm jobs also each target a GitHub Environment
 # (pypi-publish/npm-publish). Both exist with no protection rules until a
@@ -50,10 +54,10 @@ jobs:
       is_tag: ${{ steps.gate.outputs.is_tag }}
       # should_publish is the AND of the two — informational only. The
       # publish steps in the pypi/npm jobs below do NOT trust this output
-      # alone; each repeats `startsWith(github.ref, 'refs/tags/sdk-v')`
-      # directly in its own `if:`, so a bug in this job's logic can't by
-      # itself turn a workflow_dispatch run into a real upload. See the
-      # CRITICAL fix note on those steps.
+      # alone; each repeats `startsWith(github.ref, 'refs/tags/sdk-v') &&
+      # github.event_name == 'push'` directly in its own `if:`, so a bug in
+      # this job's logic can't by itself turn a workflow_dispatch run into a
+      # real upload. See the CRITICAL fix note on those steps.
       should_publish: ${{ steps.gate.outputs.should_publish }}
     steps:
       - uses: actions/checkout@v4
@@ -81,11 +85,14 @@ jobs:
           echo "enabled=$enabled" >> "$GITHUB_OUTPUT"
 
           # Real uploads require BOTH: the gate on AND this run started from
-          # an sdk-v* tag push. workflow_dispatch (a branch/ref run, not a
-          # tag) is ALWAYS dry-run, even with PUBLISH_ENABLED=true — a
-          # manual "Run workflow" click must never be able to publish
-          # whatever sdk/VERSION happens to read on main as an untagged
-          # release.
+          # an sdk-v* tag push. "is_tag" alone (github.ref matching
+          # refs/tags/sdk-v*) is NOT enough to rule out workflow_dispatch —
+          # a maintainer can dispatch a workflow_dispatch run against a tag
+          # ref, which makes github.ref match here too. It's the publish
+          # steps' own `github.event_name == 'push'` check (not reproduced
+          # in this job's output — see the comment on `should_publish`
+          # above) that actually guarantees a manual "Run workflow" click
+          # can never publish, tag ref or not.
           if [ "$enabled" = "true" ] && [ "$is_tag" = "true" ]; then
             echo "publish gate is ON and this run is an sdk-v* tag push — real upload steps will run"
             echo "should_publish=true" >> "$GITHUB_OUTPUT"
@@ -137,19 +144,24 @@ jobs:
           /tmp/offshoot-pypi-install-test/bin/python3 -c "import offshoot; print('import offshoot: ok')"
 
       - name: Publish to PyPI (Trusted Publishing / OIDC)
-        # CRITICAL fix: gated on BOTH the resolved gate output AND a direct,
-        # literal re-check of the ref here — not just needs.check.outputs.
-        # should_publish. A workflow_dispatch run's ref is a branch/tag
-        # ref that is never refs/tags/sdk-v*, so this can never fire for a
-        # manual "Run workflow" click even if PUBLISH_ENABLED is "true" and
-        # even if the check job's own gating logic had a bug.
-        if: needs.check.outputs.publish_enabled == 'true' && startsWith(github.ref, 'refs/tags/sdk-v')
+        # CRITICAL fix: gated on the resolved gate output, a direct literal
+        # re-check of the ref, AND github.event_name == 'push' — not just
+        # needs.check.outputs.should_publish, and not just the ref check
+        # alone. The ref check by itself is NOT sufficient to rule out
+        # workflow_dispatch: a maintainer can dispatch a workflow_dispatch
+        # run against a tag ref (the "Use workflow from" picker accepts
+        # tags), which makes github.ref equal refs/tags/sdk-v* too. Only the
+        # event_name check distinguishes an actual tag push from that case,
+        # so this can never fire for a manual "Run workflow" click even if
+        # PUBLISH_ENABLED is "true", the run was dispatched against a
+        # matching tag, and the check job's own gating logic had a bug.
+        if: needs.check.outputs.publish_enabled == 'true' && startsWith(github.ref, 'refs/tags/sdk-v') && github.event_name == 'push'
         uses: pypa/gh-action-pypi-publish@release/v1
         with:
           packages-dir: sdk/python/dist
 
       - name: Dry-run notice
-        if: needs.check.outputs.publish_enabled != 'true' || !startsWith(github.ref, 'refs/tags/sdk-v')
+        if: needs.check.outputs.publish_enabled != 'true' || !startsWith(github.ref, 'refs/tags/sdk-v') || github.event_name != 'push'
         run: |
           if [ "${{ needs.check.outputs.publish_enabled }}" != "true" ]; then
             echo "PUBLISH_ENABLED repository variable is not 'true' — the sdist/wheel"
@@ -157,6 +169,13 @@ jobs:
             echo "uploaded to PyPI. Set PUBLISH_ENABLED=true (repo Settings > Actions >"
             echo "Variables) once the offshoot-db PyPI project exists and Trusted"
             echo "Publishing is configured for this repo+workflow — see CONTRIBUTING.md."
+          elif [ "${{ github.event_name }}" != "push" ]; then
+            echo "PUBLISH_ENABLED is 'true' and this run's ref (${{ github.ref }}) matches"
+            echo "sdk-v*, but the triggering event is '${{ github.event_name }}', not a real"
+            echo "tag push — real uploads only ever happen from an actual 'push' event on an"
+            echo "sdk-v* tag, never from workflow_dispatch (even a manual run dispatched"
+            echo "against a tag ref). Push an sdk-v<version> tag (matching sdk/VERSION) to"
+            echo "publish for real. Nothing was uploaded."
           else
             echo "PUBLISH_ENABLED is 'true', but this run's ref (${{ github.ref }}) is not"
             echo "an sdk-v* tag — real uploads only ever happen from a tag push, never from"
@@ -203,11 +222,15 @@ jobs:
 
       - name: Publish to npm (provenance)
         # CRITICAL fix: see the identical comment on the PyPI job's publish
-        # step — gated on both the resolved gate output and a direct,
-        # literal re-check of the ref, so a workflow_dispatch run can never
-        # publish for real regardless of PUBLISH_ENABLED or a bug in the
-        # check job's own logic.
-        if: needs.check.outputs.publish_enabled == 'true' && startsWith(github.ref, 'refs/tags/sdk-v')
+        # step — gated on the resolved gate output, a direct literal
+        # re-check of the ref, AND github.event_name == 'push'. The ref
+        # check alone is not enough: a workflow_dispatch run can be
+        # dispatched against a tag ref, which would make github.ref match
+        # refs/tags/sdk-v* too — only the event_name check rules that out,
+        # so this can never publish for real regardless of PUBLISH_ENABLED,
+        # what ref a manual run targets, or a bug in the check job's own
+        # logic.
+        if: needs.check.outputs.publish_enabled == 'true' && startsWith(github.ref, 'refs/tags/sdk-v') && github.event_name == 'push'
         working-directory: sdk/typescript
         run: npm publish --provenance --access public
         env:
@@ -222,7 +245,7 @@ jobs:
           NODE_AUTH_TOKEN: ${{ secrets.NPM_TOKEN }}
 
       - name: Dry-run notice
-        if: needs.check.outputs.publish_enabled != 'true' || !startsWith(github.ref, 'refs/tags/sdk-v')
+        if: needs.check.outputs.publish_enabled != 'true' || !startsWith(github.ref, 'refs/tags/sdk-v') || github.event_name != 'push'
         run: |
           if [ "${{ needs.check.outputs.publish_enabled }}" != "true" ]; then
             echo "PUBLISH_ENABLED repository variable is not 'true' — the package above"
@@ -230,6 +253,13 @@ jobs:
             echo "Set PUBLISH_ENABLED=true (repo Settings > Actions > Variables) once the"
             echo "@offshoot-db npm scope exists and registry auth (NPM_TOKEN secret, or"
             echo "Trusted Publishing once adopted) is configured — see CONTRIBUTING.md."
+          elif [ "${{ github.event_name }}" != "push" ]; then
+            echo "PUBLISH_ENABLED is 'true' and this run's ref (${{ github.ref }}) matches"
+            echo "sdk-v*, but the triggering event is '${{ github.event_name }}', not a real"
+            echo "tag push — real uploads only ever happen from an actual 'push' event on an"
+            echo "sdk-v* tag, never from workflow_dispatch (even a manual run dispatched"
+            echo "against a tag ref). Push an sdk-v<version> tag (matching sdk/VERSION) to"
+            echo "publish for real. Nothing was uploaded."
           else
             echo "PUBLISH_ENABLED is 'true', but this run's ref (${{ github.ref }}) is not"
             echo "an sdk-v* tag — real uploads only ever happen from a tag push, never from"
