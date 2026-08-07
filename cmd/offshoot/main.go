@@ -13,11 +13,11 @@ import (
 	"syscall"
 	"time"
 
-	"github.com/offshoot-db/offshoot/internal/daemon"
-	"github.com/offshoot-db/offshoot/internal/mcp"
-	"github.com/offshoot-db/offshoot/internal/ops"
-	"github.com/offshoot-db/offshoot/internal/session"
-	"github.com/offshoot-db/offshoot/internal/store"
+	"github.com/sricola/offshoot/internal/daemon"
+	"github.com/sricola/offshoot/internal/mcp"
+	"github.com/sricola/offshoot/internal/ops"
+	"github.com/sricola/offshoot/internal/session"
+	"github.com/sricola/offshoot/internal/store"
 )
 
 // version is the offshoot release version, embedded at build time via

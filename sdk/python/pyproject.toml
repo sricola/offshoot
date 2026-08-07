@@ -33,11 +33,11 @@ classifiers = [
 dependencies = []
 
 [project.urls]
-Homepage = "https://github.com/offshoot-db/offshoot"
-Repository = "https://github.com/offshoot-db/offshoot"
-Issues = "https://github.com/offshoot-db/offshoot/issues"
-Changelog = "https://github.com/offshoot-db/offshoot/blob/main/CHANGELOG.md"
-Documentation = "https://github.com/offshoot-db/offshoot/blob/main/docs/eval-harness.md"
+Homepage = "https://github.com/sricola/offshoot"
+Repository = "https://github.com/sricola/offshoot"
+Issues = "https://github.com/sricola/offshoot/issues"
+Changelog = "https://github.com/sricola/offshoot/blob/main/CHANGELOG.md"
+Documentation = "https://github.com/sricola/offshoot/blob/main/docs/eval-harness.md"
 
 # `offshoot-db[pytest]` is the only way pytest becomes a dependency: the
 # base client (`pip install offshoot-db`) stays stdlib-only. The pytest11

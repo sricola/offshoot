@@ -3,7 +3,7 @@ package session
 import (
 	"testing"
 
-	"github.com/offshoot-db/offshoot/internal/wal"
+	"github.com/sricola/offshoot/internal/wal"
 )
 
 func frame(pgno uint32, b byte) wal.Frame {

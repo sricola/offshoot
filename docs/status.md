@@ -32,17 +32,23 @@ blocked only on the button-press:
 
 | Item | Ready since | Blocked on |
 |---|---|---|
-| Transfer the repo to the `offshoot-db` GitHub org | [Milestone 1](../ROADMAP.md#milestone-1--installable-and-trustworthy) scoped it | `go.mod` already declares `github.com/offshoot-db/offshoot`; the repo currently lives at a personal remote — `go install` against the declared module path 404s until the transfer happens |
 | Claim `offshoot-db` on PyPI and the `@offshoot-db` npm scope | Milestone 3 Task 7 — manifests filled out, publish pipeline built and dry-run-verified | This page's own [SDK publish-pipeline row](#integration-surface): real sdist/wheel/npm-tarball builds pass `twine check`/`npm pack` today; only the actual name claim + Trusted Publishing/`NPM_TOKEN` configuration + flipping the `PUBLISH_ENABLED` repository variable are outstanding (see [CONTRIBUTING.md](../CONTRIBUTING.md)'s Release process) |
 | Submit the MCP registry listing | Milestone 3 — `server.json` drafted in-repo | [docs/launch/mcp-registry.md](launch/mcp-registry.md): the current registry schema needs to be fetched and validated against at submission time, not assumed from this repo's own docs — explicitly not to be submitted as-is |
 | Submit the LangGraph community-integration PR | Milestone 3 — PR title/description/listing-table entry drafted | [docs/launch/langgraph-listing.md](launch/langgraph-listing.md): blocked on the PyPI publication above, since its install command needs to actually resolve |
-| Claim a domain, the Homebrew formula name, a `docker` image namespace | [Milestone 1](../ROADMAP.md#milestone-1--installable-and-trustworthy)'s "Claim the names" / "Release engineering" bullets | Not started this pass — no goreleaser config, Homebrew tap, or container image exist yet in this repo; [docs/recipes/kubernetes.md](recipes/kubernetes.md)'s sidecar manifest uses an illustrative, unpublished `ghcr.io/offshoot-db/offshoot:latest` tag for exactly this reason — build your own image until this row flips |
+| Claim a domain, the Homebrew formula name, a `docker` image namespace | [Milestone 1](../ROADMAP.md#milestone-1--installable-and-trustworthy)'s "Claim the names" / "Release engineering" bullets | Not started this pass — no goreleaser config, Homebrew tap, or container image exist yet in this repo; [docs/recipes/kubernetes.md](recipes/kubernetes.md)'s sidecar manifest uses an illustrative, unpublished `ghcr.io/sricola/offshoot:latest` tag for exactly this reason — build your own image until this row flips |
 | Trademark/collision check on "offshoot" in dev tooling | [Milestone 1](../ROADMAP.md#milestone-1--installable-and-trustworthy) | Not started this pass |
 
 **Not on this list on purpose:** the launch demo assets (asciinema of
 parallel attempts, the MCP-in-Claude-Code walkthrough) are explicitly *not*
 user-gated per the Milestone 4 plan's PM Amendment 13 — they were recorded
 alongside Task 1 and merged to `main` already, no further action needed.
+Also not on this list: the module-path/org mismatch that used to block `go
+install` — the repo lives at `github.com/sricola/offshoot`, not the
+aspirational `offshoot-db` org, so `go.mod` and every import/doc/workflow
+reference were retargeted to `sricola` instead of waiting on an org
+transfer (`go install github.com/sricola/offshoot/cmd/offshoot@latest`
+resolves today). PyPI/npm registry names are unaffected — those stay
+`offshoot-db`/`@offshoot-db` and are tracked in the row above.
 
 ## Core model
 

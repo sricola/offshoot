@@ -27,12 +27,12 @@ here for the walkthrough.
 
 offshoot ships as one static-ish Go binary (cgo for the SQLite driver) plus
 thin SDKs. Today, that means building from source; tagged binaries land on
-the project's [GitHub releases](https://github.com/offshoot-db/offshoot/releases)
+the project's [GitHub releases](https://github.com/sricola/offshoot/releases)
 page starting with the first 0.1.x tag — check there first if you'd rather
 not build.
 
 ```
-git clone https://github.com/offshoot-db/offshoot
+git clone https://github.com/sricola/offshoot
 cd offshoot
 go build -o offshoot ./cmd/offshoot
 ```

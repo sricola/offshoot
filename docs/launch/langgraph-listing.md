@@ -20,7 +20,7 @@ install command, and submit from there.
 
 > Adds `offshoot`'s `ThreadForks` to the community integrations list.
 >
-> `offshoot` (https://github.com/offshoot-db/offshoot) is git-like branching
+> `offshoot` (https://github.com/sricola/offshoot) is git-like branching
 > for SQLite: fork a database instantly, checkpoint it, roll back, promote a
 > winning attempt — all as CAS-safe operations over a plain SQLite file, with
 > a small Python/TypeScript client and a Rust-free, dependency-light Go
@@ -60,7 +60,7 @@ install command, and submit from there.
 
 | Name | What it does | Install | Links |
 |---|---|---|---|
-| `offshoot` (`ThreadForks`) | Forks the SQLite database a thread's tools wrote to whenever the thread itself is rewound/forked, so a retried path starts from the exact data the original had at that checkpoint. | `pip install offshoot-db` | [Repo](https://github.com/offshoot-db/offshoot) · [Example](https://github.com/offshoot-db/offshoot/tree/main/examples/langgraph-rewind) · [Docs](https://github.com/offshoot-db/offshoot#readme) |
+| `offshoot` (`ThreadForks`) | Forks the SQLite database a thread's tools wrote to whenever the thread itself is rewound/forked, so a retried path starts from the exact data the original had at that checkpoint. | `pip install offshoot-db` | [Repo](https://github.com/sricola/offshoot) · [Example](https://github.com/sricola/offshoot/tree/main/examples/langgraph-rewind) · [Docs](https://github.com/sricola/offshoot#readme) |
 
 ## Pre-submission checklist (fill in when this actually ships)
 

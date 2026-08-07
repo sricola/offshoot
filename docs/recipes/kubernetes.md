@@ -96,7 +96,7 @@ spec:
             claimName: offshoot-store-pvc # swap for an s3:// store + Secret; see the recipe doc
       containers:
         - name: offshoot
-          image: ghcr.io/offshoot-db/offshoot:latest # illustrative tag — pin a real release
+          image: ghcr.io/sricola/offshoot:latest # illustrative tag — pin a real release
           args:
             - serve
             - -socket=/offshoot/run/o.sock
@@ -151,7 +151,7 @@ spec:
 Notes on the illustrative pieces above, spelled out rather than left to
 guesswork:
 
-- `ghcr.io/offshoot-db/offshoot:latest` and `your-agent-image:latest` are
+- `ghcr.io/sricola/offshoot:latest` and `your-agent-image:latest` are
   placeholders — offshoot does not (yet) publish a container image as part
   of this milestone; see [docs/status.md](../status.md)'s publish-pipeline
   row for what *is* actually published today (source + SDKs). Build your

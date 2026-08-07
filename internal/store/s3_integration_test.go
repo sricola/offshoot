@@ -7,8 +7,8 @@ import (
 	"os"
 	"testing"
 
-	"github.com/offshoot-db/offshoot/internal/store"
-	"github.com/offshoot-db/offshoot/internal/store/storetest"
+	"github.com/sricola/offshoot/internal/store"
+	"github.com/sricola/offshoot/internal/store/storetest"
 )
 
 // TestS3RealProvider runs the full Backend conformance suite and the CAS

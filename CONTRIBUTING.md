@@ -222,21 +222,19 @@ on.
   `NODE_AUTH_TOKEN` env var from the `npm` job. Not done yet; `NPM_TOKEN`
   is the working path today.
 - `PUBLISH_ENABLED=true` set as a repository variable.
-- **The org transfer must have happened.** `sdk/python/pyproject.toml`'s
-  `[project.urls]`, `sdk/typescript/package.json`'s `repository`/`homepage`/
-  `bugs`, and `server.json`'s `repository.url` all currently point at
-  `github.com/offshoot-db/offshoot` — the repo's actual remote today is
-  `github.com/sricola/offshoot` (`git remote -v`); `offshoot-db` is the
-  planned org this repo will be transferred into, not yet where it lives.
-  `npm publish --provenance` independently verifies that `package.json`'s
-  `repository.url` matches the repo the publish is actually running from (it
-  builds the provenance attestation from the real GitHub OIDC claims) — so
-  publishing from `sricola/offshoot` with the manifest still pointing at
-  `offshoot-db/offshoot` **hard-fails the npm publish step**, not just
-  "publishes with a wrong link." Do NOT edit these URLs to `sricola/offshoot`
-  as a workaround — the org transfer is the actual plan; update the
-  manifests (and re-verify `server.json`, since MCP clients resolve it by
-  the same slug) once the transfer has happened, then publish.
+- **No org transfer needed — the manifests already match the real repo.**
+  `sdk/python/pyproject.toml`'s `[project.urls]`, `sdk/typescript/package.json`'s
+  `repository`/`homepage`/`bugs`, and `server.json`'s `repository.url` all
+  point at `github.com/sricola/offshoot` — the repo's actual remote today
+  (`git remote -v`). `npm publish --provenance` independently verifies that
+  `package.json`'s `repository.url` matches the repo the publish is actually
+  running from (it builds the provenance attestation from the real GitHub
+  OIDC claims), so publishing from `sricola/offshoot` with the manifest
+  already pointing at `sricola/offshoot` passes that check with nothing
+  further to do here. Only the PyPI/npm name-claims and `PUBLISH_ENABLED`
+  above are still outstanding; the package registry names themselves stay
+  `offshoot-db` (PyPI) and `@offshoot-db` (npm) — those are unrelated to the
+  repo's GitHub identity and are not being renamed.
 
 Claiming both names is a manual, one-time, user-side action tracked as a
 deliberately-out-of-band item in [ROADMAP.md](ROADMAP.md) and

@@ -5,7 +5,7 @@ import (
 	"testing"
 	"time"
 
-	"github.com/offshoot-db/offshoot/internal/store"
+	"github.com/sricola/offshoot/internal/store"
 )
 
 // These tests pin the two halves of Reap's CAS-claim invariant directly,

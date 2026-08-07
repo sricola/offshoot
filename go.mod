@@ -1,4 +1,4 @@
-module github.com/offshoot-db/offshoot
+module github.com/sricola/offshoot
 
 go 1.24.0
 

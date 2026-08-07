@@ -7,7 +7,7 @@ import (
 	"sort"
 	"time"
 
-	"github.com/offshoot-db/offshoot/internal/store"
+	"github.com/sricola/offshoot/internal/store"
 )
 
 // Reap destroys every branch whose TTL has expired. Per the spec: a live

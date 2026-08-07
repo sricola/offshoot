@@ -15,8 +15,8 @@ import (
 	"testing"
 
 	_ "github.com/mattn/go-sqlite3"
-	"github.com/offshoot-db/offshoot/internal/store"
-	"github.com/offshoot-db/offshoot/internal/store/storetest"
+	"github.com/sricola/offshoot/internal/store"
+	"github.com/sricola/offshoot/internal/store/storetest"
 )
 
 // captureStderr redirects os.Stderr for the duration of fn and returns

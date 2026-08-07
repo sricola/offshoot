@@ -13,8 +13,8 @@ import (
 	"time"
 
 	_ "github.com/mattn/go-sqlite3"
-	"github.com/offshoot-db/offshoot/internal/replay"
-	"github.com/offshoot-db/offshoot/internal/wal"
+	"github.com/sricola/offshoot/internal/replay"
+	"github.com/sricola/offshoot/internal/wal"
 )
 
 type replicaSink struct{ r *replay.Replica }

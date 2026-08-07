@@ -8,7 +8,7 @@ import (
 	"os"
 	"os/exec"
 
-	"github.com/offshoot-db/offshoot/internal/wal"
+	"github.com/sricola/offshoot/internal/wal"
 )
 
 type Replica struct {

@@ -5,8 +5,8 @@ import (
 	"fmt"
 	"io"
 
-	"github.com/offshoot-db/offshoot/internal/ltxio"
-	"github.com/offshoot-db/offshoot/internal/store"
+	"github.com/sricola/offshoot/internal/ltxio"
+	"github.com/sricola/offshoot/internal/store"
 )
 
 // materializeChainAt writes the state of ref's lineage at cp into dst by

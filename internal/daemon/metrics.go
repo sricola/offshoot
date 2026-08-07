@@ -5,9 +5,9 @@ import (
 	"sort"
 	"time"
 
-	"github.com/offshoot-db/offshoot/internal/metrics"
-	"github.com/offshoot-db/offshoot/internal/ops"
-	"github.com/offshoot-db/offshoot/internal/session"
+	"github.com/sricola/offshoot/internal/metrics"
+	"github.com/sricola/offshoot/internal/ops"
+	"github.com/sricola/offshoot/internal/session"
 )
 
 // Metrics is this daemon's metrics registry plus typed handles to every
