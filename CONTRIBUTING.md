@@ -176,6 +176,28 @@ deliberately-out-of-band item in [ROADMAP.md](ROADMAP.md) and
 [docs/status.md](docs/status.md) — not something a PR against this repo
 can do on its own.
 
+**`PUBLISH_ENABLED=true` alone is not enough to publish anything.** A real
+upload additionally requires the workflow run itself to be an `sdk-v*` tag
+push — `workflow_dispatch` (a manual "Run workflow" click) is *always*
+dry-run, unconditionally, even with the gate on, because a dispatch run has
+no tag to publish and would otherwise burn whatever version `sdk/VERSION`
+happens to read on the branch it was run against. Both the `pypi` and `npm`
+jobs' actual upload steps check this directly (`startsWith(github.ref,
+'refs/tags/sdk-v')`), not just the `check` job's resolved output, so the
+guard survives even a bug in that job's own gating logic.
+
+**Optional extra gate: GitHub Environments.** `publish.yml`'s `pypi` and
+`npm` jobs each target a GitHub Environment (`pypi-publish`,
+`npm-publish` respectively). Both exist with no protection rules the first
+time the workflow runs, until a maintainer adds one — configuring required
+reviewers on either (repo Settings > Environments > `pypi-publish` /
+`npm-publish` > required reviewers) is a one-click way to require a human
+approval on top of the tag+`PUBLISH_ENABLED` gate before that job's steps
+run at all. Like the two name claims and the `PUBLISH_ENABLED` flip, this is
+a manual, user-side action this repo's PRs can't do on their own — worth
+doing before the first real release, not required for the pipeline to be
+correct without it.
+
 ## What's most welcome right now
 
 - **Docs.** The gap between what's implemented and what the design spec
