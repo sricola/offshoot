@@ -8,8 +8,8 @@ import (
 	"path/filepath"
 	"testing"
 
-	"github.com/offshoot-db/offshoot/internal/ltxio"
-	"github.com/offshoot-db/offshoot/internal/store"
+	"github.com/sricola/offshoot/internal/ltxio"
+	"github.com/sricola/offshoot/internal/store"
 )
 
 // TestCheckoutReadsASnapshotPlusSegments builds a chain by hand in the store

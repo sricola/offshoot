@@ -7,7 +7,7 @@ import (
 	"testing"
 	"time"
 
-	"github.com/offshoot-db/offshoot/internal/store"
+	"github.com/sricola/offshoot/internal/store"
 )
 
 func TestWorkspaceLeaseLifecycle(t *testing.T) {

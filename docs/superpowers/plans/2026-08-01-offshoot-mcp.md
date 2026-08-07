@@ -12,7 +12,7 @@
 
 ## Global Constraints
 
-- Module `github.com/offshoot-db/offshoot`; Go 1.24+; cgo (mattn); Linux/macOS only
+- Module `github.com/sricola/offshoot`; Go 1.24+; cgo (mattn); Linux/macOS only
 - **No new module dependencies** — the MCP server is stdlib-only over the existing internal packages
 - MCP transport is stdio, one JSON-RPC 2.0 message per line, requests and responses framed as newline-delimited JSON; the server MUST NOT write anything but protocol messages to stdout (diagnostics go to stderr — a stray print corrupts the session)
 - **Dual protocol support (decided 2026-08-01):** the server speaks BOTH the legacy `initialize`/`tools/list` handshake (2025-11-25) and the current 2026-07-28 revision (per-request `_meta` versioning, `server/discover`); a client on either is served correctly
@@ -363,7 +363,7 @@ import (
 	"strings"
 	"testing"
 
-	"github.com/offshoot-db/offshoot/internal/ops"
+	"github.com/sricola/offshoot/internal/ops"
 )
 
 func newTools(t *testing.T) (*OffshootTools, *ops.Workspace) {

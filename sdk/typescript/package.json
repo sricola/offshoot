@@ -23,12 +23,12 @@
   "engines": { "node": ">=20" },
   "repository": {
     "type": "git",
-    "url": "git+https://github.com/offshoot-db/offshoot.git",
+    "url": "git+https://github.com/sricola/offshoot.git",
     "directory": "sdk/typescript"
   },
-  "homepage": "https://github.com/offshoot-db/offshoot#readme",
+  "homepage": "https://github.com/sricola/offshoot#readme",
   "bugs": {
-    "url": "https://github.com/offshoot-db/offshoot/issues"
+    "url": "https://github.com/sricola/offshoot/issues"
   },
   "keywords": [
     "sqlite",

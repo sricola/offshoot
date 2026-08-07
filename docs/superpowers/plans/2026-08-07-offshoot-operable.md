@@ -10,7 +10,7 @@
 
 ## Global Constraints
 
-- Module `github.com/offshoot-db/offshoot`; cgo; Linux/macOS; **no new dependencies** (the Prometheus text format is hand-rolled; SSE is stdlib)
+- Module `github.com/sricola/offshoot`; cgo; Linux/macOS; **no new dependencies** (the Prometheus text format is hand-rolled; SSE is stdlib)
 - HTTP is OFF by default; `serve -http 127.0.0.1:PORT` binds loopback; any non-loopback bind additionally requires `-http-allow-non-loopback` (named ack flag) AND a token; token from `-token`/`OFFSHOOT_TOKEN`, else auto-generated and printed ONCE to stderr at startup; every HTTP request requires `Authorization: Bearer <token>` except `/healthz`
 - The unix socket keeps working exactly as today with zero configuration — HTTP is additive, never required
 - Eventing must never block the daemon: slow subscribers get bounded buffers and are DROPPED with a terminal event, never back-pressure a session or the janitor

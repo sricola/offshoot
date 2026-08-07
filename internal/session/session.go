@@ -12,12 +12,12 @@ import (
 	"sync"
 	"time"
 
-	"github.com/offshoot-db/offshoot/internal/capture"
-	"github.com/offshoot-db/offshoot/internal/ltxio"
-	"github.com/offshoot-db/offshoot/internal/ops"
-	"github.com/offshoot-db/offshoot/internal/replay"
-	"github.com/offshoot-db/offshoot/internal/store"
-	"github.com/offshoot-db/offshoot/internal/wal"
+	"github.com/sricola/offshoot/internal/capture"
+	"github.com/sricola/offshoot/internal/ltxio"
+	"github.com/sricola/offshoot/internal/ops"
+	"github.com/sricola/offshoot/internal/replay"
+	"github.com/sricola/offshoot/internal/store"
+	"github.com/sricola/offshoot/internal/wal"
 )
 
 // DefaultSnapshotEvery is Options.SnapshotEvery's default: a full snapshot

@@ -7,8 +7,8 @@ import (
 	"testing"
 	"time"
 
-	"github.com/offshoot-db/offshoot/internal/ops"
-	"github.com/offshoot-db/offshoot/internal/store"
+	"github.com/sricola/offshoot/internal/ops"
+	"github.com/sricola/offshoot/internal/store"
 )
 
 func TestRenewKeepsLeaseAliveBeyondTTL(t *testing.T) {

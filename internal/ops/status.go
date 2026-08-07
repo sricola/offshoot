@@ -7,7 +7,7 @@ import (
 	"sync"
 	"time"
 
-	"github.com/offshoot-db/offshoot/internal/store"
+	"github.com/sricola/offshoot/internal/store"
 )
 
 // BranchStatus is one branch's row in Status()'s output.

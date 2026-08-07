@@ -10,7 +10,7 @@
 
 ## Global Constraints
 
-- Module `github.com/offshoot-db/offshoot`; Go 1.24+; cgo (mattn); Linux/macOS only; **no new Go module dependencies**
+- Module `github.com/sricola/offshoot`; Go 1.24+; cgo (mattn); Linux/macOS only; **no new Go module dependencies**
 - Python SDK: **stdlib only** (socket, json, subprocess for tests), Python 3.10+; TypeScript SDK: **zero runtime dependencies**, Node 20+, `typescript`/`@types/node` as devDependencies only
 - Ref changes are backward compatible: new fields are optional with `omitempty`, **no schema bump** — a Plan-7 ref decodes unchanged and means "no TTL, never reaped"
 - **A branch with a live lease is never reaped**; expiry defers until the lease is released or times out (spec: TTL measured from the last durable write or lease renewal, whichever is later; `offshoot touch` resets it explicitly; creating a child does not extend the parent; branches without a TTL live until destroyed)
@@ -256,7 +256,7 @@ import (
 	"fmt"
 	"time"
 
-	"github.com/offshoot-db/offshoot/internal/store"
+	"github.com/sricola/offshoot/internal/store"
 )
 
 // Touch resets a branch's activity clock, and optionally sets (ttl > 0) or
@@ -347,7 +347,7 @@ import (
 	"testing"
 	"time"
 
-	"github.com/offshoot-db/offshoot/internal/store"
+	"github.com/sricola/offshoot/internal/store"
 )
 
 func setTTLAt(t *testing.T, w *Workspace, db, branch, ttl, touchedAt string) {

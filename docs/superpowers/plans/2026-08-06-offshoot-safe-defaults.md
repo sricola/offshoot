@@ -10,7 +10,7 @@
 
 ## Global Constraints
 
-- Module `github.com/offshoot-db/offshoot`; Go 1.24+; cgo (mattn); Linux/macOS only; **no new dependencies except `golang.org/x/sys`** (see above)
+- Module `github.com/sricola/offshoot`; Go 1.24+; cgo (mattn); Linux/macOS only; **no new dependencies except `golang.org/x/sys`** (see above)
 - **A branch must always be materializable to exactly the bytes that were flushed** — the fast-path fork must produce byte-identical results to the slow path, proven by test
 - Auto-flush must never weaken flush semantics: it calls the same `Flush` path (target-based drain, `ErrDrainIncomplete` loud, ErrCAS-gated cleanup); a failed auto-flush surfaces in `session status`, does not kill the session, and the next tick retries
 - Any change under `internal/capture` or `internal/session`'s flush path requires a `make test-torture` run with numbers reported before the task completes

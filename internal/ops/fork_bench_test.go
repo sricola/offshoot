@@ -16,9 +16,9 @@ import (
 	"testing"
 
 	_ "github.com/mattn/go-sqlite3"
-	"github.com/offshoot-db/offshoot/internal/ops"
-	"github.com/offshoot-db/offshoot/internal/session"
-	"github.com/offshoot-db/offshoot/internal/store"
+	"github.com/sricola/offshoot/internal/ops"
+	"github.com/sricola/offshoot/internal/session"
+	"github.com/sricola/offshoot/internal/store"
 )
 
 // benchSize is one entry in the size table every benchmark in this file

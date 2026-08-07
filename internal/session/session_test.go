@@ -11,7 +11,7 @@ import (
 	"testing"
 	"time"
 
-	"github.com/offshoot-db/offshoot/internal/ops"
+	"github.com/sricola/offshoot/internal/ops"
 )
 
 // captureStderr redirects os.Stderr for the duration of fn and returns

@@ -12,7 +12,7 @@
 
 ## Global Constraints
 
-- Module `github.com/offshoot-db/offshoot`; Go 1.24+; cgo (mattn); Linux/macOS only
+- Module `github.com/sricola/offshoot`; Go 1.24+; cgo (mattn); Linux/macOS only
 - `Backend` contract is fixed by Plan 2 and MUST NOT change: `Get(key) (data []byte, etag string, err error)`, `Put(key, data) error`, `PutIf(key, data, ifMatch string) (etag string, err error)` where `ifMatch==""` means create-only, `List(prefix) ([]string, error)` sorted, `Delete(key) error` idempotent; sentinels `store.ErrNotFound`, `store.ErrCAS`
 - Every ref mutation in `internal/ops` already goes through `PutIf`; this plan changes no `ops` logic
 - **Supported stores are only those the probe passes** — the spec names AWS S3, Cloudflare R2, Tigris, MinIO, and explicitly excludes GCS's S3-interop API (no CAS on writes). Never claim "any S3-compatible"
@@ -79,7 +79,7 @@ import (
 	"sync"
 	"testing"
 
-	"github.com/offshoot-db/offshoot/internal/store"
+	"github.com/sricola/offshoot/internal/store"
 )
 
 // RunConformance exercises the full Backend contract.
@@ -238,8 +238,8 @@ package store_test
 import (
 	"testing"
 
-	"github.com/offshoot-db/offshoot/internal/store"
-	"github.com/offshoot-db/offshoot/internal/store/storetest"
+	"github.com/sricola/offshoot/internal/store"
+	"github.com/sricola/offshoot/internal/store/storetest"
 )
 
 func TestLocalConformance(t *testing.T) {
@@ -588,8 +588,8 @@ import (
 	"context"
 	"testing"
 
-	"github.com/offshoot-db/offshoot/internal/store"
-	"github.com/offshoot-db/offshoot/internal/store/storetest"
+	"github.com/sricola/offshoot/internal/store"
+	"github.com/sricola/offshoot/internal/store/storetest"
 )
 
 // newFakeBacked returns an S3 backend pointed at a fresh in-process fake.
@@ -932,8 +932,8 @@ import (
 	"errors"
 	"testing"
 
-	"github.com/offshoot-db/offshoot/internal/store"
-	"github.com/offshoot-db/offshoot/internal/store/storetest"
+	"github.com/sricola/offshoot/internal/store"
+	"github.com/sricola/offshoot/internal/store/storetest"
 )
 
 func TestProbeCASPassesLocal(t *testing.T) {
@@ -1108,8 +1108,8 @@ import (
 	"strings"
 	"testing"
 
-	"github.com/offshoot-db/offshoot/internal/store"
-	"github.com/offshoot-db/offshoot/internal/store/storetest"
+	"github.com/sricola/offshoot/internal/store"
+	"github.com/sricola/offshoot/internal/store/storetest"
 )
 
 func TestOpenBackendLocalPath(t *testing.T) {
@@ -1360,7 +1360,7 @@ func TestInitAndOpenAgainstS3Spec(t *testing.T) {
 }
 ```
 
-(add `"github.com/offshoot-db/offshoot/internal/store/storetest"`, `"os"`, `"strings"` to the test imports if missing — note `internal/ops` tests are in package `ops`, and `storetest` imports only `store`, so there is no cycle)
+(add `"github.com/sricola/offshoot/internal/store/storetest"`, `"os"`, `"strings"` to the test imports if missing — note `internal/ops` tests are in package `ops`, and `storetest` imports only `store`, so there is no cycle)
 
 - [ ] **Step 6: Update CLI usage text**
 
@@ -1416,8 +1416,8 @@ import (
 	"os"
 	"testing"
 
-	"github.com/offshoot-db/offshoot/internal/store"
-	"github.com/offshoot-db/offshoot/internal/store/storetest"
+	"github.com/sricola/offshoot/internal/store"
+	"github.com/sricola/offshoot/internal/store/storetest"
 )
 
 // TestS3RealProvider runs the full Backend conformance suite and the CAS

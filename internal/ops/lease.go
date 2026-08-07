@@ -6,7 +6,7 @@ import (
 	"sort"
 	"time"
 
-	"github.com/offshoot-db/offshoot/internal/store"
+	"github.com/sricola/offshoot/internal/store"
 )
 
 // DefaultLeaseTTL is how long an acquired lease stays valid without renewal.

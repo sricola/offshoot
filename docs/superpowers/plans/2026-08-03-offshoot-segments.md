@@ -12,7 +12,7 @@
 
 ## Global Constraints
 
-- Module `github.com/offshoot-db/offshoot`; Go 1.24+; cgo (mattn); Linux/macOS only; no new module dependencies
+- Module `github.com/sricola/offshoot`; Go 1.24+; cgo (mattn); Linux/macOS only; no new module dependencies
 - **A branch must always be materializable to exactly the bytes that were flushed** — this plan changes how state is stored, never what state a reader sees; the equivalence tests are the contract
 - Segments are immutable and epoch-fenced exactly like snapshots: `data/{lineage}/{epoch}/…`, written create-only, never rewritten
 - **Materialization must be bounded:** the number of segments replayed for any read is capped by the snapshot cadence, and the cap is asserted by a test, not assumed
@@ -558,8 +558,8 @@ import (
 	"os/exec"
 	"testing"
 
-	"github.com/offshoot-db/offshoot/internal/ltxio"
-	"github.com/offshoot-db/offshoot/internal/store"
+	"github.com/sricola/offshoot/internal/ltxio"
+	"github.com/sricola/offshoot/internal/store"
 )
 
 // TestCheckoutReadsASnapshotPlusSegments builds a chain by hand in the store
@@ -739,7 +739,7 @@ package session
 import (
 	"testing"
 
-	"github.com/offshoot-db/offshoot/internal/wal"
+	"github.com/sricola/offshoot/internal/wal"
 )
 
 func frame(pgno uint32, b byte) wal.Frame {
@@ -881,7 +881,7 @@ func TestSnapshotEveryOneKeepsOldBehavior(t *testing.T) {
 }
 ```
 
-(add `"github.com/offshoot-db/offshoot/internal/store"` to that file's imports if missing)
+(add `"github.com/sricola/offshoot/internal/store"` to that file's imports if missing)
 
 - [ ] **Step 2: Run to verify they fail**
 
@@ -1077,7 +1077,7 @@ import (
 	"testing"
 	"time"
 
-	"github.com/offshoot-db/offshoot/internal/ops"
+	"github.com/sricola/offshoot/internal/ops"
 )
 
 // TestEveryFlushIsExactlyMaterializable is the format change's core contract:

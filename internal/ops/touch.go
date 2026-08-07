@@ -5,7 +5,7 @@ import (
 	"fmt"
 	"time"
 
-	"github.com/offshoot-db/offshoot/internal/store"
+	"github.com/sricola/offshoot/internal/store"
 )
 
 // Touch resets a branch's activity clock, and optionally sets (ttl > 0) or

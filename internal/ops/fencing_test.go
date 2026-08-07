@@ -6,7 +6,7 @@ import (
 	"testing"
 	"time"
 
-	"github.com/offshoot-db/offshoot/internal/store"
+	"github.com/sricola/offshoot/internal/store"
 )
 
 // TestStaleWriterCannotCorruptLineage simulates the pause-and-resume hazard:

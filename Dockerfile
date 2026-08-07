@@ -37,7 +37,7 @@ COPY --from=build /out/offshoot /usr/local/bin/offshoot
 # OFFSHOOT_STORE there (or pass -store) to persist state across container
 # restarts, e.g.:
 #
-#   docker run -v offshoot-data:/data -e OFFSHOOT_STORE=/data ghcr.io/offshoot-db/offshoot init
+#   docker run -v offshoot-data:/data -e OFFSHOOT_STORE=/data ghcr.io/sricola/offshoot init
 #
 # /data is also set as VOLUME below so state is not silently lost even if
 # the caller forgets -v; anonymous volumes still don't survive `docker rm

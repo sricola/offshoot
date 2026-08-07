@@ -11,7 +11,7 @@ import (
 	"strings"
 	"time"
 
-	"github.com/offshoot-db/offshoot/internal/ops/reflink"
+	"github.com/sricola/offshoot/internal/ops/reflink"
 )
 
 // Local is a directory-backed Backend. CAS is implemented with a per-key

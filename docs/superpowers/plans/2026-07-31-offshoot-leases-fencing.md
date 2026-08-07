@@ -12,7 +12,7 @@
 
 ## Global Constraints
 
-- Module `github.com/offshoot-db/offshoot`; Go 1.24+; cgo (mattn); Linux/macOS only
+- Module `github.com/sricola/offshoot`; Go 1.24+; cgo (mattn); Linux/macOS only
 - `Backend` contract is fixed and MUST NOT change: `Get`/`Put`/`PutIf(key,data,ifMatch)`/`List`/`Delete`, sentinels `ErrNotFound`, `ErrCAS`
 - **One writer per lineage, for its entire life** — every repoint (fork/rollback/promote) mints a fresh lineage; this plan does not change that
 - **Epoch invariant:** acquiring or reclaiming a branch bumps `Ref.Epoch`; every object write lands under the current epoch; a write under a superseded epoch must be unreachable, never corrupting
@@ -757,7 +757,7 @@ import (
 	"testing"
 	"time"
 
-	"github.com/offshoot-db/offshoot/internal/store"
+	"github.com/sricola/offshoot/internal/store"
 )
 
 // TestStaleWriterCannotCorruptLineage simulates the pause-and-resume hazard:
@@ -949,7 +949,7 @@ import (
 	"testing"
 	"time"
 
-	"github.com/offshoot-db/offshoot/internal/store"
+	"github.com/sricola/offshoot/internal/store"
 )
 
 func TestWorkspaceLeaseLifecycle(t *testing.T) {
@@ -1033,7 +1033,7 @@ import (
 	"sort"
 	"time"
 
-	"github.com/offshoot-db/offshoot/internal/store"
+	"github.com/sricola/offshoot/internal/store"
 )
 
 // DefaultLeaseTTL is how long an acquired lease stays valid without renewal.
