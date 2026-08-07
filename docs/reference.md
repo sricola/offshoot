@@ -551,12 +551,13 @@ Releases the branch's current lease (looked up first via the same listing
 
 **Errors:** no lease currently held on that branch.
 
-## `offshoot serve [-socket PATH] [-reap-every DURATION] [-gc-grace DURATION] [-flush-every DURATION] [-ro-cache-budget BYTES] [-http ADDR] [-token TOKEN] [-http-allow-non-loopback]`
+## `offshoot serve [-socket PATH] [-reap-every DURATION] [-gc-grace DURATION] [-flush-every DURATION] [-snapshot-every N] [-ro-cache-budget BYTES] [-http ADDR] [-token TOKEN] [-http-allow-non-loopback]`
 
 ```
 offshoot serve
 offshoot serve -socket /tmp/o.sock
 offshoot serve -reap-every 1m -gc-grace 15m -flush-every 30s   # all three are the defaults
+offshoot serve -snapshot-every 4                                # snapshot every 4th flush instead of every 16th
 offshoot serve -http 127.0.0.1:8080                            # opt-in HTTP: token auto-generated, printed once
 OFFSHOOT_TOKEN=$(openssl rand -hex 32) offshoot serve -http 127.0.0.1:8080
 ```
@@ -590,8 +591,30 @@ of everything since the last manual flush. See [What a flush
 costs](../README.md#what-a-flush-costs) in the README for what a background
 flush (and every session's mandatory first "settling" flush) actually cost.
 
+`-snapshot-every N` sets the full-snapshot cadence
+(`session.Options.SnapshotEvery`) applied to every session this daemon
+opens (default `16`, unchanged if the flag is omitted; must be `>= 1` —
+there is no "unlimited"/"disabled" sentinel the way `-flush-every 0`
+disables auto-flush, since every flush must eventually snapshot).
+`Options.SnapshotEvery` has been configurable in the embeddable session
+library since Milestone 2; this flag is what exposes the same knob to a
+daemon-managed session, closing the gap the design spec's original
+taxonomy left open. See [What a flush
+costs](../README.md#what-a-flush-costs) in the README for the cost
+trade-off this cadence controls: a **lower** N (more frequent snapshots)
+means cheaper, bounded reads (a chain never replays more than N-1
+segments past its snapshot) at the cost of shipping a full-database
+upload on every Nth flush instead of an incremental segment; a **higher**
+N amortizes that upload cost across more flushes but lets read-side
+replay grow proportionally longer between snapshots. There is no single
+right answer — it is a bandwidth/write-cost vs. read-latency trade-off
+tuned to a workload's actual write-vs-read ratio, the same trade-off
+[docs/benchmarks.md](../docs/benchmarks.md) measures at the library's
+default of 16.
+
 **Errors:** socket path already in use by another listener; underlying
 store-attach failure; `-flush-every` given a negative duration;
+`-snapshot-every` given a value less than 1, or a non-integer;
 `-ro-cache-budget` given a negative value.
 
 ### `-ro-cache-budget BYTES` — checkouts-ro disk budget (Milestone 4 Task 5)
@@ -1068,5 +1091,5 @@ check it against an allow-list beyond requiring it be absolute.
 
 See [docs/status.md](status.md) for the full implemented/deferred matrix
 and links to the roadmap milestones tracking each — e.g. the FD budget
-with idle-checkout eviction and `SnapshotEvery` tuning via the daemon,
-both still not yet implemented as of this page's last update.
+with idle-checkout eviction, still not yet implemented as of this page's
+last update.

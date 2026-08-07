@@ -15,6 +15,7 @@ import (
 	"github.com/offshoot-db/offshoot/internal/daemon"
 	"github.com/offshoot-db/offshoot/internal/mcp"
 	"github.com/offshoot-db/offshoot/internal/ops"
+	"github.com/offshoot-db/offshoot/internal/session"
 	"github.com/offshoot-db/offshoot/internal/store"
 )
 
@@ -74,11 +75,16 @@ Usage:
   offshoot lease acquire <db>[@branch] [--ttl 30s]   claim or renew a lease
   offshoot lease release <db>[@branch]      release a lease
   offshoot serve [-socket PATH] [-reap-every d] [-gc-grace d] [-flush-every d]
-                 [-ro-cache-budget BYTES] [-http ADDR] [-token TOKEN] [-http-allow-non-loopback]
+                 [-snapshot-every N] [-ro-cache-budget BYTES] [-http ADDR] [-token TOKEN] [-http-allow-non-loopback]
                                              run the daemon until SIGINT/SIGTERM;
                                              -flush-every ships every open session's
                                              work on a cadence even if it's never
                                              flushed explicitly (default 30s; 0 disables);
+                                             -snapshot-every N sets every open session's
+                                             full-snapshot cadence (default 16, unchanged
+                                             if omitted; must be >= 1) — more segments per
+                                             snapshot means cheaper flushes but more replay
+                                             per read, see docs/reference.md
                                              -ro-cache-budget bounds checkouts-ro
                                              (default 0 = unlimited); the janitor
                                              LRU-evicts (by a .last-used touch-on-hit
@@ -774,7 +780,7 @@ func run(args []string) error {
 		return srv.Serve(context.Background())
 	case "serve":
 		const serveUsage = "usage: offshoot serve [-socket PATH] [-reap-every DURATION] [-gc-grace DURATION] " +
-			"[-flush-every DURATION] [-ro-cache-budget BYTES] [-http ADDR] [-token TOKEN] [-http-allow-non-loopback]"
+			"[-flush-every DURATION] [-snapshot-every N] [-ro-cache-budget BYTES] [-http ADDR] [-token TOKEN] [-http-allow-non-loopback]"
 		sock, rest, err := socketOverride(rest)
 		if err != nil {
 			return fmt.Errorf("%s: %w", serveUsage, err)
@@ -815,6 +821,22 @@ func run(args []string) error {
 		if flushEvery < 0 {
 			return fmt.Errorf("-flush-every %q must be zero or positive; zero disables auto-flush "+
 				"(there is no \"none\" alias — a negative value is almost certainly a mistake)", flushEveryStr)
+		}
+		snapshotEveryStr, rest, snapshotEveryGiven, err := extractFlag(rest, "-snapshot-every")
+		if err != nil {
+			return err
+		}
+		var snapshotEvery int
+		if snapshotEveryGiven {
+			n, err := strconv.Atoi(snapshotEveryStr)
+			if err != nil {
+				return fmt.Errorf("-snapshot-every: %w", err)
+			}
+			if n < 1 {
+				return fmt.Errorf("-snapshot-every %d must be >= 1 (there is no \"unlimited\" — "+
+					"omit the flag for the default of %d)", n, session.DefaultSnapshotEvery)
+			}
+			snapshotEvery = n
 		}
 		roCacheBudgetStr, rest, _, err := extractFlag(rest, "-ro-cache-budget")
 		if err != nil {
@@ -896,6 +918,14 @@ func run(args []string) error {
 		// disables this, restoring manual-only (session.Options' own
 		// default).
 		srv.SetFlushEvery(flushEvery)
+		// Milestone 4 Task 6a: 0 (the default, -snapshot-every not given)
+		// means "let session.Open apply its own default" — see
+		// Server.SetSnapshotEvery's doc comment. Only set when the flag was
+		// actually given (snapshotEveryGiven), so a bare `offshoot serve`
+		// keeps behaving exactly as it did before this flag existed.
+		if snapshotEveryGiven {
+			srv.SetSnapshotEvery(snapshotEvery)
+		}
 		// Milestone 4 Task 5: 0 (the default, unset) means unlimited — the
 		// janitor still computes and reports checkouts-ro usage every pass,
 		// it just never evicts. See SetROCacheBudget's doc comment.
