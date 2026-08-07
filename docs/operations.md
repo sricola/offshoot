@@ -57,10 +57,12 @@ build a dashboard against a name not in this table.
 | `offshoot_ro_cache_evictions_total` | counter | — | `checkouts-ro` entries evicted by the janitor's LRU pass under `-ro-cache-budget`. Zero forever on a daemon started with the default (unlimited) budget. |
 | `offshoot_janitor_runs_total` | counter | `result` (`ok`/`error`) | Janitor loop ticks, by whether the tick completed cleanly. Both values pre-registered at `0`; stays entirely at `0` if `-reap-every 0` disabled the janitor. |
 
-**Histogram buckets** (`offshoot_flush_duration_seconds`,
-`offshoot_fork_duration_seconds`, `offshoot_checkpoint_duration_seconds`),
-in seconds: `0.001, 0.005, 0.01, 0.025, 0.05, 0.1, 0.25, 0.5, 1, 2.5, 5, 10,
-30, 60, 120, 300, +Inf` — fixed, not configurable.
+### Histogram buckets
+
+`offshoot_flush_duration_seconds`, `offshoot_fork_duration_seconds`, and
+`offshoot_checkpoint_duration_seconds` share the same fixed buckets, in
+seconds: `0.001, 0.005, 0.01, 0.025, 0.05, 0.1, 0.25, 0.5, 1, 2.5, 5, 10,
+30, 60, 120, 300, +Inf` — not configurable.
 
 ### Try it
 
