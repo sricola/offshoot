@@ -1,6 +1,7 @@
 package ops
 
 import (
+	"errors"
 	"os"
 	"sort"
 	"time"
@@ -123,6 +124,17 @@ func parseRefTime(s string) (time.Time, bool) {
 //   - "dirty": no live lease; a checkout exists whose sidecar identity
 //     (lineage+epoch+txid) matches the ref but whose content hash does not
 //     (checkoutState's "modified" verdict) — un-checkpointed local edits.
+//     Determining this REQUIRES a quiesce (WAL checkpoint) before hashing,
+//     the same step every other identity/hash comparison in this package
+//     already takes (checkoutState's callers — CheckoutProven,
+//     warnIfUncheckpointed — always quiesce first): a committed write can
+//     sit in the checkout's WAL, invisible to a bare hash of the main
+//     file, until something folds it in. A checkout that's currently busy
+//     (a live connection, reader or writer, blocking that checkpoint right
+//     now) is itself treated as "dirty" rather than "idle" — someone is
+//     actively using an unleased checkout, which is exactly the kind of
+//     activity this state exists to surface, even though the exact byte
+//     diff can't be observed at that instant. See errQuiesceBusy.
 //   - "detached": no live lease; a checkout exists whose sidecar-recorded
 //     LINEAGE does not match the ref's CURRENT lineage — a checkout
 //     orphaned by a rollback/promote that repointed the branch at a new
@@ -134,7 +146,10 @@ func parseRefTime(s string) (time.Time, bool) {
 //     lineage still matches but whose epoch/txid lags (the branch advanced
 //     via checkpoint/flush since this checkout was last refreshed, still
 //     the SAME lineage) is not orphaned, just behind — that's "idle"
-//     below, not "detached".
+//     below, not "detached". "dirty" and "detached" are structurally
+//     mutually exclusive on any single evaluation: a lineage mismatch
+//     returns "detached" immediately, before the identity/hash comparison
+//     that could ever produce "dirty" is even reached.
 //   - "idle": none of the above. Also where checkoutState's "stale"
 //     verdict lands when the lineage still matches (needs a
 //     re-materialize, isn't orphaned), and where a missing/corrupt/absent
@@ -146,6 +161,30 @@ func parseRefTime(s string) (time.Time, bool) {
 //     idle is added deliberately here, not carried over from the spec —
 //     see docs/status.md's branch-state-taxonomy row and docs/reference.md
 //     for this addition documented for operators.
+//
+// Known blind spot: a checkout with NO readable .sum sidecar at all (never
+// stamped, or corrupt/legacy) always reads "idle" here, even if its
+// content has in fact diverged from the ref — there's no sidecar to detect
+// that against. This mirrors checkoutState's own "unknown" verdict for the
+// identical input and is a deliberate "no evidence, stay silent" stance,
+// not an oversight; a checkout materialized entirely outside this
+// package's own Checkout/Checkpoint/Rollback/Promote (which always stamp
+// one) is the only way to hit it.
+//
+// Cost: unlike active/detached/idle's checks (a ref field compare, an
+// os.Stat, a sidecar read), reaching "dirty" for a checkout whose sidecar
+// identity matches the ref requires quiescing the checkout (a real
+// wal_checkpoint(TRUNCATE), up to quiesce's 3-second busy timeout) and
+// hashing its full content (crypto/sha256 over the whole file). This runs
+// PER BRANCH, on every Status()/opBranches call, for every branch that is
+// (a) checked out, (b) not leased, and (c) not already detached — i.e.
+// exactly the branches where "is it dirty" is still an open question. A
+// store with many large, checked-out, unleased branches will feel this on
+// every `offshoot status` / "branches" call; there is no cheap
+// short-circuit here (file size/mtime cannot substitute for a real hash —
+// mtime is exactly what this codebase's own `.last-used` touch-file
+// convention elsewhere works around, not something to trust for content
+// identity).
 func BranchStateAt(ref store.Ref, checkoutPath string, now time.Time) string {
 	if store.LeaseLive(ref, now) {
 		return "active"
@@ -155,13 +194,22 @@ func BranchStateAt(ref store.Ref, checkoutPath string, now time.Time) string {
 	}
 	rec, ok := readSidecar(checkoutPath)
 	if !ok {
-		return "idle" // no sidecar, or corrupt/legacy: no provenance to act on
+		return "idle" // no sidecar, or corrupt/legacy: no provenance to act on (known blind spot, see doc comment)
 	}
 	if rec.Lineage != ref.Lineage {
 		return "detached"
 	}
 	if rec.Epoch != ref.HeadEpoch || rec.TXID != ref.HeadTXID {
 		return "idle" // same lineage, stale identity: needs re-materialize, not orphaned
+	}
+	// Fold any WAL-resident committed content into the main file before
+	// hashing it — see the "dirty" bullet above for why skipping this can
+	// silently misreport dirty as idle.
+	if err := quiesce(checkoutPath); err != nil {
+		if errors.Is(err, errQuiesceBusy) {
+			return "dirty" // see errQuiesceBusy and the "dirty" bullet above
+		}
+		return "idle" // can't quiesce for another reason: no evidence to act on
 	}
 	got, err := fileSum(checkoutPath)
 	if err != nil {

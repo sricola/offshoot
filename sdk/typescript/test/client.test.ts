@@ -14,7 +14,7 @@ import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { fileURLToPath } from "node:url";
 
-import { connect, OffshootError, type Client } from "../src/client.js";
+import { connect, OffshootError, Client } from "../src/client.js";
 
 // test-dist/test/client.test.js -> repo root is four levels up.
 const REPO = join(fileURLToPath(new URL(".", import.meta.url)), "..", "..", "..", "..");
@@ -161,6 +161,38 @@ test("full lifecycle: create, open, write, flush, fork, checkout, branches, guar
   } finally {
     await c.close();
   }
+});
+
+// These two are pure response-parsing tests, no daemon needed:
+// Object.create(Client.prototype) builds an instance without running the
+// constructor (which requires a real Socket), and `_call` — a public but
+// underscore-prefixed method meant only for this package's own client code
+// (see its doc comment in src/client.ts) — is overridden per-instance to
+// return a canned response, exactly as if it had come back over the wire.
+test('branches: state defaults to "" when an older daemon omits it (wire-compat)', async () => {
+  const client = Object.create(Client.prototype) as Client;
+  // Milestone 4 Task 1 added BranchInfo.state to the wire protocol. An
+  // older daemon predating that field sends a "branches" response with no
+  // "state" key at all — Client.branches() must not throw or fabricate a
+  // value; Branch.state must default to "" (additive, backward-compatible
+  // field; see docs/reference.md's Branch states section).
+  (client as unknown as { _call: Client["_call"] })._call = async () => ({
+    ok: true,
+    branches: [{ branch: "main", head_txid: 1 }],
+  });
+  const branches = await client.branches("app");
+  assert.equal(branches.length, 1);
+  assert.equal(branches[0].state, "");
+});
+
+test("branches: state is passed through when present", async () => {
+  const client = Object.create(Client.prototype) as Client;
+  (client as unknown as { _call: Client["_call"] })._call = async () => ({
+    ok: true,
+    branches: [{ branch: "main", head_txid: 1, state: "active" }],
+  });
+  const branches = await client.branches("app");
+  assert.equal(branches[0].state, "active");
 });
 
 test("errors are loud", async (t: TestContext) => {

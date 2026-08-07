@@ -707,7 +707,23 @@ func (w *Workspace) Checkpoint(db, branch, name string, meta map[string]string) 
 	return txid, nil
 }
 
-// quiesce checkpoints the WAL fully, failing cleanly on a busy database.
+// errQuiesceBusy is quiesce's error specifically for wal_checkpoint(TRUNCATE)
+// reporting busy != 0 — a live connection (reader or writer) is preventing a
+// full checkpoint right now. Distinct from every other quiesce failure
+// (sql.Open failure, a path that isn't a valid SQLite file at all): a caller
+// that needs to tell "someone is actively using this file right this
+// instant" apart from "this file can't be quiesced for some other reason"
+// checks errors.Is against this sentinel — see ops.BranchStateAt, which
+// treats a busy checkout as itself evidence of un-checkpointed activity
+// ("dirty") rather than an absence of evidence ("idle"). The wrapped message
+// text is unchanged from before this sentinel existed, so every existing
+// caller that only logs/propagates quiesce's error (Checkpoint,
+// CheckoutProven, Rollback's refresh, Promote's refresh,
+// warnIfUncheckpointed) sees byte-identical output.
+var errQuiesceBusy = errors.New("ops: database is busy (live writer or reader); close connections and retry")
+
+// quiesce checkpoints the WAL fully, failing cleanly on a busy database (see
+// errQuiesceBusy).
 func quiesce(path string) error {
 	conn, err := sql.Open("sqlite3", path+"?_busy_timeout=3000")
 	if err != nil {
@@ -719,7 +735,7 @@ func quiesce(path string) error {
 		return fmt.Errorf("ops: checkpoint: %w", err)
 	}
 	if busy != 0 {
-		return fmt.Errorf("ops: database is busy (live writer or reader); close connections and retry")
+		return errQuiesceBusy
 	}
 	return nil
 }
