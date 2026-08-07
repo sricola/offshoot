@@ -4,6 +4,7 @@ import (
 	"database/sql"
 	"os"
 	"os/exec"
+	"sync"
 	"testing"
 	"time"
 )
@@ -188,6 +189,56 @@ func TestBranchStateBusyCheckoutIsDirty(t *testing.T) {
 	}
 	if state != "dirty" {
 		t.Fatalf("state = %q, want dirty (a busy, unleased checkout is itself evidence of activity)", state)
+	}
+}
+
+// TestBranchStateConcurrentCallsOnCleanCheckoutNeverFlapToDirty pins the
+// fix for a self-contention hazard the busy->dirty fallback introduced:
+// two of THIS process's own BranchStateAt calls for the SAME clean
+// checkout, evaluated concurrently, used to race their own independent
+// wal_checkpoint(TRUNCATE) attempts against each other and could observe
+// busy=1 purely from that self-contention — no external writer involved
+// at all — which the busy->dirty fallback then reported as "dirty" for a
+// checkout that was, in fact, perfectly clean. checkoutLock serializes the
+// quiesce+hash step per checkout path specifically to close this: with the
+// fix, two concurrent evaluations queue instead of contending, so neither
+// can ever observe its own sibling as "busy". Reproduces the reviewer's
+// exact shape: two goroutines calling BranchState on the same clean
+// checkout at once, repeated across many trials, asserting a "dirty"
+// verdict is NEVER observed (pre-fix, this flaps to dirty on a large
+// majority of trials at zero stagger).
+func TestBranchStateConcurrentCallsOnCleanCheckoutNeverFlapToDirty(t *testing.T) {
+	w := newWS(t)
+	if err := w.Create("app"); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := w.Checkout("app", "main"); err != nil {
+		t.Fatal(err)
+	}
+
+	const trials = 30
+	for trial := 0; trial < trials; trial++ {
+		var wg sync.WaitGroup
+		states := make([]string, 2)
+		errs := make([]error, 2)
+		for g := 0; g < 2; g++ {
+			wg.Add(1)
+			go func(idx int) {
+				defer wg.Done()
+				states[idx], errs[idx] = w.BranchState("app", "main")
+			}(g)
+		}
+		wg.Wait()
+		for idx, err := range errs {
+			if err != nil {
+				t.Fatalf("trial %d goroutine %d: %v", trial, idx, err)
+			}
+		}
+		for idx, state := range states {
+			if state != "idle" {
+				t.Fatalf("trial %d goroutine %d: state = %q, want idle (a clean checkout must never flap to dirty under concurrent evaluation)", trial, idx, state)
+			}
+		}
 	}
 }
 
