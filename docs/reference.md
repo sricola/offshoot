@@ -672,6 +672,33 @@ detail:{checkpoint, bytes}}`) — subscribe (socket or `GET /events`) to
 watch evictions happen in real time. Each eviction removes both the cache
 file and its `.last-used` marker together.
 
+**TOCTOU under a configured budget:** a path `checkout --at --read-only` /
+`checkout-at` returns — from a fresh materialize OR a cache hit — is not a
+guarantee the file still exists by the time you open it once a nonzero
+budget is running: a concurrent janitor pass can evict that exact entry
+in the window between the call returning and your own open. This is the
+accepted cost of turning what used to be a purely caller/operator-driven,
+manually-`rm -rf`-safe cache into one an automatic background reclaimer
+also touches. Two rules cover it completely:
+
+- Already opened the file? Keep reading — POSIX unlink-of-an-open-file
+  semantics mean an eviction racing your open connection never corrupts
+  or truncates what you already have a handle on; it just stops being
+  visible to a future `open`/`stat` on that path.
+- Get `ENOENT` trying to open a path you were just handed? That's not
+  data loss or a corrupted store — it means "evicted since that call
+  returned." Re-call `checkout --at --read-only` (or the `checkout-at`
+  op): the checkpoint's content is immutable, so re-materializing
+  produces byte-identical content, not stale or different data.
+
+A `.last-used` touch (a cache hit) landing during the SAME pass that's
+about to evict that exact entry usually spares it (the janitor re-checks
+the marker immediately before removing anything); a touch landing in the
+last, microscopic instant right before the actual delete does not save
+it that round, but is still safe per the two rules above — the entry
+simply gets re-hit as a fresh materialize on the next `checkout-at` call,
+and self-heals into staying hot from then on.
+
 `checkouts-ro` remains safe to `rm -rf` at any time regardless of the
 budget (see the read-only checkout section above) — a budget just
 automates what that manual cleanup would otherwise require doing by hand.

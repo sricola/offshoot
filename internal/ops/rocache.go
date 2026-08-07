@@ -42,6 +42,17 @@ const lastUsedSuffix = ".last-used"
 // worse outcome than a slightly stale LRU ranking. An entry whose marker
 // never gets touched simply falls back to ITS OWN creation-time floor (see
 // lruClock) — a real, if less precise, ranking signal, not a crash.
+//
+// Races against a concurrent janitor eviction pass: a touch landing here
+// while EvictROCache is mid-pass on the SAME entry is exactly the TOCTOU
+// EvictROCache's own doc comment addresses — a touch that lands before its
+// re-guard check (immediately before that entry's os.Remove) DOES spare it
+// this pass; one landing in the microscopic window after that check but
+// before the actual unlink does not, but is still SAFE, not corrupting —
+// this cache has been "always safe to rm -rf, worst case it rebuilds"
+// since CheckoutAt's own doc comment first made that promise, and a touch
+// racing an eviction is just a narrower instance of the identical
+// contract, not a new risk this function introduces.
 func touchLastUsed(dbPath string) {
 	marker := dbPath + lastUsedSuffix
 	f, err := os.OpenFile(marker, os.O_CREATE|os.O_WRONLY, 0o644)
@@ -234,7 +245,47 @@ func (w *Workspace) ROCacheUsage() (bytes int64, count int, err error) {
 // elsewhere in this package (see gc.go's GC and reap.go's Reap) — rather
 // than losing track of real, already-completed deletions by discarding
 // them on a later failure.
+//
+// # TOCTOU: a concurrent CheckoutAt call racing this same pass
+//
+// roCacheEntries snapshots every entry's size and LastUsed once, up front;
+// everything after that (the sort, and each os.Remove below) runs against
+// that snapshot, not a live view. A CheckoutAt cache HIT on some entry E,
+// landing anywhere between that snapshot and E's own removal below, is a
+// real, expected race — CheckoutAt callers and the janitor share no lock —
+// and this function is fail-safe about it in two complementary ways:
+//
+//  1. Every removal is re-guarded immediately before it happens: if E's
+//     `.last-used` marker's mtime is at or after passStart (this call's own
+//     start time, captured before the snapshot), a touch landed DURING this
+//     very pass — E is spared outright, not evicted this round, and the
+//     loop moves on to the next-oldest candidate instead. A budget this
+//     tight, under this much concurrent touch pressure, may occasionally
+//     leave usageAfter still over budget when every remaining candidate is
+//     freshly spared this way — self-heals on the NEXT pass, which
+//     re-snapshots fresh recency data from scratch (a fresh passStart, a
+//     fresh roCacheEntries walk).
+//  2. Even a touch that lands in the microscopic window between that guard
+//     check and the os.Remove call itself (impossible to close without a
+//     lock this codebase deliberately doesn't take here — CheckoutAt and
+//     the janitor are meant to run lock-free against each other, matching
+//     the "checkouts-ro is always safe to rm -rf" contract this whole cache
+//     already operates under) is still SAFE, just not saved: E is deleted
+//     this pass despite the near-simultaneous touch, and — this is the
+//     part that makes it safe rather than merely tolerable — a caller that
+//     already has E's cache file open (or opens it moments later, having
+//     gotten its path from that same CheckoutAt call before the unlink)
+//     keeps reading it without error or corruption, POSIX unlink-of-an-
+//     open-file semantics being exactly what "safe to rm -rf at any time"
+//     already promised. A caller that has NOT yet opened it sees the file
+//     gone and — per CheckoutAt's own doc comment — simply re-calls
+//     CheckoutAt, which re-materializes it from the store.
+//
+// See CheckoutAt's doc comment (export.go) for the caller-facing half of
+// this same contract, and touchLastUsed's doc comment for why case 1 above
+// is the guard, not the whole story.
 func (w *Workspace) EvictROCache(budget int64) (evicted []ROCacheEviction, usageAfter int64, err error) {
+	passStart := time.Now()
 	entries, err := w.roCacheEntries()
 	if err != nil {
 		return nil, 0, err
@@ -259,6 +310,17 @@ func (w *Workspace) EvictROCache(budget int64) (evicted []ROCacheEviction, usage
 		if usageAfter <= budget {
 			break
 		}
+		if roCacheEvictPreRemoveHook != nil {
+			roCacheEvictPreRemoveHook(e.Path) // test-only; see its own doc comment
+		}
+		// Race guard (TOCTOU case 1 in this function's own doc comment): a
+		// marker touched at/after passStart means a CheckoutAt cache hit
+		// landed during THIS pass, after roCacheEntries's snapshot above —
+		// spare e rather than evict something that was just proven "in use"
+		// more recently than this pass even started.
+		if mi, statErr := os.Stat(e.Path + lastUsedSuffix); statErr == nil && !mi.ModTime().Before(passStart) {
+			continue
+		}
 		if rmErr := os.Remove(e.Path); rmErr != nil && !os.IsNotExist(rmErr) {
 			return evicted, usageAfter, rmErr
 		}
@@ -270,3 +332,13 @@ func (w *Workspace) EvictROCache(budget int64) (evicted []ROCacheEviction, usage
 	}
 	return evicted, usageAfter, nil
 }
+
+// roCacheEvictPreRemoveHook, when non-nil, is called with each candidate's
+// .db path immediately before EvictROCache's own race-guard check for it —
+// purely a test seam (mirrors export.go's checkoutAtChmod / daemon's
+// openDelay convention elsewhere in this codebase) so a test can inject a
+// touchLastUsed call at EXACTLY the TOCTOU window described in
+// EvictROCache's doc comment (case 1: a touch landing after the snapshot,
+// before this candidate's removal) deterministically, rather than relying
+// on real goroutine-scheduling races. nil (a no-op) in production.
+var roCacheEvictPreRemoveHook func(path string)

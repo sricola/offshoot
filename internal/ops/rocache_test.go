@@ -458,3 +458,62 @@ func TestEvictROCacheLastUsedTouchBeatsCreationOrder(t *testing.T) {
 		t.Fatalf("v2 (never hit, newer by creation) must be evicted: stat err = %v", err)
 	}
 }
+
+// TestEvictROCacheSparesEntryTouchedDuringThisPass deterministically proves
+// EvictROCache's TOCTOU race guard (see its own doc comment): a
+// CheckoutAt cache hit (touchLastUsed) landing on a candidate AFTER
+// roCacheEntries' snapshot but immediately BEFORE that candidate's
+// removal must spare it this pass, not evict something the janitor's own
+// re-check would have seen as "just used." roCacheEvictPreRemoveHook
+// (a test-only seam, mirroring export.go's checkoutAtChmod convention) is
+// what makes this deterministic — it injects the touch at exactly that
+// window instead of relying on real goroutine scheduling to hit a
+// microscopic race.
+func TestEvictROCacheSparesEntryTouchedDuringThisPass(t *testing.T) {
+	requireSQLite3(t)
+	w := newWS(t)
+	if err := w.Create("app"); err != nil {
+		t.Fatal(err)
+	}
+	path, _ := w.Checkout("app", "main")
+	mkCheckpoint(t, w, path, "v1")
+	p1, err := w.CheckoutAt("app", "main", "v1", false)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	orig := roCacheEvictPreRemoveHook
+	roCacheEvictPreRemoveHook = func(evictPath string) {
+		if evictPath == p1 {
+			// Simulate a concurrent CheckoutAt cache hit landing exactly in
+			// the window EvictROCache's doc comment describes: after the
+			// snapshot (roCacheEntries already ran), immediately before
+			// this candidate's removal.
+			touchLastUsed(p1)
+		}
+	}
+	t.Cleanup(func() { roCacheEvictPreRemoveHook = orig })
+
+	fi, err := os.Stat(p1)
+	if err != nil {
+		t.Fatal(err)
+	}
+	budget := fi.Size() - 1 // force an eviction attempt on the only entry
+
+	evicted, usageAfter, err := w.EvictROCache(budget)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(evicted) != 0 {
+		t.Fatalf("expected the touched-mid-pass entry to be spared, got %+v", evicted)
+	}
+	if usageAfter != fi.Size() {
+		t.Fatalf("usageAfter = %d, want %d (nothing evicted — the guard spared the only candidate)", usageAfter, fi.Size())
+	}
+	if _, err := os.Stat(p1); err != nil {
+		t.Fatalf("spared entry must still exist: %v", err)
+	}
+	if _, err := os.Stat(p1 + lastUsedSuffix); err != nil {
+		t.Fatalf("spared entry's marker (from the simulated touch) must still exist: %v", err)
+	}
+}
