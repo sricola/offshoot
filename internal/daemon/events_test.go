@@ -347,6 +347,98 @@ drain:
 	}
 }
 
+// ---- stalled (not gone) reader: bounded by eventWriteDeadline ------------
+//
+// TestSlowSubscriberDroppedSessionKeepsFlushing above proves eventBus.publish
+// itself never blocks the daemon — but that's a BUS-level guarantee about
+// the channel between the bus and a subscriber's own drain goroutine. It
+// says nothing about that drain goroutine's OWN blocking write to the real
+// connection (c.Write for the socket, w.Write for SSE) once the channel
+// hands it an event: a reader that is still CONNECTED but has simply
+// stopped reading (as opposed to a reader that's gone, which the existing
+// disconnect-detection paths already catch) would, absent a deadline, pin
+// that goroutine inside a blocking OS write forever once the kernel send
+// buffer fills — leaking the goroutine and its file descriptor for the
+// life of the daemon. The two tests below force that exact condition
+// through the REAL write path (an oversized event that cannot possibly fit
+// in any reasonable kernel socket buffer) and assert the server notices
+// and gives up within eventWriteDeadline, using connCount/subscriberCount
+// to observe cleanup directly rather than racing the client's own socket
+// semantics.
+
+// bigEventDetail returns a detail map whose single string value is large
+// enough (16MiB) that no reasonable kernel socket send buffer can hold it
+// unread — the point being to force a REAL blocking write on the server
+// side, not to simulate one.
+func bigEventDetail() map[string]any {
+	return map[string]any{"payload": strings.Repeat("x", 16<<20)}
+}
+
+// connCount reports how many live connections handle() is currently
+// tracking (s.conns) — used only by
+// TestStalledSocketSubscriberConnectionIsClosedWithinWriteDeadline to
+// observe, from outside, that handle()'s per-connection goroutine actually
+// returned (its deferred cleanup removes the connection from this map)
+// rather than staying parked inside a blocking write forever.
+func connCount(s *Server) int {
+	s.connMu.Lock()
+	defer s.connMu.Unlock()
+	return len(s.conns)
+}
+
+// TestStalledSocketSubscriberConnectionIsClosedWithinWriteDeadline is the
+// Important-fix regression test: a subscriber that acks "subscribe" and
+// then NEVER READS AGAIN (as opposed to disconnecting, which the existing
+// background-Read trick in streamEvents already handles) must still have
+// its connection closed within ~eventWriteDeadline, not held open forever.
+// eventWriteDeadline is shrunk via its test-only var so this doesn't need
+// to wait out the real 45s production default.
+func TestStalledSocketSubscriberConnectionIsClosedWithinWriteDeadline(t *testing.T) {
+	restore := eventWriteDeadline
+	eventWriteDeadline = 200 * time.Millisecond
+	t.Cleanup(func() { eventWriteDeadline = restore })
+
+	srv, _ := newServer(t)
+	sock := srv.SocketPath()
+
+	c, err := net.Dial("unix", sock)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer c.Close()
+	if err := json.NewEncoder(c).Encode(Request{Op: "subscribe"}); err != nil {
+		t.Fatal(err)
+	}
+	dec := json.NewDecoder(c)
+	var ack Response
+	if err := dec.Decode(&ack); err != nil {
+		t.Fatalf("decoding subscribe ack: %v", err)
+	}
+	if !ack.OK {
+		t.Fatalf("subscribe ack = %+v, want ok", ack)
+	}
+
+	before := connCount(srv)
+	if before == 0 {
+		t.Fatal("expected the subscribe connection to be tracked in s.conns")
+	}
+
+	// STOP reading from here on (no more Decode/Read calls on c at all —
+	// simulating a stalled, not disconnected, subscriber). Publish one
+	// oversized event so the server's streamEvents goroutine has something
+	// to write that cannot possibly complete without a reader draining it.
+	srv.events.publish(newEvent("flushed", "app", "main", bigEventDetail()))
+
+	deadline := time.Now().Add(5 * time.Second)
+	for time.Now().Before(deadline) {
+		if connCount(srv) < before {
+			return // success: the server noticed the stall and cleaned up
+		}
+		time.Sleep(20 * time.Millisecond)
+	}
+	t.Fatal("server never closed the stalled subscriber's connection — goroutine/FD leaked")
+}
+
 // ---- HTTP: GET /events (SSE) ---------------------------------------------
 
 // sseLines reads resp.Body line by line, sending decoded Events for every
@@ -541,6 +633,60 @@ func TestSSEStreamSurvivesPastWriteTimeout(t *testing.T) {
 		t.Fatalf("open = %+v", open)
 	}
 	waitForEventType(t, events, "session_opened", 5*time.Second)
+}
+
+// TestStalledSSESubscriberConnectionIsClosedWithinWriteDeadline is the SSE
+// analog of TestStalledSocketSubscriberConnectionIsClosedWithinWriteDeadline:
+// a GET /events client that stops reading resp.Body entirely (as opposed to
+// disconnecting, which r.Context().Done() already catches) must still have
+// its handler give up within ~eventWriteDeadline rather than leaking the
+// handler goroutine forever. Uses eventBus.subscriberCount to observe
+// cleanup directly (handleEvents's deferred unsubscribe), since a stalled
+// client offers no clean signal of its own the way a socket's tracked
+// connection count does.
+func TestStalledSSESubscriberConnectionIsClosedWithinWriteDeadline(t *testing.T) {
+	restore := eventWriteDeadline
+	eventWriteDeadline = 200 * time.Millisecond
+	t.Cleanup(func() { eventWriteDeadline = restore })
+
+	srv, _, base, token := newHTTPServer(t)
+
+	req, err := http.NewRequest(http.MethodGet, base+"/events", nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	req.Header.Set("Authorization", "Bearer "+token)
+	resp, err := http.DefaultClient.Do(req)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer resp.Body.Close()
+	if resp.StatusCode != http.StatusOK {
+		t.Fatalf("GET /events status = %d, want 200", resp.StatusCode)
+	}
+
+	waitDeadline := time.Now().Add(2 * time.Second)
+	for srv.events.subscriberCount() == 0 && time.Now().Before(waitDeadline) {
+		time.Sleep(10 * time.Millisecond)
+	}
+	before := srv.events.subscriberCount()
+	if before == 0 {
+		t.Fatal("expected the SSE request to be subscribed")
+	}
+
+	// STOP reading resp.Body from here on. Publish an oversized event so
+	// handleEvents's next write cannot possibly complete without a reader
+	// draining it.
+	srv.events.publish(newEvent("flushed", "app", "main", bigEventDetail()))
+
+	deadline := time.Now().Add(5 * time.Second)
+	for time.Now().Before(deadline) {
+		if srv.events.subscriberCount() < before {
+			return // success: handleEvents noticed the stall and gave up
+		}
+		time.Sleep(20 * time.Millisecond)
+	}
+	t.Fatal("SSE handler never gave up on the stalled subscriber — goroutine/connection leaked")
 }
 
 // TestHTTPPathTrickMatrixCoversEvents extends the existing pprof/rpc path-

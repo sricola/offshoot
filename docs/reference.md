@@ -678,6 +678,20 @@ session's own progress or the janitor's own cadence — see
 write-heavy session keeps flushing successfully while a subscriber that
 never reads its channel gets dropped.
 
+**Stalled (still-connected) subscriber:** the drop above handles a
+subscriber's *bus-side* buffer filling up, but not a subscriber that stays
+connected and simply stops reading its socket/HTTP connection at all — the
+daemon's write to that connection could otherwise block forever once the
+kernel's own send buffer fills. Every write to a subscriber's connection
+(both transports) is bounded by a per-write deadline, re-armed immediately
+before each send (default 45s); a write that cannot complete within that
+window means the reader is genuinely stuck, and the daemon gives up on
+that subscriber — closing the connection (socket) or ending the handler
+(SSE) — rather than leaking the goroutine and file descriptor. A live
+stream re-arms this deadline forward on every successful send (and, for
+SSE, at least every keepalive tick), so it never affects a merely slow but
+still-draining subscriber.
+
 ### Unix socket: the `subscribe` op
 
 ```jsonc
@@ -704,10 +718,13 @@ Same Bearer auth as everything but `/healthz`. Response is
 A `: ping` comment line is written every 15 seconds to keep the connection
 alive across any proxy/load balancer/kubelet that kills silent streams
 (PM Amendment 12) — ordinary SSE clients ignore comment lines
-automatically. Unlike the other `-http` routes, this handler explicitly
-clears its own per-connection write deadline so Task 3's `http.Server`
-`WriteTimeout` (90s, sized for `/rpc`/`/metrics`/`/debug/pprof/*`, see
-above) never hard-cuts a long-lived subscription.
+automatically. Unlike the other `-http` routes, this handler manages its
+own per-connection write deadline (re-armed before every write, see
+"Stalled (still-connected) subscriber" above) rather than being bound by
+Task 3's `http.Server` `WriteTimeout` (90s, sized for
+`/rpc`/`/metrics`/`/debug/pprof/*`, see above) — a live subscription is
+never hard-cut by that 90s bound, while a stalled one is still cleaned up
+promptly rather than left open indefinitely.
 
 ## `offshoot mcp`
 

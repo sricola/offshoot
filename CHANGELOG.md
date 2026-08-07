@@ -193,17 +193,24 @@ version if you depend on format stability.
   `data: <event JSON>\n\n` per event, plus a periodic `: ping` SSE comment
   (`sseKeepaliveInterval`, 15s default — PM Amendment 12: proxies/kubelets
   kill silent streams) to keep the connection alive across anything sitting
-  in front of this daemon. **Clears its own write deadline**
-  (`http.NewResponseController(w).SetWriteDeadline(time.Time{})`) before
-  streaming — Task 3's `http.Server.WriteTimeout` (90s) covers a handler's
-  *entire* wall-clock run with no concept of "still legitimately sending,
-  just slowly," and would otherwise hard-cut every long-lived SSE stream at
-  90 seconds; this is the fix `http.go`'s Task 3 doc comment flagged and
-  loudly warned Task 4a to make. `TestSSEStreamSurvivesPastWriteTimeout`
-  proves it structurally and cheaply: `httpWriteTimeout` is a test-only var
-  shrunk to 150ms, and the stream is proven alive well past that shrunk
-  value via a real event delivered afterward — no test ever sleeps
-  anywhere near the real 90s.
+  in front of this daemon. **Re-arms its own per-write deadline** before
+  every write (`http.NewResponseController(w).SetWriteDeadline(now +
+  eventWriteDeadline)`, 45s default) rather than clearing it once,
+  permanently — Task 3's `http.Server.WriteTimeout` (90s) covers a
+  handler's *entire* wall-clock run with no concept of "still legitimately
+  sending, just slowly," and would otherwise hard-cut every long-lived SSE
+  stream at 90 seconds; a live stream re-arms this deadline forward on
+  every successful write (and at least every keepalive tick), so it's
+  never affected, while a subscriber that's still connected but has
+  stopped reading entirely now gets its stream torn down within
+  `eventWriteDeadline` instead of pinning the handler goroutine and its
+  connection's file descriptor open forever. The unix socket's
+  `streamEvents` gets the identical per-write re-arm before every
+  `c.Write`, for the same reason. `TestSSEStreamSurvivesPastWriteTimeout`
+  proves the live-stream side structurally and cheaply: `httpWriteTimeout`
+  is a test-only var shrunk to 150ms, and the stream is proven alive well
+  past that shrunk value via a real event delivered afterward — no test
+  ever sleeps anywhere near the real 90s.
 
   Tested (`internal/daemon/events_test.go`, `-race`): a subscriber sees
   `session_opened` → `flushed` → `session_closed` for a real session
@@ -211,9 +218,16 @@ version if you depend on format stability.
   keeps-flushing proof above; SSE/socket parity (both transports
   subscribed before a real session lifecycle runs, asserted to observe the
   identical event sequence); the keepalive ping; the write-deadline proof;
-  `/events` requires auth (401 without, plus a path-trick matrix
-  extension); `subscribe` over `POST /rpc` is refused; reusing a
-  subscribed connection for an ordinary op gets silence, never a Response.
+  a genuinely STALLED (still-connected, never-reading) subscriber on
+  either transport has its connection/handler torn down within
+  `eventWriteDeadline`, forced through the real write path with an
+  oversized event rather than merely asserted
+  (`TestStalledSocketSubscriberConnectionIsClosedWithinWriteDeadline`,
+  `TestStalledSSESubscriberConnectionIsClosedWithinWriteDeadline` — both
+  confirmed to fail reliably against the pre-fix code); `/events` requires
+  auth (401 without, plus a path-trick matrix extension); `subscribe` over
+  `POST /rpc` is refused; reusing a subscribed connection for an ordinary
+  op gets silence, never a Response.
   No `internal/session` changes — bus is fed purely from the daemon-side
   callback composition, so no torture run was required for this task.
   `docs/status.md`'s eventing row flips to shipped-and-tested;

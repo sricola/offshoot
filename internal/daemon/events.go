@@ -94,6 +94,52 @@ func encodeEvent(ev Event) ([]byte, error) {
 // bounding memory for one that's genuinely stuck or gone.
 var eventSubscriberBuffer = 64
 
+// eventWriteDeadline bounds a single write to a subscriber's underlying
+// connection (unix socket streamEvents, or SSE handleEvents) — a var, not
+// a const, so tests can shrink it (events_test.go's stalled-reader
+// regression tests do exactly that) rather than waiting out the real
+// production default.
+//
+// This closes a gap eventBus.publish's own non-blocking design does NOT
+// cover: publish only bounds how long the PUBLISHER (a session transition
+// or the janitor) waits — it is a channel send, and a full channel is
+// handled by the drop-with-terminal-event path (see publish's doc
+// comment). But the goroutine on the OTHER end of that channel —
+// streamEvents/handleEvents, draining it and writing each event to a real
+// network connection — can itself block forever on the underlying
+// c.Write/w.Write if the reader on the other side has stopped reading
+// entirely (a dead/hung client, or one that simply never drains its
+// socket) and the kernel's send buffer fills up. Nothing about
+// eventBus.publish unblocks THAT: the bus-level drop only ever frees the
+// CHANNEL, not a goroutine parked inside a blocking OS write on a
+// completely separate resource (the connection). Left unbounded, that
+// goroutine — and the file descriptor it holds open — would leak for the
+// life of the daemon.
+//
+// The fix: re-arm a fresh deadline of "now + eventWriteDeadline"
+// immediately before every write attempt on both paths (see streamEvents
+// and handleEvents). A write that fails to complete within that window
+// means the reader is genuinely stuck, not merely slow — the write
+// returns a timeout error, and the caller treats that exactly like any
+// other write error (return, unsubscribe, let the connection close). A
+// live, merely-slow-but-still-draining reader never trips this: every
+// successful write pushes the deadline forward again, and (on the SSE
+// side) the periodic keepalive ping guarantees a re-arm at least every
+// sseKeepaliveInterval even with zero real events. 45s (three times the
+// 15s keepalive default) is chosen to comfortably outlast an ordinary
+// scheduling/GC hiccup on either end while still bounding a truly dead
+// reader to a small, fixed multiple of the ping cadence rather than
+// forever.
+//
+// This is intentionally a PER-WRITE deadline, re-armed on every send —
+// NOT the same thing as http.go's httpWriteTimeout (a fixed, whole-
+// handler-lifetime bound). handleEvents specifically must NOT go back to
+// a single upfront SetWriteDeadline(time.Time{}) (permanently unbounded)
+// the way an earlier version of this file did — see handleEvents's doc
+// comment for why re-arming per write is what keeps a live long-lived
+// stream unaffected while still bounding a stalled one.
+var eventWriteDeadline = 45 * time.Second
+
 // eventSubscriber is one registered subscription: a bounded channel the
 // bus fans events into.
 type eventSubscriber struct {
@@ -192,6 +238,18 @@ func (b *eventBus) publish(ev Event) {
 			close(sub.ch)
 		}
 	}
+}
+
+// subscriberCount reports the current number of live subscribers. Not used
+// by any production code path — it exists purely so tests (both the
+// socket and SSE stalled-reader regression tests in events_test.go) can
+// observe, from outside, that a stalled reader's subscription was actually
+// cleaned up (dropped by the bus, or unsubscribed once its handler gave up
+// on a stuck write) rather than leaking forever.
+func (b *eventBus) subscriberCount() int {
+	b.mu.Lock()
+	defer b.mu.Unlock()
+	return len(b.subs)
 }
 
 // --- session-transition source -------------------------------------------
@@ -335,6 +393,19 @@ func (s *Server) handleSubscribeOp(c net.Conn, enc *json.Encoder) {
 // client hanging up or Server.Shutdown's own close-every-live-connection
 // pass (c is still tracked in s.conns for exactly that reason — see
 // handle's conns bookkeeping, unchanged by this op).
+//
+// A DIFFERENT failure mode a disconnect-only check cannot catch: a client
+// that is still connected but has simply stopped READING (a stalled/stuck
+// subscriber, not a gone one). Once the kernel's send buffer for c fills
+// up, c.Write would block indefinitely with no deadline — pinning this
+// goroutine, and c's file descriptor, open forever. eventWriteDeadline
+// (see its doc comment) is re-armed immediately before every c.Write for
+// exactly this reason: a write that cannot complete within that window is
+// treated as "this reader is stuck," identically to any other write
+// error — the existing `if err != nil { return }` below already unwinds
+// correctly (unsubscribe via the defer above; c itself is closed by
+// handle()'s own defer once this function returns up through
+// handleSubscribeOp).
 func (s *Server) streamEvents(c net.Conn, ch <-chan Event, unsubscribe func()) {
 	defer unsubscribe()
 
@@ -356,12 +427,20 @@ func (s *Server) streamEvents(c net.Conn, ch <-chan Event, unsubscribe func()) {
 				// Event is a plain JSON-safe struct (string/int/map[string]any)
 				// — Marshal failing here would be a logic bug, not a reachable
 				// runtime condition (unlike the write below, which fails
-				// whenever the client is simply gone).
+				// whenever the client is simply gone or stuck).
 				return
 			}
 			data = append(data, '\n')
-			if _, err := c.Write(data); err != nil {
+			// Re-arm before EVERY write — see eventWriteDeadline's doc
+			// comment. A SetWriteDeadline failure (rare — e.g. a Conn
+			// implementation that doesn't support deadlines at all) is
+			// treated the same as a write failure: give up on this
+			// subscriber rather than risk an unbounded write next.
+			if err := c.SetWriteDeadline(time.Now().Add(eventWriteDeadline)); err != nil {
 				return
+			}
+			if _, err := c.Write(data); err != nil {
+				return // includes a timeout error from the deadline above: a stalled reader
 			}
 		case <-gone:
 			return
@@ -387,42 +466,80 @@ var sseKeepaliveInterval = 15 * time.Second
 // requireAuth by http.go's StartHTTP, exactly like /rpc and /metrics
 // (Global Constraints: everything but /healthz needs the Bearer token).
 //
-// *** CLEARS THE PER-REQUEST WRITE DEADLINE ***: http.go's httpWriteTimeout
-// doc comment (see the "*** MILESTONE 4 TASK 4a WARNING ***" block there)
-// spells out why this is mandatory, not optional polish: http.Server's
-// WriteTimeout covers a handler's ENTIRE wall-clock run, with no concept of
-// "a stream that's still legitimately sending, just slowly" — every OTHER
-// handler on this same http.Server (/rpc, /metrics, /debug/pprof/*) still
-// wants that 90s bound, so this handler opts ITSELF out via
-// http.ResponseController.SetWriteDeadline(time.Time{}) rather than the
-// server-wide constant being raised (which would un-bound every handler,
-// including the ones that should stay bounded). See
-// TestSSEStreamSurvivesPastWriteTimeout for the structural proof (Task 4a's
-// brief: don't actually sleep past 90s in a test — lower httpWriteTimeout
-// via its test-only var and stream past THAT instead).
+// *** RE-ARMS A PER-WRITE DEADLINE, NEVER RUNS UNBOUNDED ***: http.go's
+// httpWriteTimeout doc comment (see the "*** MILESTONE 4 TASK 4a ***"
+// block there) spells out why this handler cannot simply live with the
+// server's default 90s WriteTimeout: WriteTimeout covers a handler's
+// ENTIRE wall-clock run, with no concept of "a stream that's still
+// legitimately sending, just slowly," and every OTHER handler on this same
+// http.Server (/rpc, /metrics, /debug/pprof/*) still wants that 90s bound
+// — so this handler opts ITSELF out of it, via
+// http.ResponseController.SetWriteDeadline, rather than the server-wide
+// constant being raised.
+//
+// An EARLIER version of this handler cleared the deadline ONCE, up front
+// (SetWriteDeadline(time.Time{}), permanently unbounded from then on) —
+// that defeated httpWriteTimeout for a live stream, but ALSO meant a
+// client that stopped reading entirely (stalled, not disconnected — its
+// TCP connection stays open, so r.Context().Done() never fires either)
+// would pin this goroutine inside a blocking w.Write forever once the
+// kernel's send buffer filled, leaking the goroutine and its connection's
+// file descriptor for the life of the daemon.
+//
+// The fix (mirrors streamEvents's identical fix on the unix socket side):
+// arm a fresh eventWriteDeadline-out deadline immediately before EVERY
+// write — the initial header write, each event, and each keepalive ping —
+// via armWriteDeadline below. A write that blocks past that window returns
+// a timeout error and this handler gives up on the subscriber exactly like
+// any other write failure. A live long-lived stream is never affected:
+// every successful write re-arms the deadline forward again, and the
+// periodic keepalive ping (sseKeepaliveInterval, default 15s — well under
+// eventWriteDeadline's default 45s) guarantees a re-arm at least that
+// often even during a real quiet period with zero events. See
+// TestSSEStreamSurvivesPastWriteTimeout for the structural proof that a
+// live stream survives past httpWriteTimeout (Task 4a's original brief:
+// don't actually sleep past 90s in a test — lower httpWriteTimeout via its
+// test-only var and stream past THAT instead), and
+// TestStalledSSESubscriberConnectionIsClosedWithinWriteDeadline for the
+// companion proof that a genuinely stalled reader IS bounded, through the
+// real write path (an oversized event forces an actual blocking
+// w.Write), not just asserted by code inspection.
 func (s *Server) handleEvents(w http.ResponseWriter, r *http.Request) {
 	if r.Method != http.MethodGet {
 		w.Header().Set("Allow", http.MethodGet)
 		http.Error(w, "method not allowed", http.StatusMethodNotAllowed)
 		return
 	}
-	flusher, ok := w.(http.Flusher)
-	if !ok {
+	if _, ok := w.(http.Flusher); !ok {
 		// Unreachable with net/http's real ResponseWriter (which always
 		// implements Flusher for an HTTP/1.1 or HTTP/2 connection) — guards
 		// only a hypothetical non-flushing ResponseWriter a future refactor
-		// (or an unusual test double) might introduce.
+		// (or an unusual test double) might introduce. The actual flush
+		// calls below go through http.ResponseController.Flush (rc.Flush),
+		// not this Flusher directly — see armWriteDeadline's doc comment
+		// for why: unlike the bare http.Flusher interface, rc.Flush
+		// RETURNS an error, which is exactly what lets this handler notice
+		// a stalled reader whose blocking write happens to occur inside
+		// Flush (small writes are often still sitting in net/http's own
+		// internal buffer at the point of Fprintf/Fprint, only actually
+		// hitting the wire — and the armed deadline — once flushed).
 		http.Error(w, "streaming unsupported", http.StatusInternalServerError)
 		return
 	}
-	// See doc comment above: clear the write deadline BEFORE the first
-	// write, and before subscribing, so no event can arrive and be written
-	// under the still-armed 90s deadline. A failure here (some
-	// ResponseWriter/environment that doesn't support per-connection
-	// deadline control) is not fatal: this stream simply stays subject to
-	// the ordinary httpWriteTimeout, same as before Task 4a, rather than
-	// this handler refusing to serve at all.
-	_ = http.NewResponseController(w).SetWriteDeadline(time.Time{})
+	rc := http.NewResponseController(w)
+	// armWriteDeadline re-arms the write deadline to "now + eventWriteDeadline"
+	// — called immediately before every single write below (the initial
+	// header write included), never once up front. See this function's own
+	// doc comment and eventWriteDeadline's doc comment for why a permanent
+	// clear (an earlier version of this handler's behavior) is exactly the
+	// bug this re-arm-per-write approach fixes. A SetWriteDeadline failure
+	// (some ResponseWriter/environment that doesn't support per-connection
+	// deadline control at all) is not fatal on its own — reported to the
+	// caller as a write failure below, so this stream simply gives up on
+	// this subscriber rather than risk a write with no bound at all.
+	armWriteDeadline := func() error {
+		return rc.SetWriteDeadline(time.Now().Add(eventWriteDeadline))
+	}
 
 	// Subscribe BEFORE writing headers, for the identical reason
 	// handleSubscribeOp subscribes before acking (see its doc comment): by
@@ -438,8 +555,13 @@ func (s *Server) handleEvents(w http.ResponseWriter, r *http.Request) {
 	w.Header().Set("Cache-Control", "no-cache")
 	w.Header().Set("Connection", "keep-alive")
 	w.Header().Set("X-Accel-Buffering", "no") // nginx: don't buffer an SSE response
+	if err := armWriteDeadline(); err != nil {
+		return
+	}
 	w.WriteHeader(http.StatusOK)
-	flusher.Flush()
+	if err := rc.Flush(); err != nil {
+		return
+	}
 
 	ticker := time.NewTicker(sseKeepaliveInterval)
 	defer ticker.Stop()
@@ -454,21 +576,39 @@ func (s *Server) handleEvents(w http.ResponseWriter, r *http.Request) {
 			if err != nil {
 				return // see streamEvents's identical comment: not reachable in practice
 			}
-			if _, err := fmt.Fprintf(w, "data: %s\n\n", data); err != nil {
+			if err := armWriteDeadline(); err != nil {
 				return
 			}
-			flusher.Flush()
+			if _, err := fmt.Fprintf(w, "data: %s\n\n", data); err != nil {
+				return // includes a timeout error from armWriteDeadline above: a stalled reader
+			}
+			// rc.Flush (http.ResponseController.Flush), not the bare
+			// http.Flusher — see the capability-check comment above: this
+			// is what actually surfaces a timeout error when the write
+			// Fprintf above only buffered, deferring the real (deadline-
+			// bound) syscall to here.
+			if err := rc.Flush(); err != nil {
+				return
+			}
 		case <-ticker.C:
+			if err := armWriteDeadline(); err != nil {
+				return
+			}
 			if _, err := fmt.Fprint(w, ": ping\n\n"); err != nil {
 				return
 			}
-			flusher.Flush()
+			if err := rc.Flush(); err != nil {
+				return
+			}
 		case <-r.Context().Done():
 			// The idiomatic HTTP-side disconnect signal: net/http cancels a
 			// request's Context when the client connection goes away. No
 			// background-Read trick needed here the way streamEvents needs
 			// one for the unix socket (that connection has no equivalent
-			// context).
+			// context). NOTE: this fires for a genuine disconnect, but NOT
+			// for a stalled-but-still-connected reader (its TCP connection
+			// stays fully open) — armWriteDeadline above is what bounds
+			// that separate case.
 			return
 		}
 	}
