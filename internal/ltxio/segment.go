@@ -1,6 +1,7 @@
 package ltxio
 
 import (
+	"bytes"
 	"fmt"
 	"io"
 	"os"
@@ -86,6 +87,58 @@ func EncodeSegment(pageSize, commit uint32, minTXID, maxTXID uint64, preApplyChe
 	}
 	enc.SetPostApplyChecksum(ltx.Checksum(postApplyChecksum))
 	return enc.Close()
+}
+
+// TrailerPostApplyChecksum decodes an already-fetched snapshot or segment
+// LTX object (data, in memory) far enough to validate and read its trailer,
+// and returns the PostApplyChecksum it declares — by construction, always
+// exactly the checksum of the FULL database content that results from
+// applying it as the last member of a chain (see EncodeSegment's doc
+// comment on preApplyChecksum/postApplyChecksum, and EncodeSnapshot, which
+// is what makes this true for a snapshot too: MinTXID 1 has no prior state,
+// so its postApplyChecksum already covers the whole database on its own).
+// That invariant holds regardless of chain length or member type, so this
+// needs to decode ONLY the single object handed to it, never the chain
+// behind it.
+//
+// Page content is decoded and immediately discarded — never written
+// anywhere, not even to a temp file — because only the trailer's declared
+// value is needed here, not the materialized bytes. Close() still runs and
+// still verifies the object's own whole-file CRC64 integrity (catching a
+// truncated or bit-flipped download) before the trailer is trusted; this
+// does NOT re-derive the checksum from the page content the way
+// MaterializeChain does when it needs to catch a WRITER's bug (a declared
+// value that doesn't match what the pages actually produce) — this
+// function's one caller (ops.Workspace.HeadPostApplyChecksum) only needs
+// "what does the store currently say the head's checksum is", which the
+// trailer alone already answers.
+//
+// Works uniformly for both object shapes: a segment's pages are sparse and
+// order-independent from a decode-and-discard perspective (unlike
+// MaterializeChain's segment path, which must apply them to specific
+// absolute offsets to reconstruct real content — see its own doc comment),
+// so a plain header-then-drain-pages-then-close loop, with no destination
+// writer at all, is sufficient and correct for either a snapshot's
+// contiguous full page run or a segment's sparse changed-page set.
+func TrailerPostApplyChecksum(data []byte) (uint64, error) {
+	dec := ltx.NewDecoder(bytes.NewReader(data))
+	if err := dec.DecodeHeader(); err != nil {
+		return 0, fmt.Errorf("ltxio: decode header: %w", err)
+	}
+	pageSize := dec.Header().PageSize
+	var pageHeader ltx.PageHeader
+	buf := make([]byte, pageSize)
+	for {
+		if err := dec.DecodePage(&pageHeader, buf); err == io.EOF {
+			break
+		} else if err != nil {
+			return 0, fmt.Errorf("ltxio: decode page: %w", err)
+		}
+	}
+	if err := dec.Close(); err != nil {
+		return 0, fmt.Errorf("ltxio: close: %w", err)
+	}
+	return uint64(dec.Trailer().PostApplyChecksum), nil
 }
 
 // ChecksumDatabase returns the LTX rolling checksum of a quiesced SQLite

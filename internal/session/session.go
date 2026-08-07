@@ -245,28 +245,52 @@ type Session struct {
 	// upload is untouched and still shows up as pending afterward.
 	appliedGen, flushedGen, flushedRebaseGen int
 
-	// cleanAtOpen is set once by Open, from CheckoutProven's Clean result,
-	// and never written again: true means the checkout Open received was
-	// already proven byte-identical to the branch's CURRENT head (the
-	// sidecar "clean" fast path — see ops.CheckoutResult.Clean) rather than
-	// freshly (re)materialized. rebaseline's very first call — the session's
-	// mandatory startup rebase, whichever of its two call sites reaches it
-	// first (see rebaseline's doc comment) — uses this to prove, without any
-	// additional store read, that the replica it just seeded from that
-	// checkout already matches the durable head exactly, and suppresses the
-	// settling flush that would otherwise re-upload content already known
-	// durable (the settling-flush suppression, M2 follow-up, ledgered — see
-	// appliedGen's doc comment above for what that flush exists to close and
-	// why skipping it is only safe here, not for any later rebase).
-	// Read-only after Open; no lock needed for the read in rebaseline, which
-	// already holds replicaMu for everything else it touches. Safe without
-	// its own synchronization because Open sets this field before either of
-	// rebaseline's two possible first callers can run: the engine goroutine
-	// (started via `go s.runEngine` after this field is assigned in the
-	// struct literal, so the `go` statement's happens-before guarantee
-	// covers it) and Open's own direct call on the clean-resume path (same
-	// goroutine, strictly later).
-	cleanAtOpen bool
+	// cleanAtOpen, headPostApplyChecksum, and headPostApplyValid are set once
+	// by Open and never written again — see Open's own comment at the
+	// fetch site for exactly how each is derived. Together they are the
+	// settling-flush suppression's proof (M2 follow-up, ledgered — see
+	// appliedGen's doc comment above for what the settling flush exists to
+	// close, and rebaseline's doc comment for the full gate and the CRITICAL
+	// race this pair of fields exists to catch).
+	//
+	// cleanAtOpen alone is NOT sufficient proof, and must never be treated
+	// as such: it means the checkout Open's synchronous CheckoutProven call
+	// received was already proven byte-identical to the branch's head AT
+	// THAT MOMENT (T0) — but the engine's own startup rebase (the checkpoint
+	// that actually seeds the replica) runs LATER, asynchronously, in the
+	// engine goroutine, and Open returns to its caller before that rebase
+	// necessarily finishes (see the comment on the WaitReady/Resumed block
+	// below for exactly why). A write landing in that window — after
+	// CheckoutProven's read, before the startup rebase's own
+	// checkpoint(TRUNCATE) — is folded into the checkout's main file by that
+	// checkpoint and DOES show up in what rebaseline hashes (T1), even
+	// though cleanAtOpen, describing only T0, has no way to know that
+	// happened.
+	//
+	// headPostApplyChecksum closes that gap: the durable head's TRUE
+	// content checksum, fetched from the store once, synchronously, in Open
+	// (ops.Workspace.HeadPostApplyChecksum) — independent of, and not
+	// derived from, the local checkout at all. rebaseline compares its own
+	// freshly-computed checksum (necessarily reflecting T1, whatever
+	// actually ended up in the checkout by the time the real rebase ran)
+	// against this value: if a race-window write folded in, the two differ
+	// and the settle correctly proceeds; only an exact match proves nothing
+	// happened in the gap. headPostApplyValid is false whenever that fetch
+	// (or the ref-stability check guarding it — see Open) didn't succeed,
+	// which conservatively disables the suppression rather than trusting an
+	// incomplete proof.
+	//
+	// Read-only after Open; no lock needed for the reads in rebaseline,
+	// which already holds replicaMu for everything else it touches. Safe
+	// without their own synchronization because Open sets all three fields
+	// before either of rebaseline's two possible first callers can run: the
+	// engine goroutine (started via `go s.runEngine` after these fields are
+	// assigned in the struct literal, so the `go` statement's
+	// happens-before guarantee covers it) and Open's own direct call on the
+	// clean-resume path (same goroutine, strictly later).
+	cleanAtOpen           bool
+	headPostApplyChecksum uint64
+	headPostApplyValid    bool
 
 	// snapshotEvery and flushesSinceSnapshot are read and written only from
 	// within Flush, which already holds flushMu for its entire body — no
@@ -372,14 +396,44 @@ func Open(ctx context.Context, o Options) (*Session, error) {
 		return nil, err
 	}
 
+	// Settling-flush suppression's proof (M2 follow-up, ledgered — see
+	// rebaseline's doc comment for the full gate this feeds and exactly why
+	// checkoutRes.Clean ALONE is not sufficient). Fetched only when
+	// checkoutRes.Clean (no point otherwise: the suppression can never
+	// fire), and only here — once, synchronously, in Open's own goroutine,
+	// strictly before the capture engine's startup rebase can run.
+	//
+	// A SECOND, independent GetRef — not a reuse of checkoutRes.Ref — is
+	// deliberate: it confirms the ref genuinely had not moved between
+	// CheckoutProven's own read and this one, closing the (narrow, but
+	// real, since these are two separate store calls) gap between them.
+	// Any mismatch, or any error along the way, simply leaves
+	// headPostApplyValid false rather than failing Open — this checksum is
+	// a proof for an optimization, never something Open's own correctness
+	// depends on.
+	var headPostApplyChecksum uint64
+	var headPostApplyValid bool
+	if checkoutRes.Clean {
+		if ref2, _, rerr := o.WS.Store.GetRef(o.DB, o.Branch); rerr == nil &&
+			ref2.Lineage == checkoutRes.Ref.Lineage &&
+			ref2.HeadEpoch == checkoutRes.Ref.HeadEpoch &&
+			ref2.HeadTXID == checkoutRes.Ref.HeadTXID {
+			if sum, herr := o.WS.HeadPostApplyChecksum(ref2); herr == nil {
+				headPostApplyChecksum, headPostApplyValid = sum, true
+			}
+		}
+	}
+
 	s := &Session{
 		ws: o.WS, db: o.DB, branch: o.Branch, dir: dir, ownsDir: ownsDir,
-		checkoutPath:  checkoutRes.Path,
-		replica:       replay.New(filepath.Join(dir, "replica.db")),
-		lease:         lease,
-		pages:         newPageSet(),
-		snapshotEvery: o.SnapshotEvery,
-		cleanAtOpen:   checkoutRes.Clean,
+		checkoutPath:          checkoutRes.Path,
+		replica:               replay.New(filepath.Join(dir, "replica.db")),
+		lease:                 lease,
+		pages:                 newPageSet(),
+		snapshotEvery:         o.SnapshotEvery,
+		cleanAtOpen:           checkoutRes.Clean,
+		headPostApplyChecksum: headPostApplyChecksum,
+		headPostApplyValid:    headPostApplyValid,
 	}
 
 	cctx, cancel := context.WithCancel(ctx)
@@ -737,7 +791,7 @@ func (s *Session) Close() error {
 }
 
 // prepareSidecarRefresh and commitSidecarRefresh together re-stamp the
-// checkout's .sum sidecar (via ops.RefreshSum) on a CLEAN Close, so the next
+// checkout's .sum sidecar (via ops.StampSum) on a CLEAN Close, so the next
 // Open/Checkout against this db@branch clean-skips re-materializing instead
 // of paying a full chain replay — restoring, for the daemon-reopen pattern,
 // the win Milestone 2 Task 1 already established for a Checkout call
@@ -748,53 +802,70 @@ func (s *Session) Close() error {
 //
 // Split in two, straddling Close's engine-shutdown join
 // (s.cancel(); <-s.engDone), because of a hazard specific to same-process
-// SQLite locking. Stamping the sidecar needs the checkout's WAL ALREADY
-// checkpointed into its main file first: writeSum's hash (via fileSum) is a
-// raw byte hash of the file on disk, and SQLite in WAL mode can leave a
-// just-committed write sitting in the -wal file with the main file's bytes
-// still reflecting the state before it — checkoutState's own "clean" check
-// always runs after a fresh quiesce() for exactly this reason (see
-// Checkout/CheckoutProven). But this session's OWN capture engine may still
-// hold live SQLite state on this exact path while it's running, and opening
-// a second, independent connection here to checkpoint it ourselves would
-// risk the POSIX (process, inode) lock-drop hazard fileSum's own doc
-// comment warns against (closing ANY fd this process holds on an inode
-// drops EVERY advisory lock this process holds on it, including the
-// engine's) — "do not reintroduce a bare os.Open [or open/close pair] here
-// on the strength of a guard that only usually holds" is exactly that
-// comment's warning, and it applies just as much to a fresh quiesce() call
-// as to a bare os.Open.
+// SQLite locking. Stamping the sidecar needs a hash of the checkout's
+// content with its WAL ALREADY checkpointed into the main file — SQLite in
+// WAL mode can leave a just-committed write sitting in the -wal file with
+// the main file's bytes still reflecting the state before it, and a hash
+// taken before that checkpoint would describe stale bytes. But this
+// session's OWN capture engine may still hold live SQLite state on this
+// exact path while it's running, and opening a second, independent
+// connection here to checkpoint and hash it ourselves would risk the POSIX
+// (process, inode) lock-drop hazard internal/dbfile's package comment warns
+// against (closing ANY fd this process holds on an inode drops EVERY
+// advisory lock this process holds on it, including the engine's).
 //
-// The engine already solves this FOR us: capture.Engine.shutdown (called
-// from Run's ctx.Done() branch, i.e. exactly what s.cancel() triggers) does
-// its own final drain and checkpoint(TRUNCATE) of the checkout, using its
-// own long-lived connection, as the very first thing it does — and that
-// connection is fully closed (Run's own deferred e.conn.Close/e.db.Close,
-// which run before the deferred close(e.done) that unblocks <-s.engDone —
-// see Run's defer order) by the time engDone fires. So: everything that
-// needs the engine ALIVE (a final DrainNow, to make the pending check below
-// trustworthy — DrainNow folds content into the replica/appliedGen
-// bookkeeping but does not itself checkpoint the checkout's WAL) runs in
+// commitSidecarRefresh does NOT open a second connection to solve this.
+// Instead it reuses a fingerprint the engine's OWN shutdown already
+// computed, from ITS own long-lived connection: capture.Engine.shutdown
+// (called from Run's ctx.Done() branch, i.e. exactly what s.cancel()
+// triggers) drains, checkpoints(RESTART then TRUNCATE), and — ONLY if every
+// one of those steps verified clean — hashes the checkout's main file and
+// persists {Clean: true, MainHash: <that hash>} to capture.State (see that
+// type's doc comment). Critically, shutdown has FOUR early-return paths
+// (a failed final drain, checkpoint(RESTART) failing or reporting more
+// frames folded than drain() had consumed, walRacedSinceRestart detecting a
+// foreign write in the checkpoint gap, or checkpoint(TRUNCATE) itself
+// failing) that leave the persisted State at whatever it was before —
+// Clean=false, or a stale Clean=true from an earlier session entirely — NOT
+// a corrected one. An earlier version of this function assumed shutdown's
+// checkpoint always ran and always succeeded and independently re-quiesced
+// + re-hashed the checkout itself; that is wrong on exactly this path, and
+// worse than merely redundant: a fresh quiesce()+hash after one of
+// shutdown's own early returns would fold in, and then stamp, content
+// shutdown itself had just refused to vouch for. commitSidecarRefresh must
+// therefore load capture.State (capture.LoadState(capture.StatePath(s.dir)))
+// and require Clean == true before trusting MainHash for anything — see the
+// body below.
+//
+// So: everything that needs the engine ALIVE (a final DrainNow, to make the
+// pending check below trustworthy — DrainNow folds content into the
+// replica/appliedGen bookkeeping but does not itself checkpoint the
+// checkout's WAL, and does not touch capture.State at all) runs in
 // prepareSidecarRefresh, called BEFORE s.cancel(); everything that needs
-// the checkout's bytes ALREADY checkpointed and the engine's own connection
-// already gone runs in commitSidecarRefresh, called AFTER <-s.engDone. Both
-// re-check the same conditions independently (see each function's own
-// comment) rather than trusting phase one's verdict blindly: shutdown's own
-// best-effort drain can itself apply one more transaction that raced
-// between phase one's DrainNow and s.cancel(), which would make
-// autoFlushPending() flip from false to true in between — exactly what
-// commitSidecarRefresh's re-check exists to catch.
+// the engine's own shutdown to have already run (successfully or not — its
+// verdict is exactly what gates this) and its connection already gone runs
+// in commitSidecarRefresh, called AFTER <-s.engDone (Run's own deferred
+// e.conn.Close/e.db.Close run before the deferred close(e.done) that
+// unblocks <-s.engDone — see Run's defer order — so no engine-owned
+// connection is still open by the time this runs, even though this
+// function opens none of its own either way now). Both phases re-check
+// sidecarRefreshEligible() independently rather than trusting phase one's
+// verdict blindly: shutdown's own best-effort drain can itself apply one
+// more transaction that raced between phase one's DrainNow and s.cancel(),
+// which would make autoFlushPending() flip from false to true in between —
+// exactly what commitSidecarRefresh's re-check exists to catch.
 //
-// Both are best-effort: any failure along the way (drain timeout, GetRef
-// error, sidecar write error) simply skips the refresh — Close's job is
-// shutting the session down cleanly, not guaranteeing this optimization
-// landed, and the worst case of skipping it is only that the next Open pays
-// a materialize it could have avoided, never incorrect data. There remains
-// an inherent, unclosable TOCTOU window around the whole sequence (an
-// external process could commit a write to the checkout at almost any
-// point in it); that is the same class of race every other checkoutState
-// consumer in this codebase already accepts (see ops.Checkout's own
-// quiesce-then-check flow), not something new introduced here.
+// Both are best-effort: any failure along the way (drain timeout, no
+// verified-clean state, GetRef error, sidecar write error) simply skips the
+// refresh — Close's job is shutting the session down cleanly, not
+// guaranteeing this optimization landed, and the worst case of skipping it
+// is only that the next Open pays a materialize it could have avoided,
+// never incorrect data. There remains an inherent, unclosable TOCTOU
+// window around the whole sequence (an external process could commit a
+// write to the checkout at almost any point in it); that is the same class
+// of race every other checkoutState consumer in this codebase already
+// accepts (see ops.Checkout's own quiesce-then-check flow), not something
+// new introduced here.
 func (s *Session) prepareSidecarRefresh() bool {
 	s.flushMu.Lock()
 	defer s.flushMu.Unlock()
@@ -802,6 +873,15 @@ func (s *Session) prepareSidecarRefresh() bool {
 	if s.Err() != nil {
 		return false
 	}
+	// 30s matches Flush's own DrainNow budget (see its doc comment for the
+	// full worst-case-latency reasoning this borrows: the capture engine's
+	// takeover/retry budgets can legitimately run into the tens of
+	// seconds under contention) rather than a shorter one specific to
+	// Close: a tighter budget here would risk spuriously abandoning this
+	// best-effort optimization under exactly the same contention DrainNow
+	// already has to ride out elsewhere, for no real benefit — Close still
+	// blocks the caller either way, and skipping the refresh on a false
+	// timeout only costs a future reopen's materialize, never correctness.
 	dctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
 	err := s.captured.DrainNow(dctx)
 	cancel()
@@ -812,12 +892,27 @@ func (s *Session) prepareSidecarRefresh() bool {
 }
 
 // commitSidecarRefresh is prepareSidecarRefresh's other half — see its doc
-// comment for why this must run only after Close has joined engDone.
+// comment for why this must run only after Close has joined engDone, and
+// why it stamps from the engine's own verified-clean State.MainHash rather
+// than independently re-hashing the checkout.
 func (s *Session) commitSidecarRefresh() {
 	s.flushMu.Lock()
 	defer s.flushMu.Unlock()
 
 	if !s.sidecarRefreshEligible() {
+		return
+	}
+	st, ok, err := capture.LoadState(capture.StatePath(s.dir))
+	if err != nil || !ok || !st.Clean || st.MainHash == "" {
+		// Not a verified-clean shutdown (one of shutdown's four early
+		// returns fired — see the doc comment above) — nothing safe to
+		// stamp from. This is the expected outcome whenever a write raced
+		// the engine's own final checkpoint, not a bug; log it at
+		// warn-to-stderr, matching this package's other non-fatal
+		// transition logging, so an operator investigating "why did this
+		// reopen re-materialize" has a signal without this being surfaced
+		// as an error to any caller.
+		s.logTransition("sidecar-refresh-skipped", "reason", "shutdown state not verified clean")
 		return
 	}
 	s.mu.Lock()
@@ -835,7 +930,9 @@ func (s *Session) commitSidecarRefresh() {
 		return // a concurrent writer elsewhere moved the head past what we flushed
 	}
 
-	ops.RefreshSum(s.checkoutPath, ref.Lineage, ref.HeadEpoch, ref.HeadTXID)
+	if err := ops.StampSum(s.checkoutPath, st.MainHash, ref.Lineage, ref.HeadEpoch, ref.HeadTXID); err != nil {
+		s.logTransition("sidecar-refresh-skipped", "reason", err.Error())
+	}
 }
 
 // sidecarRefreshEligible is the pending/success check both
@@ -1079,57 +1176,78 @@ func (s *Session) recordApply(pageSize uint32, frames []wal.Frame) error {
 // call of rebaseline's life (rebaseGen 0 -> 1 — either call site: the
 // engine's mandatory startup Rebase, or Open's own direct call on the
 // clean-resume path, see cleanAtOpen's doc comment) AND s.cleanAtOpen is
-// true suppresses the settling flush that appliedGen/flushedRebaseGen's doc
-// comment describes: it marks THIS rebase as already durable
-// (flushedRebaseGen = rebaseGen) instead of leaving it pending, and clears
-// forceSnapshot, so flushLoop's next tick finds nothing pending and performs
-// no upload at all.
+// true AND s.headPostApplyValid is true AND sum (just computed, above)
+// equals s.headPostApplyChecksum EXACTLY suppresses the settling flush that
+// appliedGen/flushedRebaseGen's doc comment describes: it marks THIS rebase
+// as already durable (flushedRebaseGen = rebaseGen) instead of leaving it
+// pending, and clears forceSnapshot, so flushLoop's next tick finds nothing
+// pending and performs no upload at all.
 //
-// Proof obligation: this is sound exactly when the checksum this rebaseline
-// call just computed (sum, above) is provably equal to the branch head's
-// true content-checksum (every LTX chain member's postApplyChecksum is, by
-// construction, exactly ltxio.ChecksumDatabase of the content that results
-// from applying it — see ltxio.MaterializeChain's verification) AND nothing
-// has raced between that head being read and this replica being seeded from
-// it. cleanAtOpen supplies both without this function needing to fetch or
-// compute anything itself: ops.CheckoutProven already read the CURRENT ref
-// (satisfying "nothing raced" — this session's lease was already held
-// before that read, so no other writer could have moved HeadTXID/HeadEpoch
-// since) and, on the Clean=true path, already proved the checkout's bytes
-// are byte-identical (SHA-256, strictly stronger than an LTX checksum
-// comparison) to what was fingerprinted at that exact head — see
-// ops.CheckoutResult.Clean's doc comment. The replica this rebaseline call
-// just checksummed was seeded directly from that same checkout (a raw copy,
-// for the engine's startup Rebase; the resumed path's own contract —
-// "clean prior shutdown, main file unchanged" — see Open's comment — ties
-// its continued replica to that same unchanged checkout just as tightly),
-// so sum is, by transitivity, already proven equal to the head's true
-// checksum without a live comparison. No store read is added here or
-// anywhere in the engine goroutine: the one relevant read (GetRef) already
-// happened synchronously inside Open's call to CheckoutProven, before the
-// engine ever starts — see CheckoutProven's doc comment on why that read
-// costs nothing extra either (Checkout already needed it).
+// Proof obligation, and why cleanAtOpen ALONE is not sufficient (this was a
+// real, shipped bug in an earlier version of this suppression, caught by
+// code review before it merged — kept here so it is never reintroduced):
+// cleanAtOpen only proves the checkout's content AT THE MOMENT Open's
+// synchronous CheckoutProven call ran (T0). The engine's actual startup
+// rebase — the one that seeds the replica this function is about to
+// checksum — runs LATER and asynchronously, in the engine's own goroutine;
+// Open returns to its caller before that rebase necessarily finishes (see
+// the WaitReady/Resumed comment in Open). A write landing in the window
+// between T0 and the real rebase's own checkpoint(TRUNCATE) (T1) is folded
+// into the checkout's main file by that checkpoint — and therefore INTO sum
+// below — without ever passing through Apply, so appliedGen never counts
+// it either. cleanAtOpen, describing only T0, cannot see that this
+// happened; a suppression gated on cleanAtOpen alone would silently believe
+// the settle unnecessary and that write would never become durable, AND
+// s.flushChecksum would be left describing content one write ahead of what
+// was ever actually uploaded, so the next real segment's declared
+// preApplyChecksum would no longer match the chain — a hard read failure
+// for everyone materializing this branch from then on.
+//
+// The `sum == s.headPostApplyChecksum` comparison is what actually closes
+// this: headPostApplyChecksum is the durable head's TRUE content checksum,
+// fetched from the store independently of the local checkout (Open calls
+// ops.Workspace.HeadPostApplyChecksum once, synchronously, before the
+// engine's startup rebase can run — see Open's own comment at that call
+// site). sum, by contrast, necessarily reflects T1 — whatever the checkout
+// actually contained by the time the real rebase ran, race-window write or
+// not. If one landed, the two values differ (folding in even one changed
+// page changes the rolling checksum — see ltxio.UpdateChecksum) and this
+// gate correctly leaves forceSnapshot true, so the settle proceeds and
+// ships that write for real. Only an exact match is proof nothing happened
+// in the gap. headPostApplyValid guards the case where that store fetch (or
+// the ref-stability re-check guarding it, in Open) didn't succeed: no
+// number to compare against means no suppression, full stop — conservative
+// by construction, never a false "nothing to do."
+//
+// No store read is added here, in the engine goroutine: headPostApplyChecksum
+// was already fetched, once, synchronously, inside Open — see Open's own
+// comment at that call site for why a SECOND independent GetRef there,
+// rather than reusing CheckoutProven's ref, is itself part of this same
+// proof.
 //
 // When cleanAtOpen is false (the checkout was freshly (re)materialized —
 // stale, locally modified, or simply didn't exist yet), this suppression
-// does NOT apply, even though the freshly materialized checkout ALSO
-// exactly equals the head afterward: proving that would need capturing a
-// checksum as a byproduct of the chain replay materializeChainAt just did,
-// which this function deliberately does not attempt, matching the
-// suppression's actual target — the reopen-after-clean-close workload
-// (Session.Close's sidecar refresh pairs directly with this) — rather than
-// trying to also optimize the cold-materialize path. The settle proceeds
-// exactly as before M2's original settling-flush behavior.
+// does NOT apply, even though a freshly materialized checkout ALSO exactly
+// equals the head afterward: proving that would need capturing a checksum
+// as a byproduct of the chain replay materializeChainAt just did, which
+// this function deliberately does not attempt, matching the suppression's
+// actual target — the reopen-after-clean-close workload (Session.Close's
+// sidecar refresh pairs directly with this) — rather than trying to also
+// optimize the cold-materialize path. The settle proceeds exactly as
+// before M2's original settling-flush behavior.
 //
 // This gate applies ONLY to rebaseGen's 0 -> 1 transition, never to a later
 // rebase-on-divergence (rebaseGen 1 -> 2, 2 -> 3, ...): those have no
-// cleanAtOpen-shaped proof available (cleanAtOpen describes Open's ONE-TIME
-// checkout materialization, not anything about mid-session state), so
-// `first` below is false for them and this whole block is skipped — the
-// settle for a rebase that DID fold content (M2's critical fix, see
-// TestFlushLoopFlushesRebaseFoldedContentWhenOtherwiseIdle and
+// cleanAtOpen/headPostApplyChecksum-shaped proof available (both describe
+// Open's ONE-TIME checkout materialization, not anything about mid-session
+// state), so `first` below is false for them and this whole block is
+// skipped — the settle for a rebase that DID fold content (M2's critical
+// fix, see TestFlushLoopFlushesRebaseFoldedContentWhenOtherwiseIdle and
 // TestFlushLoopRetriesAfterRebaseDuringUpload) is completely untouched by
-// this change.
+// this change. TestSettlingSuppressionCatchesRaceWindowFold pins the T0/T1
+// race directly, by white-box-rewinding rebaseGen back to 0 after a real
+// (unraced) startup rebase has already landed and re-driving that "first"
+// transition with content headPostApplyChecksum knows nothing about.
 func (s *Session) rebaseline() error {
 	sum, err := ltxio.ChecksumDatabase(s.replica.Path())
 	if err != nil {
@@ -1141,7 +1259,7 @@ func (s *Session) rebaseline() error {
 	s.pages = newPageSet()
 	s.forceSnapshot = true
 	s.rebaseGen++
-	if first && s.cleanAtOpen {
+	if first && s.cleanAtOpen && s.headPostApplyValid && sum == s.headPostApplyChecksum {
 		s.forceSnapshot = false
 		s.flushedRebaseGen = s.rebaseGen
 	}

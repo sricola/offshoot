@@ -746,6 +746,77 @@ func TestEngineDetectsInPlaceUpdateAfterCleanShutdown(t *testing.T) {
 	}
 }
 
+// TestEngineShutdownLeavesUnverifiedStateAfterRacedRestart pins
+// ShutdownRaceHook and, through it, the `int64(logN) != consumed` early
+// return in shutdown() (see the "KNOWN RESIDUAL RISK" block above it): a
+// foreign write landing in the window between shutdown's final endRead and
+// its checkpoint(RESTART) call makes RESTART fold (and report) a frame
+// drain() never consumed, so shutdown must leave the persisted State at
+// Clean=false rather than record a clean marker over content the replica
+// never captured. internal/session's own TestCloseDoesNotStampSidecarAfterUnverifiedShutdown
+// reuses this exact hook to verify Session.commitSidecarRefresh's gate on
+// this same State.
+func TestEngineShutdownLeavesUnverifiedStateAfterRacedRestart(t *testing.T) {
+	if _, err := exec.LookPath("sqlite3"); err != nil {
+		t.Skip("sqlite3 CLI not on PATH")
+	}
+	dir := t.TempDir()
+	src := filepath.Join(dir, "src.db")
+	if out, err := exec.Command("sqlite3", src,
+		"PRAGMA journal_mode=WAL; CREATE TABLE t (id INTEGER PRIMARY KEY, v BLOB);").CombinedOutput(); err != nil {
+		t.Fatalf("init: %v: %s", err, out)
+	}
+
+	rep := replay.New(filepath.Join(dir, "replica.db"))
+	e := NewEngine(Options{DBPath: src, StateDir: dir, Sink: replicaSink{rep}})
+	ctx, cancel := context.WithCancel(context.Background())
+	done := make(chan error, 1)
+	go func() { done <- e.Run(ctx) }()
+
+	if out, err := exec.Command("sqlite3", src,
+		"PRAGMA busy_timeout=5000; INSERT INTO t (v) VALUES (randomblob(64));").CombinedOutput(); err != nil {
+		t.Fatalf("%v: %s", err, out)
+	}
+	waitEqual(t, src, rep, 10*time.Second)
+
+	ShutdownRaceHook = func() {
+		if out, err := exec.Command("sqlite3", src,
+			"PRAGMA busy_timeout=5000; INSERT INTO t (v) VALUES (randomblob(64));").CombinedOutput(); err != nil {
+			t.Errorf("hook write: %v: %s", err, out)
+		}
+	}
+	defer func() { ShutdownRaceHook = nil }()
+
+	cancel()
+	<-done
+
+	st, ok, err := LoadState(StatePath(dir))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !ok {
+		t.Fatal("expected a persisted state file after shutdown")
+	}
+	if st.Clean {
+		t.Fatal("a write racing shutdown's RESTART checkpoint must leave State.Clean false, not record a clean marker over unverified content")
+	}
+
+	// Confirms the consequence end to end: a fresh engine reusing the SAME
+	// StateDir (and replica) must rebase against this Clean=false state, not
+	// silently resume — same dir/rep as the first engine, not startEngine's
+	// own fresh t.TempDir(), which would trivially have no state file at all
+	// rather than exercising the Clean=false verdict specifically.
+	e2 := NewEngine(Options{DBPath: src, StateDir: dir, Sink: replicaSink{rep}})
+	ctx2, cancel2 := context.WithCancel(context.Background())
+	done2 := make(chan error, 1)
+	go func() { done2 <- e2.Run(ctx2) }()
+	defer func() { cancel2(); <-done2 }()
+	waitEqual(t, src, rep, 10*time.Second)
+	if e2.Rebased() == 0 {
+		t.Fatal("expected the next engine to rebase after an unverified (Clean=false) prior shutdown, not resume")
+	}
+}
+
 func TestEngineSurvivesForeignPassiveCheckpoint(t *testing.T) {
 	if _, err := exec.LookPath("sqlite3"); err != nil {
 		t.Skip("sqlite3 CLI not on PATH")
