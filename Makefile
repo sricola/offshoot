@@ -77,20 +77,28 @@ dry-run-python-sdk: check-sdk-versions
 	sdk/python/.dry-run-venv/bin/python3 -c "import offshoot; print('import offshoot: ok,', offshoot.__doc__.splitlines()[0])"
 	rm -rf sdk/python/.dry-run-venv
 
-# dry-run-ts-sdk builds dist/, packs the exact tarball `npm publish` would
-# upload (respecting package.json's "files" whitelist), installs *that
-# tarball* — not the source tree — into a throwaway project, and
-# import-tests the published entry point. This catches "files" whitelist
-# mistakes (dist/ not built yet, an accidentally-included test file) that
-# `npm test` against the source tree can't see. This is exactly what
-# .github/workflows/publish.yml's npm job runs when PUBLISH_ENABLED is not
-# "true" instead of uploading anywhere; ci.yml's sdks job runs it on every
-# PR. Needs `npm` on PATH.
+# dry-run-ts-sdk builds dist/ (from a clean slate — rm -rf first, so a stale
+# dist/ left over from a different files-array/branch can never be what
+# gets packed), packs the exact tarball `npm publish` would upload
+# (respecting package.json's "files" whitelist), asserts the tarball's
+# actual contents are EXACTLY the allowed set (not "at least" or "no worse
+# than" — any addition or removal fails the build, so a loosened "files"
+# array or a stray committed dist/ artifact fails CI, not a human's
+# memory), then installs *that tarball* — not the source tree — into a
+# throwaway project and import-tests the published entry point. This is
+# exactly what .github/workflows/publish.yml's npm job runs when
+# PUBLISH_ENABLED is not "true" instead of uploading anywhere; ci.yml's
+# sdks job runs it on every PR. Needs `npm` and `tar` on PATH.
 dry-run-ts-sdk:
+	rm -rf sdk/typescript/dist
 	cd sdk/typescript && npm install --no-audit --no-fund && npm run build
 	rm -rf sdk/typescript/dry-run-pack sdk/typescript/dry-run-install
 	mkdir -p sdk/typescript/dry-run-pack sdk/typescript/dry-run-install
 	cd sdk/typescript && npm pack --silent --pack-destination dry-run-pack
+	tar -tzf sdk/typescript/dry-run-pack/offshoot-db-client-*.tgz | sort > sdk/typescript/dry-run-pack/actual-tarball-contents.txt
+	printf '%s\n' package/README.md package/dist/client.d.ts package/dist/client.js package/package.json | sort > sdk/typescript/dry-run-pack/expected-tarball-contents.txt
+	diff -u sdk/typescript/dry-run-pack/expected-tarball-contents.txt sdk/typescript/dry-run-pack/actual-tarball-contents.txt
+	@echo "tarball contents: exact match (README.md, dist/client.d.ts, dist/client.js, package.json) — nothing more, nothing less"
 	cd sdk/typescript/dry-run-install && npm init -y --silent >/dev/null
 	cd sdk/typescript/dry-run-install && npm install --no-audit --no-fund --silent ../dry-run-pack/offshoot-db-client-*.tgz
 	cd sdk/typescript/dry-run-install && node -e "import('@offshoot-db/client').then((m) => { if (typeof m.connect !== 'function') throw new Error('connect export missing from published package'); console.log('import @offshoot-db/client: ok'); })"
