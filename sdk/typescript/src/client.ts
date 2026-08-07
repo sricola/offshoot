@@ -37,6 +37,13 @@ export interface CheckpointInfo {
  * describe the exact same set of checkpoints — `checkpoints` stays for
  * wire/API compat with code written before `checkpoints_v2` existed; new
  * code should prefer `checkpoints_v2`.
+ *
+ * `state` is this branch's computed state — one of `"active"`, `"pending"`,
+ * `"error"`, `"dirty"`, `"detached"`, or `"idle"`; see
+ * `internal/ops/status.go`'s `BranchStateAt` for the full taxonomy and
+ * precedence. `""` against a pre-Milestone-4 daemon that never sends this
+ * field at all (wire-additive: an old daemon still answers every other
+ * field exactly as before).
  */
 export interface Branch {
   branch: string;
@@ -48,6 +55,7 @@ export interface Branch {
   checkpoints: string[];
   touched_at: string;
   checkpoints_v2: CheckpointInfo[];
+  state: string;
 }
 
 /** One session open in the daemon, as returned by {@link Client.status}. */
@@ -287,6 +295,7 @@ export class Client {
         txid: cp.txid ?? 0,
         created_at: cp.created_at ?? "",
       })),
+      state: b.state ?? "",
     }));
   }
 

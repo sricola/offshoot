@@ -43,6 +43,13 @@ class Branch:
     created_at) describe the exact same set of checkpoints — ``checkpoints``
     stays for wire/API compat with code written before ``checkpoints_v2``
     existed; new code should prefer ``checkpoints_v2``.
+
+    ``state`` is this branch's computed state — one of ``"active"``,
+    ``"pending"``, ``"error"``, ``"dirty"``, ``"detached"``, or ``"idle"``;
+    see ``internal/ops/status.go``'s ``BranchStateAt`` for the full
+    taxonomy and precedence. Defaults to ``""`` against a pre-Milestone-4
+    daemon that never sends this field at all (wire-additive: an old daemon
+    still answers every other field exactly as before).
     """
 
     branch: str
@@ -54,6 +61,7 @@ class Branch:
     checkpoints: list[str] = field(default_factory=list)
     touched_at: str = ""
     checkpoints_v2: list[CheckpointInfo] = field(default_factory=list)
+    state: str = ""
 
 
 def _ttl_str(ttl) -> str:
@@ -206,6 +214,7 @@ class Client:
                     )
                     for cp in b.get("checkpoints_v2", [])
                 ],
+                state=b.get("state", ""),
             )
             for b in resp.get("branches", [])
         ]

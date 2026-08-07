@@ -17,7 +17,6 @@ import (
 	"net/url"
 	"os"
 	"path/filepath"
-	"sort"
 	"strings"
 	"sync/atomic"
 	"time"
@@ -485,12 +484,8 @@ func writeSum(path string, lineage string, epoch, txid, postApplyChecksum uint64
 //     corrupt files). Provenance can't be determined, so callers should
 //     stay silent rather than warn spuriously.
 func checkoutState(path string, ref store.Ref) (string, uint64) {
-	raw, err := os.ReadFile(path + ".sum")
-	if err != nil {
-		return "unknown", 0
-	}
-	var rec sumRecord
-	if err := json.Unmarshal(raw, &rec); err != nil || rec.Hash == "" {
+	rec, ok := readSidecar(path)
+	if !ok {
 		return "unknown", 0
 	}
 	if rec.Lineage != ref.Lineage || rec.Epoch != ref.HeadEpoch || rec.TXID != ref.HeadTXID {
@@ -504,6 +499,29 @@ func checkoutState(path string, ref store.Ref) (string, uint64) {
 		return "modified", 0
 	}
 	return "clean", rec.PostApplyChecksum
+}
+
+// readSidecar reads and parses path's .sum sidecar (see sumRecord's doc
+// comment) into rec, with ok=false if the file is absent or doesn't decode
+// as a valid current-format record (including a legacy bare-hash sidecar or
+// a corrupt file) — the same "nothing readable" bucket checkoutState's own
+// "unknown" verdict already treats as unknown. Shared by checkoutState and
+// ops.BranchStateAt (status.go) so the two can never disagree on what
+// counts as a readable sidecar; BranchStateAt needs the raw record (not
+// just checkoutState's collapsed stale/modified/clean verdict) to tell a
+// lineage mismatch (its "detached" state) apart from a same-lineage
+// epoch/txid mismatch (its "idle" — needs re-materialize, not orphaned) —
+// see BranchStateAt's doc comment.
+func readSidecar(path string) (sumRecord, bool) {
+	raw, err := os.ReadFile(path + ".sum")
+	if err != nil {
+		return sumRecord{}, false
+	}
+	var rec sumRecord
+	if err := json.Unmarshal(raw, &rec); err != nil || rec.Hash == "" {
+		return sumRecord{}, false
+	}
+	return rec, true
 }
 
 // fileSum is the SHA-256 of a checkout file's bytes, used by checkoutState
@@ -1150,106 +1168,4 @@ func (w *Workspace) Promote(db, source, target string, force bool) (uint64, erro
 		}
 	}
 	return txid, nil
-}
-
-type BranchStatus struct {
-	DB, Branch  string
-	HeadTXID    uint64
-	Checkpoints []string
-	Protected   bool
-	Parent      string
-	CheckedOut  bool
-	// TTL is the branch's TTL verbatim from the ref ("" if none).
-	TTL string
-	// TTLRemaining is how long until the branch is eligible for reaping,
-	// measured from the later of TouchedAt and LeaseExpiry ("" if TTL is
-	// unset; "expired" once past the deadline).
-	TTLRemaining string
-}
-
-// ReapDeadline computes when ref's TTL expires, measured from the later of
-// its activity clock (TouchedAt) and its lease expiry — either kind of
-// activity defers reaping. ok is false when ref has no TTL, its TTL is
-// non-positive (a negative or zero duration string is not a real TTL — fail
-// closed rather than compute a deadline already in the past), or its TTL or
-// timestamps fail to parse.
-func ReapDeadline(ref store.Ref) (time.Time, bool) {
-	if ref.TTL == "" {
-		return time.Time{}, false
-	}
-	d, err := time.ParseDuration(ref.TTL)
-	if err != nil || d <= 0 {
-		return time.Time{}, false
-	}
-	base, ok := parseRefTime(ref.TouchedAt)
-	if !ok {
-		return time.Time{}, false
-	}
-	if lease, ok := parseRefTime(ref.LeaseExpiry); ok && lease.After(base) {
-		base = lease
-	}
-	return base.Add(d), true
-}
-
-// FormatTTLRemaining renders ref's time-to-reap as of now, for display:
-// "" if ref has no (real) TTL, "expired" once past ReapDeadline, otherwise
-// the remaining time.Duration's String(). Shared by Status and the daemon's
-// "branches" op so the two report identical numbers computed the same way,
-// rather than each formatting ReapDeadline's result independently.
-func FormatTTLRemaining(ref store.Ref, now time.Time) string {
-	deadline, ok := ReapDeadline(ref)
-	if !ok {
-		return ""
-	}
-	if now.After(deadline) {
-		return "expired"
-	}
-	return deadline.Sub(now).String()
-}
-
-// parseRefTime parses an RFC3339Nano ref timestamp field (TouchedAt or
-// LeaseExpiry), which is empty when unset.
-func parseRefTime(s string) (time.Time, bool) {
-	if s == "" {
-		return time.Time{}, false
-	}
-	t, err := time.Parse(time.RFC3339Nano, s)
-	if err != nil {
-		return time.Time{}, false
-	}
-	return t, true
-}
-
-func (w *Workspace) Status() ([]BranchStatus, error) {
-	refs, err := w.Store.ListRefs()
-	if err != nil {
-		return nil, err
-	}
-	var dbs []string
-	for db := range refs {
-		dbs = append(dbs, db)
-	}
-	sort.Strings(dbs)
-	now := time.Now()
-	var out []BranchStatus
-	for _, db := range dbs {
-		for _, br := range refs[db] {
-			r, _, err := w.Store.GetRef(db, br)
-			if err != nil {
-				return nil, err
-			}
-			var cps []string
-			for name := range r.Checkpoints {
-				cps = append(cps, name)
-			}
-			sort.Strings(cps)
-			_, coErr := os.Stat(w.CheckoutPath(db, br))
-			out = append(out, BranchStatus{
-				DB: db, Branch: br, HeadTXID: r.HeadTXID, Checkpoints: cps,
-				Protected: r.Protected, Parent: r.Parent, CheckedOut: coErr == nil,
-				TTL: r.TTL, TTLRemaining: FormatTTLRemaining(r, now),
-			})
-		}
-	}
-	return out, nil
 }

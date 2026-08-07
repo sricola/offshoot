@@ -13,6 +13,25 @@ version if you depend on format stability.
 
 ## [Unreleased]
 
+### Added
+
+- **Branch state taxonomy** (Milestone 4 Task 1): `ops.BranchStateAt`
+  (`internal/ops/status.go`) computes a branch's state — `active`, `dirty`,
+  `detached`, `idle` — from its ref, lease liveness, and checkout `.sum`
+  sidecar alone, no daemon dependency; a daemon layers two more states
+  (`pending`, `error`) on top from its own in-memory session map
+  (`internal/daemon/server.go`'s `Server.branchState`), since only a daemon
+  knows which branches have a session reserved or errored. Precedence:
+  `error` > `pending` > `active` > `dirty` > `detached` > `idle`. `idle` is
+  a deliberate addition beyond the design spec's original taxonomy, which
+  assumed a daemon was always present — see
+  [docs/reference.md](docs/reference.md#branch-states) for the full table
+  and rationale. Surfaced in `offshoot status` (`BranchStatus.State`), the
+  daemon `branches` op (`BranchInfo.state`, always present — additive, not
+  `omitempty`), and both SDKs' `Branch.state` (Python dataclass field,
+  TypeScript interface field; both default to `""` against an older
+  daemon that never sends it, so existing SDK code is unaffected).
+
 ## [0.1.2] - 2026-08-06
 
 Milestone 3: the eval-harness release. The target persona's first hour is

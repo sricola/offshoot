@@ -93,6 +93,18 @@ type BranchInfo struct {
 	// than replacing it, so an old client reading only Checkpoints keeps
 	// working unchanged (wire compat; Milestone 3 Task 1).
 	CheckpointsV2 []CheckpointInfo `json:"checkpoints_v2,omitempty"`
+	// State is this branch's computed state: "active", "pending", "error",
+	// "dirty", "detached", or "idle" — see ops.BranchStateAt's doc comment
+	// for the full taxonomy and precedence, and Server.branchState for how
+	// this daemon layers its session-map-derived pending/error on top of
+	// ops's lease/sidecar-derived active/dirty/detached/idle. Deliberately
+	// no `omitempty`: exactly one of these six names always applies to a
+	// branch, so an absent field would never mean anything ("state
+	// unknown") a client should have to handle — a pre-this-field client
+	// simply doesn't read the key, and its JSON decoding is unaffected
+	// either way (wire-additive field, old SDKs against a new daemon still
+	// work; Milestone 4 Task 1).
+	State string `json:"state"`
 }
 
 // CheckpointInfo is one checkpoint's wire shape within BranchInfo.CheckpointsV2.
