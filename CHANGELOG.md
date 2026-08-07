@@ -140,6 +140,65 @@ version if you depend on format stability.
   - README's Resource behavior section gains the read-only-checkout-cache
     paragraph, including the explicit "safe to `rm -rf` the entire
     `checkouts-ro` directory at any time" guarantee.
+- **`offshoot.pytest` fixture plugin** (Milestone 3 Task 4): the
+  seed-once-fork-many paved road for pytest-based eval/test suites, shipped
+  as the `offshoot-db[pytest]` package extra and registered via a
+  `pytest11` entry point (`sdk/python/offshoot/pytest_plugin.py`) — nothing
+  to import by hand.
+  - `offshoot_daemon` (session-scoped): locates the `offshoot` binary
+    (`OFFSHOOT_BIN` env, else `PATH`), starts it on a fresh temp store +
+    socket, terminates it at session end; `pytest.skip`s with install
+    instructions when no binary is found, rather than failing.
+  - `offshoot_db` (session-scoped): a NAMED-SEED FACTORY,
+    `offshoot_db(name="default", seed=None)`. The first call for a name
+    creates database `eval-{name}`, runs `seed` (a callable given a
+    writable sqlite path, or a SQL string run via `sqlite3`), and flushes
+    it to a checkpoint named `seed`; later calls for the same name are a
+    pure memoization hit. `seed=None` falls back to the new `offshoot_seed`
+    ini option (a path to a `.sql` file) — the zero-code default-seed case.
+  - `offshoot_fork` (function-scoped): `offshoot_fork(seed_handle=None)`
+    forks a fresh, worker-safe-named branch (`t-{worker}-{testname-hash}-
+    {n}`, sanitized via the existing `offshoot.langgraph._sanitize`) from
+    the seed checkpoint with a TTL (default `1h`, new `offshoot_ttl` ini
+    option overrides it), opens a session, and returns an object with
+    `.path`/`.client`/`.db`/`.branch`. Teardown closes the session then
+    destroys the branch; a destroy failure is a `UserWarning`, never a test
+    failure — the TTL is the crashed-run backstop.
+  - `offshoot_dump(path) -> str`: `sqlite3 .dump` text — THE way to compare
+    two offshoot-materialized SQLite files in a golden-file test. SQLite's
+    on-disk bytes are not deterministic for identical logical content
+    (page layout, freelist order, vacuum state can all differ) — **never
+    byte-compare** two exported/checked-out `.db` files.
+  - **xdist stance (locked):** one `offshoot` daemon + temp store PER
+    WORKER (pytest has no cross-worker fixture-sharing mechanism), so a
+    named seed's cost is paid once per worker, not once total. Measured
+    (a `CREATE TABLE` + 200-row seed, macOS arm64): ~80-90ms per worker;
+    a 2-worker `pytest -n2` run pays that twice, concurrently (~170ms of
+    total seed work, ~85-90ms of wall-clock time). Documented in the
+    module's docstring and `sdk/python/README.md`.
+  - Found+fixed in passing: a SQL-string seed with no explicit
+    `BEGIN`/`COMMIT` used to run every statement as its own autocommit
+    transaction under `sqlite3.Connection.executescript` — measured ~1.6s
+    for 200 unwrapped `INSERT`s vs. ~17ms wrapped in one transaction
+    (~100x). `_run_seed` now wraps a bare multi-statement seed in one
+    transaction automatically (a seed that already opens its own
+    transaction, or a seed callable, is left alone).
+  - Base SDK stays stdlib-only: the `pytest11` entry point is registered
+    unconditionally in `pyproject.toml`, but the plugin module
+    import-guards `pytest` (a stray direct import without the extra fails
+    with an install-instruction message, not a bare traceback) — `pytest`
+    is only ever actually imported when pytest itself is already running.
+    Verified: `make test-sdks` (the plain-`unittest` suites) passes with no
+    pytest installed at all.
+  - Tests: `sdk/python/tests/test_pytest_plugin.py` — fixture-logic tests
+    (naming, TTL, teardown ordering, factory memoization, skip-when-no-
+    binary, destroy-failure-warns) against a directly started daemon, plus
+    3 `pytester`-driven smoke scenarios (plugin loads via its entry point,
+    fork-per-test isolation actually isolates, an xdist 2-worker run
+    passes — the last one is also where the xdist numbers above were
+    measured). New `make test-pytest-plugin` target (needs
+    `offshoot-db[pytest]` + `pytest-xdist`, wired into `ci.yml`'s `sdks`
+    job after `make test-sdks` already proved the base SDK pytest-free).
 
 ### Fixed
 

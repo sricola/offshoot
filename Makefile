@@ -1,5 +1,5 @@
 .PHONY: test test-torture build test-s3 bench bench-s3 test-python-sdk test-ts-sdk test-sdks \
-	check-sdk-versions dry-run-python-sdk dry-run-ts-sdk dry-run-sdks
+	check-sdk-versions dry-run-python-sdk dry-run-ts-sdk dry-run-sdks test-pytest-plugin
 test:
 	go test ./... -count=1
 test-torture:
@@ -44,13 +44,34 @@ bench-s3:
 	status=$$?; \
 	docker rm -f offshoot-bench-minio >/dev/null 2>&1; \
 	exit $$status
+# Named explicitly (not `discover -s tests`, which globs test_*.py) because
+# tests/test_pytest_plugin.py — the offshoot.pytest fixture plugin's own
+# suite — imports pytest at module level and must NOT be picked up here:
+# this target proves the base SDK's plain-unittest suites pass with no
+# pytest installed at all. See `make test-pytest-plugin` for that file.
 test-python-sdk:
-	cd sdk/python && python3 -m unittest discover -s tests -v
+	cd sdk/python && python3 -m unittest tests.test_client tests.test_langgraph -v
 test-ts-sdk:
 	cd sdk/typescript && npm install --no-audit --no-fund && npm test
 # test-sdks is deliberately not a dependency of the default `test` target:
 # it needs python3 and node/npm on PATH, which the Go suite does not.
 test-sdks: test-python-sdk test-ts-sdk
+
+# test-pytest-plugin runs offshoot.pytest_plugin's own test suite
+# (sdk/python/tests/test_pytest_plugin.py). Unlike test-python-sdk (plain
+# unittest, deliberately pytest-free so `pip install offshoot-db` with no
+# extra keeps working), this target legitimately needs pytest + pytest-xdist
+# on PATH — it IS the test suite for the pytest fixture plugin (the
+# `offshoot-db[pytest]` extra) and its xdist smoke scenario. Not a
+# dependency of test-sdks/test: see CONTRIBUTING.md's dev setup for the
+# `pip install "sdk/python[pytest]" pytest-xdist` this needs first. Builds
+# the offshoot binary once and pins OFFSHOOT_BIN so both the daemon fixture
+# and its nested pytester-driven runs reuse it instead of a repeat `go
+# build`.
+test-pytest-plugin:
+	go build -o bin/offshoot-pytest-plugin-test ./cmd/offshoot
+	OFFSHOOT_BIN=$(CURDIR)/bin/offshoot-pytest-plugin-test \
+	  python3 -m pytest sdk/python/tests/test_pytest_plugin.py -v
 
 # check-sdk-versions verifies sdk/VERSION (the single source of truth — see
 # CONTRIBUTING.md's "Release process") agrees with the version literally
