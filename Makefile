@@ -117,12 +117,13 @@ dry-run-ts-sdk:
 	mkdir -p sdk/typescript/dry-run-pack sdk/typescript/dry-run-install
 	cd sdk/typescript && npm pack --silent --pack-destination dry-run-pack
 	tar -tzf sdk/typescript/dry-run-pack/offshoot-db-client-*.tgz | sort > sdk/typescript/dry-run-pack/actual-tarball-contents.txt
-	printf '%s\n' package/README.md package/dist/client.d.ts package/dist/client.js package/package.json | sort > sdk/typescript/dry-run-pack/expected-tarball-contents.txt
+	printf '%s\n' package/README.md package/dist/client.d.ts package/dist/client.js package/dist/testkit.d.ts package/dist/testkit.js package/package.json | sort > sdk/typescript/dry-run-pack/expected-tarball-contents.txt
 	diff -u sdk/typescript/dry-run-pack/expected-tarball-contents.txt sdk/typescript/dry-run-pack/actual-tarball-contents.txt
-	@echo "tarball contents: exact match (README.md, dist/client.d.ts, dist/client.js, package.json) — nothing more, nothing less"
+	@echo "tarball contents: exact match (README.md, dist/client.d.ts, dist/client.js, dist/testkit.d.ts, dist/testkit.js, package.json) — nothing more, nothing less"
 	cd sdk/typescript/dry-run-install && npm init -y --silent >/dev/null
 	cd sdk/typescript/dry-run-install && npm install --no-audit --no-fund --silent ../dry-run-pack/offshoot-db-client-*.tgz
 	cd sdk/typescript/dry-run-install && node -e "import('@offshoot-db/client').then((m) => { if (typeof m.connect !== 'function') throw new Error('connect export missing from published package'); console.log('import @offshoot-db/client: ok'); })"
+	cd sdk/typescript/dry-run-install && node -e "import('@offshoot-db/client/testkit').then((m) => { if (typeof m.startDaemon !== 'function' || typeof m.seedOnce !== 'function' || typeof m.forkPerTest !== 'function' || typeof m.dump !== 'function') throw new Error('testkit exports missing from published package'); console.log('import @offshoot-db/client/testkit: ok'); })"
 	rm -rf sdk/typescript/dry-run-pack sdk/typescript/dry-run-install
 
 # dry-run-sdks runs both dry runs — the "does this build and install"

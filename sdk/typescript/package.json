@@ -6,6 +6,16 @@
   "type": "module",
   "main": "dist/client.js",
   "types": "dist/client.d.ts",
+  "exports": {
+    ".": {
+      "types": "./dist/client.d.ts",
+      "import": "./dist/client.js"
+    },
+    "./testkit": {
+      "types": "./dist/testkit.d.ts",
+      "import": "./dist/testkit.js"
+    }
+  },
   "files": [
     "dist",
     "README.md"
