@@ -4,6 +4,7 @@ package main
 import (
 	"context"
 	"fmt"
+	"math"
 	"os"
 	"os/signal"
 	"runtime"
@@ -351,6 +352,17 @@ func parseByteSize(raw string) (int64, error) {
 	}
 	if n < 0 {
 		return 0, fmt.Errorf("%q: must be zero or positive (zero means unlimited)", raw)
+	}
+	// n * mult on int64 can overflow: e.g. "8388608T" (n=8388608,
+	// mult=1<<40) wraps past MaxInt64 into a negative value, which callers
+	// treat as "unlimited" — the opposite of what an operator asking for a
+	// huge-but-finite budget meant. Other magnitudes wrap into small
+	// positive values, silently producing a tiny budget and surprise
+	// eviction instead of any error at all. Catch it before multiplying
+	// rather than after, since the wrapped product itself no longer carries
+	// any signal that it wrapped.
+	if n > math.MaxInt64/mult {
+		return 0, fmt.Errorf("%q: size too large", raw)
 	}
 	return n * mult, nil
 }

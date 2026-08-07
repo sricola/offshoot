@@ -16,6 +16,7 @@
 package daemon
 
 import (
+	"bytes"
 	"context"
 	"crypto/rand"
 	"crypto/subtle"
@@ -525,31 +526,63 @@ func (s *Server) handleRPC(w http.ResponseWriter, r *http.Request) {
 // item. Requires auth (Global Constraints: everything but /healthz does) —
 // metric labels include branch names, which this daemon does not consider
 // public.
+//
+// WritePrometheus is handed an in-memory bytes.Buffer, not w directly, so
+// that scrapeMu (held for WritePrometheus's entire duration: collector run
+// AND render, per its doc comment) is released before the response ever
+// touches the network. Rendering into a buffer is fast and bounded; writing
+// to w is a network call that can stall for the full WriteTimeout against a
+// slow or stalled authenticated client. If WritePrometheus held scrapeMu
+// across that write too, one stalled scraper could pin the lock for up to
+// WriteTimeout and queue every other scrape behind it. The serialization
+// guarantee itself (collector run + render never interleaves with another
+// scrape's) is unaffected — that all still happens under scrapeMu inside
+// WritePrometheus; only the subsequent network write moves out from under
+// it. Either step's error is logged the same way (see logMetricsErr) —
+// callers/tests that redirect StartHTTP's logging expect a line whether the
+// render or the network write is what failed.
 func (s *Server) handleMetrics(w http.ResponseWriter, r *http.Request) {
 	if r.Method != http.MethodGet {
 		w.Header().Set("Allow", http.MethodGet)
 		http.Error(w, "method not allowed", http.StatusMethodNotAllowed)
 		return
 	}
+	var buf bytes.Buffer
+	if err := s.WritePrometheus(&buf); err != nil {
+		// bytes.Buffer.Write never itself errors, so this path is not
+		// expected to fire in practice with the buffer target used here —
+		// kept because WritePrometheus's signature is the general io.Writer
+		// one and a future collector/render change could still fail.
+		s.logMetricsErr(err)
+		return
+	}
+	// scrapeMu is released by now (WritePrometheus returned); everything
+	// from here down is just writing the already-rendered bytes to the
+	// network, outside the lock.
 	w.Header().Set("Content-Type", "text/plain; version=0.0.4; charset=utf-8")
-	if err := s.WritePrometheus(w); err != nil {
+	if _, err := w.Write(buf.Bytes()); err != nil {
 		// Headers (and possibly some body bytes) may already be on the
 		// wire; there is no clean HTTP error left to send at this point,
 		// so this is logged server-side only, never folded into the
-		// response body. Uses the SAME writer StartHTTP's own startup
-		// lines went to (HTTPConfig.Log, defaulting to os.Stderr there) —
-		// not a bare os.Stderr here — so a caller/test that redirected
-		// StartHTTP's logging (e.g. to a buffer, to keep assertions off
-		// real stderr) sees this line too, instead of it silently
-		// escaping to the real stderr regardless.
-		s.mu.Lock()
-		logw := s.httpLog
-		s.mu.Unlock()
-		if logw == nil {
-			logw = os.Stderr
-		}
-		fmt.Fprintf(logw, "offshoot: http: /metrics: %v\n", err)
+		// response body.
+		s.logMetricsErr(err)
 	}
+}
+
+// logMetricsErr logs an err encountered while serving GET /metrics to the
+// SAME writer StartHTTP's own startup lines went to (HTTPConfig.Log,
+// defaulting to os.Stderr there) — not a bare os.Stderr here — so a
+// caller/test that redirected StartHTTP's logging (e.g. to a buffer, to
+// keep assertions off real stderr) sees this line too, instead of it
+// silently escaping to the real stderr regardless.
+func (s *Server) logMetricsErr(err error) {
+	s.mu.Lock()
+	logw := s.httpLog
+	s.mu.Unlock()
+	if logw == nil {
+		logw = os.Stderr
+	}
+	fmt.Fprintf(logw, "offshoot: http: /metrics: %v\n", err)
 }
 
 // handleHealthz is GET /healthz: the one endpoint Global Constraints
