@@ -50,6 +50,21 @@ func parseExpiry(s string) (time.Time, bool) {
 	return t, true
 }
 
+// LeaseLive reports whether ref carries a lease that is still live at now:
+// a holder is recorded AND its expiry parses AND that expiry is still in
+// the future. Exported so callers outside this package that need the exact
+// same liveness verdict AcquireLease itself uses — ops.BranchStateAt's
+// "active" branch state, in particular — never independently reimplement
+// (and risk drifting from) this check. A LeaseExpiry that fails to parse is
+// treated as not live here, the same fail-open-to-reclaimable stance
+// AcquireLease takes for corrupt expiries, just without that call's own
+// stderr warning (a read-only liveness check has no "reclaim" action to
+// warn about).
+func LeaseLive(ref Ref, now time.Time) bool {
+	exp, ok := parseExpiry(ref.LeaseExpiry)
+	return ok && ref.LeaseHolder != "" && now.Before(exp)
+}
+
 // AcquireLease claims db@branch for holder until now+ttl.
 //
 // A ref with an active reap claim (Reaping=true) refuses outright — see
@@ -85,13 +100,13 @@ func (s *Store) AcquireLease(db, branch, holder string, ttl time.Duration, now t
 	if ref.Reaping {
 		return Lease{}, fmt.Errorf("%w: %s@%s; retry shortly", ErrReaping, db, branch)
 	}
-	exp, parseOK := parseExpiry(ref.LeaseExpiry)
+	_, parseOK := parseExpiry(ref.LeaseExpiry)
 	if ref.LeaseExpiry != "" && !parseOK {
 		fmt.Fprintf(os.Stderr,
 			"offshoot: warning: %s@%s has a corrupt lease_expiry %q; treating as expired and reclaiming\n",
 			db, branch, ref.LeaseExpiry)
 	}
-	live := parseOK && ref.LeaseHolder != "" && now.Before(exp)
+	live := LeaseLive(ref, now)
 	if live && ref.LeaseHolder != holder {
 		return Lease{}, fmt.Errorf("%w by %q until %s",
 			ErrLeaseHeld, ref.LeaseHolder, ref.LeaseExpiry)

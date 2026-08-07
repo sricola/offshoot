@@ -518,6 +518,36 @@ func (s *Server) lookupSessionState(db, branch string) (sessionState, *session.S
 	return sessionOpen, sess
 }
 
+// branchState computes db@branch's full state for opBranches: this is the
+// daemon half of the split ops.BranchStateAt's doc comment documents — ops
+// computes everything derivable from ref+sidecar alone (active/dirty/
+// detached/idle); only a daemon knows its own in-memory session map, so
+// only a daemon can additionally say "pending" (a slot is reserved, mid-
+// Open) or "error" (an open session's Err() has gone non-nil). ref is the
+// caller's already-fetched GetRef (opBranches always has one in hand) so
+// this never issues a second store read of its own.
+//
+// Precedence: error and pending are session-derived and, when either
+// applies, win outright over whatever ops.BranchStateAt would have said —
+// see BranchStateAt's doc comment for the full six-state precedence list.
+// The two can never both apply to the SAME db@branch at once: s.sessions
+// holds at most one entry per key, either a nil (reserved) or non-nil
+// (open) value, never both — so this is a simple switch, not a priority
+// comparison between the two. An OPEN, HEALTHY session needs no daemon-side
+// casing at all: its own live lease is exactly what already makes
+// ops.BranchStateAt itself report "active".
+func (s *Server) branchState(db, branch string, ref store.Ref) string {
+	switch state, sess := s.lookupSessionState(db, branch); state {
+	case sessionOpen:
+		if sess.Err() != nil {
+			return "error"
+		}
+	case sessionReserved:
+		return "pending"
+	}
+	return ops.BranchStateAt(ref, s.ws.CheckoutPath(db, branch), time.Now())
+}
+
 // refuseIfClaimed refuses (as a "close the session first" error) if this
 // daemon has any claim on db@branch — a live session OR an in-flight
 // reservation. Guard for ops (checkout/destroy/rollback/promote-target)
@@ -789,6 +819,7 @@ func (s *Server) opBranches(req Request) Response {
 			Branch: br, HeadTXID: ref.HeadTXID, Protected: ref.Protected,
 			TTL: ref.TTL, TTLRemaining: ops.FormatTTLRemaining(ref, now), LeaseHolder: ref.LeaseHolder,
 			Checkpoints: cps, TouchedAt: ref.TouchedAt, CheckpointsV2: cpsV2,
+			State: s.branchState(req.DB, br, ref),
 		})
 	}
 	sort.Slice(infos, func(i, j int) bool { return infos[i].Branch < infos[j].Branch })

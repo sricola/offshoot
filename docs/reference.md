@@ -410,13 +410,57 @@ actually deleted.
 offshoot status
 ```
 
-Prints every branch across every database: head transaction id, named
-checkpoints, `protected` and `checked-out` flags (when applicable), and —
-for a branch with a TTL — the TTL itself and time remaining until it's
-reap-eligible (`remaining=expired` once past the deadline). TTL remaining is
-computed from the later of the branch's last-touch time and its lease
-expiry, whichever is later — matching exactly what the janitor's reap logic
-uses, so `status` never disagrees with what will actually happen.
+Prints every branch across every database: its computed **state** (see
+below), head transaction id, named checkpoints, `protected` and
+`checked-out` flags (when applicable), and — for a branch with a TTL — the
+TTL itself and time remaining until it's reap-eligible
+(`remaining=expired` once past the deadline). TTL remaining is computed
+from the later of the branch's last-touch time and its lease expiry,
+whichever is later — matching exactly what the janitor's reap logic uses,
+so `status` never disagrees with what will actually happen.
+
+### Branch states
+
+Every branch is in exactly one of six states, computed fresh on every call
+— nothing about state is persisted anywhere. `offshoot status`
+(`ops.Workspace.Status`, CLI/at-rest — see above) and the daemon's
+`branches` op (`BranchInfo.state`; Python `Client.branches()`'s
+`Branch.state`, TypeScript `Client.branches()`'s `Branch.state`) report the
+identical computation for the states both can see; a daemon additionally
+knows two states no at-rest computation can, since they depend on its own
+in-memory session map:
+
+| State | Meaning | Who can report it |
+|---|---|---|
+| `active` | The branch's ref carries a live lease — someone (in or out of a daemon) holds it right now. | Both |
+| `pending` | This daemon has reserved a session slot for the branch and is still inside its (slow) `session.Open` — no live session yet, but the branch is spoken for. | Daemon only |
+| `error` | A session is open here and its `Err()` is non-nil (lease loss, a capture failure, any terminal session failure). | Daemon only |
+| `dirty` | No live lease; a checkout exists whose sidecar-recorded identity (lineage/epoch/txid) matches the ref but whose content hash doesn't — un-checkpointed local edits. | Both |
+| `detached` | No live lease; a checkout exists whose sidecar-recorded **lineage** doesn't match the ref's current lineage — a checkout orphaned by a `rollback`/`promote` that repointed the branch at a new lineage before (or without) refreshing this checkout (their own checkout refresh is best-effort and can be skipped by a busy checkout at repoint time). | Both |
+| `idle` | None of the above. | Both |
+
+**Precedence** when more than one condition technically holds, most to
+least specific: `error` > `pending` > `active` > `dirty` > `detached` >
+`idle`. In practice `error` and `pending` can never both apply to the same
+branch at once (a daemon's session map holds at most one entry per
+`db@branch`, either a reservation or a live session, never both) — the
+ordering matters for `active` vs. `dirty`/`detached`: a branch can be both
+leased AND locally modified/orphaned at the file level, and `active` wins
+the report.
+
+**`idle` is a deliberate addition, not in the original design spec.** The
+spec's branch-state taxonomy (`active`/`pending`/`dirty`/`detached`/
+`error`) assumed a daemon was always running to layer a state over every
+branch. `offshoot status`'s CLI/at-rest mode has no daemon and no session
+map, so a branch with nothing going on (never checked out, never leased)
+still needs a name to report — `idle` is that name. It also covers a
+case checkout-staleness detection can't cleanly attribute to `detached`:
+a checkout whose sidecar-recorded lineage still matches the ref, but whose
+epoch/txid lags behind (the branch advanced within the SAME lineage — e.g.
+a daemon session's flush — since this checkout was last refreshed), isn't
+orphaned, just stale; it needs a re-materialize (`offshoot checkout`), not
+a warning that its parent branch moved out from under it. That case reads
+`idle`, not `detached`.
 
 ## `offshoot lease list`
 
@@ -616,7 +660,11 @@ offshoot session status
 Lists every session currently open on this daemon: `db@branch`, durable
 transaction id, epoch, lease holder, checkout path, and — if the session has
 hit an error (e.g. fenced by a lost lease, or a contract violation) — that
-error inline.
+error inline. This is per-session detail; for the computed branch-state
+taxonomy (`active`/`pending`/`error`/`dirty`/`detached`/`idle`) across
+EVERY branch of a db — including ones with no session open at all — see
+[Branch states](#branch-states) above and the daemon `branches` op (SDK
+`Client.branches()`; no CLI `session branches` subcommand exists yet).
 
 ## `offshoot session close <db>[@branch] [-socket PATH]`
 

@@ -569,8 +569,8 @@ func run(args []string) error {
 			if s.CheckedOut {
 				flags += " checked-out"
 			}
-			line := fmt.Sprintf("%s@%s txid=%d checkpoints=[%s]%s",
-				s.DB, s.Branch, s.HeadTXID, strings.Join(s.Checkpoints, ","), flags)
+			line := fmt.Sprintf("%s@%s state=%s txid=%d checkpoints=[%s]%s",
+				s.DB, s.Branch, s.State, s.HeadTXID, strings.Join(s.Checkpoints, ","), flags)
 			if s.TTL != "" {
 				line += fmt.Sprintf(" ttl=%s remaining=%s", s.TTL, s.TTLRemaining)
 			}
