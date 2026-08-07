@@ -16,7 +16,11 @@ with the first 0.1.x release. No package-manager install yet.
 **Docs:** [FAQ](docs/faq.md) (why not Litestream / LiteFS / Turso / Dolt / `cp`) ·
 [CLI reference](docs/reference.md) · [architecture](docs/architecture.md) ·
 [branch diff](docs/diff.md) ·
-[implemented/deferred status](docs/status.md) · [roadmap](ROADMAP.md)
+[implemented/deferred status](docs/status.md) · [roadmap](ROADMAP.md) ·
+[**the eval-harness tutorial**](docs/eval-harness.md) (seed-once-fork-many
+for pytest/vitest/`node:test`, from install to CI) ·
+[framework recipes](docs/recipes/) (Claude Code hooks, OpenAI Agents SDK,
+LlamaIndex/CrewAI)
 
 **Contributing:** [CONTRIBUTING.md](CONTRIBUTING.md) has dev setup and the
 test tiers; [SECURITY.md](SECURITY.md) covers vulnerability reporting.
@@ -48,6 +52,17 @@ Runnable demo: [`examples/parallel-attempts/`](examples/parallel-attempts/)
 forks a database three ways, races three migrations against the forks,
 promotes the one that's actually correct, and discards the other two —
 `./examples/parallel-attempts/run.sh`.
+
+Building an eval harness or a test suite around this instead of a one-off
+script? [docs/eval-harness.md](docs/eval-harness.md) is the paved road:
+seed once, fork per test, xdist/vitest parallelism, golden-file assertions,
+TTL cleanup, and a CI recipe — for Python (`offshoot.pytest_plugin`) and
+TypeScript (`testkit`) alike. Two more commands round out the inspect/debug
+loop that tutorial builds on: `offshoot export <db>@<branch>[@checkpoint]
+out.db` copies a checkpoint out to a plain file for handoff, and `offshoot
+diff a@x b@y [--summary]` answers "what changed between these two attempts"
+— see [docs/diff.md](docs/diff.md) and
+[docs/reference.md](docs/reference.md).
 
 At rest (no daemon running): checkpoints are full snapshots; checkout paths
 are fixed at `<store>/checkouts/{db}/{branch}.db`; operations require the
@@ -448,6 +463,17 @@ with offshoot.connect("/tmp/o.sock") as c:
     s.close()
 ```
 
+`Client` also exposes `branches()`, `dbs()`, `export()` (materialize a
+checkpoint or head to a plain file), and `checkout_at()` (a read-only
+historical checkout).
+
+**Testing with pytest?** `pip install "offshoot-db[pytest]"` registers
+`offshoot_daemon`/`offshoot_db`/`offshoot_fork` fixtures automatically —
+seed once, fork a fresh isolated branch per test, TTL-backstopped cleanup,
+`pytest-xdist` parallelism (one daemon per worker). Full tutorial:
+[docs/eval-harness.md](docs/eval-harness.md); condensed reference:
+`sdk/python/README.md`'s pytest-fixture-plugin section.
+
 ### TypeScript SDK
 
 `sdk/typescript` is the same thin client, zero runtime dependencies. Also not
@@ -469,6 +495,16 @@ await s.close();
 await c.close();
 ```
 
+`Client` also exposes `branches()`, `dbs()`, `export()`, and
+`checkoutAt()` — the same surface as the Python client above.
+
+**Testing with vitest/jest/`node:test`?** `@offshoot-db/client/testkit`
+(`startDaemon`/`seedOnce`/`forkPerTest`/`dump`) is the framework-agnostic
+counterpart of the pytest fixtures above — same seed-once-fork-many
+semantics, wired into whatever `beforeAll`/`afterEach` hooks your test
+runner calls. See [docs/eval-harness.md](docs/eval-harness.md)'s
+TypeScript section and `sdk/typescript/README.md`'s testkit section.
+
 Both SDKs are exercised against a real daemon by `make test-sdks` (needs
 `python3` and `node`/`npm` on PATH — not part of the default `make test`,
 which stays hermetic to the Go suite).
@@ -483,3 +519,14 @@ the original attempt wrote after it. See
 [`examples/langgraph-rewind/`](examples/langgraph-rewind/), runnable with
 `python3 examples/langgraph-rewind/agent.py` — no server or bucket needed
 (it builds `offshoot` and starts its own private daemon).
+
+### Other agent frameworks
+
+LangGraph is the one framework with a real companion package; everyone
+else gets a short recipe instead of an adapter — see
+[docs/recipes/](docs/recipes/): Claude Code's MCP config and hooks pattern
+([claude-agent-sdk.md](docs/recipes/claude-agent-sdk.md)), the OpenAI
+Agents SDK's `SQLiteSession` pointed at an offshoot checkout path
+([openai-agents.md](docs/recipes/openai-agents.md)), and short honest notes
+on LlamaIndex and CrewAI
+([frameworks.md](docs/recipes/frameworks.md)).

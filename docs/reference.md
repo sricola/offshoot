@@ -5,6 +5,11 @@ strings and command dispatch — flags, arities, and defaults are taken from
 the code, not from memory. If this doc and `offshoot`'s own `-h`-style usage
 text ever disagree, the code wins; please file an issue.
 
+Looking for the narrative walkthrough instead of a flag-by-flag reference —
+install, seed-once-fork-many with the pytest/testkit fixtures, xdist/vitest
+parallelism, golden-file assertions, CI — see
+[docs/eval-harness.md](eval-harness.md).
+
 ## Global
 
 ```
