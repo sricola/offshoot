@@ -49,7 +49,7 @@ func TestAbandonedLeaseIsReclaimableAfterExpiry(t *testing.T) {
 		t.Fatalf("reclaim must bump the epoch: %d -> %d", a.Lease().Epoch, b.Lease().Epoch)
 	}
 	// The abandoned session cannot write.
-	if _, err := a.Flush(""); err == nil {
+	if _, err := a.Flush("", nil); err == nil {
 		t.Fatal("an abandoned, fenced session must not be able to flush")
 	}
 	a.Close()

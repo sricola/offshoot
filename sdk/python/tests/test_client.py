@@ -172,6 +172,64 @@ class TestClient(unittest.TestCase):
             txid = c.promote("rp", "feature", "main", force=True)
             self.assertGreater(txid, 0)
 
+    def test_dbs_lists_every_database_sorted(self):
+        with offshoot.connect(self.d.sock) as c:
+            c.create("dbs-zeta")
+            c.create("dbs-alpha")
+            names = c.dbs()
+            self.assertIn("dbs-zeta", names)
+            self.assertIn("dbs-alpha", names)
+            self.assertEqual(names, sorted(names))
+
+    def test_fork_meta_and_checkpoints_v2_touched_at(self):
+        with offshoot.connect(self.d.sock) as c:
+            c.create("meta-app")
+            c.fork("meta-app", "main", "with-meta", meta={"eval_run": "42"})
+            info = {b.branch: b for b in c.branches("meta-app")}
+            self.assertIn("with-meta", info)
+            branch = info["with-meta"]
+            # touched_at is populated for a freshly forked branch.
+            self.assertTrue(branch.touched_at)
+            # checkpoints (old field) and checkpoints_v2 (new field) agree on
+            # membership: both must list the "fork" checkpoint.
+            self.assertIn("fork", branch.checkpoints)
+            names_v2 = {cp.name: cp for cp in branch.checkpoints_v2}
+            self.assertIn("fork", names_v2)
+            self.assertTrue(names_v2["fork"].txid > 0)
+            self.assertTrue(names_v2["fork"].created_at)
+
+    def test_fork_without_meta_still_works(self):
+        # Old-client-shaped call: no meta kwarg at all.
+        with offshoot.connect(self.d.sock) as c:
+            c.create("meta-app-2")
+            txid = c.fork("meta-app-2", "main", "no-meta")
+            self.assertGreater(txid, 0)
+
+    def test_flush_meta_creates_checkpoint_with_meta(self):
+        with offshoot.connect(self.d.sock) as c:
+            c.create("meta-app-3")
+            s = c.open("meta-app-3")
+            db = sqlite3.connect(s.path)
+            db.execute("CREATE TABLE t (v)")
+            db.commit()
+            txid = s.flush("v1", meta={"agent": "claude"})
+            self.assertGreater(txid, 0)
+            info = {b.branch: b for b in c.branches("meta-app-3")}
+            names_v2 = {cp.name: cp for cp in info["main"].checkpoints_v2}
+            self.assertIn("v1", names_v2)
+            self.assertTrue(names_v2["v1"].created_at)
+            db.close()
+            s.close()
+
+    def test_flush_without_meta_still_works(self):
+        # Old-client-shaped call: no meta kwarg at all.
+        with offshoot.connect(self.d.sock) as c:
+            c.create("meta-app-4")
+            s = c.open("meta-app-4")
+            txid = s.flush("v1")
+            self.assertGreater(txid, 0)
+            s.close()
+
     def test_daemon_death_mid_call_raises_offshoot_error(self):
         # A dedicated, short-lived daemon (not the shared class fixture) so
         # killing it doesn't disturb the other tests. Reuses the already-

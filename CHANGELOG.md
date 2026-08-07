@@ -13,6 +13,49 @@ version if you depend on format stability.
 
 ## [Unreleased]
 
+### Added
+
+- **List databases** (Milestone 3 Task 1): new daemon protocol op `dbs`
+  returns every database the store has at least one ref for
+  (`store.Store.ListRefs`'s keys, sorted). CLI: `offshoot session dbs`.
+  SDK: Python `Client.dbs() -> list[str]`, TypeScript
+  `Client.dbs(): Promise<string[]>`.
+- **Branch/checkpoint metadata and timestamps** (Milestone 3 Task 1):
+  - `Ref.Meta map[string]string` (branch-level lineage metadata) and
+    per-checkpoint `store.Checkpoint.CreatedAt`/`Meta` — all new, omitempty
+    fields, no store schema bump (verified with a round-trip + old-ref/
+    old-checkpoint decode test mirroring the existing TTL-fields test).
+  - `ops.Workspace.Fork`/`Checkpoint` gain a `meta map[string]string` param
+    (`nil` = none), capped at the ops layer via the new `ops.ValidateMeta`
+    (at most 32 keys, keys ≤ 64 bytes, values ≤ 512 bytes — Global
+    Constraints; clear errors naming the exact limit hit). `Fork`'s meta
+    describes the new branch's lineage (`Ref.Meta`); `Checkpoint`'s meta
+    describes that one checkpoint (`Checkpoint.Meta`). Every checkpoint-
+    creating call site (`Create`'s `init`, `Checkpoint`, `Fork`'s `fork`,
+    `Promote`'s `promote`, and a daemon session's named `flush`) now stamps
+    `CreatedAt` (RFC3339 UTC).
+  - `Rollback`'s kept-checkpoint relocation used to silently drop
+    `CreatedAt`/`Meta` when rewriting a checkpoint's epoch to the new
+    lineage's `1` — fixed to preserve both.
+  - Daemon protocol: `BranchInfo` gains `touched_at` (the ref's activity-
+    clock stamp) and `checkpoints_v2` (`[]{name, txid, created_at}`) —
+    the existing `checkpoints` (bare names) field is untouched for wire
+    compat. `fork` and `flush` ops gain an optional `meta` field; there is
+    no separate daemon "checkpoint" op — a live session's named `flush` is
+    how its checkpoints are created (parity note: `flush`'s `meta` is
+    rejected if `name` is empty — there's no checkpoint for it to attach
+    to). All new fields are additive/optional: an old-client-shaped request
+    (no `meta`, reading only `checkpoints`) still works against the new
+    daemon, pinned by wire-compat tests using hand-written JSON (not just a
+    Go zero-value round trip).
+  - CLI: `fork`/`checkpoint` gain repeatable `--meta k=v`.
+  - SDK parity (Python + TypeScript): `fork`/`Session.flush` accept `meta`;
+    `branches()`/`Client.branches` surface `touched_at`/`checkpoints_v2`
+    (new `CheckpointInfo`/`Branch` fields).
+  - MCP tool metadata exposure is explicitly out of scope for this task —
+    `offshoot_fork`/`offshoot_checkpoint` pass `nil` meta; see
+    `docs/status.md`.
+
 ### Fixed
 
 - Settling-flush checksum-compare suppression (Milestone 2 follow-up):

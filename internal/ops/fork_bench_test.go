@@ -135,7 +135,7 @@ func mustSeed(b *testing.B, w *ops.Workspace, db string, mb int) {
 	if err := sdb.Close(); err != nil {
 		b.Fatal(err)
 	}
-	if _, err := w.Checkpoint(db, "main", "seed"); err != nil {
+	if _, err := w.Checkpoint(db, "main", "seed", nil); err != nil {
 		b.Fatal(err)
 	}
 }
@@ -166,7 +166,7 @@ func runForkAtHead(b *testing.B, sz benchSize) {
 	b.ResetTimer()
 	for i := 0; i < b.N; i++ {
 		branch := fmt.Sprintf("fork-%s-%d", sz.id, i)
-		if _, err := w.Fork(db, "main", branch, "", 0); err != nil {
+		if _, err := w.Fork(db, "main", branch, "", 0, nil); err != nil {
 			b.Fatal(err)
 		}
 		b.StopTimer()
@@ -265,7 +265,7 @@ func BenchmarkSessionOpen(b *testing.B) {
 			if err != nil {
 				b.Fatal(err)
 			}
-			if _, err := s.Flush(""); err != nil {
+			if _, err := s.Flush("", nil); err != nil {
 				b.Fatal(err)
 			}
 			ref, _, err := w.Store.GetRef(db, "main")

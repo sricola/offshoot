@@ -7,6 +7,13 @@ import (
 	"time"
 )
 
+// cpEqual compares only TXID/Epoch, the fields most existing tests care
+// about — Checkpoint now carries a Meta map, which makes the struct
+// incomparable with ==/!=.
+func cpEqual(a, b Checkpoint) bool {
+	return a.TXID == b.TXID && a.Epoch == b.Epoch
+}
+
 func newStore(t *testing.T) *Store {
 	t.Helper()
 	b, err := NewLocal(t.TempDir())
@@ -35,7 +42,7 @@ func TestManifestLifecycle(t *testing.T) {
 func TestRefRoundTripAndCAS(t *testing.T) {
 	s := newStore(t)
 	r := Ref{Schema: 1, Lineage: NewLineageID(), Epoch: 1, HeadTXID: 1}
-	r.SetCheckpoint("init", 1, 1)
+	r.SetCheckpoint("init", Checkpoint{TXID: 1, Epoch: 1})
 	etag, err := s.PutRef("app", "main", r, "")
 	if err != nil {
 		t.Fatal(err)
@@ -44,7 +51,7 @@ func TestRefRoundTripAndCAS(t *testing.T) {
 	if err != nil || gotEtag != etag {
 		t.Fatalf("get: %v", err)
 	}
-	if got.Lineage != r.Lineage || got.Checkpoints["init"] != (Checkpoint{TXID: 1, Epoch: 1}) {
+	if got.Lineage != r.Lineage || !cpEqual(got.Checkpoints["init"], Checkpoint{TXID: 1, Epoch: 1}) {
 		t.Fatalf("round trip mismatch: %+v", got)
 	}
 	got.HeadTXID = 2
@@ -96,8 +103,8 @@ func TestKeys(t *testing.T) {
 func TestRefV2RoundTrip(t *testing.T) {
 	s := newStore(t)
 	r := Ref{Schema: RefSchema, Lineage: NewLineageID(), Epoch: 3, HeadTXID: 9, HeadEpoch: 3}
-	r.SetCheckpoint("init", 1, 1)
-	r.SetCheckpoint("v1", 9, 3)
+	r.SetCheckpoint("init", Checkpoint{TXID: 1, Epoch: 1})
+	r.SetCheckpoint("v1", Checkpoint{TXID: 9, Epoch: 3})
 	etag, err := s.PutRef("app", "main", r, "")
 	if err != nil {
 		t.Fatal(err)
@@ -106,10 +113,10 @@ func TestRefV2RoundTrip(t *testing.T) {
 	if err != nil || gotEtag != etag {
 		t.Fatalf("get: %v", err)
 	}
-	if got.Checkpoints["init"] != (Checkpoint{TXID: 1, Epoch: 1}) {
+	if !cpEqual(got.Checkpoints["init"], Checkpoint{TXID: 1, Epoch: 1}) {
 		t.Errorf("init checkpoint = %+v", got.Checkpoints["init"])
 	}
-	if got.Checkpoints["v1"] != (Checkpoint{TXID: 9, Epoch: 3}) {
+	if !cpEqual(got.Checkpoints["v1"], Checkpoint{TXID: 9, Epoch: 3}) {
 		t.Errorf("v1 checkpoint = %+v", got.Checkpoints["v1"])
 	}
 	if got.HeadEpoch != 3 {
@@ -133,10 +140,10 @@ func TestGetRefUpgradesV1(t *testing.T) {
 		t.Errorf("schema = %d, want %d", got.Schema, RefSchema)
 	}
 	// Every v1 checkpoint lived under the ref's epoch.
-	if got.Checkpoints["init"] != (Checkpoint{TXID: 1, Epoch: 2}) {
+	if !cpEqual(got.Checkpoints["init"], Checkpoint{TXID: 1, Epoch: 2}) {
 		t.Errorf("init = %+v, want txid 1 epoch 2", got.Checkpoints["init"])
 	}
-	if got.Checkpoints["v1"] != (Checkpoint{TXID: 7, Epoch: 2}) {
+	if !cpEqual(got.Checkpoints["v1"], Checkpoint{TXID: 7, Epoch: 2}) {
 		t.Errorf("v1 = %+v, want txid 7 epoch 2", got.Checkpoints["v1"])
 	}
 	if got.HeadEpoch != 2 {
@@ -174,8 +181,8 @@ func TestGetRefRejectsNullCheckpoint(t *testing.T) {
 
 func TestSetCheckpointAllocates(t *testing.T) {
 	var r Ref
-	r.SetCheckpoint("a", 4, 2)
-	if r.Checkpoints["a"] != (Checkpoint{TXID: 4, Epoch: 2}) {
+	r.SetCheckpoint("a", Checkpoint{TXID: 4, Epoch: 2})
+	if !cpEqual(r.Checkpoints["a"], Checkpoint{TXID: 4, Epoch: 2}) {
 		t.Fatalf("checkpoints = %+v", r.Checkpoints)
 	}
 }
@@ -357,4 +364,105 @@ func TestRefTTLFieldsRoundTripAndOldRefsDecode(t *testing.T) {
 		t.Fatalf("plain ref grew TTL state: %+v", gotOld)
 	}
 	_ = etag
+}
+
+// TestRefMetaAndCheckpointFieldsRoundTripAndOldRefsDecode mirrors
+// TestRefTTLFieldsRoundTripAndOldRefsDecode for the metadata fields added
+// alongside list-databases/metadata (Milestone 3 Task 1): Ref.Meta and
+// per-checkpoint CreatedAt/Meta. Same no-schema-bump contract: these are new
+// omitempty fields, so an old ref (or an old checkpoint sub-object) must
+// decode with them simply absent, not error.
+func TestRefMetaAndCheckpointFieldsRoundTripAndOldRefsDecode(t *testing.T) {
+	s := newStore(t)
+	if err := s.InitManifest(); err != nil {
+		t.Fatal(err)
+	}
+	r := Ref{Schema: 2, Lineage: "lin1", Epoch: 1, HeadTXID: 3, HeadEpoch: 1}
+	r.Meta = map[string]string{"eval_run": "42", "git_sha": "abc123"}
+	r.SetCheckpoint("cp1", Checkpoint{
+		TXID: 3, Epoch: 1,
+		CreatedAt: "2026-08-06T12:00:00Z",
+		Meta:      map[string]string{"agent": "claude"},
+	})
+	if _, err := s.PutRef("app", "b", r, ""); err != nil {
+		t.Fatal(err)
+	}
+	got, _, err := s.GetRef("app", "b")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got.Meta["eval_run"] != "42" || got.Meta["git_sha"] != "abc123" {
+		t.Fatalf("Ref.Meta did not round-trip: %+v", got.Meta)
+	}
+	cp, ok := got.Checkpoints["cp1"]
+	if !ok {
+		t.Fatal("checkpoint cp1 missing after round trip")
+	}
+	if cp.CreatedAt != "2026-08-06T12:00:00Z" {
+		t.Fatalf("checkpoint CreatedAt did not round-trip: %+v", cp)
+	}
+	if cp.Meta["agent"] != "claude" {
+		t.Fatalf("checkpoint Meta did not round-trip: %+v", cp.Meta)
+	}
+
+	// A ref written without Meta/CreatedAt (an old ref) must decode with
+	// them empty/nil — no metadata means none was ever recorded, not a
+	// decode error.
+	old := Ref{Schema: 2, Lineage: "lin2", Epoch: 1, HeadTXID: 1, HeadEpoch: 1}
+	old.SetCheckpoint("init", Checkpoint{TXID: 1, Epoch: 1})
+	if _, err := s.PutRef("app", "old", old, ""); err != nil {
+		t.Fatal(err)
+	}
+	gotOld, _, err := s.GetRef("app", "old")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if gotOld.Meta != nil {
+		t.Fatalf("plain ref grew Meta: %+v", gotOld.Meta)
+	}
+	oldCP, ok := gotOld.Checkpoints["init"]
+	if !ok {
+		t.Fatal("checkpoint init missing after round trip")
+	}
+	if oldCP.CreatedAt != "" || oldCP.Meta != nil {
+		t.Fatalf("plain checkpoint grew CreatedAt/Meta: %+v", oldCP)
+	}
+
+	// Decode raw bytes shaped exactly like a ref written by a binary that
+	// predates this field (no "meta" key on the ref OR on the checkpoint
+	// sub-object at all — not even as an explicit null) — the on-disk
+	// tolerant path, not just a Go zero-value round trip through PutRef.
+	raw := []byte(`{"schema":2,"lineage":"lin3","epoch":1,"head_txid":1,"head_epoch":1,` +
+		`"checkpoints":{"init":{"txid":1,"epoch":1}}}`)
+	decoded, err := decodeRef(raw)
+	if err != nil {
+		t.Fatalf("decodeRef of an old-shaped ref failed: %v", err)
+	}
+	if decoded.Meta != nil {
+		t.Fatalf("decodeRef fabricated Meta for an old-shaped ref: %+v", decoded.Meta)
+	}
+	rawCP, ok := decoded.Checkpoints["init"]
+	if !ok {
+		t.Fatal("decodeRef lost the old-shaped ref's checkpoint")
+	}
+	if rawCP.CreatedAt != "" || rawCP.Meta != nil {
+		t.Fatalf("decodeRef fabricated checkpoint CreatedAt/Meta for an old-shaped ref: %+v", rawCP)
+	}
+
+	// A v1 (pre-checkpoint-epoch) ref, whose checkpoints are bare numbers
+	// rather than objects, must still decode cleanly with the new fields
+	// simply absent.
+	v1raw := []byte(`{"schema":1,"lineage":"lin4","epoch":1,"head_txid":1,` +
+		`"checkpoints":{"init":1}}`)
+	v1decoded, err := decodeRef(v1raw)
+	if err != nil {
+		t.Fatalf("decodeRef of a v1 ref failed: %v", err)
+	}
+	v1cp, ok := v1decoded.Checkpoints["init"]
+	if !ok {
+		t.Fatal("decodeRef lost the v1 ref's checkpoint")
+	}
+	if v1cp.CreatedAt != "" || v1cp.Meta != nil {
+		t.Fatalf("decodeRef fabricated CreatedAt/Meta for a v1 ref's checkpoint: %+v", v1cp)
+	}
 }

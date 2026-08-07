@@ -212,6 +212,101 @@ test("rollback, promote, status", async (t: TestContext) => {
   }
 });
 
+test("dbs lists every database sorted", async (t: TestContext) => {
+  if (!canRun) {
+    t.skip("go and/or sqlite3 not on PATH");
+    return;
+  }
+  const c = await connect(fixture!.sock);
+  try {
+    await c.create("dbs-zeta");
+    await c.create("dbs-alpha");
+    const names = await c.dbs();
+    assert.ok(names.includes("dbs-zeta"));
+    assert.ok(names.includes("dbs-alpha"));
+    assert.deepEqual(names, [...names].sort());
+  } finally {
+    await c.close();
+  }
+});
+
+test("fork meta and checkpoints_v2/touched_at", async (t: TestContext) => {
+  if (!canRun) {
+    t.skip("go and/or sqlite3 not on PATH");
+    return;
+  }
+  const c = await connect(fixture!.sock);
+  try {
+    await c.create("meta-app");
+    await c.fork("meta-app", "main", "with-meta", { meta: { eval_run: "42" } });
+    const info = new Map((await c.branches("meta-app")).map((b) => [b.branch, b]));
+    const branch = info.get("with-meta");
+    assert.ok(branch);
+    assert.ok(branch!.touched_at);
+    assert.ok(branch!.checkpoints.includes("fork"));
+    const cpV2 = branch!.checkpoints_v2.find((cp) => cp.name === "fork");
+    assert.ok(cpV2);
+    assert.ok(cpV2!.txid > 0);
+    assert.ok(cpV2!.created_at);
+  } finally {
+    await c.close();
+  }
+});
+
+test("fork without meta still works", async (t: TestContext) => {
+  if (!canRun) {
+    t.skip("go and/or sqlite3 not on PATH");
+    return;
+  }
+  const c = await connect(fixture!.sock);
+  try {
+    await c.create("meta-app-2");
+    const txid = await c.fork("meta-app-2", "main", "no-meta");
+    assert.ok(txid > 0);
+  } finally {
+    await c.close();
+  }
+});
+
+test("flush meta creates checkpoint with meta", async (t: TestContext) => {
+  if (!canRun) {
+    t.skip("go and/or sqlite3 not on PATH");
+    return;
+  }
+  const c = await connect(fixture!.sock);
+  try {
+    await c.create("meta-app-3");
+    const s = await c.open("meta-app-3");
+    sqlite3(s.path, "CREATE TABLE t (v);");
+    const txid = await s.flush("v1", { meta: { agent: "claude" } });
+    assert.ok(txid > 0);
+    const info = new Map((await c.branches("meta-app-3")).map((b) => [b.branch, b]));
+    const cpV2 = info.get("main")!.checkpoints_v2.find((cp) => cp.name === "v1");
+    assert.ok(cpV2);
+    assert.ok(cpV2!.created_at);
+    await s.close();
+  } finally {
+    await c.close();
+  }
+});
+
+test("flush without meta still works", async (t: TestContext) => {
+  if (!canRun) {
+    t.skip("go and/or sqlite3 not on PATH");
+    return;
+  }
+  const c = await connect(fixture!.sock);
+  try {
+    await c.create("meta-app-4");
+    const s = await c.open("meta-app-4");
+    const txid = await s.flush("v1");
+    assert.ok(txid > 0);
+    await s.close();
+  } finally {
+    await c.close();
+  }
+});
+
 test("daemon death mid-call raises OffshootError", async (t: TestContext) => {
   if (!canRun) {
     t.skip("go and/or sqlite3 not on PATH");

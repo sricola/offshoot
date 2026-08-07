@@ -196,7 +196,7 @@ func TestRepointClearsLease(t *testing.T) {
 		if _, err := w.AcquireLease("app", "main", "holder-a", DefaultLeaseTTL); err != nil {
 			t.Fatal(err)
 		}
-		if _, err := w.Checkpoint("app", "main", "v1"); err != nil {
+		if _, err := w.Checkpoint("app", "main", "v1", nil); err != nil {
 			t.Fatal(err)
 		}
 		// Roll back to the "init" checkpoint laid down by Create, which
@@ -221,13 +221,13 @@ func TestRepointClearsLease(t *testing.T) {
 		if err := w.Create("app"); err != nil {
 			t.Fatal(err)
 		}
-		if _, err := w.Fork("app", "main", "feature", "", 0); err != nil {
+		if _, err := w.Fork("app", "main", "feature", "", 0, nil); err != nil {
 			t.Fatal(err)
 		}
 		if _, err := w.Checkout("app", "feature"); err != nil {
 			t.Fatal(err)
 		}
-		if _, err := w.Checkpoint("app", "feature", "v1"); err != nil {
+		if _, err := w.Checkpoint("app", "feature", "v1", nil); err != nil {
 			t.Fatal(err)
 		}
 		// Acquire a lease on the PROMOTE TARGET (main), not the source.
@@ -287,7 +287,7 @@ func TestFencedHolderLeaseOpsFailAfterReclaim(t *testing.T) {
 	// protects it: a fenced writer's stale checkout still checkpoints
 	// successfully here because nothing about this call path consults the
 	// lease at all.
-	if _, err := w.Checkpoint("app", "main", "v1"); err != nil {
+	if _, err := w.Checkpoint("app", "main", "v1", nil); err != nil {
 		t.Fatalf("branch unusable after fencing: %v", err)
 	}
 }

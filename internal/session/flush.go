@@ -8,6 +8,7 @@ import (
 	"time"
 
 	"github.com/offshoot-db/offshoot/internal/ltxio"
+	"github.com/offshoot-db/offshoot/internal/ops"
 	"github.com/offshoot-db/offshoot/internal/store"
 )
 
@@ -33,15 +34,24 @@ var ErrFenced = errors.New("session: fenced — lease lost")
 // Session are serialized rather than racing to compute and write the same
 // txid. See flushMu's doc comment for the lock-ordering invariant this
 // implies.
-func (s *Session) Flush(name string) (uint64, error) {
-	return s.flush(name, false)
+//
+// meta (nil = none) is only meaningful when name != "": it is stored on the
+// resulting named checkpoint's store.Checkpoint.Meta, capped by
+// ops.ValidateMeta exactly like ops.Workspace.Checkpoint's own meta param
+// (this is the daemon's live-session equivalent of that at-rest call — see
+// the daemon "flush" op's doc comment). A non-empty meta with name == "" is
+// rejected: there is no checkpoint for it to attach to, and silently
+// dropping it would surprise a caller who set both.
+func (s *Session) Flush(name string, meta map[string]string) (uint64, error) {
+	return s.flush(name, meta, false)
 }
 
 // flush is Flush's actual implementation, plus the auto/manual distinction
 // flushLoop needs for its own "flushed"/"flush-failed" transition logging
 // (see the deferred call below) — a distinction Flush's own public signature
 // has no room for. flushLoop calls this directly (same package, so no
-// exported surface changes); Flush itself is just auto=false.
+// exported surface changes) with meta always nil, since its unnamed
+// auto-flushes never create a checkpoint. Flush itself is just auto=false.
 //
 // Named returns (txid, err) exist for exactly one reason: the deferred log
 // call below needs to see this call's actual outcome regardless of which of
@@ -49,7 +59,7 @@ func (s *Session) Flush(name string) (uint64, error) {
 // touching every one of them individually. Every "return N, someErr"
 // statement in the body works unchanged under named returns — Go assigns
 // through the names before running deferred funcs either way.
-func (s *Session) flush(name string, auto bool) (txid uint64, err error) {
+func (s *Session) flush(name string, meta map[string]string, auto bool) (txid uint64, err error) {
 	// flushKind — not "kind", which the body below already uses for the
 	// object kind ("snapshot" vs "segment") — is this call's auto/manual
 	// tag for the deferred transition log below.
@@ -88,6 +98,11 @@ func (s *Session) flush(name string, auto bool) (txid uint64, err error) {
 		if err := store.ValidateName(name); err != nil {
 			return 0, err
 		}
+	} else if len(meta) > 0 {
+		return 0, fmt.Errorf("session: meta given with no checkpoint name; meta attaches to a named checkpoint")
+	}
+	if err := ops.ValidateMeta(meta); err != nil {
+		return 0, err
 	}
 
 	// Catch the replica up to whatever is already committed in the checkout
@@ -296,7 +311,11 @@ func (s *Session) flush(name string, auto bool) (txid uint64, err error) {
 
 	ref.HeadTXID, ref.HeadEpoch = txid, lease.Epoch
 	if name != "" {
-		ref.SetCheckpoint(name, txid, lease.Epoch)
+		ref.SetCheckpoint(name, store.Checkpoint{
+			TXID: txid, Epoch: lease.Epoch,
+			CreatedAt: time.Now().UTC().Format(time.RFC3339),
+			Meta:      meta,
+		})
 	}
 	ref.Touch(time.Now())
 	if _, err := st.PutRef(s.db, s.branch, ref, etag); err != nil {

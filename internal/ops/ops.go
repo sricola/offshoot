@@ -34,6 +34,46 @@ type Workspace struct {
 	Spec  string
 }
 
+// Metadata caps (design spec § Metadata; Milestone 3 Global Constraints):
+// branch-level lineage is the grain, not row-level provenance, so the map
+// stays small. Enforced here, at the ops layer, so every caller — CLI,
+// daemon (fork/flush ops), MCP tools (which currently always pass nil, see
+// their own doc comments) — gets the identical check and identical wording,
+// rather than each wire boundary re-implementing (or forgetting) it.
+const (
+	MaxMetaKeys     = 32
+	MaxMetaKeyLen   = 64
+	MaxMetaValueLen = 512
+)
+
+// ValidateMeta enforces the metadata caps on a fork/checkpoint meta map: at
+// most MaxMetaKeys entries, each key at most MaxMetaKeyLen bytes, each value
+// at most MaxMetaValueLen bytes. A nil or empty map always passes — "no
+// metadata" is never a cap violation. Errors name the specific limit
+// violated so a caller can fix its call without guessing which cap it hit.
+func ValidateMeta(meta map[string]string) error {
+	if len(meta) > MaxMetaKeys {
+		return fmt.Errorf("ops: metadata has %d keys, exceeds the %d-key limit", len(meta), MaxMetaKeys)
+	}
+	for k, v := range meta {
+		if len(k) > MaxMetaKeyLen {
+			return fmt.Errorf("ops: metadata key %q is %d bytes, exceeds the %d-byte limit", k, len(k), MaxMetaKeyLen)
+		}
+		if len(v) > MaxMetaValueLen {
+			return fmt.Errorf("ops: metadata value for key %q is %d bytes, exceeds the %d-byte limit", k, len(v), MaxMetaValueLen)
+		}
+	}
+	return nil
+}
+
+// nowStamp is the RFC3339 UTC timestamp ops stamps onto every checkpoint it
+// creates (Create's "init", Checkpoint, Fork's "fork", Promote's
+// "promote"). A plain function (not a field/hook) — nothing in this
+// package's tests has needed to fake the clock for this value, unlike
+// store.Ref.Touch's now time.Time parameter, which callers already had a
+// concrete time available for.
+func nowStamp() string { return time.Now().UTC().Format(time.RFC3339) }
+
 // Init creates a new store at spec and returns a workspace for it.
 func Init(spec string) (*Workspace, error) {
 	b, err := store.OpenBackend(context.Background(), spec)
@@ -166,7 +206,7 @@ func (w *Workspace) createFromQuiesced(db, quiescedPath string) error {
 		Lineage: lineage, Epoch: 1, HeadTXID: 1,
 		Protected: true, // main is protected by default (spec § Security posture)
 	}
-	ref.SetCheckpoint("init", 1, 1)
+	ref.SetCheckpoint("init", store.Checkpoint{TXID: 1, Epoch: 1, CreatedAt: nowStamp()})
 	if _, err := w.Store.PutRef(db, "main", ref, ""); err != nil {
 		// Freshly-minted lineage no rival can reference: safe to delete the
 		// orphaned snapshot (mirrors Fork's cleanup on the same failure).
@@ -544,7 +584,13 @@ func copyFile(from, to string) error {
 // session can be holding that checkout. The daemon conspicuously has no
 // checkpoint op; if one is ever added it MUST NOT call this directly —
 // route the snapshot through the session's own engine, or through dbfile.
-func (w *Workspace) Checkpoint(db, branch, name string) (uint64, error) {
+//
+// meta (nil = none) is a small string->string map describing this specific
+// checkpoint (e.g. eval run id, git SHA, agent id), capped by ValidateMeta
+// and stored on the checkpoint's own store.Checkpoint.Meta — not on the
+// branch's Ref.Meta, which Fork's meta param sets instead. Rejected (before
+// any store I/O) if it exceeds the caps.
+func (w *Workspace) Checkpoint(db, branch, name string, meta map[string]string) (uint64, error) {
 	if err := store.ValidateName(db); err != nil {
 		return 0, err
 	}
@@ -552,6 +598,9 @@ func (w *Workspace) Checkpoint(db, branch, name string) (uint64, error) {
 		return 0, err
 	}
 	if err := store.ValidateName(name); err != nil {
+		return 0, err
+	}
+	if err := ValidateMeta(meta); err != nil {
 		return 0, err
 	}
 	ref, etag, err := w.Store.GetRef(db, branch)
@@ -599,7 +648,7 @@ func (w *Workspace) Checkpoint(db, branch, name string) (uint64, error) {
 	}
 	ref.HeadTXID = txid
 	ref.HeadEpoch = ref.Epoch
-	ref.SetCheckpoint(name, txid, ref.Epoch)
+	ref.SetCheckpoint(name, store.Checkpoint{TXID: txid, Epoch: ref.Epoch, CreatedAt: nowStamp(), Meta: meta})
 	ref.Touch(time.Now())
 	if _, err := w.Store.PutRef(db, branch, ref, etag); err != nil {
 		// Decide whether to clean up the snapshot after PutRef failure.
@@ -845,11 +894,20 @@ func (w *Workspace) tryFastForkCopy(members []store.ChainMember, cp store.Checkp
 // before ever reaching here — see their own docs — so this is a second,
 // defense-in-depth check, not the primary one a caller should rely on for a
 // good error message.
-func (w *Workspace) Fork(db, srcBranch, newBranch, at string, ttl time.Duration) (uint64, error) {
+//
+// meta (nil = none) is a small string->string map describing the new
+// branch's lineage (e.g. eval run id, git SHA, agent id), capped by
+// ValidateMeta and stored on the child ref's Meta field — branch-level
+// lineage is the grain, not per-checkpoint (see Checkpoint's own meta param
+// for that). Rejected (before any store I/O) if it exceeds the caps.
+func (w *Workspace) Fork(db, srcBranch, newBranch, at string, ttl time.Duration, meta map[string]string) (uint64, error) {
 	if ttl < 0 {
 		return 0, fmt.Errorf("ops: fork ttl must be zero (no TTL) or positive, got %s", ttl)
 	}
 	if err := store.ValidateName(newBranch); err != nil {
+		return 0, err
+	}
+	if err := ValidateMeta(meta); err != nil {
 		return 0, err
 	}
 	src, _, err := w.Store.GetRef(db, srcBranch)
@@ -876,12 +934,13 @@ func (w *Workspace) Fork(db, srcBranch, newBranch, at string, ttl time.Duration)
 	child := store.Ref{
 		Lineage: childLineage, Epoch: 1, HeadTXID: txid, HeadEpoch: 1,
 		Parent: fmt.Sprintf("%s@%s@%d", db, srcBranch, txid),
+		Meta:   meta,
 	}
 	if ttl > 0 {
 		child.TTL = ttl.String()
 	}
 	child.Touch(time.Now())
-	child.SetCheckpoint("fork", txid, 1)
+	child.SetCheckpoint("fork", store.Checkpoint{TXID: txid, Epoch: 1, CreatedAt: nowStamp()})
 	if _, err := w.Store.PutRef(db, newBranch, child, ""); err != nil {
 		// Branch already exists (or lost a race): remove the orphan snapshot.
 		w.Store.B.Delete(store.SnapshotKey(childLineage, 1, txid))
@@ -967,7 +1026,11 @@ func (w *Workspace) Rollback(db, branch, to string) (string, error) {
 			}
 			copiedKeys = append(copiedKeys, key)
 		}
-		kept[name] = store.Checkpoint{TXID: c.TXID, Epoch: 1}
+		// Rewrite epoch to 1 (where the copy now actually lives) while
+		// preserving CreatedAt/Meta — this is a location update, not a new
+		// checkpoint, so its recorded creation time and metadata must
+		// survive the rewrite unchanged.
+		kept[name] = store.Checkpoint{TXID: c.TXID, Epoch: 1, CreatedAt: c.CreatedAt, Meta: c.Meta}
 	}
 
 	next := ref
@@ -1056,7 +1119,7 @@ func (w *Workspace) Promote(db, source, target string, force bool) (uint64, erro
 	next := tgt
 	next.Lineage, next.Epoch, next.HeadTXID, next.HeadEpoch = lineage, 1, txid, 1
 	next.Checkpoints = nil
-	next.SetCheckpoint("promote", txid, 1)
+	next.SetCheckpoint("promote", store.Checkpoint{TXID: txid, Epoch: 1, CreatedAt: nowStamp()})
 	next.Parent = fmt.Sprintf("%s@%s@%d", db, source, txid)
 	// A repoint is itself a revocation: the old holder is already fenced (its
 	// epoch no longer matches), but carrying its lease forward would leave a

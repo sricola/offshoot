@@ -17,6 +17,20 @@ class OffshootError(Exception):
 
 
 @dataclass
+class CheckpointInfo:
+    """One checkpoint's entry within :attr:`Branch.checkpoints_v2`.
+
+    Mirrors ``internal/daemon/protocol.go``'s ``CheckpointInfo``.
+    ``created_at`` is RFC3339 UTC, empty for a checkpoint that predates
+    per-checkpoint timestamps.
+    """
+
+    name: str
+    txid: int
+    created_at: str = ""
+
+
+@dataclass
 class Branch:
     """One branch of one db, as returned by :meth:`Client.branches`.
 
@@ -24,6 +38,11 @@ class Branch:
     canonical ``time.Duration.String()`` re-render (e.g. a fork requested
     with ttl "1h" reads back here as "1h0m0s") — safe to echo straight back
     into a future :meth:`Client.fork`/:meth:`Client.touch` call.
+
+    ``checkpoints`` (bare names) and ``checkpoints_v2`` (name/txid/
+    created_at) describe the exact same set of checkpoints — ``checkpoints``
+    stays for wire/API compat with code written before ``checkpoints_v2``
+    existed; new code should prefer ``checkpoints_v2``.
     """
 
     branch: str
@@ -33,6 +52,8 @@ class Branch:
     ttl_remaining: str = ""
     lease_holder: str = ""
     checkpoints: list[str] = field(default_factory=list)
+    touched_at: str = ""
+    checkpoints_v2: list[CheckpointInfo] = field(default_factory=list)
 
 
 def _ttl_str(ttl) -> str:
@@ -128,13 +149,18 @@ class Client:
         return resp["checkout"]
 
     def fork(self, db: str, source: str, new: str, from_checkpoint: str | None = None,
-              ttl=None) -> int:
+              ttl=None, meta: dict[str, str] | None = None) -> int:
         """Branch `new` off db@source (at from_checkpoint, or source's head).
+
+        meta (None = no metadata) is a small string->string map describing
+        the new branch's lineage (e.g. eval run id, git SHA, agent id),
+        capped server-side (ops.ValidateMeta: at most 32 keys, keys <= 64
+        bytes, values <= 512 bytes) and stored on the new branch's ref.
 
         Returns the fork point's txid.
         """
         resp = self._call("fork", db=db, branch=source, name=new, ttl=_ttl_str(ttl),
-                            **{"from": from_checkpoint or ""})
+                            meta=meta or None, **{"from": from_checkpoint or ""})
         return resp.get("txid", 0)
 
     def destroy(self, db: str, branch: str, force: bool = False) -> None:
@@ -171,9 +197,23 @@ class Client:
                 ttl_remaining=b.get("ttl_remaining", ""),
                 lease_holder=b.get("lease_holder", ""),
                 checkpoints=b.get("checkpoints", []),
+                touched_at=b.get("touched_at", ""),
+                checkpoints_v2=[
+                    CheckpointInfo(
+                        name=cp["name"],
+                        txid=cp.get("txid", 0),
+                        created_at=cp.get("created_at", ""),
+                    )
+                    for cp in b.get("checkpoints_v2", [])
+                ],
             )
             for b in resp.get("branches", [])
         ]
+
+    def dbs(self) -> list[str]:
+        """List every database this store has at least one ref for, sorted."""
+        resp = self._call("dbs")
+        return resp.get("databases", [])
 
     def status(self) -> list[dict]:
         """List every session open in the daemon, as raw dicts."""
@@ -192,9 +232,17 @@ class Session:
     def __init__(self, client: Client, path: str, db: str, branch: str):
         self._client, self.path, self._db, self._branch = client, path, db, branch
 
-    def flush(self, name: str = "") -> int:
-        """Flush the checkout to a durable snapshot; returns its txid."""
-        resp = self._client._call("flush", db=self._db, branch=self._branch, name=name)
+    def flush(self, name: str = "", meta: dict[str, str] | None = None) -> int:
+        """Flush the checkout to a durable snapshot; returns its txid.
+
+        meta (None = no metadata) is only meaningful alongside a non-empty
+        name: it is stored on the resulting named checkpoint (capped
+        server-side, same limits as :meth:`Client.fork`'s meta). Passing
+        meta with an empty name is rejected by the daemon — there is no
+        checkpoint for it to attach to.
+        """
+        resp = self._client._call("flush", db=self._db, branch=self._branch, name=name,
+                                    meta=meta or None)
         return resp.get("txid", 0)
 
     def close(self) -> None:

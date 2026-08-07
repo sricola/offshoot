@@ -14,7 +14,7 @@ package daemon
 type Request struct {
 	// Op is one of: "open" | "flush" | "status" | "close" | "shutdown" |
 	// "create" | "checkout" | "fork" | "destroy" | "rollback" | "promote" |
-	// "touch" | "branches".
+	// "touch" | "branches" | "dbs".
 	Op     string `json:"op"`
 	DB     string `json:"db,omitempty"`
 	Branch string `json:"branch,omitempty"` // also: fork/promote source branch
@@ -30,6 +30,16 @@ type Request struct {
 	// Force overrides protected-branch/live-lease refusals for destroy and
 	// promote (passed through to ops.Destroy/ops.Promote).
 	Force bool `json:"force,omitempty"`
+	// Meta is a small string->string map (capped by ops.ValidateMeta; see
+	// its doc comment for the exact limits), used by "fork" (stored on the
+	// new branch's Ref.Meta) and "flush" WHEN Name is also set (stored on
+	// that named checkpoint's own Meta — see opFlush's doc comment for why
+	// flush, not a separate "checkpoint" op, is where a daemon session's
+	// named checkpoints are created). Omitted/absent (the old-client shape)
+	// means no metadata, exactly like nil — this field is purely additive,
+	// so a pre-Milestone-3 client's requests decode and behave identically
+	// to before.
+	Meta map[string]string `json:"meta,omitempty"`
 }
 
 // Response is the daemon's reply to a single Request.
@@ -40,6 +50,9 @@ type Response struct {
 	TXID     uint64        `json:"txid,omitempty"`
 	Sessions []SessionInfo `json:"sessions,omitempty"`
 	Branches []BranchInfo  `json:"branches,omitempty"`
+	// Databases is every database this store has at least one ref for
+	// (store.Store.ListRefs's keys, sorted), as returned by the "dbs" op.
+	Databases []string `json:"databases,omitempty"`
 }
 
 // BranchInfo describes one branch of one db, as returned by the "branches"
@@ -57,6 +70,25 @@ type BranchInfo struct {
 	TTLRemaining string   `json:"ttl_remaining,omitempty"`
 	LeaseHolder  string   `json:"lease_holder,omitempty"`
 	Checkpoints  []string `json:"checkpoints,omitempty"` // sorted names
+	// TouchedAt is the ref's activity-clock stamp (store.Ref.TouchedAt),
+	// RFC3339 UTC. Omitted for a ref that predates TTL tracking and has
+	// never been touched since.
+	TouchedAt string `json:"touched_at,omitempty"`
+	// CheckpointsV2 carries the same checkpoints as Checkpoints (sorted by
+	// name, identically), plus each one's txid and creation timestamp.
+	// Added alongside Checkpoints — which stays exactly as it was — rather
+	// than replacing it, so an old client reading only Checkpoints keeps
+	// working unchanged (wire compat; Milestone 3 Task 1).
+	CheckpointsV2 []CheckpointInfo `json:"checkpoints_v2,omitempty"`
+}
+
+// CheckpointInfo is one checkpoint's wire shape within BranchInfo.CheckpointsV2.
+type CheckpointInfo struct {
+	Name string `json:"name"`
+	TXID uint64 `json:"txid"`
+	// CreatedAt is RFC3339 UTC, omitted for a checkpoint that predates
+	// per-checkpoint timestamps (see store.Checkpoint.CreatedAt).
+	CreatedAt string `json:"created_at,omitempty"`
 }
 
 // SessionInfo describes one session open in the daemon, as returned by the

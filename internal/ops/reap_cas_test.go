@@ -25,7 +25,7 @@ func TestTouchRefusesWhenReapingClaimed(t *testing.T) {
 	if err := w.Create("app"); err != nil {
 		t.Fatal(err)
 	}
-	if _, err := w.Fork("app", "main", "claimed", "", 0); err != nil {
+	if _, err := w.Fork("app", "main", "claimed", "", 0, nil); err != nil {
 		t.Fatal(err)
 	}
 
@@ -54,7 +54,7 @@ func TestReapClaimLosesCASWhenTouchLandsFirst(t *testing.T) {
 	if err := w.Create("app"); err != nil {
 		t.Fatal(err)
 	}
-	if _, err := w.Fork("app", "main", "contested", "", 0); err != nil {
+	if _, err := w.Fork("app", "main", "contested", "", 0, nil); err != nil {
 		t.Fatal(err)
 	}
 
