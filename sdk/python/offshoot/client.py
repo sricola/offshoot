@@ -331,7 +331,15 @@ class Client:
         block below always runs in response (whether the generator is
         garbage-collected, explicitly closed, or the loop breaks) and
         closes both the buffered reader and the underlying socket, so no
-        file descriptor is leaked by stopping early.
+        file descriptor is leaked by stopping early. A bare ``break`` with
+        no explicit ``.close()`` relies on the generator being garbage
+        collected promptly to trigger that cleanup — immediate under
+        CPython's reference counting, but not guaranteed to be immediate
+        on a non-refcounting implementation (e.g. PyPy), where the socket
+        could stay open until the next GC cycle. Call ``gen.close()``
+        explicitly (rather than just letting a ``break``ed-out-of
+        generator go out of scope) for deterministic, implementation-
+        independent cleanup timing.
         """
         sock = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
         try:
