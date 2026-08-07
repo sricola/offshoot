@@ -15,7 +15,7 @@ import { join } from "node:path";
 import { fileURLToPath } from "node:url";
 import { createServer, Socket, type Server } from "node:net";
 
-import { connect, OffshootError, Client, type OffshootEvent } from "../src/client.js";
+import { connect, OffshootError, Client, type OffshootEvent, type Session } from "../src/client.js";
 
 // test-dist/test/client.test.js -> repo root is four levels up.
 const REPO = join(fileURLToPath(new URL(".", import.meta.url)), "..", "..", "..", "..");
@@ -139,6 +139,76 @@ function daemonUnixSocketFdCount(pid: number): number | undefined {
     return undefined; // lsof exits non-zero on some platforms for a live pid; best effort
   }
   return out.split("\n").filter((line) => line.split(/\s+/).includes("unix")).length;
+}
+
+/** Races `p` against a `ms`-long timer, returning a tagged result rather
+ * than a bare union so a timeout can never be confused with (or need an
+ * unsound cast away from) any real value `p` could resolve to. */
+type RaceResult<T> = { timedOut: false; value: T } | { timedOut: true };
+
+function raceWithTimeout<T>(p: Promise<T>, ms: number): Promise<RaceResult<T>> {
+  return Promise.race([
+    p.then((value): RaceResult<T> => ({ timedOut: false, value })),
+    sleep(ms).then((): RaceResult<T> => ({ timedOut: true })),
+  ]);
+}
+
+/** Repeatedly open db@main on c2 (via a FRESH events() connection each
+ * attempt) until the helper observes the resulting session_opened,
+ * bounded by a generous overall deadline -- returns the winning
+ * session, its still-open async iterator, and the observed event.
+ *
+ * Why this exists instead of a fixed sleep: Task 4a's daemon subscribes
+ * a connection to the bus strictly BEFORE acking "subscribe" (see
+ * handleSubscribeOp's doc comment), but events()'s public contract gives
+ * an outside caller no way to observe "the ack has been consumed" from
+ * outside -- that read is fused with the wait for the first event inside
+ * one opaque `.next()` step. A fixed sleep to paper over that (this
+ * repo's CI has a documented history of exactly this flake shape -- lost
+ * torture logs, a takeover flake, a pytester HOME issue) is exactly the
+ * anti-pattern to avoid. Instead: start `it.next()` FIRST (before firing
+ * the op that should produce its result), race it against a short
+ * per-attempt timeout, and retry against a brand new events() connection
+ * if it doesn't arrive in time (the bus never replays, so an open() that
+ * fires before the subscription lands is simply never seen and must be
+ * redone) -- no guessing, no fixed delay in the common case where the
+ * first attempt wins.
+ *
+ * A timed-out attempt's `it` is abandoned rather than awaited further: a
+ * best-effort `it.return?.()` is fired without being awaited (harmless,
+ * and may eventually release its dedicated connection once its pending
+ * `.next()` call settles on its own), but nothing here blocks waiting
+ * for that to happen. Acceptable because this path is only exercised on
+ * a genuine ack-vs-transition race, which a 1s per-attempt timeout makes
+ * rare in practice; callers that also measure the daemon's fd count take
+ * their baseline AFTER any retry churn for exactly this reason (see the
+ * break-mid-stream test below).
+ */
+async function openUntilSubscribed(
+  c: Client,
+  c2: Client,
+  db: string,
+  perAttemptMs = 1000,
+  overallMs = 15_000,
+): Promise<{ session: Session; it: AsyncGenerator<OffshootEvent, void, void>; opened: OffshootEvent }> {
+  const deadline = Date.now() + overallMs;
+  let s: Session | undefined;
+  for (;;) {
+    if (Date.now() > deadline) {
+      throw new Error("events() never observed session_opened before the retry deadline");
+    }
+    if (s) await s.close();
+    const it = c.events();
+    const pending = it.next(); // start reading BEFORE firing the triggering op
+    s = await c2.open(db);
+    const result = await raceWithTimeout(pending, perAttemptMs);
+    if (!result.timedOut && !result.value.done) {
+      return { session: s, it, opened: result.value.value };
+    }
+    if (result.timedOut) {
+      void it.return?.().catch(() => {}); // best-effort, not awaited -- see doc comment
+    }
+  }
 }
 
 /** A minimal one-shot fake daemon: accepts exactly one connection on a
@@ -683,19 +753,18 @@ test("events(): sees a real session lifecycle in order, on its own dedicated con
   const c = await connect(fixture!.sock);
   try {
     await c.create("events-lifecycle-app");
-    const it = c.events();
-    const first = it.next(); // starts the dedicated connection + subscribe + ack
-
-    // Let the connect+subscribe+ack round trip actually land (typically
-    // sub-millisecond over a local unix socket) before driving transitions
-    // on a SEPARATE connection -- the bus has no replay, so a transition
-    // published before this subscription is registered would be silently
-    // missed.
-    await sleep(500);
-
     const c2 = await connect(fixture!.sock);
     try {
-      const s = await c2.open("events-lifecycle-app");
+      // Deterministic, zero-fixed-sleep sync for the ack-vs-transition
+      // race -- see openUntilSubscribed's doc comment.
+      const { session: s, it, opened } = await openUntilSubscribed(c, c2, "events-lifecycle-app");
+      assert.equal(opened.type, "session_opened");
+      assert.equal(opened.db, "events-lifecycle-app");
+      assert.equal(opened.branch, "main");
+
+      // Subscription is now proven live -- no more races. The rest of
+      // the lifecycle is driven once, normally, and read directly off
+      // the same winning `it`.
       sqlite3(s.path, "CREATE TABLE t (v);");
       let txid = 0;
       const deadline = Date.now() + 10_000;
@@ -705,29 +774,23 @@ test("events(): sees a real session lifecycle in order, on its own dedicated con
         await sleep(100);
       }
       assert.ok(txid > 0);
+
+      const flushed = await it.next();
+      assert.equal(flushed.done, false);
+      assert.equal(flushed.value!.type, "flushed");
+      assert.equal(flushed.value!.db, "events-lifecycle-app");
+      assert.equal(flushed.value!.detail?.kind, "manual");
+
       await s.close();
+      const closed = await it.next();
+      assert.equal(closed.done, false);
+      assert.equal(closed.value!.type, "session_closed");
+      assert.equal(closed.value!.db, "events-lifecycle-app");
+
+      await it.return?.();
     } finally {
       await c2.close();
     }
-
-    const opened = await first;
-    assert.equal(opened.done, false);
-    assert.equal(opened.value!.type, "session_opened");
-    assert.equal(opened.value!.db, "events-lifecycle-app");
-    assert.equal(opened.value!.branch, "main");
-
-    const flushed = await it.next();
-    assert.equal(flushed.done, false);
-    assert.equal(flushed.value!.type, "flushed");
-    assert.equal(flushed.value!.db, "events-lifecycle-app");
-    assert.equal(flushed.value!.detail?.kind, "manual");
-
-    const closed = await it.next();
-    assert.equal(closed.done, false);
-    assert.equal(closed.value!.type, "session_closed");
-    assert.equal(closed.value!.db, "events-lifecycle-app");
-
-    await it.return?.();
   } finally {
     await c.close();
   }
@@ -741,49 +804,48 @@ test("events(): break mid-stream closes the dedicated socket (no leaked fd)", as
   const c = await connect(fixture!.sock);
   try {
     await c.create("events-close-app");
-
-    // Let any startup-transient fd churn settle before sampling a baseline.
-    await sleep(200);
-    const baseline = daemonUnixSocketFdCount(fixture!.proc.pid!);
-
-    const got: OffshootEvent[] = [];
-    const loopDone = (async () => {
-      for await (const ev of c.events()) {
-        got.push(ev);
-        break; // <- triggers the async iterator's return(), closing the socket
-      }
-    })();
-
-    await sleep(300); // let the subscribe connect+ack land first
     const c2 = await connect(fixture!.sock);
     try {
-      await c2.open("events-close-app");
+      // Same zero-fixed-sleep retry sync as the lifecycle test above.
+      const { session: s, it, opened } = await openUntilSubscribed(c, c2, "events-close-app");
+      assert.equal(opened.type, "session_opened");
+
+      // Baseline sampled HERE, AFTER any retry churn above -- an
+      // abandoned attempt's connection, if any, leaks (best-effort
+      // cleanup only -- see openUntilSubscribed's doc comment) and so
+      // belongs in the baseline, not the delta this assertion actually
+      // cares about: whether closing the WINNING `it` below releases its
+      // own fd.
+      const baseline = daemonUnixSocketFdCount(fixture!.proc.pid!);
+
+      // Stop iterating mid-stream -- return() propagates through
+      // events()'s try/finally, closing the dedicated socket. Safe here:
+      // the winning `it`'s only next() call already resolved (inside
+      // openUntilSubscribed), so nothing else is concurrently driving it.
+      await it.return?.();
+
+      if (baseline !== undefined) {
+        const deadline = Date.now() + 5_000;
+        let after = baseline + 1;
+        while (Date.now() < deadline) {
+          after = daemonUnixSocketFdCount(fixture!.proc.pid!) ?? after;
+          if (after <= baseline) break;
+          await sleep(100);
+        }
+        assert.ok(
+          after <= baseline,
+          `daemon unix-socket fd count did not return to baseline after break() (baseline=${baseline}, after=${after}) -- possible leaked subscriber fd`,
+        );
+      }
+
+      await s.close();
+
+      // The daemon itself must be unaffected: an ordinary op on this
+      // same connection still works after the dropped subscriber.
+      await c.branches("events-close-app");
     } finally {
       await c2.close();
     }
-
-    await loopDone;
-    assert.equal(got.length, 1);
-    assert.equal(got[0]!.type, "session_opened");
-
-    if (baseline !== undefined) {
-      const deadline = Date.now() + 5_000;
-      let after = baseline + 1;
-      while (Date.now() < deadline) {
-        after = daemonUnixSocketFdCount(fixture!.proc.pid!) ?? after;
-        if (after <= baseline) break;
-        await sleep(100);
-      }
-      assert.ok(
-        after <= baseline,
-        `daemon unix-socket fd count did not return to baseline after break() (baseline=${baseline}, after=${after}) -- possible leaked subscriber fd`,
-      );
-    }
-
-    // The daemon itself must be unaffected: an ordinary op on this same
-    // (never-subscribed) connection still works after the dropped
-    // subscriber.
-    await c.branches("events-close-app");
   } finally {
     await c.close();
   }
