@@ -4,9 +4,11 @@ import (
 	"bytes"
 	"context"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"io"
 	"net/http"
+	"net/http/httptest"
 	"reflect"
 	"regexp"
 	"strconv"
@@ -123,6 +125,25 @@ func TestHTTPAuthAccepts(t *testing.T) {
 	}
 	if !out.OK {
 		t.Fatalf("response = %+v, want ok", out)
+	}
+}
+
+// TestHTTPAuthAcceptsCaseInsensitiveBearerScheme pins checkAuth's documented
+// case-insensitive scheme matching (RFC 7235: auth-scheme names are
+// case-insensitive) as a POSITIVE assertion — TestHTTPAuthRejectsMalformedHeader
+// only covers scheme-related REJECTIONS, so without this test a future
+// change that accidentally made scheme matching case-SENSITIVE would pass
+// every existing test while quietly breaking any client that sends a
+// lowercase "bearer" (some HTTP libraries normalize scheme names to
+// lowercase automatically).
+func TestHTTPAuthAcceptsCaseInsensitiveBearerScheme(t *testing.T) {
+	_, _, base, token := newHTTPServer(t)
+	for _, scheme := range []string{"bearer", "BEARER", "BeArEr"} {
+		resp := httpRPC(t, base, scheme+" "+token, Request{Op: "dbs"})
+		out := decodeResponse(t, resp)
+		if resp.StatusCode != http.StatusOK || !out.OK {
+			t.Errorf("scheme %q: status=%d response=%+v, want 200/ok", scheme, resp.StatusCode, out)
+		}
 	}
 }
 
@@ -307,6 +328,84 @@ func TestStartHTTPRefusesNonLoopbackWithoutAckOrToken(t *testing.T) {
 	}
 }
 
+// TestStartHTTPRejectsShortToken pins the minHTTPTokenLen guard: an
+// explicit token under 16 characters is refused outright, since
+// TokenFingerprint's 8-character prefix would otherwise reveal half (or,
+// for anything 8 chars or under, ALL) of a short token in ongoing
+// status/log output.
+func TestStartHTTPRejectsShortToken(t *testing.T) {
+	srv, _ := newServer(t)
+	err := srv.StartHTTP(HTTPConfig{Addr: "127.0.0.1:0", Token: "short-token"})
+	if err == nil {
+		t.Fatal("StartHTTP with a 11-character token must be refused")
+	}
+	if !strings.Contains(err.Error(), "at least") {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	if srv.HTTPAddr() != "" {
+		t.Fatal("a rejected StartHTTP call must not leave a listener bound")
+	}
+}
+
+// TestStartHTTPConcurrentCallsOnlyOneWins is the TOCTOU regression test for
+// StartHTTP's already-called guard: the first check (before the slow,
+// unlocked net.Listen call) is not enough on its own to prevent two
+// concurrent StartHTTP calls from both passing it and racing to bind their
+// own listener — only the SECOND check, taken again under s.mu after both
+// listeners are already bound, can catch that. Without it, the loser's
+// httpSrv/httpToken/httpAddr write could silently clobber the winner's
+// (or vice versa, depending on scheduling), leaving the daemon serving on
+// a listener/token combination neither caller can predict, with the
+// loser's own listener leaked (never closed). This asserts the outcome a
+// caller can actually observe: exactly one of the two calls succeeds, the
+// other gets the "already called" error, and HTTPAddr() afterward reports
+// a real, working listener.
+func TestStartHTTPConcurrentCallsOnlyOneWins(t *testing.T) {
+	srv, _ := newServer(t)
+
+	var wg sync.WaitGroup
+	errs := make(chan error, 2)
+	for i := 0; i < 2; i++ {
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			errs <- srv.StartHTTP(HTTPConfig{Addr: "127.0.0.1:0", Token: testHTTPToken, Log: io.Discard})
+		}()
+	}
+	wg.Wait()
+	close(errs)
+
+	var succeeded, failed int
+	var failErr error
+	for err := range errs {
+		if err == nil {
+			succeeded++
+		} else {
+			failed++
+			failErr = err
+		}
+	}
+	if succeeded != 1 || failed != 1 {
+		t.Fatalf("concurrent StartHTTP calls: %d succeeded, %d failed, want exactly 1 and 1", succeeded, failed)
+	}
+	if !strings.Contains(failErr.Error(), "already called") {
+		t.Fatalf("loser's error = %v, want \"already called\"", failErr)
+	}
+	if srv.HTTPAddr() == "" {
+		t.Fatal("the winner's listener must be reachable via HTTPAddr()")
+	}
+
+	// The winner's listener must actually work end to end.
+	resp, err := http.Get("http://" + srv.HTTPAddr() + "/healthz")
+	if err != nil {
+		t.Fatalf("GET /healthz on the winning listener: %v", err)
+	}
+	resp.Body.Close()
+	if resp.StatusCode != http.StatusOK {
+		t.Fatalf("GET /healthz status = %d, want 200", resp.StatusCode)
+	}
+}
+
 // ---- token generation / fingerprint / redaction ----
 
 func TestGenerateTokenIsHighEntropyAndUnique(t *testing.T) {
@@ -454,6 +553,49 @@ func TestHTTPPprofBehindAuth(t *testing.T) {
 	resp3.Body.Close()
 	if resp3.StatusCode != http.StatusOK {
 		t.Fatalf("GET /debug/pprof/cmdline with auth: status = %d, want 200", resp3.StatusCode)
+	}
+}
+
+// failingResponseWriter is a minimal http.ResponseWriter whose Write always
+// fails — used by TestHandleMetricsLogsWritePrometheusErrorsToConfiguredLog
+// to force handleMetrics's WritePrometheus error path deterministically
+// (a real HTTP round trip has no reliable way to make the server's own
+// io.WriteString to the connection fail on demand).
+type failingResponseWriter struct {
+	h http.Header
+}
+
+func (f *failingResponseWriter) Header() http.Header {
+	if f.h == nil {
+		f.h = http.Header{}
+	}
+	return f.h
+}
+func (f *failingResponseWriter) Write([]byte) (int, error) {
+	return 0, errors.New("simulated write failure")
+}
+func (f *failingResponseWriter) WriteHeader(int) {}
+
+// TestHandleMetricsLogsWritePrometheusErrorsToConfiguredLog pins that
+// handleMetrics's error-path logging goes to HTTPConfig.Log (s.httpLog),
+// not a bare os.Stderr — a caller/test that redirected StartHTTP's logging
+// (e.g. to a buffer, specifically to keep assertions off real stderr)
+// must see this line too.
+func TestHandleMetricsLogsWritePrometheusErrorsToConfiguredLog(t *testing.T) {
+	srv, _ := newServer(t)
+	var log bytes.Buffer
+	if err := srv.StartHTTP(HTTPConfig{Addr: "127.0.0.1:0", Token: testHTTPToken, Log: &log}); err != nil {
+		t.Fatal(err)
+	}
+	log.Reset() // drop StartHTTP's own startup lines; only handleMetrics's line matters below
+
+	fw := &failingResponseWriter{}
+	req := httptest.NewRequest(http.MethodGet, "/metrics", nil)
+	srv.handleMetrics(fw, req)
+
+	out := log.String()
+	if !strings.Contains(out, "offshoot: http: /metrics:") {
+		t.Fatalf("handleMetrics's WritePrometheus error was not logged to the configured Log writer:\n%s", out)
 	}
 }
 
@@ -682,4 +824,59 @@ func TestHTTPShutdownWhileRequestsInFlightIsSafe(t *testing.T) {
 	}
 	close(stop)
 	wg.Wait()
+}
+
+// ---- path-trick matrix (routing/auth-bypass attempts) ----
+
+// TestHTTPPathTrickMatrixNeverBypassesAuth is a reviewer-probed matrix of
+// path variants aimed at reaching a Bearer-protected handler (/metrics,
+// /debug/pprof) WITHOUT ever satisfying requireAuth — case variation,
+// dot-segments, double slashes, a percent-encoded slash, and a trailing
+// ";" — plus one no-trailing-slash pprof variant that exercises
+// http.ServeMux's own subtree-redirect behavior. Every request here is
+// sent with NO Authorization header via a client that follows redirects
+// (http.Get's default), so the only acceptable final outcomes are 401
+// (the request eventually reached a requireAuth-wrapped handler, and was
+// correctly rejected) or 404 (the mux never matched a registered pattern
+// at all) — 200 would mean an auth bypass, and anything else would be a
+// surprise worth understanding before trusting this routing. Pinning the
+// ACTUAL observed status per variant (not just "not 200") means a future
+// Go version's ServeMux behavior change shows up as a targeted test
+// failure here instead of an unnoticed regression.
+func TestHTTPPathTrickMatrixNeverBypassesAuth(t *testing.T) {
+	_, _, base, _ := newHTTPServer(t)
+
+	cases := []struct {
+		path string
+		want int
+	}{
+		{"/RPC", http.StatusNotFound},                           // case-sensitive: /RPC != /rpc
+		{"//metrics", http.StatusUnauthorized},                  // net/http's own path-cleaning collapses "//" -> "/", redirects to "/metrics", then hits auth
+		{"/./metrics", http.StatusUnauthorized},                 // net/http cleans "/./metrics" -> "/metrics", redirects, then hits auth
+		{"/a/../metrics", http.StatusUnauthorized},              // cleans to "/metrics", redirects, then hits auth
+		{"/healthz/../metrics", http.StatusUnauthorized},        // cleans to "/metrics" (NOT a healthz bypass), redirects, then hits auth
+		{"/healthz%2f..%2fmetrics", http.StatusNotFound},        // %2f is NOT decoded into a path separator for routing; literal segment, no match
+		{"/debug/pprof/../../metrics", http.StatusUnauthorized}, // cleans to "/metrics", redirects, then hits auth
+		{"/metrics;", http.StatusNotFound},                      // literal distinct path; ";" is not a segment/query separator here
+		{"/debug/pprof", http.StatusUnauthorized},               // subtree pattern "/debug/pprof/" redirects the no-slash form, then hits auth
+	}
+
+	for _, c := range cases {
+		t.Run(c.path, func(t *testing.T) {
+			resp, err := http.Get(base + c.path)
+			if err != nil {
+				t.Fatalf("GET %s: %v", c.path, err)
+			}
+			defer resp.Body.Close()
+			if resp.StatusCode == http.StatusOK {
+				body, _ := io.ReadAll(resp.Body)
+				t.Fatalf("GET %s with NO Authorization header returned 200 (auth bypass!): body=%s", c.path, body)
+			}
+			if resp.StatusCode != c.want {
+				t.Fatalf("GET %s = %d, want %d (still not a bypass, but the routing behavior this test "+
+					"pins has changed — re-verify by hand before updating the expectation)",
+					c.path, resp.StatusCode, c.want)
+			}
+		})
+	}
 }

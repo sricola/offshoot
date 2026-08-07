@@ -195,6 +195,84 @@ func TestServeNegativeFlushEveryIsRejected(t *testing.T) {
 	}
 }
 
+// TestServeTokenWithoutHTTPIsRejected and
+// TestServeAllowNonLoopbackWithoutHTTPIsRejected pin Milestone 4 Task 3's
+// review-fold item: -token/-http-allow-non-loopback only mean anything
+// alongside -http, so giving either one without it must fail as a startup
+// error (almost certainly a typo'd or dropped -http ADDR) rather than
+// silently doing nothing — the surprising alternative would be an operator
+// noticing only by ABSENCE (no HTTP listener, no auth) instead of an
+// explicit error. Both run() before ever touching the socket/daemon, same
+// shape as TestServeNegativeFlushEveryIsRejected.
+func TestServeTokenWithoutHTTPIsRejected(t *testing.T) {
+	dir := filepath.Join(t.TempDir(), "s")
+	if err := run([]string{"-store", dir, "init"}); err != nil {
+		t.Fatal(err)
+	}
+	err := run([]string{"-store", dir, "serve", "-token", "some-token-value-0123456789"})
+	if err == nil {
+		t.Fatal("serve -token without -http must be rejected, not silently ignored")
+	}
+	if !strings.Contains(err.Error(), "-token given without -http") {
+		t.Fatalf("unexpected error: %v", err)
+	}
+}
+
+func TestServeAllowNonLoopbackWithoutHTTPIsRejected(t *testing.T) {
+	dir := filepath.Join(t.TempDir(), "s")
+	if err := run([]string{"-store", dir, "init"}); err != nil {
+		t.Fatal(err)
+	}
+	err := run([]string{"-store", dir, "serve", "-http-allow-non-loopback"})
+	if err == nil {
+		t.Fatal("serve -http-allow-non-loopback without -http must be rejected, not silently ignored")
+	}
+	if !strings.Contains(err.Error(), "-http-allow-non-loopback given without -http") {
+		t.Fatalf("unexpected error: %v", err)
+	}
+}
+
+// TestServeHTTPNonLoopbackStartupErrorsAreDistinct exercises PM Amendment
+// 10's two-distinct-errors requirement through the CLI end to end (not
+// just daemon.ValidateHTTPBind directly, which internal/daemon's own tests
+// already cover) — missing -http-allow-non-loopback vs. (ack given but) no
+// explicit token must fail with different messages, both before run() ever
+// creates a socket/daemon.
+func TestServeHTTPNonLoopbackStartupErrorsAreDistinct(t *testing.T) {
+	dir := filepath.Join(t.TempDir(), "s")
+	if err := run([]string{"-store", dir, "init"}); err != nil {
+		t.Fatal(err)
+	}
+	errNoAck := run([]string{"-store", dir, "serve", "-http", "0.0.0.0:0"})
+	if errNoAck == nil {
+		t.Fatal("serve -http on a non-loopback address without -http-allow-non-loopback must be rejected")
+	}
+	errNoToken := run([]string{"-store", dir, "serve", "-http", "0.0.0.0:0", "-http-allow-non-loopback"})
+	if errNoToken == nil {
+		t.Fatal("serve -http-allow-non-loopback without an explicit token must be rejected")
+	}
+	if errNoAck.Error() == errNoToken.Error() {
+		t.Fatalf("the two non-loopback startup errors must be distinct, both were: %q", errNoAck.Error())
+	}
+}
+
+// TestServeShortTokenIsRejected exercises the minHTTPTokenLen guard through
+// the CLI: an explicit -token under 16 characters must be a startup error,
+// not something only internal/daemon.StartHTTP's own tests catch.
+func TestServeShortTokenIsRejected(t *testing.T) {
+	dir := filepath.Join(t.TempDir(), "s")
+	if err := run([]string{"-store", dir, "init"}); err != nil {
+		t.Fatal(err)
+	}
+	err := run([]string{"-store", dir, "serve", "-http", "127.0.0.1:0", "-token", "short"})
+	if err == nil {
+		t.Fatal("serve -http with a short -token must be rejected")
+	}
+	if !strings.Contains(err.Error(), "at least") {
+		t.Fatalf("unexpected error: %v", err)
+	}
+}
+
 // TestMCPDefaultTTLNegativeIsRejected mirrors
 // TestServeNegativeFlushEveryIsRejected for mcp's -default-ttl: a negative
 // duration is (almost certainly) a mistake and must fail closed as a usage
