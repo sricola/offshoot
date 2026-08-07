@@ -46,7 +46,7 @@ func TestReplayStaysBoundedAcrossManyFlushes(t *testing.T) {
 		if out, err := exec.Command("sqlite3", s.CheckoutPath(), "INSERT INTO t VALUES ('x');").CombinedOutput(); err != nil {
 			t.Fatalf("INSERT %d failed: %v: %s", i, err, out)
 		}
-		if _, err := s.Flush(""); err != nil {
+		if _, err := s.Flush("", nil); err != nil {
 			t.Fatalf("flush %d: %v", i, err)
 		}
 	}
@@ -74,7 +74,7 @@ func TestGCSweepsSegmentsWithTheirLineage(t *testing.T) {
 	if err := w.Create("app"); err != nil {
 		t.Fatal(err)
 	}
-	if _, err := w.Fork("app", "main", "doomed", "", 0); err != nil {
+	if _, err := w.Fork("app", "main", "doomed", "", 0, nil); err != nil {
 		t.Fatal(err)
 	}
 	s, err := session.Open(context.Background(), session.Options{
@@ -90,7 +90,7 @@ func TestGCSweepsSegmentsWithTheirLineage(t *testing.T) {
 		if out, err := exec.Command("sqlite3", s.CheckoutPath(), "INSERT INTO t VALUES ('x');").CombinedOutput(); err != nil {
 			t.Fatalf("INSERT %d failed: %v: %s", i, err, out)
 		}
-		if _, err := s.Flush(""); err != nil {
+		if _, err := s.Flush("", nil); err != nil {
 			t.Fatal(err)
 		}
 	}
@@ -161,7 +161,7 @@ func TestForkFastPathSkipsMultiMemberChains(t *testing.T) {
 	// First flush after Open is always a forced full snapshot (the
 	// "settling flush" — see docs/benchmarks.md), regardless of
 	// SnapshotEvery. This becomes the branch's only snapshot so far.
-	if _, err := s.Flush(""); err != nil {
+	if _, err := s.Flush("", nil); err != nil {
 		t.Fatal(err)
 	}
 	if out, err := exec.Command("sqlite3", s.CheckoutPath(), "INSERT INTO t VALUES (2);").CombinedOutput(); err != nil {
@@ -169,7 +169,7 @@ func TestForkFastPathSkipsMultiMemberChains(t *testing.T) {
 	}
 	// Second flush, still short of the SnapshotEvery=4 cadence: a segment,
 	// not a snapshot. The branch's chain is now [snapshot, segment].
-	if _, err := s.Flush(""); err != nil {
+	if _, err := s.Flush("", nil); err != nil {
 		t.Fatal(err)
 	}
 	if err := s.Close(); err != nil {
@@ -189,7 +189,7 @@ func TestForkFastPathSkipsMultiMemberChains(t *testing.T) {
 	}
 
 	before := ops.ForkFastPathHits()
-	if _, err := w.Fork("app", "main", "child", "", 0); err != nil {
+	if _, err := w.Fork("app", "main", "child", "", 0, nil); err != nil {
 		t.Fatal(err)
 	}
 	if got := ops.ForkFastPathHits(); got != before {

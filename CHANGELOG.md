@@ -13,6 +13,452 @@ version if you depend on format stability.
 
 ## [Unreleased]
 
+## [0.1.2] - 2026-08-06
+
+Milestone 3: the eval-harness release. The target persona's first hour is
+now paved end to end — install, seed once, fork per test, inspect, export,
+clean up — from Python (`offshoot.pytest_plugin`) or TypeScript
+(`testkit`), with [docs/eval-harness.md](docs/eval-harness.md) as the
+serious tutorial and framework recipes for Claude Code, the OpenAI Agents
+SDK, LlamaIndex, and CrewAI in [docs/recipes/](docs/recipes/). New protocol
+surface (`dbs`, metadata/timestamps, `export`, read-only historical
+checkouts) lands first, the fixture plugin and TS testkit are built on top
+of it, and `offshoot diff` closes the daily "what changed between these two
+attempts" loop. Two Milestone-2 performance follow-ups (settling-flush
+suppression; sidecar refresh on clean close) ride along because the
+fixture's session-per-test pattern is exactly the workload they fix. SDK
+publishing is prepared (workflows, manifests) but actual PyPI/npm
+publication, and the MCP registry/LangGraph listing submissions, stay
+user-gated — see [docs/status.md](docs/status.md) and
+[ROADMAP.md](ROADMAP.md)'s Milestone 3 section for exactly what shipped vs.
+what's a stated, pre-written deferral.
+
+### Added
+
+- **Docs sweep** (Milestone 3 Task 8): [docs/eval-harness.md](docs/eval-harness.md),
+  the serious tutorial — install, the pytest plugin end to end (named-seed
+  factory, fork-per-test, `pytest-xdist` with the measured per-worker
+  number, mid-test flush checkpoints, golden assertions via `offshoot_dump`
+  — never byte-compare, why), export for handoff/debug, `offshoot diff` for
+  the failed-vs-passed loop, TTL hygiene, a CI recipe (this repo's own
+  `ci.yml` `sdks` job as a live example), what it costs, and the TypeScript
+  `testkit` section mirroring the same semantics for vitest/jest/`node:test`.
+  Every pytest example in it was actually run against a real daemon while
+  writing it (a scratch project, real output pasted in, not invented); the
+  TypeScript `testkit` section's `node:test` example was likewise run
+  against a real build of `sdk/typescript`. `sdk/python/README.md`'s
+  pytest-fixture-plugin section is superseded by the tutorial as the
+  primary teaching surface and now points to it, staying as the
+  PyPI-landing-page-sized condensed reference.
+  - `docs/recipes/claude-agent-sdk.md`: `claude mcp add` config for
+    `offshoot mcp`, and a hooks pattern (fork on `SessionStart`, checkpoint
+    on `Stop`, roll back on failure) — explicitly checked against the MCP
+    daemon-mode reality documented in the README's MCP section and
+    `docs/reference.md`: `offshoot mcp` never opens a session itself, so
+    the recipe's actual content is opening the session via the CLI/SDK
+    *before* the agent's first tool call, with the hooks shown as one way
+    to automate that open/close, not a substitute for it. The hooks JSON
+    shape itself is marked illustrative (Claude Code's own surface, not
+    offshoot's, and outside what this task could pin the way the rest of
+    this repo's docs are).
+  - `docs/recipes/openai-agents.md`: the OpenAI Agents SDK's
+    `SQLiteSession(session_id, db_path)` pointed at an offshoot checkout
+    path, fork-per-attempt via the Python SDK. Actually run end to end
+    against a real `pip install openai-agents` (no API key needed to prove
+    the storage integration — `add_items`/`get_items` stand in for
+    `Runner.run`); real output pasted in, including two forked attempts'
+    histories staying independent after diverging from a shared checkpoint.
+  - `docs/recipes/frameworks.md`: short, honest LlamaIndex/CrewAI notes —
+    recipes, not adapters, per the plan's stance. Explicitly marked
+    unverified against a live install this pass (LlamaIndex's SQL chat
+    store needs the `aiosqlite` extra; CrewAI's package failed to build
+    locally — `tiktoken`, one of its transitive dependencies, has no
+    prebuilt wheel for this Python/platform combination) rather than
+    presented with false confidence.
+  - README: integration-surface refresh — pytest plugin, TypeScript
+    `testkit`, `export`/`checkout_at`/`dbs` all get their own lines under
+    the Python/TypeScript SDK sections; a new "Other agent frameworks"
+    section points at `docs/recipes/`; the Docs line and Quickstart section
+    both gain pointers to the new tutorial.
+  - `docs/reference.md`: verified complete for `export`/`diff`/
+    `checkout --at` (documented per-task already; no gaps found) — added
+    one pointer line at the top to the tutorial for readers who want the
+    narrative walkthrough instead of the flag-by-flag reference.
+  - `docs/status.md`: two new deferral rows, both pre-written per PM
+    Amendment — `create --from` daemon/SDK/MCP reach (needs an upload
+    channel or a same-host path-trust story like `export`'s; CLI remains
+    the import path) and MCP session open/close (the fixture plugin and TS
+    testkit are now real lifecycle owners for their own harness workload,
+    but neither is an MCP tool pair — the no-natural-owner reasoning from
+    Milestone 2's amendment stands, confirmed rather than just carried
+    forward).
+  - `ROADMAP.md`: Milestone 3 checked off item-by-item against what
+    actually shipped, with the two deferrals above plus listings
+    submission and actual SDK publication called out as pre-written,
+    user-gated deferral rows rather than silently-dropped scope; Milestone
+    2's "MCP rides the daemon" bullet updated to note the fixture/testkit
+    now exist without overclaiming they closed the MCP-tool-pair gap.
+- **List databases** (Milestone 3 Task 1): new daemon protocol op `dbs`
+  returns every database the store has at least one ref for
+  (`store.Store.ListRefs`'s keys, sorted). CLI: `offshoot session dbs`.
+  SDK: Python `Client.dbs() -> list[str]`, TypeScript
+  `Client.dbs(): Promise<string[]>`.
+- **Branch/checkpoint metadata and timestamps** (Milestone 3 Task 1):
+  - `Ref.Meta map[string]string` (branch-level lineage metadata) and
+    per-checkpoint `store.Checkpoint.CreatedAt`/`Meta` — all new, omitempty
+    fields, no store schema bump (verified with a round-trip + old-ref/
+    old-checkpoint decode test mirroring the existing TTL-fields test).
+  - `ops.Workspace.Fork`/`Checkpoint` gain a `meta map[string]string` param
+    (`nil` = none), capped at the ops layer via the new `ops.ValidateMeta`
+    (at most 32 keys, keys ≤ 64 bytes, values ≤ 512 bytes — Global
+    Constraints; clear errors naming the exact limit hit). `Fork`'s meta
+    describes the new branch's lineage (`Ref.Meta`); `Checkpoint`'s meta
+    describes that one checkpoint (`Checkpoint.Meta`). Every checkpoint-
+    creating call site (`Create`'s `init`, `Checkpoint`, `Fork`'s `fork`,
+    `Promote`'s `promote`, and a daemon session's named `flush`) now stamps
+    `CreatedAt` (RFC3339 UTC).
+  - `Rollback`'s kept-checkpoint relocation used to silently drop
+    `CreatedAt`/`Meta` when rewriting a checkpoint's epoch to the new
+    lineage's `1` — fixed to preserve both.
+  - Daemon protocol: `BranchInfo` gains `touched_at` (the ref's activity-
+    clock stamp) and `checkpoints_v2` (`[]{name, txid, created_at}`) —
+    the existing `checkpoints` (bare names) field is untouched for wire
+    compat. `fork` and `flush` ops gain an optional `meta` field; there is
+    no separate daemon "checkpoint" op — a live session's named `flush` is
+    how its checkpoints are created (parity note: `flush`'s `meta` is
+    rejected if `name` is empty — there's no checkpoint for it to attach
+    to). All new fields are additive/optional: an old-client-shaped request
+    (no `meta`, reading only `checkpoints`) still works against the new
+    daemon, pinned by wire-compat tests using hand-written JSON (not just a
+    Go zero-value round trip).
+  - CLI: `fork`/`checkpoint` gain repeatable `--meta k=v`.
+  - SDK parity (Python + TypeScript): `fork`/`Session.flush` accept `meta`;
+    `branches()`/`Client.branches` surface `touched_at`/`checkpoints_v2`
+    (new `CheckpointInfo`/`Branch` fields).
+  - MCP tool metadata exposure is explicitly out of scope for this task —
+    `offshoot_fork`/`offshoot_checkpoint` pass `nil` meta; see
+    `docs/status.md`.
+- **Publish pipeline, prepared and gated** (Milestone 3 Task 7): the SDKs
+  are ready to publish; actual publication needs the user to claim the
+  `offshoot-db` PyPI name and `@offshoot-db` npm scope first (see
+  CONTRIBUTING.md's new Release process section).
+  - `.github/workflows/publish.yml`: triggered on `sdk-v*` tags or
+    `workflow_dispatch`. Two jobs, PyPI (`pypa/gh-action-pypi-publish`,
+    Trusted Publishing/OIDC, `id-token: write`) and npm (`npm publish
+    --provenance`, registry auth via `NPM_TOKEN` today — npm's own OIDC
+    Trusted Publishing is documented as the future swap). Both gated on
+    the `PUBLISH_ENABLED` repository variable: off (the default) runs a
+    full dry run — real sdist/wheel + `twine check` + wheel install/import
+    test; real `npm pack` tarball + install/import test — everything short
+    of the upload step. The same dry-run tier now runs in `ci.yml`'s
+    `sdks` job on every PR (`make dry-run-sdks`), so a manifest mistake is
+    caught long before a release tag exists.
+  - `sdk/python/pyproject.toml` filled out for real publication: readme,
+    `project.urls` (Homepage/Repository/Issues/Changelog/Documentation),
+    authors, classifiers, SPDX `license = "Apache-2.0"` (no redundant
+    `License ::` classifier — current PEP 639 practice), reserved
+    `[pytest]` extra ahead of Milestone 3 Task 4's fixture plugin.
+    `sdk/python/README.md` added (PyPI landing page).
+  - `sdk/typescript/package.json` filled out: `repository`/`bugs`/
+    `homepage`, `files` whitelist (`dist`, `README.md` — excludes tests/
+    tsconfig from the published tarball, verified with `npm pack
+    --dry-run`), `publishConfig.access: public` (required for a scoped
+    package to publish non-private), `prepublishOnly` builds `dist/`
+    before packing. `sdk/typescript/README.md` added.
+  - **Version discipline:** both SDKs publish in lockstep from one
+    `sdk-v<version>` tag (not two `sdk-py-v`/`sdk-ts-v` tags) — simplest
+    scheme for two SDKs on one wire protocol and one review cadence.
+    `sdk/VERSION` is the single source of truth; `pyproject.toml`'s and
+    `package.json`'s literal version fields are checked against it by the
+    new `scripts/check_sdk_versions.py` (`make check-sdk-versions`, and
+    the first step of `make dry-run-python-sdk`/CI); `scripts/
+    check_sdk_tag_version.py` checks a pushed tag against the same file.
+  - `server.json` (repo root): draft MCP registry manifest built only from
+    fields this repo's own MCP docs establish (name/description/version/
+    repository/command/args) — not submitted; the exact registry schema
+    was deliberately not assumed from outside the repo, see
+    `docs/launch/mcp-registry.md` and the TODO row in `docs/status.md`.
+  - `docs/launch/langgraph-listing.md`: LangGraph community-integration PR
+    text (title, description, listing-table entry) for
+    `offshoot.langgraph.ThreadForks` — drafted, clearly marked not
+    submitted (blocked on PyPI).
+- **Export + read-only historical checkouts** (Milestone 3 Task 2):
+  - `ops.Workspace.Export(db, branch, checkpoint, dstPath, force)`
+    materializes any checkpoint (or head, when `checkpoint == ""`) to a
+    plain SQLite file at `dstPath`, anywhere on the local filesystem, with
+    zero ongoing relationship to the store afterward: no `.sum` sidecar,
+    no lease. Refuses to overwrite an existing `dstPath` unless `force`.
+    Reuses `materializeChainAt`/`materializeAt`'s existing atomic
+    temp-file-in-the-destination's-own-directory + rename, so a failed
+    export (fetch error, checksum mismatch) never leaves a partial or
+    truncated file, and discards the `PostApplyChecksum` that machinery
+    now threads through (Task 3) since there is no sidecar to stamp with
+    it.
+  - CLI: `offshoot export <db>[@branch[@checkpoint]] <out.db> [--force]`
+    (`ops.ParseExportTarget` parses the triple-`@` target form).
+  - Daemon `export` op: `db`/`branch`/`name` (checkpoint)/`path`
+    (destination)/`force`. `path` must be an ABSOLUTE path — refused
+    otherwise — per the same-host/same-user unix-socket trust model
+    documented in `docs/reference.md`'s new daemon-ops section. Reads the
+    branch's last DURABLE state from the store, never a live session's
+    checkout: an open session's unflushed writes are NOT included, proven
+    directly over the wire (`internal/daemon/export_test.go`'s
+    `TestOpExportMissesUnflushedSessionWrites`).
+  - `ops.Workspace.CheckoutAt(db, branch, checkpoint, force) (string,
+    error)` materializes a NAMED checkpoint (no head alias) into a
+    dedicated read-only cache path, `<store-root>/checkouts-ro/<db>/
+    <branch>@<checkpoint>.db`, `chmod 0444`, distinct from and never
+    touching the writable checkout path, its sidecar, or a live capture
+    engine's file descriptors on it — safe alongside an open daemon
+    session on the SAME branch. A repeat call with `force=false` is a pure
+    cache hit (no store access at all — a checkpoint's content is
+    immutable); `force=true` re-materializes and re-reads the store.
+  - CLI: `offshoot checkout <db>[@branch] --at <checkpoint> --read-only
+    [--force]` (must be given together).
+  - Daemon `checkout-at` op: same semantics, server-side cache path.
+  - SDK parity (Python + TypeScript): `Client.export(db, branch, out_path,
+    checkpoint=None, force=False)`, `Client.checkout_at(db, branch,
+    checkpoint, force=False)` (TypeScript: `checkoutAt`, options-object
+    style matching the rest of that client).
+  - README's Resource behavior section gains the read-only-checkout-cache
+    paragraph, including the explicit "safe to `rm -rf` the entire
+    `checkouts-ro` directory at any time" guarantee.
+- **`offshoot.pytest_plugin` fixture plugin** (Milestone 3 Task 4): the
+  seed-once-fork-many paved road for pytest-based eval/test suites, shipped
+  as the `offshoot-db[pytest]` package extra and registered via a
+  `pytest11` entry point (`sdk/python/offshoot/pytest_plugin.py`) — nothing
+  to import by hand.
+  - `offshoot_daemon` (session-scoped): locates the `offshoot` binary
+    (`OFFSHOOT_BIN` env, else `PATH`), starts it on a fresh temp store +
+    socket, terminates it at session end; `pytest.skip`s with install
+    instructions when no binary is found, rather than failing.
+  - `offshoot_db` (session-scoped): a NAMED-SEED FACTORY,
+    `offshoot_db(name="default", seed=None)`. The first call for a name
+    creates database `eval-{name}`, runs `seed` (a callable given a
+    writable sqlite path, or a SQL string run via `sqlite3`), and flushes
+    it to a checkpoint named `seed`; later calls for the same name are a
+    pure memoization hit. `seed=None` falls back to the new `offshoot_seed`
+    ini option (a path to a `.sql` file) — the zero-code default-seed case.
+  - `offshoot_fork` (function-scoped): `offshoot_fork(seed_handle=None)`
+    forks a fresh, worker-safe-named branch (`t-{worker}-{testname-hash}-
+    {n}`, sanitized via the existing `offshoot.langgraph._sanitize`) from
+    the seed checkpoint with a TTL (default `1h`, new `offshoot_ttl` ini
+    option overrides it), opens a session, and returns an object with
+    `.path`/`.client`/`.db`/`.branch`. Teardown closes the session then
+    destroys the branch; a destroy failure is a `UserWarning`, never a test
+    failure — the TTL is the crashed-run backstop.
+  - `offshoot_dump(path) -> str`: `sqlite3 .dump` text — THE way to compare
+    two offshoot-materialized SQLite files in a golden-file test. SQLite's
+    on-disk bytes are not deterministic for identical logical content
+    (page layout, freelist order, vacuum state can all differ) — **never
+    byte-compare** two exported/checked-out `.db` files.
+  - **xdist stance (locked):** one `offshoot` daemon + temp store PER
+    WORKER (pytest has no cross-worker fixture-sharing mechanism), so a
+    named seed's cost is paid once per worker, not once total. Measured
+    (a `CREATE TABLE` + 200-row seed, macOS arm64): ~80-90ms per worker;
+    a 2-worker `pytest -n2` run pays that twice, concurrently (~170ms of
+    total seed work, ~85-90ms of wall-clock time). Documented in the
+    module's docstring and `sdk/python/README.md`.
+  - Found+fixed in passing: a SQL-string seed with no explicit
+    `BEGIN`/`COMMIT` used to run every statement as its own autocommit
+    transaction under `sqlite3.Connection.executescript` — measured ~1.6s
+    for 200 unwrapped `INSERT`s vs. ~17ms wrapped in one transaction
+    (~100x). `_run_seed` now wraps a bare multi-statement seed in one
+    transaction automatically (a seed that already opens its own
+    transaction, or a seed callable, is left alone).
+  - Base SDK stays stdlib-only: the `pytest11` entry point is registered
+    unconditionally in `pyproject.toml`, but the plugin module
+    import-guards `pytest` (a stray direct import without the extra fails
+    with an install-instruction message, not a bare traceback) — `pytest`
+    is only ever actually imported when pytest itself is already running.
+    Verified: `make test-sdks` (the plain-`unittest` suites) passes with no
+    pytest installed at all.
+  - Tests: `sdk/python/tests/test_pytest_plugin.py` — fixture-logic tests
+    (naming, TTL, teardown ordering, factory memoization, skip-when-no-
+    binary, destroy-failure-warns) against a directly started daemon, plus
+    3 `pytester`-driven smoke scenarios (plugin loads via its entry point,
+    fork-per-test isolation actually isolates, an xdist 2-worker run
+    passes — the last one is also where the xdist numbers above were
+    measured). New `make test-pytest-plugin` target (needs
+    `offshoot-db[pytest]` + `pytest-xdist`, wired into `ci.yml`'s `sdks`
+    job after `make test-sdks` already proved the base SDK pytest-free).
+- **TypeScript testkit** (Milestone 3 Task 5): `sdk/typescript/src/testkit.ts`
+  — the vitest/jest counterpart of `offshoot.pytest_plugin`, exported as a
+  new subpath, `@offshoot-db/client/testkit` (package.json `exports` map
+  added; previously only a bare `main`/`types` pair). Framework-agnostic
+  FUNCTIONS, not fixtures — no vitest/jest runtime dependency (this SDK
+  stays zero-runtime-deps) and nothing is registered automatically; wire
+  them into your own `beforeAll`/`afterEach`.
+  - `startDaemon(opts?) -> Promise<DaemonHandle>`: locates the `offshoot`
+    binary (`OFFSHOOT_BIN` env, else `PATH` — a clear error naming both
+    when neither has one; there is no skip tier here, unlike the pytest
+    plugin, since this module has no test-framework integration to skip
+    through), starts it on a fresh temp store + socket. Returns
+    `{ sock, store, proc, stderrTail(), stop() }`; the caller stops it
+    themselves (typically from a top-level `afterAll`).
+  - `seedOnce(daemon, {name?, seed}) -> Promise<SeedHandle>`: a NAMED-SEED
+    memoization cache keyed on `(daemon, name)`. `seed` is a SQL string, a
+    path to a `.sql` file (detected: no newline, ends in `.sql`, and the
+    file exists — there's no pytest.ini-style config file here to hold that
+    decision separately), or an async `(dbPath) => void` callback. The
+    first call for a name creates database `eval-{name}`, runs the seed,
+    and checkpoints it `seed`; a later call for the same name with a
+    *different* seed (fingerprinted: SQL/path text by content hash,
+    callables by identity) throws a clear error rather than silently
+    keeping the first one — same mismatch semantics as the pytest plugin's
+    `offshoot_db`. Ports `_skip_leading_noise`/`_seed_opens_own_transaction`
+    verbatim: a SQL-string seed is wrapped in one transaction unless it
+    already opens its own (so a `sqlite3 .dump`'s text — `PRAGMA` before
+    `BEGIN TRANSACTION` — works verbatim as a seed, and so a plain
+    multi-statement seed doesn't pay one autocommit-transaction-per-
+    statement). Since this SDK ships no SQLite driver, seeding (and
+    `dump`, below) shells out to the `sqlite3` CLI, same as
+    `test/client.test.ts` already does.
+  - `forkPerTest(daemon, seedHandleOrName, opts?) -> Promise<ForkedSession>`:
+    forks a fresh, worker-safe-named branch
+    (`t-{worker}-{sanitized-hint}-{n}`; worker id from `VITEST_POOL_ID` or
+    `JEST_WORKER_ID` when present, else `"local"`) from the seed's
+    checkpoint with a TTL (default `"1h"`, `opts.ttl` overrides), opens a
+    session, and returns `{ path, db, branch, client, flush(name?),
+    close() }`. `seedHandleOrName` may be a `SeedHandle` or a plain string
+    naming an already-`seedOnce`d name. `close()` closes the session and
+    destroys the branch; either failing is a `console.warn`, never a
+    throw — call it from `afterEach` with no surrounding try/catch. Each
+    `ForkedSession` owns its own connection and teardown independently, so
+    (unlike the pytest plugin's shared-per-test `_ForkFactory.teardown()`
+    loop) one fork's cleanup trouble can never block another's by
+    construction, not by an explicit try/except around each step.
+  - `dump(path) -> Promise<string>`: `sqlite3 <path> .dump`'s text — THE
+    golden-comparison method. SQLite's on-disk bytes are not deterministic
+    across writes with identical logical content — never byte-compare two
+    exported/checked-out `.db` files; compare `await dump(a) === await
+    dump(b)` instead.
+  - Tests: `sdk/typescript/test/testkit.test.ts`, run via `node:test`
+    against a real daemon (mirroring the pytest plugin's direct-daemon
+    tier): binary resolution (`OFFSHOOT_BIN`/`PATH`/neither), naming,
+    TTL default+override, `seedOnce` memoization + fingerprint mismatch, a
+    `.dump`-shaped seed, a path-to-`.sql` seed, an async-callback seed,
+    fork-per-test isolation, the string-name shorthand, teardown-warn-not-
+    throw against a killed daemon, and a golden-file (`dump`, not bytes)
+    scenario — plus one integration test wiring `startDaemon`/`seedOnce`/
+    `forkPerTest` into `node:test`'s own `before`/`after`/`beforeEach`/
+    `afterEach`, the way a real suite would. Wired into the existing
+    `make test-ts-sdk` target (it already globs `test-dist/test/*.test.js`)
+    — same zero-extra-dependency constraint (`typescript`/`@types/node`
+    devDeps only).
+  - `make dry-run-ts-sdk`'s tarball exact-match assertion updated to expect
+    `dist/testkit.js`/`dist/testkit.d.ts` alongside the existing
+    `dist/client.*` files, and a second install-then-`import()` check
+    added for the new `@offshoot-db/client/testkit` subpath (not just the
+    package root).
+- **`offshoot diff`** (Milestone 3 Task 6): `offshoot diff
+  <db>[@branch[@checkpoint]] <db>[@branch[@checkpoint]] [--summary]`
+  materializes both sides READ-ONLY (never a live checkout, never a lease)
+  and either streams `sqldiff`'s output over them or prints a
+  `sqldiff`-free table-level row-count summary. CLI-only for this task — no
+  daemon op, no SDK parity.
+  - `ops.Workspace.MaterializeForDiff(db, branch, checkpoint)
+    (DiffSide, error)`: a named checkpoint reuses the existing `CheckoutAt`
+    read-only cache (a checkpoint's content is immutable, so this is a
+    legitimate cache hit across repeated diffs); a bare head target is
+    always freshly `Export`ed to a private temp file, because head moves
+    and a head-keyed entry in the checkout-at cache could never be
+    idempotently cached the way a checkpoint-keyed one is — this is the
+    task's staleness decision, documented on `MaterializeForDiff`'s doc
+    comment and pinned by `internal/ops/diff_test.go`'s
+    `TestMaterializeForDiffHeadSideAlwaysReflectsANewWrite` (a write
+    between two calls against the same head target is visible in the
+    second one, never served stale) and the CLI-level
+    `TestDiffCLIHeadSideReflectsNewWriteNotStaleCache`. `DiffSide.Close()`
+    is a no-op for the cache-backed checkpoint case and removes the temp
+    file/directory for the head case.
+  - `ops.TableRowCounts(path) (map[string]int, error)` /
+    `ops.DiffSummary(leftPath, rightPath) ([]TableDiff, error)`: the
+    `--summary` engine, stdlib-`database/sql` + the `mattn/go-sqlite3`
+    driver already vendored for `internal/capture`/`internal/ops` (no new
+    Go module dependency), opened as
+    `file:<abs>?mode=ro&immutable=1` — verified against a real `chmod
+    0444` file (`TestTableRowCountsOpensReadOnlyEvenOnA0444File`) that
+    SQLite accepts a `mode=ro` URI parameter layered on top of the
+    driver's always-requested `SQLITE_OPEN_READWRITE|SQLITE_OPEN_CREATE`
+    flags (SQLite only rejects a mode LESS restrictive than the flags
+    argument passed to `sqlite3_open_v2`; `ro` is strictly more
+    restrictive). Lists tables from `sqlite_master` (excluding
+    `sqlite_%` internals) and counts rows per table on both sides; a
+    table present on only one side is reported `added`/`removed` wholesale
+    rather than as a row-count delta. The two materialized paths may be
+    two entirely different databases — cross-db diff is a legitimate eval-
+    comparison shape and is explicitly tested
+    (`TestDiffSummaryCLIWorksAcrossTwoDifferentDatabases`).
+  - CLI `--summary` output: an aligned `text/tabwriter` table (TABLE/LEFT/
+    RIGHT/STATUS columns, `status` one of `same`/`added`/`removed`/
+    `changed (+N)`/`changed (-N)`) plus a trailing totals line.
+  - Default mode requires the separate `sqldiff` binary (NOT included by
+    installing plain `sqlite3` on every platform) and fails with a clear,
+    per-OS-hinted error naming the install path when it's missing, plus
+    `--summary` as the `sqldiff`-free alternative — found and fixed a
+    wrong hint mid-task: a real local Homebrew install of the general
+    `sqlite` formula (keg-only, 13 files) confirmed it does NOT include
+    `sqldiff`; Homebrew ships `sqldiff` as its OWN separate formula
+    (`brew install sqldiff`), corrected in both the error text and
+    `docs/diff.md`. The Debian/Ubuntu hint (`sqlite3-tools`) is verified
+    against a real `ubuntu:24.04` container's `apt-cache show
+    sqlite3-tools` output (lists `/usr/bin/sqldiff`), and
+    `.github/workflows/ci.yml`'s Linux job now installs that package
+    alongside plain `sqlite3` so `offshoot diff`'s real-`sqldiff` CLI
+    tests (`TestDiffCLISqldiffPresentStreamsOutput`,
+    `TestDiffCLIIdenticalSidesProduceNoSqldiffOutput`) exercise the actual
+    binary in CI instead of permanently skipping — they gate on
+    `exec.LookPath("sqldiff")` the same way `requireSQLite3` gates on
+    `sqlite3` itself, so a machine without it still skips cleanly.
+  - `docs/diff.md`: the command, the raw by-hand `export`-twice-then-
+    `sqldiff` recipe, the staleness rule, and a link to the FAQ's
+    [no-merge stance](docs/faq.md#why-no-merge) — `offshoot diff` is a read
+    tool; it never resolves anything.
+
+### Fixed
+
+- Settling-flush checksum-compare suppression (Milestone 2 follow-up):
+  `rebaseline`'s first call now skips a session's mandatory startup settling
+  flush when BOTH the checkout `Open` received was already proven
+  byte-identical to the branch's head at the moment `Open` checked AND the
+  LTX checksum recorded in that same checkout's `.sum` sidecar exactly
+  matches what the checkout actually contains once the session's real
+  startup rebase finishes running — the second check catches a write
+  landing in the window between `Open` returning and its own startup
+  rebase actually finishing, which the first check alone cannot see.
+  Reading the checksum out of the local sidecar, rather than fetching it
+  fresh from the store, costs `Open` no extra store call at all — critically,
+  no download of the head object itself, which a full snapshot can be
+  (post-Create, post-Fork, every 16th flush, and permanently for a
+  read-only branch that never flushes, exactly defeating this
+  optimization's own purpose). `ops.Checkout`/`Checkpoint`/`Rollback`/
+  `Promote` all now record this checksum when they stamp a sidecar
+  (`sumRecord.PostApplyChecksum`, `ltxio.EncodeSnapshot`/`MaterializeChain`
+  now return it as a byproduct of work they already do); a sidecar that
+  never recorded one settles exactly as before ("fail toward settling"). A
+  read-only daemon session reopened against an unmodified checkout no
+  longer uploads a full snapshot (previously measured 541.9MB at a 512MB
+  db) for doing nothing. A first-ever open, or one against a dirty/stale
+  checkout, still settles exactly as before.
+- Sidecar refresh on clean Close (Milestone 2 follow-up): `Session.Close`
+  now re-stamps the checkout's `.sum` sidecar — including its LTX checksum
+  (the row above is what reads it back on the next `Open`) — when the
+  close is provably clean (no session error, nothing left unflushed, at
+  least one flush succeeded, the branch head hasn't moved past what was
+  flushed, the replica was never rebuilt by anything beyond its own
+  startup rebase, and — the stamped hash itself — the capture engine's own
+  post-shutdown fingerprint, persisted only once its shutdown fully
+  verified the checkout's WAL was cleanly folded in, is reused directly
+  rather than independently re-derived), so the next `Open`/`Checkout`
+  against the same db@branch clean-skips instead of re-materializing —
+  restoring, for the daemon-reopen pattern, the disk/descriptor win
+  Milestone 2 Task 1 already established for `Checkout`/`Checkpoint`/
+  `Rollback`/`Promote`. Ledgered as a documented tradeoff, not a
+  regression: a clean-and-current checkout is now served without chain
+  validation across a session's clean close too, not only across those
+  four `ops` entry points (see docs/status.md).
+
 ## [0.1.1] - 2026-08-06
 
 Milestone 2: safe defaults for an unattended agent. The daemon now ships

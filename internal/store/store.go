@@ -30,6 +30,19 @@ type Manifest struct {
 type Checkpoint struct {
 	TXID  uint64 `json:"txid"`
 	Epoch uint64 `json:"epoch"`
+	// CreatedAt is when this checkpoint was created, RFC3339 UTC, stamped by
+	// every ops call site that creates one (Create's "init", Checkpoint,
+	// Fork's "fork", Promote's "promote", and a named session flush).
+	// Omitempty so a checkpoint written before this field existed (or a v1
+	// ref's upgraded bare-number checkpoints, which have no creation time to
+	// recover) decodes with it empty rather than a fabricated value.
+	CreatedAt string `json:"created_at,omitempty"`
+	// Meta is a small user-supplied string->string map describing this
+	// specific checkpoint (e.g. eval run id, git SHA, agent id), capped at
+	// the ops layer (ops.ValidateMeta: at most 32 keys, keys <= 64 bytes,
+	// values <= 512 bytes — see the design spec's metadata cap). Omitempty;
+	// nil/absent means no metadata was given.
+	Meta map[string]string `json:"meta,omitempty"`
 }
 
 type Ref struct {
@@ -57,14 +70,21 @@ type Ref struct {
 	TTL       string `json:"ttl,omitempty"`
 	TouchedAt string `json:"touched_at,omitempty"` // RFC3339Nano UTC
 	Reaping   bool   `json:"reaping,omitempty"`
+	// Meta is a small user-supplied string->string map describing this
+	// branch's lineage (e.g. eval run id, git SHA, agent id), set by Fork
+	// and capped at the ops layer (ops.ValidateMeta). Branch-level lineage
+	// is the grain — no row-level provenance. Omitempty, no schema bump: a
+	// ref written before this field existed decodes with it nil, same as
+	// the TTL fields above.
+	Meta map[string]string `json:"meta,omitempty"`
 }
 
-// SetCheckpoint records name at (txid, epoch), allocating the map if needed.
-func (r *Ref) SetCheckpoint(name string, txid, epoch uint64) {
+// SetCheckpoint records name -> cp, allocating the map if needed.
+func (r *Ref) SetCheckpoint(name string, cp Checkpoint) {
 	if r.Checkpoints == nil {
 		r.Checkpoints = map[string]Checkpoint{}
 	}
-	r.Checkpoints[name] = Checkpoint{TXID: txid, Epoch: epoch}
+	r.Checkpoints[name] = cp
 }
 
 // Touch stamps the ref's activity clock. Reaping (ops.Reap) measures TTL
@@ -90,6 +110,7 @@ type refWire struct {
 	TTL         string                     `json:"ttl,omitempty"`
 	TouchedAt   string                     `json:"touched_at,omitempty"`
 	Reaping     bool                       `json:"reaping,omitempty"`
+	Meta        map[string]string          `json:"meta,omitempty"`
 }
 
 // decodeRef parses the on-disk ref shape, upgrading a v1 ref (schema 1,
@@ -112,6 +133,7 @@ func decodeRef(data []byte) (Ref, error) {
 		Parent: w.Parent, Protected: w.Protected,
 		LeaseHolder: w.LeaseHolder, LeaseExpiry: w.LeaseExpiry,
 		TTL: w.TTL, TouchedAt: w.TouchedAt, Reaping: w.Reaping,
+		Meta: w.Meta,
 	}
 	// A v1 ref predates per-checkpoint epochs: everything it references was
 	// written under the ref's own epoch.
@@ -124,14 +146,14 @@ func decodeRef(data []byte) (Ref, error) {
 		}
 		var cp Checkpoint
 		if err := json.Unmarshal(raw, &cp); err == nil && cp.TXID != 0 {
-			r.SetCheckpoint(name, cp.TXID, cp.Epoch)
+			r.SetCheckpoint(name, cp)
 			continue
 		}
 		var txid uint64
 		if err := json.Unmarshal(raw, &txid); err != nil {
 			return Ref{}, fmt.Errorf("store: bad checkpoint %q: %w", name, err)
 		}
-		r.SetCheckpoint(name, txid, w.Epoch)
+		r.SetCheckpoint(name, Checkpoint{TXID: txid, Epoch: w.Epoch})
 	}
 	return r, nil
 }

@@ -155,6 +155,33 @@ func TestParseTarget(t *testing.T) {
 	}
 }
 
+func TestParseExportTarget(t *testing.T) {
+	db, br, cp, err := ParseExportTarget("app")
+	if err != nil || db != "app" || br != "main" || cp != "" {
+		t.Fatalf("%s %s %s %v", db, br, cp, err)
+	}
+	db, br, cp, err = ParseExportTarget("app@x-1")
+	if err != nil || db != "app" || br != "x-1" || cp != "" {
+		t.Fatalf("%s %s %s %v", db, br, cp, err)
+	}
+	db, br, cp, err = ParseExportTarget("app@x-1@v1")
+	if err != nil || db != "app" || br != "x-1" || cp != "v1" {
+		t.Fatalf("%s %s %s %v", db, br, cp, err)
+	}
+	if _, _, _, err := ParseExportTarget("a@b@c@d"); err == nil {
+		t.Fatal("want error on a 4th '@'-separated component")
+	}
+	if _, _, _, err := ParseExportTarget("Bad@x@v1"); err == nil {
+		t.Fatal("want db name validation error")
+	}
+	if _, _, _, err := ParseExportTarget("app@Bad@v1"); err == nil {
+		t.Fatal("want branch name validation error")
+	}
+	if _, _, _, err := ParseExportTarget("app@x@Bad"); err == nil {
+		t.Fatal("want checkpoint name validation error")
+	}
+}
+
 func TestCheckpointAndRematerialize(t *testing.T) {
 	if _, err := exec.LookPath("sqlite3"); err != nil {
 		t.Skip("sqlite3 CLI not on PATH")
@@ -171,14 +198,14 @@ func TestCheckpointAndRematerialize(t *testing.T) {
 		"CREATE TABLE t (v); INSERT INTO t VALUES (1),(2),(3);").CombinedOutput(); err != nil {
 		t.Fatalf("%v: %s", err, out)
 	}
-	txid, err := w.Checkpoint("app", "main", "v1")
+	txid, err := w.Checkpoint("app", "main", "v1", nil)
 	if err != nil {
 		t.Fatal(err)
 	}
 	if txid != 2 {
 		t.Errorf("txid = %d, want 2", txid)
 	}
-	if _, err := w.Checkpoint("app", "main", "v1"); err == nil {
+	if _, err := w.Checkpoint("app", "main", "v1", nil); err == nil {
 		t.Fatal("duplicate checkpoint name must fail")
 	}
 
@@ -228,7 +255,7 @@ func TestCheckpointRecoversFromOrphanedSnapshot(t *testing.T) {
 		t.Fatal(err)
 	}
 
-	txid, err := w.Checkpoint("app", "main", "v1")
+	txid, err := w.Checkpoint("app", "main", "v1", nil)
 	if err != nil {
 		t.Fatalf("Checkpoint must recover from an orphaned snapshot object, got: %v", err)
 	}
@@ -274,7 +301,7 @@ func TestCheckpointFailsCleanlyUnderLiveWriter(t *testing.T) {
 		t.Fatal(err)
 	}
 	// Open write transaction -> checkpoint must fail cleanly, not hang forever.
-	if _, err := w.Checkpoint("app", "main", "x"); err == nil {
+	if _, err := w.Checkpoint("app", "main", "x", nil); err == nil {
 		t.Fatal("checkpoint under live write txn must fail")
 	}
 	tx.Rollback()
@@ -290,11 +317,11 @@ func TestForkIsIndependentOfParent(t *testing.T) {
 	}
 	path, _ := w.Checkout("app", "main")
 	exec.Command("sqlite3", path, "CREATE TABLE t (v); INSERT INTO t VALUES (1);").Run()
-	if _, err := w.Checkpoint("app", "main", "v1"); err != nil {
+	if _, err := w.Checkpoint("app", "main", "v1", nil); err != nil {
 		t.Fatal(err)
 	}
 
-	txid, err := w.Fork("app", "main", "attempt-1", "", 0)
+	txid, err := w.Fork("app", "main", "attempt-1", "", 0, nil)
 	if err != nil || txid != 2 {
 		t.Fatalf("fork: txid=%d err=%v", txid, err)
 	}
@@ -340,11 +367,11 @@ func TestForkAtCheckpoint(t *testing.T) {
 	w.Create("app")
 	path, _ := w.Checkout("app", "main")
 	exec.Command("sqlite3", path, "CREATE TABLE t (v); INSERT INTO t VALUES (1);").Run()
-	w.Checkpoint("app", "main", "v1")
+	w.Checkpoint("app", "main", "v1", nil)
 	exec.Command("sqlite3", path, "INSERT INTO t VALUES (2);").Run()
-	w.Checkpoint("app", "main", "v2")
+	w.Checkpoint("app", "main", "v2", nil)
 
-	if _, err := w.Fork("app", "main", "old", "v1", 0); err != nil {
+	if _, err := w.Fork("app", "main", "old", "v1", 0, nil); err != nil {
 		t.Fatal(err)
 	}
 	p, _ := w.Checkout("app", "old")
@@ -352,10 +379,10 @@ func TestForkAtCheckpoint(t *testing.T) {
 	if string(got) != "1\n" {
 		t.Fatalf("fork --at v1 content: %q", got)
 	}
-	if _, err := w.Fork("app", "main", "bad", "nope", 0); err == nil {
+	if _, err := w.Fork("app", "main", "bad", "nope", 0, nil); err == nil {
 		t.Fatal("unknown checkpoint must fail")
 	}
-	if _, err := w.Fork("app", "main", "old", "", 0); err == nil {
+	if _, err := w.Fork("app", "main", "old", "", 0, nil); err == nil {
 		t.Fatal("existing branch name must fail")
 	}
 }
@@ -380,14 +407,14 @@ func TestForkWarnsOnUncheckpointedChanges(t *testing.T) {
 		"CREATE TABLE t (v); INSERT INTO t VALUES (1);").CombinedOutput(); err != nil {
 		t.Fatalf("%v: %s", err, out)
 	}
-	if _, err := w.Checkpoint("app", "main", "v1"); err != nil {
+	if _, err := w.Checkpoint("app", "main", "v1", nil); err != nil {
 		t.Fatal(err)
 	}
 
 	// No-warning case: fork immediately after a fresh checkpoint (checkout
 	// matches the committed state exactly).
 	stderr := captureStderr(t, func() {
-		if _, err := w.Fork("app", "main", "clean", "", 0); err != nil {
+		if _, err := w.Fork("app", "main", "clean", "", 0, nil); err != nil {
 			t.Fatal(err)
 		}
 	})
@@ -402,7 +429,7 @@ func TestForkWarnsOnUncheckpointedChanges(t *testing.T) {
 
 	var txid uint64
 	stderr = captureStderr(t, func() {
-		txid, err = w.Fork("app", "main", "dirty", "", 0)
+		txid, err = w.Fork("app", "main", "dirty", "", 0, nil)
 		if err != nil {
 			t.Fatal(err)
 		}
@@ -456,13 +483,13 @@ func TestForkWarnsOnStaleCheckout(t *testing.T) {
 		"CREATE TABLE t (v); INSERT INTO t VALUES (1);").CombinedOutput(); err != nil {
 		t.Fatalf("%v: %s", err, out)
 	}
-	if _, err := w.Checkpoint("app", "main", "v1"); err != nil {
+	if _, err := w.Checkpoint("app", "main", "v1", nil); err != nil {
 		t.Fatal(err)
 	}
 
 	// Build a "new state" for main to be silently repointed to: fork a
 	// scratch branch off main, add more data, and checkpoint it there.
-	if _, err := w.Fork("app", "main", "scratch", "", 0); err != nil {
+	if _, err := w.Fork("app", "main", "scratch", "", 0, nil); err != nil {
 		t.Fatal(err)
 	}
 	scratchPath, err := w.Checkout("app", "scratch")
@@ -472,7 +499,7 @@ func TestForkWarnsOnStaleCheckout(t *testing.T) {
 	if out, err := exec.Command("sqlite3", scratchPath, "INSERT INTO t VALUES (2);").CombinedOutput(); err != nil {
 		t.Fatalf("%v: %s", err, out)
 	}
-	newTXID, err := w.Checkpoint("app", "scratch", "v2")
+	newTXID, err := w.Checkpoint("app", "scratch", "v2", nil)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -499,7 +526,7 @@ func TestForkWarnsOnStaleCheckout(t *testing.T) {
 
 	var forkTXID uint64
 	stderr := captureStderr(t, func() {
-		forkTXID, err = w.Fork("app", "main", "child", "", 0)
+		forkTXID, err = w.Fork("app", "main", "child", "", 0, nil)
 		if err != nil {
 			t.Fatal(err)
 		}
@@ -537,9 +564,9 @@ func TestRollback(t *testing.T) {
 	w.Create("app")
 	path, _ := w.Checkout("app", "main")
 	exec.Command("sqlite3", path, "CREATE TABLE t (v); INSERT INTO t VALUES (1);").Run()
-	w.Checkpoint("app", "main", "good")
+	w.Checkpoint("app", "main", "good", nil)
 	exec.Command("sqlite3", path, "DROP TABLE t;").Run()
-	w.Checkpoint("app", "main", "bad")
+	w.Checkpoint("app", "main", "bad", nil)
 
 	before, _, _ := w.Store.GetRef("app", "main")
 	p, err := w.Rollback("app", "main", "good")
@@ -557,7 +584,8 @@ func TestRollback(t *testing.T) {
 	if _, ok := after.Checkpoints["bad"]; ok {
 		t.Fatal("later checkpoint must be dropped")
 	}
-	if after.Checkpoints["good"] != before.Checkpoints["good"] {
+	gotGood, wantGood := after.Checkpoints["good"], before.Checkpoints["good"]
+	if gotGood.TXID != wantGood.TXID || gotGood.Epoch != wantGood.Epoch {
 		t.Fatal("earlier checkpoint must be kept")
 	}
 	if !after.Protected {
@@ -580,11 +608,11 @@ func TestRollbackToEarlierCheckpointTwice(t *testing.T) {
 	w.Create("app")
 	path, _ := w.Checkout("app", "main")
 	exec.Command("sqlite3", path, "CREATE TABLE t (v); INSERT INTO t VALUES (1);").Run()
-	if _, err := w.Checkpoint("app", "main", "v1"); err != nil {
+	if _, err := w.Checkpoint("app", "main", "v1", nil); err != nil {
 		t.Fatal(err)
 	}
 	exec.Command("sqlite3", path, "INSERT INTO t VALUES (2);").Run()
-	if _, err := w.Checkpoint("app", "main", "v2"); err != nil {
+	if _, err := w.Checkpoint("app", "main", "v2", nil); err != nil {
 		t.Fatal(err)
 	}
 
@@ -613,18 +641,18 @@ func TestForkAtCheckpointAfterRollback(t *testing.T) {
 	w.Create("app")
 	path, _ := w.Checkout("app", "main")
 	exec.Command("sqlite3", path, "CREATE TABLE t (v); INSERT INTO t VALUES (1);").Run()
-	if _, err := w.Checkpoint("app", "main", "v1"); err != nil {
+	if _, err := w.Checkpoint("app", "main", "v1", nil); err != nil {
 		t.Fatal(err)
 	}
 	exec.Command("sqlite3", path, "INSERT INTO t VALUES (2);").Run()
-	if _, err := w.Checkpoint("app", "main", "v2"); err != nil {
+	if _, err := w.Checkpoint("app", "main", "v2", nil); err != nil {
 		t.Fatal(err)
 	}
 
 	if _, err := w.Rollback("app", "main", "v2"); err != nil {
 		t.Fatalf("rollback --to v2: %v", err)
 	}
-	if _, err := w.Fork("app", "main", "old", "v1", 0); err != nil {
+	if _, err := w.Fork("app", "main", "old", "v1", 0, nil); err != nil {
 		t.Fatalf("fork --at v1 after rollback --to v2: %v", err)
 	}
 	p, err := w.Checkout("app", "old")
@@ -660,7 +688,7 @@ func TestForkFastPathMatchesSlowPath(t *testing.T) {
 		"CREATE TABLE t (v); INSERT INTO t VALUES (1),(2),(3);").CombinedOutput(); err != nil {
 		t.Fatalf("seed: %v: %s", err, out)
 	}
-	if _, err := w.Checkpoint("app", "main", "v1"); err != nil {
+	if _, err := w.Checkpoint("app", "main", "v1", nil); err != nil {
 		t.Fatal(err)
 	}
 	srcRef, _, err := w.Store.GetRef("app", "main")
@@ -673,7 +701,7 @@ func TestForkFastPathMatchesSlowPath(t *testing.T) {
 	}
 
 	before := ForkFastPathHits()
-	if _, err := w.Fork("app", "main", "fast", "", 0); err != nil {
+	if _, err := w.Fork("app", "main", "fast", "", 0, nil); err != nil {
 		t.Fatal(err)
 	}
 	if got := ForkFastPathHits(); got != before+1 {
@@ -683,7 +711,7 @@ func TestForkFastPathMatchesSlowPath(t *testing.T) {
 	SetForkSlowPathForTest(true)
 	t.Cleanup(func() { SetForkSlowPathForTest(false) })
 	before = ForkFastPathHits()
-	if _, err := w.Fork("app", "main", "slow", "", 0); err != nil {
+	if _, err := w.Fork("app", "main", "slow", "", 0, nil); err != nil {
 		t.Fatal(err)
 	}
 	if got := ForkFastPathHits(); got != before {
@@ -773,12 +801,12 @@ func TestForkFastPathFiresOnS3WithinSizeLimit(t *testing.T) {
 		"CREATE TABLE t (v); INSERT INTO t VALUES (1),(2);").CombinedOutput(); err != nil {
 		t.Fatalf("seed: %v: %s", err, out)
 	}
-	if _, err := w.Checkpoint("app", "main", "v1"); err != nil {
+	if _, err := w.Checkpoint("app", "main", "v1", nil); err != nil {
 		t.Fatal(err)
 	}
 
 	before := ForkFastPathHits()
-	if _, err := w.Fork("app", "main", "child", "", 0); err != nil {
+	if _, err := w.Fork("app", "main", "child", "", 0, nil); err != nil {
 		t.Fatal(err)
 	}
 	if got := ForkFastPathHits(); got != before+1 {
@@ -823,7 +851,7 @@ func TestCheckoutQuiescesAndWarnsOnDirtyOverwrite(t *testing.T) {
 		"CREATE TABLE t (v); INSERT INTO t VALUES (1);").CombinedOutput(); err != nil {
 		t.Fatalf("%v: %s", err, out)
 	}
-	if _, err := w.Checkpoint("app", "main", "v1"); err != nil {
+	if _, err := w.Checkpoint("app", "main", "v1", nil); err != nil {
 		t.Fatal(err)
 	}
 
@@ -883,10 +911,10 @@ func TestPromoteWarnsOnUncheckpointedSourceChanges(t *testing.T) {
 		"CREATE TABLE t (v); INSERT INTO t VALUES (1);").CombinedOutput(); err != nil {
 		t.Fatalf("%v: %s", err, out)
 	}
-	if _, err := w.Checkpoint("app", "main", "v1"); err != nil {
+	if _, err := w.Checkpoint("app", "main", "v1", nil); err != nil {
 		t.Fatal(err)
 	}
-	if _, err := w.Fork("app", "main", "attempt-1", "", 0); err != nil {
+	if _, err := w.Fork("app", "main", "attempt-1", "", 0, nil); err != nil {
 		t.Fatal(err)
 	}
 	ap, err := w.Checkout("app", "attempt-1")
@@ -896,7 +924,7 @@ func TestPromoteWarnsOnUncheckpointedSourceChanges(t *testing.T) {
 	if out, err := exec.Command("sqlite3", ap, "INSERT INTO t VALUES (99);").CombinedOutput(); err != nil {
 		t.Fatalf("%v: %s", err, out)
 	}
-	if _, err := w.Checkpoint("app", "attempt-1", "winner"); err != nil {
+	if _, err := w.Checkpoint("app", "attempt-1", "winner", nil); err != nil {
 		t.Fatal(err)
 	}
 	// Dirty edit on the SOURCE after its last checkpoint, without
@@ -935,12 +963,12 @@ func TestPromote(t *testing.T) {
 	w.Create("app")
 	path, _ := w.Checkout("app", "main")
 	exec.Command("sqlite3", path, "CREATE TABLE t (v); INSERT INTO t VALUES (1);").Run()
-	w.Checkpoint("app", "main", "v1")
-	w.Fork("app", "main", "attempt-1", "", 0)
+	w.Checkpoint("app", "main", "v1", nil)
+	w.Fork("app", "main", "attempt-1", "", 0, nil)
 
 	ap, _ := w.Checkout("app", "attempt-1")
 	exec.Command("sqlite3", ap, "INSERT INTO t VALUES (99);").Run()
-	w.Checkpoint("app", "attempt-1", "winner")
+	w.Checkpoint("app", "attempt-1", "winner", nil)
 
 	// Protected target requires force.
 	if _, err := w.Promote("app", "attempt-1", "main", false); err == nil {
@@ -1020,13 +1048,13 @@ func TestRollbackReportsRepointOnRefreshFailure(t *testing.T) {
 		"CREATE TABLE t (v); INSERT INTO t VALUES (1);").CombinedOutput(); err != nil {
 		t.Fatalf("%v: %s", err, out)
 	}
-	if _, err := w.Checkpoint("app", "main", "good"); err != nil {
+	if _, err := w.Checkpoint("app", "main", "good", nil); err != nil {
 		t.Fatal(err)
 	}
 	if out, err := exec.Command("sqlite3", path, "DROP TABLE t;").CombinedOutput(); err != nil {
 		t.Fatalf("%v: %s", err, out)
 	}
-	if _, err := w.Checkpoint("app", "main", "bad"); err != nil {
+	if _, err := w.Checkpoint("app", "main", "bad", nil); err != nil {
 		t.Fatal(err)
 	}
 
@@ -1080,7 +1108,7 @@ func TestConcurrentForksFromSameParent(t *testing.T) {
 	w.Create("app")
 	path, _ := w.Checkout("app", "main")
 	exec.Command("sqlite3", path, "CREATE TABLE t (v); INSERT INTO t VALUES (1);").Run()
-	w.Checkpoint("app", "main", "v1")
+	w.Checkpoint("app", "main", "v1", nil)
 
 	var wg sync.WaitGroup
 	errs := make([]error, 8)
@@ -1088,7 +1116,7 @@ func TestConcurrentForksFromSameParent(t *testing.T) {
 		wg.Add(1)
 		go func(n int) {
 			defer wg.Done()
-			_, errs[n] = w.Fork("app", "main", fmt.Sprintf("f-%d", n), "", 0)
+			_, errs[n] = w.Fork("app", "main", fmt.Sprintf("f-%d", n), "", 0, nil)
 		}(i)
 	}
 	wg.Wait()
@@ -1128,7 +1156,7 @@ func TestConcurrentCheckpointsOnlyOneWins(t *testing.T) {
 		wg.Add(1)
 		go func(n int) {
 			defer wg.Done()
-			if _, err := w.Checkpoint("app", "main", fmt.Sprintf("cp-%d", n)); err == nil {
+			if _, err := w.Checkpoint("app", "main", fmt.Sprintf("cp-%d", n), nil); err == nil {
 				mu.Lock()
 				okCount++
 				mu.Unlock()
@@ -1190,7 +1218,7 @@ func TestConcurrentCheckpointsOnlyOneWinsOnS3(t *testing.T) {
 		wg.Add(1)
 		go func(n int) {
 			defer wg.Done()
-			if _, err := w.Checkpoint("app", "main", fmt.Sprintf("cp-%d", n)); err == nil {
+			if _, err := w.Checkpoint("app", "main", fmt.Sprintf("cp-%d", n), nil); err == nil {
 				mu.Lock()
 				okCount++
 				mu.Unlock()
@@ -1340,7 +1368,7 @@ func TestMaterializeUsesCheckpointEpochNotRefEpoch(t *testing.T) {
 		"CREATE TABLE t (v); INSERT INTO t VALUES (1);").CombinedOutput(); err != nil {
 		t.Fatalf("%v: %s", err, out)
 	}
-	if _, err := w.Checkpoint("app", "main", "v1"); err != nil {
+	if _, err := w.Checkpoint("app", "main", "v1", nil); err != nil {
 		t.Fatal(err)
 	}
 
@@ -1364,7 +1392,7 @@ func TestMaterializeUsesCheckpointEpochNotRefEpoch(t *testing.T) {
 	if string(got) != "1\n" {
 		t.Fatalf("content after epoch bump: %q", got)
 	}
-	if _, err := w.Fork("app", "main", "child", "v1", 0); err != nil {
+	if _, err := w.Fork("app", "main", "child", "v1", 0, nil); err != nil {
 		t.Fatalf("fork --at across an epoch bump: %v", err)
 	}
 }
@@ -1392,7 +1420,7 @@ func TestCheckpointAfterEpochBumpIsMaterializable(t *testing.T) {
 		"CREATE TABLE t (v); INSERT INTO t VALUES (1);").CombinedOutput(); err != nil {
 		t.Fatalf("%v: %s", err, out)
 	}
-	if _, err := w.Checkpoint("app", "main", "v1"); err != nil {
+	if _, err := w.Checkpoint("app", "main", "v1", nil); err != nil {
 		t.Fatal(err)
 	}
 
@@ -1412,7 +1440,7 @@ func TestCheckpointAfterEpochBumpIsMaterializable(t *testing.T) {
 	if out, err := exec.Command("sqlite3", path, "INSERT INTO t VALUES (2);").CombinedOutput(); err != nil {
 		t.Fatalf("%v: %s", err, out)
 	}
-	if _, err := w.Checkpoint("app", "main", "v2"); err != nil {
+	if _, err := w.Checkpoint("app", "main", "v2", nil); err != nil {
 		t.Fatal(err)
 	}
 
@@ -1432,7 +1460,7 @@ func TestCheckpointAfterEpochBumpIsMaterializable(t *testing.T) {
 
 	// The pre-bump checkpoint must still be reachable: its object lives
 	// under the old epoch and was never touched by the bump or by v2.
-	if _, err := w.Fork("app", "main", "child", "v1", 0); err != nil {
+	if _, err := w.Fork("app", "main", "child", "v1", 0, nil); err != nil {
 		t.Fatalf("fork --at v1 (pre-bump checkpoint) after later checkpoint: %v", err)
 	}
 }
@@ -1457,7 +1485,7 @@ func TestOpsRejectEscapingNames(t *testing.T) {
 		if _, err := w.Checkout("app", "main"); err != nil {
 			t.Fatal(err)
 		}
-		if _, err := w.Checkpoint("app", "main", "v1"); err != nil {
+		if _, err := w.Checkpoint("app", "main", "v1", nil); err != nil {
 			t.Fatal(err)
 		}
 		return w
@@ -1493,17 +1521,17 @@ func TestOpsRejectEscapingNames(t *testing.T) {
 
 		t.Run("Checkpoint/db="+label, func(t *testing.T) {
 			w := setup(t)
-			_, err := w.Checkpoint(bad, "main", "v2")
+			_, err := w.Checkpoint(bad, "main", "v2", nil)
 			assertRejected(t, err, "Checkpoint db")
 		})
 		t.Run("Checkpoint/branch="+label, func(t *testing.T) {
 			w := setup(t)
-			_, err := w.Checkpoint("app", bad, "v2")
+			_, err := w.Checkpoint("app", bad, "v2", nil)
 			assertRejected(t, err, "Checkpoint branch")
 		})
 		t.Run("Checkpoint/name="+label, func(t *testing.T) {
 			w := setup(t)
-			_, err := w.Checkpoint("app", "main", bad)
+			_, err := w.Checkpoint("app", "main", bad, nil)
 			assertRejected(t, err, "Checkpoint name")
 		})
 
@@ -1587,7 +1615,7 @@ func TestCheckoutSkipsRematerializeWhenCleanAndCurrent(t *testing.T) {
 	// Checkpoint), so the checkout is STILL clean and current at the new
 	// head without Checkout doing anything — still no re-materialize.
 	mustExecSQL(t, p2, "CREATE TABLE t (v);")
-	if _, err := w.Checkpoint("app", "main", "cp1"); err != nil {
+	if _, err := w.Checkpoint("app", "main", "cp1", nil); err != nil {
 		t.Fatal(err)
 	}
 	p3, err := w.Checkout("app", "main")
@@ -1692,7 +1720,7 @@ func TestCheckoutRematerializesOnEpochMismatchOrOldFormatSidecar(t *testing.T) {
 	if err := os.WriteFile(p1+".sum", []byte(staleEpoch), 0o644); err != nil {
 		t.Fatal(err)
 	}
-	if got := checkoutState(p1, ref); got != "stale" {
+	if got, _ := checkoutState(p1, ref); got != "stale" {
 		t.Fatalf("checkoutState with mismatched epoch = %q, want %q", got, "stale")
 	}
 	p2, err := w.Checkout("app", "main")
@@ -1724,7 +1752,7 @@ func TestCheckoutRematerializesOnEpochMismatchOrOldFormatSidecar(t *testing.T) {
 	if err := os.WriteFile(p2+".sum", []byte(oldFormat), 0o644); err != nil {
 		t.Fatal(err)
 	}
-	if got := checkoutState(p2, ref2); got != "stale" {
+	if got, _ := checkoutState(p2, ref2); got != "stale" {
 		t.Fatalf("checkoutState for an old-format (no epoch) sidecar = %q, want %q", got, "stale")
 	}
 	p3, err := w.Checkout("app", "main")
@@ -1737,5 +1765,262 @@ func TestCheckoutRematerializesOnEpochMismatchOrOldFormatSidecar(t *testing.T) {
 	}
 	if os.SameFile(st2, st3) {
 		t.Fatal("an old-format sidecar (no epoch field) must be re-materialized, not skipped")
+	}
+}
+
+// --- Milestone 3 Task 1: dbs op / branch+checkpoint metadata & timestamps ---
+
+func TestValidateMetaCaps(t *testing.T) {
+	if err := ValidateMeta(nil); err != nil {
+		t.Fatalf("nil meta must always pass: %v", err)
+	}
+	if err := ValidateMeta(map[string]string{}); err != nil {
+		t.Fatalf("empty meta must always pass: %v", err)
+	}
+	if err := ValidateMeta(map[string]string{"k": "v"}); err != nil {
+		t.Fatalf("a small map must pass: %v", err)
+	}
+
+	tooMany := map[string]string{}
+	for i := 0; i < MaxMetaKeys+1; i++ {
+		tooMany[fmt.Sprintf("k%d", i)] = "v"
+	}
+	if err := ValidateMeta(tooMany); err == nil {
+		t.Fatal("a map over the key-count cap must be rejected")
+	} else if !strings.Contains(err.Error(), fmt.Sprintf("%d", MaxMetaKeys)) {
+		t.Fatalf("error should name the limit: %v", err)
+	}
+
+	if err := ValidateMeta(map[string]string{strings.Repeat("k", MaxMetaKeyLen+1): "v"}); err == nil {
+		t.Fatal("a key over the length cap must be rejected")
+	}
+	// Exactly at the cap must pass.
+	if err := ValidateMeta(map[string]string{strings.Repeat("k", MaxMetaKeyLen): "v"}); err != nil {
+		t.Fatalf("a key exactly at the length cap must pass: %v", err)
+	}
+
+	if err := ValidateMeta(map[string]string{"k": strings.Repeat("v", MaxMetaValueLen+1)}); err == nil {
+		t.Fatal("a value over the length cap must be rejected")
+	}
+	if err := ValidateMeta(map[string]string{"k": strings.Repeat("v", MaxMetaValueLen)}); err != nil {
+		t.Fatalf("a value exactly at the length cap must pass: %v", err)
+	}
+}
+
+func TestCheckpointStampsCreatedAtAndMeta(t *testing.T) {
+	requireSQLite(t)
+	w := newWS(t)
+	if err := w.Create("app"); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := w.Checkout("app", "main"); err != nil {
+		t.Fatal(err)
+	}
+	before := nowStamp()
+	txid, err := w.Checkpoint("app", "main", "v1", map[string]string{"eval_run": "42"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	after := nowStamp()
+
+	ref, _, err := w.Store.GetRef("app", "main")
+	if err != nil {
+		t.Fatal(err)
+	}
+	cp, ok := ref.Checkpoints["v1"]
+	if !ok || cp.TXID != txid {
+		t.Fatalf("checkpoint v1 = %+v ok=%v, want txid %d", cp, ok, txid)
+	}
+	if cp.CreatedAt == "" {
+		t.Fatal("checkpoint CreatedAt must be stamped")
+	}
+	if cp.CreatedAt < before || cp.CreatedAt > after {
+		t.Fatalf("checkpoint CreatedAt %q not within [%q, %q]", cp.CreatedAt, before, after)
+	}
+	if cp.Meta["eval_run"] != "42" {
+		t.Fatalf("checkpoint Meta did not round-trip: %+v", cp.Meta)
+	}
+	// Meta attaches to the checkpoint, not the branch's own Ref.Meta.
+	if ref.Meta != nil {
+		t.Fatalf("Checkpoint's meta must not leak onto Ref.Meta: %+v", ref.Meta)
+	}
+}
+
+func TestCheckpointRejectsMetaOverCap(t *testing.T) {
+	requireSQLite(t)
+	w := newWS(t)
+	if err := w.Create("app"); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := w.Checkout("app", "main"); err != nil {
+		t.Fatal(err)
+	}
+	tooMany := map[string]string{}
+	for i := 0; i < MaxMetaKeys+1; i++ {
+		tooMany[fmt.Sprintf("k%d", i)] = "v"
+	}
+	if _, err := w.Checkpoint("app", "main", "v1", tooMany); err == nil {
+		t.Fatal("Checkpoint must reject metadata over the cap before touching the store")
+	}
+	ref, _, err := w.Store.GetRef("app", "main")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, exists := ref.Checkpoints["v1"]; exists {
+		t.Fatal("a rejected checkpoint must not have been created")
+	}
+}
+
+func TestForkStampsRefMetaAndCheckpointCreatedAt(t *testing.T) {
+	requireSQLite(t)
+	w := newWS(t)
+	if err := w.Create("app"); err != nil {
+		t.Fatal(err)
+	}
+	before := nowStamp()
+	if _, err := w.Fork("app", "main", "attempt-1", "", 0, map[string]string{"git_sha": "abc123"}); err != nil {
+		t.Fatal(err)
+	}
+	after := nowStamp()
+
+	child, _, err := w.Store.GetRef("app", "attempt-1")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if child.Meta["git_sha"] != "abc123" {
+		t.Fatalf("Fork's meta did not land on the child's Ref.Meta: %+v", child.Meta)
+	}
+	cp, ok := child.Checkpoints["fork"]
+	if !ok {
+		t.Fatal("fork must still stamp the 'fork' checkpoint")
+	}
+	if cp.CreatedAt == "" || cp.CreatedAt < before || cp.CreatedAt > after {
+		t.Fatalf("fork checkpoint CreatedAt %q not within [%q, %q]", cp.CreatedAt, before, after)
+	}
+	// Fork's meta describes branch-level lineage, not the "fork" checkpoint
+	// itself — Checkpoint's own meta param is the per-checkpoint knob.
+	if cp.Meta != nil {
+		t.Fatalf("Fork's meta must not leak onto the 'fork' checkpoint's own Meta: %+v", cp.Meta)
+	}
+}
+
+func TestForkRejectsMetaOverCap(t *testing.T) {
+	requireSQLite(t)
+	w := newWS(t)
+	if err := w.Create("app"); err != nil {
+		t.Fatal(err)
+	}
+	bigValue := map[string]string{"k": strings.Repeat("v", MaxMetaValueLen+1)}
+	if _, err := w.Fork("app", "main", "attempt-1", "", 0, bigValue); err == nil {
+		t.Fatal("Fork must reject metadata over the cap before touching the store")
+	}
+	refs, err := w.Store.ListRefs()
+	if err != nil {
+		t.Fatal(err)
+	}
+	for _, br := range refs["app"] {
+		if br == "attempt-1" {
+			t.Fatal("a rejected fork must not have created the branch")
+		}
+	}
+}
+
+// TestRollbackPreservesCheckpointCreatedAtAndMeta guards a Rollback bug: the
+// kept-checkpoint copy loop used to rewrite every earlier checkpoint's epoch
+// to 1 (correct — that's where the copy now lives) by constructing a brand
+// new store.Checkpoint{TXID, Epoch}, which silently dropped CreatedAt/Meta
+// on the floor. A rollback must relocate a checkpoint, not erase its
+// history.
+func TestRollbackPreservesCheckpointCreatedAtAndMeta(t *testing.T) {
+	requireSQLite(t)
+	w := newWS(t)
+	if err := w.Create("app"); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := w.Checkout("app", "main"); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := w.Checkpoint("app", "main", "v1", map[string]string{"agent": "claude"}); err != nil {
+		t.Fatal(err)
+	}
+	beforeRef, _, err := w.Store.GetRef("app", "main")
+	if err != nil {
+		t.Fatal(err)
+	}
+	beforeCP := beforeRef.Checkpoints["v1"]
+	if beforeCP.CreatedAt == "" || beforeCP.Meta["agent"] != "claude" {
+		t.Fatalf("test setup: v1 checkpoint missing CreatedAt/Meta before rollback: %+v", beforeCP)
+	}
+
+	if _, err := w.Checkpoint("app", "main", "v2", nil); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := w.Rollback("app", "main", "v2"); err != nil {
+		t.Fatal(err)
+	}
+
+	afterRef, _, err := w.Store.GetRef("app", "main")
+	if err != nil {
+		t.Fatal(err)
+	}
+	afterCP, ok := afterRef.Checkpoints["v1"]
+	if !ok {
+		t.Fatal("v1 must survive a rollback to a later checkpoint")
+	}
+	if afterCP.CreatedAt != beforeCP.CreatedAt {
+		t.Fatalf("rollback dropped v1's CreatedAt: got %q, want %q", afterCP.CreatedAt, beforeCP.CreatedAt)
+	}
+	if afterCP.Meta["agent"] != "claude" {
+		t.Fatalf("rollback dropped v1's Meta: %+v", afterCP.Meta)
+	}
+	if afterCP.Epoch != 1 {
+		t.Fatalf("rollback must still relocate the checkpoint to the new lineage's epoch 1, got %d", afterCP.Epoch)
+	}
+}
+
+func TestCreateStampsInitCheckpointCreatedAt(t *testing.T) {
+	w := newWS(t)
+	before := nowStamp()
+	if err := w.Create("app"); err != nil {
+		t.Fatal(err)
+	}
+	after := nowStamp()
+	ref, _, err := w.Store.GetRef("app", "main")
+	if err != nil {
+		t.Fatal(err)
+	}
+	cp, ok := ref.Checkpoints["init"]
+	if !ok {
+		t.Fatal("Create must set an 'init' checkpoint")
+	}
+	if cp.CreatedAt == "" || cp.CreatedAt < before || cp.CreatedAt > after {
+		t.Fatalf("init checkpoint CreatedAt %q not within [%q, %q]", cp.CreatedAt, before, after)
+	}
+}
+
+func TestPromoteStampsCheckpointCreatedAt(t *testing.T) {
+	requireSQLite(t)
+	w := newWS(t)
+	if err := w.Create("app"); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := w.Fork("app", "main", "feature", "", 0, nil); err != nil {
+		t.Fatal(err)
+	}
+	before := nowStamp()
+	if _, err := w.Promote("app", "feature", "main", true); err != nil {
+		t.Fatal(err)
+	}
+	after := nowStamp()
+	ref, _, err := w.Store.GetRef("app", "main")
+	if err != nil {
+		t.Fatal(err)
+	}
+	cp, ok := ref.Checkpoints["promote"]
+	if !ok {
+		t.Fatal("Promote must set a 'promote' checkpoint")
+	}
+	if cp.CreatedAt == "" || cp.CreatedAt < before || cp.CreatedAt > after {
+		t.Fatalf("promote checkpoint CreatedAt %q not within [%q, %q]", cp.CreatedAt, before, after)
 	}
 }

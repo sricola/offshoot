@@ -10,6 +10,7 @@ import (
 	"fmt"
 	"net"
 	"os"
+	"path/filepath"
 	"sort"
 	"sync"
 	"time"
@@ -218,6 +219,12 @@ func (s *Server) dispatch(req Request) Response {
 		return s.opTouch(req)
 	case "branches":
 		return s.opBranches(req)
+	case "dbs":
+		return s.opDbs()
+	case "export":
+		return s.opExport(req)
+	case "checkout-at":
+		return s.opCheckoutAt(req)
 	default:
 		return errResp(fmt.Errorf("daemon: unknown op %q", req.Op))
 	}
@@ -337,12 +344,21 @@ func (s *Server) lookup(db, branch string) (*session.Session, error) {
 	return sess, nil
 }
 
+// opFlush ships the session's current state, optionally as a named
+// checkpoint (req.Name), optionally carrying req.Meta on that checkpoint
+// (Session.Flush rejects a non-empty Meta with an empty Name — there's no
+// checkpoint for it to attach to). There is deliberately no separate
+// "checkpoint" daemon op: a live session's checkpoint IS a named flush (see
+// ops.Workspace.Checkpoint's own doc comment on why its raw checkout access
+// is unsafe against a live session) — this is also why req.Meta rides here
+// rather than a dedicated op, giving the daemon-session path parity with
+// ops.Workspace.Checkpoint's own meta param.
 func (s *Server) opFlush(req Request) Response {
 	sess, err := s.lookup(req.DB, req.Branch)
 	if err != nil {
 		return errResp(err)
 	}
-	txid, err := sess.Flush(req.Name)
+	txid, err := sess.Flush(req.Name, req.Meta)
 	if err != nil {
 		return errResp(err)
 	}
@@ -492,7 +508,7 @@ func (s *Server) refuseIfClaimed(db, branch string) error {
 func (s *Server) flushIfOpen(db, branch, opName string) error {
 	switch st, sess := s.lookupSessionState(db, branch); st {
 	case sessionOpen:
-		if _, err := sess.Flush(""); err != nil {
+		if _, err := sess.Flush("", nil); err != nil {
 			return fmt.Errorf("daemon: flush %s before %s: %w", key(db, branch), opName, err)
 		}
 	case sessionReserved:
@@ -532,8 +548,10 @@ func (s *Server) opCheckoutAtRest(req Request) Response {
 
 // opFork creates req.Name as a new branch forked from req.Branch (source)
 // at checkpoint req.From ("" = source's head), with TTL req.TTL ("" = no
-// TTL; else a Go duration). A non-positive duration (<= 0) is refused: fork
-// has no "none" sentinel the way touch does (a brand-new branch has no
+// TTL; else a Go duration), and req.Meta (nil = none) stored on the new
+// branch's Ref.Meta (see ops.Workspace.Fork's doc comment for the cap). A
+// non-positive duration (<= 0) is refused: fork has no "none" sentinel the
+// way touch does (a brand-new branch has no
 // existing TTL to explicitly clear), so a caller that means "no TTL" omits
 // req.TTL entirely rather than sending a zero or negative one — sending one
 // anyway is almost certainly a mistake (e.g. an unintended negative
@@ -542,7 +560,12 @@ func (s *Server) opCheckoutAtRest(req Request) Response {
 // daemon has an open session on the source, that session is flushed
 // (unnamed) first so the fork point includes writes the caller never
 // explicitly flushed — matching Fork's semantics for a session that owns
-// the source's checkout. Returns the fork point's txid.
+// the source's checkout. req.Meta is validated (ops.ValidateMeta) BEFORE
+// that flush: an over-cap meta is a caller mistake that Fork would reject
+// anyway, and rejecting it before flushIfOpen means an over-cap fork
+// against an open session never triggers store I/O (and never advances the
+// session's flushed head) for a call that was only going to unwind on the
+// next line regardless. Returns the fork point's txid.
 func (s *Server) opFork(req Request) Response {
 	branch := req.Branch
 	if branch == "" {
@@ -560,10 +583,13 @@ func (s *Server) opFork(req Request) Response {
 		}
 		ttl = d
 	}
+	if err := ops.ValidateMeta(req.Meta); err != nil {
+		return errResp(err)
+	}
 	if err := s.flushIfOpen(req.DB, branch, "fork"); err != nil {
 		return errResp(err)
 	}
-	txid, err := s.ws.Fork(req.DB, branch, req.Name, req.From, ttl)
+	txid, err := s.ws.Fork(req.DB, branch, req.Name, req.From, ttl, req.Meta)
 	if err != nil {
 		return errResp(err)
 	}
@@ -715,14 +741,92 @@ func (s *Server) opBranches(req Request) Response {
 			cps = append(cps, name)
 		}
 		sort.Strings(cps)
+		// CheckpointsV2 carries the same names, in the same sorted order, as
+		// Checkpoints above, plus each one's txid/created_at — built from the
+		// same cps slice so the two can never disagree on membership or order.
+		cpsV2 := make([]CheckpointInfo, 0, len(cps))
+		for _, name := range cps {
+			cp := ref.Checkpoints[name]
+			cpsV2 = append(cpsV2, CheckpointInfo{Name: name, TXID: cp.TXID, CreatedAt: cp.CreatedAt})
+		}
 		infos = append(infos, BranchInfo{
 			Branch: br, HeadTXID: ref.HeadTXID, Protected: ref.Protected,
 			TTL: ref.TTL, TTLRemaining: ops.FormatTTLRemaining(ref, now), LeaseHolder: ref.LeaseHolder,
-			Checkpoints: cps,
+			Checkpoints: cps, TouchedAt: ref.TouchedAt, CheckpointsV2: cpsV2,
 		})
 	}
 	sort.Slice(infos, func(i, j int) bool { return infos[i].Branch < infos[j].Branch })
 	return Response{OK: true, Branches: infos}
+}
+
+// opDbs lists every database this store has at least one ref for —
+// store.Store.ListRefs's keys, sorted. Unlike opBranches, an empty result is
+// not an error: a fresh store with nothing created yet legitimately has no
+// databases, and a cleanup job enumerating what exists (the motivating case
+// for this op — see the design spec's list-databases note) needs to be able
+// to tell "nothing here" from a failure.
+func (s *Server) opDbs() Response {
+	refs, err := s.ws.Store.ListRefs()
+	if err != nil {
+		return errResp(err)
+	}
+	dbs := make([]string, 0, len(refs))
+	for db := range refs {
+		dbs = append(dbs, db)
+	}
+	sort.Strings(dbs)
+	return Response{OK: true, Databases: dbs}
+}
+
+// opExport materializes db@branch's state at checkpoint req.Name ("" =
+// head) to a plain SQLite file at req.Path (ops.Workspace.Export — refuses
+// to overwrite an existing file there unless req.Force; writes atomically,
+// no sidecar, no lease — see Export's own doc comment for the exact
+// semantics). req.Path must be ABSOLUTE (see Request.Path's doc comment for
+// the trust model this enforces); a relative path is refused outright
+// rather than resolved against the daemon's own working directory.
+//
+// Deliberately UNGUARDED by refuseIfClaimed, unlike opCheckoutAtRest/
+// opRollback/opPromote: Export reads the STORE (the branch's last durable
+// chain), never the live checkout, so an open session on db@branch runs
+// concurrently with an export of that same branch with no conflict — but
+// also with a real consequence worth stating plainly: that session's
+// UNFLUSHED writes are invisible to this export. Export always reflects
+// the branch's last DURABLE state; a caller that needs in-flight session
+// writes included must flush (or checkpoint) first.
+func (s *Server) opExport(req Request) Response {
+	branch := req.Branch
+	if branch == "" {
+		branch = "main"
+	}
+	if !filepath.IsAbs(req.Path) {
+		return errResp(fmt.Errorf("daemon: export path %q must be absolute", req.Path))
+	}
+	if err := s.ws.Export(req.DB, branch, req.Name, req.Path, req.Force); err != nil {
+		return errResp(err)
+	}
+	return Response{OK: true}
+}
+
+// opCheckoutAt materializes db@branch's state at checkpoint req.Name into
+// its dedicated read-only cache file (ops.Workspace.CheckoutAt) — a path
+// distinct from, and never touching, the writable checkout a live session
+// or opCheckoutAtRest owns. That separation is exactly why this handler,
+// unlike opCheckoutAtRest/opRollback/opPromote, needs no refuseIfClaimed
+// guard: it is safe to run alongside an open session on the SAME branch.
+// req.Force re-materializes an already-cached file (and re-reads the
+// store to do it); otherwise a cache hit is returned as-is with no store
+// access at all — see CheckoutAt's own doc comment.
+func (s *Server) opCheckoutAt(req Request) Response {
+	branch := req.Branch
+	if branch == "" {
+		branch = "main"
+	}
+	path, err := s.ws.CheckoutAt(req.DB, branch, req.Name, req.Force)
+	if err != nil {
+		return errResp(err)
+	}
+	return Response{OK: true, Checkout: path}
 }
 
 // Shutdown stops the janitor, stops accepting, refuses any further opens,

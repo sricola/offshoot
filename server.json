@@ -1,0 +1,11 @@
+{
+  "name": "offshoot",
+  "description": "Git-like branching for SQLite databases, exposed over the Model Context Protocol so an agent can fork a database before risky work, checkpoint when it succeeds, and roll back when it doesn't — without asking a human to run commands. Seven tools: list, checkout, checkpoint, fork, rollback, promote, destroy. Destructive tools respect the same protected-branch rules as the offshoot CLI.",
+  "version": "0.1.0",
+  "repository": {
+    "type": "git",
+    "url": "https://github.com/offshoot-db/offshoot"
+  },
+  "command": "offshoot",
+  "args": ["-store", "./.offshoot", "mcp"]
+}

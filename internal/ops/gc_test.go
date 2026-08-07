@@ -17,8 +17,8 @@ func TestDestroyAndGC(t *testing.T) {
 	w.Create("app")
 	path, _ := w.Checkout("app", "main")
 	exec.Command("sqlite3", path, "CREATE TABLE t (v); INSERT INTO t VALUES (1);").Run()
-	w.Checkpoint("app", "main", "v1")
-	w.Fork("app", "main", "attempt-1", "", 0)
+	w.Checkpoint("app", "main", "v1", nil)
+	w.Fork("app", "main", "attempt-1", "", 0, nil)
 	aref, _, _ := w.Store.GetRef("app", "attempt-1")
 
 	// Protected destroy requires force.
@@ -63,7 +63,7 @@ func TestDestroyRefusesLiveLeaseWithoutForce(t *testing.T) {
 	if err := w.Create("app"); err != nil {
 		t.Fatal(err)
 	}
-	if _, err := w.Fork("app", "main", "b1", "", 0); err != nil {
+	if _, err := w.Fork("app", "main", "b1", "", 0, nil); err != nil {
 		t.Fatal(err)
 	}
 	if _, err := w.AcquireLease("app", "b1", "holder-a", DefaultLeaseTTL); err != nil {
@@ -81,7 +81,7 @@ func TestDestroyRefusesLiveLeaseWithoutForce(t *testing.T) {
 	}
 
 	// A branch whose lease has already expired is destroyable without force.
-	if _, err := w.Fork("app", "main", "b2", "", 0); err != nil {
+	if _, err := w.Fork("app", "main", "b2", "", 0, nil); err != nil {
 		t.Fatal(err)
 	}
 	if _, err := w.AcquireLease("app", "b2", "holder-b", time.Nanosecond); err != nil {
@@ -109,8 +109,8 @@ func TestDestroyAndGCOnS3(t *testing.T) {
 	w.Create("app")
 	path, _ := w.Checkout("app", "main")
 	exec.Command("sqlite3", path, "CREATE TABLE t (v); INSERT INTO t VALUES (1);").Run()
-	w.Checkpoint("app", "main", "v1")
-	w.Fork("app", "main", "attempt-1", "", 0)
+	w.Checkpoint("app", "main", "v1", nil)
+	w.Fork("app", "main", "attempt-1", "", 0, nil)
 	aref, _, _ := w.Store.GetRef("app", "attempt-1")
 
 	// Protected destroy requires force.
@@ -162,8 +162,8 @@ func TestGCSingleRunDoesNotSweepStonesMintedThisRun(t *testing.T) {
 	w.Create("app")
 	path, _ := w.Checkout("app", "main")
 	exec.Command("sqlite3", path, "CREATE TABLE t (v); INSERT INTO t VALUES (1);").Run()
-	w.Checkpoint("app", "main", "v1")
-	w.Fork("app", "main", "attempt-1", "", 0)
+	w.Checkpoint("app", "main", "v1", nil)
+	w.Fork("app", "main", "attempt-1", "", 0, nil)
 	aref, _, _ := w.Store.GetRef("app", "attempt-1")
 	if err := w.Destroy("app", "attempt-1", false); err != nil {
 		t.Fatal(err)

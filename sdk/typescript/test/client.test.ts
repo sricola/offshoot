@@ -9,7 +9,7 @@
 import { test, before, after, type TestContext } from "node:test";
 import assert from "node:assert/strict";
 import { execFileSync, spawn, type ChildProcess } from "node:child_process";
-import { existsSync, mkdtempSync, rmSync } from "node:fs";
+import { existsSync, mkdtempSync, rmSync, statSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { fileURLToPath } from "node:url";
@@ -19,8 +19,12 @@ import { connect, OffshootError, type Client } from "../src/client.js";
 // test-dist/test/client.test.js -> repo root is four levels up.
 const REPO = join(fileURLToPath(new URL(".", import.meta.url)), "..", "..", "..", "..");
 
+// unref()'d so a pending sleep() timer never by itself keeps the process's
+// event loop alive — see src/testkit.ts's identical `sleep` for why: without
+// it, DaemonFixture.stop()'s race below can hold the process open for up to
+// 10s after the daemon has already exited and stop() has logically finished.
 function sleep(ms: number): Promise<void> {
-  return new Promise((res) => setTimeout(res, ms));
+  return new Promise((res) => setTimeout(res, ms).unref());
 }
 
 function hasCmd(cmd: string): boolean {
@@ -207,6 +211,262 @@ test("rollback, promote, status", async (t: TestContext) => {
     await c.fork("rp", "main", "feature");
     const txid = await c.promote("rp", "feature", "main", { force: true });
     assert.ok(txid > 0);
+  } finally {
+    await c.close();
+  }
+});
+
+test("dbs lists every database sorted", async (t: TestContext) => {
+  if (!canRun) {
+    t.skip("go and/or sqlite3 not on PATH");
+    return;
+  }
+  const c = await connect(fixture!.sock);
+  try {
+    await c.create("dbs-zeta");
+    await c.create("dbs-alpha");
+    const names = await c.dbs();
+    assert.ok(names.includes("dbs-zeta"));
+    assert.ok(names.includes("dbs-alpha"));
+    assert.deepEqual(names, [...names].sort());
+  } finally {
+    await c.close();
+  }
+});
+
+test("fork meta and checkpoints_v2/touched_at", async (t: TestContext) => {
+  if (!canRun) {
+    t.skip("go and/or sqlite3 not on PATH");
+    return;
+  }
+  const c = await connect(fixture!.sock);
+  try {
+    await c.create("meta-app");
+    await c.fork("meta-app", "main", "with-meta", { meta: { eval_run: "42" } });
+    const info = new Map((await c.branches("meta-app")).map((b) => [b.branch, b]));
+    const branch = info.get("with-meta");
+    assert.ok(branch);
+    assert.ok(branch!.touched_at);
+    assert.ok(branch!.checkpoints.includes("fork"));
+    const cpV2 = branch!.checkpoints_v2.find((cp) => cp.name === "fork");
+    assert.ok(cpV2);
+    assert.ok(cpV2!.txid > 0);
+    assert.ok(cpV2!.created_at);
+  } finally {
+    await c.close();
+  }
+});
+
+test("fork without meta still works", async (t: TestContext) => {
+  if (!canRun) {
+    t.skip("go and/or sqlite3 not on PATH");
+    return;
+  }
+  const c = await connect(fixture!.sock);
+  try {
+    await c.create("meta-app-2");
+    const txid = await c.fork("meta-app-2", "main", "no-meta");
+    assert.ok(txid > 0);
+  } finally {
+    await c.close();
+  }
+});
+
+test("flush meta creates checkpoint with meta", async (t: TestContext) => {
+  if (!canRun) {
+    t.skip("go and/or sqlite3 not on PATH");
+    return;
+  }
+  const c = await connect(fixture!.sock);
+  try {
+    await c.create("meta-app-3");
+    const s = await c.open("meta-app-3");
+    sqlite3(s.path, "CREATE TABLE t (v);");
+    const txid = await s.flush("v1", { meta: { agent: "claude" } });
+    assert.ok(txid > 0);
+    const info = new Map((await c.branches("meta-app-3")).map((b) => [b.branch, b]));
+    const cpV2 = info.get("main")!.checkpoints_v2.find((cp) => cp.name === "v1");
+    assert.ok(cpV2);
+    assert.ok(cpV2!.created_at);
+    await s.close();
+  } finally {
+    await c.close();
+  }
+});
+
+test("flush without meta still works", async (t: TestContext) => {
+  if (!canRun) {
+    t.skip("go and/or sqlite3 not on PATH");
+    return;
+  }
+  const c = await connect(fixture!.sock);
+  try {
+    await c.create("meta-app-4");
+    const s = await c.open("meta-app-4");
+    const txid = await s.flush("v1");
+    assert.ok(txid > 0);
+    await s.close();
+  } finally {
+    await c.close();
+  }
+});
+
+test("export: head and named checkpoint", async (t: TestContext) => {
+  if (!canRun) {
+    t.skip("go and/or sqlite3 not on PATH");
+    return;
+  }
+  const c = await connect(fixture!.sock);
+  try {
+    await c.create("export-app");
+    const s = await c.open("export-app");
+    sqlite3(s.path, "CREATE TABLE t (v); INSERT INTO t VALUES ('one');");
+    await s.flush("v1");
+    sqlite3(s.path, "INSERT INTO t VALUES ('two');");
+    await s.flush("v2");
+    await s.close();
+
+    const out1 = join(fixture!.dir, "export-v1.db");
+    await c.export("export-app", "main", out1, { checkpoint: "v1" });
+    assert.equal(sqlite3(out1, "SELECT count(*) FROM t;").trim(), "1");
+
+    const out2 = join(fixture!.dir, "export-head.db");
+    await c.export("export-app", "main", out2);
+    assert.equal(sqlite3(out2, "SELECT count(*) FROM t;").trim(), "2");
+  } finally {
+    await c.close();
+  }
+});
+
+test("export: refuses overwrite without force, then force succeeds", async (t: TestContext) => {
+  if (!canRun) {
+    t.skip("go and/or sqlite3 not on PATH");
+    return;
+  }
+  const c = await connect(fixture!.sock);
+  try {
+    await c.create("export-force-app");
+    const s = await c.open("export-force-app");
+    sqlite3(s.path, "CREATE TABLE t (v);");
+    await s.flush("v1");
+    await s.close();
+
+    const out = join(fixture!.dir, "export-force.db");
+    await c.export("export-force-app", "main", out);
+    await assert.rejects(() => c.export("export-force-app", "main", out), OffshootError);
+    await c.export("export-force-app", "main", out, { force: true });
+  } finally {
+    await c.close();
+  }
+});
+
+test("export: rejects a relative path", async (t: TestContext) => {
+  if (!canRun) {
+    t.skip("go and/or sqlite3 not on PATH");
+    return;
+  }
+  const c = await connect(fixture!.sock);
+  try {
+    await c.create("export-relpath-app");
+    await assert.rejects(() => c.export("export-relpath-app", "main", "relative-out.db"), OffshootError);
+  } finally {
+    await c.close();
+  }
+});
+
+test("export: misses a session's unflushed writes", async (t: TestContext) => {
+  if (!canRun) {
+    t.skip("go and/or sqlite3 not on PATH");
+    return;
+  }
+  const c = await connect(fixture!.sock);
+  try {
+    await c.create("export-unflushed-app");
+    const s = await c.open("export-unflushed-app");
+    sqlite3(s.path, "CREATE TABLE t (v); INSERT INTO t VALUES ('durable');");
+    await s.flush("v1");
+    sqlite3(s.path, "INSERT INTO t VALUES ('unflushed');"); // never flushed
+
+    const out = join(fixture!.dir, "export-unflushed.db");
+    await c.export("export-unflushed-app", "main", out);
+    assert.equal(
+      sqlite3(out, "SELECT count(*) FROM t;").trim(),
+      "1",
+      "export must not include a session's unflushed write",
+    );
+
+    await s.flush();
+    const out2 = join(fixture!.dir, "export-after-flush.db");
+    await c.export("export-unflushed-app", "main", out2);
+    assert.equal(sqlite3(out2, "SELECT count(*) FROM t;").trim(), "2");
+    await s.close();
+  } finally {
+    await c.close();
+  }
+});
+
+test("checkoutAt: materializes a separate read-only path", async (t: TestContext) => {
+  if (!canRun) {
+    t.skip("go and/or sqlite3 not on PATH");
+    return;
+  }
+  const c = await connect(fixture!.sock);
+  try {
+    await c.create("checkout-at-app");
+    const s = await c.open("checkout-at-app");
+    sqlite3(s.path, "CREATE TABLE t (v); INSERT INTO t VALUES ('one');");
+    await s.flush("v1");
+    sqlite3(s.path, "INSERT INTO t VALUES ('two');");
+    await s.flush("v2");
+
+    const roPath = await c.checkoutAt("checkout-at-app", "main", "v1");
+    assert.notEqual(roPath, s.path);
+    assert.equal(sqlite3(roPath, "SELECT count(*) FROM t;").trim(), "1");
+    const mode = statSync(roPath).mode & 0o777;
+    assert.equal(mode, 0o444);
+
+    // Repeat call is a cache hit: same path, no error.
+    const again = await c.checkoutAt("checkout-at-app", "main", "v1");
+    assert.equal(again, roPath);
+
+    await s.close();
+  } finally {
+    await c.close();
+  }
+});
+
+test("checkoutAt: requires a checkpoint name", async (t: TestContext) => {
+  if (!canRun) {
+    t.skip("go and/or sqlite3 not on PATH");
+    return;
+  }
+  const c = await connect(fixture!.sock);
+  try {
+    await c.create("checkout-at-empty-app");
+    await assert.rejects(() => c.checkoutAt("checkout-at-empty-app", "main", ""), OffshootError);
+  } finally {
+    await c.close();
+  }
+});
+
+test("checkoutAt: rejects a path-traversal checkpoint", async (t: TestContext) => {
+  if (!canRun) {
+    t.skip("go and/or sqlite3 not on PATH");
+    return;
+  }
+  // The SDK forwards `checkpoint` verbatim as the daemon's `name` field;
+  // the server-side ops.Workspace.CheckoutAt fix must reject a crafted
+  // value before it ever reaches CheckoutAtPath's filepath.Join, not just
+  // an empty one.
+  const c = await connect(fixture!.sock);
+  try {
+    await c.create("checkout-at-traversal-app");
+    const s = await c.open("checkout-at-traversal-app");
+    sqlite3(s.path, "CREATE TABLE t (v); INSERT INTO t VALUES ('writable');");
+    await s.close();
+    for (const bad of ["../../../etc/passwd", "..", "a/b", "../../checkouts/app/main"]) {
+      await assert.rejects(() => c.checkoutAt("checkout-at-traversal-app", "main", bad), OffshootError);
+    }
   } finally {
     await c.close();
   }

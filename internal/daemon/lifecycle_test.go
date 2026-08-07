@@ -22,7 +22,7 @@ import (
 func TestJanitorReapsExpiredBranchWhileDaemonRuns(t *testing.T) {
 	srv, w := newServer(t)
 
-	if _, err := w.Fork("app", "main", "doomed", "", 0); err != nil {
+	if _, err := w.Fork("app", "main", "doomed", "", 0, nil); err != nil {
 		t.Fatal(err)
 	}
 	ref, etag, err := w.Store.GetRef("app", "doomed")
@@ -67,7 +67,7 @@ func TestJanitorReapsExpiredBranchWhileDaemonRuns(t *testing.T) {
 func TestStartJanitorZeroDisablesIt(t *testing.T) {
 	srv, w := newServer(t)
 
-	if _, err := w.Fork("app", "main", "doomed", "", 0); err != nil {
+	if _, err := w.Fork("app", "main", "doomed", "", 0, nil); err != nil {
 		t.Fatal(err)
 	}
 	ref, etag, err := w.Store.GetRef("app", "doomed")
@@ -220,10 +220,10 @@ func TestPromoteGuards(t *testing.T) {
 	srv, w := newServer(t)
 	sock := srv.SocketPath()
 
-	if _, err := w.Fork("app", "main", "src", "", 0); err != nil {
+	if _, err := w.Fork("app", "main", "src", "", 0, nil); err != nil {
 		t.Fatal(err)
 	}
-	if _, err := w.Fork("app", "main", "target-open", "", 0); err != nil {
+	if _, err := w.Fork("app", "main", "target-open", "", 0, nil); err != nil {
 		t.Fatal(err)
 	}
 	open := call(t, sock, Request{Op: "open", DB: "app", Branch: "target-open"})
@@ -241,10 +241,10 @@ func TestPromoteGuards(t *testing.T) {
 		t.Fatalf("close = %+v", cl)
 	}
 
-	if _, err := w.Fork("app", "main", "src2", "", 0); err != nil {
+	if _, err := w.Fork("app", "main", "src2", "", 0, nil); err != nil {
 		t.Fatal(err)
 	}
-	if _, err := w.Fork("app", "main", "target2", "", 0); err != nil {
+	if _, err := w.Fork("app", "main", "target2", "", 0, nil); err != nil {
 		t.Fatal(err)
 	}
 	openSrc := call(t, sock, Request{Op: "open", DB: "app", Branch: "src2"})
@@ -349,7 +349,7 @@ func TestGuardsRefuseDuringInFlightOpen(t *testing.T) {
 	srv, w := newServer(t)
 	sock := srv.SocketPath()
 
-	if _, err := w.Fork("app", "main", "mid", "", 0); err != nil {
+	if _, err := w.Fork("app", "main", "mid", "", 0, nil); err != nil {
 		t.Fatal(err)
 	}
 
@@ -653,7 +653,7 @@ func TestBranchesSkipsBranchVanishedMidIteration(t *testing.T) {
 	srv, w := newServer(t)
 	sock := srv.SocketPath()
 
-	if _, err := w.Fork("app", "main", "doomed", "", 0); err != nil {
+	if _, err := w.Fork("app", "main", "doomed", "", 0, nil); err != nil {
 		t.Fatal(err)
 	}
 
@@ -714,10 +714,10 @@ func TestJanitorNeverReapsThisDaemonsOwnSession(t *testing.T) {
 	srv, w := newServer(t)
 	sock := srv.SocketPath()
 
-	if _, err := w.Fork("app", "main", "live", "", 0); err != nil {
+	if _, err := w.Fork("app", "main", "live", "", 0, nil); err != nil {
 		t.Fatal(err)
 	}
-	if _, err := w.Fork("app", "main", "doomed", "", 0); err != nil {
+	if _, err := w.Fork("app", "main", "doomed", "", 0, nil); err != nil {
 		t.Fatal(err)
 	}
 

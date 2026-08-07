@@ -64,15 +64,15 @@ of work, leak branches forever, or take the slow path by default.*
   `serve -flush-every` (per-session override), defaulting on. *Delivered as
   one daemon-wide cadence, not a per-session override — see
   [docs/status.md](docs/status.md)'s "Per-session `FlushEvery` override" row
-  for that gap, deferred as YAGNI. Follow-up: every session's mandatory
-  first "settling" flush still uploads a full snapshot unconditionally, even
-  when nothing changed since open; a checksum-compare-and-skip refinement is
-  scoped but not built — see status.md's "Settling-flush checksum-compare
-  suppression" row. Related follow-up: that same settling flush advances the
-  branch ref's head txid, but no clean `Session.Close` refreshes the
-  checkout's `.sum` sidecar to match, so any session outliving its own
-  settling flush leaves the next `session open` re-materializing the
-  checkout — see status.md's "Sidecar refresh on clean Close" row.*
+  for that gap, deferred as YAGNI. Both follow-ups originally noted here have
+  since shipped: every session's mandatory first "settling" flush now skips
+  the upload entirely when the checkout `Open` received was already proven
+  unchanged since the branch's current head, and a clean `Session.Close` now
+  refreshes the checkout's `.sum` sidecar so reopen-after-settling stays flat
+  too — see status.md's "Settling-flush checksum-compare suppression" and
+  "Sidecar refresh on clean Close" rows for exactly what's covered and what
+  still isn't (a dirty/stale checkout, or a session that ever took a
+  mid-session rebase-on-divergence, still pays the old cost once).*
 - **MCP forks get TTLs.** The MCP `fork` tool currently cannot set a TTL, so
   every agent-initiated fork is immortal — the exact orphan-leak class the
   design calls launch-killing. Add the tool argument plus a server-side
@@ -90,10 +90,16 @@ of work, leak branches forever, or take the slow path by default.*
   session would have no natural owner responsible for closing it, which
   would recreate exactly the leak class (leases and branches nobody ever
   releases) this milestone's TTL and background-flush work exists to kill.
-  Milestone 3's pytest fixture plugin (and its vitest counterpart) is where
-  session lifecycle gets an actual, always-present owner. MCP-first stacks
-  are the default enterprise path; the existing-session path is the good
-  path they get today.
+  *(Milestone 3 update: the pytest fixture plugin and its vitest testkit
+  counterpart both shipped and are exactly the always-present lifecycle
+  owner this note anticipated — but for their own harness workload, not as
+  an MCP tool pair. The MCP `open`/`close` gap named here is still open by
+  the same reasoning; see [docs/status.md](docs/status.md)'s "MCP session
+  open/close" row for the confirmed-still-deferred status.)* MCP-first
+  stacks are the default enterprise path; the existing-session path (a
+  harness opens the session, MCP rides it — see
+  [docs/recipes/claude-agent-sdk.md](docs/recipes/claude-agent-sdk.md) for
+  the concrete wiring) is the good path they get today.
 - **Fork performance, measured then fixed.** Fork is currently a local byte
   copy plus a synchronous fork-point upload — O(size) twice, unmeasured at any
   size. Ship a benchmark suite (100MB / 1GB / 10GB, local + MinIO), publish
@@ -111,37 +117,86 @@ of work, leak branches forever, or take the slow path by default.*
 *Bar: the target persona's first hour is paved end to end: install, seed,
 fork-per-test, inspect, export, clean up — from their language.*
 
-- **`offshoot.pytest` fixture plugin + vitest helper + the serious tutorial:**
-  session-scoped daemon, seed fixture, fork-per-test with TTL, worker-parallel
-  branch naming, teardown. Highest leverage per line of code on this list.
-  This is also where MCP-initiated session open/close belongs, deferred from
-  Milestone 2's "MCP rides the daemon" (see that bullet) — the fixture is a
-  lifecycle owner that reliably closes what it opens, unlike a bare MCP tool
-  call with no equivalent guarantee.
-- **Publish the SDKs.** PyPI + npm with trusted publishing/provenance; SDK
+**Status: mostly shipped, with two named deferrals (⏸ below).** Everything
+marked ✅ landed on the `eval-harness` branch; see
+[docs/status.md](docs/status.md)'s Integration Surface section for the
+shipped-and-tested rows and [docs/eval-harness.md](docs/eval-harness.md)
+for the tutorial. Two items were consciously pushed out with a stated
+reason rather than silently dropped, not shipped and not pretended
+otherwise — `create --from`'s daemon/SDK/MCP reach, and the actual
+PyPI/npm/registry button-presses — see their own ⏸ bullets below.
+
+- ✅ **`offshoot.pytest` fixture plugin + vitest helper + the serious
+  tutorial:** session-scoped daemon, seed fixture, fork-per-test with TTL,
+  worker-parallel branch naming, teardown. Shipped as
+  `offshoot.pytest_plugin` (`offshoot-db[pytest]`) and
+  `sdk/typescript/src/testkit.ts`; the tutorial is
+  [docs/eval-harness.md](docs/eval-harness.md). This is also where
+  MCP-initiated session open/close was slated to belong, deferred from
+  Milestone 2's "MCP rides the daemon" (see that bullet) — the fixture and
+  testkit are now real, always-present lifecycle owners for the harness
+  workload they were built for, but no MCP `open`/`close` tool pair was
+  built on top of them; that reach stays deferred for the same
+  no-natural-owner reason — see
+  [docs/status.md](docs/status.md)'s "MCP session open/close" row.
+- ✅ **Publish the SDKs.** PyPI + npm with trusted publishing/provenance; SDK
   docs rewritten to installed-package form; manifests filled out
-  (urls, classifiers, files whitelist).
-- **Import/export everywhere.** `create --from` reaches the daemon protocol,
-  SDKs, and MCP; new `offshoot export <db>@<branch>[@checkpoint] out.db` for
-  plain-file egress (backups, handoff) without fork-checkout-copy-destroy.
-- **Read-only and historical checkouts.** Materialize a checkpoint for
-  inspection without forking; sanctioned read-only sessions alongside a live
-  writer.
-- **List databases** in the protocol and SDKs (cleanup jobs shouldn't shell
-  out to the CLI).
-- **Checkpoint/branch metadata.** Timestamps and txids in `branches` output;
-  a small user-metadata map on fork/checkpoint (eval run id, git SHA, agent
-  id); branch-level lineage is the right grain — no row-level provenance.
-- **Branch diff.** `offshoot diff a@x b@y` wrapping sqldiff over two
+  (urls, classifiers, files whitelist). Publish pipeline (`.github/workflows/publish.yml`)
+  is prepared and gated (`PUBLISH_ENABLED`, default off) — the pipeline
+  itself is done; see the Listings bullet below for what's still
+  user-gated.
+- ✅ **Export.** New `offshoot export <db>@<branch>[@checkpoint] out.db`
+  shipped for plain-file egress (backups, handoff) without
+  fork-checkout-copy-destroy, daemon op and SDK parity included — this
+  half of "Import/export everywhere" is fully shipped.
+- ⏸ **`create --from` reach (daemon protocol, SDKs, MCP) — deferred, not
+  shipped.** The other half of "Import/export everywhere" did not land
+  this milestone. This is a **pre-written deferral, not a gap found
+  late**: importing an existing file through the daemon needs either an
+  upload channel (stream bytes over the unix socket — a new wire
+  primitive) or a same-host path-trust story like `export`'s own (the
+  daemon reads/writes a path the caller names, trusted under the existing
+  same-host/same-user socket trust model) — that design deserves its own
+  pass. CLI `offshoot create --from` remains the only import path; see
+  [docs/status.md](docs/status.md)'s `create --from` reach row.
+- ✅ **Read-only and historical checkouts.** Materialize a checkpoint for
+  inspection without forking; sanctioned read-only sessions alongside a
+  live writer. Shipped as `ops.Workspace.CheckoutAt` / `offshoot checkout
+  --at --read-only` / daemon `checkout-at` op / SDK `checkout_at()`.
+- ✅ **List databases** in the protocol and SDKs (cleanup jobs shouldn't
+  shell out to the CLI). Shipped as the daemon `dbs` op / `offshoot session
+  dbs` / SDK `dbs()`.
+- ✅ **Checkpoint/branch metadata.** Timestamps and txids in `branches`
+  output; a small user-metadata map on fork/checkpoint (eval run id, git
+  SHA, agent id); branch-level lineage is the right grain — no row-level
+  provenance. Shipped as `Ref.Meta`/`Checkpoint.Meta`, `--meta k=v`,
+  `checkpoints_v2`/`touched_at`. MCP tool metadata exposure
+  (`offshoot_fork`/`offshoot_checkpoint` taking a caller-supplied `meta`)
+  stayed out of scope for this task — see [docs/status.md](docs/status.md).
+- ✅ **Branch diff.** `offshoot diff a@x b@y` wrapping sqldiff over two
   materializations; the daily "attempt-2 passed, attempt-3 failed, what
-  changed?" loop.
-- **Framework recipes, not adapters.** The ThreadForks pattern (thread →
+  changed?" loop. Shipped, CLI-only per the task's own scope (no daemon op,
+  no SDK parity) — see [docs/diff.md](docs/diff.md).
+- ✅ **Framework recipes, not adapters.** The ThreadForks pattern (thread →
   branch, checkpoint-id → checkpoint) documented once and applied as short
-  recipes: Claude agent SDK hooks, OpenAI Agents SDK session store,
-  LlamaIndex/CrewAI notes. LangGraph keeps the real companion; everyone else
-  gets a page, not a package.
-- **Listings.** MCP registry submission; LangGraph community-integration PR
-  (requires PyPI first).
+  recipes: [Claude agent SDK hooks](docs/recipes/claude-agent-sdk.md),
+  [OpenAI Agents SDK session store](docs/recipes/openai-agents.md),
+  [LlamaIndex/CrewAI notes](docs/recipes/frameworks.md). LangGraph keeps the
+  real companion (`offshoot.langgraph.ThreadForks`); everyone else gets a
+  page, not a package.
+- ⏸ **Listings — prepared, submission deliberately deferred (user-gated).**
+  MCP registry `server.json` manifest authored in-repo
+  ([docs/launch/mcp-registry.md](docs/launch/mcp-registry.md)) but **not
+  submitted** — the exact registry schema needs to be fetched and validated
+  against at submission time, not assumed from this repo's own docs.
+  LangGraph community-integration PR text drafted
+  ([docs/launch/langgraph-listing.md](docs/launch/langgraph-listing.md))
+  but **not submitted** — its install command needs real PyPI publication
+  to be true. Both are blocked on the same user action as actual SDK
+  publication: claiming the `offshoot-db` PyPI name and `@offshoot-db` npm
+  scope (see the Launch track's Milestone 1 note and
+  [docs/status.md](docs/status.md)'s publish-pipeline row) — everything up
+  to that button-press shipped this milestone.
 
 ## Milestone 4 — Operable at scale
 

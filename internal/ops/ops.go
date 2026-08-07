@@ -34,6 +34,46 @@ type Workspace struct {
 	Spec  string
 }
 
+// Metadata caps (design spec § Metadata; Milestone 3 Global Constraints):
+// branch-level lineage is the grain, not row-level provenance, so the map
+// stays small. Enforced here, at the ops layer, so every caller — CLI,
+// daemon (fork/flush ops), MCP tools (which currently always pass nil, see
+// their own doc comments) — gets the identical check and identical wording,
+// rather than each wire boundary re-implementing (or forgetting) it.
+const (
+	MaxMetaKeys     = 32
+	MaxMetaKeyLen   = 64
+	MaxMetaValueLen = 512
+)
+
+// ValidateMeta enforces the metadata caps on a fork/checkpoint meta map: at
+// most MaxMetaKeys entries, each key at most MaxMetaKeyLen bytes, each value
+// at most MaxMetaValueLen bytes. A nil or empty map always passes — "no
+// metadata" is never a cap violation. Errors name the specific limit
+// violated so a caller can fix its call without guessing which cap it hit.
+func ValidateMeta(meta map[string]string) error {
+	if len(meta) > MaxMetaKeys {
+		return fmt.Errorf("ops: metadata has %d keys, exceeds the %d-key limit", len(meta), MaxMetaKeys)
+	}
+	for k, v := range meta {
+		if len(k) > MaxMetaKeyLen {
+			return fmt.Errorf("ops: metadata key %q is %d bytes, exceeds the %d-byte limit", k, len(k), MaxMetaKeyLen)
+		}
+		if len(v) > MaxMetaValueLen {
+			return fmt.Errorf("ops: metadata value for key %q is %d bytes, exceeds the %d-byte limit", k, len(v), MaxMetaValueLen)
+		}
+	}
+	return nil
+}
+
+// nowStamp is the RFC3339 UTC timestamp ops stamps onto every checkpoint it
+// creates (Create's "init", Checkpoint, Fork's "fork", Promote's
+// "promote"). A plain function (not a field/hook) — nothing in this
+// package's tests has needed to fake the clock for this value, unlike
+// store.Ref.Touch's now time.Time parameter, which callers already had a
+// concrete time available for.
+func nowStamp() string { return time.Now().UTC().Format(time.RFC3339) }
+
 // Init creates a new store at spec and returns a workspace for it.
 func Init(spec string) (*Workspace, error) {
 	b, err := store.OpenBackend(context.Background(), spec)
@@ -128,7 +168,7 @@ func (w *Workspace) CheckoutPath(db, branch string) string {
 func (w *Workspace) snapshotTo(dbPath string, txid uint64) (string, error) {
 	lineage := store.NewLineageID()
 	var buf bytes.Buffer
-	if err := ltxio.EncodeSnapshot(dbPath, txid, &buf); err != nil {
+	if _, err := ltxio.EncodeSnapshot(dbPath, txid, &buf); err != nil {
 		return "", err
 	}
 	// Immutable data object: create-only put under a fresh lineage/epoch.
@@ -166,7 +206,7 @@ func (w *Workspace) createFromQuiesced(db, quiescedPath string) error {
 		Lineage: lineage, Epoch: 1, HeadTXID: 1,
 		Protected: true, // main is protected by default (spec § Security posture)
 	}
-	ref.SetCheckpoint("init", 1, 1)
+	ref.SetCheckpoint("init", store.Checkpoint{TXID: 1, Epoch: 1, CreatedAt: nowStamp()})
 	if _, err := w.Store.PutRef(db, "main", ref, ""); err != nil {
 		// Freshly-minted lineage no rival can reference: safe to delete the
 		// orphaned snapshot (mirrors Fork's cleanup on the same failure).
@@ -216,20 +256,86 @@ func (w *Workspace) CreateFrom(db, srcPath string) error {
 // checkout has un-checkpointed local edits, Checkout proceeds (head always
 // wins) but warns first, since those edits are about to be discarded.
 func (w *Workspace) Checkout(db, branch string) (string, error) {
-	if err := store.ValidateName(db); err != nil {
+	res, err := w.CheckoutProven(db, branch)
+	if err != nil {
 		return "", err
 	}
+	return res.Path, nil
+}
+
+// CheckoutResult is CheckoutProven's return value: the materialized path,
+// plus the proof session.Open's settling-flush suppression needs — see
+// Clean and PostApplyChecksum.
+type CheckoutResult struct {
+	Path string
+	// Clean reports whether this checkout was ALREADY byte-identical to
+	// ref's CURRENT head when this call ran (the sidecar "clean" fast path
+	// below) rather than freshly (re)materialized. When true, Ref is the
+	// exact head identity (lineage, HeadEpoch, HeadTXID) this checkout is
+	// now proven to equal.
+	//
+	// The proof is the sidecar's SHA-256 content hash matching the file's
+	// actual current bytes (checkoutState's "clean" verdict) AND the
+	// sidecar's recorded identity matching a GetRef read of the CURRENT
+	// ref, both already computed below at no extra cost — Clean adds no
+	// store read of its own.
+	//
+	// See Session.Open / Session.rebaseline's doc comment for how the
+	// session package consumes this to decide whether its startup settling
+	// flush can be safely skipped.
+	Clean bool
+	Ref   store.Ref
+	// PostApplyChecksum is the LTX postApplyChecksum this checkout's
+	// content is known to embody — sumRecord.PostApplyChecksum, read
+	// straight out of the sidecar checkoutState already parsed to decide
+	// Clean, at no extra cost (no store read, no re-hash). Valid (non-zero;
+	// 0 means "absent", matching every other zero-means-absent LTX checksum
+	// convention in this codebase — see EncodeSegment's own preApplyChecksum/
+	// postApplyChecksum == 0 checks) only when Clean is true AND the
+	// sidecar that proved it was itself stamped by code new enough to
+	// record one (see writeSum/StampSum's postApplyChecksum parameter); an
+	// older-format sidecar, or one written before this field existed, has
+	// PostApplyChecksum == 0 here even when Clean is true.
+	//
+	// Trusting a checksum read from a LOCAL file, rather than fetched fresh
+	// from the store on every Open, is sound under exactly the same guard
+	// Clean itself already required, not a new hazard: checkoutState only
+	// ever reports "clean" after confirming the sidecar's recorded
+	// (lineage, epoch, txid) identity still matches the CURRENT ref (see
+	// checkoutState's doc comment) — a sidecar whose branch has since moved
+	// (rollback/promote, or any other repoint) already falls to "stale",
+	// never "clean", before this field is ever consulted. So whatever
+	// checksum a "clean" sidecar carries necessarily describes the SAME
+	// (lineage, epoch, txid) that identity check just re-verified as
+	// current — no more, no less.
+	//
+	// See Session.Open / Session.rebaseline's doc comment for how the
+	// settling-flush suppression uses this to avoid a store round trip
+	// (and, worse, a full-object DOWNLOAD when the head is a snapshot) on
+	// every single Open.
+	PostApplyChecksum uint64
+}
+
+// CheckoutProven is Checkout plus the clean-cache proof described on
+// CheckoutResult.Clean/PostApplyChecksum. Exported (rather than folding
+// those into Checkout's own signature) so Checkout's three other call sites
+// (cmd/offshoot, internal/mcp, internal/daemon) — none of which need the
+// proof — are unaffected.
+func (w *Workspace) CheckoutProven(db, branch string) (CheckoutResult, error) {
+	if err := store.ValidateName(db); err != nil {
+		return CheckoutResult{}, err
+	}
 	if err := store.ValidateName(branch); err != nil {
-		return "", err
+		return CheckoutResult{}, err
 	}
 	ref, _, err := w.Store.GetRef(db, branch)
 	if err != nil {
-		return "", err
+		return CheckoutResult{}, err
 	}
 	path := w.CheckoutPath(db, branch)
 	if _, err := os.Stat(path); err == nil {
 		if err := quiesce(path); err != nil {
-			return "", err
+			return CheckoutResult{}, err
 		}
 		// checkoutState compares the sidecar's recorded (lineage, epoch,
 		// txid) against ref.Lineage/ref.HeadEpoch/ref.HeadTXID — the CURRENT
@@ -243,23 +349,57 @@ func (w *Workspace) Checkout(db, branch string) (string, error) {
 		// re-materialization: return it as-is rather than paying the
 		// temp+rename cost (and, via materializeAt->dbfile, stranding
 		// another descriptor) to rebuild bytes that are already correct.
-		switch checkoutState(path, ref) {
+		state, postApplyChecksum := checkoutState(path, ref)
+		switch state {
 		case "clean":
-			return path, nil
+			return CheckoutResult{Path: path, Clean: true, Ref: ref, PostApplyChecksum: postApplyChecksum}, nil
 		case "modified":
 			fmt.Fprintf(os.Stderr, "offshoot: warning: overwriting un-checkpointed changes in %s@%s checkout\n", db, branch)
 		}
 	}
 	if err := os.MkdirAll(filepath.Dir(path), 0o755); err != nil {
-		return "", err
+		return CheckoutResult{}, err
 	}
-	if err := w.materializeAt(ref, headCheckpoint(ref), path); err != nil {
-		return "", err
+	checksum, err := w.materializeAt(ref, headCheckpoint(ref), path)
+	if err != nil {
+		return CheckoutResult{}, err
 	}
-	if err := writeSum(path, ref.Lineage, ref.HeadEpoch, ref.HeadTXID); err != nil {
-		return "", err
+	if err := writeSum(path, ref.Lineage, ref.HeadEpoch, ref.HeadTXID, checksum); err != nil {
+		return CheckoutResult{}, err
 	}
-	return path, nil
+	return CheckoutResult{Path: path, Clean: false, Ref: ref}, nil
+}
+
+// StampSum writes path's .sum sidecar directly from a hash the caller
+// already obtained independently, skipping writeSum's own read-and-hash of
+// path entirely — see sumRecord's doc comment for the on-disk shape.
+// postApplyChecksum is optional (0 = absent, matching sumRecord's own
+// zero-means-absent convention — see its doc comment); Session.
+// commitSidecarRefresh, this function's one caller, always has one (its
+// last successful flush's checksumAtEncode, tracked as s.flushChecksum).
+//
+// Exported for Session.Close's clean-close sidecar refresh (M2 follow-up):
+// Session.commitSidecarRefresh has the capture engine's own post-shutdown
+// MainHash fingerprint (capture.State — a SHA-256 of the checkout's main
+// file, computed by the engine itself immediately after its shutdown
+// verified everything captured was cleanly folded in, see that type's doc
+// comment) and reuses that number directly rather than re-deriving one.
+// That is a deliberate choice, not just an optimization: an independent
+// hash pass here would need its own fresh SQLite connection on path, and
+// this checkout may still have the capture engine's own connection state
+// nearby in the same process — see commitSidecarRefresh's doc comment for
+// why trusting the engine's already-verified fingerprint, rather than
+// re-deriving one, is what keeps this call site off that hazard (and, as a
+// second-order benefit, off the risk of folding in content the engine's own
+// shutdown verification specifically refused to vouch for).
+func StampSum(path, hash, lineage string, epoch, txid, postApplyChecksum uint64) error {
+	data, err := json.Marshal(sumRecord{
+		Hash: hash, Lineage: lineage, Epoch: epoch, TXID: txid, PostApplyChecksum: postApplyChecksum,
+	})
+	if err != nil {
+		return err
+	}
+	return os.WriteFile(path+".sum", data, 0o644)
 }
 
 // sumRecord is the on-disk shape of a checkout's .sum sidecar: a content hash
@@ -277,34 +417,56 @@ func (w *Workspace) Checkout(db, branch string) (string, error) {
 // ever changes in lockstep with Lineage/TXID; a future change to that
 // invariant would make the fast path in Checkout serve stale bytes as
 // current.
+//
+// PostApplyChecksum is the LTX rolling checksum (see ltxio.ChecksumDatabase)
+// the checkout's content embodies at (Lineage, Epoch, TXID) above — omitted
+// (zero value) from the JSON on disk when absent, via `omitempty`, so a
+// pre-this-field sidecar decodes with it simply at 0, and callers already
+// treat 0 as "no checksum available" (see CheckoutResult.PostApplyChecksum).
+// Recording this is what lets Session.Open's settling-flush suppression
+// read a trustworthy checksum straight from this local file instead of
+// fetching (and, when the head is a snapshot, fully downloading) the head
+// object from the store on every single Open — see CheckoutResult's doc
+// comment for exactly why trusting it is safe under the SAME identity guard
+// this whole sidecar mechanism already enforces, not a new one.
 type sumRecord struct {
-	Hash    string `json:"hash"`
-	Lineage string `json:"lineage"`
-	Epoch   uint64 `json:"epoch"`
-	TXID    uint64 `json:"txid"`
+	Hash              string `json:"hash"`
+	Lineage           string `json:"lineage"`
+	Epoch             uint64 `json:"epoch"`
+	TXID              uint64 `json:"txid"`
+	PostApplyChecksum uint64 `json:"post_apply_checksum,omitempty"`
 }
 
 // writeSum computes the hex SHA-256 of the file at path and writes it, along
 // with the (lineage, epoch, txid) ref identity the checkout currently
-// embodies, to path + ".sum". This is the checkout fingerprint: it records
-// what the checkout file looked like, and which branch state it was, at the
-// moment it was last known to equal a committed state (fresh materialize, a
-// successful checkpoint encode, or a post-repoint refresh). Callers pass the
-// ref's HeadEpoch (the epoch the checkout's current head was written under),
-// not the ref's own (writer-generation) Epoch — see sumRecord's doc comment.
-func writeSum(path string, lineage string, epoch, txid uint64) error {
+// embodies and its LTX postApplyChecksum (0 if the caller doesn't have one
+// handy — see sumRecord's doc comment), to path + ".sum". This is the
+// checkout fingerprint: it records what the checkout file looked like, and
+// which branch state it was, at the moment it was last known to equal a
+// committed state (fresh materialize, a successful checkpoint encode, or a
+// post-repoint refresh). Callers pass the ref's HeadEpoch (the epoch the
+// checkout's current head was written under), not the ref's own
+// (writer-generation) Epoch — see sumRecord's doc comment.
+func writeSum(path string, lineage string, epoch, txid, postApplyChecksum uint64) error {
 	sum, err := fileSum(path)
 	if err != nil {
 		return err
 	}
-	data, err := json.Marshal(sumRecord{Hash: sum, Lineage: lineage, Epoch: epoch, TXID: txid})
+	data, err := json.Marshal(sumRecord{
+		Hash: sum, Lineage: lineage, Epoch: epoch, TXID: txid, PostApplyChecksum: postApplyChecksum,
+	})
 	if err != nil {
 		return err
 	}
 	return os.WriteFile(path+".sum", data, 0o644)
 }
 
-// checkoutState reports how the checkout at path relates to ref:
+// checkoutState reports how the checkout at path relates to ref, and — only
+// when the verdict is "clean" — the sidecar's own recorded
+// PostApplyChecksum (0 for every other verdict, and for a "clean" verdict
+// against an older-format sidecar that never recorded one; see
+// CheckoutResult.PostApplyChecksum for how callers are expected to treat a
+// zero value):
 //
 //   - "clean": the sidecar's recorded identity (lineage, epoch, txid)
 //     matches ref, and the file's content still matches the recorded hash.
@@ -322,26 +484,26 @@ func writeSum(path string, lineage string, epoch, txid uint64) error {
 //     record (including legacy bare-hash sidecars predating this fix, and
 //     corrupt files). Provenance can't be determined, so callers should
 //     stay silent rather than warn spuriously.
-func checkoutState(path string, ref store.Ref) string {
+func checkoutState(path string, ref store.Ref) (string, uint64) {
 	raw, err := os.ReadFile(path + ".sum")
 	if err != nil {
-		return "unknown"
+		return "unknown", 0
 	}
 	var rec sumRecord
 	if err := json.Unmarshal(raw, &rec); err != nil || rec.Hash == "" {
-		return "unknown"
+		return "unknown", 0
 	}
 	if rec.Lineage != ref.Lineage || rec.Epoch != ref.HeadEpoch || rec.TXID != ref.HeadTXID {
-		return "stale"
+		return "stale", 0
 	}
 	got, err := fileSum(path)
 	if err != nil {
-		return "unknown"
+		return "unknown", 0
 	}
 	if got != rec.Hash {
-		return "modified"
+		return "modified", 0
 	}
-	return "clean"
+	return "clean", rec.PostApplyChecksum
 }
 
 // fileSum is the SHA-256 of a checkout file's bytes, used by checkoutState
@@ -377,12 +539,13 @@ func fileSum(path string) (string, error) {
 	return hex.EncodeToString(h.Sum(nil)), nil
 }
 
-// materializeAt writes the state identified by cp into dst. It is a thin
-// wrapper over materializeChainAt (see materialize.go), which resolves the
-// full snapshot+segment chain rather than assuming cp's txid is itself a
+// materializeAt writes the state identified by cp into dst, and returns its
+// checksum (see materializeChainAt). It is a thin wrapper over
+// materializeChainAt (see materialize.go), which resolves the full
+// snapshot+segment chain rather than assuming cp's txid is itself a
 // snapshot: every caller here (Checkout, Rollback's refresh, Promote's
 // refresh, copySnapshotIntoLineage's read side) picks that up unchanged.
-func (w *Workspace) materializeAt(ref store.Ref, cp store.Checkpoint, dst string) error {
+func (w *Workspace) materializeAt(ref store.Ref, cp store.Checkpoint, dst string) (uint64, error) {
 	return w.materializeChainAt(ref, cp, dst)
 }
 
@@ -421,7 +584,13 @@ func copyFile(from, to string) error {
 // session can be holding that checkout. The daemon conspicuously has no
 // checkpoint op; if one is ever added it MUST NOT call this directly —
 // route the snapshot through the session's own engine, or through dbfile.
-func (w *Workspace) Checkpoint(db, branch, name string) (uint64, error) {
+//
+// meta (nil = none) is a small string->string map describing this specific
+// checkpoint (e.g. eval run id, git SHA, agent id), capped by ValidateMeta
+// and stored on the checkpoint's own store.Checkpoint.Meta — not on the
+// branch's Ref.Meta, which Fork's meta param sets instead. Rejected (before
+// any store I/O) if it exceeds the caps.
+func (w *Workspace) Checkpoint(db, branch, name string, meta map[string]string) (uint64, error) {
 	if err := store.ValidateName(db); err != nil {
 		return 0, err
 	}
@@ -429,6 +598,9 @@ func (w *Workspace) Checkpoint(db, branch, name string) (uint64, error) {
 		return 0, err
 	}
 	if err := store.ValidateName(name); err != nil {
+		return 0, err
+	}
+	if err := ValidateMeta(meta); err != nil {
 		return 0, err
 	}
 	ref, etag, err := w.Store.GetRef(db, branch)
@@ -447,7 +619,8 @@ func (w *Workspace) Checkpoint(db, branch, name string) (uint64, error) {
 	}
 	txid := ref.HeadTXID + 1
 	var buf bytes.Buffer
-	if err := ltxio.EncodeSnapshot(path, txid, &buf); err != nil {
+	checksum, err := ltxio.EncodeSnapshot(path, txid, &buf)
+	if err != nil {
 		return 0, err
 	}
 	snapKey := store.SnapshotKey(ref.Lineage, ref.Epoch, txid)
@@ -475,7 +648,7 @@ func (w *Workspace) Checkpoint(db, branch, name string) (uint64, error) {
 	}
 	ref.HeadTXID = txid
 	ref.HeadEpoch = ref.Epoch
-	ref.SetCheckpoint(name, txid, ref.Epoch)
+	ref.SetCheckpoint(name, store.Checkpoint{TXID: txid, Epoch: ref.Epoch, CreatedAt: nowStamp(), Meta: meta})
 	ref.Touch(time.Now())
 	if _, err := w.Store.PutRef(db, branch, ref, etag); err != nil {
 		// Decide whether to clean up the snapshot after PutRef failure.
@@ -510,7 +683,7 @@ func (w *Workspace) Checkpoint(db, branch, name string) (uint64, error) {
 	// encode above and this point leaves the OLD sidecar in place — which
 	// still correctly describes the checkout's actual (pre-checkpoint)
 	// identity, rather than claiming a commit that never landed.
-	if err := writeSum(path, ref.Lineage, ref.HeadEpoch, txid); err != nil {
+	if err := writeSum(path, ref.Lineage, ref.HeadEpoch, txid, checksum); err != nil {
 		return 0, fmt.Errorf("ops: checkpoint %q committed (txid %d), but the checkout fingerprint could not be refreshed: %w", name, txid, err)
 	}
 	return txid, nil
@@ -549,7 +722,8 @@ func (w *Workspace) warnIfUncheckpointed(db, branch string, ref store.Ref) {
 		fmt.Fprintf(os.Stderr, "offshoot: warning: checkout of %s@%s is busy; forking last committed state (txid %d)\n", db, branch, ref.HeadTXID)
 		return
 	}
-	switch checkoutState(path, ref) {
+	state, _ := checkoutState(path, ref)
+	switch state {
 	case "modified":
 		fmt.Fprintf(os.Stderr, "offshoot: warning: checkout of %s@%s has un-checkpointed changes; forking last committed state (txid %d)\n", db, branch, ref.HeadTXID)
 	case "stale":
@@ -585,11 +759,11 @@ func (w *Workspace) copySnapshotIntoLineage(src store.Ref, cp store.Checkpoint, 
 func (w *Workspace) copySnapshotIntoLineageFromChain(srcLineage string, members []store.ChainMember, cp store.Checkpoint, dstLineage string) (string, error) {
 	tmp := filepath.Join(os.TempDir(), "offshoot-copy-"+store.NewLineageID()+".db")
 	defer os.Remove(tmp)
-	if err := w.materializeMembersAt(srcLineage, members, tmp); err != nil {
+	if _, err := w.materializeMembersAt(srcLineage, members, tmp); err != nil {
 		return "", fmt.Errorf("ops: materializing lineage %s at txid %d for copy: %w", srcLineage, cp.TXID, err)
 	}
 	var buf bytes.Buffer
-	if err := ltxio.EncodeSnapshot(tmp, cp.TXID, &buf); err != nil {
+	if _, err := ltxio.EncodeSnapshot(tmp, cp.TXID, &buf); err != nil {
 		return "", err
 	}
 	key := store.SnapshotKey(dstLineage, 1, cp.TXID)
@@ -720,11 +894,20 @@ func (w *Workspace) tryFastForkCopy(members []store.ChainMember, cp store.Checkp
 // before ever reaching here — see their own docs — so this is a second,
 // defense-in-depth check, not the primary one a caller should rely on for a
 // good error message.
-func (w *Workspace) Fork(db, srcBranch, newBranch, at string, ttl time.Duration) (uint64, error) {
+//
+// meta (nil = none) is a small string->string map describing the new
+// branch's lineage (e.g. eval run id, git SHA, agent id), capped by
+// ValidateMeta and stored on the child ref's Meta field — branch-level
+// lineage is the grain, not per-checkpoint (see Checkpoint's own meta param
+// for that). Rejected (before any store I/O) if it exceeds the caps.
+func (w *Workspace) Fork(db, srcBranch, newBranch, at string, ttl time.Duration, meta map[string]string) (uint64, error) {
 	if ttl < 0 {
 		return 0, fmt.Errorf("ops: fork ttl must be zero (no TTL) or positive, got %s", ttl)
 	}
 	if err := store.ValidateName(newBranch); err != nil {
+		return 0, err
+	}
+	if err := ValidateMeta(meta); err != nil {
 		return 0, err
 	}
 	src, _, err := w.Store.GetRef(db, srcBranch)
@@ -751,12 +934,13 @@ func (w *Workspace) Fork(db, srcBranch, newBranch, at string, ttl time.Duration)
 	child := store.Ref{
 		Lineage: childLineage, Epoch: 1, HeadTXID: txid, HeadEpoch: 1,
 		Parent: fmt.Sprintf("%s@%s@%d", db, srcBranch, txid),
+		Meta:   meta,
 	}
 	if ttl > 0 {
 		child.TTL = ttl.String()
 	}
 	child.Touch(time.Now())
-	child.SetCheckpoint("fork", txid, 1)
+	child.SetCheckpoint("fork", store.Checkpoint{TXID: txid, Epoch: 1, CreatedAt: nowStamp()})
 	if _, err := w.Store.PutRef(db, newBranch, child, ""); err != nil {
 		// Branch already exists (or lost a race): remove the orphan snapshot.
 		w.Store.B.Delete(store.SnapshotKey(childLineage, 1, txid))
@@ -842,7 +1026,11 @@ func (w *Workspace) Rollback(db, branch, to string) (string, error) {
 			}
 			copiedKeys = append(copiedKeys, key)
 		}
-		kept[name] = store.Checkpoint{TXID: c.TXID, Epoch: 1}
+		// Rewrite epoch to 1 (where the copy now actually lives) while
+		// preserving CreatedAt/Meta — this is a location update, not a new
+		// checkpoint, so its recorded creation time and metadata must
+		// survive the rewrite unchanged.
+		kept[name] = store.Checkpoint{TXID: c.TXID, Epoch: 1, CreatedAt: c.CreatedAt, Meta: c.Meta}
 	}
 
 	next := ref
@@ -872,13 +1060,14 @@ func (w *Workspace) Rollback(db, branch, to string) (string, error) {
 		if err := os.MkdirAll(filepath.Dir(path), 0o755); err != nil {
 			return err
 		}
-		if err := w.materializeAt(next, headCheckpoint(next), path); err != nil {
+		checksum, err := w.materializeAt(next, headCheckpoint(next), path)
+		if err != nil {
 			return err
 		}
 		// The checkout now equals committed state: refresh the fingerprint
 		// (identity too, since this repointed to a new lineage) so a later
 		// Fork sees it as clean rather than stale.
-		return writeSum(path, next.Lineage, next.HeadEpoch, txid)
+		return writeSum(path, next.Lineage, next.HeadEpoch, txid, checksum)
 	}
 	if err := refresh(); err != nil {
 		return "", fmt.Errorf("ops: branch repointed to checkpoint %q (txid %d), but the checkout could not be refreshed (run 'offshoot checkout' to re-materialize): %w", to, txid, err)
@@ -930,7 +1119,7 @@ func (w *Workspace) Promote(db, source, target string, force bool) (uint64, erro
 	next := tgt
 	next.Lineage, next.Epoch, next.HeadTXID, next.HeadEpoch = lineage, 1, txid, 1
 	next.Checkpoints = nil
-	next.SetCheckpoint("promote", txid, 1)
+	next.SetCheckpoint("promote", store.Checkpoint{TXID: txid, Epoch: 1, CreatedAt: nowStamp()})
 	next.Parent = fmt.Sprintf("%s@%s@%d", db, source, txid)
 	// A repoint is itself a revocation: the old holder is already fenced (its
 	// epoch no longer matches), but carrying its lease forward would leave a
@@ -949,13 +1138,14 @@ func (w *Workspace) Promote(db, source, target string, force bool) (uint64, erro
 		if err := quiesce(path); err != nil {
 			return txid, fmt.Errorf("ops: promoted, but checkout %s is in use and was NOT refreshed: %w", path, err)
 		}
-		if err := w.materializeAt(next, headCheckpoint(next), path); err != nil {
+		checksum, err := w.materializeAt(next, headCheckpoint(next), path)
+		if err != nil {
 			return txid, fmt.Errorf("ops: promoted, but checkout %s could not be refreshed: %w", path, err)
 		}
 		// The checkout now equals committed state: refresh the fingerprint
 		// (identity too, since this repointed to a new lineage) so a later
 		// Fork sees it as clean rather than stale.
-		if err := writeSum(path, next.Lineage, next.HeadEpoch, txid); err != nil {
+		if err := writeSum(path, next.Lineage, next.HeadEpoch, txid, checksum); err != nil {
 			return txid, fmt.Errorf("ops: promoted, but checkout %s could not be refreshed: %w", path, err)
 		}
 	}

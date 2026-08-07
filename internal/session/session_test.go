@@ -205,7 +205,7 @@ func TestSessionTransitionLogsOpenedFlushedClosed(t *testing.T) {
 			out, err := exec.Command("sqlite3", s.ReplicaPath(), "SELECT count(*) FROM t;").Output()
 			return err == nil && string(out) == "1\n"
 		})
-		txid, err = s.Flush("")
+		txid, err = s.Flush("", nil)
 		if err != nil {
 			t.Fatal(err)
 		}
@@ -248,7 +248,7 @@ func TestSessionFencedTransitionIsLogged(t *testing.T) {
 	}
 
 	out := captureStderr(t, func() {
-		if _, err := s.Flush(""); err == nil {
+		if _, err := s.Flush("", nil); err == nil {
 			t.Fatal("Flush after fencing must fail")
 		}
 	})

@@ -423,6 +423,45 @@ Task 1's separate O(size) check.
 
 ## Settling-flush cost (Task 2 controller decision)
 
+> **Update (Milestone 2 follow-up, shipped):** the measurements below still
+> describe the upload's *size* accurately for the case where it happens, but
+> it is no longer unconditional. `rebaseline` now skips this flush entirely
+> when BOTH the checkout `Open` received was already proven byte-identical
+> to the branch's head at open time AND the checksum recorded in that
+> checkout's own `.sum` sidecar exactly matches what the checkout actually
+> contains once the session's real startup rebase finishes — see
+> [docs/status.md](status.md)'s "Settling-flush checksum-compare
+> suppression" row and `internal/session/session.go`'s `rebaseline` doc
+> comment for exactly why both conditions matter. A read-only agent
+> reopening an unmodified checkout uploads nothing at all — AND, just as
+> important, the checksum comparison itself costs no store read: it's read
+> straight out of the local sidecar `Checkout`/`Checkpoint`/`Rollback`/
+> `Promote` already stamp, never fetched fresh from the store. An earlier,
+> since-reverted version of this fix DID fetch it fresh on every `Open`,
+> which meant downloading the entire head object whenever it happened to be
+> a full snapshot — the exact case a permanently-idle read-only session
+> always hits, since it never advances past its first (snapshot) head.
+> `internal/session/flush_test.go`'s
+> `TestReadOnlySessionWithCleanCheckoutMakesNoStoreWrites` asserts this at
+> the backend-call level (exactly 2 `Get`s during `Open` — both tiny ref
+> reads, zero for the head object — and zero of anything at all across the
+> idle settle window). `BenchmarkSessionOpen`, re-run against the final
+> code:
+>
+> | size | ns/op | throughput | B/op | allocs/op |
+> |---|---|---|---|---|
+> | 64MB | 29,996,972 | 2239.92 MB/s | 62,634 | 394 |
+> | 512MB | 199,496,139 | 2694.13 MB/s | 62,906 | 393 |
+>
+> (`-benchtime=3x`, local filesystem backend — the default this benchmark
+> falls back to without `OFFSHOOT_S3_TEST_BUCKET` set; `B/op`/`allocs/op` stay flat across
+> a 8x size increase, consistent with no per-byte store traffic on this
+> path — the unit test above is the byte-level proof, this is its latency
+> consequence.) A session whose checkout had to be (re)materialized first
+> (first-ever open, a dirty/stale checkout, or one whose sidecar predates
+> checksum-recording — see status.md's row for the exact fail-toward-settling
+> case) still pays the settling-flush cost measured below, once.
+
 Every daemon session's first auto-flush tick after `Open` uploads a **full
 snapshot** — the `forceSnapshot` path — even for a session that never
 writes anything (a read-only agent that only queries). This was a ledgered

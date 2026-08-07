@@ -79,7 +79,7 @@ func TestRenewalDetectsFencingAndEndsSession(t *testing.T) {
 	waitFor(t, 3*time.Second, "session to notice it was fenced", func() bool {
 		return errors.Is(s.Err(), ErrFenced)
 	})
-	if _, err := s.Flush(""); !errors.Is(err, ErrFenced) {
+	if _, err := s.Flush("", nil); !errors.Is(err, ErrFenced) {
 		t.Fatalf("a fenced session must refuse to flush, got %v", err)
 	}
 }
@@ -134,7 +134,7 @@ func TestRenewalEndsWhenBranchDestroyed(t *testing.T) {
 	if err := w.Create("app"); err != nil {
 		t.Fatal(err)
 	}
-	if _, err := w.Fork("app", "main", "feature", "", 0); err != nil {
+	if _, err := w.Fork("app", "main", "feature", "", 0, nil); err != nil {
 		t.Fatal(err)
 	}
 	s, err := Open(context.Background(), Options{

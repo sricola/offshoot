@@ -3,6 +3,7 @@ package session
 import (
 	"context"
 	"fmt"
+	"os"
 	"os/exec"
 	"testing"
 
@@ -51,7 +52,7 @@ func TestCleanResumeRebaselinesBeforeFirstSegment(t *testing.T) {
 		if out, err := exec.Command("sqlite3", s1.CheckoutPath(), "INSERT INTO t VALUES ('a');").CombinedOutput(); err != nil {
 			t.Fatalf("%v: %s", err, out)
 		}
-		if _, err := s1.Flush(""); err != nil {
+		if _, err := s1.Flush("", nil); err != nil {
 			t.Fatalf("flush %d: %v", i, err)
 		}
 	}
@@ -76,7 +77,7 @@ func TestCleanResumeRebaselinesBeforeFirstSegment(t *testing.T) {
 		if out, err := exec.Command("sqlite3", s2.CheckoutPath(), "INSERT INTO t VALUES ('b');").CombinedOutput(); err != nil {
 			t.Fatalf("%v: %s", err, out)
 		}
-		if _, err := s2.Flush(""); err != nil {
+		if _, err := s2.Flush("", nil); err != nil {
 			t.Fatalf("flush after resume %d: %v", i, err)
 		}
 	}
@@ -125,13 +126,13 @@ func TestEveryFlushIsExactlyMaterializable(t *testing.T) {
 			t.Fatalf("%v: %s", err, out)
 		}
 		name := fmt.Sprintf("cp%d", i)
-		if _, err := s.Flush(name); err != nil {
+		if _, err := s.Flush(name, nil); err != nil {
 			t.Fatalf("flush %d: %v", i, err)
 		}
 		// Every checkpoint so far must still materialize to the right row count.
 		for j := 0; j <= i; j++ {
 			br := fmt.Sprintf("check-%d-%d", i, j)
-			if _, err := w.Fork("app", "main", br, fmt.Sprintf("cp%d", j), 0); err != nil {
+			if _, err := w.Fork("app", "main", br, fmt.Sprintf("cp%d", j), 0, nil); err != nil {
 				t.Fatalf("fork at cp%d: %v", j, err)
 			}
 			p, err := w.Checkout("app", br)
@@ -207,7 +208,7 @@ func TestChainSurvivesSessionRestart(t *testing.T) {
 		if out, err := exec.Command("sqlite3", s1.CheckoutPath(), "INSERT INTO t VALUES ('a');").CombinedOutput(); err != nil {
 			t.Fatalf("%v: %s", err, out)
 		}
-		if _, err := s1.Flush(""); err != nil {
+		if _, err := s1.Flush("", nil); err != nil {
 			t.Fatal(err)
 		}
 	}
@@ -229,7 +230,7 @@ func TestChainSurvivesSessionRestart(t *testing.T) {
 	if out, err := exec.Command("sqlite3", s2.CheckoutPath(), "INSERT INTO t VALUES ('b');").CombinedOutput(); err != nil {
 		t.Fatalf("%v: %s", err, out)
 	}
-	if _, err := s2.Flush(""); err != nil {
+	if _, err := s2.Flush("", nil); err != nil {
 		t.Fatalf("flush after restart: %v", err)
 	}
 	// w.Checkout materializes to the same fixed checkout path s2 already has
@@ -275,7 +276,7 @@ func TestMissingSegmentIsLoud(t *testing.T) {
 		if out, err := exec.Command("sqlite3", s.CheckoutPath(), "INSERT INTO t VALUES ('x');").CombinedOutput(); err != nil {
 			t.Fatalf("%v: %s", err, out)
 		}
-		if _, err := s.Flush(""); err != nil {
+		if _, err := s.Flush("", nil); err != nil {
 			t.Fatal(err)
 		}
 	}
@@ -303,6 +304,21 @@ func TestMissingSegmentIsLoud(t *testing.T) {
 	if err := w.Store.B.Delete(victim); err != nil {
 		t.Fatal(err)
 	}
+	// s.Close() above just stamped the checkout's .sum sidecar as clean and
+	// current (Commit B — sidecar refresh on clean close): a checkout
+	// proven clean-and-current skips chain resolution entirely (see
+	// ops.Checkout's own fast path), which would make this test's whole
+	// premise — that a checkout ACTUALLY consults the chain — silently
+	// untrue. Force the real materialization path by removing the checkout
+	// (and its now-stale-relative-to-the-deleted-segment sidecar) first,
+	// same as a checkout on a fresh machine or after `rm -rf` on the local
+	// cache (an intentionally supported operation — see README's
+	// resource-behavior section).
+	checkoutPath := w.CheckoutPath("app", "main")
+	if err := os.Remove(checkoutPath); err != nil {
+		t.Fatal(err)
+	}
+	os.Remove(checkoutPath + ".sum")
 	if _, err := w.Checkout("app", "main"); err == nil {
 		t.Fatal("a missing chain member must fail loudly, not silently read an older state")
 	}

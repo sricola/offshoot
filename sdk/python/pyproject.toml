@@ -1,13 +1,58 @@
 [build-system]
-requires = ["setuptools>=68"]
+requires = ["setuptools>=77"]
 build-backend = "setuptools.build_meta"
 
 [project]
 name = "offshoot-db"
 version = "0.1.0"
 description = "Python client for offshoot: branchable SQLite for agents"
+readme = "README.md"
 requires-python = ">=3.10"
 license = "Apache-2.0"
+authors = [
+  { name = "offshoot contributors" },
+]
+keywords = ["sqlite", "branching", "agents", "eval", "testing", "checkpoint"]
+classifiers = [
+  "Development Status :: 3 - Alpha",
+  "Intended Audience :: Developers",
+  "Programming Language :: Python :: 3",
+  "Programming Language :: Python :: 3.10",
+  "Programming Language :: Python :: 3.11",
+  "Programming Language :: Python :: 3.12",
+  "Programming Language :: Python :: 3.13",
+  "Topic :: Database",
+  "Topic :: Software Development :: Testing",
+  "Operating System :: POSIX :: Linux",
+  "Operating System :: MacOS",
+]
+# License classifiers are deliberately omitted: PEP 639's SPDX `license`
+# string above and a `License ::` trove classifier are redundant, and recent
+# setuptools treats having both as at least a deprecation warning — see
+# https://peps.python.org/pep-0639/.
+dependencies = []
+
+[project.urls]
+Homepage = "https://github.com/offshoot-db/offshoot"
+Repository = "https://github.com/offshoot-db/offshoot"
+Issues = "https://github.com/offshoot-db/offshoot/issues"
+Changelog = "https://github.com/offshoot-db/offshoot/blob/main/CHANGELOG.md"
+Documentation = "https://github.com/offshoot-db/offshoot/blob/main/docs/eval-harness.md"
+
+# `offshoot-db[pytest]` is the only way pytest becomes a dependency: the
+# base client (`pip install offshoot-db`) stays stdlib-only. The pytest11
+# entry point below is registered UNCONDITIONALLY (every install, extra or
+# not) — that's harmless, because pytest only ever imports
+# offshoot.pytest_plugin when pytest itself is already running (i.e.
+# already installed); a bare `pip install offshoot-db` with no pytest on
+# the machine never triggers that import at all. The module itself still
+# import-guards `pytest` (see offshoot/pytest_plugin.py's docstring) as a
+# second line of defense for a stray direct import.
+[project.optional-dependencies]
+pytest = ["pytest>=7"]
+
+[project.entry-points.pytest11]
+offshoot = "offshoot.pytest_plugin"
 
 [tool.setuptools.packages.find]
 include = ["offshoot*"]
