@@ -2,8 +2,11 @@ package metrics
 
 import (
 	"bytes"
+	"fmt"
 	"os"
 	"os/exec"
+	"regexp"
+	"strconv"
 	"strings"
 	"sync"
 	"testing"
@@ -323,6 +326,90 @@ func TestCollectCanCallWithLabelValuesWithoutDeadlock(t *testing.T) {
 	case <-done:
 	case <-time.After(5 * time.Second):
 		t.Fatal("WritePrometheus deadlocked calling a Collect callback that uses WithLabelValues")
+	}
+}
+
+// TestWritePrometheusSerializesConcurrentCollectorRuns is the Registry-level
+// half of Milestone 4 Task 3's carried-over T2 review item: WritePrometheus
+// must serialize concurrent scrapes so a multi-step Collect callback (Reset
+// a GaugeVec, then repopulate it — exactly the shape internal/daemon's
+// collectSessionGauges uses for offshoot_capture_lag_bytes/
+// offshoot_durable_age_seconds) can never have another concurrent scrape's
+// run of the SAME callback interleave with its own Reset/repopulate and tear
+// the output. See Registry.scrapeMu's doc comment for the exact failure
+// mode; internal/daemon/http_test.go's TestConcurrentMetricsScrapesWithSessionChurn
+// exercises the same property end to end over real HTTP against the real
+// daemon collector.
+//
+// This test's collector deliberately mirrors that two-family shape: a plain
+// Gauge always set to n, and a GaugeVec Reset then repopulated with exactly
+// n label combinations, with a sleep between Reset and repopulate to widen
+// the race window. Because both are set from the SAME collector run with the
+// SAME n, every single scrape's output must show the vec's live sample-line
+// count exactly equal to the gauge's value — any mismatch is direct proof a
+// scrape observed a torn, interleaved collector state. Confirmed to fail
+// reliably (mismatches most iterations) against a build with scrapeMu's
+// Lock/Unlock removed from WritePrometheus.
+func TestWritePrometheusSerializesConcurrentCollectorRuns(t *testing.T) {
+	r := NewRegistry()
+	countGauge := r.NewGauge("scrape_count_gauge", "count of the vec's live label combinations")
+	vec := r.NewGaugeVec("scrape_vec_gauge", "one sample per live combination", "id")
+
+	const n = 5
+	r.Collect(func() {
+		vec.Reset()
+		countGauge.Set(float64(n))
+		// Deliberate gap: without scrapeMu, another goroutine's concurrent
+		// WritePrometheus call can run this same collector's Reset (wiping
+		// what's about to be repopulated below, or repopulating and then
+		// getting wiped) inside this window.
+		time.Sleep(500 * time.Microsecond)
+		for i := 0; i < n; i++ {
+			vec.WithLabelValues(fmt.Sprintf("s%d", i)).Set(1)
+		}
+	})
+
+	countRE := regexp.MustCompile(`(?m)^scrape_count_gauge (\S+)$`)
+	vecLineRE := regexp.MustCompile(`(?m)^scrape_vec_gauge\{`)
+
+	const goroutines = 20
+	const perGoroutine = 15
+	var wg sync.WaitGroup
+	failures := make(chan string, goroutines*perGoroutine)
+	for g := 0; g < goroutines; g++ {
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			for i := 0; i < perGoroutine; i++ {
+				var buf bytes.Buffer
+				if err := r.WritePrometheus(&buf); err != nil {
+					failures <- "WritePrometheus error: " + err.Error()
+					continue
+				}
+				out := buf.String()
+				m := countRE.FindStringSubmatch(out)
+				if m == nil {
+					failures <- "missing scrape_count_gauge sample:\n" + out
+					continue
+				}
+				count, err := strconv.ParseFloat(m[1], 64)
+				if err != nil {
+					failures <- "unparseable scrape_count_gauge value: " + m[1]
+					continue
+				}
+				lines := len(vecLineRE.FindAllString(out, -1))
+				if int(count) != lines {
+					failures <- fmt.Sprintf(
+						"torn scrape: scrape_count_gauge=%v but scrape_vec_gauge has %d sample lines (want equal):\n%s",
+						count, lines, out)
+				}
+			}
+		}()
+	}
+	wg.Wait()
+	close(failures)
+	for f := range failures {
+		t.Error(f)
 	}
 }
 

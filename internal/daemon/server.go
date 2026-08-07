@@ -9,6 +9,7 @@ import (
 	"errors"
 	"fmt"
 	"net"
+	"net/http"
 	"os"
 	"path/filepath"
 	"sort"
@@ -67,6 +68,24 @@ type Server struct {
 	// instrumentation hooks get wired to it without either of those
 	// packages importing internal/metrics.
 	metrics *Metrics
+
+	// httpSrv is the optional opt-in HTTP listener (Milestone 4 Task 3) —
+	// nil unless StartHTTP has been called. Written once, under s.mu, by
+	// StartHTTP before its handler goroutine is spawned (see StartHTTP's
+	// doc comment); Shutdown reads it under s.mu too, so a Shutdown racing
+	// a StartHTTP call sees either nil (nothing to close) or a fully
+	// initialized *http.Server, never a partially-constructed one. See
+	// http.go.
+	httpSrv *http.Server
+	// httpToken is the Bearer token every authenticated HTTP request must
+	// present (see http.go's requireAuth). Same single-writer-before-
+	// serving contract as httpSrv above.
+	httpToken string
+	// httpAddr is the HTTP listener's actual bound address (ln.Addr().String()),
+	// captured so a caller that bound to "host:0" can discover the
+	// OS-assigned port via HTTPAddr(). Same single-writer-before-serving
+	// contract as httpSrv/httpToken above.
+	httpAddr string
 }
 
 func key(db, branch string) string { return db + "@" + branch }
@@ -524,6 +543,21 @@ func (s *Server) opStatus() Response {
 		infos = append(infos, info)
 	}
 	return Response{OK: true, Sessions: infos}
+}
+
+// sessionCount returns the number of FULLY OPEN sessions (a reserved-but-
+// nil in-flight-open slot does not count, matching opStatus's own
+// treatment) — backs GET /healthz's `sessions` field.
+func (s *Server) sessionCount() int {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	n := 0
+	for _, sess := range s.sessions {
+		if sess != nil {
+			n++
+		}
+	}
+	return n
 }
 
 func (s *Server) opClose(req Request) Response {
@@ -1030,6 +1064,35 @@ func (s *Server) Shutdown(ctx context.Context) error {
 		c.Close()
 	}
 	s.connMu.Unlock()
+
+	// The optional HTTP listener (Milestone 4 Task 3), if StartHTTP was ever
+	// called, is shed at this same point, right alongside the unix
+	// listener/conns above: http.Server.Close() immediately closes its
+	// listener AND every connection it currently holds, matching the unix
+	// side's philosophy of shedding fast rather than draining gracefully
+	// (http.Server.Shutdown would wait out in-flight handlers, which this
+	// daemon does not need — see below). This is safe for a request that is
+	// ITSELF the "shutdown" op arriving over HTTP: the HTTP rpc handler
+	// writes and flushes that request's response, on its own connection,
+	// strictly BEFORE it ever triggers this Shutdown call (see http.go's
+	// handleRPC, the HTTP analog of handle's own respond-then-shutdown
+	// ordering fix) — by the time Close() runs here, those bytes are
+	// already past the handler and into the kernel's send buffer, so
+	// Close() tearing down the connection immediately afterward cannot
+	// erase a response that was already written. Any OTHER HTTP request
+	// truly in flight when an unrelated Shutdown (e.g. SIGINT) fires simply
+	// sees its connection close — no panic, no hang; dispatch()'s own
+	// per-op s.closing checks (opOpen, etc.) already make a request that
+	// slips through in the narrow window before Close() takes effect fail
+	// safely with "daemon: shutting down" rather than corrupting state,
+	// exactly as they do for the unix socket. s.httpSrv is read under s.mu
+	// since StartHTTP writes it under the same lock (see its doc comment).
+	s.mu.Lock()
+	httpSrv := s.httpSrv
+	s.mu.Unlock()
+	if httpSrv != nil {
+		httpSrv.Close()
+	}
 
 	janitorWait := make(chan struct{})
 	go func() {
