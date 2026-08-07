@@ -8,8 +8,16 @@ from __future__ import annotations
 
 import json
 import socket
+from collections.abc import Generator
 from dataclasses import dataclass, field
 from datetime import timedelta
+from typing import Any, TypeAlias, cast
+
+# The TTL argument shape every `ttl=`-accepting method on this client (and
+# offshoot.langgraph.ThreadForks) takes — see `_ttl_str`'s docstring for how
+# each variant renders onto the wire. Not exported (module-private): purely
+# a typing convenience, not part of the public API surface.
+_TTL: TypeAlias = timedelta | int | str | None
 
 
 class OffshootError(Exception):
@@ -88,10 +96,10 @@ class Event:
     type: str
     db: str = ""
     branch: str = ""
-    detail: dict = field(default_factory=dict)
+    detail: dict[str, Any] = field(default_factory=dict)
 
 
-def _ttl_str(ttl) -> str:
+def _ttl_str(ttl: _TTL) -> str:
     """Render a Python TTL value into the wire's Go-duration-string form.
 
     None means "no change" (fork: no TTL; touch: keep the current TTL); 0 or
@@ -150,10 +158,10 @@ class Client:
     def __enter__(self) -> "Client":
         return self
 
-    def __exit__(self, *exc_info) -> None:
+    def __exit__(self, *exc_info: object) -> None:
         self.close()
 
-    def _call(self, op: str, **fields) -> dict:
+    def _call(self, op: str, **fields: object) -> dict[str, Any]:
         req = {"op": op, **{k: v for k, v in fields.items() if v not in ("", None, False)}}
         try:
             self._sock.sendall(json.dumps(req).encode() + b"\n")
@@ -163,7 +171,7 @@ class Client:
         if not line:
             raise OffshootError("daemon closed the connection")
         try:
-            resp = json.loads(line)
+            resp: dict[str, Any] = json.loads(line)
         except json.JSONDecodeError as e:
             raise OffshootError(f"daemon sent a malformed response: {e}") from e
         if not resp.get("ok", False):
@@ -182,10 +190,10 @@ class Client:
     def checkout(self, db: str, branch: str) -> str:
         """Materialize db@branch's head snapshot at rest; returns its path."""
         resp = self._call("checkout", db=db, branch=branch)
-        return resp["checkout"]
+        return cast(str, resp["checkout"])
 
     def fork(self, db: str, source: str, new: str, from_checkpoint: str | None = None,
-              ttl=None, meta: dict[str, str] | None = None) -> int:
+              ttl: _TTL = None, meta: dict[str, str] | None = None) -> int:
         """Branch `new` off db@source (at from_checkpoint, or source's head).
 
         meta (None = no metadata) is a small string->string map describing
@@ -197,7 +205,7 @@ class Client:
         """
         resp = self._call("fork", db=db, branch=source, name=new, ttl=_ttl_str(ttl),
                             meta=meta or None, **{"from": from_checkpoint or ""})
-        return resp.get("txid", 0)
+        return cast(int, resp.get("txid", 0))
 
     def destroy(self, db: str, branch: str, force: bool = False) -> None:
         """Delete db@branch. force overrides the protected-branch refusal."""
@@ -206,14 +214,14 @@ class Client:
     def rollback(self, db: str, branch: str, to: str) -> str:
         """Repoint db@branch at checkpoint `to`; returns the refreshed checkout path."""
         resp = self._call("rollback", db=db, branch=branch, name=to)
-        return resp.get("checkout", "")
+        return cast(str, resp.get("checkout", ""))
 
     def promote(self, db: str, source: str, onto: str, force: bool = False) -> int:
         """Repoint db@onto at db@source's head; returns the promoted txid."""
         resp = self._call("promote", db=db, branch=source, name=onto, force=force)
-        return resp.get("txid", 0)
+        return cast(int, resp.get("txid", 0))
 
-    def touch(self, db: str, branch: str, ttl=None) -> None:
+    def touch(self, db: str, branch: str, ttl: _TTL = None) -> None:
         """Reset db@branch's activity clock, optionally setting/clearing its TTL.
 
         ttl: None keeps the current TTL, a timedelta/duration-string sets it,
@@ -250,7 +258,7 @@ class Client:
     def dbs(self) -> list[str]:
         """List every database this store has at least one ref for, sorted."""
         resp = self._call("dbs")
-        return resp.get("databases", [])
+        return cast(list[str], resp.get("databases", []))
 
     def export(self, db: str, branch: str, out_path: str,
                checkpoint: str | None = None, force: bool = False) -> None:
@@ -281,9 +289,9 @@ class Client:
         Returns the read-only cache file's path.
         """
         resp = self._call("checkout-at", db=db, branch=branch, name=checkpoint, force=force)
-        return resp.get("checkout", "")
+        return cast(str, resp.get("checkout", ""))
 
-    def events(self):
+    def events(self) -> Generator[Event, None, None]:
         """Stream the daemon's event feed, yielding one :class:`Event` per
         line, in publish order, until the stream ends.
 
@@ -357,7 +365,7 @@ class Client:
             if not line:
                 raise OffshootError("daemon closed the connection")
             try:
-                ack = json.loads(line)
+                ack: dict[str, Any] = json.loads(line)
             except json.JSONDecodeError as e:
                 raise OffshootError(f"daemon sent a malformed response: {e}") from e
             if not ack.get("ok", False):
@@ -371,7 +379,7 @@ class Client:
                 if not line:
                     return  # daemon closed the stream (unsubscribed, or shutdown)
                 try:
-                    raw = json.loads(line)
+                    raw: dict[str, Any] = json.loads(line)
                 except json.JSONDecodeError as e:
                     raise OffshootError(f"daemon sent a malformed event: {e}") from e
                 ev = Event(
@@ -389,10 +397,10 @@ class Client:
             rfile.close()
             sock.close()
 
-    def status(self) -> list[dict]:
+    def status(self) -> list[dict[str, Any]]:
         """List every session open in the daemon, as raw dicts."""
         resp = self._call("status")
-        return resp.get("sessions", [])
+        return cast(list[dict[str, Any]], resp.get("sessions", []))
 
     def close(self) -> None:
         """Close the connection to the daemon."""
@@ -417,7 +425,7 @@ class Session:
         """
         resp = self._client._call("flush", db=self._db, branch=self._branch, name=name,
                                     meta=meta or None)
-        return resp.get("txid", 0)
+        return cast(int, resp.get("txid", 0))
 
     def close(self) -> None:
         """Close the session, releasing its lease."""

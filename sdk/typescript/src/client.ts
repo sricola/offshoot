@@ -164,8 +164,90 @@ export async function connect(socketPath: string): Promise<Client> {
   return new Client(sock, socketPath);
 }
 
+// --------------------------------------------------------------------------
+// Internal wire types
+// --------------------------------------------------------------------------
+//
+// The interfaces below mirror internal/daemon/protocol.go's Response and
+// its embedded structs EXACTLY as JSON arrives off the socket — every
+// field that Go struct tags `omitempty` is optional here too, and none of
+// this is exported. They exist purely so `_call`'s Promise<RawResponse>
+// return type gives every call site in this file a real, typed field to
+// read (`resp.checkout`, `resp.branches`, ...) instead of `any`. These are
+// NOT the same types as the public {@link Branch}, {@link CheckpointInfo},
+// {@link SessionInfo} a couple of them get normalized into above — e.g.
+// RawBranchInfo's fields are all optional pre-normalization; Branch's
+// aren't.
+
+/** @internal Wire shape of one entry in Response.CheckpointsV2. */
+interface RawCheckpointInfo {
+  name: string;
+  txid?: number;
+  created_at?: string;
+}
+
+/** @internal Wire shape of one entry in Response.Branches. */
+interface RawBranchInfo {
+  branch: string;
+  head_txid?: number;
+  protected?: boolean;
+  ttl?: string;
+  ttl_remaining?: string;
+  lease_holder?: string;
+  checkpoints?: string[];
+  touched_at?: string;
+  checkpoints_v2?: RawCheckpointInfo[];
+  state?: string;
+}
+
+/** @internal Wire shape of one entry in Response.Sessions — structurally
+ * compatible with the public {@link SessionInfo} (every field SessionInfo
+ * requires is required here too), so `status()` can return it unmodified. */
+interface RawSessionInfo {
+  db: string;
+  branch: string;
+  checkout: string;
+  holder: string;
+  epoch: number;
+  durable_txid: number;
+  error?: string;
+}
+
+/** @internal The daemon's raw JSON response line — mirrors
+ * internal/daemon/protocol.go's `Response` struct. Every op populates a
+ * different subset of these fields (see that struct's doc comment for
+ * which); every field but `ok` stays optional here rather than chasing a
+ * true per-op union, since each call site below already knows — and
+ * defaults, via the exact same `??`/`!` it used before this type existed —
+ * which fields its own op actually guarantees. */
+interface RawResponse {
+  ok: boolean;
+  error?: string;
+  checkout?: string;
+  txid?: number;
+  sessions?: RawSessionInfo[];
+  branches?: RawBranchInfo[];
+  databases?: string[];
+}
+
+/** @internal The subscribe op's one-line ack, read off the socket before
+ * the connection leaves request/response mode — see {@link Client.events}. */
+type RawAck = Pick<RawResponse, "ok" | "error">;
+
+/** @internal One event line's wire shape, exactly as JSON.parse returns it
+ * before {@link Client.events} narrows it into the public
+ * {@link OffshootEvent} it yields. */
+interface RawEvent {
+  v: number;
+  ts: string;
+  type: string;
+  db?: string;
+  branch?: string;
+  detail?: Record<string, unknown>;
+}
+
 interface Waiter {
-  res: (v: any) => void;
+  res: (v: RawResponse) => void;
   rej: (e: Error) => void;
 }
 
@@ -207,7 +289,7 @@ export class Client {
         this.buf = this.buf.slice(i + 1);
         const waiter = this.queue.shift();
         if (!waiter) continue;
-        let resp: any;
+        let resp: RawResponse;
         try {
           resp = JSON.parse(line);
         } catch (e) {
@@ -227,12 +309,22 @@ export class Client {
     for (const w of this.queue.splice(0)) w.rej(e);
   }
 
-  /** Send one request and resolve with its response. Public (but
+  /**
+   * Send one request and resolve with its response. Public (but
    * underscore-prefixed, matching the Python SDK's `_call` convention) so
    * {@link Session} can issue requests through the same connection/queue
    * without an `as any` escape hatch. Not intended for use outside this
-   * package's own client code. */
-  _call(op: string, fields: Record<string, unknown> = {}): Promise<any> {
+   * package's own client code.
+   *
+   * Stays a real, callable method at runtime, and still fully typed for
+   * this package's own test files (which compile straight against this
+   * source, not against the stripped declaration output below) — only the
+   * PUBLISHED `.d.ts` loses it, via the `@internal` tag below plus
+   * tsconfig.build.json's `stripInternal`.
+   *
+   * @internal
+   */
+  _call(op: string, fields: Record<string, unknown> = {}): Promise<RawResponse> {
     if (this.closed) {
       return Promise.reject(new OffshootError("daemon connection failed: socket is closed"));
     }
@@ -260,13 +352,17 @@ export class Client {
   /** Open a live session on db@branch; returns its Session. */
   async open(db: string, branch = "main"): Promise<Session> {
     const resp = await this._call("open", { db, branch });
-    return new Session(this, resp.checkout, db, branch);
+    // "open" always populates checkout on an ok:true response — see
+    // protocol.go's Response.Checkout — same non-defaulted assumption this
+    // line always made back when resp was `any`, now spelled out as a
+    // non-null assertion instead of an implicit one.
+    return new Session(this, resp.checkout!, db, branch);
   }
 
   /** Materialize db@branch's head snapshot at rest; returns its path. */
   async checkout(db: string, branch: string): Promise<string> {
     const resp = await this._call("checkout", { db, branch });
-    return resp.checkout;
+    return resp.checkout!;
   }
 
   /** Branch `newBranch` off db@source (at opts.from, or source's head).
@@ -314,7 +410,7 @@ export class Client {
   /** List every branch of db. */
   async branches(db: string): Promise<Branch[]> {
     const resp = await this._call("branches", { db });
-    const raw: any[] = resp.branches ?? [];
+    const raw: RawBranchInfo[] = resp.branches ?? [];
     return raw.map((b) => ({
       branch: b.branch,
       head_txid: b.head_txid ?? 0,
@@ -324,7 +420,7 @@ export class Client {
       lease_holder: b.lease_holder ?? "",
       checkpoints: b.checkpoints ?? [],
       touched_at: b.touched_at ?? "",
-      checkpoints_v2: (b.checkpoints_v2 ?? []).map((cp: any) => ({
+      checkpoints_v2: (b.checkpoints_v2 ?? []).map((cp) => ({
         name: cp.name,
         txid: cp.txid ?? 0,
         created_at: cp.created_at ?? "",
@@ -455,7 +551,7 @@ export class Client {
           buf = buf.slice(i + 1);
           if (!sawAck) {
             sawAck = true;
-            let ack: any;
+            let ack: RawAck;
             try {
               ack = JSON.parse(line);
             } catch (e) {
@@ -464,7 +560,7 @@ export class Client {
             if (!ack.ok) throw new OffshootError(ack.error ?? "unknown daemon error");
             continue;
           }
-          let raw: any;
+          let raw: RawEvent;
           try {
             raw = JSON.parse(line);
           } catch (e) {

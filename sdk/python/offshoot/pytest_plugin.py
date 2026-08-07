@@ -161,9 +161,10 @@ import tempfile
 import threading
 import time
 import warnings
+from collections.abc import Generator, Mapping
 from dataclasses import dataclass, field
 from pathlib import Path
-from typing import Callable
+from typing import Callable, TypeAlias
 
 try:
     import pytest
@@ -178,6 +179,11 @@ except ImportError as e:  # pragma: no cover - exercised only when the
 
 from .client import Client, OffshootError, Session, connect
 from .langgraph import _UNSAFE_RUN, _sanitize
+
+# A seed is a callable given the writable sqlite path to seed however it
+# likes, or a SQL string run via `sqlite3` — see `_run_seed`. Module-private
+# typing convenience, not part of this module's public surface.
+_Seed: TypeAlias = Callable[[str], object] | str
 
 __all__ = [
     "SeedHandle",
@@ -200,7 +206,7 @@ _MAX_WORKER_LEN = 20  # bounds _branch_name's worker segment; see its docstring
 # byte-compare two SQLite files; compare their `.dump` text instead).
 # --------------------------------------------------------------------------
 
-def offshoot_dump(path) -> str:
+def offshoot_dump(path: str | Path) -> str:
     """Return ``sqlite3 <path> .dump``'s text output.
 
     THE way to compare two offshoot-materialized SQLite files (e.g. two
@@ -237,7 +243,7 @@ def offshoot_dump(path) -> str:
 
 
 @pytest.fixture(name="offshoot_dump")
-def _offshoot_dump_fixture():
+def _offshoot_dump_fixture() -> Callable[[str | Path], str]:
     """Fixture form of :func:`offshoot_dump` — returns the callable itself
     (not its result), so a test can request it by fixture name and call it
     like the plain function: ``def test_x(offshoot_dump):
@@ -260,13 +266,13 @@ class BinaryMisconfigured(Exception):
     path should fail loud, not silently skip the whole suite."""
 
 
-def _locate_binary(env: dict | None = None) -> Path | None:
+def _locate_binary(env: Mapping[str, str] | None = None) -> Path | None:
     """OFFSHOOT_BIN env var (must point at an existing, regular file — else
     raises :class:`BinaryMisconfigured`), else the first `offshoot` on
     PATH, else None (nothing configured anywhere — the ordinary "skip"
     case)."""
-    env = os.environ if env is None else env
-    explicit = env.get("OFFSHOOT_BIN")
+    resolved_env: Mapping[str, str] = os.environ if env is None else env
+    explicit = resolved_env.get("OFFSHOOT_BIN")
     if explicit:
         p = Path(explicit)
         if not p.exists():
@@ -277,7 +283,7 @@ def _locate_binary(env: dict | None = None) -> Path | None:
                 f"OFFSHOOT_BIN={explicit!r} is not a file "
                 "(is it a directory?).")
         return p
-    found = shutil.which("offshoot", path=env.get("PATH"))
+    found = shutil.which("offshoot", path=resolved_env.get("PATH"))
     return Path(found) if found else None
 
 
@@ -290,7 +296,7 @@ _INSTALL_INSTRUCTIONS = (
 )
 
 
-def _drain_stderr(proc: subprocess.Popen, tail: "collections.deque[str]") -> None:
+def _drain_stderr(proc: subprocess.Popen[bytes], tail: "collections.deque[str]") -> None:
     assert proc.stderr is not None
     try:
         for raw in iter(proc.stderr.readline, b""):
@@ -306,7 +312,7 @@ class DaemonHandle:
     exercise a dead-daemon failure mode, for instance) uses this directly.
     """
 
-    def __init__(self, sock: str, store: Path, proc: subprocess.Popen):
+    def __init__(self, sock: str, store: Path, proc: subprocess.Popen[bytes]):
         self.sock = sock
         self.store = store
         self.proc = proc
@@ -388,7 +394,7 @@ def _connect(sock: str, stderr_tail: Callable[[], str] = lambda: "") -> Client:
 
 
 @pytest.fixture(scope="session")
-def offshoot_daemon(request):
+def offshoot_daemon(request: pytest.FixtureRequest) -> Generator[DaemonHandle, None, None]:
     """Session-scoped `offshoot serve` on a fresh temp store + socket.
 
     See the module docstring's "xdist stance" section: under xdist this
@@ -468,7 +474,7 @@ def _seed_opens_own_transaction(seed: str) -> bool:
     return head == "BEGIN" and (len(rest) == 5 or not (rest[5].isalnum() or rest[5] == "_"))
 
 
-def _run_seed(session: Session, seed) -> None:
+def _run_seed(session: Session, seed: _Seed) -> None:
     """Run one seed (a callable(path) or a SQL string) against session's
     writable sqlite path, then flush it to the `seed` checkpoint."""
     if callable(seed):
@@ -502,7 +508,7 @@ def _run_seed(session: Session, seed) -> None:
     session.flush("seed")
 
 
-def _fingerprint_seed(seed) -> str:
+def _fingerprint_seed(seed: _Seed) -> str:
     """A cheap identity for a seed value, used to catch "same name, silently
     different seed" mistakes: `offshoot_db` memoizes by NAME, not by seed
     content, so a second call for an already-seeded name whose seed doesn't
@@ -553,7 +559,7 @@ class _SeedFactory:
         # against the stale fingerprint.
         self._seed_refs: dict[str, object] = {}
 
-    def __call__(self, name: str = "default", seed=None) -> SeedHandle:
+    def __call__(self, name: str = "default", seed: _Seed | None = None) -> SeedHandle:
         cached = self._seeded.get(name)
         if cached is not None:
             if seed is not None and _fingerprint_seed(seed) != self._fingerprints.get(name):
@@ -592,7 +598,7 @@ class _SeedFactory:
 
 
 @pytest.fixture(scope="session")
-def offshoot_db(offshoot_daemon, request):
+def offshoot_db(offshoot_daemon: DaemonHandle, request: pytest.FixtureRequest) -> Generator[_SeedFactory, None, None]:
     """Session-scoped named-seed factory: `offshoot_db(name="default",
     seed=None)`. See the module docstring for the full contract."""
     client = _connect(offshoot_daemon.sock, offshoot_daemon.stderr_tail)
@@ -728,7 +734,9 @@ class _ForkFactory:
 
 
 @pytest.fixture
-def offshoot_fork(offshoot_daemon, offshoot_db, request):
+def offshoot_fork(
+    offshoot_daemon: DaemonHandle, offshoot_db: _SeedFactory, request: pytest.FixtureRequest,
+) -> Generator[_ForkFactory, None, None]:
     """Function-scoped fork-per-test factory: `offshoot_fork(seed_handle=
     None)`. See the module docstring for the full contract."""
     client = _connect(offshoot_daemon.sock, offshoot_daemon.stderr_tail)
@@ -750,7 +758,7 @@ def offshoot_fork(offshoot_daemon, offshoot_db, request):
             client.close()
 
 
-def pytest_addoption(parser):
+def pytest_addoption(parser: pytest.Parser) -> None:
     parser.addini(
         "offshoot_seed", default="",
         help="Path to a .sql file (resolved against rootdir) run (via "

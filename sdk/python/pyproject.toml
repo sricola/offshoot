@@ -56,3 +56,11 @@ offshoot = "offshoot.pytest_plugin"
 
 [tool.setuptools.packages.find]
 include = ["offshoot*"]
+
+# PEP 561: py.typed is a zero-byte marker (not a .py file, so setuptools
+# doesn't ship it by default) telling downstream type checkers (mypy,
+# pyright, ...) that this package carries its own inline type annotations
+# and should be checked against them, instead of falling back to
+# stub-less "Any" for everything imported from it.
+[tool.setuptools.package-data]
+offshoot = ["py.typed"]

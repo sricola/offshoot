@@ -453,6 +453,50 @@ version if you depend on format stability.
   shipped-and-tested row; `docs/reference.md`'s `offshoot destroy` section
   documents the claim-guard and the backend split.
 
+- **SDK typing polish** (Milestone 4 Task 7, pre-publish list) — behavior-
+  preserving, no public signature or wire changes.
+
+  TypeScript (`sdk/typescript/src/client.ts`): the internal `_call`
+  plumbing no longer returns `Promise<any>`. A module-private `RawResponse`
+  interface (plus `RawBranchInfo`/`RawCheckpointInfo`/`RawSessionInfo`/
+  `RawAck`/`RawEvent`) mirrors `internal/daemon/protocol.go`'s `Response`
+  and its embedded structs exactly as JSON arrives off the wire — every
+  `_call` consumer (`open`/`checkout`/`fork`/`rollback`/`promote`/
+  `branches`/`dbs`/`checkoutAt`/`status`/`Session.flush`, plus `events`'s
+  ack/event-line parsing) now reads a real, typed field instead of `any`,
+  with the exact same `??`/non-null-assertion defaulting each call site
+  already had (no behavior change — verified via a before/after `dist/
+  client.js` diff showing only added comments). `_call` itself is tagged
+  `@internal` and stripped from the published `.d.ts` via
+  `tsconfig.build.json`'s new `stripInternal: true` — it remains a real,
+  callable, fully-typed method at runtime and for this package's own test
+  files (which compile against source, not the stripped declaration
+  output), since `test/client.test.ts` overrides it directly as a test
+  double. Verified additive: a `dist/client.d.ts` before/after diff shows
+  exactly one removal (the now-`@internal` `_call` line) and zero changes
+  to any other exported symbol; `dist/testkit.d.ts` is byte-identical.
+
+  Python (`sdk/python`): added the PEP 561 `offshoot/py.typed` marker,
+  shipped via a new `[tool.setuptools.package-data]` entry in
+  `pyproject.toml` (verified present in the dry-run wheel via `unzip -l`).
+  `mypy --strict offshoot` is clean across all four modules
+  (`client.py`/`langgraph.py`/`pytest_plugin.py`/`__init__.py`) — fixed
+  with annotations only: missing parameter/return types, `dict`/`Popen`
+  generic type arguments, a module-private `_TTL`/`_Seed` type alias each
+  in `client.py`/`pytest_plugin.py`, `typing.cast()` (a no-op at runtime)
+  on JSON-derived returns that were otherwise widening to `Any`, and a
+  `Mapping[str, str]` narrowing for `_locate_binary`'s `env` parameter
+  (`os.environ` isn't literally a `dict`). `pytest_plugin.py`'s guarded
+  `import pytest` type-checks cleanly against pytest's own inline types
+  (pytest ships PEP 561 support; no stub package or `type: ignore` needed).
+
+  Tests: `make test-sdks` (Python 41/41, TypeScript 49/49) and
+  `make test-pytest-plugin` (58/58) all green; `tsc --noEmit` (both
+  `tsconfig.json` and `tsconfig.build.json`) clean; `mypy --strict offshoot`
+  clean; dry-run wheel/sdist (`make dry-run-python-sdk`) and tarball
+  (`make dry-run-ts-sdk`) both pass unchanged — no file-list updates
+  needed on either SDK. No Go changes.
+
 ## [0.1.2] - 2026-08-06
 
 Milestone 3: the eval-harness release. The target persona's first hour is
