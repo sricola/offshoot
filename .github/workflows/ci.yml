@@ -26,10 +26,18 @@ jobs:
         if: runner.os == 'Linux'
         run: |
           sudo apt-get update
-          sudo apt-get install -y sqlite3
+          # sqlite3-tools is a SEPARATE package from sqlite3 (verified against
+          # the ubuntu-latest image: `apt-cache show sqlite3-tools` lists
+          # /usr/bin/sqldiff, /usr/bin/sqlite3_analyzer, /usr/bin/sqlite3_rsync)
+          # — offshoot diff's default (non --summary) mode needs sqldiff on
+          # PATH; the CLI tests that exercise it (cmd/offshoot/diff_test.go)
+          # gate on exec.LookPath("sqldiff") the same way requireSQLite3
+          # gates on sqlite3 itself, so this install is what turns those
+          # tests on in CI rather than silently skipping them.
+          sudo apt-get install -y sqlite3 sqlite3-tools
 
       - name: Verify sqlite3 CLI is present
-        run: sqlite3 --version
+        run: sqlite3 --version && sqldiff --help >/dev/null
 
       - name: go vet
         run: go vet ./...

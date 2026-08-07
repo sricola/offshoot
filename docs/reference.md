@@ -180,6 +180,36 @@ error, a checksum mismatch) never leaves a truncated or partial file at
 **Errors:** no such `db@branch`; no such checkpoint; `out.db` already exists
 and `--force` was not given.
 
+## `offshoot diff <db>[@branch[@checkpoint]] <db>[@branch[@checkpoint]] [--summary]`
+
+```
+offshoot diff app@attempt-1@v1 app@attempt-2@v1
+offshoot diff app@attempt-1@v1 app@attempt-2@v1 --summary
+offshoot diff app@attempt-1 app@attempt-2                # both at head
+offshoot diff evals@golden@v1 candidate@main@final       # cross-db is legit
+```
+
+Materializes both sides READ-ONLY through the same primitives `export`/
+`checkout --at --read-only` use (never a live checkout, never a lease — safe
+alongside an open daemon session on either branch) and either streams
+`sqldiff`'s output over them (default) or prints a stdlib-only table-level
+row-count summary (`--summary`, no `sqldiff` dependency at all). Each target
+uses the same triple-`@` form `export` does — `db` alone means `db@main`
+head, `db@branch` means that branch's head, `db@branch@checkpoint` means
+that named checkpoint. The two targets may name the same `db` or two
+different ones. Full walkthrough, the raw by-hand recipe, and the exact
+staleness rule for a head-side (no-checkpoint) target: [docs/diff.md](diff.md).
+
+**Default mode** requires the separate `sqldiff` binary on PATH (NOT
+included by installing plain `sqlite3` on every platform) — its absence is a
+clear, per-OS-hinted error (`sudo apt-get install sqlite3-tools` on Debian/
+Ubuntu, `brew install sqldiff` on macOS — both verified, not guessed; see
+[docs/diff.md](diff.md#default-mode-sqldiff)) naming `--summary` as the
+`sqldiff`-free alternative.
+
+**Errors:** no such `db@branch` or checkpoint on either side; `sqldiff` not
+on PATH (default mode only — `--summary` never needs it).
+
 ## `offshoot checkpoint <db>[@branch] <name> [--meta k=v ...]`
 
 ```

@@ -15,6 +15,7 @@ with the first 0.1.x release. No package-manager install yet.
 
 **Docs:** [FAQ](docs/faq.md) (why not Litestream / LiteFS / Turso / Dolt / `cp`) ·
 [CLI reference](docs/reference.md) · [architecture](docs/architecture.md) ·
+[branch diff](docs/diff.md) ·
 [implemented/deferred status](docs/status.md) · [roadmap](ROADMAP.md)
 
 **Contributing:** [CONTRIBUTING.md](CONTRIBUTING.md) has dev setup and the

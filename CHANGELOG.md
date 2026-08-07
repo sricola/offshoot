@@ -268,6 +268,70 @@ version if you depend on format stability.
     `dist/client.*` files, and a second install-then-`import()` check
     added for the new `@offshoot-db/client/testkit` subpath (not just the
     package root).
+- **`offshoot diff`** (Milestone 3 Task 6): `offshoot diff
+  <db>[@branch[@checkpoint]] <db>[@branch[@checkpoint]] [--summary]`
+  materializes both sides READ-ONLY (never a live checkout, never a lease)
+  and either streams `sqldiff`'s output over them or prints a
+  `sqldiff`-free table-level row-count summary. CLI-only for this task — no
+  daemon op, no SDK parity.
+  - `ops.Workspace.MaterializeForDiff(db, branch, checkpoint)
+    (DiffSide, error)`: a named checkpoint reuses the existing `CheckoutAt`
+    read-only cache (a checkpoint's content is immutable, so this is a
+    legitimate cache hit across repeated diffs); a bare head target is
+    always freshly `Export`ed to a private temp file, because head moves
+    and a head-keyed entry in the checkout-at cache could never be
+    idempotently cached the way a checkpoint-keyed one is — this is the
+    task's staleness decision, documented on `MaterializeForDiff`'s doc
+    comment and pinned by `internal/ops/diff_test.go`'s
+    `TestMaterializeForDiffHeadSideAlwaysReflectsANewWrite` (a write
+    between two calls against the same head target is visible in the
+    second one, never served stale) and the CLI-level
+    `TestDiffCLIHeadSideReflectsNewWriteNotStaleCache`. `DiffSide.Close()`
+    is a no-op for the cache-backed checkpoint case and removes the temp
+    file/directory for the head case.
+  - `ops.TableRowCounts(path) (map[string]int, error)` /
+    `ops.DiffSummary(leftPath, rightPath) ([]TableDiff, error)`: the
+    `--summary` engine, stdlib-`database/sql` + the `mattn/go-sqlite3`
+    driver already vendored for `internal/capture`/`internal/ops` (no new
+    Go module dependency), opened as
+    `file:<abs>?mode=ro&immutable=1` — verified against a real `chmod
+    0444` file (`TestTableRowCountsOpensReadOnlyEvenOnA0444File`) that
+    SQLite accepts a `mode=ro` URI parameter layered on top of the
+    driver's always-requested `SQLITE_OPEN_READWRITE|SQLITE_OPEN_CREATE`
+    flags (SQLite only rejects a mode LESS restrictive than the flags
+    argument passed to `sqlite3_open_v2`; `ro` is strictly more
+    restrictive). Lists tables from `sqlite_master` (excluding
+    `sqlite_%` internals) and counts rows per table on both sides; a
+    table present on only one side is reported `added`/`removed` wholesale
+    rather than as a row-count delta. The two materialized paths may be
+    two entirely different databases — cross-db diff is a legitimate eval-
+    comparison shape and is explicitly tested
+    (`TestDiffSummaryCLIWorksAcrossTwoDifferentDatabases`).
+  - CLI `--summary` output: an aligned `text/tabwriter` table (TABLE/LEFT/
+    RIGHT/STATUS columns, `status` one of `same`/`added`/`removed`/
+    `changed (+N)`/`changed (-N)`) plus a trailing totals line.
+  - Default mode requires the separate `sqldiff` binary (NOT included by
+    installing plain `sqlite3` on every platform) and fails with a clear,
+    per-OS-hinted error naming the install path when it's missing, plus
+    `--summary` as the `sqldiff`-free alternative — found and fixed a
+    wrong hint mid-task: a real local Homebrew install of the general
+    `sqlite` formula (keg-only, 13 files) confirmed it does NOT include
+    `sqldiff`; Homebrew ships `sqldiff` as its OWN separate formula
+    (`brew install sqldiff`), corrected in both the error text and
+    `docs/diff.md`. The Debian/Ubuntu hint (`sqlite3-tools`) is verified
+    against a real `ubuntu:24.04` container's `apt-cache show
+    sqlite3-tools` output (lists `/usr/bin/sqldiff`), and
+    `.github/workflows/ci.yml`'s Linux job now installs that package
+    alongside plain `sqlite3` so `offshoot diff`'s real-`sqldiff` CLI
+    tests (`TestDiffCLISqldiffPresentStreamsOutput`,
+    `TestDiffCLIIdenticalSidesProduceNoSqldiffOutput`) exercise the actual
+    binary in CI instead of permanently skipping — they gate on
+    `exec.LookPath("sqldiff")` the same way `requireSQLite3` gates on
+    `sqlite3` itself, so a machine without it still skips cleanly.
+  - `docs/diff.md`: the command, the raw by-hand `export`-twice-then-
+    `sqldiff` recipe, the staleness rule, and a link to the FAQ's
+    [no-merge stance](docs/faq.md#why-no-merge) — `offshoot diff` is a read
+    tool; it never resolves anything.
 
 ### Fixed
 
