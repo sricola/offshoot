@@ -230,6 +230,62 @@ version if you depend on format stability.
   op gets silence, never a Response.
   No `internal/session` changes — bus is fed purely from the daemon-side
   callback composition, so no torture run was required for this task.
+
+- **Eventing: SDK stream helpers** (Milestone 4 Task 4b): both SDKs ship a
+  thin `events()` helper over Task 4a's socket `subscribe` op — Python
+  `Client.events()` (`sdk/python/offshoot/client.py`) is a generator
+  yielding `Event(v, ts, type, db, branch, detail)` dataclass instances;
+  TypeScript `Client.events()` (`sdk/typescript/src/client.ts`) is an
+  `AsyncGenerator<OffshootEvent>` (a new versioned interface, mirroring the
+  wire schema). Both **open their own fresh, dedicated socket connection**
+  — never the caller's own `Client` connection, matching Task 4a's
+  MANDATORY "subscribe permanently takes over its connection" contract
+  (see both methods' doc comments and docs/reference.md's Eventing
+  section) — send `subscribe`, read the ack, then yield one parsed event
+  per line in publish order until the stream ends. Stdlib-only / zero-dep
+  on both sides (Python: only `json`/`socket`, already-imported stdlib;
+  TypeScript: only `node:net`, already-imported).
+
+  **`dropped_slow_consumer` contract, decided and documented**: yielded
+  like any other event, then the stream simply ends (Python: the generator
+  returns, no `StopIteration`-wrapped error; TypeScript: the async
+  iterator's `done: true`) — NOT raised/thrown as an `OffshootError`. A
+  drop ends the stream the same way an ordinary disconnect does; a caller
+  that cares whether it was dropped checks the last event's `type`. Only a
+  genuine transport/protocol failure (a connect error, a malformed line, a
+  daemon `ok:false` ack) raises/throws.
+
+  **Closing early, no leaked fd**: Python — `break`/`generator.close()`
+  delivers `GeneratorExit` at the suspended `yield`, caught by a `finally`
+  that closes the buffered reader and the socket. TypeScript — `break`/
+  `.return()` on the async iterator resumes the generator's suspended
+  `yield` as an abrupt completion, running an identical `finally` that
+  `sock.destroy()`s the dedicated connection. Both proved against a real
+  daemon: a helper connection sees one real event, then closes mid-stream,
+  and the daemon's open unix-domain-socket fd count (`lsof -p <pid>`
+  filtered to `TYPE unix` — a raw total-fd comparison would be confounded
+  by `internal/dbfile`'s deliberately-never-closed checkout descriptors)
+  returns to its pre-subscribe baseline, and the daemon keeps answering
+  ordinary ops on an unrelated connection throughout.
+
+  **Real end-to-end lifecycle tests** (`sdk/python/tests/test_client.py`'s
+  `test_events_sees_session_lifecycle_in_order`, `sdk/typescript/test/
+  client.test.ts`'s matching test): the helper subscribes on its own
+  connection; `session_opened` → `flushed` → `session_closed` is driven by
+  real ops on a SEPARATE connection and observed in order with correct
+  `db`/`branch`/`detail` fields. The `dropped_slow_consumer` path is hard
+  to force deterministically from the SDK side (it needs the real bus's
+  internal buffer-overflow timing — already proven server-side by Task
+  4a's `TestEventBusDropsSlowSubscriberWithTerminalEvent`); both SDKs
+  instead unit-test the helper's own decode/contract path end to end
+  against a small scripted fake daemon speaking the identical
+  line-per-event wire shape (`TestEventsDecodePath` / the `events():
+  dropped_slow_consumer ...` `node:test` cases), covering the terminal
+  event, a malformed line, and a not-ok ack.
+
+  Both SDK suites green under `make test-sdks`; both SDKs confirmed
+  stdlib-only/zero-dep (import inspection, no new dependency added to
+  either `pyproject.toml` or `package.json`).
   `docs/status.md`'s eventing row flips to shipped-and-tested;
   `docs/reference.md` gains the `subscribe` op and `GET /events` route,
   with the dedicated-connection warning restated for operators.

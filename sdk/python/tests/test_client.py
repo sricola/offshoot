@@ -1,8 +1,12 @@
+import contextlib
+import json
 import os
 import shutil
+import socket
 import sqlite3
 import subprocess
 import tempfile
+import threading
 import time
 import unittest
 from pathlib import Path
@@ -130,6 +134,122 @@ class DaemonFixture:
         self.proc.wait(timeout=10)
         self.proc.stderr.close()
         shutil.rmtree(self.dir, ignore_errors=True)
+
+
+@contextlib.contextmanager
+def fake_subscribe_daemon(lines: list[str], ack: dict | None = None):
+    """A minimal one-shot fake daemon: accepts exactly one connection on a
+    fresh temp unix socket, discards the `{"op":"subscribe"}` request line
+    it's sent, writes `ack` (default `{"ok": true}`) then each of `lines`
+    (newline-terminated, in order), then closes.
+
+    Used to drive Client.events()'s decode path end to end — including the
+    `dropped_slow_consumer` terminal event — against a scripted server that
+    speaks the exact same line-per-event wire shape the real daemon does,
+    without needing to force a real daemon's buffer-overflow/slow-consumer
+    mechanics deterministically from the SDK side (hard to do reliably; see
+    internal/daemon/events_test.go's TestEventBusDropsSlowSubscriberWithTerminalEvent
+    for that proof against the real bus instead). Yields the fake socket's
+    path.
+    """
+    ack = {"ok": True} if ack is None else ack
+    tmpdir = tempfile.mkdtemp(prefix="offshoot-fake-daemon-")
+    sock_path = os.path.join(tmpdir, "d.sock")
+    srv = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
+    srv.bind(sock_path)
+    srv.listen(1)
+
+    def serve():
+        try:
+            conn, _ = srv.accept()
+        except OSError:
+            return  # srv closed before a client ever connected
+        try:
+            conn.makefile("rb").readline()  # the subscribe request; discarded
+            conn.sendall(json.dumps(ack).encode() + b"\n")
+            for line in lines:
+                conn.sendall(line.encode() + b"\n")
+        finally:
+            conn.close()
+
+    th = threading.Thread(target=serve, daemon=True)
+    th.start()
+    try:
+        yield sock_path
+    finally:
+        srv.close()
+        th.join(timeout=5)
+        shutil.rmtree(tmpdir, ignore_errors=True)
+
+
+def fake_events_client(sock_path: str) -> offshoot.Client:
+    """A Client wired to sock_path without dialing the real request/response
+    handshake __init__ performs (there is no request/response daemon on the
+    other end here, only fake_subscribe_daemon's scripted one-shot server) —
+    Client.events() only ever reads self._socket_path, so this is enough to
+    exercise it standalone. Mirrors TestBranchesWireCompat's
+    Client.__new__ technique above.
+    """
+    client = offshoot.Client.__new__(offshoot.Client)
+    client._socket_path = sock_path
+    return client
+
+
+class TestEventsDecodePath(unittest.TestCase):
+    """Fake-daemon tests for Client.events()'s decode/contract path — no
+    real offshoot daemon needed."""
+
+    def test_dropped_slow_consumer_is_yielded_then_stream_ends(self):
+        lines = [
+            json.dumps({"v": 1, "ts": "2026-08-07T00:00:00Z", "type": "session_opened",
+                        "db": "app", "branch": "main", "detail": {"holder": "h1", "epoch": 1}}),
+            json.dumps({"v": 1, "ts": "2026-08-07T00:00:01Z", "type": "dropped_slow_consumer"}),
+        ]
+        with fake_subscribe_daemon(lines) as sock_path:
+            got = list(fake_events_client(sock_path).events())
+        # Yielded like any other event, then the generator simply stops
+        # (StopIteration via list()'s own loop) -- no exception, per this
+        # method's documented contract.
+        self.assertEqual(len(got), 2)
+        self.assertEqual(got[0].type, "session_opened")
+        self.assertEqual(got[0].db, "app")
+        self.assertEqual(got[0].branch, "main")
+        self.assertEqual(got[0].detail, {"holder": "h1", "epoch": 1})
+        self.assertEqual(got[1].type, "dropped_slow_consumer")
+        self.assertEqual(got[1].db, "")
+        self.assertEqual(got[1].detail, {})
+
+    def test_events_yielded_in_order_with_defaults_for_missing_fields(self):
+        lines = [
+            json.dumps({"v": 1, "ts": "2026-08-07T00:00:00Z", "type": "reaped"}),
+        ]
+        with fake_subscribe_daemon(lines) as sock_path:
+            got = list(fake_events_client(sock_path).events())
+        self.assertEqual(len(got), 1)
+        ev = got[0]
+        self.assertEqual(ev.v, 1)
+        self.assertEqual(ev.type, "reaped")
+        self.assertEqual(ev.db, "")
+        self.assertEqual(ev.branch, "")
+        self.assertEqual(ev.detail, {})
+
+    def test_subscribe_ack_not_ok_raises(self):
+        with fake_subscribe_daemon([], ack={"ok": False, "error": "boom"}) as sock_path:
+            with self.assertRaises(OffshootError) as cm:
+                list(fake_events_client(sock_path).events())
+        self.assertIn("boom", str(cm.exception))
+
+    def test_malformed_event_line_raises_offshoot_error(self):
+        with fake_subscribe_daemon(["not json"]) as sock_path:
+            with self.assertRaises(OffshootError):
+                list(fake_events_client(sock_path).events())
+
+    def test_generator_close_before_first_next_is_a_harmless_noop(self):
+        # events() is lazy -- calling it alone opens no socket. Closing
+        # before ever iterating must not raise (nothing to clean up).
+        client = fake_events_client("/nonexistent/path/does/not/matter")
+        gen = client.events()
+        gen.close()  # must not raise
 
 
 class TestClient(unittest.TestCase):
@@ -403,6 +523,126 @@ class TestClient(unittest.TestCase):
             for bad in ("../../../etc/passwd", "..", "a/b", "../../checkouts/app/main"):
                 with self.assertRaises(OffshootError):
                     c.checkout_at("checkout-at-traversal-app", "main", bad)
+
+    def _daemon_unix_socket_fd_count(self) -> int | None:
+        """Number of the daemon process's currently-open unix-domain-socket
+        file descriptors (its listening socket plus one per live
+        connection -- ordinary Client connections AND subscribe streams
+        alike), via `lsof -p <pid>` filtered to TYPE "unix". None if lsof
+        isn't on PATH (the fd-leak assertion below is then skipped -- best
+        effort, not load-bearing on every CI runner).
+
+        Deliberately filtered to TYPE "unix" rather than a raw total fd
+        count: internal/dbfile's checkout file descriptors are DELIBERATELY
+        NEVER closed for the life of the daemon (see docs/status.md's
+        Resource behavior table) -- opening a session over the course of
+        this test legitimately grows the daemon's REG-file fd count by
+        design, which would make a raw total-fd-count comparison spuriously
+        fail regardless of whether events()'s dedicated socket itself
+        leaked. Counting only "unix" rows isolates exactly the resource
+        events()'s dedicated connection actually holds.
+        """
+        if not shutil.which("lsof"):
+            return None
+        out = subprocess.run(["lsof", "-p", str(self.d.proc.pid)],
+                              capture_output=True, text=True)
+        return sum(1 for line in out.stdout.splitlines() if "unix" in line.split())
+
+    def test_events_sees_session_lifecycle_in_order(self):
+        # Subscribes via the helper on its own dedicated connection, then
+        # drives session_opened/flushed/session_closed on a SEPARATE
+        # connection (c2) -- proving events() never shares a socket with
+        # ordinary request/response calls (the daemon's "subscribe" op
+        # permanently takes a connection out of request/response mode; see
+        # events() docstring and docs/reference.md's Eventing section).
+        with offshoot.connect(self.d.sock) as c:
+            c.create("events-lifecycle-app")
+            gen = c.events()
+            got: list = []
+
+            def collect(n):
+                for _ in range(n):
+                    got.append(next(gen))
+
+            th = threading.Thread(target=collect, args=(3,))
+            th.start()
+            # Let events()'s first next() call actually complete its
+            # connect+subscribe+ack round trip (typically sub-millisecond
+            # over a local unix socket) before driving transitions on c2 --
+            # the bus has no replay, so a transition published before this
+            # subscription is registered would be silently missed.
+            time.sleep(0.5)
+
+            with offshoot.connect(self.d.sock) as c2:
+                s = c2.open("events-lifecycle-app")
+                db = sqlite3.connect(s.path)
+                db.execute("CREATE TABLE t (v)")
+                db.commit()
+                db.close()
+                deadline = time.time() + 10
+                txid = 0
+                while time.time() < deadline:
+                    txid = s.flush()
+                    if txid:
+                        break
+                    time.sleep(0.1)
+                self.assertGreater(txid, 0)
+                s.close()
+
+            th.join(timeout=15)
+            self.assertFalse(th.is_alive(), "events() never observed all 3 transitions")
+            self.assertEqual(len(got), 3)
+            self.assertEqual(got[0].type, "session_opened")
+            self.assertEqual(got[0].db, "events-lifecycle-app")
+            self.assertEqual(got[0].branch, "main")
+            self.assertEqual(got[1].type, "flushed")
+            self.assertEqual(got[1].db, "events-lifecycle-app")
+            self.assertEqual(got[1].detail.get("kind"), "manual")
+            self.assertEqual(got[2].type, "session_closed")
+            self.assertEqual(got[2].db, "events-lifecycle-app")
+            gen.close()
+
+    def test_events_close_mid_stream_closes_the_dedicated_socket(self):
+        with offshoot.connect(self.d.sock) as c:
+            c.create("events-close-app")
+
+            # Let any startup-transient fd churn settle before sampling a
+            # baseline.
+            time.sleep(0.2)
+            baseline = self._daemon_unix_socket_fd_count()
+
+            gen = c.events()
+            got: list = []
+            th = threading.Thread(target=lambda: got.append(next(gen)))
+            th.start()
+            time.sleep(0.3)  # let the subscribe connect+ack land first
+            with offshoot.connect(self.d.sock) as c2:
+                c2.open("events-close-app")
+            th.join(timeout=10)
+            self.assertEqual(len(got), 1)
+            self.assertEqual(got[0].type, "session_opened")
+
+            # Stop iterating mid-stream -- GeneratorExit propagates through
+            # events()'s try/finally, closing the dedicated socket without
+            # ever reading it to EOF.
+            gen.close()
+
+            if baseline is not None:
+                deadline = time.time() + 5
+                after = baseline + 1
+                while time.time() < deadline:
+                    after = self._daemon_unix_socket_fd_count()
+                    if after is not None and after <= baseline:
+                        break
+                    time.sleep(0.1)
+                self.assertLessEqual(
+                    after, baseline,
+                    f"daemon fd count did not return to baseline after events().close() "
+                    f"(baseline={baseline}, after={after}) -- possible leaked subscriber fd")
+
+            # The daemon itself must be unaffected: an ordinary op on a
+            # fresh connection still works after the dropped subscriber.
+            c.branches("events-close-app")
 
     def test_daemon_death_mid_call_raises_offshoot_error(self):
         # A dedicated, short-lived daemon (not the shared class fixture) so

@@ -58,6 +58,30 @@ export interface Branch {
   state: string;
 }
 
+/** One event from the daemon's event stream — see {@link Client.events}.
+ *
+ * Mirrors `internal/daemon/events.go`'s `Event`: the ONE versioned JSON
+ * schema (`v` is currently always `1`) the daemon emits over BOTH the unix
+ * socket `subscribe` op and HTTP `GET /events` (SSE) — see
+ * `docs/reference.md`'s Eventing section for the full `type` table
+ * (`session_opened`, `flushed`, `flush_failed`, `fenced`, `session_closed`,
+ * `reaped`, `evicted` (reserved — nothing emits it yet), and the terminal
+ * `dropped_slow_consumer` — see {@link Client.events}'s doc comment for how
+ * that one is handled).
+ *
+ * `ts` is RFC3339 UTC. `db`/`branch` are omitted for event types that carry
+ * no branch (e.g. `dropped_slow_consumer`). `detail` is omitted when the
+ * daemon sends none (events with no extra detail, e.g. `reaped`).
+ */
+export interface OffshootEvent {
+  v: number;
+  ts: string;
+  type: string;
+  db?: string;
+  branch?: string;
+  detail?: Record<string, unknown>;
+}
+
 /** One session open in the daemon, as returned by {@link Client.status}. */
 export interface SessionInfo {
   db: string;
@@ -137,7 +161,7 @@ export async function connect(socketPath: string): Promise<Client> {
     });
     sock.once("error", rej);
   });
-  return new Client(sock);
+  return new Client(sock, socketPath);
 }
 
 interface Waiter {
@@ -163,7 +187,17 @@ export class Client {
   private readonly queue: Waiter[] = [];
   private closed = false;
 
-  constructor(private readonly sock: Socket) {
+  constructor(
+    private readonly sock: Socket,
+    /** The daemon's unix-socket path this Client connected to — retained
+     * only so {@link Client.events} can dial its own fresh, dedicated
+     * connection to the SAME daemon (see that method's doc comment for
+     * why it can't reuse `sock` above). `undefined` for a Client built by
+     * a test double that never goes through {@link connect} (e.g.
+     * `Object.create(Client.prototype)` in client.test.ts) — such a
+     * double never calls `events()` either. */
+    private readonly socketPath?: string,
+  ) {
     sock.setEncoding("utf8");
     sock.on("data", (chunk: string) => {
       this.buf += chunk;
@@ -338,6 +372,118 @@ export class Client {
   async checkoutAt(db: string, branch: string, checkpoint: string, opts: CheckoutAtOptions = {}): Promise<string> {
     const resp = await this._call("checkout-at", { db, branch, name: checkpoint, force: opts.force ?? false });
     return resp.checkout ?? "";
+  }
+
+  /** Stream the daemon's event feed as an async iterator, yielding one
+   * {@link OffshootEvent} per line, in publish order, until the stream
+   * ends.
+   *
+   * *** OPENS ITS OWN, DEDICATED SOCKET CONNECTION *** — never this
+   * Client's own connection. The daemon's `subscribe` op
+   * (`internal/daemon/events.go`/`server.go`) permanently takes a
+   * connection out of request/response mode the instant it acks: no
+   * further `open`/`flush`/`status`/... call could ever get a reply on
+   * that same connection again. This method dials a fresh unix-socket
+   * connection to the same path this Client was built with (via
+   * {@link connect}), precisely so callers never have to think about
+   * that — keep using this same `Client` for ordinary ops exactly as
+   * before, and iterate the async iterator this method returns for
+   * events; the two never share a socket.
+   *
+   * ```ts
+   * for await (const ev of client.events()) {
+   *   console.log(ev.type, ev.db, ev.branch, ev.detail);
+   * }
+   * ```
+   *
+   * **`dropped_slow_consumer`** (this consumer fell behind the daemon's
+   * bounded per-subscriber buffer and was dropped — see
+   * `docs/reference.md`'s Eventing section): yielded like any other
+   * event, and then the iterator ends (a plain return, not a thrown
+   * error) — the daemon has already closed its end, there is nothing
+   * more to read. This is the unambiguous contract: a caller that cares
+   * whether it was dropped checks `ev.type === "dropped_slow_consumer"`
+   * on the last event it received; a caller that doesn't care just sees
+   * the loop end normally. It is deliberately NOT thrown as an
+   * {@link OffshootError} — a drop ends the stream the same way an
+   * ordinary disconnect does; only a genuine transport/protocol failure
+   * (a connect error, a malformed line, a daemon `ok:false` ack) throws.
+   *
+   * **Closing early:** `break` out of a `for await` loop (or call
+   * `.return()` on the returned iterator directly) to close the
+   * dedicated socket. Per the async-iterator protocol, that calls this
+   * generator's own `return()`, which resumes at the suspended `yield`
+   * as an abrupt completion — the `finally` block below always runs in
+   * response and destroys the underlying socket, so no file descriptor
+   * is leaked by stopping early. */
+  async *events(): AsyncGenerator<OffshootEvent, void, void> {
+    if (!this.socketPath) {
+      throw new OffshootError(
+        "events(): this Client was not constructed via connect() (no socketPath on record); " +
+          "cannot open a dedicated subscribe connection",
+      );
+    }
+    const sock = createConnection(this.socketPath);
+    try {
+      await new Promise<void>((res, rej) => {
+        sock.once("connect", () => {
+          sock.off("error", rej);
+          res();
+        });
+        sock.once("error", rej);
+      });
+    } catch (e) {
+      sock.destroy();
+      throw new OffshootError(`daemon connection failed: ${(e as Error).message}`);
+    }
+    try {
+      sock.setEncoding("utf8");
+      await new Promise<void>((res, rej) => {
+        sock.write(JSON.stringify({ op: "subscribe" }) + "\n", (err) => {
+          if (err) rej(err);
+          else res();
+        });
+      });
+
+      let buf = "";
+      let sawAck = false;
+      for await (const chunk of sock) {
+        buf += String(chunk);
+        let i: number;
+        while ((i = buf.indexOf("\n")) >= 0) {
+          const line = buf.slice(0, i);
+          buf = buf.slice(i + 1);
+          if (!sawAck) {
+            sawAck = true;
+            let ack: any;
+            try {
+              ack = JSON.parse(line);
+            } catch (e) {
+              throw new OffshootError(`daemon sent a malformed response: ${(e as Error).message}`);
+            }
+            if (!ack.ok) throw new OffshootError(ack.error ?? "unknown daemon error");
+            continue;
+          }
+          let raw: any;
+          try {
+            raw = JSON.parse(line);
+          } catch (e) {
+            throw new OffshootError(`daemon sent a malformed event: ${(e as Error).message}`);
+          }
+          const ev: OffshootEvent = { v: raw.v, ts: raw.ts, type: raw.type };
+          if (raw.db !== undefined) ev.db = raw.db;
+          if (raw.branch !== undefined) ev.branch = raw.branch;
+          if (raw.detail !== undefined) ev.detail = raw.detail;
+          yield ev;
+          if (ev.type === "dropped_slow_consumer") return;
+        }
+      }
+    } catch (e) {
+      if (e instanceof OffshootError) throw e;
+      throw new OffshootError(`daemon connection failed: ${(e as Error).message}`);
+    } finally {
+      sock.destroy();
+    }
   }
 
   /** List every session open in the daemon. */

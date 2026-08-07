@@ -711,6 +711,32 @@ sent on that same connection — the daemon stops reading it entirely.
 > pointing at `GET /events`), since an HTTP request/response cycle has no
 > way to switch modes mid-stream the way a raw socket connection can.
 
+**SDK helpers** (Milestone 4 Task 4b): both SDKs ship a thin `events()`
+helper that does exactly this — opens its own fresh, dedicated socket
+connection (never the caller's own `Client`/`Session` connection), sends
+`subscribe`, reads the ack, and yields one parsed event per line:
+
+```python
+for ev in client.events():
+    print(ev.type, ev.db, ev.branch, ev.detail)
+```
+
+```ts
+for await (const ev of client.events()) {
+  console.log(ev.type, ev.db, ev.branch, ev.detail);
+}
+```
+
+Python's `events()` is a generator (nothing is opened until the first
+iteration); TS's is an `AsyncGenerator<OffshootEvent>`. Both close their
+dedicated socket cleanly when the caller stops iterating early (Python:
+`break`/`generator.close()`, delivered as `GeneratorExit`; TS: `break`/
+`.return()`, delivered through the async-iterator return protocol) — no
+file descriptor is leaked by stopping mid-stream. The terminal
+`dropped_slow_consumer` event (see above) is yielded like any other event
+and then the stream simply ends (no exception) — a caller that cares
+whether it was dropped checks the last event's `type`.
+
 ### HTTP: `GET /events`
 
 Same Bearer auth as everything but `/healthz`. Response is

@@ -13,8 +13,9 @@ import { existsSync, mkdtempSync, rmSync, statSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { fileURLToPath } from "node:url";
+import { createServer, Socket, type Server } from "node:net";
 
-import { connect, OffshootError, Client } from "../src/client.js";
+import { connect, OffshootError, Client, type OffshootEvent } from "../src/client.js";
 
 // test-dist/test/client.test.js -> repo root is four levels up.
 const REPO = join(fileURLToPath(new URL(".", import.meta.url)), "..", "..", "..", "..");
@@ -110,6 +111,88 @@ class DaemonFixture {
     }
     rmSync(this.dir, { recursive: true, force: true });
   }
+}
+
+/** Number of the daemon process's currently-open unix-domain-socket file
+ * descriptors (its listening socket plus one per live connection --
+ * ordinary Client connections AND subscribe streams alike), via
+ * `lsof -p <pid>` filtered to TYPE "unix". `undefined` if `lsof` isn't on
+ * PATH (the fd-leak assertion in the events() test below is then skipped
+ * -- best effort, not load-bearing on every CI runner).
+ *
+ * Deliberately filtered to TYPE "unix" rather than a raw total fd count:
+ * internal/dbfile's checkout file descriptors are DELIBERATELY NEVER
+ * closed for the life of the daemon (see docs/status.md's Resource
+ * behavior table) -- opening a session over the course of a test
+ * legitimately grows the daemon's REG-file fd count by design, which
+ * would make a raw total-fd-count comparison spuriously fail regardless
+ * of whether events()'s dedicated socket itself leaked. Counting only
+ * "unix" rows isolates exactly the resource events()'s dedicated
+ * connection actually holds.
+ */
+function daemonUnixSocketFdCount(pid: number): number | undefined {
+  if (!hasCmd("lsof")) return undefined;
+  let out: string;
+  try {
+    out = execFileSync("lsof", ["-p", String(pid)]).toString();
+  } catch {
+    return undefined; // lsof exits non-zero on some platforms for a live pid; best effort
+  }
+  return out.split("\n").filter((line) => line.split(/\s+/).includes("unix")).length;
+}
+
+/** A minimal one-shot fake daemon: accepts exactly one connection on a
+ * fresh temp unix socket, discards the `{"op":"subscribe"}` request line
+ * it's sent, writes `ack` (default `{ok: true}`) then each of `lines`
+ * (newline-terminated, in order), then ends the connection.
+ *
+ * Used to drive Client.events()'s decode path end to end -- including the
+ * `dropped_slow_consumer` terminal event -- against a scripted server that
+ * speaks the exact same line-per-event wire shape the real daemon does,
+ * without needing to force a real daemon's buffer-overflow/slow-consumer
+ * mechanics deterministically from the SDK side (hard to do reliably; see
+ * internal/daemon/events_test.go's
+ * TestEventBusDropsSlowSubscriberWithTerminalEvent for that proof against
+ * the real bus instead).
+ */
+async function fakeSubscribeDaemon(
+  lines: string[],
+  ack: Record<string, unknown> = { ok: true },
+): Promise<{ sockPath: string; close: () => Promise<void> }> {
+  const dir = mkdtempSync(join(tmpdir(), "offshoot-fake-daemon-"));
+  const sockPath = join(dir, "d.sock");
+  const srv: Server = createServer((conn) => {
+    conn.setEncoding("utf8");
+    let buf = "";
+    const onData = (chunk: string) => {
+      buf += chunk;
+      if (buf.includes("\n")) {
+        conn.off("data", onData);
+        conn.write(JSON.stringify(ack) + "\n");
+        for (const line of lines) conn.write(line + "\n");
+        conn.end();
+      }
+    };
+    conn.on("data", onData);
+  });
+  await new Promise<void>((res) => srv.listen(sockPath, res));
+  return {
+    sockPath,
+    close: () =>
+      new Promise<void>((res) => {
+        srv.close(() => res());
+        rmSync(dir, { recursive: true, force: true });
+      }),
+  };
+}
+
+/** A Client wired to sockPath with a dummy, never-connected Socket in
+ * place of a real request/response connection -- Client.events() only
+ * ever reads its own retained socketPath (never `sock`), so this is
+ * enough to exercise it standalone against fakeSubscribeDaemon without a
+ * real offshoot daemon underneath. */
+function fakeEventsClient(sockPath: string): Client {
+  return new Client(new Socket(), sockPath);
 }
 
 let fixture: DaemonFixture | undefined;
@@ -499,6 +582,208 @@ test("checkoutAt: rejects a path-traversal checkpoint", async (t: TestContext) =
     for (const bad of ["../../../etc/passwd", "..", "a/b", "../../checkouts/app/main"]) {
       await assert.rejects(() => c.checkoutAt("checkout-at-traversal-app", "main", bad), OffshootError);
     }
+  } finally {
+    await c.close();
+  }
+});
+
+// --- events() decode-path tests (no real offshoot daemon needed) ---------
+
+test("events(): dropped_slow_consumer is yielded then the stream ends", async () => {
+  const lines = [
+    JSON.stringify({
+      v: 1,
+      ts: "2026-08-07T00:00:00Z",
+      type: "session_opened",
+      db: "app",
+      branch: "main",
+      detail: { holder: "h1", epoch: 1 },
+    }),
+    JSON.stringify({ v: 1, ts: "2026-08-07T00:00:01Z", type: "dropped_slow_consumer" }),
+  ];
+  const fake = await fakeSubscribeDaemon(lines);
+  try {
+    const client = fakeEventsClient(fake.sockPath);
+    const got: OffshootEvent[] = [];
+    for await (const ev of client.events()) got.push(ev);
+    // Yielded like any other event, then the async iterator simply ends
+    // (the for-await loop exits normally) -- no thrown error, per this
+    // method's documented contract.
+    assert.equal(got.length, 2);
+    assert.equal(got[0]!.type, "session_opened");
+    assert.equal(got[0]!.db, "app");
+    assert.equal(got[0]!.branch, "main");
+    assert.deepEqual(got[0]!.detail, { holder: "h1", epoch: 1 });
+    assert.equal(got[1]!.type, "dropped_slow_consumer");
+    assert.equal(got[1]!.db, undefined);
+  } finally {
+    await fake.close();
+  }
+});
+
+test("events(): fields default sensibly when the daemon omits them", async () => {
+  const fake = await fakeSubscribeDaemon([JSON.stringify({ v: 1, ts: "2026-08-07T00:00:00Z", type: "reaped" })]);
+  try {
+    const client = fakeEventsClient(fake.sockPath);
+    const got: OffshootEvent[] = [];
+    for await (const ev of client.events()) got.push(ev);
+    assert.equal(got.length, 1);
+    assert.equal(got[0]!.v, 1);
+    assert.equal(got[0]!.type, "reaped");
+    assert.equal(got[0]!.db, undefined);
+    assert.equal(got[0]!.branch, undefined);
+    assert.equal(got[0]!.detail, undefined);
+  } finally {
+    await fake.close();
+  }
+});
+
+test("events(): a not-ok subscribe ack rejects", async () => {
+  const fake = await fakeSubscribeDaemon([], { ok: false, error: "boom" });
+  try {
+    const client = fakeEventsClient(fake.sockPath);
+    await assert.rejects(
+      async () => {
+        for await (const _ev of client.events()) {
+          // unreachable
+        }
+      },
+      (err: unknown) => {
+        assert.ok(err instanceof OffshootError);
+        assert.match(err.message, /boom/);
+        return true;
+      },
+    );
+  } finally {
+    await fake.close();
+  }
+});
+
+test("events(): a malformed event line raises OffshootError", async () => {
+  const fake = await fakeSubscribeDaemon(["not json"]);
+  try {
+    const client = fakeEventsClient(fake.sockPath);
+    await assert.rejects(async () => {
+      for await (const _ev of client.events()) {
+        // unreachable
+      }
+    }, OffshootError);
+  } finally {
+    await fake.close();
+  }
+});
+
+// --- events() against a real daemon ---------------------------------------
+
+test("events(): sees a real session lifecycle in order, on its own dedicated connection", async (t: TestContext) => {
+  if (!canRun) {
+    t.skip("go and/or sqlite3 not on PATH");
+    return;
+  }
+  const c = await connect(fixture!.sock);
+  try {
+    await c.create("events-lifecycle-app");
+    const it = c.events();
+    const first = it.next(); // starts the dedicated connection + subscribe + ack
+
+    // Let the connect+subscribe+ack round trip actually land (typically
+    // sub-millisecond over a local unix socket) before driving transitions
+    // on a SEPARATE connection -- the bus has no replay, so a transition
+    // published before this subscription is registered would be silently
+    // missed.
+    await sleep(500);
+
+    const c2 = await connect(fixture!.sock);
+    try {
+      const s = await c2.open("events-lifecycle-app");
+      sqlite3(s.path, "CREATE TABLE t (v);");
+      let txid = 0;
+      const deadline = Date.now() + 10_000;
+      while (Date.now() < deadline) {
+        txid = await s.flush();
+        if (txid) break;
+        await sleep(100);
+      }
+      assert.ok(txid > 0);
+      await s.close();
+    } finally {
+      await c2.close();
+    }
+
+    const opened = await first;
+    assert.equal(opened.done, false);
+    assert.equal(opened.value!.type, "session_opened");
+    assert.equal(opened.value!.db, "events-lifecycle-app");
+    assert.equal(opened.value!.branch, "main");
+
+    const flushed = await it.next();
+    assert.equal(flushed.done, false);
+    assert.equal(flushed.value!.type, "flushed");
+    assert.equal(flushed.value!.db, "events-lifecycle-app");
+    assert.equal(flushed.value!.detail?.kind, "manual");
+
+    const closed = await it.next();
+    assert.equal(closed.done, false);
+    assert.equal(closed.value!.type, "session_closed");
+    assert.equal(closed.value!.db, "events-lifecycle-app");
+
+    await it.return?.();
+  } finally {
+    await c.close();
+  }
+});
+
+test("events(): break mid-stream closes the dedicated socket (no leaked fd)", async (t: TestContext) => {
+  if (!canRun) {
+    t.skip("go and/or sqlite3 not on PATH");
+    return;
+  }
+  const c = await connect(fixture!.sock);
+  try {
+    await c.create("events-close-app");
+
+    // Let any startup-transient fd churn settle before sampling a baseline.
+    await sleep(200);
+    const baseline = daemonUnixSocketFdCount(fixture!.proc.pid!);
+
+    const got: OffshootEvent[] = [];
+    const loopDone = (async () => {
+      for await (const ev of c.events()) {
+        got.push(ev);
+        break; // <- triggers the async iterator's return(), closing the socket
+      }
+    })();
+
+    await sleep(300); // let the subscribe connect+ack land first
+    const c2 = await connect(fixture!.sock);
+    try {
+      await c2.open("events-close-app");
+    } finally {
+      await c2.close();
+    }
+
+    await loopDone;
+    assert.equal(got.length, 1);
+    assert.equal(got[0]!.type, "session_opened");
+
+    if (baseline !== undefined) {
+      const deadline = Date.now() + 5_000;
+      let after = baseline + 1;
+      while (Date.now() < deadline) {
+        after = daemonUnixSocketFdCount(fixture!.proc.pid!) ?? after;
+        if (after <= baseline) break;
+        await sleep(100);
+      }
+      assert.ok(
+        after <= baseline,
+        `daemon unix-socket fd count did not return to baseline after break() (baseline=${baseline}, after=${after}) -- possible leaked subscriber fd`,
+      );
+    }
+
+    // The daemon itself must be unaffected: an ordinary op on this same
+    // (never-subscribed) connection still works after the dropped
+    // subscriber.
+    await c.branches("events-close-app");
   } finally {
     await c.close();
   }
