@@ -32,6 +32,20 @@ change, checkpoint when something works, roll back when it doesn't), so a
 bare `claude mcp add` is enough to get an agent branching on its own
 initiative in an at-rest workflow — no hooks needed for that baseline case.
 
+One default worth knowing before you rely on this baseline: every branch
+`offshoot_fork` creates gets a **24h TTL by default** (`offshoot mcp
+-default-ttl`, itself defaulting to `24h`), not "no TTL" — an agent that
+forks and forgets is reap-eligible a day later rather than leaking the
+branch forever. An explicit `ttl` argument on the `offshoot_fork` call
+always overrides it (including `ttl:"none"` for no TTL); `-default-ttl
+none` on `offshoot mcp` itself changes the default for every fork that
+doesn't specify one. TTL alone reaps nothing without a running janitor
+(`offshoot serve`, or a manual `offshoot gc`) — see
+[docs/reference.md](../reference.md)'s `offshoot mcp` entry for the full
+detail. This applies with or without the daemon-riding upgrade and the
+hooks below; it's true of every `offshoot_fork` call in this at-rest
+baseline case too.
+
 The rest of this recipe is about a specific upgrade: making
 `offshoot_checkpoint` and `offshoot_fork` ride *live daemon capture*
 (incremental, no full-snapshot re-encode) instead of running at rest, by

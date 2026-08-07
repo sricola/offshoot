@@ -117,12 +117,14 @@ of work, leak branches forever, or take the slow path by default.*
 *Bar: the target persona's first hour is paved end to end: install, seed,
 fork-per-test, inspect, export, clean up — from their language.*
 
-**Status: shipped.** Every bullet below landed on the `eval-harness` branch;
-see [docs/status.md](docs/status.md)'s Integration Surface section for the
-shipped-and-tested rows and [docs/eval-harness.md](docs/eval-harness.md) for
-the tutorial. Two items were consciously pushed out with a stated reason
-rather than silently dropped — `create --from`'s daemon/SDK/MCP reach, and
-the actual PyPI/npm/registry button-presses — see their own bullets below.
+**Status: mostly shipped, with two named deferrals (⏸ below).** Everything
+marked ✅ landed on the `eval-harness` branch; see
+[docs/status.md](docs/status.md)'s Integration Surface section for the
+shipped-and-tested rows and [docs/eval-harness.md](docs/eval-harness.md)
+for the tutorial. Two items were consciously pushed out with a stated
+reason rather than silently dropped, not shipped and not pretended
+otherwise — `create --from`'s daemon/SDK/MCP reach, and the actual
+PyPI/npm/registry button-presses — see their own ⏸ bullets below.
 
 - ✅ **`offshoot.pytest` fixture plugin + vitest helper + the serious
   tutorial:** session-scoped daemon, seed fixture, fork-per-test with TTL,
@@ -143,17 +145,19 @@ the actual PyPI/npm/registry button-presses — see their own bullets below.
   is prepared and gated (`PUBLISH_ENABLED`, default off) — the pipeline
   itself is done; see the Listings bullet below for what's still
   user-gated.
-- ✅ **Import/export everywhere** — partially, by design. New `offshoot
-  export <db>@<branch>[@checkpoint] out.db` shipped for plain-file egress
-  (backups, handoff) without fork-checkout-copy-destroy, daemon op and SDK
-  parity included. `create --from`'s reach into the daemon protocol, SDKs,
-  and MCP is a **pre-written deferral, not a gap found late**: importing an
-  existing file through the daemon needs either an upload channel (stream
-  bytes over the unix socket — a new wire primitive) or a same-host
-  path-trust story like `export`'s own (the daemon reads/writes a path the
-  caller names, trusted under the existing same-host/same-user socket
-  trust model) — that design deserves its own pass. CLI `offshoot create
-  --from` remains the only import path; see
+- ✅ **Export.** New `offshoot export <db>@<branch>[@checkpoint] out.db`
+  shipped for plain-file egress (backups, handoff) without
+  fork-checkout-copy-destroy, daemon op and SDK parity included — this
+  half of "Import/export everywhere" is fully shipped.
+- ⏸ **`create --from` reach (daemon protocol, SDKs, MCP) — deferred, not
+  shipped.** The other half of "Import/export everywhere" did not land
+  this milestone. This is a **pre-written deferral, not a gap found
+  late**: importing an existing file through the daemon needs either an
+  upload channel (stream bytes over the unix socket — a new wire
+  primitive) or a same-host path-trust story like `export`'s own (the
+  daemon reads/writes a path the caller names, trusted under the existing
+  same-host/same-user socket trust model) — that design deserves its own
+  pass. CLI `offshoot create --from` remains the only import path; see
   [docs/status.md](docs/status.md)'s `create --from` reach row.
 - ✅ **Read-only and historical checkouts.** Materialize a checkpoint for
   inspection without forking; sanctioned read-only sessions alongside a
@@ -180,7 +184,7 @@ the actual PyPI/npm/registry button-presses — see their own bullets below.
   [LlamaIndex/CrewAI notes](docs/recipes/frameworks.md). LangGraph keeps the
   real companion (`offshoot.langgraph.ThreadForks`); everyone else gets a
   page, not a package.
-- **Listings — prepared, submission deliberately deferred (user-gated).**
+- ⏸ **Listings — prepared, submission deliberately deferred (user-gated).**
   MCP registry `server.json` manifest authored in-repo
   ([docs/launch/mcp-registry.md](docs/launch/mcp-registry.md)) but **not
   submitted** — the exact registry schema needs to be fetched and validated

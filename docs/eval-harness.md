@@ -396,7 +396,7 @@ $ offshoot diff evals@attempt-passed@done evals@attempt-failed@done --summary
 left:  evals@attempt-passed@done right: evals@attempt-failed@done
 TABLE    evals@attempt-passed@done  evals@attempt-failed@done  STATUS
 results  3                          3                          same
-1 tables: 1 same, 0 changed, 0 added, 1 removed
+1 tables: 1 same, 0 changed, 0 added, 0 removed
 ```
 
 Both sides have 3 rows in `results`, so `--summary` reports `same` — which
@@ -407,6 +407,32 @@ change at all," not a substitute for the default `sqldiff` mode when you
 need to know what. Reach for `--summary` first when comparing many
 attempts' shapes cheaply; reach for the default mode the moment you need to
 know *which* rows moved.
+
+That row-count-only comparison also means `--summary` still catches a
+*structural* difference — a whole table present on one side and missing on
+the other — even though it can't see value-level changes. One more table,
+checked into `attempt-passed` only, to show what that looks like for real:
+
+```
+sqlite3 "$(offshoot checkout evals@attempt-passed)" "CREATE TABLE scratch (note TEXT); INSERT INTO scratch VALUES ('local notes, never checked in');"
+offshoot checkpoint evals@attempt-passed done2
+offshoot diff evals@attempt-passed@done2 evals@attempt-failed@done --summary
+```
+
+```
+left:  evals@attempt-passed@done2 right: evals@attempt-failed@done
+TABLE    evals@attempt-passed@done2  evals@attempt-failed@done  STATUS
+results  3                           3                          same
+scratch  1                           -                          removed
+2 tables: 1 same, 0 changed, 0 added, 1 removed
+```
+
+`scratch` exists on the left (`attempt-passed`) and not on the right
+(`attempt-failed`) — hence `removed` and the `-` in the right-hand count
+column. Swap which side you name first and the same table reports `added`
+instead; "removed"/"added" is about which side of *this specific command*
+a table is missing from, not a judgment about which attempt is more
+"complete."
 
 Both modes materialize read-only (never a live checkout, never a lease), so
 running `offshoot diff` alongside a live daemon session on either branch is
@@ -459,22 +485,68 @@ live, running example — `.github/workflows/ci.yml`'s `sdks` job:
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
+
       - uses: actions/setup-go@v5
         with:
           go-version-file: go.mod
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: "22"
+
       - name: Verify system python3 is present
         run: python3 --version
+
       - name: Install sqlite3 CLI
         run: |
           sudo apt-get update
           sudo apt-get install -y sqlite3
+
       - name: make test-sdks
         run: make test-sdks
+
+      # test-pytest-plugin exercises the offshoot.pytest_plugin fixture plugin
+      # (the `offshoot-db[pytest]` extra) — its own suite, separate from
+      # test-sdks above, because it genuinely needs pytest + pytest-xdist
+      # installed (unlike the plain-unittest suites test-sdks just proved
+      # pass WITHOUT pytest on PATH — see Milestone 3 Task 4's status.md
+      # row for why that separation is load-bearing: the base SDK must stay
+      # stdlib-only). Installed editable so its `pytest11` entry point
+      # registration is exercised for real, exactly as an installed
+      # `offshoot-db[pytest]` would be.
       - name: Install offshoot-db[pytest] + pytest-xdist
         run: python3 -m pip install --break-system-packages --quiet -e "sdk/python[pytest]" pytest-xdist
+
       - name: make test-pytest-plugin
         run: make test-pytest-plugin
+
+      # dry-run-sdks builds the real sdist/wheel and npm tarball, runs twine
+      # check, and install-tests both — the same build-verification tier
+      # .github/workflows/publish.yml runs in dry-run mode (PUBLISH_ENABLED
+      # off) or right before a real upload (PUBLISH_ENABLED on). Running it
+      # here, on every PR, is the simplest way to prove the SDKs still
+      # build and install correctly without duplicating any of publish.yml's
+      # upload logic or adding a second trigger to reason about — see
+      # publish.yml's top comment for the fuller rationale. --break-system-
+      # packages is needed because Ubuntu's system python3 (PEP 668) refuses
+      # a bare `pip install`; this is an ephemeral CI container, not a dev
+      # machine, so that's the right call here (contrast: publish.yml's own
+      # jobs use actions/setup-python, which isn't externally managed and
+      # doesn't need this flag).
+      - name: Install SDK build/publish check tooling
+        run: python3 -m pip install --break-system-packages --quiet build twine
+
+      - name: make dry-run-sdks
+        run: make dry-run-sdks
 ```
+
+That's `.github/workflows/ci.yml`'s `sdks` job pasted verbatim, comments
+included — not an adapted excerpt. `actions/setup-node@v4` is there because
+`make test-sdks` and `make dry-run-sdks` both also exercise the TypeScript
+SDK (`test-ts-sdk`, `dry-run-ts-sdk`) in the same job; a pytest-only CI
+setup that skips the TS pieces can drop that step and the two `make
+dry-run-sdks`-related steps at the end, keeping just checkout, setup-go,
+the `sqlite3` install, `make test-sdks`, and the two `pytest-plugin` steps.
 
 That `Makefile` target (`make test-pytest-plugin`) is the exact template for
 your own CI job:
