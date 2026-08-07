@@ -4,6 +4,7 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"os"
 	"os/exec"
 	"path/filepath"
 	"strings"
@@ -1194,4 +1195,176 @@ func TestSettleStillHappensWhenCheckoutWasStaleAtOpen(t *testing.T) {
 		ref, _, err := w.Store.GetRef("app", "main")
 		return err == nil && ref.HeadTXID > 1
 	})
+}
+
+// TestCloseRefreshesSidecarSoReopenCleanSkips pins Commit B (sidecar refresh
+// on clean Close, M2 follow-up, ledgered): open, write, flush, close — a
+// textbook clean shutdown — then reopen the SAME db@branch and confirm the
+// checkout is clean-skipped rather than re-materialized. Extends
+// internal/ops's TestCheckoutSkipsRematerializeWhenCleanAndCurrent same-inode
+// pattern into the session layer, where the "clean" stamp now has to survive
+// a real session's Close rather than only ops.Checkout/Checkpoint's own
+// in-line refresh.
+func TestCloseRefreshesSidecarSoReopenCleanSkips(t *testing.T) {
+	requireSQLite(t)
+	w := newWS(t)
+	if err := w.Create("app"); err != nil {
+		t.Fatal(err)
+	}
+
+	s, err := Open(context.Background(), Options{WS: w, DB: "app", Branch: "main"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	checkoutPath := s.CheckoutPath()
+	mustExec(t, checkoutPath, "CREATE TABLE t (v); INSERT INTO t VALUES (1);")
+	if _, err := s.Flush(""); err != nil {
+		t.Fatal(err)
+	}
+	if err := s.Close(); err != nil {
+		t.Fatal(err)
+	}
+
+	st1, err := os.Stat(checkoutPath)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	s2, err := Open(context.Background(), Options{WS: w, DB: "app", Branch: "main"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer s2.Close()
+
+	if !s2.cleanAtOpen {
+		t.Fatal("expected the reopen to see a checkout the prior session's clean Close already stamped current")
+	}
+	st2, err := os.Stat(s2.CheckoutPath())
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !os.SameFile(st1, st2) {
+		t.Fatal("reopen after a clean close should clean-skip re-materializing the checkout (same inode expected)")
+	}
+}
+
+// TestCloseAfterFailedFlushDoesNotStampSidecar guards Commit B's safety
+// guard from the other side: a session that writes, then hits a flush
+// failure that leaves that write unflushed (an injected non-CAS ref-write
+// error, same fault as TestFlushDoesNotDeleteSnapshotOnNonCASRefFailure —
+// NOT a fencing failure, so s.Err() stays nil and the pending check below is
+// what actually has to catch this), must NOT stamp the sidecar on Close: a
+// later Checkout must still see this checkout as needing re-materialization,
+// not incorrectly treat the unflushed write as durable.
+func TestCloseAfterFailedFlushDoesNotStampSidecar(t *testing.T) {
+	requireSQLite(t)
+	w := newWS(t)
+	if err := w.Create("app"); err != nil {
+		t.Fatal(err)
+	}
+	s, err := Open(context.Background(), Options{WS: w, DB: "app", Branch: "main"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	checkoutPath := s.CheckoutPath()
+	stBefore, err := os.Stat(checkoutPath)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	mustExec(t, checkoutPath, "CREATE TABLE t (v); INSERT INTO t VALUES (1);")
+
+	// Inject a non-CAS failure on the ref write, same fault
+	// TestFlushDoesNotDeleteSnapshotOnNonCASRefFailure uses — installed only
+	// AFTER Open (whose own AcquireLease also writes a "refs/" key) and
+	// restored right after the failed Flush, so Close's later ReleaseLease
+	// call isn't hit by it too.
+	orig := w.Store.B
+	w.Store.B = failRefPutIf{orig}
+	_, err = s.Flush("")
+	w.Store.B = orig
+	if err == nil {
+		t.Fatal("expected the injected ref-write failure to fail Flush")
+	}
+	if s.Err() != nil {
+		t.Fatalf("a non-CAS ref failure must not fence the session, got %v", s.Err())
+	}
+	if err := s.Close(); err != nil {
+		t.Fatal(err)
+	}
+
+	p2, err := w.Checkout("app", "main")
+	if err != nil {
+		t.Fatal(err)
+	}
+	stAfter, err := os.Stat(p2)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if os.SameFile(stBefore, stAfter) {
+		t.Fatal("a checkout left with unflushed content after a failed flush must not be treated as clean on the next Checkout (expected a fresh inode from re-materializing)")
+	}
+}
+
+// TestSidecarNotStampedAfterMidSessionRebase pins singleStartupRebase's
+// gate directly: a session that took a mid-session rebase — driven here the
+// same way TestFlushLoopFlushesRebaseFoldedContentWhenOtherwiseIdle does,
+// with content unrelated to the actual checkout — must not stamp its
+// checkout's sidecar on Close, even though everything IS otherwise flushed
+// and settled (autoFlushPending() is false). Without this gate, the
+// checkout — which the fake rebase never touched — would be stamped as
+// matching durable content it doesn't actually contain, and a later
+// Checkout would silently clean-skip instead of re-materializing the real
+// (rebase-folded) content.
+func TestSidecarNotStampedAfterMidSessionRebase(t *testing.T) {
+	requireSQLite(t)
+	w := newWS(t)
+	if err := w.Create("app"); err != nil {
+		t.Fatal(err)
+	}
+	s, err := Open(context.Background(), Options{
+		WS: w, DB: "app", Branch: "main", FlushEvery: 40 * time.Millisecond,
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	checkoutPath := s.CheckoutPath()
+	stBefore, err := os.Stat(checkoutPath)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	waitFor(t, 5*time.Second, "the session to settle after startup", func() bool {
+		_, _, ok := s.LastFlush()
+		return ok && !s.autoFlushPending()
+	})
+
+	snapPath := filepath.Join(t.TempDir(), "rebase-snapshot.db")
+	mustExec(t, snapPath, "CREATE TABLE rebased (v); INSERT INTO rebased VALUES ('rebase-only');")
+	if err := (replicaSink{s}).Rebase(snapPath); err != nil {
+		t.Fatal(err)
+	}
+	waitFor(t, 5*time.Second, "flushLoop to ship the rebase-folded content", func() bool {
+		return !s.autoFlushPending() && s.LastFlushErr() == nil
+	})
+
+	if err := s.Close(); err != nil {
+		t.Fatal(err)
+	}
+
+	p2, err := w.Checkout("app", "main")
+	if err != nil {
+		t.Fatal(err)
+	}
+	stAfter, err := os.Stat(p2)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if os.SameFile(stBefore, stAfter) {
+		t.Fatal("a checkout that never physically received a mid-session rebase's content must not be treated as clean on the next Checkout (expected a fresh inode from re-materializing)")
+	}
+	out, err := exec.Command("sqlite3", p2, "SELECT v FROM rebased;").Output()
+	if err != nil || string(out) != "rebase-only\n" {
+		t.Fatalf("rebase-folded content missing after re-materializing: %q err=%v", out, err)
+	}
 }

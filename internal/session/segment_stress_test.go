@@ -3,6 +3,7 @@ package session
 import (
 	"context"
 	"fmt"
+	"os"
 	"os/exec"
 	"testing"
 
@@ -303,6 +304,21 @@ func TestMissingSegmentIsLoud(t *testing.T) {
 	if err := w.Store.B.Delete(victim); err != nil {
 		t.Fatal(err)
 	}
+	// s.Close() above just stamped the checkout's .sum sidecar as clean and
+	// current (Commit B — sidecar refresh on clean close): a checkout
+	// proven clean-and-current skips chain resolution entirely (see
+	// ops.Checkout's own fast path), which would make this test's whole
+	// premise — that a checkout ACTUALLY consults the chain — silently
+	// untrue. Force the real materialization path by removing the checkout
+	// (and its now-stale-relative-to-the-deleted-segment sidecar) first,
+	// same as a checkout on a fresh machine or after `rm -rf` on the local
+	// cache (an intentionally supported operation — see README's
+	// resource-behavior section).
+	checkoutPath := w.CheckoutPath("app", "main")
+	if err := os.Remove(checkoutPath); err != nil {
+		t.Fatal(err)
+	}
+	os.Remove(checkoutPath + ".sum")
 	if _, err := w.Checkout("app", "main"); err == nil {
 		t.Fatal("a missing chain member must fail loudly, not silently read an older state")
 	}
