@@ -240,3 +240,42 @@ func TestOpCheckoutAtRequiresAName(t *testing.T) {
 		t.Fatal("checkout-at with no checkpoint name must be refused")
 	}
 }
+
+// TestOpCheckoutAtRejectsPathTraversalCheckpoint pins the CRITICAL fix over
+// the wire: the daemon's checkout-at op forwards req.Name straight to
+// ops.Workspace.CheckoutAt, which must refuse a '/'- or '..'-containing
+// value before it ever reaches CheckoutAtPath's filepath.Join — otherwise a
+// crafted Name could resolve outside checkouts-ro, including onto the
+// branch's own writable checkout path.
+func TestOpCheckoutAtRejectsPathTraversalCheckpoint(t *testing.T) {
+	srv, w := newServer(t)
+	sock := srv.SocketPath()
+
+	path, err := w.Checkout("app", "main")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if out, err := exec.Command("sqlite3", path,
+		"CREATE TABLE t (v); INSERT INTO t VALUES ('writable');").CombinedOutput(); err != nil {
+		t.Fatalf("%v: %s", err, out)
+	}
+
+	for _, cp := range []string{"../../../etc/passwd", "..", "a/b", "../../checkouts/app/main"} {
+		r := call(t, sock, Request{Op: "checkout-at", DB: "app", Branch: "main", Name: cp})
+		if r.OK {
+			t.Fatalf("checkout-at with name %q must be refused (path traversal), got checkout=%q", cp, r.Checkout)
+		}
+	}
+
+	// The writable checkout must be untouched: still there, still writable.
+	fi, err := os.Stat(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if fi.Mode().Perm()&0o200 == 0 {
+		t.Fatal("the writable checkout must still be writable")
+	}
+	if got := dRowCount(t, path); got != 1 {
+		t.Fatalf("writable checkout rows = %d, want 1", got)
+	}
+}

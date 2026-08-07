@@ -346,6 +346,24 @@ class TestClient(unittest.TestCase):
             with self.assertRaises(OffshootError):
                 c.checkout_at("checkout-at-empty-app", "main", "")
 
+    def test_checkout_at_rejects_path_traversal_checkpoint(self):
+        # The SDK forwards `checkpoint` verbatim as the daemon's `name`
+        # field; the server-side ops.Workspace.CheckoutAt fix must reject a
+        # crafted value before it ever reaches CheckoutAtPath's
+        # filepath.Join, not just an empty one.
+        with offshoot.connect(self.d.sock) as c:
+            c.create("checkout-at-traversal-app")
+            s = c.open("checkout-at-traversal-app")
+            db = sqlite3.connect(s.path)
+            db.execute("CREATE TABLE t (v)")
+            db.execute("INSERT INTO t VALUES ('writable')")
+            db.commit()
+            db.close()
+            s.close()
+            for bad in ("../../../etc/passwd", "..", "a/b", "../../checkouts/app/main"):
+                with self.assertRaises(OffshootError):
+                    c.checkout_at("checkout-at-traversal-app", "main", bad)
+
     def test_daemon_death_mid_call_raises_offshoot_error(self):
         # A dedicated, short-lived daemon (not the shared class fixture) so
         # killing it doesn't disturb the other tests. Reuses the already-
