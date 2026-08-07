@@ -776,10 +776,16 @@ automates what that manual cleanup would otherwise require doing by hand.
 Off by default. `-http ADDR` (e.g. `127.0.0.1:8080`) starts an HTTP
 listener alongside the unix socket, exposing:
 
+See [docs/operations.md](operations.md) for the operator-facing view of
+this whole surface (metrics reference table, HTTP/auth threat model,
+tuning-flag trade-offs) and [docs/recipes/kubernetes.md](recipes/kubernetes.md)
+for a real sidecar manifest — this section stays the flag-by-flag command
+reference.
+
 | Method | Path | Auth | Body |
 |---|---|---|---|
 | `POST` | `/rpc` | Bearer | The same `Request`/`Response` JSON the unix socket speaks, one op per POST (`Content-Type: application/json` required; body capped at 1MiB, oversized -> `413`) |
-| `GET` | `/metrics` | Bearer | Prometheus text exposition of the locked `offshoot_*` metric set (see [docs/status.md](status.md)'s metrics row for the full name list) |
+| `GET` | `/metrics` | Bearer | Prometheus text exposition of the locked `offshoot_*` metric set — see [docs/operations.md](operations.md#metrics) for the full name/type/label reference table |
 | `GET` | `/healthz` | **none** | `{"ok":true,"sessions":N}` — the one endpoint that needs no token, for liveness probes |
 | `GET` | `/events` | Bearer | Server-Sent Events: the daemon's event stream (Milestone 4 Task 4a — see [Eventing](#eventing-subscribe-op--get-events) below) |
 | `GET` | `/debug/pprof/*` | Bearer | `net/http/pprof`'s standard handlers (index, cmdline, profile, symbol, trace) |
@@ -832,6 +838,10 @@ shorter window or profile out-of-band), `IdleTimeout` 2 minutes.
 address already in use; the two non-loopback-bind errors above.
 
 ## Eventing (subscribe op / GET /events)
+
+See [docs/operations.md](operations.md#eventing) for the operator summary
+(drop-slow-consumer semantics, what to do when a subscriber disappears,
+the SDK helpers to reach for) — this section is the wire-level reference.
 
 The daemon publishes one versioned JSON event per state transition it
 observes, drainable two ways — the unix socket protocol's `subscribe` op,

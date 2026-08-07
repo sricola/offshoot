@@ -1,0 +1,95 @@
+apiVersion: v1
+kind: Secret
+metadata:
+  name: offshoot-http-token
+type: Opaque
+stringData:
+  # Illustrative value only — generate a real one, e.g.:
+  #   kubectl create secret generic offshoot-http-token \
+  #     --from-literal=token="$(openssl rand -hex 32)"
+  token: "REPLACE-ME-WITH-A-REAL-TOKEN"
+---
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: offshoot-agent
+  labels:
+    app: offshoot-agent
+spec:
+  replicas: 1 # single-node scope — see docs/recipes/kubernetes.md's top note; do not scale this up
+  strategy:
+    type: Recreate # a second live replica would just race the first for every lease
+  selector:
+    matchLabels:
+      app: offshoot-agent
+  template:
+    metadata:
+      labels:
+        app: offshoot-agent
+      annotations:
+        # Only scraped if the offshoot container below is configured for a
+        # non-loopback bind (see docs/recipes/kubernetes.md's "Metrics
+        # scraping" section) — with the loopback-only default below this
+        # annotation is inert.
+        prometheus.io/scrape: "true"
+        prometheus.io/port: "9090"
+        prometheus.io/path: "/metrics"
+    spec:
+      volumes:
+        - name: offshoot-runtime
+          emptyDir: {} # socket + checkouts; pod-local, ephemeral by design
+        - name: offshoot-store
+          persistentVolumeClaim:
+            claimName: offshoot-store-pvc # swap for an s3:// store + Secret; see the recipe doc
+      containers:
+        - name: offshoot
+          image: ghcr.io/offshoot-db/offshoot:latest # illustrative tag — pin a real release
+          args:
+            - serve
+            - -socket=/offshoot/run/o.sock
+            - -http=127.0.0.1:9090
+            - -flush-every=30s
+            - -ro-cache-budget=1GB
+          env:
+            - name: OFFSHOOT_STORE
+              value: /offshoot/store
+            - name: OFFSHOOT_CHECKOUTS
+              value: /offshoot/run/checkouts
+            - name: OFFSHOOT_SOCKET
+              value: /offshoot/run/o.sock
+            - name: OFFSHOOT_TOKEN
+              valueFrom:
+                secretKeyRef:
+                  name: offshoot-http-token
+                  key: token
+          volumeMounts:
+            - name: offshoot-runtime
+              mountPath: /offshoot/run
+            - name: offshoot-store
+              mountPath: /offshoot/store
+          # httpGet probes are evaluated by the kubelet against the Pod IP,
+          # not the container's own loopback — with -http bound to
+          # 127.0.0.1 (the safe default; see the recipe doc's "Metrics
+          # scraping" section), an httpGet probe here would never actually
+          # reach it. exec runs inside this container's own network
+          # namespace, so it sees the same loopback the offshoot process
+          # bound to.
+          livenessProbe:
+            exec:
+              command: ["/bin/sh", "-c", "wget -q -O- http://127.0.0.1:9090/healthz | grep -q '\"ok\":true'"]
+            initialDelaySeconds: 5
+            periodSeconds: 10
+          readinessProbe:
+            exec:
+              command: ["/bin/sh", "-c", "wget -q -O- http://127.0.0.1:9090/healthz | grep -q '\"ok\":true'"]
+            initialDelaySeconds: 2
+            periodSeconds: 5
+        - name: agent
+          image: your-agent-image:latest # illustrative — your workload's own image
+          env:
+            - name: OFFSHOOT_SOCKET
+              value: /offshoot/run/o.sock
+          volumeMounts:
+            - name: offshoot-runtime
+              mountPath: /offshoot/run
+          command: ["/bin/sh", "-c", "sleep infinity"] # placeholder for your real entrypoint
