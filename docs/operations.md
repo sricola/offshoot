@@ -139,6 +139,14 @@ documented cost of the only correct way to detect it (see
 reference.md#branch-states's Cost section for why there's no cheap
 short-circuit).
 
+**A branch that refuses `open`** with "branch is being deleted" or "branch
+is being reaped" is mid-`destroy`/mid-reap, not stuck — the claim is
+transient (retry shortly). None of the six states above surface that claim:
+they're computed purely from the ref's lease and the checkout's sidecar,
+which a Destroy/Reap claim doesn't touch, so `status`/`branches` reads that
+same branch as `idle` (or `active`, if it still carries a lease at that
+instant) for the whole window the claim is held.
+
 ## Eventing
 
 The daemon publishes one versioned JSON event per state transition it

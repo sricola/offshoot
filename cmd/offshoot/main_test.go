@@ -2,6 +2,7 @@ package main
 
 import (
 	"fmt"
+	"math"
 	"os"
 	"os/exec"
 	"path/filepath"
@@ -251,6 +252,13 @@ func TestParseByteSize(t *testing.T) {
 		{"abc", 0, true},
 		{"MB", 0, true},
 		{"1.5MB", 0, true},
+		{"100GB", 100 * (1 << 30), false},
+		// 8388608T = 2^23 * 2^40 = 2^63, one past math.MaxInt64: on int64
+		// this overflows to a negative product, which pre-fix was silently
+		// treated as 0/"unlimited" — the opposite of what a huge-but-finite
+		// budget request meant. Must be a clear error, not a wrapped value.
+		{"8388608T", 0, true},
+		{"9223372036854775807", math.MaxInt64, false},
 	}
 	for _, c := range cases {
 		got, err := parseByteSize(c.in)

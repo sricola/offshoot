@@ -242,7 +242,13 @@ what's left that no further engineering resolves.
   package's own design (a stray-close lock hazard the design deliberately
   avoids), which makes "evict a cold session's FD" a real design problem
   needing its own pass, not a variant of the ro-cache budget's shape. See
-  [docs/status.md](docs/status.md)'s FD-budget row.
+  [docs/status.md](docs/status.md)'s FD-budget row. **Follow-up, not yet
+  scoped:** `destroy`/GC never clean up a branch's `checkouts-ro` entries —
+  they linger until LRU eviction claims them, which never happens at the
+  default `-ro-cache-budget 0` (unlimited). Safe today (every entry is an
+  immutable checkpoint snapshot, and `rm -rf checkouts-ro` remains sound at
+  any time), but worth a real cleanup path now that Task 5 turned what used
+  to be a manual `rm -rf` grace into an institutionalized cache.
 - ✅ **Tuning surface.** `SnapshotEvery` exposed through the daemon
   (`serve -snapshot-every N`); documented guidance in
   [docs/operations.md](docs/operations.md#tuning-flags) including the
