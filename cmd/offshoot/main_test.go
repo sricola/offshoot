@@ -195,6 +195,99 @@ func TestServeNegativeFlushEveryIsRejected(t *testing.T) {
 	}
 }
 
+// TestParseByteSize pins -ro-cache-budget's value grammar (Milestone 4 Task
+// 5): bare integers are bytes (the contract), a trailing power-of-1024
+// K/M/G/T(B) suffix is a convenience multiplier, "" (flag omitted) is 0
+// (unlimited), and a negative or garbage value is rejected outright rather
+// than silently coerced to 0 or ignored.
+func TestParseByteSize(t *testing.T) {
+	cases := []struct {
+		in      string
+		want    int64
+		wantErr bool
+	}{
+		{"", 0, false},
+		{"0", 0, false},
+		{"1", 1, false},
+		{"1024", 1024, false},
+		{"500", 500, false},
+		{"1K", 1024, false},
+		{"1KB", 1024, false},
+		{"1kb", 1024, false},
+		{"1M", 1 << 20, false},
+		{"500MB", 500 * (1 << 20), false},
+		{"2G", 2 << 30, false},
+		{"1GB", 1 << 30, false},
+		{"1T", 1 << 40, false},
+		{"1TB", 1 << 40, false},
+		{"500B", 500, false},
+		{"-1", 0, true},
+		{"-1MB", 0, true},
+		{"abc", 0, true},
+		{"MB", 0, true},
+		{"1.5MB", 0, true},
+	}
+	for _, c := range cases {
+		got, err := parseByteSize(c.in)
+		if c.wantErr {
+			if err == nil {
+				t.Errorf("parseByteSize(%q) = %d, <nil>, want an error", c.in, got)
+			}
+			continue
+		}
+		if err != nil {
+			t.Errorf("parseByteSize(%q) unexpected error: %v", c.in, err)
+			continue
+		}
+		if got != c.want {
+			t.Errorf("parseByteSize(%q) = %d, want %d", c.in, got, c.want)
+		}
+	}
+}
+
+// TestServeNegativeROCacheBudgetIsRejected mirrors
+// TestServeNegativeFlushEveryIsRejected's shape for the new flag: a
+// negative -ro-cache-budget is refused at startup, before any socket/daemon
+// is touched, rather than silently treated as 0 (unlimited) or something
+// else surprising.
+func TestServeNegativeROCacheBudgetIsRejected(t *testing.T) {
+	dir := filepath.Join(t.TempDir(), "s")
+	if err := run([]string{"-store", dir, "init"}); err != nil {
+		t.Fatal(err)
+	}
+	if err := run([]string{"-store", dir, "create", "app"}); err != nil {
+		t.Fatal(err)
+	}
+	if err := run([]string{"-store", dir, "serve", "-ro-cache-budget", "-5"}); err == nil {
+		t.Fatal("serve -ro-cache-budget -5 must be rejected, not silently treated as unlimited")
+	}
+}
+
+// TestStatusShowsROCacheUsageAndBudget exercises `offshoot status`'s
+// ro-cache summary line end to end through the CLI: an empty store reports
+// zero usage with "unlimited" when -ro-cache-budget is omitted, and echoes
+// back a given -ro-cache-budget (including its size-suffix parsing) when
+// one is passed.
+func TestStatusShowsROCacheUsageAndBudget(t *testing.T) {
+	dir := filepath.Join(t.TempDir(), "s")
+	if err := run([]string{"-store", dir, "init"}); err != nil {
+		t.Fatal(err)
+	}
+	if err := run([]string{"-store", dir, "create", "app"}); err != nil {
+		t.Fatal(err)
+	}
+
+	out := call(t, dir, "status")
+	if !strings.Contains(out, "ro-cache: 0 entries, 0 bytes used (budget: unlimited)") {
+		t.Fatalf("status without -ro-cache-budget:\n%s", out)
+	}
+
+	out = call(t, dir, "status", "-ro-cache-budget", "1MB")
+	if !strings.Contains(out, fmt.Sprintf("budget %d bytes", int64(1<<20))) {
+		t.Fatalf("status -ro-cache-budget 1MB:\n%s", out)
+	}
+}
+
 // TestServeTokenWithoutHTTPIsRejected and
 // TestServeAllowNonLoopbackWithoutHTTPIsRejected pin Milestone 4 Task 3's
 // review-fold item: -token/-http-allow-non-loopback only mean anything

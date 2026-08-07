@@ -44,6 +44,15 @@ type Server struct {
 	// -flush-every (default 30s) — safe-by-default cadence lives at this
 	// daemon boundary, not in the session library's own default.
 	flushEvery time.Duration
+	// roCacheBudget is the checkouts-ro disk budget in bytes (Milestone 4
+	// Task 5): janitorTick calls ops.Workspace.EvictROCache with this value
+	// on every pass. 0 (the zero value, matching CheckoutAt's own unbounded-
+	// by-default behavior) means unlimited — the pass still computes and
+	// reports usage (offshoot_ro_cache_bytes), it just never evicts. Set via
+	// SetROCacheBudget before Serve starts accepting connections, mirroring
+	// flushEvery's own single-writer-before-Serve contract; cmd/offshoot's
+	// `serve` command sets it from -ro-cache-budget (default 0).
+	roCacheBudget int64
 	// openWG counts in-flight opOpen calls: Add(1) happens under mu at the
 	// moment a slot is reserved, Done() happens once that call's bookkeeping
 	// has fully resolved (map updated and, if it self-closed, the session
@@ -165,6 +174,18 @@ func (s *Server) SetFlushEvery(d time.Duration) {
 	s.mu.Unlock()
 }
 
+// SetROCacheBudget sets the checkouts-ro disk budget in bytes (Milestone 4
+// Task 5), applied by janitorTick's ro-cache pass starting from the next
+// tick. Call before Serve starts accepting connections, mirroring
+// SetFlushEvery's own contract. bytes <= 0 means unlimited (the default) —
+// the janitor still computes and reports usage every pass, it just never
+// evicts anything.
+func (s *Server) SetROCacheBudget(bytes int64) {
+	s.mu.Lock()
+	s.roCacheBudget = bytes
+	s.mu.Unlock()
+}
+
 // StartJanitor reaps expired branches and runs GC every interval until
 // Shutdown. grace is passed to GC (tombstone age before deletion); the
 // default in cmd is deliberately generous — the spec requires it to exceed
@@ -210,20 +231,22 @@ func (s *Server) StartJanitor(every, grace time.Duration) {
 	}()
 }
 
-// janitorTick runs one reap+GC pass and updates every janitor-sourced
-// metric (offshoot_reap_total, offshoot_gc_tombstoned_total,
-// offshoot_gc_deleted_total, offshoot_gc_backlog,
-// offshoot_janitor_runs_total{result}) from its results — split out of
-// StartJanitor's ticker loop so a test can drive exactly one tick
-// deterministically instead of waiting on a real ticker. Reap/GC results are
-// counted even when they also return an error: both ops.Workspace.Reap and
-// ops.Workspace.GC keep processing everything they can and report a partial
-// result alongside the first error they hit (see their own doc comments),
-// so len(reaped)/tombstoned/deleted are real work actually done, not
-// discarded just because something else in the same pass failed.
-// offshoot_janitor_runs_total{result} is "error" if EITHER step failed,
-// "ok" only if both fully succeeded — a single counter per tick, not one
-// per step, matching the locked metric's one label (result), not two.
+// janitorTick runs one reap+GC+ro-cache pass and updates every
+// janitor-sourced metric (offshoot_reap_total, offshoot_gc_tombstoned_total,
+// offshoot_gc_deleted_total, offshoot_gc_backlog, offshoot_ro_cache_bytes,
+// offshoot_ro_cache_evictions_total, offshoot_janitor_runs_total{result})
+// from its results — split out of StartJanitor's ticker loop so a test can
+// drive exactly one tick deterministically instead of waiting on a real
+// ticker. Reap/GC results are counted even when they also return an error:
+// both ops.Workspace.Reap and ops.Workspace.GC keep processing everything
+// they can and report a partial result alongside the first error they hit
+// (see their own doc comments), so len(reaped)/tombstoned/deleted are real
+// work actually done, not discarded just because something else in the same
+// pass failed. ops.Workspace.EvictROCache follows the identical convention
+// (see its own doc comment) for the same reason.
+// offshoot_janitor_runs_total{result} is "error" if ANY step failed, "ok"
+// only if all fully succeeded — a single counter per tick, not one per
+// step, matching the locked metric's one label (result), not two.
 func (s *Server) janitorTick(grace time.Duration) {
 	failed := false
 
@@ -262,6 +285,50 @@ func (s *Server) janitorTick(grace time.Duration) {
 		fmt.Fprintf(os.Stderr, "offshoot: janitor: gc backlog: %v\n", err)
 	} else {
 		s.metrics.GCBacklog.Set(float64(backlog))
+	}
+
+	// Milestone 4 Task 5: ro-cache budget/eviction. s.roCacheBudget is read
+	// under s.mu (set once, before Serve starts accepting connections, via
+	// SetROCacheBudget — same single-writer-before-Serve contract as
+	// flushEvery), mirroring opOpen's own read of flushEvery.
+	s.mu.Lock()
+	budget := s.roCacheBudget
+	s.mu.Unlock()
+	evicted, usage, roErr := s.ws.EvictROCache(budget)
+	if roErr != nil {
+		fmt.Fprintf(os.Stderr, "offshoot: janitor: ro-cache: %v\n", roErr)
+		failed = true
+	}
+	// Always set, even when budget <= 0 (unlimited) or usage is already
+	// under budget: offshoot_ro_cache_bytes reports CURRENT usage every
+	// pass regardless of whether this pass evicted anything, matching
+	// GCBacklog's own always-set-even-at-zero treatment above. This is a
+	// janitor-pass-cadence gauge, not a scrape-time one (unlike
+	// SessionsOpen/CaptureLagBytes/DurableAgeSeconds in metrics.go's
+	// collectSessionGauges) — see EvictROCache's doc comment and
+	// docs/reference.md's `-ro-cache-budget` section for the staleness this
+	// implies between passes.
+	s.metrics.ROCacheBytes.Set(float64(usage))
+	if len(evicted) > 0 {
+		s.metrics.ROCacheEvictionsTotal.Add(float64(len(evicted)))
+	}
+	for _, e := range evicted {
+		// Eviction is LOUD by design (Global Constraints): a log line per
+		// eviction, on top of the counter/gauge above and the "evicted"
+		// event below — an operator watching stderr sees exactly what left
+		// disk and why, the same family as this function's other
+		// "offshoot: janitor: ..." lines.
+		fmt.Fprintf(os.Stderr, "offshoot: janitor: ro-cache: evicted %s@%s@%s (%d bytes)\n",
+			e.DB, e.Branch, e.Checkpoint, e.Bytes)
+		// Milestone 4 Task 4a reserved this event type with no emitter;
+		// this is that emitter. publish is non-blocking (see
+		// eventBus.publish's doc comment) — never stalls the janitor loop
+		// regardless of subscriber count/speed, exactly like the "reaped"
+		// publish above.
+		s.events.publish(newEvent("evicted", e.DB, e.Branch, map[string]any{
+			"checkpoint": e.Checkpoint,
+			"bytes":      e.Bytes,
+		}))
 	}
 
 	result := "ok"

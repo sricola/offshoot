@@ -405,10 +405,11 @@ disabling collection.
 Prints which branches were reaped, and how many lineages were tombstoned vs.
 actually deleted.
 
-## `offshoot status`
+## `offshoot status [-ro-cache-budget BYTES]`
 
 ```
 offshoot status
+offshoot status -ro-cache-budget 500MB
 ```
 
 Prints every branch across every database: its computed **state** (see
@@ -419,6 +420,19 @@ TTL itself and time remaining until it's reap-eligible
 from the later of the branch's last-touch time and its lease expiry,
 whichever is later — matching exactly what the janitor's reap logic uses,
 so `status` never disagrees with what will actually happen.
+
+After the branch listing, a final `ro-cache: N entries, B bytes used
+(budget: unlimited)` line (Milestone 4 Task 5) reports `checkouts-ro`'s
+current usage (`ops.Workspace.ROCacheUsage`, an at-rest read — no daemon
+required, exactly like the rest of this command). `-ro-cache-budget` is
+**display-only** here: it echoes back `serve -ro-cache-budget`'s own value
+and grammar (see below) so an operator can see usage against the budget
+they intend to run with, without needing a live daemon connection — the
+budget itself is never persisted anywhere (like every other `serve` tuning
+flag), so this at-rest command has no other way to know what a *running*
+daemon was actually started with. Omitted, the line reads
+`(budget: unlimited)` regardless of what any running daemon's own
+`-ro-cache-budget` is actually set to.
 
 ### Branch states
 
@@ -537,7 +551,7 @@ Releases the branch's current lease (looked up first via the same listing
 
 **Errors:** no lease currently held on that branch.
 
-## `offshoot serve [-socket PATH] [-reap-every DURATION] [-gc-grace DURATION] [-flush-every DURATION] [-http ADDR] [-token TOKEN] [-http-allow-non-loopback]`
+## `offshoot serve [-socket PATH] [-reap-every DURATION] [-gc-grace DURATION] [-flush-every DURATION] [-ro-cache-budget BYTES] [-http ADDR] [-token TOKEN] [-http-allow-non-loopback]`
 
 ```
 offshoot serve
@@ -577,7 +591,90 @@ costs](../README.md#what-a-flush-costs) in the README for what a background
 flush (and every session's mandatory first "settling" flush) actually cost.
 
 **Errors:** socket path already in use by another listener; underlying
-store-attach failure; `-flush-every` given a negative duration.
+store-attach failure; `-flush-every` given a negative duration;
+`-ro-cache-budget` given a negative value.
+
+### `-ro-cache-budget BYTES` — checkouts-ro disk budget (Milestone 4 Task 5)
+
+```
+offshoot serve -ro-cache-budget 0            # unlimited (the default)
+offshoot serve -ro-cache-budget 536870912    # 512 MiB, in bytes
+offshoot serve -ro-cache-budget 500MB        # same idea, via a size suffix
+```
+
+Bounds `checkouts-ro` — the read-only cache `offshoot checkout --at
+--read-only` / the daemon's `checkout-at` op materializes into (see
+[above](#read-only-historical-checkout---at-checkpoint---read-only---force))
+— which otherwise grows without bound: one file per distinct
+`db@branch@checkpoint` ever cached, never reclaimed on its own. **Never
+`checkouts/`** (the writable, leased tree `checkout`/`session open` use) —
+see the writable-never-evicted guarantee below.
+
+Default `0` means unlimited, matching `CheckoutAt`'s own unbounded-by-default
+behavior — the janitor still computes and reports usage every pass (see
+below), it just never evicts. A bare integer is bytes, the contract this
+flag, `offshoot_ro_cache_bytes`, and every eviction event/log line all
+speak; as a convenience, a trailing power-of-1024 size suffix is also
+accepted, case-insensitively: `K`/`KB`, `M`/`MB`, `G`/`GB`, `T`/`TB` (each
+multiplies by 1024^n — **not** the SI decimal 1000-based convention some
+tools use for the same letters; pass raw bytes if that distinction
+matters to you). `offshoot status`'s own `-ro-cache-budget` flag accepts
+the identical grammar, purely for display (see `offshoot status` above) —
+it is never persisted, so that at-rest command has no other way to know
+what a running daemon was actually started with.
+
+**When it runs:** on the same cadence as reap/GC — every `-reap-every`
+tick (the janitor loop; `-reap-every 0` disables the janitor entirely, so
+no ro-cache pass runs either, exactly like reap/GC). Each pass:
+
+1. Computes `checkouts-ro`'s total current size and sets
+   `offshoot_ro_cache_bytes` to it — **always**, even when the budget is
+   `0` or usage is already under it. This is a once-per-janitor-pass
+   gauge, not a scrape-time one: between passes it can lag real usage by
+   up to `-reap-every`'s interval (e.g. a `CheckoutAt` call materializing a
+   large new entry moments after a pass won't be reflected until the
+   next one).
+2. If usage exceeds the budget, evicts entries **oldest-by-LRU-clock
+   first** (see below) until usage is back at or under it.
+
+**The LRU clock (PM Amendment 11, pre-decided): a `.last-used`
+touch-on-HIT marker file, not the cache file's own mtime.** Every
+force=false `CheckoutAt` cache HIT (a repeat call for an already-cached
+`db@branch@checkpoint`) touches a `<cachefile>.last-used` sidecar file to
+the current time. This exists because the cache file's own mtime is set
+exactly once, by the materialize that created it — a cache HIT is a pure
+read of an already-`chmod 0444` file and must never write through it again
+— so without a separate marker, "least recently used" would silently
+collapse to "least recently created," exactly backwards for a cache whose
+entire purpose is that a checkpoint hit over and over stays hot. Ranking:
+the marker's mtime when one exists, falling back to the cache file's own
+mtime (the materialize timestamp) as the floor for an entry that has never
+been hit since it was created. A cache file with **no** marker therefore
+ranks no more recently than its own creation time — the correct, and only
+sensible, floor.
+
+**`checkouts/` is never evicted — by construction, not a runtime check.**
+The eviction pass only ever lists and removes files under `checkouts-ro`
+(a directory tree, and a filename shape — `<branch>@<checkpoint>.db` — that
+`checkouts/<db>/<branch>.db` can never collide with; see the read-only
+checkout section above for the same separation stated from `CheckoutAt`'s
+side). There is no code path in the eviction pass that can construct, or
+be handed, a `checkouts/` path at all — a leased, currently-open session's
+writable checkout survives even the most aggressive budget (e.g. `1`, which
+forces every `checkouts-ro` entry out) untouched, by the same guarantee.
+
+**Eviction is loud**: one `offshoot: janitor: ro-cache: evicted
+<db>@<branch>@<checkpoint> (<bytes> bytes)` line to stderr per entry
+removed, `offshoot_ro_cache_evictions_total` (a counter) incremented once
+per entry, and an `evicted` event published on the [event
+bus](#eventing-subscribe-op--get-events) (`{type:"evicted", db, branch,
+detail:{checkpoint, bytes}}`) — subscribe (socket or `GET /events`) to
+watch evictions happen in real time. Each eviction removes both the cache
+file and its `.last-used` marker together.
+
+`checkouts-ro` remains safe to `rm -rf` at any time regardless of the
+budget (see the read-only checkout section above) — a budget just
+automates what that manual cleanup would otherwise require doing by hand.
 
 ### `-http ADDR` — opt-in HTTP listener (Milestone 4 Task 3)
 
@@ -665,7 +762,7 @@ sees events published *after* it subscribes.
 | `fenced` | A session is fenced out by a lease it no longer holds | `cause` |
 | `session_closed` | A session closes (daemon `close` op, or `shutdown`) | `error` (only if the close itself errored) |
 | `reaped` | The janitor destroys a branch whose TTL expired | *(none)* |
-| `evicted` | *(reserved — not yet emitted; see [docs/status.md](status.md))* | Milestone 4 Task 5's ro-cache LRU eviction path |
+| `evicted` | The janitor evicts a `checkouts-ro` entry over `-ro-cache-budget` | `checkpoint`, `bytes` |
 | `dropped_slow_consumer` | Sent to a subscriber being dropped (see below), never to anyone else | *(none)* |
 
 **Slow-subscriber drop:** publishing never blocks the daemon (a session
@@ -942,6 +1039,7 @@ check it against an allow-list beyond requiring it be absolute.
 
 ## What's not here
 
-The ro-cache disk budget does not exist yet — see
-[docs/status.md](status.md) for the full implemented/deferred matrix and
-links to the roadmap milestones tracking each.
+See [docs/status.md](status.md) for the full implemented/deferred matrix
+and links to the roadmap milestones tracking each — e.g. the FD budget
+with idle-checkout eviction and `SnapshotEvery` tuning via the daemon,
+both still not yet implemented as of this page's last update.

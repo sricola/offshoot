@@ -18,15 +18,17 @@ import (
 // the string literals passed to Registry.New* are what actually matters
 // and must not drift from this list.
 //
-// Every metric is registered up front, in NewMetrics, even the two whose
-// real data doesn't exist yet (offshoot_ro_cache_bytes,
-// offshoot_ro_cache_evictions_total — Milestone 4 Task 5 wires the ro-cache
-// janitor pass that actually moves these; until then they read 0, which is
-// itself informative — "not evicting anything" is a true statement about a
-// budget that doesn't exist yet) — registering the full locked set NOW,
-// rather than growing the exposition output task-by-task, is what makes the
-// name list actually locked from day one instead of accreting surprises
-// later.
+// Every metric is registered up front, in NewMetrics — registering the full
+// locked set from the start, rather than growing the exposition output
+// task-by-task, is what makes the name list actually locked from day one
+// instead of accreting surprises later. offshoot_ro_cache_bytes/
+// offshoot_ro_cache_evictions_total (Milestone 4 Task 5) are driven by the
+// janitor's ro-cache pass (Server.janitorTick, internal/daemon/server.go) —
+// both read 0 until the first janitor tick runs (or forever, on a daemon
+// started with -reap-every 0, which disables the janitor entirely), which
+// is itself informative: "no usage observed yet" for a gauge that updates
+// once per pass, not continuously (see janitorTick's doc comment for the
+// resulting between-passes staleness).
 type Metrics struct {
 	Registry *metrics.Registry
 
@@ -54,9 +56,9 @@ type Metrics struct {
 	GCDeletedTotal    *metrics.Counter
 	GCBacklog         *metrics.Gauge
 
-	// ROCacheBytes/ROCacheEvictionsTotal: registered now at zero: Task 5
-	// wires the ro-cache budget/eviction janitor pass that gives these real
-	// values. See this type's doc comment.
+	// ROCacheBytes/ROCacheEvictionsTotal: driven by the janitor's ro-cache
+	// pass (Milestone 4 Task 5) — see this type's doc comment and
+	// Server.janitorTick.
 	ROCacheBytes          *metrics.Gauge
 	ROCacheEvictionsTotal *metrics.Counter
 
@@ -115,9 +117,9 @@ func newMetrics() *Metrics {
 			"Tombstoned lineages currently awaiting GC's grace period before deletion."),
 
 		ROCacheBytes: r.NewGauge("offshoot_ro_cache_bytes",
-			"Bytes used by the read-only checkout cache. Always 0 until Milestone 4 Task 5 wires the ro-cache budget/eviction pass."),
+			"Bytes used by the read-only checkout cache (checkouts-ro). Updated once per janitor pass, not continuously; see docs/reference.md."),
 		ROCacheEvictionsTotal: r.NewCounter("offshoot_ro_cache_evictions_total",
-			"Read-only checkout cache entries evicted. Always 0 until Milestone 4 Task 5."),
+			"Read-only checkout cache entries evicted by the janitor's LRU pass under -ro-cache-budget."),
 
 		JanitorRunsTotal: r.NewCounterVec("offshoot_janitor_runs_total",
 			"Janitor loop ticks, by result.", "result"),
