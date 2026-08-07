@@ -318,8 +318,8 @@ footer a{color:var(--ink-dim); border:none}
       <div class="card"><h3>pytest fixture + ts testkit</h3>
         <p><code>pip install "offshoot-db[pytest]"</code> wires three fixtures — <code>offshoot_daemon</code>,
         <code>offshoot_db</code>, <code>offshoot_fork</code> — into seed-once-fork-many: one seed checkpoint,
-        a fresh forked branch per test, TTL-backstopped teardown, <code>pytest-xdist</code> parallel by
-        default. <code>@offshoot-db/client/testkit</code> is the same shape for vitest/jest/<code>node:test</code>.
+        a fresh forked branch per test, TTL-backstopped teardown — and xdist-safe: one daemon per worker
+        under <code>pytest-xdist -n</code>. <code>@offshoot-db/client/testkit</code> is the same shape for vitest/jest/<code>node:test</code>.
         The full tutorial, install to CI, is in the eval-harness doc.</p></div>
       <div class="card"><h3>mcp server</h3>
         <p>One command: <code>claude mcp add offshoot -- offshoot mcp</code>. Seven tools with descriptions a model
