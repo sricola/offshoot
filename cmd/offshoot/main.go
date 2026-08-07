@@ -39,6 +39,14 @@ Usage:
                                      overwrite an existing out.db unless
                                      --force; no sidecar, no lease — out.db
                                      has no ongoing relationship to the store
+  offshoot diff <db>[@branch[@checkpoint]] <db>[@branch[@checkpoint]] [--summary]
+                                     materialize both sides read-only and run
+                                     sqldiff over them; --summary prints a
+                                     table-level row-count comparison instead
+                                     (no sqldiff needed) — either target may
+                                     omit the checkpoint for the branch's
+                                     current head; the two sides may name the
+                                     same db or different ones
   offshoot checkpoint <db>[@branch] <name> [--meta k=v ...]
                                      snapshot the checkout as a named checkpoint
   offshoot fork <db>[@branch] <new> [--at cp] [--ttl duration] [--meta k=v ...]
@@ -494,6 +502,12 @@ func run(args []string) error {
 		}
 		fmt.Println(rest[1])
 		return nil
+	case "diff":
+		summary, rest := extractBoolFlag(rest, "--summary")
+		if len(rest) != 2 {
+			return fmt.Errorf("usage: offshoot diff <db>[@branch[@checkpoint]] <db>[@branch[@checkpoint]] [--summary]")
+		}
+		return runDiff(w, os.Stdout, rest[0], rest[1], summary)
 	case "destroy":
 		force := false
 		fs := rest[:0]
