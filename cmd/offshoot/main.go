@@ -735,6 +735,20 @@ func run(args []string) error {
 		if len(rest) != 0 {
 			return fmt.Errorf(serveUsage)
 		}
+		// -token/-http-allow-non-loopback only mean anything alongside
+		// -http; given without it, they'd otherwise be silently ignored —
+		// almost certainly a mistake (e.g. a typo'd or dropped -http ADDR
+		// in a script), and one that would be surprising to notice only by
+		// its ABSENCE (no auth, no HTTP listener at all) rather than an
+		// explicit error at startup.
+		if httpAddr == "" {
+			if tokenFlag != "" {
+				return fmt.Errorf("-token given without -http; it has no effect unless -http ADDR is also set")
+			}
+			if allowNonLoopback {
+				return fmt.Errorf("-http-allow-non-loopback given without -http; it has no effect unless -http ADDR is also set")
+			}
+		}
 
 		// Milestone 4 Task 3: HTTP is off by default (httpAddr == ""); when
 		// requested, validate the bind BEFORE touching the socket/daemon at

@@ -8,6 +8,7 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"io"
 	"net"
 	"net/http"
 	"os"
@@ -86,6 +87,18 @@ type Server struct {
 	// OS-assigned port via HTTPAddr(). Same single-writer-before-serving
 	// contract as httpSrv/httpToken above.
 	httpAddr string
+	// httpLog is StartHTTP's resolved log writer (HTTPConfig.Log, or
+	// os.Stderr if that was nil) — stored so request-time handlers
+	// (handleMetrics's error path, in particular) log to the SAME
+	// destination StartHTTP's own startup lines went to, rather than a
+	// bare os.Stderr that would silently ignore a caller/test's redirected
+	// Log. Read under s.mu (unlike httpSrv/httpToken/httpAddr, which rely
+	// on the happens-before-Serve guarantee) since handleMetrics runs on a
+	// per-request goroutine with no such guarantee relative to a
+	// hypothetical concurrent StartHTTP retry; the read is cheap and rare
+	// (only on a WritePrometheus error) so this costs nothing in the
+	// common path.
+	httpLog io.Writer
 }
 
 func key(db, branch string) string { return db + "@" + branch }
