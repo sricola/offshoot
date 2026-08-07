@@ -217,7 +217,42 @@ func TestDiffCLIIdenticalSidesProduceNoSqldiffOutput(t *testing.T) {
 	call(t, store, "checkpoint", "app", "v1")
 
 	out := call(t, store, "diff", "app@main@v1", "app@main@v1")
-	if strings.TrimSpace(out) != "" {
-		t.Fatalf("diffing a checkpoint against itself should produce no sqldiff output, got:\n%s", out)
+	// The only line runDiff itself ever prints is the left/right header —
+	// everything else is sqldiff's own stdout, which must be empty for two
+	// identical sides.
+	wantHeader := "left:  app@main@v1 right: app@main@v1\n"
+	if out != wantHeader {
+		t.Fatalf("diffing a checkpoint against itself should produce only the left/right header and no sqldiff output, got:\n%q", out)
+	}
+}
+
+// TestDiffCLIPrintsLeftRightHeaderInBothModes is the fix for the reviewer's
+// IMPORTANT finding: neither mode's output used to record which target was
+// which side. Both the default sqldiff mode and --summary must now print a
+// "left: ... right: ..." header naming the two raw target strings the
+// caller passed, and --summary's own table header row must use those same
+// target strings as its two count columns (not bare "LEFT"/"RIGHT") so a
+// reader never has to scroll back up to know which count is which side.
+func TestDiffCLIPrintsLeftRightHeaderInBothModes(t *testing.T) {
+	requireSQLite3ForCLI(t)
+	store := filepath.Join(t.TempDir(), "s")
+	left, right := seedTwoSidesForDiff(t, store)
+
+	summaryOut := call(t, store, "diff", left, right, "--summary")
+	if !strings.Contains(summaryOut, "left:  "+left+" right: "+right) {
+		t.Fatalf("--summary output missing the left/right header naming %q and %q; full output:\n%s", left, right, summaryOut)
+	}
+	// The table's own column headers must also name the targets, not bare
+	// LEFT/RIGHT.
+	if !strings.Contains(summaryOut, left) || !strings.Contains(summaryOut, right) {
+		t.Fatalf("--summary table headers must use the target strings %q/%q, got:\n%s", left, right, summaryOut)
+	}
+
+	if _, err := exec.LookPath("sqldiff"); err != nil {
+		t.Skip("sqldiff not on PATH; already proved the --summary half above")
+	}
+	sqldiffOut := call(t, store, "diff", left, right)
+	if !strings.Contains(sqldiffOut, "left:  "+left+" right: "+right) {
+		t.Fatalf("default (sqldiff) mode output missing the left/right header naming %q and %q; full output:\n%s", left, right, sqldiffOut)
 	}
 }

@@ -80,8 +80,17 @@ func runDiff(w *ops.Workspace, out io.Writer, leftTarget, rightTarget string, su
 	}
 	defer right.Close()
 
+	// Print which target is which side BEFORE either mode's own output —
+	// this is the only place that ever prints the raw target strings the
+	// caller typed, so it's the only trust anchor tying "left"/"right" (or
+	// a --summary table's column headers, or an un-labeled sqldiff
+	// transcript) back to an actual db@branch[@checkpoint]. Both modes get
+	// it: sqldiff's own output never mentions which file was DB1 vs DB2 by
+	// name, and --summary's LEFT/RIGHT columns are meaningless without it.
+	fmt.Fprintf(out, "left:  %s right: %s\n", leftTarget, rightTarget)
+
 	if summary {
-		return printDiffSummary(out, left.Path, right.Path)
+		return printDiffSummary(out, left.Path, right.Path, leftTarget, rightTarget)
 	}
 
 	if _, err := exec.LookPath("sqldiff"); err != nil {
@@ -104,14 +113,21 @@ func runDiff(w *ops.Workspace, out io.Writer, leftTarget, rightTarget string, su
 // "changed (-N)" for a differing row count, "same" otherwise. A trailing
 // summary line gives the totals so a caller doesn't have to count rows of
 // output to answer "did anything change at all."
-func printDiffSummary(out io.Writer, leftPath, rightPath string) error {
+//
+// The two count columns are headered with the caller's own leftTarget/
+// rightTarget strings (not bare "LEFT"/"RIGHT") — runDiff already prints a
+// "left: ... right: ..." line above this table, but repeating the target
+// names as the column headers themselves means a reader scanning just the
+// table doesn't have to scroll back up to know which count belongs to
+// which side.
+func printDiffSummary(out io.Writer, leftPath, rightPath, leftTarget, rightTarget string) error {
 	rows, err := ops.DiffSummary(leftPath, rightPath)
 	if err != nil {
 		return fmt.Errorf("offshoot diff --summary: %w", err)
 	}
 
 	tw := tabwriter.NewWriter(out, 0, 4, 2, ' ', 0)
-	fmt.Fprintln(tw, "TABLE\tLEFT\tRIGHT\tSTATUS")
+	fmt.Fprintf(tw, "TABLE\t%s\t%s\tSTATUS\n", leftTarget, rightTarget)
 
 	var added, removed, changed, same int
 	for _, d := range rows {

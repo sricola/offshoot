@@ -193,12 +193,21 @@ Materializes both sides READ-ONLY through the same primitives `export`/
 `checkout --at --read-only` use (never a live checkout, never a lease — safe
 alongside an open daemon session on either branch) and either streams
 `sqldiff`'s output over them (default) or prints a stdlib-only table-level
-row-count summary (`--summary`, no `sqldiff` dependency at all). Each target
-uses the same triple-`@` form `export` does — `db` alone means `db@main`
-head, `db@branch` means that branch's head, `db@branch@checkpoint` means
-that named checkpoint. The two targets may name the same `db` or two
-different ones. Full walkthrough, the raw by-hand recipe, and the exact
-staleness rule for a head-side (no-checkpoint) target: [docs/diff.md](diff.md).
+row-count summary (`--summary`, no `sqldiff` dependency at all;
+row-counts-only — equal counts with different values still report `same`,
+use the default `sqldiff` mode for content). Each target uses the same
+triple-`@` form `export` does — `db` alone means `db@main` head, `db@branch`
+means that branch's head, `db@branch@checkpoint` means that named
+checkpoint. The two targets may name the same `db` or two different ones.
+Full walkthrough, the raw by-hand recipe, and the exact staleness rule for a
+head-side (no-checkpoint) target: [docs/diff.md](diff.md).
+
+Before either mode's own output, a header line names which raw target
+string is which side: `left:  <target1> right: <target2>` (verbatim, using
+exactly what was typed on the command line — not a normalized/expanded
+form). `--summary`'s own table header row reuses those same two strings as
+its count columns instead of bare `LEFT`/`RIGHT`, so the table stays
+self-describing even scrolled away from the header line above it.
 
 **Default mode** requires the separate `sqldiff` binary on PATH (NOT
 included by installing plain `sqlite3` on every platform) — its absence is a

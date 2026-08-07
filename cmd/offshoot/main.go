@@ -43,10 +43,13 @@ Usage:
                                      materialize both sides read-only and run
                                      sqldiff over them; --summary prints a
                                      table-level row-count comparison instead
-                                     (no sqldiff needed) — either target may
-                                     omit the checkpoint for the branch's
-                                     current head; the two sides may name the
-                                     same db or different ones
+                                     (no sqldiff needed) — row counts only;
+                                     equal counts with different values
+                                     report as same — use full sqldiff mode
+                                     for content; either target may omit the
+                                     checkpoint for the branch's current
+                                     head; the two sides may name the same
+                                     db or different ones
   offshoot checkpoint <db>[@branch] <name> [--meta k=v ...]
                                      snapshot the checkout as a named checkpoint
   offshoot fork <db>[@branch] <new> [--at cp] [--ttl duration] [--meta k=v ...]

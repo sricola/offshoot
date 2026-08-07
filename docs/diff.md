@@ -43,6 +43,16 @@ runs [`sqldiff`](https://www.sqlite.org/sqldiff.html) DB1 DB2, streaming its
 output (SQL statements that would transform the left side into the right
 side) straight to stdout.
 
+Before either mode's own output, `offshoot diff` always prints one header
+line naming which raw target string is which side — the only place either
+mode ever repeats what you typed, so it's the one anchor tying "left"/
+"right" (or, in `--summary`, a bare row-count column) back to an actual
+`db@branch[@checkpoint]`:
+
+```
+left:  evals@attempt-1@done right: evals@attempt-2@done
+```
+
 **`sqldiff` is a separate binary from the `sqlite3` CLI** — installing
 `sqlite3` alone does not put `sqldiff` on PATH on every platform. If it's
 missing, `offshoot diff` fails with a clear, verified-per-OS install hint
@@ -73,12 +83,17 @@ offshoot diff evals@attempt-1@done evals@attempt-2@done --summary
 ```
 
 ```
-TABLE     LEFT  RIGHT  STATUS
-attempts  12    12     same
-results   40    46     changed (+6)
-scratch   3     -      removed
-5 tables: 3 same, 1 changed, 0 added, 1 removed
+left:  evals@attempt-1@done right: evals@attempt-2@done
+TABLE     evals@attempt-1@done  evals@attempt-2@done  STATUS
+attempts  12                    12                    same
+results   40                    46                    changed (+6)
+scratch   3                     -                     removed
+3 tables: 1 same, 1 changed, 0 added, 1 removed
 ```
+
+(real output, from a store seeded exactly as the walkthrough above describes
+— `evals@attempt-1` untouched from a 12/40/3-row base, `evals@attempt-2`
+with 6 more `results` rows and `scratch` dropped entirely.)
 
 `--summary` never shells out to `sqldiff` (or any external binary at all) —
 it lists both sides' tables from `sqlite_master` and counts rows per table
@@ -93,7 +108,10 @@ Each table gets one row: its name, each side's row count (`-` when the
 table doesn't exist on that side at all), and a status — `added`/`removed`
 for a table on only one side, `changed (+N)`/`changed (-N)` for a
 differing row count, `same` otherwise. A trailing totals line answers "did
-anything change" without counting rows of output.
+anything change" without counting rows of output. The two count columns are
+headered with the raw target strings themselves (not bare `LEFT`/`RIGHT`),
+matching the `left: ... right: ...` line above — a reader scanning just the
+table never has to scroll back up to know which count is which side.
 
 **Note:** `--summary` is a row-count diff, not a content diff — a table
 with the same row count on both sides but different *values* still reports
