@@ -286,11 +286,36 @@ var lagRaceHook func()
 // (and report, as logN) a frame drain() never consumed, so the
 // `int64(logN) != consumed` check correctly leaves the persisted State at
 // Clean=false rather than record a clean marker over content the replica
-// never saw. Exported (unlike lagRaceHook) so internal/session's own tests
-// can deterministically land a write in this window to verify
-// Session.commitSidecarRefresh's gate on State.Clean, without needing to
-// win a real, sub-millisecond race against wall-clock timing. nil (the
-// default) is a no-op and imposes no cost in production.
+// never saw. nil (the default) is a no-op and imposes no cost in
+// production.
+//
+// TEST-ONLY. Not part of this package's API contract, and — unlike every
+// other field/var in this file — never read or written by any production
+// code path; the sole reason it is exported at all (matching
+// lagRaceHook's purpose but not its unexported visibility) is that
+// internal/session's tests need to deterministically land a write in this
+// window to verify Session.commitSidecarRefresh's gate on State.Clean,
+// without winning a real, sub-millisecond race against wall-clock timing —
+// a cross-package need lagRaceHook's tests (same-package only) never had.
+// A production caller has NO reason to ever read or set this; if you are
+// tempted to, you are almost certainly looking for a real engine
+// configuration knob, not a test seam — see Options instead. Considered
+// moving this into Options (a per-Engine-instance field instead of a
+// shared package var, which would also close the "a test that panics
+// before its defer runs leaves this set for every OTHER test in the
+// package" class of bug this global still has) but Options is a
+// production-facing configuration struct (DBPath, StateDir, Sink, Poll —
+// every field on it is something a real caller might legitimately set),
+// and every OTHER same-package test hook in this codebase
+// (lagRaceHook here; FlushEncodeHook/FlushUploadHook in
+// internal/session/flush.go) already uses this exact
+// package-level-var-with-a-doc-comment shape, not an Options field — kept
+// consistent with that established pattern rather than introducing a new
+// one for this single cross-package case. Every test that sets this MUST
+// restore it to nil (e.g. via `defer func() { ShutdownRaceHook = nil }()`,
+// registered immediately after setting it) before returning, precisely
+// because it IS a shared global and a leftover non-nil value would corrupt
+// every subsequent test's engine shutdown in the same test binary run.
 var ShutdownRaceHook func()
 
 // armDeadTailBaseline stats the WAL file's current on-disk size and records

@@ -3,6 +3,7 @@ package session
 import (
 	"bytes"
 	"context"
+	"encoding/json"
 	"errors"
 	"fmt"
 	"os"
@@ -565,8 +566,9 @@ func mustExec(t *testing.T, path, sql string) {
 // the PM-review blocking amendment this task exists to satisfy.
 type countingBackend struct {
 	store.Backend
-	mu     sync.Mutex
-	writes int
+	mu          sync.Mutex
+	writes      int
+	gets, lists int
 }
 
 func (c *countingBackend) Put(key string, data []byte) error {
@@ -590,10 +592,49 @@ func (c *countingBackend) Delete(key string) error {
 	return c.Backend.Delete(key)
 }
 
+// Get and List are counted SEPARATELY from writes (gets/lists, not folded
+// into c.writes) — TestReadOnlySessionWithCleanCheckoutMakesNoStoreWrites
+// and TestCleanReopenReadsChecksumFromSidecarNotTheStore need to assert
+// zero of EACH independently: a settling-flush suppression that avoided
+// every write but still fetched the head object to read its checksum would
+// pass the writes-only assertion while still doing exactly the full-object
+// download I2 (review round 3) exists to prevent.
+func (c *countingBackend) Get(key string) ([]byte, string, error) {
+	c.mu.Lock()
+	c.gets++
+	c.mu.Unlock()
+	return c.Backend.Get(key)
+}
+
+func (c *countingBackend) List(prefix string) ([]string, error) {
+	c.mu.Lock()
+	c.lists++
+	c.mu.Unlock()
+	return c.Backend.List(prefix)
+}
+
 func (c *countingBackend) Count() int {
 	c.mu.Lock()
 	defer c.mu.Unlock()
 	return c.writes
+}
+
+// GetCount reports Get calls observed so far — see Get's doc comment.
+func (c *countingBackend) GetCount() int {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	return c.gets
+}
+
+// ListCount reports List calls observed so far — see Get's doc comment
+// (Chain resolution, ops.Workspace.HeadPostApplyChecksum's now-deleted
+// caller, went through List before Get; counting both makes the
+// zero-store-read assertion unambiguous about which RPC, if any, crept
+// back in).
+func (c *countingBackend) ListCount() int {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	return c.lists
 }
 
 // TestAutoFlushShipsWritesWithoutManualFlush pins Options.FlushEvery: a
@@ -1141,19 +1182,55 @@ func TestReadOnlySessionWithCleanCheckoutMakesNoStoreWrites(t *testing.T) {
 	if !s.cleanAtOpen {
 		t.Fatal("expected cleanAtOpen: the checkout was materialized fresh against the current head just before Open")
 	}
+	if !s.headPostApplyValid {
+		t.Fatal("expected headPostApplyValid: the checkout's fresh materialize just stamped a checksum-bearing sidecar")
+	}
+	// Open itself must have made exactly two backend Gets, both tiny ref
+	// metadata reads (AcquireLease's own GetRef, then CheckoutProven's) —
+	// never a Get on a "data/" object key, which is what a head-checksum
+	// fetch would have needed. This is the direct, positive proof: review
+	// round 2's version of this suppression fetched the head chain's LAST
+	// object on this exact path, a full download whenever the head was a
+	// snapshot; review round 3 replaced it with reading the checksum out of
+	// the LOCAL sidecar CheckoutProven's own GetRef-driven checkoutState
+	// call already parsed, so this count must stay at exactly the two ref
+	// reads Open always needed anyway, regardless of what the head object
+	// is or how large it is.
+	if got := cb.GetCount(); got != 2 {
+		t.Fatalf("Open performed %d backend Get(s), want exactly 2 (AcquireLease's + CheckoutProven's own GetRef) — anything more means a head object was fetched", got)
+	}
+	if got := cb.ListCount(); got != 0 {
+		t.Fatalf("Open performed %d backend List(s), want 0 (no chain resolution needed for a clean-at-open checkout)", got)
+	}
 
-	// baseline excludes AcquireLease's own ref write (a legitimate write
-	// Open always makes, unrelated to the settling-flush suppression under
-	// test) — same reasoning as TestIdleAutoFlushWritesNothing's baseline,
-	// just captured right after Open returns instead of after the session
-	// settles, since here nothing should ever cause it to write at all.
-	baseline := cb.Count()
+	// baseline excludes AcquireLease's own ref write and CheckoutProven's
+	// own GetRef (both legitimate, unavoidable parts of any Open call,
+	// unrelated to the settling-flush suppression under test) — same
+	// reasoning as TestIdleAutoFlushWritesNothing's baseline, just captured
+	// right after Open returns instead of after the session settles, since
+	// here nothing past this point should ever touch the backend at all —
+	// GetCount/ListCount included: review round 3's whole point is that
+	// reading headPostApplyChecksum out of the LOCAL sidecar (see
+	// ops.CheckoutResult.PostApplyChecksum) must add no Get (the previous,
+	// since-reverted design fetched the head chain's last object — a full
+	// DOWNLOAD whenever the head is a snapshot, exactly the case a
+	// permanently-idle read-only session like this one always has) and no
+	// List (Store.Chain resolution) beyond whatever Open already needed.
+	baseline, baselineGets, baselineLists := cb.Count(), cb.GetCount(), cb.ListCount()
 	// Spans the startup rebase, its (suppressed) settle decision, and
 	// several idle flushLoop ticks — ~12 at 40ms.
 	time.Sleep(500 * time.Millisecond)
 	if got := cb.Count(); got != baseline {
 		t.Fatalf("a read-only session with a clean-at-open checkout performed %d backend write(s) after Open returned (baseline %d, now %d), want 0 (no settling flush, no idle-tick writes)",
 			got-baseline, baseline, got)
+	}
+	if got := cb.GetCount(); got != baselineGets {
+		t.Fatalf("a read-only session with a clean-at-open checkout performed %d backend Get(s) after Open returned (baseline %d, now %d), want 0 (the settling-flush suppression must read its checksum from the local .sum sidecar, never fetch the head object)",
+			got-baselineGets, baselineGets, got)
+	}
+	if got := cb.ListCount(); got != baselineLists {
+		t.Fatalf("a read-only session with a clean-at-open checkout performed %d backend List(s) after Open returned (baseline %d, now %d), want 0",
+			got-baselineLists, baselineLists, got)
 	}
 	if s.autoFlushPending() {
 		t.Fatal("expected the suppressed startup rebase to leave nothing pending")
@@ -1195,6 +1272,76 @@ func TestSettleStillHappensWhenCheckoutWasStaleAtOpen(t *testing.T) {
 	}
 
 	waitFor(t, 5*time.Second, "the settling flush", func() bool {
+		ref, _, err := w.Store.GetRef("app", "main")
+		return err == nil && ref.HeadTXID > 1
+	})
+}
+
+// TestSettleStillHappensWithOldFormatSidecarLackingChecksum pins review
+// round 3's fail-toward-settling contract: a sidecar written before
+// PostApplyChecksum existed (or, equivalently, one from a store backend
+// that never records it) still decodes — sumRecord.PostApplyChecksum's
+// `omitempty` JSON tag means the field just isn't there, and Go decodes a
+// missing field to its zero value, 0, exactly the "absent" sentinel this
+// whole mechanism already uses everywhere else (see
+// CheckoutResult.PostApplyChecksum's doc comment). The checkout is
+// genuinely, fully clean by every OTHER measure (hash and identity both
+// match) — cleanAtOpen must still be true — but with no checksum to trust,
+// headPostApplyValid must be false and the settle must proceed exactly as
+// it always did before this suppression existed.
+func TestSettleStillHappensWithOldFormatSidecarLackingChecksum(t *testing.T) {
+	requireSQLite(t)
+	w := newWS(t)
+	if err := w.Create("app"); err != nil {
+		t.Fatal(err)
+	}
+	path, err := w.Checkout("app", "main")
+	if err != nil {
+		t.Fatal(err)
+	}
+	ref, _, err := w.Store.GetRef("app", "main")
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	// Rewrite the sidecar to the pre-review-round-3 format: same
+	// hash/lineage/epoch/txid Checkout just stamped — still fully "clean"
+	// by checkoutState's own identity+hash check — but with no
+	// "post_apply_checksum" field at all. The hash is read back out of the
+	// sidecar Checkout just wrote (not recomputed here) so this test
+	// doesn't duplicate fileSum's own hashing logic.
+	raw, err := os.ReadFile(path + ".sum")
+	if err != nil {
+		t.Fatal(err)
+	}
+	var rec struct {
+		Hash string `json:"hash"`
+	}
+	if err := json.Unmarshal(raw, &rec); err != nil {
+		t.Fatal(err)
+	}
+	oldFormat := fmt.Sprintf(`{"hash":%q,"lineage":%q,"epoch":%d,"txid":%d}`,
+		rec.Hash, ref.Lineage, ref.HeadEpoch, ref.HeadTXID)
+	if err := os.WriteFile(path+".sum", []byte(oldFormat), 0o644); err != nil {
+		t.Fatal(err)
+	}
+
+	s, err := Open(context.Background(), Options{
+		WS: w, DB: "app", Branch: "main", FlushEvery: 40 * time.Millisecond,
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer s.Close()
+
+	if !s.cleanAtOpen {
+		t.Fatal("expected cleanAtOpen: the old-format sidecar's hash and identity still fully match — the checkout genuinely IS clean, it just predates checksum-recording")
+	}
+	if s.headPostApplyValid {
+		t.Fatal("expected headPostApplyValid == false: an old-format sidecar has no post_apply_checksum to trust (decodes to 0, treated as absent)")
+	}
+
+	waitFor(t, 5*time.Second, "the settling flush despite cleanAtOpen (no checksum available to suppress on)", func() bool {
 		ref, _, err := w.Store.GetRef("app", "main")
 		return err == nil && ref.HeadTXID > 1
 	})

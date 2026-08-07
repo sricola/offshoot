@@ -283,7 +283,7 @@ func TestCheckoutIgnoresAFencedWritersObject(t *testing.T) {
 		t.Fatalf("%v: %s", err, out)
 	}
 	var buf bytes.Buffer
-	if err := ltxio.EncodeSnapshot(orphan, ref.HeadTXID, &buf); err != nil {
+	if _, err := ltxio.EncodeSnapshot(orphan, ref.HeadTXID, &buf); err != nil {
 		t.Fatal(err)
 	}
 	if ref.HeadEpoch < 2 {

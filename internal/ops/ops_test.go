@@ -1692,7 +1692,7 @@ func TestCheckoutRematerializesOnEpochMismatchOrOldFormatSidecar(t *testing.T) {
 	if err := os.WriteFile(p1+".sum", []byte(staleEpoch), 0o644); err != nil {
 		t.Fatal(err)
 	}
-	if got := checkoutState(p1, ref); got != "stale" {
+	if got, _ := checkoutState(p1, ref); got != "stale" {
 		t.Fatalf("checkoutState with mismatched epoch = %q, want %q", got, "stale")
 	}
 	p2, err := w.Checkout("app", "main")
@@ -1724,7 +1724,7 @@ func TestCheckoutRematerializesOnEpochMismatchOrOldFormatSidecar(t *testing.T) {
 	if err := os.WriteFile(p2+".sum", []byte(oldFormat), 0o644); err != nil {
 		t.Fatal(err)
 	}
-	if got := checkoutState(p2, ref2); got != "stale" {
+	if got, _ := checkoutState(p2, ref2); got != "stale" {
 		t.Fatalf("checkoutState for an old-format (no epoch) sidecar = %q, want %q", got, "stale")
 	}
 	p3, err := w.Checkout("app", "main")
