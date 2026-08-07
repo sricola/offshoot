@@ -68,11 +68,23 @@ const maxRPCBodyBytes = 1 << 20 // 1MiB
 //     hard-cut a long-lived SSE `GET /events` stream at 90 seconds —
 //     WriteTimeout has no concept of "a stream that's still legitimately
 //     sending, just slowly," it only sees total handler wall-clock time.
-//     ADDRESSED: handleEvents (events.go) clears the write deadline for
-//     its own connection before it starts streaming, via
-//     `http.NewResponseController(w).SetWriteDeadline(time.Time{})` —
-//     see that function's doc comment and TestSSEStreamSurvivesPastWriteTimeout
-//     (events_test.go). This constant itself was deliberately NOT raised:
+//     ADDRESSED: handleEvents (events.go) re-arms its OWN per-write
+//     deadline (`eventWriteDeadline`, default 45s) via
+//     `http.NewResponseController(w).SetWriteDeadline` immediately before
+//     EVERY write — never once, permanently, up front (an earlier version
+//     of this handler did exactly that, which defeated this 90s bound but
+//     also let a stalled-but-still-connected reader pin the handler's
+//     goroutine and file descriptor inside a blocking write forever, since
+//     nothing ever re-armed a bound on it again). A live long-lived stream
+//     re-arms this deadline on every successful write (and at least every
+//     `sseKeepaliveInterval` via the periodic ping even with zero real
+//     events), so it is never affected either way — see that function's
+//     doc comment, `eventWriteDeadline`'s doc comment,
+//     TestSSEStreamSurvivesPastWriteTimeout (a live stream unaffected by a
+//     SHRUNK httpWriteTimeout), and
+//     TestStalledSSESubscriberConnectionIsClosedWithinWriteDeadline (a
+//     genuinely stalled reader IS bounded, through the real write path) in
+//     events_test.go. This constant itself was deliberately NOT raised:
 //     every OTHER handler on this http.Server (/rpc, /metrics,
 //     /debug/pprof/*) still wants the 90s bound, and per-connection
 //     deadline overrides are exactly the mechanism net/http provides for a
