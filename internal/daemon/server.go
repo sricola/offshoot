@@ -60,6 +60,13 @@ type Server struct {
 	// called, so Shutdown's close+Wait is unconditionally safe.
 	janitorStop chan struct{}
 	janitorWG   sync.WaitGroup
+
+	// metrics is this daemon's metrics registry (Milestone 4 Task 2) —
+	// always non-nil once NewServer returns. See metrics.go's Metrics type
+	// and newMetrics/wireHooks for what gets registered and how ops/session
+	// instrumentation hooks get wired to it without either of those
+	// packages importing internal/metrics.
+	metrics *Metrics
 }
 
 func key(db, branch string) string { return db + "@" + branch }
@@ -76,14 +83,28 @@ func NewServer(ws *ops.Workspace, socketPath string) (*Server, error) {
 		ln.Close()
 		return nil, err
 	}
-	return &Server{ws: ws, ln: ln, sock: socketPath,
+	srv := &Server{ws: ws, ln: ln, sock: socketPath,
 		sessions:    map[string]*session.Session{},
 		conns:       map[net.Conn]struct{}{},
 		janitorStop: make(chan struct{}),
-	}, nil
+		metrics:     newMetrics(),
+	}
+	// Wired here, at construction, before Serve can ever accept a
+	// connection or StartJanitor can ever tick — see wireHooks/OnTransition/
+	// ObserveFork's doc comments for why process-wide assignment this early
+	// is safe and sufficient (one daemon Server per process in production).
+	srv.metrics.wireHooks(srv)
+	return srv, nil
 }
 
 func (s *Server) SocketPath() string { return s.sock }
+
+// SetVersion sets the version string reported by offshoot_build_info
+// (default "dev" if never called). Call before Serve starts accepting
+// connections, mirroring SetFlushEvery's own single-writer-before-Serve
+// contract — cmd/offshoot's `serve` command calls this with the same
+// -ldflags-embedded version string `offshoot version` prints.
+func (s *Server) SetVersion(v string) { s.metrics.setVersion(v) }
 
 // SetFlushEvery sets the background-flush cadence (session.Options.FlushEvery)
 // applied to every session opOpen opens from now on. Call before Serve
@@ -137,17 +158,62 @@ func (s *Server) StartJanitor(every, grace time.Duration) {
 			case <-s.janitorStop: // closed by Shutdown before it waits on janitorWG
 				return
 			case <-t.C:
-				if reaped, err := s.ws.Reap(time.Now()); err != nil {
-					fmt.Fprintf(os.Stderr, "offshoot: janitor: reap: %v\n", err)
-				} else if len(reaped) > 0 {
-					fmt.Fprintf(os.Stderr, "offshoot: janitor: reaped %v\n", reaped)
-				}
-				if _, _, err := s.ws.GC(grace); err != nil {
-					fmt.Fprintf(os.Stderr, "offshoot: janitor: gc: %v\n", err)
-				}
+				s.janitorTick(grace)
 			}
 		}
 	}()
+}
+
+// janitorTick runs one reap+GC pass and updates every janitor-sourced
+// metric (offshoot_reap_total, offshoot_gc_tombstoned_total,
+// offshoot_gc_deleted_total, offshoot_gc_backlog,
+// offshoot_janitor_runs_total{result}) from its results — split out of
+// StartJanitor's ticker loop so a test can drive exactly one tick
+// deterministically instead of waiting on a real ticker. Reap/GC results are
+// counted even when they also return an error: both ops.Workspace.Reap and
+// ops.Workspace.GC keep processing everything they can and report a partial
+// result alongside the first error they hit (see their own doc comments),
+// so len(reaped)/tombstoned/deleted are real work actually done, not
+// discarded just because something else in the same pass failed.
+// offshoot_janitor_runs_total{result} is "error" if EITHER step failed,
+// "ok" only if both fully succeeded — a single counter per tick, not one
+// per step, matching the locked metric's one label (result), not two.
+func (s *Server) janitorTick(grace time.Duration) {
+	failed := false
+
+	reaped, reapErr := s.ws.Reap(time.Now())
+	if reapErr != nil {
+		fmt.Fprintf(os.Stderr, "offshoot: janitor: reap: %v\n", reapErr)
+		failed = true
+	} else if len(reaped) > 0 {
+		fmt.Fprintf(os.Stderr, "offshoot: janitor: reaped %v\n", reaped)
+	}
+	if len(reaped) > 0 {
+		s.metrics.ReapTotal.Add(float64(len(reaped)))
+	}
+
+	tombstoned, deleted, gcErr := s.ws.GC(grace)
+	if gcErr != nil {
+		fmt.Fprintf(os.Stderr, "offshoot: janitor: gc: %v\n", gcErr)
+		failed = true
+	}
+	if tombstoned > 0 {
+		s.metrics.GCTombstonedTotal.Add(float64(tombstoned))
+	}
+	if deleted > 0 {
+		s.metrics.GCDeletedTotal.Add(float64(deleted))
+	}
+	if backlog, err := s.ws.TombstoneBacklog(); err != nil {
+		fmt.Fprintf(os.Stderr, "offshoot: janitor: gc backlog: %v\n", err)
+	} else {
+		s.metrics.GCBacklog.Set(float64(backlog))
+	}
+
+	result := "ok"
+	if failed {
+		result = "error"
+	}
+	s.metrics.JanitorRunsTotal.WithLabelValues(result).Inc()
 }
 
 func (s *Server) Serve() error {

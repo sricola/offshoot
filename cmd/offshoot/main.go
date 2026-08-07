@@ -723,6 +723,7 @@ func run(args []string) error {
 		if err != nil {
 			return err
 		}
+		srv.SetVersion(version)
 		srv.StartJanitor(reapEvery, gcGrace)
 		// safe-by-default cadence: the daemon ships work on a cadence even
 		// if the agent it's serving never calls flush; -flush-every 0
