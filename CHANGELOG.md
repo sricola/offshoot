@@ -401,6 +401,58 @@ version if you depend on format stability.
   frequent full-database uploads but cheaper/bounded reads, and vice
   versa); README's "What a flush costs" section updated to match.
 
+- **CAS-conditional ref delete** (Milestone 4 Task 6b): `ops.Workspace.Destroy`
+  now CAS-writes a `Deleting` claim (`store.Ref.Deleting`/`DeletingAt`) on
+  the ref before doing anything irreversible, closing the `GetRef` ->
+  lease-check -> unconditional-`DeleteRef` TOCTOU an earlier design review
+  documented for `Destroy` — a lease acquired in that window could
+  previously have its branch deleted out from under it. `store.AcquireLease`
+  refuses outright (`store.ErrDeleting`, retryable) once it sees the claim,
+  the same way it already refuses `Reap`'s `Reaping` claim. `--force`
+  bypasses the protected/live-lease pre-checks only, never the claim: a
+  lease that wins the underlying CAS still survives a concurrent forced
+  destroy.
+
+  Scoped per the task's own one-review-cycle timebox (PM Amendment 9) as a
+  **sibling claim field, not a unification with Reap's existing `Reaping`
+  claim** — `Reaping`'s CAS mechanics are torture/race-tested and
+  deliberately untouched (`internal/ops/reap.go`/its test files pass
+  unmodified).
+
+  Backend split (PM Amendment 5 — no pretending S3 `DeleteObject` has
+  preconditions it doesn't): a new `store.ConditionalDeleter` optional
+  capability interface (`DeleteIf(key, ifMatch) error`) backs
+  `Store.DeleteRefIf`. Local implements it for real (`Local.DeleteIf`, the
+  same per-key lock file `PutIf` already uses) — a true compare-and-delete,
+  belt-and-suspenders on top of the claim. S3 does not implement it at all
+  (`DeleteObject` ignores `If-Match`/`If-None-Match`; those headers are
+  GET/PUT-only there), so `DeleteRefIf` falls back to an unconditional
+  delete on S3 and the claim marker is the entire safety mechanism on that
+  backend — documented as such on `S3.Delete`, not silently pretended away.
+
+  A Destroy that crashes after claiming but before deleting leaves the
+  claim stranded (branch untouched, no partial delete); `ops.Workspace
+  .ClearStaleDeleteClaims` self-heals it by age (30s — a delete claim has no
+  TTL/deadline concept the way Reap's `ReapDeadline` gives its own claim
+  one), wired into both the daemon janitor (`janitorTick`) and the CLI
+  `offshoot gc`, same "report and press on" convention as a reap failure.
+
+  Tests: `internal/ops/destroy_claim_test.go`'s
+  `TestConcurrentDestroyAndAcquireLeaseHaveExactlyOneWinner` (20-iteration
+  race loop mirroring M2's `TestConcurrentTouchAndReapHaveExactlyOneWinner`:
+  exactly one of Destroy/AcquireLease wins, the branch is never left
+  half-deleted under a live lease), `TestForceDestroyStillClaimGuards` (same
+  race with `force=true`), `TestDestroySelfHealsStaleDeletingClaim`;
+  `internal/store/local_test.go`'s `TestLocalDeleteIfConditionalDelete`/
+  `TestStoreDeleteRefIfUsesConditionalDeleteOnLocal`; `internal/daemon
+  /destroy_claim_test.go`'s `TestJanitorTickClearsStaleDeleteClaim` through
+  a real janitor pass. `go test ./internal/ops ./internal/store
+  ./internal/daemon ./cmd/offshoot -count=1 -race` clean; no
+  `internal/session`/`internal/capture` changes, so no torture run was
+  required. `docs/status.md`'s TTL/GC/janitor table gains a
+  shipped-and-tested row; `docs/reference.md`'s `offshoot destroy` section
+  documents the claim-guard and the backend split.
+
 ## [0.1.2] - 2026-08-06
 
 Milestone 3: the eval-harness release. The target persona's first hour is

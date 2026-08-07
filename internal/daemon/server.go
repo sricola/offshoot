@@ -256,7 +256,7 @@ func (s *Server) StartJanitor(every, grace time.Duration) {
 	}()
 }
 
-// janitorTick runs one reap+GC+ro-cache pass and updates every
+// janitorTick runs one reap+GC+ro-cache+stale-delete-claim pass and updates every
 // janitor-sourced metric (offshoot_reap_total, offshoot_gc_tombstoned_total,
 // offshoot_gc_deleted_total, offshoot_gc_backlog, offshoot_ro_cache_bytes,
 // offshoot_ro_cache_evictions_total, offshoot_janitor_runs_total{result})
@@ -293,6 +293,19 @@ func (s *Server) janitorTick(grace time.Duration) {
 			db, branch := splitKey(k)
 			s.events.publish(newEvent("reaped", db, branch, nil))
 		}
+	}
+
+	// Milestone 4 Task 6b: self-heal any Destroy claim (Ref.Deleting)
+	// stranded by a crashed Destroy call, same cadence as reap/GC — see
+	// ops.Workspace.ClearStaleDeleteClaims's doc comment for why this needs
+	// its own age-based pass rather than piggybacking on Reap's own
+	// deadline-driven self-heal.
+	healed, healErr := s.ws.ClearStaleDeleteClaims(time.Now())
+	if healErr != nil {
+		fmt.Fprintf(os.Stderr, "offshoot: janitor: clear stale delete claims: %v\n", healErr)
+		failed = true
+	} else if len(healed) > 0 {
+		fmt.Fprintf(os.Stderr, "offshoot: janitor: cleared stale delete claim(s) %v\n", healed)
 	}
 
 	tombstoned, deleted, gcErr := s.ws.GC(grace)

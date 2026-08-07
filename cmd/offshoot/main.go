@@ -629,6 +629,18 @@ func run(args []string) error {
 		if reapErr != nil {
 			fmt.Fprintf(os.Stderr, "offshoot: gc: reap: %v\n", reapErr)
 		}
+		// Milestone 4 Task 6b: self-heal any Destroy claim (Ref.Deleting)
+		// stranded by a crashed `destroy`/`gc` call, same "report and press
+		// on" convention as the reap failure above — this is at-rest cleanup
+		// independent of everything else `gc` does, so one branch's stale
+		// claim must not block it either.
+		healed, healErr := w.ClearStaleDeleteClaims(time.Now())
+		if len(healed) > 0 {
+			fmt.Printf("gc: cleared stale delete claim(s) %v\n", healed)
+		}
+		if healErr != nil {
+			fmt.Fprintf(os.Stderr, "offshoot: gc: clear stale delete claims: %v\n", healErr)
+		}
 		tombstoned, deleted, err := w.GC(grace)
 		if err != nil {
 			return err
