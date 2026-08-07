@@ -203,22 +203,55 @@ PyPI/npm/registry button-presses — see their own ⏸ bullets below.
 *Bar: a platform running hundreds of agent sessions can see, bound, and
 automate offshoot.*
 
-- **Prometheus `/metrics`**: capture lag, durable-through age per branch, GC
-  backlog, checkout cache usage, fork/checkpoint latencies.
-- **HTTP binding + single-token auth** (loopback by default, explicit opt-in
-  beyond), unlocking sidecars and remote dev; container/k8s recipe docs.
-- **Branch state taxonomy** (`active / detached / dirty / error / pending`)
+**Status: shipped**, with one bullet delivered narrower than originally
+scoped and named as such below rather than silently dropped. See
+[docs/status.md](docs/status.md)'s Observability/Resource-behavior sections
+for the shipped-and-tested rows, [docs/operations.md](docs/operations.md)
+for the operator-facing reference this milestone's Task 8 wrote, and
+[docs/status.md](docs/status.md#standing-nag-user-gated-launch-items) for
+what's left that no further engineering resolves.
+
+- ✅ **Prometheus `/metrics`**: capture lag, durable-through age per branch
+  (open sessions only, by design — see
+  [docs/operations.md](docs/operations.md#deliberately-out-of-scope-in-m4)),
+  GC backlog, checkout cache usage, fork/checkpoint latencies. Sixteen
+  `offshoot_*` metric families total, names locked as API as of the
+  [0.1.3] tag (one free rename window, now closed) — see
+  [docs/operations.md](docs/operations.md#metrics)'s full reference table.
+- ✅ **HTTP binding + single-token auth** (loopback by default, explicit
+  opt-in beyond), unlocking sidecars and remote dev; container/k8s recipe
+  docs. Shipped as `serve -http ADDR` (`internal/daemon/http.go`) plus
+  [docs/recipes/kubernetes.md](docs/recipes/kubernetes.md)'s sidecar
+  manifest — no container image is published yet (see the Standing-nag
+  section linked above), so the recipe builds its own.
+- ✅ **Branch state taxonomy** (`active / detached / dirty / error /
+  pending`, plus an `idle` sixth state the design spec's taxonomy didn't
+  anticipate — see [docs/operations.md](docs/operations.md#branch-states))
   implemented and reported, not just spec'd.
-- **Eventing.** A `subscribe` op (SSE once HTTP exists) for flush / lease-loss
-  / fence / reap events, replacing supervisor polling.
-- **Resource budgets.** Checkout-cache disk budget and FD budget with LRU
-  eviction of cold read-only materializations; writable leased checkouts never
-  evicted.
-- **Tuning surface.** `SnapshotEvery` exposed through the daemon; documented
-  guidance.
-- **Follow-ups from review:** CAS-conditional ref delete (closes Destroy's
-  read-then-delete window generally); typed TS response shapes before any
-  1.0 SDK claim.
+- ✅ **Eventing.** A `subscribe` op (SSE once HTTP exists) for flush /
+  lease-loss / fence / reap events, replacing supervisor polling. Shipped
+  with a `checkouts-ro` eviction event type too, feeding directly off the
+  budget bullet below.
+- ⚠️ **Resource budgets — delivered narrower than scoped.** Checkout-cache
+  (`checkouts-ro`) disk budget with LRU eviction shipped
+  (`serve -ro-cache-budget`); writable leased checkouts are never evicted,
+  structurally. The **FD budget with LRU eviction of cold read-only
+  materializations did not ship this milestone** — consciously narrowed at
+  Task 8 dispatch time, not discovered as a gap late:
+  `internal/dbfile`'s file descriptors are deliberately unclosable by that
+  package's own design (a stray-close lock hazard the design deliberately
+  avoids), which makes "evict a cold session's FD" a real design problem
+  needing its own pass, not a variant of the ro-cache budget's shape. See
+  [docs/status.md](docs/status.md)'s FD-budget row.
+- ✅ **Tuning surface.** `SnapshotEvery` exposed through the daemon
+  (`serve -snapshot-every N`); documented guidance in
+  [docs/operations.md](docs/operations.md#tuning-flags) including the
+  flush-cost/replay-latency trade-off.
+- ✅ **Follow-ups from review:** CAS-conditional ref delete (closes
+  Destroy's read-then-delete window generally — local gets a true
+  conditional delete, S3 formalizes the claim-marker pattern since
+  `DeleteObject` has no real preconditions); typed TS response shapes
+  shipped ahead of any 1.0 SDK claim.
 
 ## Launch track (parallel to v0.1–v0.3)
 

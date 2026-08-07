@@ -13,6 +13,28 @@ version if you depend on format stability.
 
 ## [Unreleased]
 
+## [0.1.3] - 2026-08-07
+
+Milestone 4: operable at scale. A platform running hundreds of agent
+sessions can now see (a hand-rolled, zero-dependency Prometheus `/metrics`
+endpoint plus six computed branch states), bound (a `checkouts-ro` disk
+budget with LRU eviction), and automate (an opt-in, token-authenticated
+HTTP listener alongside the unix socket, plus an event bus drainable over
+either transport) offshoot — without any of it requiring multi-node
+anything; see [docs/operations.md](docs/operations.md)'s first paragraph
+and [ROADMAP.md](ROADMAP.md#non-goals-v1) for that standing scope
+boundary. **Metric names are locked as of this release: every
+`offshoot_*` name below is now API — renaming one after this tag is a
+breaking change** (this was the one free rename window; see PM Amendment
+2/12 in the Milestone 4 plan). Operator-facing docs land in this release
+too: [docs/operations.md](docs/operations.md) (the metrics/states/events/
+budgets/HTTP-auth reference in one page) and
+[docs/recipes/kubernetes.md](docs/recipes/kubernetes.md) (a real,
+schema-validated sidecar manifest). See
+[docs/status.md](docs/status.md)'s Standing nag section for what's still
+user-gated (PyPI/npm publication, the `offshoot-db` org transfer, registry
+listing submissions) — none of it is blocked on further engineering.
+
 ### Added
 
 - **Branch state taxonomy** (Milestone 4 Task 1): `ops.BranchStateAt`
@@ -496,6 +518,69 @@ version if you depend on format stability.
   clean; dry-run wheel/sdist (`make dry-run-python-sdk`) and tarball
   (`make dry-run-ts-sdk`) both pass unchanged — no file-list updates
   needed on either SDK. No Go changes.
+
+- **Operator docs + Kubernetes recipe + the M4 sweep** (Milestone 4 Task
+  8): [docs/operations.md](docs/operations.md) is the new operator-facing
+  page — a metrics reference table (all sixteen `offshoot_*` metric
+  families, grep-verified against `internal/daemon/metrics.go` and against
+  a real `curl /metrics` scrape of a locally built binary: sixteen `# TYPE`
+  lines, sixteen table rows, one-to-one), the six-state branch-state table
+  with precedence, the eight-type event schema and drop-slow-consumer
+  semantics, the `-ro-cache-budget` mechanics (LRU `.last-used` clock,
+  writable-never-evicted guarantee, the eviction-vs-`CheckoutAt` TOCTOU),
+  the HTTP/auth threat model (single-tenant same-host-or-trusted-network,
+  not multi-tenant isolation; constant-time token compare; loopback
+  default with an explicit non-loopback ack + token requirement; "treat
+  stderr as sensitive at startup"; `-token`'s argv-visible-via-`ps` gap and
+  why `OFFSHOOT_TOKEN` is preferred on a shared host; `/debug/pprof`
+  behind the same auth), and a tuning-flags table for all five `serve`
+  knobs including the `-flush-every`/`-snapshot-every` cost interaction.
+  Its first paragraph restates the single-node scope explicitly (PM
+  Amendment 12) and links the FAQ's no-cluster stance.
+
+  [docs/recipes/kubernetes.md](docs/recipes/kubernetes.md) is a new sidecar
+  recipe: one `offshoot serve` + one agent container per Pod, a shared
+  `emptyDir` for BOTH the unix socket and the checkout tree (restated why:
+  a checkout is a real SQLite file the agent process opens directly —
+  `OFFSHOOT_CHECKOUTS`/the socket path cannot cross a network filesystem),
+  `-http 127.0.0.1` for `/metrics`/`/healthz` with `exec`-based liveness/
+  readiness probes (an `httpGet` probe is dispatched against the Pod IP,
+  which a loopback-only bind never answers), a Prometheus scrape-annotation
+  example with the honest caveat that it needs a deliberate non-loopback
+  opt-in (`-http-allow-non-loopback` + a real token) to actually be
+  reachable from outside the Pod, and an explicit "no StatefulSet-for-HA
+  story" scope note linking the FAQ. The manifest
+  (`docs/recipes/k8s/offshoot-sidecar.yaml`) is real and apply-able, not
+  pseudocode: schema-validated with both `kubectl apply --dry-run=client`
+  and `--dry-run=server` against a disposable local `rancher/k3s` control
+  plane (no live cluster was otherwise available), both passing.
+
+  Sweep: README gained an operator paragraph under "Daemon mode" (metrics/
+  HTTP/events/budgets, linking both new docs) and a fifth "operator
+  surface" note in "Integration surface"; its stale "Resource behavior"
+  claim that "there are no resource budgets yet" is corrected now that
+  Task 5's `-ro-cache-budget` shipped. `docs/reference.md` cross-links
+  `docs/operations.md` from its `-http ADDR` and eventing sections rather
+  than duplicating the operator-focused tables. `docs/status.md` gained
+  three new deliberately-deferred rows this milestone's self-review named
+  but hadn't yet recorded (TLS, per-branch at-rest metrics by default,
+  metrics push/remote-write), reworded the FD-budget row from "not yet
+  implemented" to "deliberately deferred" with the `internal/dbfile`
+  reasoning, retired two stale forward-references to "the operator-facing
+  docs/operations.md page itself is Task 8" now that the page exists, and
+  gained a new "Standing nag: user-gated launch items" section consolidating
+  every button-press-only action (org transfer, PyPI/npm name claims,
+  registry listing submissions, domain/Homebrew/container-image claims)
+  that no further engineering resolves. `ROADMAP.md`'s Milestone 4 bullets
+  are checked off against what actually shipped.
+
+  Verification: every command in every changed/new doc was run verbatim,
+  not transcribed from memory — the metrics table's scrape example is a
+  real `go build` + `serve -http` + `curl /metrics` run; the Kubernetes
+  manifest was actually dry-run-applied (see above) rather than merely
+  YAML-parsed. `make test-sdks` and a full `go test ./... -count=1` both
+  green (no code changed this task — docs and CHANGELOG/ROADMAP/status.md
+  only).
 
 ## [0.1.2] - 2026-08-06
 

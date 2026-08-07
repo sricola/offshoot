@@ -20,7 +20,10 @@ with the first 0.1.x release. No package-manager install yet.
 [**the eval-harness tutorial**](docs/eval-harness.md) (seed-once-fork-many
 for pytest/vitest/`node:test`, from install to CI) ·
 [framework recipes](docs/recipes/) (Claude Code hooks, OpenAI Agents SDK,
-LlamaIndex/CrewAI)
+LlamaIndex/CrewAI) ·
+[**operations**](docs/operations.md) (metrics, branch states, eventing,
+budgets, HTTP/auth threat model — single node, see that page's first
+paragraph) · [Kubernetes sidecar recipe](docs/recipes/kubernetes.md)
 
 **Contributing:** [CONTRIBUTING.md](CONTRIBUTING.md) has dev setup and the
 test tiers; [SECURITY.md](SECURITY.md) covers vulnerability reporting.
@@ -288,10 +291,41 @@ instead) — the CLI has no other way to find a non-default socket. Daemon and
 agent must share a kernel and a local filesystem: the checkout is a real
 SQLite file both processes open.
 
+### Metrics, HTTP, and events
+
+`offshoot serve` is opt-in observable and automatable: `-http ADDR` starts a
+loopback-by-default, token-authenticated HTTP listener alongside the unix
+socket — `GET /metrics` (Prometheus text exposition of every
+`offshoot_*` metric, zero new dependencies), `GET /healthz` (unauthenticated
+liveness), `POST /rpc` (the same protocol the socket speaks, over HTTP),
+`GET /events` (Server-Sent Events), and token-gated `GET /debug/pprof/*`.
+The unix socket also gains a `subscribe` op streaming the same versioned
+event JSON — flush/fork/reap/eviction/fencing, as they happen, instead of
+polling `status` in a loop. Six computed branch states
+(`active`/`pending`/`error`/`dirty`/`detached`/`idle`) answer "what's this
+branch doing right now" without a separate audit pass. A `-ro-cache-budget`
+bounds the read-only checkout cache with LRU eviction, never touching a
+writable, leased checkout. All of it is single-node: see
+[docs/operations.md](docs/operations.md) for the full metrics reference,
+states table, event schema, budget mechanics, and the HTTP threat model in
+one place, and [docs/recipes/kubernetes.md](docs/recipes/kubernetes.md) for
+a real sidecar manifest.
+
 ### Resource behavior
 
-There are no resource budgets yet — no checkout-cache disk limit, no FD
-limit, no eviction of cold sessions (all [Milestone 4](ROADMAP.md#milestone-4--operable-at-scale)).
+`checkouts-ro` (the read-only historical-checkpoint cache) has a real disk
+budget as of [Milestone 4](ROADMAP.md#milestone-4--operable-at-scale):
+`serve -ro-cache-budget <bytes|0>` (default `0`, unlimited) LRU-evicts it
+under the janitor, on the same cadence as reap/GC — see
+[docs/operations.md](docs/operations.md#budgets) for the mechanics
+(the `.last-used` touch-on-hit clock, the writable-`checkouts/`-is-never-
+evicted guarantee, and the TOCTOU-vs-`CheckoutAt` note). There is still no
+FD budget or eviction of cold *writable* sessions — see
+[docs/operations.md](docs/operations.md#deliberately-out-of-scope-in-m4)
+for exactly what M4 narrowed and why (`internal/dbfile`'s descriptors are
+deliberately unclosable by design, documented there rather than budgeted
+around this milestone).
+
 In today's code, an open session's own FD footprint is small and fixed
 (capture engine reader, WAL reader, lease-renewal timer — none of it scales
 with how long the session stays open or how much it writes). Disk is the
@@ -372,6 +406,13 @@ Capture-spike evidence: docs/superpowers/specs/2026-07-29-offshoot-spike-report.
 Four ways to talk to offshoot (the design spec's "integration surface"): the
 CLI above needs no daemon and no SDK; everything else below is a client of
 the daemon's lifecycle API and requires `offshoot serve` already running.
+A fifth, operator-facing surface rides alongside all four without changing
+any of them: `serve -http ADDR` exposes the identical `Request`/`Response`
+protocol the unix socket speaks as `POST /rpc` over HTTP, plus `/metrics`,
+`/healthz`, `/events`, and token-gated `/debug/pprof/*` — the same
+lifecycle API, reachable from a sidecar or a remote-dev setup instead of
+only a local unix socket. See [docs/operations.md](docs/operations.md) for
+the full surface and its threat model.
 
 ### MCP
 
