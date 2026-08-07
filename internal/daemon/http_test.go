@@ -710,6 +710,89 @@ func TestConcurrentMetricsScrapesWithSessionChurn(t *testing.T) {
 
 // ---- shutdown ordering / in-flight safety ----
 
+// TestHTTPShutdownResponseIsNotChunkedAndReadAllUnmarshalsCleanly is the
+// direct regression test for IMPORTANT-1 (review fold-in round 2): the
+// EARLIER fix's own proof (TestHTTPShutdownRespondsBeforeClosingRequestingConn)
+// reads the response via json.Decoder, which stops as soon as it has
+// decoded one complete JSON value and NEVER reads a chunked body's
+// terminating "0\r\n\r\n" trailer — so that test could not have failed
+// against the pre-fix (streamed json.Encoder + Flush(), no declared
+// Content-Length -> forced chunked encoding) code, even though the bug was
+// real. The actual victim is a client that reads the FULL body first (e.g.
+// io.ReadAll, or any ReadAll-then-json.Unmarshal pattern), which — on a
+// body missing its trailer — surfaces io.ErrUnexpectedEOF even when the
+// JSON payload itself had fully landed.
+//
+// This test targets that exact class, on the "shutdown" op specifically
+// (it exercises the respond-then-shutdown-trigger window handleRPC's doc
+// comment describes, the narrowest and most relevant case): it reads the
+// response with io.ReadAll, not json.Decoder, and separately asserts the
+// response's FRAMING headers directly (resp.ContentLength >= 0, no
+// "chunked" in resp.TransferEncoding). The framing assertion is the
+// deterministic half — Go's http.Client always reports ContentLength == -1
+// and a "chunked" TransferEncoding for a response sent without a declared
+// Content-Length, on every run, regardless of whether the timing race that
+// makes the trailer actually go missing happens to fire on this
+// particular run (reviewer reported not reproducing the raw EOF in 3000
+// iterations locally) — so this is what actually regresses reliably if
+// handleRPC's Content-Length-framed single Write is ever reverted back to
+// streaming json.Encoder + Flush().
+//
+// Verified: reverting handleRPC's fix locally (restoring the
+// json.NewEncoder(w).Encode(resp) + Flush() path with no Content-Length)
+// makes this test fail every time on the framing assertion
+// (ContentLength == -1, TransferEncoding == ["chunked"]) — see this
+// task's report for the exact before/after run. Restored, this test
+// passes.
+func TestHTTPShutdownResponseIsNotChunkedAndReadAllUnmarshalsCleanly(t *testing.T) {
+	_, _, base, token := newHTTPServer(t)
+
+	body, err := json.Marshal(Request{Op: "shutdown"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	req, err := http.NewRequest(http.MethodPost, base+"/rpc", bytes.NewReader(body))
+	if err != nil {
+		t.Fatal(err)
+	}
+	req.Header.Set("Content-Type", "application/json")
+	req.Header.Set("Authorization", "Bearer "+token)
+	resp, err := http.DefaultClient.Do(req)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer resp.Body.Close()
+
+	// Framing: must be Content-Length-declared, never chunked. This is the
+	// part that fails DETERMINISTICALLY (every run, not just under a
+	// timing race) against the pre-fix streamed-Encoder-plus-Flush code.
+	if resp.ContentLength < 0 {
+		t.Fatalf("response ContentLength = %d, want >= 0 (negative means Go's client saw chunked "+
+			"Transfer-Encoding rather than a declared Content-Length)", resp.ContentLength)
+	}
+	for _, te := range resp.TransferEncoding {
+		if strings.EqualFold(te, "chunked") {
+			t.Fatalf("response TransferEncoding = %v, must not include \"chunked\"", resp.TransferEncoding)
+		}
+	}
+
+	// The actual victim scenario: read the FULL body via io.ReadAll (never
+	// json.Decoder, which would mask exactly this failure mode — see this
+	// test's own doc comment), then unmarshal what was read.
+	raw, err := io.ReadAll(resp.Body)
+	if err != nil {
+		t.Fatalf("io.ReadAll(resp.Body) = %v (a ReadAll-then-Unmarshal client would see this on a body "+
+			"missing its chunked trailer, even though the JSON payload itself had fully landed)", err)
+	}
+	var out Response
+	if err := json.Unmarshal(raw, &out); err != nil {
+		t.Fatalf("json.Unmarshal(%q) = %v", raw, err)
+	}
+	if !out.OK {
+		t.Fatalf("shutdown response = %+v, want OK", out)
+	}
+}
+
 // TestHTTPShutdownRespondsBeforeClosingRequestingConn is the HTTP analog of
 // server_test.go's TestShutdownRespondsBeforeClosingRequestingConn: an
 // op=shutdown request's own response must be fully written before
