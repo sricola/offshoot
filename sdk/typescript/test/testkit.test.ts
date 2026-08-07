@@ -16,9 +16,9 @@
 import { test, describe, it, before, after, beforeEach, afterEach, type TestContext } from "node:test";
 import assert from "node:assert/strict";
 import { execFileSync } from "node:child_process";
-import { mkdtempSync, readFileSync, rmSync, writeFileSync } from "node:fs";
+import { mkdtempSync, readFileSync, rmSync, symlinkSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
-import { join } from "node:path";
+import { delimiter as PATH_DELIMITER, join } from "node:path";
 import { fileURLToPath } from "node:url";
 
 import { connect, OffshootError } from "../src/client.js";
@@ -114,6 +114,35 @@ test("startDaemon: no binary anywhere names both OFFSHOOT_BIN and PATH", async (
       },
     );
   });
+});
+
+test("startDaemon: resolves the binary via PATH when OFFSHOOT_BIN is unset (success branch)", async (t: TestContext) => {
+  if (!canRun) {
+    t.skip("go and/or sqlite3 not on PATH");
+    return;
+  }
+  const pathDir = mkdtempSync(join(tmpdir(), "offshoot-testkit-pathbin-"));
+  try {
+    symlinkSync(bin!, join(pathDir, "offshoot"));
+    await withEnv({ OFFSHOOT_BIN: undefined, PATH: `${pathDir}${PATH_DELIMITER}${process.env.PATH ?? ""}` }, async () => {
+      // No opts.bin and no OFFSHOOT_BIN: this can only succeed by finding
+      // `offshoot` on PATH, exercising the fallback branch the "no binary
+      // anywhere" test above never reaches.
+      const daemon = await startDaemon({});
+      try {
+        const c = await connect(daemon.sock);
+        try {
+          await c.create("path-resolved-app");
+        } finally {
+          await c.close();
+        }
+      } finally {
+        await daemon.stop();
+      }
+    });
+  } finally {
+    rmSync(pathDir, { recursive: true, force: true });
+  }
 });
 
 // --------------------------------------------------------------------------
@@ -292,6 +321,78 @@ test("seedOnce: accepts an async callback seed given the writable path", async (
   });
 });
 
+test("seedOnce: two distinct callback functions for the same name is a mismatch, not a memoization hit", async (t: TestContext) => {
+  if (!canRun) {
+    t.skip("go and/or sqlite3 not on PATH");
+    return;
+  }
+  await withDaemon(async (daemon) => {
+    const seedA = async (dbPath: string) => {
+      execFileSync("sqlite3", [dbPath, "CREATE TABLE t (v);"]);
+    };
+    const seedB = async (dbPath: string) => {
+      execFileSync("sqlite3", [dbPath, "CREATE TABLE u (v);"]);
+    };
+    await seedOnce(daemon, { name: "callback-mismatch", seed: seedA });
+    await assert.rejects(
+      () => seedOnce(daemon, { name: "callback-mismatch", seed: seedB }),
+      (err: unknown) => {
+        assert.ok(err instanceof OffshootError);
+        assert.match(err.message, /DIFFERENT seed/);
+        assert.match(err.message, /callback-mismatch/);
+        return true;
+      },
+      "two distinct callables for the same name must fingerprint as different seeds",
+    );
+  });
+});
+
+test("seedOnce: the same callback reference reused for the same name is a memoization hit", async (t: TestContext) => {
+  if (!canRun) {
+    t.skip("go and/or sqlite3 not on PATH");
+    return;
+  }
+  await withDaemon(async (daemon) => {
+    const seed = async (dbPath: string) => {
+      execFileSync("sqlite3", [dbPath, "CREATE TABLE t (v);"]);
+    };
+    const h1 = await seedOnce(daemon, { name: "callback-memo", seed });
+    const h2 = await seedOnce(daemon, { name: "callback-memo", seed });
+    assert.equal(h2, h1, "the identical function reference reused must be a pure memoization hit (same object)");
+  });
+});
+
+test("seedOnce: editing a .sql seed file on disk between calls is caught as a mismatch, not silently passed", async (t: TestContext) => {
+  if (!canRun) {
+    t.skip("go and/or sqlite3 not on PATH");
+    return;
+  }
+  await withDaemon(async (daemon) => {
+    const dir = mkdtempSync(join(tmpdir(), "offshoot-testkit-editedseed-"));
+    try {
+      const sqlFile = join(dir, "seed.sql");
+      writeFileSync(sqlFile, "CREATE TABLE t (v);");
+      await seedOnce(daemon, { name: "edited-file", seed: sqlFile });
+
+      // Same PATH string, but the file's on-disk CONTENT has changed —
+      // must be caught (fingerprinting the raw path string, rather than
+      // the resolved content, would miss this: the path text is
+      // unchanged even though what it points at is not).
+      writeFileSync(sqlFile, "CREATE TABLE u (v);");
+      await assert.rejects(
+        () => seedOnce(daemon, { name: "edited-file", seed: sqlFile }),
+        (err: unknown) => {
+          assert.ok(err instanceof OffshootError);
+          assert.match(err.message, /DIFFERENT seed/);
+          return true;
+        },
+      );
+    } finally {
+      rmSync(dir, { recursive: true, force: true });
+    }
+  });
+});
+
 // --------------------------------------------------------------------------
 // forkPerTest: TTL default/override, worker-safe distinct naming,
 // isolation, string-name shorthand, teardown-warn-not-throw.
@@ -407,6 +508,41 @@ test("forkPerTest: close() teardown failures warn via console.warn, never throw,
     warnings.some((w) => w.includes(fork.branch)),
     "expected a warning naming the fork's branch",
   );
+});
+
+test("forkPerTest: close() warns (not throws) when only the destroy step fails", async (t: TestContext) => {
+  if (!canRun) {
+    t.skip("go and/or sqlite3 not on PATH");
+    return;
+  }
+  await withDaemon(async (daemon) => {
+    const seed = await seedOnce(daemon, { name: "destroy-warn", seed: "CREATE TABLE t (v)" });
+    const fork = await forkPerTest(daemon, seed);
+
+    // Close the session and destroy the branch out from under the fork,
+    // the same way test_fork_factory_destroy_failure_warns_not_raises does
+    // on the Python side — fork.client is the same connection fork.close()
+    // itself will use, so its own session.close() (via the raw "close" op)
+    // and client.destroy() calls below run cleanly, leaving nothing for
+    // fork.close() to legitimately do when it runs afterward.
+    await fork.client._call("close", { db: fork.db, branch: fork.branch });
+    await fork.client.destroy(fork.db, fork.branch, { force: true });
+
+    const originalWarn = console.warn;
+    const warnings: string[] = [];
+    console.warn = ((...args: unknown[]) => {
+      warnings.push(args.map(String).join(" "));
+    }) as typeof console.warn;
+    try {
+      await fork.close(); // must not throw despite there being nothing left to close/destroy
+    } finally {
+      console.warn = originalWarn;
+    }
+    assert.ok(
+      warnings.some((w) => w.includes("destroying branch") && w.includes(fork.branch)),
+      "expected a warning naming the branch-destroy failure",
+    );
+  });
 });
 
 // --------------------------------------------------------------------------
