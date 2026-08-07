@@ -702,11 +702,21 @@ func (s *Session) Close() error {
 	lease := s.lease
 	s.mu.Unlock()
 
+	// Sidecar refresh on clean close (M2 follow-up, ledgered), split around
+	// the engine shutdown join below — see prepareSidecarRefresh's doc
+	// comment for why stamping needs to straddle it rather than run
+	// entirely on one side.
+	refresh := s.prepareSidecarRefresh()
+
 	s.cancel()
 	<-s.engDone
 	<-s.renewDone
 	if s.flushDone != nil {
 		<-s.flushDone
+	}
+
+	if refresh {
+		s.commitSidecarRefresh()
 	}
 
 	var relErr error
@@ -724,6 +734,183 @@ func (s *Session) Close() error {
 		s.logTransition("closed")
 	}
 	return relErr
+}
+
+// prepareSidecarRefresh and commitSidecarRefresh together re-stamp the
+// checkout's .sum sidecar (via ops.RefreshSum) on a CLEAN Close, so the next
+// Open/Checkout against this db@branch clean-skips re-materializing instead
+// of paying a full chain replay — restoring, for the daemon-reopen pattern,
+// the win Milestone 2 Task 1 already established for a Checkout call
+// landing on an already-current checkout. This pairs directly with
+// rebaseline's settling-flush suppression (Commit A, cleanAtOpen): a session
+// that reopens against a sidecar these functions stamped both clean-skips
+// the materialization AND suppresses its own startup settle.
+//
+// Split in two, straddling Close's engine-shutdown join
+// (s.cancel(); <-s.engDone), because of a hazard specific to same-process
+// SQLite locking. Stamping the sidecar needs the checkout's WAL ALREADY
+// checkpointed into its main file first: writeSum's hash (via fileSum) is a
+// raw byte hash of the file on disk, and SQLite in WAL mode can leave a
+// just-committed write sitting in the -wal file with the main file's bytes
+// still reflecting the state before it — checkoutState's own "clean" check
+// always runs after a fresh quiesce() for exactly this reason (see
+// Checkout/CheckoutProven). But this session's OWN capture engine may still
+// hold live SQLite state on this exact path while it's running, and opening
+// a second, independent connection here to checkpoint it ourselves would
+// risk the POSIX (process, inode) lock-drop hazard fileSum's own doc
+// comment warns against (closing ANY fd this process holds on an inode
+// drops EVERY advisory lock this process holds on it, including the
+// engine's) — "do not reintroduce a bare os.Open [or open/close pair] here
+// on the strength of a guard that only usually holds" is exactly that
+// comment's warning, and it applies just as much to a fresh quiesce() call
+// as to a bare os.Open.
+//
+// The engine already solves this FOR us: capture.Engine.shutdown (called
+// from Run's ctx.Done() branch, i.e. exactly what s.cancel() triggers) does
+// its own final drain and checkpoint(TRUNCATE) of the checkout, using its
+// own long-lived connection, as the very first thing it does — and that
+// connection is fully closed (Run's own deferred e.conn.Close/e.db.Close,
+// which run before the deferred close(e.done) that unblocks <-s.engDone —
+// see Run's defer order) by the time engDone fires. So: everything that
+// needs the engine ALIVE (a final DrainNow, to make the pending check below
+// trustworthy — DrainNow folds content into the replica/appliedGen
+// bookkeeping but does not itself checkpoint the checkout's WAL) runs in
+// prepareSidecarRefresh, called BEFORE s.cancel(); everything that needs
+// the checkout's bytes ALREADY checkpointed and the engine's own connection
+// already gone runs in commitSidecarRefresh, called AFTER <-s.engDone. Both
+// re-check the same conditions independently (see each function's own
+// comment) rather than trusting phase one's verdict blindly: shutdown's own
+// best-effort drain can itself apply one more transaction that raced
+// between phase one's DrainNow and s.cancel(), which would make
+// autoFlushPending() flip from false to true in between — exactly what
+// commitSidecarRefresh's re-check exists to catch.
+//
+// Both are best-effort: any failure along the way (drain timeout, GetRef
+// error, sidecar write error) simply skips the refresh — Close's job is
+// shutting the session down cleanly, not guaranteeing this optimization
+// landed, and the worst case of skipping it is only that the next Open pays
+// a materialize it could have avoided, never incorrect data. There remains
+// an inherent, unclosable TOCTOU window around the whole sequence (an
+// external process could commit a write to the checkout at almost any
+// point in it); that is the same class of race every other checkoutState
+// consumer in this codebase already accepts (see ops.Checkout's own
+// quiesce-then-check flow), not something new introduced here.
+func (s *Session) prepareSidecarRefresh() bool {
+	s.flushMu.Lock()
+	defer s.flushMu.Unlock()
+
+	if s.Err() != nil {
+		return false
+	}
+	dctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
+	err := s.captured.DrainNow(dctx)
+	cancel()
+	if err != nil {
+		return false
+	}
+	return s.sidecarRefreshEligible()
+}
+
+// commitSidecarRefresh is prepareSidecarRefresh's other half — see its doc
+// comment for why this must run only after Close has joined engDone.
+func (s *Session) commitSidecarRefresh() {
+	s.flushMu.Lock()
+	defer s.flushMu.Unlock()
+
+	if !s.sidecarRefreshEligible() {
+		return
+	}
+	s.mu.Lock()
+	durable := s.durable
+	s.mu.Unlock()
+	lease := s.Lease()
+	ref, _, err := s.ws.Store.GetRef(s.db, s.branch)
+	if err != nil {
+		return
+	}
+	if ref.LeaseHolder != lease.Holder || ref.Epoch != lease.Epoch {
+		return // fenced or reclaimed out from under us
+	}
+	if ref.HeadTXID != durable || ref.HeadEpoch != lease.Epoch {
+		return // a concurrent writer elsewhere moved the head past what we flushed
+	}
+
+	ops.RefreshSum(s.checkoutPath, ref.Lineage, ref.HeadEpoch, ref.HeadTXID)
+}
+
+// sidecarRefreshEligible is the pending/success check both
+// prepareSidecarRefresh and commitSidecarRefresh run — see the caller
+// closest to each call for why each needs its own independent evaluation
+// rather than sharing one verdict. Callers hold flushMu already; this reads
+// s.mu itself (briefly) for lastFlushOK/durable, same as every other
+// Session accessor that touches those fields.
+//
+//   - s.Err() == nil: no fencing, no capture-engine failure. A session that
+//     ended abnormally has no business asserting anything about what its
+//     checkout currently contains.
+//   - !s.autoFlushPending(): everything ever applied or rebased-in is
+//     already reflected in the last successful flush — the exact signal
+//     flushLoop's own idle short-circuit uses (see autoFlushPending's doc
+//     comment). This is the load-bearing check: a session with ANY
+//     unflushed content (a write that was never flushed, or a flush attempt
+//     that failed and left autoFlushPending() true — the failed-flush case
+//     this must refuse to stamp for) must not have its checkout stamped as
+//     durable, or a later reopen would clean-skip re-materializing content
+//     that was never actually saved to the store — silently losing it,
+//     since the settling-flush suppression would then also treat that
+//     reopen as needing no settle either.
+//   - s.lastFlushOK and s.durable > 0: at least one flush has actually
+//     succeeded on this session. A session that never flushed anything
+//     (pure read-only, nothing written) has nothing fresher to record than
+//     whatever sidecar Open's own Checkout call already left in place —
+//     nothing to refresh.
+//   - singleStartupRebase(): rebaseGen is still exactly 1 — nothing beyond
+//     this session's one mandatory startup rebase ever rebuilt the replica.
+//     A later rebase-on-divergence rebuilds it from whatever snapshot the
+//     engine's divergence recovery produced at that moment; in real
+//     operation that snapshot is always itself derived from a checkpoint of
+//     the ACTUAL checkout (see capture.Engine.rebase's doc comment), so the
+//     mirror invariant this whole function otherwise leans on — "the
+//     replica's flushed content already equals the live checkout's actual
+//     bytes" — still holds even then. But nothing here can re-verify that
+//     cheaply (doing so would mean re-hashing the checkout wholesale,
+//     defeating the point of this optimization), so this stays deliberately
+//     conservative and refuses to stamp for any session that ever took that
+//     path — see singleStartupRebase's own doc comment for the test that
+//     exists specifically to pin this boundary.
+func (s *Session) sidecarRefreshEligible() bool {
+	if s.Err() != nil {
+		return false
+	}
+	if s.autoFlushPending() {
+		return false
+	}
+	if !s.singleStartupRebase() {
+		return false
+	}
+	s.mu.Lock()
+	okFlush, durable := s.lastFlushOK, s.durable
+	s.mu.Unlock()
+	return okFlush && durable > 0
+}
+
+// singleStartupRebase reports whether rebaseGen is still exactly 1 — see the
+// gate's use in sidecarRefreshEligible for the full reasoning, and
+// TestSidecarNotStampedAfterMidSessionRebase for a test pinning it directly.
+// Without this gate, a session whose replica was rebuilt via
+// replicaSink.Rebase with content unrelated to its actual checkout —
+// exactly what TestFlushLoopFlushesRebaseFoldedContentWhenOtherwiseIdle and
+// TestFlushLoopRetriesAfterRebaseDuringUpload also drive directly, to
+// exercise flushedRebaseGen's bookkeeping in isolation from a real WAL race
+// — would have its checkout sidecar confidently stamped on Close, claiming
+// the checkout matches durable content the checkout's own bytes never
+// actually received; both tests' later `w.Checkout` call to read that
+// content back would then silently clean-skip instead of re-materializing
+// it, and fail.
+func (s *Session) singleStartupRebase() bool {
+	s.replicaMu.Lock()
+	defer s.replicaMu.Unlock()
+	return s.rebaseGen == 1
 }
 
 // recordApply folds one captured transaction's frames into the session's

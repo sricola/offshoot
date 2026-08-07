@@ -306,15 +306,35 @@ func (w *Workspace) CheckoutProven(db, branch string) (CheckoutResult, error) {
 	return CheckoutResult{Path: path, Clean: false, Ref: ref}, nil
 }
 
-// RefreshSum re-stamps path's .sum sidecar to record it as current for
-// (lineage, epoch, txid) — see writeSum. Exported for Session.Close's
-// clean-close sidecar refresh (M2 follow-up): the session package knows its
-// own db/branch/checkout path and, from its last successful flush, the
-// exact ref identity that checkout now durably reflects, but sidecar
-// writing itself (content hash + JSON shape) is ops' concern, not
-// session's — see writeSum's doc comment for the format and sumRecord's for
-// why epoch is load-bearing in it.
+// RefreshSum quiesces path (checkpoints any pending WAL content into the
+// main file — see quiesce) and re-stamps its .sum sidecar to record it as
+// current for (lineage, epoch, txid) — see writeSum. Exported for
+// Session.Close's clean-close sidecar refresh (M2 follow-up): the session
+// package knows its own db/branch/checkout path and, from its last
+// successful flush, the exact ref identity that checkout now durably
+// reflects, but sidecar writing itself (content hash + JSON shape) is ops'
+// concern, not session's — see writeSum's doc comment for the format and
+// sumRecord's for why epoch is load-bearing in it.
+//
+// The quiesce step is not optional: writeSum's hash is a raw byte hash of
+// the file on disk, and a just-committed write can sit in a WAL-mode
+// database's -wal file with the main file's own bytes still reflecting the
+// state before it. Every other writeSum call site in this file (Checkout's
+// materialize path, Checkpoint, Rollback/Promote's refresh) is naturally
+// already checkpoint-consistent — a fresh materialize or checkpoint's own
+// encode always produces a plain, non-WAL file — so this is the one caller
+// for which stamping a possibly-WAL-dirty file is a real risk: a live
+// checkout's WAL is exactly what this is stamping. Callers MUST only invoke
+// this when it is safe to open a fresh, independent SQLite connection on
+// path — i.e., nothing else in this process still holds SQLite state open
+// on the same inode (see quiesce's own busy-timeout behavior, and dbfile's
+// package comment for why a naive open/close pair is unsafe otherwise;
+// Session.commitSidecarRefresh's doc comment works through exactly this for
+// its own call site).
 func RefreshSum(path, lineage string, epoch, txid uint64) error {
+	if err := quiesce(path); err != nil {
+		return err
+	}
 	return writeSum(path, lineage, epoch, txid)
 }
 
