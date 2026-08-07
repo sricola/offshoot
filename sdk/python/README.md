@@ -66,24 +66,44 @@ def test_agent_run(offshoot_fork):
 - `offshoot_daemon` (session-scoped): finds the `offshoot` binary
   (`OFFSHOOT_BIN` env, else `PATH`), starts it on a fresh temp store, and
   tears it down at session end. No binary found → the fixture `pytest.skip`s
-  with install instructions, it doesn't fail the run.
+  with install instructions, it doesn't fail the run (set ini
+  `offshoot_require_binary = true` to make that a hard failure instead —
+  CI's "don't silently skip everything" strict mode). `OFFSHOOT_BIN` set
+  but pointing at something missing or not a file (e.g. a directory) is
+  always a hard failure, regardless of that option — a typo in an explicit
+  path is a misconfiguration, not "this machine doesn't have offshoot".
 - `offshoot_db` (session-scoped): `offshoot_db(name="default", seed=None)`
   — a named-seed factory. The first call for a name creates `eval-{name}`,
-  runs `seed` (a callable given a writable sqlite path, or a SQL string),
-  and checkpoints it as `seed`; later calls for the same name are a pure
-  memoization hit. `seed=None` falls back to the `offshoot_seed` ini option
-  (a path to a `.sql` file) — set that once and every test's default
-  `offshoot_fork()` call needs no seed code at all.
+  runs `seed` (a callable given a writable sqlite path, or a SQL string —
+  a `sqlite3 <file> .dump`'s text works verbatim), and checkpoints it as
+  `seed`; later calls for the same name are a pure memoization hit — a
+  later call that passes a *different* seed for an already-seeded name
+  raises a clear error rather than silently keeping the first one.
+  `seed=None` falls back to the `offshoot_seed` ini option (a path to a
+  `.sql` file, resolved against pytest's rootdir) — set that once and every
+  test's default `offshoot_fork()` call needs no seed code at all.
 - `offshoot_fork` (function-scoped): `offshoot_fork(seed_handle=None)` —
-  forks a fresh, worker-safe-named branch from a seed checkpoint (TTL: 1h
-  default, `offshoot_ttl` ini-overridable), opens a session, and returns an
-  object with `.path`/`.client`/`.db`/`.branch`. Teardown closes the session
-  and destroys the branch; a destroy failure is a warning, never a test
-  failure (the TTL is the backstop).
+  `seed_handle` may be a handle from `offshoot_db`, a plain `str` naming an
+  already-seeded name (`offshoot_fork("special")`), or `None` for the
+  default seed. Forks a fresh, worker-safe-named branch from a seed
+  checkpoint (TTL: 1h default, `offshoot_ttl` ini-overridable), opens a
+  session, and returns an object with `.path`/`.client`/`.db`/`.branch`
+  plus a `.flush(name="", meta=None)` passthrough for a mid-test named
+  checkpoint. Teardown closes the session and destroys the branch; a
+  destroy (or close) failure is a warning, never a test failure (the TTL is
+  the backstop), and one fork's teardown failure never stops the rest of
+  that test's forks from being cleaned up too.
 - `offshoot_dump(path) -> str`: the golden-file comparison helper — `sqlite3
-  <path> .dump` text. **Never byte-compare two SQLite files**; SQLite's
-  on-disk bytes aren't deterministic for identical logical content. Compare
-  `offshoot_dump(a) == offshoot_dump(b)` instead.
+  <path> .dump` text, also available as a fixture of the same name
+  (`def test_x(offshoot_dump): ...`). **Never byte-compare two SQLite
+  files**; SQLite's on-disk bytes aren't deterministic for identical
+  logical content. Compare `offshoot_dump(a) == offshoot_dump(b)` instead:
+
+  ```python
+  from offshoot.pytest_plugin import offshoot_dump
+
+  assert offshoot_dump(golden_path) == offshoot_dump(forked.path)
+  ```
 
 **`pytest-xdist`:** this plugin runs one `offshoot` daemon + one temp store
 **per worker** (pytest has no fixture-sharing mechanism across worker
