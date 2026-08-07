@@ -64,6 +64,33 @@ class Branch:
     state: str = ""
 
 
+@dataclass
+class Event:
+    """One event from the daemon's event stream — see :meth:`Client.events`.
+
+    Mirrors ``internal/daemon/events.go``'s ``Event``: the ONE versioned
+    JSON schema (``v`` is currently always ``1``) the daemon emits over
+    BOTH the unix socket ``subscribe`` op and HTTP ``GET /events`` (SSE) —
+    see ``docs/reference.md``'s Eventing section for the full ``type``
+    table (``session_opened``, ``flushed``, ``flush_failed``, ``fenced``,
+    ``session_closed``, ``reaped``, ``evicted`` (reserved — nothing emits
+    it yet), and the terminal ``dropped_slow_consumer`` — see
+    :meth:`Client.events`'s docstring for how that one is handled).
+
+    ``ts`` is RFC3339 UTC. ``db``/``branch`` are ``""`` for event types
+    that carry no branch (e.g. ``dropped_slow_consumer``). ``detail`` is
+    ``{}`` when the daemon omits it (events with no extra detail, e.g.
+    ``reaped``).
+    """
+
+    v: int
+    ts: str
+    type: str
+    db: str = ""
+    branch: str = ""
+    detail: dict = field(default_factory=dict)
+
+
 def _ttl_str(ttl) -> str:
     """Render a Python TTL value into the wire's Go-duration-string form.
 
@@ -111,6 +138,7 @@ class Client:
     """
 
     def __init__(self, socket_path: str):
+        self._socket_path = socket_path
         self._sock = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
         try:
             self._sock.connect(socket_path)
@@ -254,6 +282,104 @@ class Client:
         """
         resp = self._call("checkout-at", db=db, branch=branch, name=checkpoint, force=force)
         return resp.get("checkout", "")
+
+    def events(self):
+        """Stream the daemon's event feed, yielding one :class:`Event` per
+        line, in publish order, until the stream ends.
+
+        *** OPENS ITS OWN, DEDICATED SOCKET CONNECTION *** — never this
+        Client's own ``self._sock``. The daemon's ``subscribe`` op
+        (``internal/daemon/events.go``/``server.go``) permanently takes a
+        connection out of request/response mode the instant it acks: no
+        further ``open``/``flush``/``status``/... call could ever get a
+        reply on that same connection again. This method dials a fresh
+        unix-socket connection to the same ``socket_path`` this Client was
+        constructed with, precisely so callers never have to think about
+        that — keep using ``self``/this ``Client`` for ordinary ops exactly
+        as before, and iterate the generator this method returns for
+        events; the two never share a socket.
+
+        This is a *generator function*: calling ``client.events()`` alone
+        does nothing yet (no socket is opened) — the connection is made,
+        ``subscribe`` sent, and the ack read on the FIRST ``next()``/loop
+        iteration. A connection failure or a daemon error response (e.g. an
+        ack the daemon returned ``ok: false`` for — not expected in
+        practice, but handled) surfaces as :class:`OffshootError` from
+        that first iteration, not from the ``events()`` call itself::
+
+            for ev in client.events():
+                print(ev.type, ev.db, ev.branch, ev.detail)
+
+        **``dropped_slow_consumer`` (this consumer fell behind the
+        daemon's bounded per-subscriber buffer and was dropped — see
+        ``docs/reference.md``'s Eventing section): yielded like any other
+        event, and then the generator stops** (a plain ``return``, not an
+        exception) — the daemon has already closed its end, there is
+        nothing more to read. This is the unambiguous contract: a caller
+        that cares whether it was dropped checks
+        ``ev.type == "dropped_slow_consumer"`` on the last event it
+        received; a caller that doesn't care just sees the loop end. It is
+        deliberately NOT raised as an :class:`OffshootError` — a drop ends
+        the stream the same way an ordinary disconnect does (the ``for``
+        loop simply finishes); only a genuine transport/protocol failure
+        (a connect error, a malformed line) raises.
+
+        **Closing early:** stop iterating — ``break`` out of the ``for``
+        loop, or call ``.close()`` on the generator object directly — to
+        close the dedicated socket. Python delivers this as
+        :class:`GeneratorExit` at the suspended ``yield``; the ``finally``
+        block below always runs in response (whether the generator is
+        garbage-collected, explicitly closed, or the loop breaks) and
+        closes both the buffered reader and the underlying socket, so no
+        file descriptor is leaked by stopping early.
+        """
+        sock = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
+        try:
+            sock.connect(self._socket_path)
+        except OSError as e:
+            sock.close()
+            raise OffshootError(f"daemon connection failed: {e}") from e
+        rfile = sock.makefile("rb")
+        try:
+            try:
+                sock.sendall(json.dumps({"op": "subscribe"}).encode() + b"\n")
+                line = rfile.readline()
+            except OSError as e:
+                raise OffshootError(f"daemon connection failed: {e}") from e
+            if not line:
+                raise OffshootError("daemon closed the connection")
+            try:
+                ack = json.loads(line)
+            except json.JSONDecodeError as e:
+                raise OffshootError(f"daemon sent a malformed response: {e}") from e
+            if not ack.get("ok", False):
+                raise OffshootError(ack.get("error", "unknown daemon error"))
+
+            while True:
+                try:
+                    line = rfile.readline()
+                except OSError as e:
+                    raise OffshootError(f"daemon connection failed: {e}") from e
+                if not line:
+                    return  # daemon closed the stream (unsubscribed, or shutdown)
+                try:
+                    raw = json.loads(line)
+                except json.JSONDecodeError as e:
+                    raise OffshootError(f"daemon sent a malformed event: {e}") from e
+                ev = Event(
+                    v=raw.get("v", 0),
+                    ts=raw.get("ts", ""),
+                    type=raw.get("type", ""),
+                    db=raw.get("db", ""),
+                    branch=raw.get("branch", ""),
+                    detail=raw.get("detail") or {},
+                )
+                yield ev
+                if ev.type == "dropped_slow_consumer":
+                    return  # terminal: the daemon has already closed its end
+        finally:
+            rfile.close()
+            sock.close()
 
     def status(self) -> list[dict]:
         """List every session open in the daemon, as raw dicts."""
