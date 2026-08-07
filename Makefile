@@ -1,4 +1,5 @@
-.PHONY: test test-torture build test-s3 bench bench-s3 test-python-sdk test-ts-sdk test-sdks
+.PHONY: test test-torture build test-s3 bench bench-s3 test-python-sdk test-ts-sdk test-sdks \
+	check-sdk-versions dry-run-python-sdk dry-run-ts-sdk dry-run-sdks
 test:
 	go test ./... -count=1
 test-torture:
@@ -50,6 +51,56 @@ test-ts-sdk:
 # test-sdks is deliberately not a dependency of the default `test` target:
 # it needs python3 and node/npm on PATH, which the Go suite does not.
 test-sdks: test-python-sdk test-ts-sdk
+
+# check-sdk-versions verifies sdk/VERSION (the single source of truth — see
+# CONTRIBUTING.md's "Release process") agrees with the version literally
+# spelled out in sdk/python/pyproject.toml and sdk/typescript/package.json.
+check-sdk-versions:
+	python3 scripts/check_sdk_versions.py
+
+# dry-run-python-sdk builds the real sdist+wheel `offshoot-db` would publish,
+# runs twine's metadata check against them, then installs the wheel into a
+# throwaway venv and import-tests it. This is exactly what
+# .github/workflows/publish.yml's PyPI job runs when the repository variable
+# PUBLISH_ENABLED is not "true" instead of uploading anywhere; ci.yml's sdks
+# job runs it on every PR so a manifest mistake (bad classifier, missing
+# readme, broken package-discovery glob) fails long before a release tag
+# does. Needs `python3 -m pip install build twine` on PATH — see
+# CONTRIBUTING.md's dev setup.
+dry-run-python-sdk: check-sdk-versions
+	rm -rf sdk/python/dist
+	cd sdk/python && python3 -m build
+	python3 -m twine check sdk/python/dist/*
+	rm -rf sdk/python/.dry-run-venv
+	python3 -m venv sdk/python/.dry-run-venv
+	sdk/python/.dry-run-venv/bin/pip install --quiet sdk/python/dist/*.whl
+	sdk/python/.dry-run-venv/bin/python3 -c "import offshoot; print('import offshoot: ok,', offshoot.__doc__.splitlines()[0])"
+	rm -rf sdk/python/.dry-run-venv
+
+# dry-run-ts-sdk builds dist/, packs the exact tarball `npm publish` would
+# upload (respecting package.json's "files" whitelist), installs *that
+# tarball* — not the source tree — into a throwaway project, and
+# import-tests the published entry point. This catches "files" whitelist
+# mistakes (dist/ not built yet, an accidentally-included test file) that
+# `npm test` against the source tree can't see. This is exactly what
+# .github/workflows/publish.yml's npm job runs when PUBLISH_ENABLED is not
+# "true" instead of uploading anywhere; ci.yml's sdks job runs it on every
+# PR. Needs `npm` on PATH.
+dry-run-ts-sdk:
+	cd sdk/typescript && npm install --no-audit --no-fund && npm run build
+	rm -rf sdk/typescript/dry-run-pack sdk/typescript/dry-run-install
+	mkdir -p sdk/typescript/dry-run-pack sdk/typescript/dry-run-install
+	cd sdk/typescript && npm pack --silent --pack-destination dry-run-pack
+	cd sdk/typescript/dry-run-install && npm init -y --silent >/dev/null
+	cd sdk/typescript/dry-run-install && npm install --no-audit --no-fund --silent ../dry-run-pack/offshoot-db-client-*.tgz
+	cd sdk/typescript/dry-run-install && node -e "import('@offshoot-db/client').then((m) => { if (typeof m.connect !== 'function') throw new Error('connect export missing from published package'); console.log('import @offshoot-db/client: ok'); })"
+	rm -rf sdk/typescript/dry-run-pack sdk/typescript/dry-run-install
+
+# dry-run-sdks runs both dry runs — the "does this build and install"
+# tier that gates on nothing but PATH tools, run on every PR touching
+# sdk/** (see ci.yml's sdks job) so PUBLISH_ENABLED flipping on is never the
+# first time a manifest mistake is discovered.
+dry-run-sdks: dry-run-python-sdk dry-run-ts-sdk
 
 .PHONY: third-party-licenses
 # third-party-licenses regenerates THIRD_PARTY_LICENSES.csv from the current
