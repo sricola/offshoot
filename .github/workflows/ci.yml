@@ -36,6 +36,17 @@ jobs:
           # tests on in CI rather than silently skipping them.
           sudo apt-get install -y sqlite3 sqlite3-tools
 
+      - name: Install sqlite3 CLI (macos)
+        if: runner.os == 'macOS'
+        run: |
+          # The macos-26 runner image (macos-latest since 2026-07) no longer
+          # ships the sqlite3 CLI on PATH — earlier images did, and this step's
+          # absence only bit when macos-latest rolled forward. brew's sqlite
+          # is keg-only, so link the binaries onto PATH explicitly; the
+          # `sqldiff` formula provides offshoot diff's default mode.
+          brew install sqlite sqldiff || true
+          echo "$(brew --prefix sqlite)/bin" >> "$GITHUB_PATH"
+
       - name: Verify sqlite3 CLI is present
         run: sqlite3 --version && sqldiff --help >/dev/null
 
@@ -78,11 +89,34 @@ jobs:
       # stdlib-only). Installed editable so its `pytest11` entry point
       # registration is exercised for real, exactly as an installed
       # `offshoot-db[pytest]` would be.
+      #
+      # A venv, NOT `pip install --break-system-packages` straight onto
+      # system python: this runner is non-root/no-sudo, so PEP 668's
+      # externally-managed guard plus --break-system-packages makes pip
+      # silently fall back to a *user*-site install
+      # (~/.local/lib/pythonX.Y/site-packages) — which is only importable
+      # via $HOME. That's fine for the outer `make test-pytest-plugin`
+      # process itself, but three of its tests use pytest's own `pytester`
+      # fixture in *subprocess* mode (`runpytest_subprocess`, needed for a
+      # real xdist -n2 run, a real cwd-vs-rootdir check, and a real -W
+      # error flag) — and `pytester` deliberately repoints HOME at a
+      # throwaway tmp dir for every nested run (see _pytest/pytester.py's
+      # Pytester.__init__, "Ensure no user config is used"). With pytest
+      # installed only under the REAL $HOME, that nested subprocess can no
+      # longer find it at all: it exits with "No module named pytest"
+      # before printing a terminal summary, which pytester.py:585 surfaces
+      # as "ValueError: Pytest terminal summary report not found". A venv's
+      # site-packages path is baked into the interpreter itself, independent
+      # of $HOME, so the nested subprocess (same interpreter, same venv)
+      # keeps seeing pytest regardless of what HOME it's given — the same
+      # reason this never reproduces in a local dev venv.
       - name: Install offshoot-db[pytest] + pytest-xdist
-        run: python3 -m pip install --break-system-packages --quiet -e "sdk/python[pytest]" pytest-xdist
+        run: |
+          python3 -m venv .venv-pytest-plugin
+          .venv-pytest-plugin/bin/pip install --quiet -e "sdk/python[pytest]" pytest-xdist
 
       - name: make test-pytest-plugin
-        run: make test-pytest-plugin
+        run: PATH="$PWD/.venv-pytest-plugin/bin:$PATH" make test-pytest-plugin
 
       # dry-run-sdks builds the real sdist/wheel and npm tarball, runs twine
       # check, and install-tests both — the same build-verification tier
