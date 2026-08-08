@@ -820,8 +820,32 @@ func (w *Workspace) copySnapshotIntoLineageFromChain(srcLineage string, members 
 // child, to compare their outputs — see ops_test.go's fork fast-path tests.
 // The external ops_test package (which needs to import session without an
 // import cycle) reaches this via the exported test-only wrapper in
-// export_test.go.
+// export_test.go. Since the copy-on-write shared fork path landed, this knob
+// also forces Fork itself onto the MATERIALIZE branch (a "definitely slow
+// path" child must materialize at all before it can re-encode), so setting
+// it alone yields a fully-slow fork.
 var forkSlowPathForTest bool
+
+// forkMaterializeForTest, when true, forces Fork to take the MATERIALIZE
+// branch (copySnapshotToNewLineage) even when the shared base-pointer path
+// would apply, WITHOUT suppressing the fast object-copy inside it (that
+// suppression is forkSlowPathForTest's job; setting that knob also implies
+// materializing — see its doc comment). Test-only,
+// process-global, restore via t.Cleanup, same rules as forkSlowPathForTest.
+// It exists because the copy-on-write shared path made a plain Fork of a
+// short chain share instead of materialize, so the materialize-path
+// equivalence tests (fast copy vs slow re-encode) need a way to reach the
+// materialize machinery at all from Fork.
+var forkMaterializeForTest bool
+
+// ForkShareMaxDepth is the fork-time snapshot-floor bound: a shared fork
+// whose FULLY-resolved base chain (transitive ancestors included) already
+// reaches this many members materializes a fresh floor snapshot instead of
+// sharing, so no fork spine's resolved chain exceeds it. Mirrors
+// session.DefaultSnapshotEvery — the bound that keeps materialization
+// bounded (ops must not import internal/session, hence the local constant).
+// Not yet configurable per-session; follow-up.
+const ForkShareMaxDepth = 16
 
 // forkFastPathHits counts how many times copySnapshotToNewLineage has taken
 // the fast object-copy path (single-snapshot chain, backend CopyObject
@@ -1013,16 +1037,66 @@ func (w *Workspace) Fork(db, srcBranch, newBranch, at string, ttl time.Duration,
 		w.warnIfUncheckpointed(db, srcBranch, src)
 	}
 	txid := cp.TXID
-	// Materialized fork point: copy the source snapshot into the child's own
-	// lineage so the child never references parent storage.
-	childLineage, fast, err := w.copySnapshotToNewLineage(src, cp)
+	// Fork-time snapshot-floor decision: the fork point's FULLY-resolved
+	// chain length (Chain follows base pointers transitively, so this counts
+	// every ancestor's contribution) decides SHARE vs MATERIALIZE. Sharing
+	// adds zero members of its own — the child's resolved chain at the fork
+	// point IS this chain — so sharing below the bound can never push a
+	// resolved chain past it, and materializing at the bound resets the
+	// spine's depth to one. That construction is what keeps materialization
+	// bounded without relying on manual compaction.
+	baseMembers, err := w.Store.Chain(src.Lineage, cp.TXID)
 	if err != nil {
-		return 0, err
+		return 0, fmt.Errorf("ops: resolving chain for lineage %s to txid %d: %w", src.Lineage, cp.TXID, err)
+	}
+	var (
+		childLineage string
+		base         *store.BasePointer
+		fast         bool
+	)
+	if len(baseMembers) >= ForkShareMaxDepth || forkMaterializeForTest || forkSlowPathForTest {
+		// MATERIALIZE (the hybrid floor): copy the source snapshot into the
+		// child's own lineage so the child never references parent storage —
+		// exactly the pre-CoW fork. The M2 reflink/CopyObject fast path is
+		// now only reachable from Fork through here (and in practice fires
+		// only under the test hooks: the floor trips at ForkShareMaxDepth
+		// members while the fast copy needs a single-member chain; Rollback
+		// and Promote remain its everyday callers).
+		//
+		// copySnapshotToNewLineage re-resolves the chain it needs; the extra
+		// Chain call over baseMembers above is accepted here because the
+		// floor is the rare branch and threading members through would touch
+		// its other callers (Rollback, Promote) for no behavioral gain.
+		childLineage, fast, err = w.copySnapshotToNewLineage(src, cp)
+		if err != nil {
+			return 0, err
+		}
+	} else {
+		// SHARE: no snapshot/segment objects at all — the child is born as a
+		// base pointer into the parent's already-durable chain. Reads at the
+		// fork point resolve purely in the parent (Chain's target <= base.TXID
+		// branch); the child's own segments concatenate on top as it diverges.
+		childLineage = store.NewLineageID()
+		// A base pointer must never land in a store an old (layout v1) binary
+		// could still open — its lineage-granular GC would sweep the shared
+		// parent out from under the child. Bump the manifest first.
+		if err := w.Store.EnsureLayoutV2(); err != nil {
+			return 0, fmt.Errorf("ops: fork %s@%s: %w", db, newBranch, err)
+		}
+		bp := store.BasePointer{Lineage: src.Lineage, TXID: cp.TXID}
+		// The durable per-lineage base object is the resolution source of
+		// truth (it outlives the ref if the child's ancestors are destroyed);
+		// Ref.Base below is only its reporting mirror.
+		if err := w.Store.WriteLineageBase(childLineage, bp); err != nil {
+			return 0, fmt.Errorf("ops: fork %s@%s: %w", db, newBranch, err)
+		}
+		base = &bp
 	}
 	child := store.Ref{
 		Lineage: childLineage, Epoch: 1, HeadTXID: txid, HeadEpoch: 1,
 		Parent: fmt.Sprintf("%s@%s@%d", db, srcBranch, txid),
 		Meta:   meta,
+		Base:   base,
 	}
 	if ttl > 0 {
 		child.TTL = ttl.String()
@@ -1030,11 +1104,21 @@ func (w *Workspace) Fork(db, srcBranch, newBranch, at string, ttl time.Duration,
 	child.Touch(time.Now())
 	child.SetCheckpoint("fork", store.Checkpoint{TXID: txid, Epoch: 1, CreatedAt: nowStamp()})
 	if _, err := w.Store.PutRef(db, newBranch, child, ""); err != nil {
-		// Branch already exists (or lost a race): remove the orphan snapshot.
-		w.Store.B.Delete(store.SnapshotKey(childLineage, 1, txid))
+		// Branch already exists (or lost a race): remove the orphan — the
+		// base object on the shared path (there is no snapshot to delete),
+		// the snapshot on the materialize path.
+		if base != nil {
+			w.Store.B.Delete(store.BaseKey(childLineage))
+		} else {
+			w.Store.B.Delete(store.SnapshotKey(childLineage, 1, txid))
+		}
 		return 0, fmt.Errorf("ops: fork %s@%s: %w", db, newBranch, err)
 	}
 	if ObserveFork != nil {
+		// A shared fork reports fast=false: the fast/slow split was defined
+		// for the materialize path's copy strategy, and a shared fork copies
+		// nothing. A dedicated "shared" path label for the fork metrics is a
+		// follow-up, not smuggled into this bool.
 		ObserveFork(time.Since(start), fast)
 	}
 	return txid, nil

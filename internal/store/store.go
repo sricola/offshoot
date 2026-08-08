@@ -339,12 +339,22 @@ func (s *Store) lineageBase(lineage string) (*BasePointer, error) {
 	return &b, nil
 }
 
-// writeLineageBase durably records a lineage's base pointer, create-only: a
+// WriteLineageBase durably records a lineage's base pointer, create-only: a
 // lineage's base is immutable once written, so a second write is refused with
-// ErrCAS (surfaced as-is). The shared-fork path (Task 3) is the real caller;
-// it exists in this task so tests can construct shared-lineage scenarios
-// directly, without the ops layer.
-func (s *Store) writeLineageBase(lineage string, b BasePointer) error {
+// ErrCAS (surfaced as-is). The shared-fork path (ops.Fork) is the real
+// caller; it writes the base BEFORE the child ref CAS so resolution's source
+// of truth exists by the time any reader can see the child.
+//
+// A base naming the lineage itself is refused outright: Chain resolves a
+// based lineage by recursing into its base, so a self-base would recurse
+// forever. (A longer cycle through several lineages would too, but bases are
+// create-only and always point at an ALREADY-EXISTING lineage, so a cycle
+// cannot be constructed through this writer; the self-base is the one cheap,
+// local mistake worth guarding here.)
+func (s *Store) WriteLineageBase(lineage string, b BasePointer) error {
+	if b.Lineage == lineage {
+		return fmt.Errorf("store: lineage %s cannot be its own base", lineage)
+	}
 	data, err := json.Marshal(b)
 	if err != nil {
 		return err
@@ -470,7 +480,20 @@ func (s *Store) Chain(lineage string, target uint64) ([]ChainMember, error) {
 		// nothing.
 		return s.Chain(base.Lineage, target)
 	}
-	// Above the fork point: concatenate two INDEPENDENTLY-resolved halves.
+	// Above the fork point: if the child has grown its OWN snapshot covering
+	// target (a divergence floor — ops.Checkpoint always writes one, and the
+	// session's snapshot cadence will too), resolution anchors there and
+	// never touches the base: the whole chain lives in this one lineage.
+	// A shared child is born with zero objects and only ever writes txids
+	// above its fork point, so a child snapshot is necessarily > base.TXID
+	// and chainSelf succeeding is always a complete, single-lineage answer.
+	// When chainSelf cannot anchor (no child snapshot at or below target, or
+	// its segment run has a genuine hole), fall through to the seam path,
+	// which reports its own error for real holes.
+	if selfChain, err := s.chainSelf(lineage, target); err == nil {
+		return selfChain, nil
+	}
+	// Concatenate two INDEPENDENTLY-resolved halves.
 	// The base half is resolved wholly within the base lineage (and its
 	// ancestors, via recursion) up to base.TXID; the child half is this
 	// lineage's own contiguous segment run in (base.TXID, target]. Neither
