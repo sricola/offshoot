@@ -12,6 +12,7 @@ import (
 
 	"github.com/sricola/offshoot/internal/daemon"
 	"github.com/sricola/offshoot/internal/ops"
+	"github.com/sricola/offshoot/internal/testutil"
 )
 
 // newDaemonTools starts a real daemon server (daemon.NewServer, the exact
@@ -28,9 +29,7 @@ import (
 // argument sets OffshootTools' configured default.
 func newDaemonTools(t *testing.T, defaultTTL ...time.Duration) (ts *OffshootTools, w *ops.Workspace, sock string) {
 	t.Helper()
-	if _, err := exec.LookPath("sqlite3"); err != nil {
-		t.Skip("sqlite3 CLI not on PATH")
-	}
+	testutil.RequireSQLite3(t)
 	dir := t.TempDir()
 	spec := filepath.Join(dir, "store")
 	w, err := ops.Init(spec)

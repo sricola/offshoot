@@ -11,6 +11,7 @@ import (
 
 	_ "github.com/mattn/go-sqlite3"
 	"github.com/sricola/offshoot/internal/dbfile"
+	"github.com/sricola/offshoot/internal/testutil"
 )
 
 // sqlite3UnlinksWALOnExit reports whether the sqlite3 CLI on PATH does the
@@ -84,9 +85,7 @@ func lockSurvives(t *testing.T, src string, read func(t *testing.T, path string)
 // ordinary os.Open/Close of the same file DOES drop those locks — so that the
 // guarantee is demonstrated against a control rather than merely asserted.
 func TestReaderPreservesSQLiteLocks(t *testing.T) {
-	if _, err := exec.LookPath("sqlite3"); err != nil {
-		t.Skip("sqlite3 CLI not on PATH")
-	}
+	testutil.RequireSQLite3(t)
 	if !sqlite3UnlinksWALOnExit(t) {
 		t.Skip("this platform's sqlite3 keeps the WAL on last close (persistent " +
 			"WAL), so a dropped lock is not observable and these tests cannot " +

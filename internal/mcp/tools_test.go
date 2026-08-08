@@ -13,6 +13,7 @@ import (
 	"time"
 
 	"github.com/sricola/offshoot/internal/ops"
+	"github.com/sricola/offshoot/internal/testutil"
 )
 
 // newTools builds a tool set with no default fork TTL, unless a single
@@ -20,9 +21,7 @@ import (
 // unaffected).
 func newTools(t *testing.T, defaultTTL ...time.Duration) (*OffshootTools, *ops.Workspace) {
 	t.Helper()
-	if _, err := exec.LookPath("sqlite3"); err != nil {
-		t.Skip("sqlite3 CLI not on PATH")
-	}
+	testutil.RequireSQLite3(t)
 	spec := filepath.Join(t.TempDir(), "store")
 	w, err := ops.Init(spec)
 	if err != nil {

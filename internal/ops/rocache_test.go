@@ -5,6 +5,8 @@ import (
 	"os/exec"
 	"testing"
 	"time"
+
+	"github.com/sricola/offshoot/internal/testutil"
 )
 
 // mkCheckpoint writes a single INSERT to path via the sqlite3 CLI and
@@ -48,7 +50,7 @@ func TestROCacheUsageEmptyWhenNoCacheDirectory(t *testing.T) {
 }
 
 func TestROCacheUsageCountsCachedEntries(t *testing.T) {
-	requireSQLite3(t)
+	testutil.RequireSQLite3(t)
 	w := newWS(t)
 	if err := w.Create("app"); err != nil {
 		t.Fatal(err)
@@ -91,7 +93,7 @@ func TestROCacheUsageCountsCachedEntries(t *testing.T) {
 }
 
 func TestEvictROCacheBudgetZeroNeverEvicts(t *testing.T) {
-	requireSQLite3(t)
+	testutil.RequireSQLite3(t)
 	w := newWS(t)
 	if err := w.Create("app"); err != nil {
 		t.Fatal(err)
@@ -131,7 +133,7 @@ func TestEvictROCacheBudgetZeroNeverEvicts(t *testing.T) {
 }
 
 func TestEvictROCacheAlreadyUnderBudgetNeverEvicts(t *testing.T) {
-	requireSQLite3(t)
+	testutil.RequireSQLite3(t)
 	w := newWS(t)
 	if err := w.Create("app"); err != nil {
 		t.Fatal(err)
@@ -165,7 +167,7 @@ func TestEvictROCacheAlreadyUnderBudgetNeverEvicts(t *testing.T) {
 // oldest is gone, the other two survive, and reported usage is at or under
 // budget.
 func TestEvictROCacheEvictsOldestFirstUntilUnderBudget(t *testing.T) {
-	requireSQLite3(t)
+	testutil.RequireSQLite3(t)
 	w := newWS(t)
 	if err := w.Create("app"); err != nil {
 		t.Fatal(err)
@@ -247,7 +249,7 @@ func TestEvictROCacheEvictsOldestFirstUntilUnderBudget(t *testing.T) {
 // `.last-used` marker alongside the .db file it belongs to, not just the
 // .db itself.
 func TestEvictROCacheRemovesBothDBAndMarker(t *testing.T) {
-	requireSQLite3(t)
+	testutil.RequireSQLite3(t)
 	w := newWS(t)
 	if err := w.Create("app"); err != nil {
 		t.Fatal(err)
@@ -307,7 +309,7 @@ func TestEvictROCacheRemovesBothDBAndMarker(t *testing.T) {
 // permissions — because EvictROCache only ever walks/removes paths under
 // the SEPARATE checkouts-ro tree.
 func TestEvictROCacheNeverTouchesWritableCheckout(t *testing.T) {
-	requireSQLite3(t)
+	testutil.RequireSQLite3(t)
 	w := newWS(t)
 	if err := w.Create("app"); err != nil {
 		t.Fatal(err)
@@ -365,7 +367,7 @@ func TestEvictROCacheNeverTouchesWritableCheckout(t *testing.T) {
 // (PM Amendment 11 — "touch-on-HIT", not touch-on-create), and a
 // subsequent force=false cache hit creates/updates one.
 func TestCheckoutAtCacheHitTouchesLastUsedMarker(t *testing.T) {
-	requireSQLite3(t)
+	testutil.RequireSQLite3(t)
 	w := newWS(t)
 	if err := w.Create("app"); err != nil {
 		t.Fatal(err)
@@ -400,7 +402,7 @@ func TestCheckoutAtCacheHitTouchesLastUsedMarker(t *testing.T) {
 // evicted instead — proving the `.last-used` marker, not raw creation
 // order, drives the LRU ranking.
 func TestEvictROCacheLastUsedTouchBeatsCreationOrder(t *testing.T) {
-	requireSQLite3(t)
+	testutil.RequireSQLite3(t)
 	w := newWS(t)
 	if err := w.Create("app"); err != nil {
 		t.Fatal(err)
@@ -470,7 +472,7 @@ func TestEvictROCacheLastUsedTouchBeatsCreationOrder(t *testing.T) {
 // window instead of relying on real goroutine scheduling to hit a
 // microscopic race.
 func TestEvictROCacheSparesEntryTouchedDuringThisPass(t *testing.T) {
-	requireSQLite3(t)
+	testutil.RequireSQLite3(t)
 	w := newWS(t)
 	if err := w.Create("app"); err != nil {
 		t.Fatal(err)

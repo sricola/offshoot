@@ -7,15 +7,14 @@ import (
 	"time"
 
 	"github.com/sricola/offshoot/internal/store"
+	"github.com/sricola/offshoot/internal/testutil"
 )
 
 // TestStaleWriterCannotCorruptLineage simulates the pause-and-resume hazard:
 // holder A is fenced by holder B, then wakes up and writes. A's object must
 // land under a dead epoch and must not be reachable from any ref.
 func TestStaleWriterCannotCorruptLineage(t *testing.T) {
-	if _, err := exec.LookPath("sqlite3"); err != nil {
-		t.Skip("sqlite3 CLI not on PATH")
-	}
+	testutil.RequireSQLite3(t)
 	w := newWS(t)
 	if err := w.Create("app"); err != nil {
 		t.Fatal(err)

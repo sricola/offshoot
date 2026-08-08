@@ -5,6 +5,8 @@ import (
 	"path/filepath"
 	"strings"
 	"testing"
+
+	"github.com/sricola/offshoot/internal/testutil"
 )
 
 // TestDiffCLIRejectsBadTarget pins ParseExportTarget's arity check at the
@@ -72,7 +74,7 @@ func seedTwoSidesForDiff(t *testing.T, store string) (leftTarget, rightTarget st
 // test: it asserts the EXACT counts (not just presence/absence) for a
 // changed, an added, and a removed table, plus the trailing totals line.
 func TestDiffSummaryCLIReportsExactRowCounts(t *testing.T) {
-	requireSQLite3ForCLI(t)
+	testutil.RequireSQLite3(t)
 	store := filepath.Join(t.TempDir(), "s")
 	left, right := seedTwoSidesForDiff(t, store)
 
@@ -93,7 +95,7 @@ func TestDiffSummaryCLIReportsExactRowCounts(t *testing.T) {
 // TestDiffSummaryCLIWorksAcrossTwoDifferentDatabases proves cross-db diff is
 // legit (Milestone 3 Task 6): the two targets need not name the same `db`.
 func TestDiffSummaryCLIWorksAcrossTwoDifferentDatabases(t *testing.T) {
-	requireSQLite3ForCLI(t)
+	testutil.RequireSQLite3(t)
 	store := filepath.Join(t.TempDir(), "s")
 	call(t, store, "init")
 
@@ -119,7 +121,7 @@ func TestDiffSummaryCLIWorksAcrossTwoDifferentDatabases(t *testing.T) {
 // branch's HEAD, and running diff --summary again after a new write must
 // show the new state — never a cached, stale head from the first call.
 func TestDiffCLIHeadSideReflectsNewWriteNotStaleCache(t *testing.T) {
-	requireSQLite3ForCLI(t)
+	testutil.RequireSQLite3(t)
 	store := filepath.Join(t.TempDir(), "s")
 	call(t, store, "init")
 	call(t, store, "create", "app")
@@ -155,7 +157,7 @@ func TestDiffCLIHeadSideReflectsNewWriteNotStaleCache(t *testing.T) {
 // (non --summary) diff path names the sqlite3-tools package rather than
 // failing with a bare "executable file not found" error.
 func TestDiffCLIErrorsClearlyWhenSqldiffMissing(t *testing.T) {
-	requireSQLite3ForCLI(t)
+	testutil.RequireSQLite3(t)
 	store := filepath.Join(t.TempDir(), "s")
 	call(t, store, "init")
 	call(t, store, "create", "app")
@@ -182,10 +184,8 @@ func TestDiffCLIErrorsClearlyWhenSqldiffMissing(t *testing.T) {
 // installs sqlite3-tools specifically so this test runs there; locally it
 // skips cleanly if sqldiff isn't on PATH.
 func TestDiffCLISqldiffPresentStreamsOutput(t *testing.T) {
-	if _, err := exec.LookPath("sqldiff"); err != nil {
-		t.Skip("sqldiff not on PATH (install sqlite3-tools / brew's sqlite formula to run this test)")
-	}
-	requireSQLite3ForCLI(t)
+	testutil.RequireSQLdiff(t)
+	testutil.RequireSQLite3(t)
 	store := filepath.Join(t.TempDir(), "s")
 	call(t, store, "init")
 	call(t, store, "create", "app")
@@ -205,10 +205,8 @@ func TestDiffCLISqldiffPresentStreamsOutput(t *testing.T) {
 // really runs (not just "doesn't error") by diffing a checkpoint against
 // itself and checking sqldiff prints nothing.
 func TestDiffCLIIdenticalSidesProduceNoSqldiffOutput(t *testing.T) {
-	if _, err := exec.LookPath("sqldiff"); err != nil {
-		t.Skip("sqldiff not on PATH")
-	}
-	requireSQLite3ForCLI(t)
+	testutil.RequireSQLdiff(t)
+	testutil.RequireSQLite3(t)
 	store := filepath.Join(t.TempDir(), "s")
 	call(t, store, "init")
 	call(t, store, "create", "app")
@@ -234,7 +232,7 @@ func TestDiffCLIIdenticalSidesProduceNoSqldiffOutput(t *testing.T) {
 // target strings as its two count columns (not bare "LEFT"/"RIGHT") so a
 // reader never has to scroll back up to know which count is which side.
 func TestDiffCLIPrintsLeftRightHeaderInBothModes(t *testing.T) {
-	requireSQLite3ForCLI(t)
+	testutil.RequireSQLite3(t)
 	store := filepath.Join(t.TempDir(), "s")
 	left, right := seedTwoSidesForDiff(t, store)
 
@@ -248,9 +246,7 @@ func TestDiffCLIPrintsLeftRightHeaderInBothModes(t *testing.T) {
 		t.Fatalf("--summary table headers must use the target strings %q/%q, got:\n%s", left, right, summaryOut)
 	}
 
-	if _, err := exec.LookPath("sqldiff"); err != nil {
-		t.Skip("sqldiff not on PATH; already proved the --summary half above")
-	}
+	testutil.RequireSQLdiff(t)
 	sqldiffOut := call(t, store, "diff", left, right)
 	if !strings.Contains(sqldiffOut, "left:  "+left+" right: "+right) {
 		t.Fatalf("default (sqldiff) mode output missing the left/right header naming %q and %q; full output:\n%s", left, right, sqldiffOut)

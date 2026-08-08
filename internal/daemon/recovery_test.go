@@ -9,15 +9,14 @@ import (
 
 	"github.com/sricola/offshoot/internal/ops"
 	"github.com/sricola/offshoot/internal/session"
+	"github.com/sricola/offshoot/internal/testutil"
 )
 
 // TestAbandonedLeaseIsReclaimableAfterExpiry simulates a daemon killed without
 // shutdown: its lease is never released, but it expires and a new daemon takes
 // the branch over, fencing the dead one.
 func TestAbandonedLeaseIsReclaimableAfterExpiry(t *testing.T) {
-	if _, err := exec.LookPath("sqlite3"); err != nil {
-		t.Skip("sqlite3 CLI not on PATH")
-	}
+	testutil.RequireSQLite3(t)
 	dir := t.TempDir()
 	w, err := ops.Init(filepath.Join(dir, "store"))
 	if err != nil {

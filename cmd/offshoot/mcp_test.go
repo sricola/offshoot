@@ -7,6 +7,8 @@ import (
 	"path/filepath"
 	"strings"
 	"testing"
+
+	"github.com/sricola/offshoot/internal/testutil"
 )
 
 // TestMCPSubprocessHandshakeAndCall builds nothing: it runs `go run .` so the
@@ -15,9 +17,7 @@ import (
 // (2025-11-25) initialize handshake, and the modern (2026-07-28) stateless
 // per-request path via server/discover and a _meta-bearing tools/call.
 func TestMCPSubprocessHandshakeAndCall(t *testing.T) {
-	if _, err := exec.LookPath("sqlite3"); err != nil {
-		t.Skip("sqlite3 CLI not on PATH")
-	}
+	testutil.RequireSQLite3(t)
 	store := filepath.Join(t.TempDir(), "store")
 	if err := run([]string{"-store", store, "init"}); err != nil {
 		t.Fatal(err)

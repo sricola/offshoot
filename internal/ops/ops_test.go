@@ -18,6 +18,7 @@ import (
 	_ "github.com/mattn/go-sqlite3"
 	"github.com/sricola/offshoot/internal/store"
 	"github.com/sricola/offshoot/internal/store/storetest"
+	"github.com/sricola/offshoot/internal/testutil"
 )
 
 // captureStderr redirects os.Stderr for the duration of fn and returns
@@ -111,9 +112,7 @@ func TestCreateAndCheckout(t *testing.T) {
 }
 
 func TestCreateFromImportsWithoutTouchingSource(t *testing.T) {
-	if _, err := exec.LookPath("sqlite3"); err != nil {
-		t.Skip("sqlite3 CLI not on PATH")
-	}
+	testutil.RequireSQLite3(t)
 	src := filepath.Join(t.TempDir(), "legacy.db")
 	if out, err := exec.Command("sqlite3", src,
 		"CREATE TABLE t (v); INSERT INTO t VALUES (42);").CombinedOutput(); err != nil {
@@ -184,9 +183,7 @@ func TestParseExportTarget(t *testing.T) {
 }
 
 func TestCheckpointAndRematerialize(t *testing.T) {
-	if _, err := exec.LookPath("sqlite3"); err != nil {
-		t.Skip("sqlite3 CLI not on PATH")
-	}
+	testutil.RequireSQLite3(t)
 	w := newWS(t)
 	if err := w.Create("app"); err != nil {
 		t.Fatal(err)
@@ -229,9 +226,7 @@ func TestCheckpointAndRematerialize(t *testing.T) {
 // put at that same key must not wedge forever behind the orphan; it must
 // recover and succeed with the real (non-garbage) data.
 func TestCheckpointRecoversFromOrphanedSnapshot(t *testing.T) {
-	if _, err := exec.LookPath("sqlite3"); err != nil {
-		t.Skip("sqlite3 CLI not on PATH")
-	}
+	testutil.RequireSQLite3(t)
 	w := newWS(t)
 	if err := w.Create("app"); err != nil {
 		t.Fatal(err)
@@ -315,9 +310,7 @@ func TestCheckpointFailsCleanlyUnderLiveWriter(t *testing.T) {
 // daemon's source for offshoot_fork_mode_total{mode} — see ObserveFork's
 // doc comment.
 func TestObserveForkReportsStorageMode(t *testing.T) {
-	if _, err := exec.LookPath("sqlite3"); err != nil {
-		t.Skip("sqlite3 CLI not on PATH")
-	}
+	testutil.RequireSQLite3(t)
 	var sharedSeen []bool
 	prev := ObserveFork
 	ObserveFork = func(_ time.Duration, _, shared bool) { sharedSeen = append(sharedSeen, shared) }
@@ -358,9 +351,7 @@ func TestObserveForkReportsStorageMode(t *testing.T) {
 // resolution plus reachability GC, covered by the shared-fork tests — so
 // this test pins the materialize branch via the test hook.
 func TestForkIsIndependentOfParent(t *testing.T) {
-	if _, err := exec.LookPath("sqlite3"); err != nil {
-		t.Skip("sqlite3 CLI not on PATH")
-	}
+	testutil.RequireSQLite3(t)
 	SetForkMaterializeForTest(true)
 	t.Cleanup(func() { SetForkMaterializeForTest(false) })
 	w := newWS(t)
@@ -412,9 +403,7 @@ func TestForkIsIndependentOfParent(t *testing.T) {
 }
 
 func TestForkAtCheckpoint(t *testing.T) {
-	if _, err := exec.LookPath("sqlite3"); err != nil {
-		t.Skip("sqlite3 CLI not on PATH")
-	}
+	testutil.RequireSQLite3(t)
 	w := newWS(t)
 	w.Create("app")
 	path, _ := w.Checkout("app", "main")
@@ -444,9 +433,7 @@ func TestForkAtCheckpoint(t *testing.T) {
 // committed state and prints a warning naming the txid used. Forking right
 // after a fresh checkpoint (no drift) must stay silent.
 func TestForkWarnsOnUncheckpointedChanges(t *testing.T) {
-	if _, err := exec.LookPath("sqlite3"); err != nil {
-		t.Skip("sqlite3 CLI not on PATH")
-	}
+	testutil.RequireSQLite3(t)
 	w := newWS(t)
 	if err := w.Create("app"); err != nil {
 		t.Fatal(err)
@@ -520,9 +507,7 @@ func TestForkWarnsOnUncheckpointedChanges(t *testing.T) {
 // must warn that the checkout is stale (not silently treat it as clean) and
 // must still fork from the branch's actual (new) head.
 func TestForkWarnsOnStaleCheckout(t *testing.T) {
-	if _, err := exec.LookPath("sqlite3"); err != nil {
-		t.Skip("sqlite3 CLI not on PATH")
-	}
+	testutil.RequireSQLite3(t)
 	w := newWS(t)
 	if err := w.Create("app"); err != nil {
 		t.Fatal(err)
@@ -609,9 +594,7 @@ func TestForkWarnsOnStaleCheckout(t *testing.T) {
 }
 
 func TestRollback(t *testing.T) {
-	if _, err := exec.LookPath("sqlite3"); err != nil {
-		t.Skip("sqlite3 CLI not on PATH")
-	}
+	testutil.RequireSQLite3(t)
 	w := newWS(t)
 	w.Create("app")
 	path, _ := w.Checkout("app", "main")
@@ -653,9 +636,7 @@ func TestRollback(t *testing.T) {
 // delete the data for good). Rolling back to v2 then to v1 must both
 // succeed, with v1's content correct.
 func TestRollbackToEarlierCheckpointTwice(t *testing.T) {
-	if _, err := exec.LookPath("sqlite3"); err != nil {
-		t.Skip("sqlite3 CLI not on PATH")
-	}
+	testutil.RequireSQLite3(t)
 	w := newWS(t)
 	w.Create("app")
 	path, _ := w.Checkout("app", "main")
@@ -686,9 +667,7 @@ func TestRollbackToEarlierCheckpointTwice(t *testing.T) {
 // earlier checkpoint that rollback kept must still find its snapshot object
 // (not "not found") and must produce the correct (earlier) content.
 func TestForkAtCheckpointAfterRollback(t *testing.T) {
-	if _, err := exec.LookPath("sqlite3"); err != nil {
-		t.Skip("sqlite3 CLI not on PATH")
-	}
+	testutil.RequireSQLite3(t)
 	w := newWS(t)
 	w.Create("app")
 	path, _ := w.Checkout("app", "main")
@@ -728,9 +707,7 @@ func TestForkAtCheckpointAfterRollback(t *testing.T) {
 //     byte-identical to the SOURCE snapshot object it was copied from — not
 //     merely equivalent after a decode/re-encode round trip.
 func TestForkFastPathMatchesSlowPath(t *testing.T) {
-	if _, err := exec.LookPath("sqlite3"); err != nil {
-		t.Skip("sqlite3 CLI not on PATH")
-	}
+	testutil.RequireSQLite3(t)
 	// Since the copy-on-write shared fork landed, a plain Fork of a
 	// single-snapshot chain shares (writes no objects) instead of
 	// materializing, so this equivalence test forces the materialize branch
@@ -847,9 +824,7 @@ func TestForkFastPathMatchesSlowPath(t *testing.T) {
 // TestForkFastPathSkipsMultiMemberChains (gc_chain_test.go), so it isn't
 // duplicated again here at the ops level.
 func TestForkFastPathFiresOnS3WithinSizeLimit(t *testing.T) {
-	if _, err := exec.LookPath("sqlite3"); err != nil {
-		t.Skip("sqlite3 CLI not on PATH")
-	}
+	testutil.RequireSQLite3(t)
 	// Force the materialize branch (a plain Fork now shares) — see
 	// TestForkFastPathMatchesSlowPath's doc comment.
 	SetForkMaterializeForTest(true)
@@ -898,9 +873,7 @@ func TestForkFastPathFiresOnS3WithinSizeLimit(t *testing.T) {
 // the durable base pointer (base.json), and its ref carries the reporting
 // mirror pointing at the parent lineage and fork txid.
 func TestSharedForkWritesZeroDataObjects(t *testing.T) {
-	if _, err := exec.LookPath("sqlite3"); err != nil {
-		t.Skip("sqlite3 CLI not on PATH")
-	}
+	testutil.RequireSQLite3(t)
 	w := newWS(t)
 	if err := w.Create("app"); err != nil {
 		t.Fatal(err)
@@ -970,9 +943,7 @@ func TestSharedForkWritesZeroDataObjects(t *testing.T) {
 // exactly the parent's content at the fork point, resolved purely through
 // the base pointer (the child lineage holds no data objects at all).
 func TestSharedForkReadsResolveAtForkPoint(t *testing.T) {
-	if _, err := exec.LookPath("sqlite3"); err != nil {
-		t.Skip("sqlite3 CLI not on PATH")
-	}
+	testutil.RequireSQLite3(t)
 	w := newWS(t)
 	if err := w.Create("app"); err != nil {
 		t.Fatal(err)
@@ -1011,9 +982,7 @@ func TestSharedForkReadsResolveAtForkPoint(t *testing.T) {
 // and a force-materialized fork of the SAME point produce identical .dump
 // output. The two paths must be observationally interchangeable.
 func TestSharedForkMatchesMaterializedFork(t *testing.T) {
-	if _, err := exec.LookPath("sqlite3"); err != nil {
-		t.Skip("sqlite3 CLI not on PATH")
-	}
+	testutil.RequireSQLite3(t)
 	w := newWS(t)
 	if err := w.Create("app"); err != nil {
 		t.Fatal(err)
@@ -1085,9 +1054,7 @@ func TestSharedForkMatchesMaterializedFork(t *testing.T) {
 // stderr before silently discarding them, and the resulting file must equal
 // the branch's actual committed head, not the discarded local edit.
 func TestCheckoutQuiescesAndWarnsOnDirtyOverwrite(t *testing.T) {
-	if _, err := exec.LookPath("sqlite3"); err != nil {
-		t.Skip("sqlite3 CLI not on PATH")
-	}
+	testutil.RequireSQLite3(t)
 	w := newWS(t)
 	if err := w.Create("app"); err != nil {
 		t.Fatal(err)
@@ -1145,9 +1112,7 @@ func TestCheckoutQuiescesAndWarnsOnDirtyOverwrite(t *testing.T) {
 // promote always proceeds from the source's last committed head, and the
 // operator should be told their dirty edits weren't included.
 func TestPromoteWarnsOnUncheckpointedSourceChanges(t *testing.T) {
-	if _, err := exec.LookPath("sqlite3"); err != nil {
-		t.Skip("sqlite3 CLI not on PATH")
-	}
+	testutil.RequireSQLite3(t)
 	w := newWS(t)
 	if err := w.Create("app"); err != nil {
 		t.Fatal(err)
@@ -1205,9 +1170,7 @@ func TestPromoteWarnsOnUncheckpointedSourceChanges(t *testing.T) {
 }
 
 func TestPromote(t *testing.T) {
-	if _, err := exec.LookPath("sqlite3"); err != nil {
-		t.Skip("sqlite3 CLI not on PATH")
-	}
+	testutil.RequireSQLite3(t)
 	w := newWS(t)
 	w.Create("app")
 	path, _ := w.Checkout("app", "main")
@@ -1282,9 +1245,7 @@ func TestPromoteOntoSelfRejected(t *testing.T) {
 // repointed state is not silently lost behind a plain error: the error
 // names the partial success, and the ref itself really has moved.
 func TestRollbackReportsRepointOnRefreshFailure(t *testing.T) {
-	if _, err := exec.LookPath("sqlite3"); err != nil {
-		t.Skip("sqlite3 CLI not on PATH")
-	}
+	testutil.RequireSQLite3(t)
 	w := newWS(t)
 	if err := w.Create("app"); err != nil {
 		t.Fatal(err)
@@ -1350,9 +1311,7 @@ func TestRollbackReportsRepointOnRefreshFailure(t *testing.T) {
 }
 
 func TestConcurrentForksFromSameParent(t *testing.T) {
-	if _, err := exec.LookPath("sqlite3"); err != nil {
-		t.Skip("sqlite3 CLI not on PATH")
-	}
+	testutil.RequireSQLite3(t)
 	w := newWS(t)
 	w.Create("app")
 	path, _ := w.Checkout("app", "main")
@@ -1389,9 +1348,7 @@ func TestConcurrentForksFromSameParent(t *testing.T) {
 }
 
 func TestConcurrentCheckpointsOnlyOneWins(t *testing.T) {
-	if _, err := exec.LookPath("sqlite3"); err != nil {
-		t.Skip("sqlite3 CLI not on PATH")
-	}
+	testutil.RequireSQLite3(t)
 	w := newWS(t)
 	w.Create("app")
 	path, _ := w.Checkout("app", "main")
@@ -1451,9 +1408,7 @@ func TestConcurrentCheckpointsOnlyOneWins(t *testing.T) {
 // checkpoint wins, the ref stays internally consistent, and every recorded
 // checkpoint's snapshot object is actually present.
 func TestConcurrentCheckpointsOnlyOneWinsOnS3(t *testing.T) {
-	if _, err := exec.LookPath("sqlite3"); err != nil {
-		t.Skip("sqlite3 CLI not on PATH")
-	}
+	testutil.RequireSQLite3(t)
 	w := newWSOnFakeS3(t)
 	w.Create("app")
 	path, _ := w.Checkout("app", "main")
@@ -1586,9 +1541,7 @@ func TestCheckoutRootSeparatesDistinctEndpoints(t *testing.T) {
 }
 
 func TestCorruptSnapshotFailsClosedEndToEnd(t *testing.T) {
-	if _, err := exec.LookPath("sqlite3"); err != nil {
-		t.Skip("sqlite3 CLI not on PATH")
-	}
+	testutil.RequireSQLite3(t)
 	w := newWS(t)
 	w.Create("app")
 	r, _, _ := w.Store.GetRef("app", "main")
@@ -1602,9 +1555,7 @@ func TestCorruptSnapshotFailsClosedEndToEnd(t *testing.T) {
 }
 
 func TestMaterializeUsesCheckpointEpochNotRefEpoch(t *testing.T) {
-	if _, err := exec.LookPath("sqlite3"); err != nil {
-		t.Skip("sqlite3 CLI not on PATH")
-	}
+	testutil.RequireSQLite3(t)
 	w := newWS(t)
 	if err := w.Create("app"); err != nil {
 		t.Fatal(err)
@@ -1654,9 +1605,7 @@ func TestMaterializeUsesCheckpointEpochNotRefEpoch(t *testing.T) {
 // txid): an object that was never written. A fresh Checkout would then
 // fail "not found" even though the checkpoint just succeeded.
 func TestCheckpointAfterEpochBumpIsMaterializable(t *testing.T) {
-	if _, err := exec.LookPath("sqlite3"); err != nil {
-		t.Skip("sqlite3 CLI not on PATH")
-	}
+	testutil.RequireSQLite3(t)
 	w := newWS(t)
 	if err := w.Create("app"); err != nil {
 		t.Fatal(err)
@@ -1832,7 +1781,7 @@ func TestOpsRejectEscapingNames(t *testing.T) {
 // so a skipped re-materialization is observable as the checkout path keeping
 // the SAME inode across calls; a re-materialized one gets a fresh inode.
 func TestCheckoutSkipsRematerializeWhenCleanAndCurrent(t *testing.T) {
-	requireSQLite(t)
+	testutil.RequireSQLite3(t)
 	w := newWS(t)
 	if err := w.Create("app"); err != nil {
 		t.Fatal(err)
@@ -1937,7 +1886,7 @@ func TestCheckoutSkipsRematerializeWhenCleanAndCurrent(t *testing.T) {
 // to its zero value) — it must not be trusted as clean just because a real
 // ref's HeadEpoch is never 0.
 func TestCheckoutRematerializesOnEpochMismatchOrOldFormatSidecar(t *testing.T) {
-	requireSQLite(t)
+	testutil.RequireSQLite3(t)
 	w := newWS(t)
 	if err := w.Create("app"); err != nil {
 		t.Fatal(err)
@@ -2057,7 +2006,7 @@ func TestValidateMetaCaps(t *testing.T) {
 }
 
 func TestCheckpointStampsCreatedAtAndMeta(t *testing.T) {
-	requireSQLite(t)
+	testutil.RequireSQLite3(t)
 	w := newWS(t)
 	if err := w.Create("app"); err != nil {
 		t.Fatal(err)
@@ -2096,7 +2045,7 @@ func TestCheckpointStampsCreatedAtAndMeta(t *testing.T) {
 }
 
 func TestCheckpointRejectsMetaOverCap(t *testing.T) {
-	requireSQLite(t)
+	testutil.RequireSQLite3(t)
 	w := newWS(t)
 	if err := w.Create("app"); err != nil {
 		t.Fatal(err)
@@ -2121,7 +2070,7 @@ func TestCheckpointRejectsMetaOverCap(t *testing.T) {
 }
 
 func TestForkStampsRefMetaAndCheckpointCreatedAt(t *testing.T) {
-	requireSQLite(t)
+	testutil.RequireSQLite3(t)
 	w := newWS(t)
 	if err := w.Create("app"); err != nil {
 		t.Fatal(err)
@@ -2154,7 +2103,7 @@ func TestForkStampsRefMetaAndCheckpointCreatedAt(t *testing.T) {
 }
 
 func TestForkRejectsMetaOverCap(t *testing.T) {
-	requireSQLite(t)
+	testutil.RequireSQLite3(t)
 	w := newWS(t)
 	if err := w.Create("app"); err != nil {
 		t.Fatal(err)
@@ -2181,7 +2130,7 @@ func TestForkRejectsMetaOverCap(t *testing.T) {
 // on the floor. A rollback must relocate a checkpoint, not erase its
 // history.
 func TestRollbackPreservesCheckpointCreatedAtAndMeta(t *testing.T) {
-	requireSQLite(t)
+	testutil.RequireSQLite3(t)
 	w := newWS(t)
 	if err := w.Create("app"); err != nil {
 		t.Fatal(err)
@@ -2248,7 +2197,7 @@ func TestCreateStampsInitCheckpointCreatedAt(t *testing.T) {
 }
 
 func TestPromoteStampsCheckpointCreatedAt(t *testing.T) {
-	requireSQLite(t)
+	testutil.RequireSQLite3(t)
 	w := newWS(t)
 	if err := w.Create("app"); err != nil {
 		t.Fatal(err)

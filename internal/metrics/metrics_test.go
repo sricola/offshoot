@@ -11,6 +11,8 @@ import (
 	"sync"
 	"testing"
 	"time"
+
+	"github.com/sricola/offshoot/internal/testutil"
 )
 
 // TestCounterConcurrentIncrements exercises Counter.Add's CAS-retry loop
@@ -484,14 +486,11 @@ func buildGoldenRegistry() *Registry {
 // separate binary, not a Go import) and is not assumed present on a
 // contributor's machine, so this test SKIPS LOUDLY (not silently) if it
 // isn't on PATH — CI installs it explicitly (see .github/workflows/ci.yml's
-// metrics-lint job) so the real gate still runs there on every PR.
+// metrics-lint job, which also sets OFFSHOOT_REQUIRE_PROMTOOL=1 to turn a
+// missing binary into a hard failure there) so the real gate still runs on
+// every PR. See testutil.RequirePromtool for the full skip/fail contract.
 func TestPromtoolCheckMetrics(t *testing.T) {
-	promtool, err := exec.LookPath("promtool")
-	if err != nil {
-		t.Skip("SKIPPING: promtool not found on PATH — this test only verifies exposition-format " +
-			"compliance when promtool is installed (https://github.com/prometheus/prometheus/releases). " +
-			"CI installs it explicitly; install it locally to run this check here too.")
-	}
+	testutil.RequirePromtool(t)
 
 	r := buildGoldenRegistry()
 	var buf bytes.Buffer
@@ -499,7 +498,7 @@ func TestPromtoolCheckMetrics(t *testing.T) {
 		t.Fatal(err)
 	}
 
-	cmd := exec.Command(promtool, "check", "metrics")
+	cmd := exec.Command("promtool", "check", "metrics")
 	cmd.Stdin = &buf
 	out, err := cmd.CombinedOutput()
 	if err != nil {

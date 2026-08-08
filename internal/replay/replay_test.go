@@ -3,18 +3,16 @@ package replay
 import (
 	"database/sql"
 	"os"
-	"os/exec"
 	"path/filepath"
 	"testing"
 
 	_ "github.com/mattn/go-sqlite3"
+	"github.com/sricola/offshoot/internal/testutil"
 	"github.com/sricola/offshoot/internal/wal"
 )
 
 func TestReplayMatchesSource(t *testing.T) {
-	if _, err := exec.LookPath("sqlite3"); err != nil {
-		t.Skip("sqlite3 CLI not on PATH")
-	}
+	testutil.RequireSQLite3(t)
 	dir := t.TempDir()
 	src := filepath.Join(dir, "src.db")
 

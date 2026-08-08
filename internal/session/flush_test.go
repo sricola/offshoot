@@ -19,10 +19,11 @@ import (
 	"github.com/sricola/offshoot/internal/ltxio"
 	"github.com/sricola/offshoot/internal/ops"
 	"github.com/sricola/offshoot/internal/store"
+	"github.com/sricola/offshoot/internal/testutil"
 )
 
 func TestFlushMakesWritesDurableWithoutPausingTheWriter(t *testing.T) {
-	requireSQLite(t)
+	testutil.RequireSQLite3(t)
 	w := newWS(t)
 	if err := w.Create("app"); err != nil {
 		t.Fatal(err)
@@ -78,7 +79,7 @@ func TestFlushMakesWritesDurableWithoutPausingTheWriter(t *testing.T) {
 }
 
 func TestFlushedStateIsRecoverableByAnotherWorkspace(t *testing.T) {
-	requireSQLite(t)
+	testutil.RequireSQLite3(t)
 	w := newWS(t)
 	if err := w.Create("app"); err != nil {
 		t.Fatal(err)
@@ -118,7 +119,7 @@ func TestFlushedStateIsRecoverableByAnotherWorkspace(t *testing.T) {
 }
 
 func TestFlushAfterFencingIsRefused(t *testing.T) {
-	requireSQLite(t)
+	testutil.RequireSQLite3(t)
 	w := newWS(t)
 	if err := w.Create("app"); err != nil {
 		t.Fatal(err)
@@ -170,7 +171,7 @@ func (f failRefPutIf) PutIf(key string, data []byte, ifMatch string) (string, er
 // delete the snapshot it just uploaded. Deleting would leave a possibly-live
 // ref pointing at a missing object — silent, unrecoverable data loss.
 func TestFlushDoesNotDeleteSnapshotOnNonCASRefFailure(t *testing.T) {
-	requireSQLite(t)
+	testutil.RequireSQLite3(t)
 	w := newWS(t)
 	if err := w.Create("app"); err != nil {
 		t.Fatal(err)
@@ -219,7 +220,7 @@ func TestFlushDoesNotDeleteSnapshotOnNonCASRefFailure(t *testing.T) {
 }
 
 func TestFlushWritesASegmentThenSnapshotsOnCadence(t *testing.T) {
-	requireSQLite(t)
+	testutil.RequireSQLite3(t)
 	w := newWS(t)
 	if err := w.Create("app"); err != nil {
 		t.Fatal(err)
@@ -296,7 +297,7 @@ func TestFlushWritesASegmentThenSnapshotsOnCadence(t *testing.T) {
 }
 
 func TestSnapshotEveryOneKeepsOldBehavior(t *testing.T) {
-	requireSQLite(t)
+	testutil.RequireSQLite3(t)
 	w := newWS(t)
 	if err := w.Create("app"); err != nil {
 		t.Fatal(err)
@@ -355,7 +356,7 @@ func TestSnapshotEveryOneKeepsOldBehavior(t *testing.T) {
 // ltxio.MaterializeChain's identical skip (see the code and its comments)
 // instead.
 func TestFlushSegmentAcrossAShrinkingCommit(t *testing.T) {
-	requireSQLite(t)
+	testutil.RequireSQLite3(t)
 	w := newWS(t)
 	if err := w.Create("app"); err != nil {
 		t.Fatal(err)
@@ -464,7 +465,7 @@ func TestFlushSegmentAcrossAShrinkingCommit(t *testing.T) {
 // in case of external contention, but must never be ErrFenced or a
 // duplicated txid).
 func TestConcurrentFlushIsSerialized(t *testing.T) {
-	requireSQLite(t)
+	testutil.RequireSQLite3(t)
 	w := newWS(t)
 	if err := w.Create("app"); err != nil {
 		t.Fatal(err)
@@ -651,7 +652,7 @@ func (c *countingBackend) ListCount() int {
 // txid bump alone still isn't proof of WHAT shipped, reads the row back from
 // a fresh materialization as the actual content proof.
 func TestAutoFlushShipsWritesWithoutManualFlush(t *testing.T) {
-	requireSQLite(t)
+	testutil.RequireSQLite3(t)
 	w := newWS(t)
 	if err := w.Create("app"); err != nil {
 		t.Fatal(err)
@@ -751,7 +752,7 @@ func (f *failNRefPutIf) PutIf(key string, data []byte, ifMatch string) (string, 
 // session (Err() stays nil, the checkout stays usable), and once the backend
 // heals a later tick clears LastFlushErr again.
 func TestAutoFlushFailureSurfacesAndRecovers(t *testing.T) {
-	requireSQLite(t)
+	testutil.RequireSQLite3(t)
 	w := newWS(t)
 	if err := w.Create("app"); err != nil {
 		t.Fatal(err)
@@ -807,7 +808,7 @@ func TestAutoFlushFailureSurfacesAndRecovers(t *testing.T) {
 // logs "flush-failed kind=auto error=...", and the later tick that recovers
 // once the backend heals logs "flushed kind=auto txid=...".
 func TestAutoFlushTransitionLogsRecordKindAutoAndFailure(t *testing.T) {
-	requireSQLite(t)
+	testutil.RequireSQLite3(t)
 	w := newWS(t)
 	if err := w.Create("app"); err != nil {
 		t.Fatal(err)
@@ -870,7 +871,7 @@ func TestAutoFlushTransitionLogsRecordKindAutoAndFailure(t *testing.T) {
 // only after the session is provably caught up isolates exactly the
 // idle-tick behavior this test exists to pin.
 func TestIdleAutoFlushWritesNothing(t *testing.T) {
-	requireSQLite(t)
+	testutil.RequireSQLite3(t)
 	w := newWS(t)
 	if err := w.Create("app"); err != nil {
 		t.Fatal(err)
@@ -919,7 +920,7 @@ func TestIdleAutoFlushWritesNothing(t *testing.T) {
 // the ref still advances within a few ticks: the rebaseGen half of
 // flushLoop's pending check must catch what the appliedGen half cannot.
 func TestFlushLoopFlushesRebaseFoldedContentWhenOtherwiseIdle(t *testing.T) {
-	requireSQLite(t)
+	testutil.RequireSQLite3(t)
 	w := newWS(t)
 	if err := w.Create("app"); err != nil {
 		t.Fatal(err)
@@ -980,7 +981,7 @@ func TestFlushLoopFlushesRebaseFoldedContentWhenOtherwiseIdle(t *testing.T) {
 // actually ships it. Uses FlushUploadHook, FlushEncodeHook's sibling, to
 // pause a real auto-flush exactly inside that window.
 func TestFlushLoopRetriesAfterRebaseDuringUpload(t *testing.T) {
-	requireSQLite(t)
+	testutil.RequireSQLite3(t)
 	w := newWS(t)
 	if err := w.Create("app"); err != nil {
 		t.Fatal(err)
@@ -1150,7 +1151,7 @@ func TestFlushLoopRetriesAfterRebaseDuringUpload(t *testing.T) {
 // asserting zero writes from the moment Open returns, not just after the
 // session has already settled.
 func TestReadOnlySessionWithCleanCheckoutMakesNoStoreWrites(t *testing.T) {
-	requireSQLite(t)
+	testutil.RequireSQLite3(t)
 	w := newWS(t)
 	if err := w.Create("app"); err != nil {
 		t.Fatal(err)
@@ -1245,7 +1246,7 @@ func TestReadOnlySessionWithCleanCheckoutMakesNoStoreWrites(t *testing.T) {
 // prior shutdown can leave behind — must NOT be treated as clean-at-open,
 // and the settling flush must still happen, same as before this change.
 func TestSettleStillHappensWhenCheckoutWasStaleAtOpen(t *testing.T) {
-	requireSQLite(t)
+	testutil.RequireSQLite3(t)
 	w := newWS(t)
 	if err := w.Create("app"); err != nil {
 		t.Fatal(err)
@@ -1290,7 +1291,7 @@ func TestSettleStillHappensWhenCheckoutWasStaleAtOpen(t *testing.T) {
 // headPostApplyValid must be false and the settle must proceed exactly as
 // it always did before this suppression existed.
 func TestSettleStillHappensWithOldFormatSidecarLackingChecksum(t *testing.T) {
-	requireSQLite(t)
+	testutil.RequireSQLite3(t)
 	w := newWS(t)
 	if err := w.Create("app"); err != nil {
 		t.Fatal(err)
@@ -1377,7 +1378,7 @@ func TestSettleStillHappensWithOldFormatSidecarLackingChecksum(t *testing.T) {
 // out — the rewound "first" rebase is suppressed again regardless of its
 // content, and the settle this test waits for never happens.
 func TestSettlingSuppressionCatchesRaceWindowFold(t *testing.T) {
-	requireSQLite(t)
+	testutil.RequireSQLite3(t)
 	w := newWS(t)
 	if err := w.Create("app"); err != nil {
 		t.Fatal(err)
@@ -1470,7 +1471,7 @@ func TestSettlingSuppressionCatchesRaceWindowFold(t *testing.T) {
 // flush.go's updated comment on the snapshot-vs-segment decision). The
 // chain must still resolve correctly end to end.
 func TestCleanAtOpenSessionsFirstRealFlushIsASegment(t *testing.T) {
-	requireSQLite(t)
+	testutil.RequireSQLite3(t)
 	w := newWS(t)
 	if err := w.Create("app"); err != nil {
 		t.Fatal(err)
@@ -1539,7 +1540,7 @@ func TestCleanAtOpenSessionsFirstRealFlushIsASegment(t *testing.T) {
 // a real session's Close rather than only ops.Checkout/Checkpoint's own
 // in-line refresh.
 func TestCloseRefreshesSidecarSoReopenCleanSkips(t *testing.T) {
-	requireSQLite(t)
+	testutil.RequireSQLite3(t)
 	w := newWS(t)
 	if err := w.Create("app"); err != nil {
 		t.Fatal(err)
@@ -1595,7 +1596,7 @@ func TestCloseRefreshesSidecarSoReopenCleanSkips(t *testing.T) {
 // Task 1), only in reach: it now also persists across an ordinary session's
 // clean Close, not just those four ops entry points.
 func TestCleanCheckoutServedWithoutChainValidationAcrossClose(t *testing.T) {
-	requireSQLite(t)
+	testutil.RequireSQLite3(t)
 	w := newWS(t)
 	if err := w.Create("app"); err != nil {
 		t.Fatal(err)
@@ -1662,7 +1663,7 @@ func TestCleanCheckoutServedWithoutChainValidationAcrossClose(t *testing.T) {
 // later Checkout must still see this checkout as needing re-materialization,
 // not incorrectly treat the unflushed write as durable.
 func TestCloseAfterFailedFlushDoesNotStampSidecar(t *testing.T) {
-	requireSQLite(t)
+	testutil.RequireSQLite3(t)
 	w := newWS(t)
 	if err := w.Create("app"); err != nil {
 		t.Fatal(err)
@@ -1732,7 +1733,7 @@ func TestCloseAfterFailedFlushDoesNotStampSidecar(t *testing.T) {
 // must then NOT stamp the sidecar, even though everything the session
 // itself was ever asked to flush WAS successfully flushed.
 func TestCloseDoesNotStampSidecarAfterUnverifiedShutdown(t *testing.T) {
-	requireSQLite(t)
+	testutil.RequireSQLite3(t)
 	w := newWS(t)
 	if err := w.Create("app"); err != nil {
 		t.Fatal(err)
@@ -1788,7 +1789,7 @@ func TestCloseDoesNotStampSidecarAfterUnverifiedShutdown(t *testing.T) {
 // Checkout would silently clean-skip instead of re-materializing the real
 // (rebase-folded) content.
 func TestSidecarNotStampedAfterMidSessionRebase(t *testing.T) {
-	requireSQLite(t)
+	testutil.RequireSQLite3(t)
 	w := newWS(t)
 	if err := w.Create("app"); err != nil {
 		t.Fatal(err)
@@ -1846,7 +1847,7 @@ func TestSidecarNotStampedAfterMidSessionRebase(t *testing.T) {
 // server.opFlush's doc comment for why there is no separate daemon
 // "checkpoint" op), so it needs the identical meta/CreatedAt behavior.
 func TestNamedFlushStampsCheckpointMetaAndCreatedAt(t *testing.T) {
-	requireSQLite(t)
+	testutil.RequireSQLite3(t)
 	w := newWS(t)
 	if err := w.Create("app"); err != nil {
 		t.Fatal(err)
@@ -1887,7 +1888,7 @@ func TestNamedFlushStampsCheckpointMetaAndCreatedAt(t *testing.T) {
 // attach to" rule: an unnamed (auto or manual) flush creates no checkpoint,
 // so metadata passed alongside one would otherwise be silently dropped.
 func TestFlushRejectsMetaWithoutAName(t *testing.T) {
-	requireSQLite(t)
+	testutil.RequireSQLite3(t)
 	w := newWS(t)
 	if err := w.Create("app"); err != nil {
 		t.Fatal(err)
@@ -1906,7 +1907,7 @@ func TestFlushRejectsMetaWithoutAName(t *testing.T) {
 // TestFlushRejectsMetaOverCap mirrors ops.TestCheckpointRejectsMetaOverCap
 // for the live-session path.
 func TestFlushRejectsMetaOverCap(t *testing.T) {
-	requireSQLite(t)
+	testutil.RequireSQLite3(t)
 	w := newWS(t)
 	if err := w.Create("app"); err != nil {
 		t.Fatal(err)

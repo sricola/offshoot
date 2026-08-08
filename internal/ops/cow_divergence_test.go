@@ -14,6 +14,7 @@ import (
 
 	"github.com/sricola/offshoot/internal/session"
 	"github.com/sricola/offshoot/internal/store"
+	"github.com/sricola/offshoot/internal/testutil"
 )
 
 // flushInserts runs n rounds of (INSERT one row via the sqlite3 CLI, then
@@ -55,9 +56,7 @@ func flushInserts(t *testing.T, s *session.Session, n int, val string) {
 // exceed, REGARDLESS of how many levels deep the spine grows — which is
 // exactly what makes 40 levels a falsifying probe rather than a tautology.
 func TestDeepForkChainStaysBounded(t *testing.T) {
-	if _, err := exec.LookPath("sqlite3"); err != nil {
-		t.Skip("sqlite3 CLI not on PATH")
-	}
+	testutil.RequireSQLite3(t)
 	const (
 		levels        = 40
 		snapshotEvery = 4
@@ -187,9 +186,7 @@ func TestDeepForkChainStaysBounded(t *testing.T) {
 // OWN lineage at a txid above the fork point, and a read above that snapshot
 // must resolve wholly in-child — no parent-lineage members in the chain.
 func TestSharedChildSelfSnapshotsPastCadence(t *testing.T) {
-	if _, err := exec.LookPath("sqlite3"); err != nil {
-		t.Skip("sqlite3 CLI not on PATH")
-	}
+	testutil.RequireSQLite3(t)
 	w := newWS(t)
 	if err := w.Create("app"); err != nil {
 		t.Fatal(err)
@@ -294,9 +291,7 @@ func TestSharedChildSelfSnapshotsPastCadence(t *testing.T) {
 // run, so the bound holds across session restarts exactly as within one
 // session.
 func TestSharedChildShortSessionsStayBounded(t *testing.T) {
-	if _, err := exec.LookPath("sqlite3"); err != nil {
-		t.Skip("sqlite3 CLI not on PATH")
-	}
+	testutil.RequireSQLite3(t)
 	const snapshotEvery = 4
 	w := newWS(t)
 	if err := w.Create("app"); err != nil {
@@ -403,9 +398,7 @@ func TestSharedChildShortSessionsStayBounded(t *testing.T) {
 // directions. A resolution bug that served the parent's post-fork bytes to
 // the child (or vice versa) fails here even if every chain stays bounded.
 func TestSharedForkDivergenceIsolation(t *testing.T) {
-	if _, err := exec.LookPath("sqlite3"); err != nil {
-		t.Skip("sqlite3 CLI not on PATH")
-	}
+	testutil.RequireSQLite3(t)
 	w := newWS(t)
 	if err := w.Create("app"); err != nil {
 		t.Fatal(err)

@@ -4,16 +4,9 @@ import (
 	"os/exec"
 	"testing"
 	"time"
-)
 
-// requireSQLite skips the test when the sqlite3 CLI isn't on PATH, matching
-// the skip pattern used throughout this package (see gc_chain_test.go).
-func requireSQLite(t *testing.T) {
-	t.Helper()
-	if _, err := exec.LookPath("sqlite3"); err != nil {
-		t.Skip("sqlite3 CLI not on PATH")
-	}
-}
+	"github.com/sricola/offshoot/internal/testutil"
+)
 
 // mustExecSQL runs sql against the sqlite3 CLI on path, failing the test with
 // combined output on error.
@@ -87,7 +80,7 @@ func TestForkRejectsNegativeTTL(t *testing.T) {
 }
 
 func TestDurableWritesStampTheClock(t *testing.T) {
-	requireSQLite(t)
+	testutil.RequireSQLite3(t)
 	w := newWS(t)
 	if err := w.Create("app"); err != nil {
 		t.Fatal(err)

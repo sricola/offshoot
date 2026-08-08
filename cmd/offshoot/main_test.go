@@ -12,6 +12,7 @@ import (
 	"time"
 
 	"github.com/sricola/offshoot/internal/daemon"
+	"github.com/sricola/offshoot/internal/testutil"
 )
 
 // call runs the CLI's run() with -store pointing at dir, capturing stdout.
@@ -104,9 +105,7 @@ func TestVersionRejectsArgs(t *testing.T) {
 }
 
 func TestQuickstartTranscript(t *testing.T) {
-	if _, err := exec.LookPath("sqlite3"); err != nil {
-		t.Skip("sqlite3 CLI not on PATH")
-	}
+	testutil.RequireSQLite3(t)
 	store := filepath.Join(t.TempDir(), "s")
 	call(t, store, "init")
 	call(t, store, "create", "app")
@@ -488,9 +487,7 @@ func TestMCPDefaultTTLDefaultsTo24h(t *testing.T) {
 // daemon's default socket and mask this bug), then confirm the matching
 // -socket makes them agree.
 func TestSessionHonorsServeSocketOverride(t *testing.T) {
-	if _, err := exec.LookPath("sqlite3"); err != nil {
-		t.Skip("sqlite3 CLI not on PATH")
-	}
+	testutil.RequireSQLite3(t)
 	store := filepath.Join(t.TempDir(), "s")
 	if err := run([]string{"-store", store, "init"}); err != nil {
 		t.Fatal(err)

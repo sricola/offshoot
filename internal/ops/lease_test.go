@@ -8,6 +8,7 @@ import (
 	"time"
 
 	"github.com/sricola/offshoot/internal/store"
+	"github.com/sricola/offshoot/internal/testutil"
 )
 
 func TestWorkspaceLeaseLifecycle(t *testing.T) {
@@ -251,9 +252,7 @@ func TestRepointClearsLease(t *testing.T) {
 }
 
 func TestFencedHolderLeaseOpsFailAfterReclaim(t *testing.T) {
-	if _, err := exec.LookPath("sqlite3"); err != nil {
-		t.Skip("sqlite3 CLI not on PATH")
-	}
+	testutil.RequireSQLite3(t)
 	w := newWS(t)
 	if err := w.Create("app"); err != nil {
 		t.Fatal(err)

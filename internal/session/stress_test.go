@@ -13,6 +13,7 @@ import (
 	_ "github.com/mattn/go-sqlite3"
 	"github.com/sricola/offshoot/internal/ltxio"
 	"github.com/sricola/offshoot/internal/store"
+	"github.com/sricola/offshoot/internal/testutil"
 )
 
 // TestFlushesUnderContinuousWritesAreConsistent runs an agent writing in a
@@ -29,7 +30,7 @@ import (
 // this test focused on what it actually exists to catch (a torn or dropped
 // write under load), independent of the cadence feature.
 func TestFlushesUnderContinuousWritesAreConsistent(t *testing.T) {
-	requireSQLite(t)
+	testutil.RequireSQLite3(t)
 	w := newWS(t)
 	if err := w.Create("app"); err != nil {
 		t.Fatal(err)
@@ -162,7 +163,7 @@ func bytesReader(b []byte) *bytes.Reader { return bytes.NewReader(b) }
 // only decoder) to isolate DrainNow's contract from chain-resolution
 // concerns, which are exercised elsewhere.
 func TestFlushIncludesEverythingCommittedBeforeIt(t *testing.T) {
-	requireSQLite(t)
+	testutil.RequireSQLite3(t)
 	w := newWS(t)
 	if err := w.Create("app"); err != nil {
 		t.Fatal(err)

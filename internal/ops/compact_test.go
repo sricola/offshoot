@@ -10,6 +10,7 @@ import (
 	"time"
 
 	"github.com/sricola/offshoot/internal/store"
+	"github.com/sricola/offshoot/internal/testutil"
 )
 
 // dataKeys lists every object key under data/ (all lineages), sorted, so a
@@ -213,9 +214,7 @@ func TestPromoteAndRollbackClearStaleBaseMirror(t *testing.T) {
 // mirror) is authoritative for this destructive op even if some future
 // code path leaves a stale mirror behind.
 func TestCompactNoOpAfterRollbackPreservesCheckpoints(t *testing.T) {
-	if _, err := exec.LookPath("sqlite3"); err != nil {
-		t.Skip("sqlite3 CLI not on PATH")
-	}
+	testutil.RequireSQLite3(t)
 	w := newWS(t)
 	if err := w.Create("app"); err != nil {
 		t.Fatal(err)

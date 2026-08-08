@@ -5,13 +5,15 @@ import (
 	"os/exec"
 	"path/filepath"
 	"testing"
+
+	"github.com/sricola/offshoot/internal/testutil"
 )
 
 // --- TableRowCounts / DiffSummary: pure functions over plain SQLite files,
 // no Workspace needed ---
 
 func TestTableRowCountsCountsEveryOrdinaryTableExcludingSqliteInternal(t *testing.T) {
-	requireSQLite3(t)
+	testutil.RequireSQLite3(t)
 	path := filepath.Join(t.TempDir(), "x.db")
 	if out, err := exec.Command("sqlite3", path,
 		"CREATE TABLE a (v); INSERT INTO a VALUES (1),(2),(3);"+
@@ -40,7 +42,7 @@ func TestTableRowCountsCountsEveryOrdinaryTableExcludingSqliteInternal(t *testin
 }
 
 func TestTableRowCountsOpensReadOnlyEvenOnA0444File(t *testing.T) {
-	requireSQLite3(t)
+	testutil.RequireSQLite3(t)
 	path := filepath.Join(t.TempDir(), "x.db")
 	if out, err := exec.Command("sqlite3", path, "CREATE TABLE t (v);").CombinedOutput(); err != nil {
 		t.Fatalf("%v: %s", err, out)
@@ -54,7 +56,7 @@ func TestTableRowCountsOpensReadOnlyEvenOnA0444File(t *testing.T) {
 }
 
 func TestDiffSummaryReportsAddedRemovedAndChangedTables(t *testing.T) {
-	requireSQLite3(t)
+	testutil.RequireSQLite3(t)
 	left := filepath.Join(t.TempDir(), "left.db")
 	right := filepath.Join(t.TempDir(), "right.db")
 
@@ -111,7 +113,7 @@ func TestDiffSummaryReportsAddedRemovedAndChangedTables(t *testing.T) {
 }
 
 func TestDiffSummaryAcrossTwoEntirelyDifferentDatabasesIsLegit(t *testing.T) {
-	requireSQLite3(t)
+	testutil.RequireSQLite3(t)
 	a := filepath.Join(t.TempDir(), "a.db")
 	b := filepath.Join(t.TempDir(), "b.db")
 	exec.Command("sqlite3", a, "CREATE TABLE only_a (v); INSERT INTO only_a VALUES (1);").Run()
@@ -130,7 +132,7 @@ func TestDiffSummaryAcrossTwoEntirelyDifferentDatabasesIsLegit(t *testing.T) {
 // private, always-fresh export ---
 
 func TestMaterializeForDiffCheckpointSideUsesTheReadOnlyCache(t *testing.T) {
-	requireSQLite3(t)
+	testutil.RequireSQLite3(t)
 	w := newWS(t)
 	if err := w.Create("app"); err != nil {
 		t.Fatal(err)
@@ -175,7 +177,7 @@ func TestMaterializeForDiffCheckpointSideUsesTheReadOnlyCache(t *testing.T) {
 // made between two diff calls MUST be visible in the second one — nothing
 // about it is ever served from a stale cache.
 func TestMaterializeForDiffHeadSideAlwaysReflectsANewWrite(t *testing.T) {
-	requireSQLite3(t)
+	testutil.RequireSQLite3(t)
 	w := newWS(t)
 	if err := w.Create("app"); err != nil {
 		t.Fatal(err)

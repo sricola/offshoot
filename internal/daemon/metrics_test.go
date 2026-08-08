@@ -9,6 +9,7 @@ import (
 	"time"
 
 	"github.com/sricola/offshoot/internal/store"
+	"github.com/sricola/offshoot/internal/testutil"
 )
 
 // TestMetricsSmokeOpenWriteFlushFork is Milestone 4 Task 2's instrumentation
@@ -229,19 +230,16 @@ func TestJanitorTickCountsGCError(t *testing.T) {
 	}
 }
 
-// TestPromtoolCheckRealMetrics runs promtool (skip-if-absent, loud skip
-// message — see internal/metrics's identical test for the rationale) against
+// TestPromtoolCheckRealMetrics runs promtool (skip-if-absent locally, a
+// hard failure under ci.yml's metrics-lint job — see testutil.RequirePromtool
+// and internal/metrics's identical test for the rationale) against
 // THIS daemon's real, fully-wired registry after a bit of activity, rather
 // than the generic shape internal/metrics/metrics_test.go already checks —
 // this is the "the endpoint output" half of PM Amendment 7's gate: proving
 // the locked metric list, as actually registered by production wiring, is
 // promtool-compliant, not just the format primitives in isolation.
 func TestPromtoolCheckRealMetrics(t *testing.T) {
-	promtool, err := exec.LookPath("promtool")
-	if err != nil {
-		t.Skip("SKIPPING: promtool not found on PATH — install from " +
-			"https://github.com/prometheus/prometheus/releases to run this locally; CI installs it explicitly.")
-	}
+	testutil.RequirePromtool(t)
 
 	srv, _ := newServer(t)
 	srv.janitorTick(time.Hour) // populate the janitor-sourced metrics too
@@ -251,7 +249,7 @@ func TestPromtoolCheckRealMetrics(t *testing.T) {
 		t.Fatal(err)
 	}
 
-	cmd := exec.Command(promtool, "check", "metrics")
+	cmd := exec.Command("promtool", "check", "metrics")
 	cmd.Stdin = &buf
 	out, err := cmd.CombinedOutput()
 	if err != nil {

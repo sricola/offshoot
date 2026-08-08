@@ -12,6 +12,7 @@ import (
 	"time"
 
 	"github.com/sricola/offshoot/internal/replay"
+	"github.com/sricola/offshoot/internal/testutil"
 	"github.com/sricola/offshoot/internal/wal"
 )
 
@@ -28,9 +29,7 @@ func (s tortureSink) Rebase(p string) error                { return s.r.Rebase(p
 func (s tortureSink) Apply(ps uint32, f []wal.Frame) error { return s.r.Apply(ps, f) }
 
 func TestTortureWriterKill(t *testing.T) {
-	if _, err := exec.LookPath("sqlite3"); err != nil {
-		t.Skip("sqlite3 CLI not on PATH")
-	}
+	testutil.RequireSQLite3(t)
 	dir := t.TempDir()
 	src := filepath.Join(dir, "src.db")
 	if out, err := exec.Command("sqlite3", src,

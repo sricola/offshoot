@@ -9,10 +9,11 @@ import (
 
 	"github.com/sricola/offshoot/internal/ops"
 	"github.com/sricola/offshoot/internal/store"
+	"github.com/sricola/offshoot/internal/testutil"
 )
 
 func TestRenewKeepsLeaseAliveBeyondTTL(t *testing.T) {
-	requireSQLite(t)
+	testutil.RequireSQLite3(t)
 	w := newWS(t)
 	if err := w.Create("app"); err != nil {
 		t.Fatal(err)
@@ -47,7 +48,7 @@ func TestRenewKeepsLeaseAliveBeyondTTL(t *testing.T) {
 }
 
 func TestRenewalDetectsFencingAndEndsSession(t *testing.T) {
-	requireSQLite(t)
+	testutil.RequireSQLite3(t)
 	w := newWS(t)
 	if err := w.Create("app"); err != nil {
 		t.Fatal(err)
@@ -101,7 +102,7 @@ func TestRenewalDetectsFencingAndEndsSession(t *testing.T) {
 // these parameters — see the task-3 report for the pre-fix run this test
 // was validated against).
 func TestCloseDoesNotMarkSessionFenced(t *testing.T) {
-	requireSQLite(t)
+	testutil.RequireSQLite3(t)
 	w := newWS(t)
 	if err := w.Create("app"); err != nil {
 		t.Fatal(err)
@@ -129,7 +130,7 @@ func TestCloseDoesNotMarkSessionFenced(t *testing.T) {
 // ref RenewLease's own GetRef depends on) ends the session instead of
 // spinning the renewal loop forever on a branch that can never come back.
 func TestRenewalEndsWhenBranchDestroyed(t *testing.T) {
-	requireSQLite(t)
+	testutil.RequireSQLite3(t)
 	w := newWS(t)
 	if err := w.Create("app"); err != nil {
 		t.Fatal(err)
