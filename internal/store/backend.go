@@ -48,3 +48,19 @@ type Backend interface {
 	// Get) before calling CopyObject.
 	CopyObject(dst, src string) error
 }
+
+// BatchDeleter is an optional Backend capability: delete many keys in as few
+// round trips as the backend allows (S3: the DeleteObjects API, 1000 keys
+// per request — perf audit H2; Local: a plain loop, no RPC to save but the
+// same contract so callers stay uniform). It is deliberately NOT part of
+// Backend itself: test wrappers and future backends keep working unchanged,
+// and callers (ops' GC sweep) type-assert and fall back to per-key Delete.
+//
+// DeleteObjects returns the keys it SUCCESSFULLY deleted — so a caller
+// pruning per-key state (GC tombstones) prunes exactly those — plus an
+// error describing any failures. A key that did not exist counts as
+// successfully deleted (idempotent), matching Delete. Empty input is a
+// no-op: (nil, nil).
+type BatchDeleter interface {
+	DeleteObjects(keys []string) (deleted []string, err error)
+}

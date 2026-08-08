@@ -107,6 +107,42 @@ func TestLocalListAndDelete(t *testing.T) {
 	}
 }
 
+// TestLocalDeleteObjects pins Local's BatchDeleter capability as an exact
+// stand-in for a per-key Delete loop: every key it reports deleted is gone,
+// a key that never existed still counts as deleted (matching Delete's
+// os.Remove-IsNotExist-is-success idempotency), and empty input is (nil, nil).
+func TestLocalDeleteObjects(t *testing.T) {
+	b, _ := NewLocal(t.TempDir())
+	var _ BatchDeleter = b // Local must implement the optional capability
+
+	if deleted, err := b.DeleteObjects(nil); deleted != nil || err != nil {
+		t.Fatalf("empty input must be (nil, nil), got (%v, %v)", deleted, err)
+	}
+
+	keys := []string{"data/l1/a", "data/l1/b", "data/l2/c"}
+	for _, k := range keys {
+		if err := b.Put(k, []byte("x")); err != nil {
+			t.Fatal(err)
+		}
+	}
+	req := append(append([]string(nil), keys...), "data/l1/never-existed")
+	deleted, err := b.DeleteObjects(req)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(deleted) != len(req) {
+		t.Fatalf("deleted %d keys, want %d (absent key counts as deleted)", len(deleted), len(req))
+	}
+	for i, k := range req {
+		if deleted[i] != k {
+			t.Fatalf("deleted[%d] = %s, want %s", i, deleted[i], k)
+		}
+	}
+	if left, _ := b.List("data/"); len(left) != 0 {
+		t.Fatalf("objects left after batch delete: %v", left)
+	}
+}
+
 // TestLocalDeleteIfConditionalDelete pins Local.DeleteIf as a TRUE
 // compare-and-delete (Milestone 4 Task 6b), the local-backend half of
 // ConditionalDeleter: a matching etag deletes, a stale etag or an absent key

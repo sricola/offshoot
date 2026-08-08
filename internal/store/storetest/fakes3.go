@@ -35,6 +35,12 @@ type FakeS3 struct {
 	// never the real bytes, so a small stored object with a lied-about size
 	// drives the same code path a real oversized object would.
 	sizeOverrides map[string]int64
+
+	// batchDeleteErrs marks keys the batch DeleteObjects handler reports a
+	// per-key <Error> for instead of deleting — the partial-failure shape
+	// real S3 uses (a 200 response carrying Error entries), which
+	// store.S3.DeleteObjects must map to "not in deleted, named in err".
+	batchDeleteErrs map[string]bool
 }
 
 func NewFakeS3(t *testing.T) *FakeS3 {
@@ -72,6 +78,29 @@ func (f *FakeS3) SetSizeOverride(key string, size int64) {
 		f.sizeOverrides = map[string]int64{}
 	}
 	f.sizeOverrides[key] = size
+}
+
+// SetBatchDeleteError makes the batch DeleteObjects handler report a
+// per-key <Error> for key (in a 200 response, real S3's partial-failure
+// shape) instead of deleting it. See the batchDeleteErrs field.
+func (f *FakeS3) SetBatchDeleteError(key string) {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	if f.batchDeleteErrs == nil {
+		f.batchDeleteErrs = map[string]bool{}
+	}
+	f.batchDeleteErrs[key] = true
+}
+
+// Seed stores data at key directly, bypassing HTTP. Exists so a test that
+// needs thousands of objects in place (the DeleteObjects chunking test)
+// doesn't pay thousands of signed SDK Puts just to arrange its fixture.
+func (f *FakeS3) Seed(key string, data []byte) {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	cp := make([]byte, len(data))
+	copy(cp, data)
+	f.objs[key] = cp
 }
 
 func etagOf(b []byte) string {
@@ -169,6 +198,16 @@ func (f *FakeS3) handle(w http.ResponseWriter, r *http.Request) {
 		delete(f.objs, key)
 		w.WriteHeader(http.StatusNoContent)
 
+	case http.MethodPost:
+		// Batch delete: POST /{bucket}?delete with an XML key manifest —
+		// what store.S3.DeleteObjects issues (perf audit H2). No other POST
+		// operation is faked.
+		if _, ok := r.URL.Query()["delete"]; ok && key == "" {
+			f.deleteObjects(w, r)
+			return
+		}
+		w.WriteHeader(http.StatusMethodNotAllowed)
+
 	case http.MethodHead:
 		data, ok := f.objs[key]
 		if !ok {
@@ -247,6 +286,71 @@ func decodeCopySource(v string) (string, error) {
 		return "", err
 	}
 	return dec, nil
+}
+
+// deleteObjectsRequest mirrors the S3 DeleteObjects request body:
+// <Delete><Object><Key>k</Key></Object>...</Delete>.
+type deleteObjectsRequest struct {
+	XMLName xml.Name `xml:"Delete"`
+	Objects []struct {
+		Key string `xml:"Key"`
+	} `xml:"Object"`
+	Quiet bool `xml:"Quiet"`
+}
+
+// deleteObjectsResult mirrors the DeleteObjects response:
+// <DeleteResult><Deleted><Key>k</Key></Deleted><Error>...</Error>...</DeleteResult>.
+type deleteObjectsResult struct {
+	XMLName xml.Name             `xml:"DeleteResult"`
+	Deleted []deleteObjectsKey   `xml:"Deleted"`
+	Errors  []deleteObjectsError `xml:"Error"`
+}
+
+type deleteObjectsKey struct {
+	Key string `xml:"Key"`
+}
+
+type deleteObjectsError struct {
+	Key     string `xml:"Key"`
+	Code    string `xml:"Code"`
+	Message string `xml:"Message"`
+}
+
+// deleteObjects serves the batch DeleteObjects API (POST ?delete). Real S3
+// semantics this fake reproduces because store.S3.DeleteObjects depends on
+// them: at most 1000 keys per request (over-limit is a MalformedXML 400 —
+// enforcing it here is what makes a chunking test against this fake
+// honest), an absent key still counts as Deleted (idempotent), and per-key
+// failures come back as <Error> entries in a 200 response, not an HTTP
+// error. batchDeleteErrs (SetBatchDeleteError) drives that last case.
+func (f *FakeS3) deleteObjects(w http.ResponseWriter, r *http.Request) {
+	body, err := io.ReadAll(r.Body)
+	if err != nil {
+		w.WriteHeader(http.StatusBadRequest)
+		return
+	}
+	var req deleteObjectsRequest
+	if xml.Unmarshal(body, &req) != nil || len(req.Objects) > 1000 {
+		w.Header().Set("Content-Type", "application/xml")
+		w.WriteHeader(http.StatusBadRequest)
+		io.WriteString(w, `<Error><Code>MalformedXML</Code></Error>`)
+		return
+	}
+	var res deleteObjectsResult
+	for _, o := range req.Objects {
+		if f.batchDeleteErrs[o.Key] {
+			res.Errors = append(res.Errors, deleteObjectsError{
+				Key: o.Key, Code: "InternalError", Message: "injected by SetBatchDeleteError",
+			})
+			continue
+		}
+		delete(f.objs, o.Key)
+		if !req.Quiet {
+			res.Deleted = append(res.Deleted, deleteObjectsKey{Key: o.Key})
+		}
+	}
+	w.Header().Set("Content-Type", "application/xml")
+	xml.NewEncoder(w).Encode(res)
 }
 
 type listResult struct {

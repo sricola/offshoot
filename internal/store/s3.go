@@ -14,6 +14,7 @@ import (
 	"github.com/aws/aws-sdk-go-v2/aws"
 	awsconfig "github.com/aws/aws-sdk-go-v2/config"
 	"github.com/aws/aws-sdk-go-v2/service/s3"
+	"github.com/aws/aws-sdk-go-v2/service/s3/types"
 	"github.com/aws/smithy-go"
 	smithyhttp "github.com/aws/smithy-go/transport/http"
 )
@@ -333,4 +334,77 @@ func (s *S3) Delete(key string) error {
 		return fmt.Errorf("store: s3 delete %s: %w", key, err)
 	}
 	return nil
+}
+
+// s3DeleteObjectsMaxKeys is the S3 DeleteObjects API's hard per-request
+// limit on the number of keys.
+const s3DeleteObjectsMaxKeys = 1000
+
+// DeleteObjects implements store.BatchDeleter: keys are chunked into
+// batches of at most 1000 (the API's limit) and each batch is one
+// DeleteObjects round trip — 80k objects cost ~80 RPCs instead of 80k
+// serial DeleteObject calls (perf audit H2). Batches are issued
+// sequentially; that already collapses the sweep's wall time by three
+// orders of magnitude, and issuing them concurrently would need a rate/
+// error story S3's 503-slowdown behavior makes nontrivial, so concurrency
+// is deliberately left for later.
+//
+// Per the interface contract it returns the keys (in the caller's
+// un-prefixed form) that were actually deleted, plus an error naming any
+// keys the API reported per-key Errors for. A key that did not exist counts
+// as deleted (S3's DeleteObjects reports absent keys under Deleted), same
+// as Delete. A transport-level batch failure returns the keys deleted by
+// the batches that DID complete plus the error.
+func (s *S3) DeleteObjects(keys []string) (deleted []string, err error) {
+	if len(keys) == 0 {
+		return nil, nil
+	}
+	// Validate every key up front so an invalid key fails the call before
+	// any RPC, instead of surfacing mid-sweep with half the work done.
+	orig := make(map[string]string, len(keys)) // bucket key -> caller's key
+	full := make([]string, len(keys))
+	for i, k := range keys {
+		fk, ferr := s.full(k)
+		if ferr != nil {
+			return nil, ferr
+		}
+		full[i] = fk
+		orig[fk] = k
+	}
+	var failed []string
+	for start := 0; start < len(full); start += s3DeleteObjectsMaxKeys {
+		end := min(start+s3DeleteObjectsMaxKeys, len(full))
+		ids := make([]types.ObjectIdentifier, 0, end-start)
+		for _, fk := range full[start:end] {
+			ids = append(ids, types.ObjectIdentifier{Key: aws.String(fk)})
+		}
+		out, cerr := s.cl.DeleteObjects(context.Background(), &s3.DeleteObjectsInput{
+			Bucket: aws.String(s.bucket),
+			// Quiet=false so the response lists every Deleted key — the
+			// contract's "which keys actually succeeded" needs them.
+			Delete: &types.Delete{Objects: ids, Quiet: aws.Bool(false)},
+		})
+		if cerr != nil {
+			return deleted, fmt.Errorf("store: s3 batch delete: %w", cerr)
+		}
+		for _, d := range out.Deleted {
+			if k, ok := orig[aws.ToString(d.Key)]; ok {
+				deleted = append(deleted, k)
+			}
+		}
+		for _, e := range out.Errors {
+			k := aws.ToString(e.Key)
+			if o, ok := orig[k]; ok {
+				k = o
+			}
+			// Key + API error code only — never the raw error Message, which
+			// providers have been known to stuff request-signing detail into.
+			failed = append(failed, fmt.Sprintf("%s (%s)", k, aws.ToString(e.Code)))
+		}
+	}
+	if len(failed) > 0 {
+		return deleted, fmt.Errorf("store: s3 batch delete failed for %d key(s): %s",
+			len(failed), strings.Join(failed, ", "))
+	}
+	return deleted, nil
 }
