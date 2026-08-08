@@ -49,9 +49,12 @@ type Checkpoint struct {
 type Ref struct {
 	Schema  int    `json:"schema"`
 	Lineage string `json:"lineage"`
-	// Epoch identifies a lineage's current writer generation. Local (Plan-2)
-	// mode never re-acquires a lineage, so Epoch stays 1 for the lifetime of
-	// every ref this binary writes; bumping it is a Plan-3 daemon concern.
+	// Epoch identifies a lineage's current writer generation. AcquireLease
+	// bumps it on every fresh acquisition (and on reclaim of a dead lease —
+	// see lease.go), fencing out whatever a superseded holder might still
+	// write: chain resolution collapses same-range members down to the
+	// highest epoch (keepHighestEpoch), so a fenced writer's stragglers
+	// lose deterministically.
 	Epoch       uint64                `json:"epoch"`
 	HeadTXID    uint64                `json:"head_txid"`
 	HeadEpoch   uint64                `json:"head_epoch"`
@@ -103,11 +106,13 @@ type Ref struct {
 	// lineage has its own Base) for anything at or below the fork point.
 	// This is DELIBERATELY DISTINCT from Parent (a human-readable breadcrumb
 	// with no resolution or GC meaning): Base is live, load-bearing data
-	// that both Chain resolution and GC reachability must consult once a
-	// later task wires them up. Nil means this ref has no base — every
-	// pre-CoW ref, and every fork that fully materializes today (a plain
-	// Fork remains as it is; Task 3 introduces a NEW shared-fork path that
-	// sets this). No epoch field: an epoch here would let a fenced writer's
+	// that both Chain resolution (chainFrom's fall-through) and GC
+	// reachability (ops.reachableObjects' base-spine marking) consult. Nil
+	// means this ref has no base — every pre-CoW ref, and every fork that
+	// fully materializes (a plain Fork SHARES by default, setting this,
+	// whenever the resolved chain is below the fork-time depth bound; it
+	// materializes — nil Base — only at the floor or under the test hooks,
+	// see ops.Fork). No epoch field: an epoch here would let a fenced writer's
 	// stale base survive past the point it was superseded, re-creating the
 	// fenced-orphan bug epoch fencing exists to prevent — see the design
 	// spec's "The base pointer" section. Omitempty, no schema bump: a ref
@@ -240,9 +245,8 @@ func (s *Store) CheckManifest() error {
 // newer. It is idempotent and CAS-safe under concurrent callers: if this
 // call's CAS loses the race because another caller already bumped the
 // manifest to >= 2, that is re-checked and treated as success, not failure.
-// Nothing calls this yet — it is wired in by the shared-fork path (a later
-// task) before writing the first base ref, since a base pointer must never
-// land in a store an old binary could still open.
+// Called by ops.Fork's SHARE path before writing the first base ref, since
+// a base pointer must never land in a store an old binary could still open.
 func (s *Store) EnsureLayoutV2() error {
 	for {
 		data, etag, err := s.B.Get(manifestKey)

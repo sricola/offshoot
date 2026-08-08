@@ -44,10 +44,13 @@ import (
 // comment for why replaying them again heals rather than corrupts. The
 // no-duplicate-Apply guarantee above still holds unconditionally — but the
 // snapshot a Rebase hands over and the Apply stream that follows it may
-// overlap in what they each already reflect. Plan 2's LTX sink must handle
-// that overlap explicitly (e.g. by checking its own cumulative state before
-// trusting a rebase snapshot at face value), not assume Rebase output and
-// Apply calls together partition the transaction history exactly once each.
+// overlap in what they each already reflect. A Sink must handle that
+// overlap explicitly, not assume Rebase output and Apply calls together
+// partition the transaction history exactly once each. The shipped sink,
+// session.replicaSink, does exactly this: its Rebase forwards to
+// Session.rebaseline, which re-derives the cumulative checksum from the
+// rebased replica and sets forceSnapshot so the next flush writes a full
+// snapshot rather than trusting incremental state across the overlap.
 type Sink interface {
 	Rebase(snapshotPath string) error
 	Apply(pageSize uint32, frames []wal.Frame) error
@@ -1637,16 +1640,16 @@ func (e *Engine) srcReader() (*io.SectionReader, error) {
 // computed by streaming its full contents (io.Copy into the hash, not a full
 // in-memory read).
 //
-// Plan-2 note: this re-hashes the entire main DB file on every clean
+// Cost note: this re-hashes the entire main DB file on every clean
 // shutdown and every resume attempt — an O(file size) cost at exactly two
-// process-lifetime boundaries, not a hot-path cost. For this spike's target
-// session sizes (MBs to low-single-digit GBs) that's acceptable, but it does
-// not scale indefinitely: a much larger DB would make this a noticeable
-// startup/shutdown stall. Plan 2's LTX sink carries cumulative checksums
-// that already cover the full committed history incrementally as writes
-// happen; once that lands, this whole-file re-hash should be replaced by
-// comparing against LTX's own running checksum instead of re-deriving one
-// from scratch here.
+// process-lifetime boundaries, not a hot-path cost. For the target session
+// sizes (MBs to low-single-digit GBs) that's acceptable, but it does not
+// scale indefinitely: a much larger DB would make this a noticeable
+// startup/shutdown stall. TODO(now doable): session.Session carries a
+// cumulative LTX checksum (Session.checksum) that already covers the full
+// committed history incrementally as writes happen; this whole-file re-hash
+// could be replaced by comparing against that running checksum instead of
+// re-deriving one from scratch here.
 func (e *Engine) hashSrc() (string, error) {
 	r, err := e.srcReader()
 	if err != nil {
