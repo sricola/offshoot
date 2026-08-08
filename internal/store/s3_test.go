@@ -4,6 +4,7 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"io"
 	"net/http"
 	"reflect"
 	"sort"
@@ -77,6 +78,42 @@ func TestS3CopyObjectOverSizeLimitFallsBack(t *testing.T) {
 	data, _, err := b.Get("data/huge/dst")
 	if err != nil || string(data) != "not actually 6GB" {
 		t.Fatalf("dst = %q, err = %v, want the source content copied", data, err)
+	}
+}
+
+// TestS3GetReader pins store.ReaderGetter's contract on the S3 backend
+// (perf audit H3 / task 9a): a streamed read must return the same content
+// Get would, over the same key namespace/prefix, and a missing key must map
+// to ErrNotFound exactly like Get does.
+func TestS3GetReader(t *testing.T) {
+	b := newFakeBacked(t)
+	rg, ok := b.(store.ReaderGetter)
+	if !ok {
+		t.Fatal("store.S3 must implement store.ReaderGetter")
+	}
+	if err := b.Put("data/x/1.ltx", []byte("hello")); err != nil {
+		t.Fatal(err)
+	}
+	r, etag, err := rg.GetReader("data/x/1.ltx")
+	if err != nil {
+		t.Fatal(err)
+	}
+	got, err := io.ReadAll(r)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := r.Close(); err != nil {
+		t.Fatalf("close: %v", err)
+	}
+	if string(got) != "hello" {
+		t.Fatalf("streamed content = %q, want %q", got, "hello")
+	}
+	if etag == "" {
+		t.Error("etag must not be empty")
+	}
+
+	if _, _, err := rg.GetReader("nope"); !errors.Is(err, store.ErrNotFound) {
+		t.Fatalf("want ErrNotFound for a missing key, got %v", err)
 	}
 }
 

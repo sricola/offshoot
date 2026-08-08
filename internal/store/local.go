@@ -4,6 +4,7 @@ import (
 	"crypto/sha256"
 	"encoding/hex"
 	"fmt"
+	"io"
 	"io/fs"
 	"os"
 	"path/filepath"
@@ -54,6 +55,32 @@ func (l *Local) Get(key string) ([]byte, string, error) {
 		return nil, "", err
 	}
 	return data, etagOf(data), nil
+}
+
+// GetReader implements store.ReaderGetter: it opens the file directly
+// rather than os.ReadFile-ing its full contents into memory (unlike Get),
+// so a caller applying a large object (e.g. a snapshot/segment during chain
+// materialization) holds only one open file descriptor, not the whole
+// object's bytes. A missing file maps to store.ErrNotFound, same as Get.
+// The caller MUST Close the returned file.
+//
+// etag is always "" here: computing the real content etag (etagOf, a
+// sha256 over the full data) would require reading the whole file, which
+// defeats the point of a streaming Get. A caller that needs the content
+// etag should use Get instead.
+func (l *Local) GetReader(key string) (io.ReadCloser, string, error) {
+	p, err := l.path(key)
+	if err != nil {
+		return nil, "", err
+	}
+	f, err := os.Open(p)
+	if os.IsNotExist(err) {
+		return nil, "", ErrNotFound
+	}
+	if err != nil {
+		return nil, "", err
+	}
+	return f, "", nil
 }
 
 // write does a write-to-temp-then-rename. The temp file gets a unique name

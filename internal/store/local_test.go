@@ -3,6 +3,7 @@ package store
 import (
 	"errors"
 	"fmt"
+	"io"
 	"os"
 	"path/filepath"
 	"sync"
@@ -24,6 +25,38 @@ func TestLocalPutGetEtag(t *testing.T) {
 	}
 	if _, _, err := b.Get("nope"); !errors.Is(err, ErrNotFound) {
 		t.Fatalf("want ErrNotFound, got %v", err)
+	}
+}
+
+// TestLocalGetReader pins store.ReaderGetter's contract on the Local
+// backend (perf audit H3 / task 9a): a streamed read must return the same
+// content Get would, over the same key namespace, and a missing key must
+// map to ErrNotFound exactly like Get does.
+func TestLocalGetReader(t *testing.T) {
+	b, err := NewLocal(t.TempDir())
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := b.Put("data/x/1.ltx", []byte("hello")); err != nil {
+		t.Fatal(err)
+	}
+	r, _, err := b.GetReader("data/x/1.ltx")
+	if err != nil {
+		t.Fatal(err)
+	}
+	got, err := io.ReadAll(r)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := r.Close(); err != nil {
+		t.Fatalf("close: %v", err)
+	}
+	if string(got) != "hello" {
+		t.Fatalf("streamed content = %q, want %q", got, "hello")
+	}
+
+	if _, _, err := b.GetReader("nope"); !errors.Is(err, ErrNotFound) {
+		t.Fatalf("want ErrNotFound for a missing key, got %v", err)
 	}
 }
 
