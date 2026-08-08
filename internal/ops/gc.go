@@ -494,6 +494,7 @@ func (w *Workspace) GC(grace time.Duration) (tombstoned, deleted int, err error)
 	cutoff := time.Now().Add(-grace)
 	var reMark, existing map[string]bool
 	var liveHeads map[string]uint64
+	var toDelete []string
 	for key, markedAt := range stones {
 		if _, mintedThisRun := newStones[key]; mintedThisRun {
 			// A stone minted in phase 1 above is timestamped `time.Now()`,
@@ -565,11 +566,33 @@ func (w *Workspace) GC(grace time.Duration) (tombstoned, deleted int, err error)
 				}
 			}
 		}
-		if err := w.Store.B.Delete(key); err != nil {
-			return tombstoned, deleted, err
+		toDelete = append(toDelete, key)
+	}
+	// Delete every eligible key in one batched call (sweepDelete: the
+	// backend's BatchDeleter capability when it has one — S3's DeleteObjects,
+	// 1000 keys per RPC instead of one Delete RPC each, perf audit H2 — else
+	// a per-key loop with identical results). Gates and eligible set are
+	// exactly the per-key loop's; only the RPC shape changed. Sorted so the
+	// delete order (and, on a partial failure, which keys got done first) is
+	// deterministic instead of map-iteration order.
+	if len(toDelete) > 0 {
+		sort.Strings(toDelete)
+		succeeded, derr := w.sweepDelete(toDelete)
+		for _, key := range succeeded {
+			delete(stones, key)
 		}
-		deleted++
-		delete(stones, key)
+		deleted += len(succeeded)
+		if derr != nil {
+			// Abort the pass on a delete error, but don't lose the progress
+			// made: the succeeded keys' stones are pruned and persisted, the
+			// failed keys keep their (original-timestamp) stones for a later
+			// pass. The same clobber-safety argument as the Put below applies.
+			data, _ := json.Marshal(stones)
+			if perr := w.Store.B.Put(tombstoneKey, data); perr != nil {
+				return tombstoned, deleted, errors.Join(derr, perr)
+			}
+			return tombstoned, deleted, derr
+		}
 	}
 	// Persist the pruned stone list. This is an unconditional Put, not a
 	// CAS: it can clobber phase-1 additions from a concurrent GC run that
@@ -584,4 +607,24 @@ func (w *Workspace) GC(grace time.Duration) (tombstoned, deleted int, err error)
 		return tombstoned, deleted, err
 	}
 	return tombstoned, deleted, nil
+}
+
+// sweepDelete is GC phase 2's delete step: remove keys via the backend's
+// optional BatchDeleter capability (store.BatchDeleter — S3 batches 1000
+// keys per DeleteObjects RPC) when present, else per-key Delete. Both paths
+// return the keys ACTUALLY deleted so the caller prunes exactly those
+// tombstones; on an error the returned prefix of keys is what succeeded
+// before the failure (BatchDeleter's own contract; the fallback loop stops
+// at the first error, exactly what the old inline per-key sweep did).
+func (w *Workspace) sweepDelete(keys []string) (deleted []string, err error) {
+	if bd, ok := w.Store.B.(store.BatchDeleter); ok {
+		return bd.DeleteObjects(keys)
+	}
+	for _, key := range keys {
+		if err := w.Store.B.Delete(key); err != nil {
+			return deleted, err
+		}
+		deleted = append(deleted, key)
+	}
+	return deleted, nil
 }

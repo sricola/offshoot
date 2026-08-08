@@ -4,7 +4,11 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"net/http"
+	"reflect"
+	"sort"
 	"strings"
+	"sync"
 	"testing"
 
 	"github.com/sricola/offshoot/internal/store"
@@ -227,5 +231,112 @@ func TestS3ListPaginates(t *testing.T) {
 	}
 	if keys[0] != "data/lin/00000.ltx" || keys[n-1] != fmt.Sprintf("data/lin/%05d.ltx", n-1) {
 		t.Fatalf("pagination lost ordering: first=%s last=%s", keys[0], keys[n-1])
+	}
+}
+
+// TestS3DeleteObjectsChunksBatches pins store.S3's BatchDeleter capability
+// (perf audit H2): 2500 keys must go out as exactly ceil(2500/1000) = 3
+// DeleteObjects requests (the fake enforces the API's 1000-key cap with a
+// MalformedXML rejection, so an unchunked request could not sneak through),
+// zero per-key DELETE round trips, with every key deleted and every deleted
+// key reported back in the caller's un-prefixed form — the backend runs
+// under a bucket prefix precisely to prove the batch path namespaces and
+// strips keys the same way single Delete does.
+func TestS3DeleteObjectsChunksBatches(t *testing.T) {
+	f := storetest.NewFakeS3(t)
+	t.Setenv("AWS_ACCESS_KEY_ID", "test")
+	t.Setenv("AWS_SECRET_ACCESS_KEY", "test")
+	b, err := store.NewS3(context.Background(), store.S3Config{
+		Bucket: f.Bucket(), Prefix: "team-a", Endpoint: f.URL(), Region: "us-east-1", UsePathStyle: true,
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	// Compile-time pin: *store.S3 implements the optional capability.
+	var bd store.BatchDeleter = b
+
+	const n = 2500
+	keys := make([]string, n)
+	for i := range keys {
+		keys[i] = fmt.Sprintf("data/lin/%05d.ltx", i)
+		f.Seed("team-a/"+keys[i], []byte("x"))
+	}
+
+	var mu sync.Mutex
+	var posts, deletes int
+	f.SetFault(func(method, key string) (int, bool) {
+		mu.Lock()
+		switch method {
+		case http.MethodPost:
+			posts++
+		case http.MethodDelete:
+			deletes++
+		}
+		mu.Unlock()
+		return 0, false // observe only, never fault
+	})
+
+	deleted, err := bd.DeleteObjects(keys)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if posts != 3 {
+		t.Fatalf("2500 keys issued %d DeleteObjects requests, want exactly 3 (1000-key chunks)", posts)
+	}
+	if deletes != 0 {
+		t.Fatalf("batch delete issued %d per-key DELETE round trips, want 0", deletes)
+	}
+	sort.Strings(deleted)
+	if !reflect.DeepEqual(deleted, keys) {
+		t.Fatalf("deleted key set mismatch: got %d keys, want %d (un-prefixed caller form)", len(deleted), len(keys))
+	}
+	if left, err := b.List("data/"); err != nil || len(left) != 0 {
+		t.Fatalf("objects left after batch delete: %d err=%v", len(left), err)
+	}
+}
+
+// TestS3DeleteObjectsPartialFailureAndIdempotency pins the two contract
+// edges GC's stone pruning depends on: a key S3 reports a per-key <Error>
+// for is NOT in the returned deleted set but IS named in the returned error
+// (and its object survives), while a key that never existed still counts as
+// deleted (S3's DeleteObjects reports absent keys under Deleted — same
+// idempotency as single Delete). Empty input is a no-op.
+func TestS3DeleteObjectsPartialFailureAndIdempotency(t *testing.T) {
+	f := storetest.NewFakeS3(t)
+	t.Setenv("AWS_ACCESS_KEY_ID", "test")
+	t.Setenv("AWS_SECRET_ACCESS_KEY", "test")
+	b, err := store.NewS3(context.Background(), store.S3Config{
+		Bucket: f.Bucket(), Endpoint: f.URL(), Region: "us-east-1", UsePathStyle: true,
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	var bd store.BatchDeleter = b
+
+	if deleted, err := bd.DeleteObjects(nil); deleted != nil || err != nil {
+		t.Fatalf("empty input must be (nil, nil), got (%v, %v)", deleted, err)
+	}
+
+	for _, k := range []string{"data/l/ok.ltx", "data/l/stuck.ltx"} {
+		if err := b.Put(k, []byte("x")); err != nil {
+			t.Fatal(err)
+		}
+	}
+	f.SetBatchDeleteError("data/l/stuck.ltx")
+
+	deleted, err := bd.DeleteObjects([]string{"data/l/ok.ltx", "data/l/stuck.ltx", "data/l/never-existed.ltx"})
+	if err == nil || !strings.Contains(err.Error(), "data/l/stuck.ltx") {
+		t.Fatalf("partial failure must return an error naming the failed key, got: %v", err)
+	}
+	sort.Strings(deleted)
+	want := []string{"data/l/never-existed.ltx", "data/l/ok.ltx"}
+	if !reflect.DeepEqual(deleted, want) {
+		t.Fatalf("deleted = %v, want %v (absent key counts as deleted; failed key does not)", deleted, want)
+	}
+	if _, _, err := b.Get("data/l/stuck.ltx"); err != nil {
+		t.Fatalf("failed key's object must survive: %v", err)
+	}
+	if _, _, err := b.Get("data/l/ok.ltx"); !errors.Is(err, store.ErrNotFound) {
+		t.Fatalf("succeeded key must be gone, Get err = %v", err)
 	}
 }

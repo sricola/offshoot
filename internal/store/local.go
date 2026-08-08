@@ -280,6 +280,24 @@ func (l *Local) Delete(key string) error {
 	return nil
 }
 
+// DeleteObjects implements store.BatchDeleter as a plain sequential loop
+// over Delete: a local directory has no round trips to batch away, but
+// implementing the capability keeps callers (ops' GC sweep) on one uniform
+// code path across backends. Semantics follow the interface contract and
+// Delete exactly — a missing file counts as deleted (os.Remove's
+// IsNotExist is already success in Delete above); the first real error
+// stops the loop and is returned alongside the keys deleted so far, which
+// matches what a per-key fallback loop would have done.
+func (l *Local) DeleteObjects(keys []string) (deleted []string, err error) {
+	for _, k := range keys {
+		if err := l.Delete(k); err != nil {
+			return deleted, err
+		}
+		deleted = append(deleted, k)
+	}
+	return deleted, nil
+}
+
 // DeleteIf implements store.ConditionalDeleter: a true compare-and-delete,
 // using the exact same per-key O_CREAT|O_EXCL lock file PutIf uses to
 // implement its own compare-and-swap (see the package doc comment on Local).

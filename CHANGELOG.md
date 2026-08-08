@@ -37,6 +37,17 @@ version if you depend on format stability.
   long chain. Rollback and Promote are unchanged; fork results are
   byte-identical.
 
+- **GC's phase-2 sweep batch-deletes on S3: 1000 objects per DeleteObjects
+  RPC instead of one serial DeleteObject each** (perf audit H2). Destroying
+  a month-old branch (~80k objects) now sweeps in ~80 round trips instead
+  of ~80k (~an hour inside a single janitor tick). Implemented as an
+  optional `store.BatchDeleter` capability — S3 chunks into 1000-key
+  DeleteObjects requests; the local backend loops; a backend without the
+  capability falls back to per-key deletes. The swept key set, tombstone
+  pruning, and abort-on-error semantics are unchanged (a partial batch
+  failure prunes exactly the succeeded keys' tombstones and keeps the
+  rest for a later pass); only the RPC shape changed.
+
 - **A sweeping GC pass no longer re-enumerates refs a third time** (perf
   audit M4). The compensating rule's live-head set is derived from the same
   ListRefs + GetRefs the phase-2 re-mark already performed, saving
