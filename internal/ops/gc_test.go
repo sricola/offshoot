@@ -1,6 +1,7 @@
 package ops
 
 import (
+	"errors"
 	"os/exec"
 	"reflect"
 	"sort"
@@ -195,17 +196,34 @@ func TestGCSingleRunDoesNotSweepStonesMintedThisRun(t *testing.T) {
 	}
 }
 
-func TestGCSparesRereferencedLineage(t *testing.T) {
+// TestGCPrunesLegacyLineageKeyedStone: the pre-object-granular tombstone
+// format keyed stones by LINEAGE id. Such a key names no real object, so
+// phase 2's re-list finds nothing behind it: the stone is pruned without a
+// delete and the (live) lineage it once named is untouched. (This test's
+// ancestor, TestGCSparesRereferencedLineage, claimed the stone was spared
+// "because it is still referenced" — under object granularity what actually
+// happens is legacy-stone pruning, which is what is asserted now.)
+func TestGCPrunesLegacyLineageKeyedStone(t *testing.T) {
 	w := newWS(t)
-	w.Create("app")
-	// Tombstone main's lineage artificially, then verify phase 2 spares it
-	// because it is still referenced.
-	ref, _, _ := w.Store.GetRef("app", "main")
+	if err := w.Create("app"); err != nil {
+		t.Fatal(err)
+	}
+	ref, _, err := w.Store.GetRef("app", "main")
+	if err != nil {
+		t.Fatal(err)
+	}
 	if err := w.tombstone(map[string]string{ref.Lineage: "2000-01-01T00:00:00Z"}); err != nil {
 		t.Fatal(err)
 	}
 	if _, deleted, err := w.GC(0); err != nil || deleted != 0 {
-		t.Fatalf("gc must spare a referenced lineage: deleted=%d err=%v", deleted, err)
+		t.Fatalf("a legacy lineage-keyed stone must prune without deleting: deleted=%d err=%v", deleted, err)
+	}
+	stones, _, err := w.loadTombstones()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, still := stones[ref.Lineage]; still {
+		t.Fatal("legacy lineage-keyed stone must be pruned from gc/tombstones")
 	}
 	if _, err := w.Checkout("app", "main"); err != nil {
 		t.Fatal(err)
@@ -744,5 +762,154 @@ func TestGCKeepsPassThroughLineageBaseJSON(t *testing.T) {
 	}
 	if got := querySQL(t, cpath, "SELECT v FROM t;"); got != "9\n" {
 		t.Fatalf("C content = %q, want \"9\\n\"", got)
+	}
+}
+
+// TestGCRescuedStoneGetsFreshGrace guards the review-fix for the grace
+// bypass: a stone rescued by phase 2's re-mark (its object became reachable
+// again) must be PRUNED, not kept with its original timestamp. Kept, the
+// stale stone would let the object's later, legitimate death be swept with
+// effectively zero grace — skipping exactly the fork-in-flight window grace
+// exists to protect. Pruned, the later death mints a FRESH stone and gets a
+// full grace period.
+func TestGCRescuedStoneGetsFreshGrace(t *testing.T) {
+	if _, err := exec.LookPath("sqlite3"); err != nil {
+		t.Skip("sqlite3 CLI not on PATH")
+	}
+	w := newWS(t)
+	if err := w.Create("app"); err != nil {
+		t.Fatal(err)
+	}
+	path, err := w.Checkout("app", "main")
+	if err != nil {
+		t.Fatal(err)
+	}
+	mustSQL(t, path, "CREATE TABLE t (v); INSERT INTO t VALUES (1);")
+	if _, err := w.Checkpoint("app", "main", "v1", nil); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := w.Fork("app", "main", "b", "", 0, nil); err != nil {
+		t.Fatal(err)
+	}
+	bref, _, err := w.Store.GetRef("app", "b")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if bref.Base == nil {
+		t.Fatal("test precondition: fork b must share")
+	}
+	key := store.BaseKey(bref.Lineage)
+
+	// An old race-window stone for a NOW-REACHABLE object (the shape a
+	// caught-mid-flight fork leaves behind once its ref lands).
+	if err := w.tombstone(map[string]string{key: "2000-01-01T00:00:00Z"}); err != nil {
+		t.Fatal(err)
+	}
+	// Rescue run: the re-mark sees the object reachable; the stone must be
+	// pruned, the object untouched.
+	if _, _, err := w.GC(0); err != nil {
+		t.Fatal(err)
+	}
+	if _, _, err := w.Store.B.Get(key); err != nil {
+		t.Fatalf("rescued object must survive: %v", err)
+	}
+	stones, _, err := w.loadTombstones()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, still := stones[key]; still {
+		t.Fatal("rescued stone must be pruned, not kept with its stale timestamp")
+	}
+
+	// The object later legitimately dies (branch destroyed). The immediately
+	// following grace-elapsed run must NOT sweep it: it gets a FRESH stone
+	// (full grace from now), never a sweep against the old timestamp.
+	if err := w.Destroy("app", "b", false); err != nil {
+		t.Fatal(err)
+	}
+	if _, _, err := w.GC(0); err != nil {
+		t.Fatal(err)
+	}
+	if _, _, err := w.Store.B.Get(key); err != nil {
+		t.Fatalf("grace bypass: object swept against a stale rescued stone without a fresh grace period: %v", err)
+	}
+	// And the fresh stone ages normally: a later independent run sweeps it.
+	if _, _, err := w.GC(0); err != nil {
+		t.Fatal(err)
+	}
+	if _, _, err := w.Store.B.Get(key); !errors.Is(err, store.ErrNotFound) {
+		t.Fatalf("object must sweep after its fresh grace elapses, Get err = %v", err)
+	}
+}
+
+// TestGCCompensatingRuleProtectsAboveHeadOrphan guards the review-fix for
+// the flush-retry race: a session flush that hit an ambiguous ref-write
+// failure re-Puts the SAME (lineage, epoch, txid) object key on retry
+// (session/flush.go), and HeadTXID only advances on a successful ref write,
+// so that key is always ABOVE the live ref's head — unreachable by
+// definition, so reachability alone cannot protect it from the object-
+// granular sweep. The compensating rule must: phase 2 never deletes a
+// member object above a live ref's head in that ref's own lineage, however
+// old its stone; once the branch itself dies, the same object becomes
+// sweepable.
+func TestGCCompensatingRuleProtectsAboveHeadOrphan(t *testing.T) {
+	if _, err := exec.LookPath("sqlite3"); err != nil {
+		t.Skip("sqlite3 CLI not on PATH")
+	}
+	w := newWS(t)
+	if err := w.Create("app"); err != nil {
+		t.Fatal(err)
+	}
+	path, err := w.Checkout("app", "main")
+	if err != nil {
+		t.Fatal(err)
+	}
+	mustSQL(t, path, "CREATE TABLE t (v); INSERT INTO t VALUES (1);")
+	head, err := w.Checkpoint("app", "main", "v1", nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	mref, _, err := w.Store.GetRef("app", "main")
+	if err != nil {
+		t.Fatal(err)
+	}
+	// The orphan a crashed/ambiguous flush leaves: a segment at head+1 in
+	// the live ref's own lineage, with a stone already past any grace.
+	orphanKey := store.SegmentKey(mref.Lineage, mref.Epoch, head+1, head+1)
+	if err := w.Store.B.Put(orphanKey, []byte("orphan")); err != nil {
+		t.Fatal(err)
+	}
+	if err := w.tombstone(map[string]string{orphanKey: "2000-01-01T00:00:00Z"}); err != nil {
+		t.Fatal(err)
+	}
+
+	// While the branch lives, the orphan must never be deleted, run after run.
+	for i := 0; i < 2; i++ {
+		if _, _, err := w.GC(0); err != nil {
+			t.Fatal(err)
+		}
+		if _, _, err := w.Store.B.Get(orphanKey); err != nil {
+			t.Fatalf("run %d: above-head orphan in a live lineage swept (flush retry would re-create it): %v", i, err)
+		}
+	}
+	// The stone is deliberately KEPT while the rule protects the object.
+	stones, _, err := w.loadTombstones()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, kept := stones[orphanKey]; !kept {
+		t.Fatal("protected orphan's stone must be kept until the object is reachable or the branch dies")
+	}
+
+	// Branch gone: the lineage drops out of the live-head set and the same
+	// stale stone now sweeps.
+	if err := w.Destroy("app", "main", true); err != nil {
+		t.Fatal(err)
+	}
+	if _, _, err := w.GC(0); err != nil {
+		t.Fatal(err)
+	}
+	if _, _, err := w.Store.B.Get(orphanKey); !errors.Is(err, store.ErrNotFound) {
+		t.Fatalf("orphan must be sweepable once its branch is gone, Get err = %v", err)
 	}
 }

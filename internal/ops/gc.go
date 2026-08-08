@@ -6,6 +6,7 @@ import (
 	"fmt"
 	"os"
 	"sort"
+	"strings"
 	"time"
 
 	"github.com/sricola/offshoot/internal/store"
@@ -388,6 +389,52 @@ func (w *Workspace) reachableObjects() (map[string]bool, error) {
 	return reachable, nil
 }
 
+// liveHeadLineages returns, for every lineage some live ref names as its OWN
+// (head) lineage, the smallest HeadTXID among the refs naming it — the input
+// to GC's compensating rule (see the phase-2 sweep): an object ABOVE a live
+// ref's head in that ref's own lineage may be an orphan a session flush is
+// entitled to re-create at the same key (session/flush.go's ambiguous-
+// ref-write retry overwrites the SAME (lineage, epoch, txid) key), so the
+// sweep must never delete there. Smallest head because that is the txid a
+// retrying writer would build up from. A ref gone between ListRefs and
+// GetRef (a completed Destroy) is skipped, matching reachableObjects.
+func (w *Workspace) liveHeadLineages() (map[string]uint64, error) {
+	refs, err := w.Store.ListRefs()
+	if err != nil {
+		return nil, err
+	}
+	heads := map[string]uint64{}
+	for db, branches := range refs {
+		for _, br := range branches {
+			r, _, err := w.Store.GetRef(db, br)
+			if err != nil {
+				if errors.Is(err, store.ErrNotFound) {
+					continue
+				}
+				return nil, fmt.Errorf("ops: gc live heads %s@%s: %w", db, br, err)
+			}
+			if h, ok := heads[r.Lineage]; !ok || r.HeadTXID < h {
+				heads[r.Lineage] = r.HeadTXID
+			}
+		}
+	}
+	return heads, nil
+}
+
+// lineageOfDataKey extracts the lineage component of a data/{lineage}/...
+// object key; ok is false for anything shaped differently.
+func lineageOfDataKey(key string) (string, bool) {
+	rest, ok := strings.CutPrefix(key, "data/")
+	if !ok {
+		return "", false
+	}
+	lineage, _, ok := strings.Cut(rest, "/")
+	if !ok || lineage == "" {
+		return "", false
+	}
+	return lineage, true
+}
+
 // GC is the object-granular reachability collector: phase 1 tombstones every
 // object under data/ that no live ref can reach (see reachableObjects — the
 // transitive base closure of every ref's head and checkpoints), phase 2
@@ -450,6 +497,7 @@ func (w *Workspace) GC(grace time.Duration) (tombstoned, deleted int, err error)
 	// format, which names no real object key and so re-lists to nothing.
 	cutoff := time.Now().Add(-grace)
 	var reMark, existing map[string]bool
+	var liveHeads map[string]uint64
 	for key, markedAt := range stones {
 		if _, mintedThisRun := newStones[key]; mintedThisRun {
 			// A stone minted in phase 1 above is timestamped `time.Now()`,
@@ -477,13 +525,48 @@ func (w *Workspace) GC(grace time.Duration) (tombstoned, deleted int, err error)
 			for _, k := range relisted {
 				existing[k] = true
 			}
+			if liveHeads, err = w.liveHeadLineages(); err != nil {
+				return tombstoned, deleted, err
+			}
 		}
 		if reMark[key] {
-			continue // re-referenced during grace; keep the stone for review
+			// Re-referenced during grace (a fork or flush landed and its ref
+			// now reaches this object): PRUNE the stone rather than keeping
+			// it. Keeping it with its original timestamp would let a later,
+			// legitimate death of this object (its branch destroyed) be
+			// swept against the STALE stone with effectively zero grace —
+			// the exact fork-in-flight window the grace period exists to
+			// protect. Pruned, the object gets a FRESH tombstone and a full
+			// grace period from phase 1 of a later run if it ever becomes
+			// unreachable again.
+			delete(stones, key)
+			continue
 		}
 		if !existing[key] {
 			delete(stones, key) // already gone (or a legacy lineage-keyed stone): prune
 			continue
+		}
+		// Compensating rule: NEVER delete a member object above a live ref's
+		// head in that ref's OWN lineage. A session flush that hit an
+		// ambiguous ref-write failure retries by re-Putting the SAME
+		// (lineage, epoch, txid) key (see session/flush.go's orphan-overwrite
+		// path) — HeadTXID only advances on a successful ref write, so its
+		// retry txid is always head+1 and the sweep deleting that key in the
+		// window between the retry's Put and its ref CAS would leave a live
+		// ref pointing at nothing. Such an orphan is unreachable by
+		// definition (nothing references beyond head), so reachability alone
+		// cannot protect it; this rule does, narrowly: only member-parseable
+		// keys (base.json never carries a txid), only in a lineage a live ref
+		// names as its head lineage, only above that head. The stone is KEPT:
+		// if the writer's retry lands, the object becomes reachable and the
+		// stone is rescued/pruned above; if the branch dies instead, the
+		// lineage drops out of liveHeads and a later run sweeps it.
+		if m, ok := store.ParseMemberKey(key); ok {
+			if lineage, lok := lineageOfDataKey(key); lok {
+				if head, live := liveHeads[lineage]; live && m.MaxTXID > head {
+					continue
+				}
+			}
 		}
 		if err := w.Store.B.Delete(key); err != nil {
 			return tombstoned, deleted, err
