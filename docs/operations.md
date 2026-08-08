@@ -14,8 +14,9 @@ document, not a slogan.
 
 This page is the operator's reference: what to scrape, what a branch state
 means when you're paged for it, how to watch the daemon live instead of
-polling, how disk use is bounded, and the exact threat model behind
-`-http`. For the flag-by-flag CLI reference (arities, defaults, error
+polling, how disk use is bounded, what copy-on-write forks mean for the
+storage bill and for reclaim after a destroy, and the exact threat model
+behind `-http`. For the flag-by-flag CLI reference (arities, defaults, error
 messages), see [docs/reference.md](reference.md) — this page is organized
 around operator tasks, that one around commands.
 
@@ -265,6 +266,51 @@ a data-loss risk:
 `-ro-cache-budget` flag there is display-only (echoes back what you intend
 to run a daemon with — it's never persisted, so `status` has no other way to
 know what a *running* daemon was actually started with).
+
+## Storage sharing (copy-on-write forks)
+
+Forks are copy-on-write: a fork writes a base pointer into its parent's
+already-durable chain and adds objects only as it diverges, so N forks of
+a G-byte database cost near-zero added store bytes until each child
+actually writes — not N×G. Four operator-facing consequences:
+
+**Two cost classes, reported per branch — believe them.** `offshoot
+status` prints `storage=shared` or `storage=materialized` on every branch
+line, and the daemon `branches` op reports the same bit as
+`BranchInfo.shared`. The asymmetry is deliberate and not hidden: **`fork`
+shares (near-free); `promote`, `rollback`, and `compact` each materialize
+a full independent copy** (they abandon or replace a lineage, and
+base-pointing into a lineage that is meant to die would pin it forever).
+Budget accordingly: a promote of a large database is a full-size store
+write even though the fork that produced the candidate was free.
+
+**Destroy is instant; the storage refund waits for the last sharing
+child.** Destroying a branch always removes its ref immediately — that
+guarantee is unchanged — but a destroyed parent's *bytes* stay in the
+store for as long as any surviving child's chain still resolves through
+them (GC's reachability mark follows base pointers transitively). If the
+bucket isn't shrinking after a destroy, look for surviving shared
+children: destroy or `compact` them and the next GC pass reclaims the
+ancestor. `offshoot compact <db>@<branch>` is the manual release valve —
+it re-encodes the branch as one self-contained snapshot and drops its base
+pointer, at full-copy cost, and **resets the branch's checkpoints to a
+single `compact` checkpoint** (export anything you need first).
+
+**GC counts objects, not lineages.** `gc: tombstoned N, deleted M objects`
+(and `offshoot_gc_tombstoned_total` / `offshoot_gc_deleted_total` /
+`offshoot_gc_backlog`) are object counts; a partially-shared ancestor can
+legitimately have part of its storage reclaimed while its below-fork-point
+objects stay live for a descendant.
+
+**The layout v2 gate: don't run pre-copy-on-write binaries against a
+store that has ever had a shared fork.** The first shared fork bumps the
+store manifest to layout version 2, and every older binary then refuses
+the *entire store* up front. This lock-out is intentional, not a
+compatibility bug to work around: an old binary's GC marks liveness per
+lineage, cannot see base pointers, and would sweep a shared ancestor out
+from under live children — silent data loss. Upgrade every binary that
+touches a store before any of them starts forking; there is no downgrade
+path once a base pointer exists.
 
 ## HTTP/auth threat model
 

@@ -13,166 +13,139 @@ version if you depend on format stability.
 
 ## [Unreleased]
 
+## [0.2.0] - 2026-08-07
+
+**Copy-on-write forks.** `offshoot fork` no longer materializes a full
+copy of the source into the child's lineage. The common-case fork now
+**shares**: it writes a durable base pointer into the parent's
+already-durable chain — zero data objects of its own — so N forks of a
+G-byte database cost near-zero added store bytes instead of up to N×G.
+The rest of this release is what makes that safe: base-following chain
+resolution under a strict never-merge-across-lineages rule, two automatic
+snapshot floors that keep read materialization bounded on any fork spine,
+an object-granular reachability GC, a new `offshoot compact` command to
+cut a shared branch's cord, and honest per-branch cost reporting in
+`status`/`branches`.
+
+**Storage-format change — the reason this release is 0.2.0, not 0.1.4.**
+The first shared fork CAS-bumps the store manifest from LayoutVersion 1
+to 2, and every pre-0.2.0 binary then refuses the **entire store** up
+front (`CheckManifest`). The lockout is deliberate: a 0.1.x binary's
+lineage-granular GC cannot see base pointers and would sweep a shared
+ancestor's objects out from under live children — silent data loss — so
+old binaries are fenced out of the store rather than allowed to corrupt
+it. There is no downgrade path once a base pointer exists; upgrade every
+binary that touches a store before any of them forks. A 0.2.0 binary
+reads and writes a v1 (no-base) store unchanged, and GC's reachability
+handles a mixed store (old full-copy forks + new shared forks) uniformly.
+
+**The two cost models, stated honestly:** fork shares (near-free);
+`promote`, `rollback`, and `compact` each still materialize a full
+independent copy — "fork at checkpoint X is free but rollback to X costs
+a full copy" is a deliberate, documented asymmetry, not an oversight
+(rollback/promote abandon their old lineage; base-pointing into a lineage
+that is meant to die would pin it forever). Destroying a parent stays
+instant and always allowed, but its **bytes** are now reclaimed only once
+no surviving child's chain still reads through them — destroy lingers
+until the last sharing child is destroyed or compacted.
+
 ### Changed
 
-- **GC is now an object-granular reachability collector** (copy-on-write
-  Task 5): the mark phase computes the live set as the union, over every
-  live branch, of its resolved chain (`store.Chain`, the same base-following
-  resolver the read path uses — never a reimplementation) at its head AND at
-  every checkpoint, transitively through copy-on-write base pointers, plus
-  the `base.json` object of every lineage along each branch's base spine
-  (a forked-but-never-diverged pass-through lineage contributes zero chain
-  members yet its `base.json` is still read during resolution, so it must
-  survive). This replaces the lineage-granular mark that could not see the
-  base closure at all — under it, a shared ancestor kept alive only by a
-  descendant's base pointer would have been swept out from under that
-  descendant (data loss). Sweep granularity follows: `gc/tombstones` now
-  maps individual object keys (stale lineage-keyed entries from the old
-  format are pruned harmlessly), the two-phase tombstone → grace → re-mark
-  → delete shape, the mint-this-run skip, and the clobber-safe unconditional
-  stone persist are all preserved at the new granularity, and both phases
-  follow the base closure. A destroyed parent now keeps exactly its
-  ≤ fork-point objects while its above-fork range (and any dead-below-head,
-  uncheckpointed objects in live lineages) is reclaimed. `GC`'s returned
-  `tombstoned`/`deleted` counts (and the `offshoot_gc_tombstoned_total` /
-  `offshoot_gc_deleted_total` / `offshoot_gc_backlog` metrics and the CLI
-  `gc` summary line) now count OBJECTS, not lineages. A per-pass cache
-  (memoized `List`/`Get` under the real resolver, plus per-(lineage, txid)
-  chain memoization) keeps a shared ancestor's prefix Listed once per pass
-  no matter how many descendants resolve into it. New `store.BaseSpine`
-  exposes the base-pointer ancestor walk. New tests cover: a parent kept
-  alive only by a child's base pointer; ≤base survives / >base reclaimed
-  after parent destroy; a MARK==READ equality property test against the
-  read path's own resolution; the ancestor-destroyed-mid-fork-of-fork
-  fault-injection race; a mixed store of full-copy and shared forks; old
-  checkpoints' snapshots surviving (union-over-checkpoints, not head-only);
-  and the pass-through lineage's `base.json` surviving — the head-only,
-  members-only-base-marking, and no-mint-skip regressions are each
-  mutation-verified to fail their test. Two review-driven hardenings close
-  data-loss windows the finer sweep granularity widened: (1) a tombstone
-  rescued by phase 2's re-mark (its object became reachable again) is now
-  *pruned* rather than kept, so the object's later legitimate death always
-  earns a fresh tombstone and a full grace period instead of being swept
-  against the stale timestamp; and (2) a **compensating rule** — the sweep
-  never deletes a member object above a live branch's head in that branch's
-  own lineage, because a session flush retrying an ambiguous ref write
-  re-creates exactly that key (such an orphan is unreachable by definition,
-  so reachability alone cannot protect it); it becomes sweepable once the
-  branch itself is gone. Both hardenings are mutation-verified by their own
-  tests.
+- **Fork is copy-on-write** (Tasks 1–4). The share path writes only a
+  durable per-lineage base pointer (`data/<lineage>/base.json`, written
+  create-only via `store.WriteLineageBase`) plus the child ref's new
+  `Base *BasePointer` reporting mirror (`BasePointer{Lineage, TXID}`,
+  deliberately separate from the human-facing `Parent` breadcrumb, and
+  deliberately epoch-free — pinning an epoch could resurrect a fenced
+  writer's orphan). Resolution: `store.Chain` follows base pointers
+  transitively under the one hard rule that members are never merged
+  across lineages — each lineage's half is resolved wholly within its own
+  prefix and concatenated at a seam verified contiguous, so
+  `keepHighestEpoch` can never let a higher-epoch parent object win a
+  child's txid range. The base object (not the ref mirror) is the
+  resolution source of truth, so a shared parent's ref can be destroyed
+  while descendants still resolve through its lineage. Bounded
+  materialization survives sharing via two automatic floors, both keyed
+  on the existing snapshot cadence: a **fork-time floor** (a fork whose
+  fully-resolved chain is already at `ops.ForkShareMaxDepth` materializes
+  one fresh snapshot instead of sharing — the pre-0.2.0 fork path, now
+  the fallback rather than the default) and a **divergence floor** (a
+  session's snapshot counter seeds from the branch's durable divergence,
+  so the `SnapshotEvery` bound is a property of the branch, not the
+  process, and a shared child stops touching its parent once it has
+  written its own snapshot). Tests cover divergence isolation both ways,
+  fenced-orphan safety at the fork point, bounded replay across a
+  40-level fork spine with content verification, and the
+  cross-lineage-merge hazard (mutation-verified: a resolver that unions
+  across lineages fails).
+- **GC is an object-granular reachability collector** (Task 5), a
+  rewrite forced by sharing: liveness can no longer be decided per
+  lineage when one lineage can be live-below-a-fork-point for a
+  descendant and dead-above-it for everyone. The mark phase computes the
+  live set as the union, over every live branch, of its resolved chain at
+  head AND at every checkpoint — using `store.Chain` itself, never a
+  reimplementation, so mark == read-path resolution by construction
+  (property-tested) — plus every `base.json` along each branch's base
+  spine. Sweep follows at object granularity: `gc/tombstones` maps
+  individual object keys (stale lineage-keyed entries are pruned
+  harmlessly); the two-phase tombstone → grace → re-mark → delete shape,
+  mint-this-run skip, and clobber-safe stone persist all survive at the
+  new grain. `GC`'s `tombstoned`/`deleted` counts, the CLI `gc` summary
+  line, and the `offshoot_gc_*` metrics now count **objects, not
+  lineages**. A per-pass memoized resolver keeps a shared ancestor's
+  prefix listed once per pass regardless of descendant count. Two
+  review-driven hardenings: a tombstone rescued by the re-mark is pruned
+  (a later legitimate death earns a fresh grace period), and the sweep
+  never deletes above a live branch's head in its own lineage (a
+  retrying flush can legitimately re-create exactly that key). Covered by
+  reachability, mixed-store, checkpoint-survival, and
+  ancestor-destroyed-mid-fork-of-fork fault-injection tests, each
+  mutation-verified.
+- **`offshoot status` output** (Task 7): every branch line now carries a
+  `storage=shared|materialized` field between `state=` and `txid=` — the
+  per-branch cost class, surfacing the fork-shares vs
+  promote/rollback/compact-materialize asymmetry instead of hiding it.
 
 ### Added
 
-- **`offshoot compact <db>[@branch]` — cut a shared fork's cord**
-  (copy-on-write Task 6): `ops.Compact` re-encodes a shared branch's full
-  base-following chain at head as ONE self-contained snapshot in a fresh
-  lineage, CAS-repoints the ref with its base pointer cleared, and
-  refreshes the checkout if present (best-effort, like promote). The
-  previously shared ancestor storage — including the abandoned lineage's
-  `base.json` — becomes unreferenced and is reclaimed by the reachability
-  GC; compact deletes nothing itself. An already self-contained branch is
-  a NO-OP returning the current head txid, so scripted "compact
-  everything" loops never fail on branches with nothing to do. The
-  checkpoint map is reset to `{"compact": head}`, matching promote and
-  rollback's repoint semantics (old checkpoints anchored on the shared
-  ancestor would not resolve in the new lineage; preserving them
-  rollback-style is a noted follow-up). A CAS loss to a concurrent flush
-  deletes the orphan snapshot and returns a retry error — no internal
-  retry. New daemon op `compact` (an open session on the branch is
-  flushed first, like fork's source flush, so unflushed writes land in
-  the head compact materializes), plus SDK one-liners
-  (`Client.compact(db, branch)` in Python and TypeScript). Review fix:
-  `Promote` and `Rollback` now clear the ref's `Base` mirror when they
-  repoint a formerly-shared branch at a fresh self-contained lineage
-  (previously the stale non-nil mirror survived, misreporting the branch
-  as shared — and a later compact trusting it would needlessly
-  re-materialize and wipe the checkpoints Rollback had preserved), and
-  compact's no-op decision now consults the DURABLE base spine
-  (`store.BaseSpine`, the base.json chain) rather than the mirror, so
-  this destructive op stays a no-op on a self-contained branch even if a
-  stale mirror is ever left behind.
-- **Divergence floor: the session snapshot cadence now survives session
-  restarts** (copy-on-write Task 4): a session's first flush seeds its
-  snapshot counter from the branch's DURABLE divergence — the trailing run
-  of segment members in the resolved chain at head — instead of restarting
-  at zero with every process. Previously, the settling-flush suppression
-  let each new session on a clean checkout keep appending segments directly
-  onto the branch's pre-session chain, so a branch written through many
-  short sessions (each flushing fewer than `SnapshotEvery` times) grew its
-  resolved chain without bound — and a shared (base-pointer) fork's child
-  doing the same never wrote its own divergence-floor snapshot, dragging
-  its parent's chain into every read forever. The seed costs one store
-  List, paid only on the first flush of a session whose settling snapshot
-  was suppressed (read-only sessions never pay it; a non-suppressed first
-  flush snapshots without it), and fails toward writing a full snapshot if
-  the probe errors. With it, the `SnapshotEvery` bound on resolved chain
-  length is a property of the branch, not the process. New tests cover the
-  cross-session bound on a shared child, the divergence self-snapshot plus
-  wholly-in-child resolution above it, bounded materialization across a
-  40-level fork spine with content verification at the deepest level, and
-  end-to-end parent/child divergence isolation on a shared fork.
-- **Copy-on-write forks: base-pointer sharing with a fork-time snapshot
-  floor** (copy-on-write Task 3): `ops.Fork` no longer always copies a full
-  snapshot into the child's lineage. When the fork point's fully-resolved
-  chain is shallower than the new `ops.ForkShareMaxDepth` bound (16,
-  mirroring the session snapshot cadence), the fork SHARES: it writes zero
-  snapshot/segment objects — only the durable per-lineage base pointer
-  (`data/<lineage>/base.json`, now written via the exported
-  `store.WriteLineageBase`, which additionally refuses a self-referential
-  base) plus the child ref carrying the `Base` reporting mirror, after
-  `EnsureLayoutV2` bumps the manifest so pre-CoW binaries are locked out.
-  Reads resolve through the parent's chain (Task 2's base-following
-  `Chain`). When the resolved chain already reaches the bound, Fork falls
-  back to the existing materialize path (one fresh snapshot floor), so no
-  fork spine's resolved chain ever exceeds the bound; the M2
-  reflink/CopyObject fast path is now only reachable from Fork on that
-  fallback. `Chain` additionally anchors at a shared child's own snapshot
-  once one exists (e.g. a CLI `checkpoint` on the forked branch), keeping
-  every read on the child self-contained past its first divergence floor;
-  only the specific "no snapshot covers target" case falls through to the
-  base seam — any other failure there (e.g. a transient backend error)
-  propagates unchanged instead of being misreported as a chain hole.
-- **Base-pointer field and LayoutVersion 2** (copy-on-write Task 1):
-  `store.Ref` gains a new `Base *BasePointer` field (`BasePointer{Lineage
-  string; TXID uint64}`, `json:"base,omitempty"`) — deliberately separate
-  from the existing `Parent` breadcrumb, which stays a human-readable
-  string with no resolution/GC meaning. `Base` carries no epoch by design:
-  an epoch here would let a fenced writer's stale base pointer survive past
-  the point it was superseded, re-creating the fenced-orphan bug epoch
-  fencing exists to prevent (see the copy-on-write design spec's "The base
-  pointer" section). `store.LayoutVersion` is bumped to 2; `InitManifest`
-  now stamps new stores with it, and a v2 binary still reads a v1 store
-  fine (no base pointers exist there yet). A new `Store.EnsureLayoutV2()`
-  CAS-bumps an existing v1 manifest to v2, idempotent and safe under
-  concurrent callers (a concurrent bump to v2 is success, not a CAS
-  failure); nothing calls it yet — it lands ahead of the shared-fork path
-  (a later copy-on-write task) that will call it before writing the first
-  base ref. This task changes no resolution or GC logic: `Chain` and every
-  reachability computation are untouched, and `Base` is not yet read
-  anywhere.
-- **Base-following chain resolution** (copy-on-write Task 2 — the
-  correctness core): `store.Chain(lineage, target)` now follows a durable
-  per-lineage base pointer, resolving a shared fork's reads under the one
-  hard rule — *resolution never merges members across lineages*. The base
-  pointer is stored as its own immutable per-lineage object
-  (`store.BaseKey(lineage)` -> `data/<lineage>/base.json`), read via
-  `Store.lineageBase` and written create-only via `Store.writeLineageBase`,
-  deliberately NOT read from `Ref.Base` (a reporting mirror only): a shared
-  parent branch can have its ref destroyed while a live descendant still
-  bases on it, so resolution must follow a base that outlives any ref. When
-  a lineage has a base: `target <= base.TXID` resolves entirely in the base
-  lineage (transitively); `target > base.TXID` concatenates the base's
-  snapshot-anchored chain up to `base.TXID` with the child's own contiguous
-  segment run in `(base.TXID, target]`, each half resolved wholly within one
-  lineage's List so `keepHighestEpoch` never sees a cross-lineage union (a
-  union would let a higher-epoch parent object win the child's txid range and
-  silently serve the parent's timeline). The seam is verified contiguous and
-  errors loudly otherwise. Recursion follows base pointers down through
-  fork-of-fork chains until the target lands in an ancestor's own objects;
-  a non-shared lineage (no base object) takes the existing single-lineage
-  path unchanged, so every pre-CoW caller is unaffected. `writeLineageBase`
-  exists in this task so shared-lineage scenarios can be built directly; the
-  shared-fork path (Task 3) is its real caller.
+- **`offshoot compact <db>[@branch]`** (Task 6) — the manual
+  cord-cutter: re-encodes a shared branch's full base-following chain at
+  head as ONE self-contained snapshot in a fresh lineage, CAS-repoints
+  the ref with its base pointer cleared, and best-effort refreshes the
+  checkout. The previously shared ancestor storage becomes unreferenced
+  and is reclaimed by GC (compact itself deletes nothing). An already
+  self-contained branch is a no-op returning the head txid, so scripted
+  "compact everything" loops never fail. **Flagged tradeoff:** the
+  checkpoint map resets to `{"compact": head}`, like promote's repoint
+  (old checkpoints anchored on the shared ancestor would not resolve in
+  the new lineage; preserving them rollback-style is a noted follow-up).
+  A CAS loss to a concurrent flush deletes the orphan snapshot and
+  returns a retry error. Ships as a daemon op (an open session is flushed
+  first, like fork's source flush) and SDK `compact()` in Python and
+  TypeScript. Review fix folded in: `Promote` and `Rollback` now clear
+  the ref's `Base` mirror when they repoint a formerly-shared branch
+  (previously a stale mirror survived, misreporting the branch as shared
+  — and compact trusting it would needlessly re-materialize and wipe
+  checkpoints Rollback had preserved); compact's no-op decision consults
+  the durable base spine (`store.BaseSpine`), not the mirror, so the
+  destructive path stays a no-op on a self-contained branch even against
+  a stale mirror.
+- **Per-branch cost reporting on the wire** (Task 7): `BranchInfo` (the
+  daemon `branches` op) gains a wire-additive `shared` bool — true for a
+  base-pointer fork (near-zero added storage), false for a materialized,
+  self-contained branch — mirrored by `ops.BranchStatus.Shared` for the
+  at-rest CLI `status`. No `omitempty`: false means "materialized," never
+  "unknown"; old clients that don't read the key are unaffected.
+- **Store plumbing for all of the above** (Tasks 1–2):
+  `store.LayoutVersion` 2 (new stores are stamped v2 at init;
+  `Store.EnsureLayoutV2` CAS-bumps an existing v1 manifest exactly once,
+  idempotent under concurrent callers, called before the first base
+  pointer is written), `store.BaseKey`/`WriteLineageBase` (which refuses
+  a self-referential base) and `store.BaseSpine` (the durable
+  base-ancestor walk), and `MaterializeChain`'s per-member
+  `PreApplyChecksum` verification doing fail-closed duty on every
+  resolved splice — a mis-resolved chain with divergent content is a loud
+  materialization failure, never silent corruption.
 
 ## [0.1.3] - 2026-08-07
 

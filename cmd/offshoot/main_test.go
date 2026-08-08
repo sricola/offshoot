@@ -559,3 +559,43 @@ func TestSessionHonorsServeSocketOverride(t *testing.T) {
 		t.Fatal("serve -socket did not exit after session shutdown -socket")
 	}
 }
+
+// statusLineFor returns the status output line for db@branch, failing if
+// it's absent.
+func statusLineFor(t *testing.T, status, target string) string {
+	t.Helper()
+	for _, line := range strings.Split(status, "\n") {
+		if strings.HasPrefix(line, target+" ") {
+			return line
+		}
+	}
+	t.Fatalf("status has no line for %s:\n%s", target, status)
+	return ""
+}
+
+// TestStatusReportsStorageClass covers `offshoot status`'s copy-on-write
+// cost reporting (Task 7): every branch line carries storage=shared (a
+// base-pointer fork, near-zero added storage) or storage=materialized (a
+// self-contained lineage). A fresh fork must read shared; the root, and the
+// same fork after `compact` cuts its cord, must read materialized — the
+// honest surface for the fork-shares / compact-materializes asymmetry.
+func TestStatusReportsStorageClass(t *testing.T) {
+	store := filepath.Join(t.TempDir(), "s")
+	call(t, store, "init")
+	call(t, store, "create", "app")
+	call(t, store, "fork", "app", "attempt-1")
+
+	status := call(t, store, "status")
+	if line := statusLineFor(t, status, "app@main"); !strings.Contains(line, "storage=materialized") {
+		t.Fatalf("main must report storage=materialized: %q", line)
+	}
+	if line := statusLineFor(t, status, "app@attempt-1"); !strings.Contains(line, "storage=shared") {
+		t.Fatalf("shared fork must report storage=shared: %q", line)
+	}
+
+	call(t, store, "compact", "app@attempt-1")
+	status = call(t, store, "status")
+	if line := statusLineFor(t, status, "app@attempt-1"); !strings.Contains(line, "storage=materialized") {
+		t.Fatalf("compacted branch must report storage=materialized: %q", line)
+	}
+}

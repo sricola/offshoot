@@ -3,9 +3,9 @@
 Branch SQLite like git: create, fork, checkpoint, rollback, and promote
 SQLite databases — stock SQLite files, your storage, one binary.
 
-**Status: prerelease (0.1.x).** The CLI and daemon both work today: local and
-S3-compatible stores, live WAL capture with incremental segments, leases and
-TTL reaping, an MCP server, and Python/TypeScript SDKs. See
+**Status: prerelease (0.2.x).** The CLI and daemon both work today: local and
+S3-compatible stores, copy-on-write forks, live WAL capture with incremental
+segments, leases and TTL reaping, an MCP server, and Python/TypeScript SDKs. See
 [docs/status.md](docs/status.md) for exactly what's shipped-and-tested,
 what's shipped-but-unverified, and what's still on the [roadmap](ROADMAP.md).
 Requires Go 1.24+, cgo, and the `sqlite3` CLI for tests. Linux and macOS only.
@@ -33,11 +33,15 @@ live in [CHANGELOG.md](CHANGELOG.md).
 
 ## Versioning
 
-offshoot is in the 0.1.x prerelease series (tags `v0.1.0`, `v0.1.1`, …). The
-CLI surface and the on-disk storage format may still change release to
-release. Compatibility is never left to guesswork: the store's layout version
-detects a mismatch outright — a newer binary refuses to write a layout an
-older one wouldn't understand. 1.0 is reserved for the point the storage
+offshoot is in the 0.x prerelease series (tags `v0.1.0` … `v0.2.0`, the
+current line). The CLI surface and the on-disk storage format may still
+change release to release. Compatibility is never left to guesswork: the
+store's layout version detects a mismatch outright — a newer binary refuses
+to write a layout an older one wouldn't understand, and an older binary
+refuses a store a newer one has upgraded. 0.2.0 exercised exactly that
+mechanism for real: the first copy-on-write (shared) fork bumps a store to
+layout version 2, and 0.1.x binaries then refuse the whole store — see
+[CHANGELOG.md](CHANGELOG.md). 1.0 is reserved for the point the storage
 format freezes.
 
 ## Quickstart (60 seconds, no server, no bucket)
@@ -275,15 +279,27 @@ runs without a daemon, so it has no record of which pages changed and would
 have to diff the whole database to find out. If you checkpoint large databases
 in a loop, run a daemon.
 
-Forking is a different cost from flushing. At rest, `offshoot fork` (and the
-same machinery behind `rollback`/`promote`) copies the source snapshot object
-directly — a filesystem clone or a backend-side server copy, not a
-materialize-and-re-encode round trip — whenever the checkpoint being forked
-resolves to a single, unsegmented snapshot; once a daemon session has
-flushed even one segment past a branch's last snapshot, fork falls back to
-the slower materialize-and-re-encode path for that checkpoint. Measured
-before/after numbers for both paths, both backends, are in
-[docs/benchmarks.md](docs/benchmarks.md).
+Forking is a different cost from flushing — and since the copy-on-write
+release, usually no storage cost at all. `offshoot fork` shares the
+parent's already-durable store objects through a base pointer: the child
+records where it forked from and writes new objects only as it diverges,
+so N forks of a G-byte database cost near-zero added store bytes rather
+than N×G. Reads stay bounded by construction (a fork whose resolved chain
+is already at the depth bound materializes one snapshot floor instead, and
+a diverging child self-snapshots on the ordinary cadence). The asymmetry
+to know: **fork shares; `promote`, `rollback`, and `compact` each
+materialize a full independent copy** — those paths still use the
+snapshot-copy machinery (filesystem clone / backend-side `CopyObject` when
+the source resolves to a single snapshot, materialize-and-re-encode
+otherwise; measured numbers in [docs/benchmarks.md](docs/benchmarks.md)).
+Destroying a parent stays instant and always allowed, but its bytes are
+reclaimed only once no surviving shared child still reads through them —
+`offshoot compact` cuts that cord on demand. The first shared fork bumps
+the store to layout version 2, which locks pre-copy-on-write binaries out
+of the whole store (their lineage-granular GC would sweep shared objects —
+the refusal is the protection). Full model:
+[docs/reference.md](docs/reference.md)'s `fork`/`compact`/`destroy`
+sections and [docs/operations.md](docs/operations.md#storage-sharing-copy-on-write-forks).
 
 The daemon serves a unix socket (mode 0600) under your cache directory, one per
 store; override with `OFFSHOOT_SOCKET`, or pass `-socket PATH` to `offshoot

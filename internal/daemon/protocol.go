@@ -107,6 +107,20 @@ type BranchInfo struct {
 	// than replacing it, so an old client reading only Checkpoints keeps
 	// working unchanged (wire compat; Milestone 3 Task 1).
 	CheckpointsV2 []CheckpointInfo `json:"checkpoints_v2,omitempty"`
+	// Shared reports this branch's storage cost class under copy-on-write:
+	// true when the branch's ref carries a base pointer (a shared fork — it
+	// reads through an ancestor's durable objects and wrote near-zero
+	// storage of its own at fork time); false when the branch is
+	// materialized (a fully self-contained lineage: created roots,
+	// promote/rollback/compact results, and forks that tripped the
+	// fork-time snapshot floor). This surfaces the two-cost-model asymmetry
+	// honestly rather than hiding it: fork SHARES (near-free), while
+	// promote, rollback, and compact each MATERIALIZE a full independent
+	// copy. Deliberately no `omitempty`, for the same reason as State:
+	// false is itself meaningful ("materialized"), never "unknown" — and
+	// the field is wire-additive, so an old client that never reads the key
+	// decodes exactly as before (copy-on-write Task 7).
+	Shared bool `json:"shared"`
 	// State is this branch's computed state: "active", "pending", "error",
 	// "dirty", "detached", or "idle" — see ops.BranchStateAt's doc comment
 	// for the full taxonomy and precedence, and Server.branchState for how
