@@ -15,8 +15,8 @@ type Replica struct {
 	path string
 }
 
-func New(path string) *Replica       { return &Replica{path: path} }
-func (r *Replica) Path() string      { return r.path }
+func New(path string) *Replica  { return &Replica{path: path} }
+func (r *Replica) Path() string { return r.path }
 
 func (r *Replica) Rebase(snapshotPath string) error {
 	in, err := os.Open(snapshotPath)
