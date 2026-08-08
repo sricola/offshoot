@@ -679,6 +679,12 @@ func TestForkFastPathMatchesSlowPath(t *testing.T) {
 	if _, err := exec.LookPath("sqlite3"); err != nil {
 		t.Skip("sqlite3 CLI not on PATH")
 	}
+	// Since the copy-on-write shared fork landed, a plain Fork of a
+	// single-snapshot chain shares (writes no objects) instead of
+	// materializing, so this equivalence test forces the materialize branch
+	// for both children; the fast copy stays enabled for the "fast" one.
+	SetForkMaterializeForTest(true)
+	t.Cleanup(func() { SetForkMaterializeForTest(false) })
 	w := newWS(t)
 	if err := w.Create("app"); err != nil {
 		t.Fatal(err)
@@ -792,6 +798,10 @@ func TestForkFastPathFiresOnS3WithinSizeLimit(t *testing.T) {
 	if _, err := exec.LookPath("sqlite3"); err != nil {
 		t.Skip("sqlite3 CLI not on PATH")
 	}
+	// Force the materialize branch (a plain Fork now shares) — see
+	// TestForkFastPathMatchesSlowPath's doc comment.
+	SetForkMaterializeForTest(true)
+	t.Cleanup(func() { SetForkMaterializeForTest(false) })
 	w := newWSOnFakeS3(t)
 	if err := w.Create("app"); err != nil {
 		t.Fatal(err)
@@ -827,6 +837,193 @@ func TestForkFastPathFiresOnS3WithinSizeLimit(t *testing.T) {
 	}
 	if !bytes.Equal(srcDump, childDump) {
 		t.Fatalf("child diverges from source on the S3 fast path:\n--- src ---\n%s\n--- child ---\n%s", srcDump, childDump)
+	}
+}
+
+// TestSharedForkWritesZeroDataObjects pins the copy-on-write fork's core
+// promise: a fork whose resolved base chain is shallow (< ForkShareMaxDepth)
+// SHARES — it writes NO snapshot or segment objects in its own lineage, only
+// the durable base pointer (base.json), and its ref carries the reporting
+// mirror pointing at the parent lineage and fork txid.
+func TestSharedForkWritesZeroDataObjects(t *testing.T) {
+	if _, err := exec.LookPath("sqlite3"); err != nil {
+		t.Skip("sqlite3 CLI not on PATH")
+	}
+	w := newWS(t)
+	if err := w.Create("app"); err != nil {
+		t.Fatal(err)
+	}
+	path, _ := w.Checkout("app", "main")
+	if out, err := exec.Command("sqlite3", path,
+		"CREATE TABLE t (v); INSERT INTO t VALUES (1),(2);").CombinedOutput(); err != nil {
+		t.Fatalf("seed: %v: %s", err, out)
+	}
+	if _, err := w.Checkpoint("app", "main", "v1", nil); err != nil {
+		t.Fatal(err)
+	}
+	srcRef, _, err := w.Store.GetRef("app", "main")
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	txid, err := w.Fork("app", "main", "shared", "", 0, nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	cref, _, err := w.Store.GetRef("app", "shared")
+	if err != nil {
+		t.Fatal(err)
+	}
+	// The ref's reporting mirror: parent lineage and fork txid.
+	if cref.Base == nil || cref.Base.Lineage != srcRef.Lineage || cref.Base.TXID != txid {
+		t.Fatalf("child ref Base = %+v, want {Lineage:%s TXID:%d}", cref.Base, srcRef.Lineage, txid)
+	}
+	if cref.Lineage == srcRef.Lineage {
+		t.Fatal("child must still have its own lineage id")
+	}
+	// Zero data objects: no key under the child's lineage prefix parses as a
+	// snapshot or segment member. The base.json is expected and is the only
+	// object there.
+	keys, err := w.Store.B.List(store.LineagePrefix(cref.Lineage))
+	if err != nil {
+		t.Fatal(err)
+	}
+	sawBase := false
+	for _, k := range keys {
+		if _, ok := store.ParseMemberKey(k); ok {
+			t.Fatalf("shared fork must write no snapshot/segment objects, found %s", k)
+		}
+		if k == store.BaseKey(cref.Lineage) {
+			sawBase = true
+		}
+	}
+	if !sawBase {
+		t.Fatalf("shared fork must write the durable base object %s, got %v",
+			store.BaseKey(cref.Lineage), keys)
+	}
+	// The durable base object — resolution's source of truth — must agree
+	// with the ref's mirror.
+	chain, err := w.Store.Chain(cref.Lineage, txid)
+	if err != nil {
+		t.Fatalf("shared child chain must resolve through the base: %v", err)
+	}
+	for _, m := range chain {
+		if !strings.HasPrefix(m.Key, store.LineagePrefix(srcRef.Lineage)) {
+			t.Fatalf("fork-point member %s not in the parent lineage", m.Key)
+		}
+	}
+}
+
+// TestSharedForkReadsResolveAtForkPoint: a shared fork materializes to
+// exactly the parent's content at the fork point, resolved purely through
+// the base pointer (the child lineage holds no data objects at all).
+func TestSharedForkReadsResolveAtForkPoint(t *testing.T) {
+	if _, err := exec.LookPath("sqlite3"); err != nil {
+		t.Skip("sqlite3 CLI not on PATH")
+	}
+	w := newWS(t)
+	if err := w.Create("app"); err != nil {
+		t.Fatal(err)
+	}
+	path, _ := w.Checkout("app", "main")
+	if out, err := exec.Command("sqlite3", path,
+		"CREATE TABLE t (v); INSERT INTO t VALUES ('a'),('b'),('c');").CombinedOutput(); err != nil {
+		t.Fatalf("seed: %v: %s", err, out)
+	}
+	if _, err := w.Checkpoint("app", "main", "v1", nil); err != nil {
+		t.Fatal(err)
+	}
+	parentDump, err := exec.Command("sqlite3", path, ".dump").Output()
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	if _, err := w.Fork("app", "main", "shared", "", 0, nil); err != nil {
+		t.Fatal(err)
+	}
+	cpath, err := w.Checkout("app", "shared")
+	if err != nil {
+		t.Fatalf("checkout of a shared fork must resolve through the base: %v", err)
+	}
+	childDump, err := exec.Command("sqlite3", cpath, ".dump").Output()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !bytes.Equal(parentDump, childDump) {
+		t.Fatalf("shared fork diverges from parent at the fork point:\n--- parent ---\n%s\n--- child ---\n%s",
+			parentDump, childDump)
+	}
+}
+
+// TestSharedForkMatchesMaterializedFork: byte-equivalence — a shared fork
+// and a force-materialized fork of the SAME point produce identical .dump
+// output. The two paths must be observationally interchangeable.
+func TestSharedForkMatchesMaterializedFork(t *testing.T) {
+	if _, err := exec.LookPath("sqlite3"); err != nil {
+		t.Skip("sqlite3 CLI not on PATH")
+	}
+	w := newWS(t)
+	if err := w.Create("app"); err != nil {
+		t.Fatal(err)
+	}
+	path, _ := w.Checkout("app", "main")
+	if out, err := exec.Command("sqlite3", path,
+		"CREATE TABLE t (v); INSERT INTO t VALUES (1),(2),(3);").CombinedOutput(); err != nil {
+		t.Fatalf("seed: %v: %s", err, out)
+	}
+	if _, err := w.Checkpoint("app", "main", "v1", nil); err != nil {
+		t.Fatal(err)
+	}
+
+	if _, err := w.Fork("app", "main", "shared", "", 0, nil); err != nil {
+		t.Fatal(err)
+	}
+	SetForkMaterializeForTest(true)
+	t.Cleanup(func() { SetForkMaterializeForTest(false) })
+	if _, err := w.Fork("app", "main", "mat", "", 0, nil); err != nil {
+		t.Fatal(err)
+	}
+	SetForkMaterializeForTest(false)
+
+	// Shape check: the shared child has a base and no data objects; the
+	// materialized child has data objects, no base pointer, and no base.json.
+	sref, _, err := w.Store.GetRef("app", "shared")
+	if err != nil {
+		t.Fatal(err)
+	}
+	mref, _, err := w.Store.GetRef("app", "mat")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if sref.Base == nil {
+		t.Fatal("shared child must carry a base pointer")
+	}
+	if mref.Base != nil {
+		t.Fatalf("materialized child must not carry a base pointer, got %+v", mref.Base)
+	}
+	if _, _, err := w.Store.B.Get(store.BaseKey(mref.Lineage)); !errors.Is(err, store.ErrNotFound) {
+		t.Fatalf("materialized child must have no base.json, Get err = %v", err)
+	}
+
+	spath, err := w.Checkout("app", "shared")
+	if err != nil {
+		t.Fatal(err)
+	}
+	mpath, err := w.Checkout("app", "mat")
+	if err != nil {
+		t.Fatal(err)
+	}
+	sharedDump, err := exec.Command("sqlite3", spath, ".dump").Output()
+	if err != nil {
+		t.Fatal(err)
+	}
+	matDump, err := exec.Command("sqlite3", mpath, ".dump").Output()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !bytes.Equal(sharedDump, matDump) {
+		t.Fatalf("shared and materialized forks of the same point diverge:\n--- shared ---\n%s\n--- materialized ---\n%s",
+			sharedDump, matDump)
 	}
 }
 

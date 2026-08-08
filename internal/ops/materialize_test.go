@@ -81,12 +81,18 @@ func TestCheckoutReadsASnapshotPlusSegments(t *testing.T) {
 	}
 }
 
-// TestForkFromAChainProducesASingleSnapshot proves a child's lineage is not a
-// copied chain: it holds exactly one snapshot object, so it stays independent.
+// TestForkFromAChainProducesASingleSnapshot proves a MATERIALIZED child's
+// lineage is not a copied chain: it holds exactly one snapshot object, so it
+// stays independent. Since the copy-on-write shared fork landed, a plain
+// Fork of a short chain shares instead (see TestSharedForkWritesZeroDataObjects),
+// so this pins the materialize branch — the fork-time snapshot floor — via
+// the test hook.
 func TestForkFromAChainProducesASingleSnapshot(t *testing.T) {
 	if _, err := exec.LookPath("sqlite3"); err != nil {
 		t.Skip("sqlite3 CLI not on PATH")
 	}
+	SetForkMaterializeForTest(true)
+	t.Cleanup(func() { SetForkMaterializeForTest(false) })
 	w := newWS(t)
 	if err := w.Create("app"); err != nil {
 		t.Fatal(err)
@@ -118,11 +124,15 @@ func TestForkFromAChainProducesASingleSnapshot(t *testing.T) {
 // TestForkAtHeadAfterASegmentProducesASingleSnapshot proves the fork read
 // side resolves the chain (not a direct snapshot lookup) when HEAD sits past
 // the last snapshot on a hand-built segment, and still lands exactly one
-// snapshot object in the child's fresh lineage.
+// snapshot object in the child's fresh lineage. Pinned to the materialize
+// branch via the test hook — see TestForkFromAChainProducesASingleSnapshot's
+// doc comment.
 func TestForkAtHeadAfterASegmentProducesASingleSnapshot(t *testing.T) {
 	if _, err := exec.LookPath("sqlite3"); err != nil {
 		t.Skip("sqlite3 CLI not on PATH")
 	}
+	SetForkMaterializeForTest(true)
+	t.Cleanup(func() { SetForkMaterializeForTest(false) })
 	w := newWS(t)
 	if err := w.Create("app"); err != nil {
 		t.Fatal(err)

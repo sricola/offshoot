@@ -18,6 +18,12 @@ package ops
 // restore it (e.g. via t.Cleanup) since it is process-global test state.
 func SetForkSlowPathForTest(v bool) { forkSlowPathForTest = v }
 
+// SetForkMaterializeForTest forces (true) or releases (false) Fork's
+// MATERIALIZE branch without suppressing the fast object-copy inside it —
+// see forkMaterializeForTest's doc comment. Callers should restore it (e.g.
+// via t.Cleanup) since it is process-global test state.
+func SetForkMaterializeForTest(v bool) { forkMaterializeForTest = v }
+
 // ForkFastPathHits returns how many times the fast object-copy fork path
 // has fired since process start.
 func ForkFastPathHits() int { return int(forkFastPathHits.Load()) }

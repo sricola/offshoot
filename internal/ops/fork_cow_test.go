@@ -1,0 +1,137 @@
+// Fork-time snapshot-floor tests. External package (ops_test) because
+// building a deep resolved chain requires session's flush cadence (segments,
+// not the CLI Checkpoint's always-a-snapshot), and session imports ops — see
+// gc_chain_test.go's package doc comment for the cycle rationale.
+package ops_test
+
+import (
+	"context"
+	"errors"
+	"fmt"
+	"os/exec"
+	"testing"
+
+	"github.com/sricola/offshoot/internal/ops"
+	"github.com/sricola/offshoot/internal/session"
+	"github.com/sricola/offshoot/internal/store"
+)
+
+// TestForkTimeFloorMaterializesDeepChain: a fork whose resolved base chain
+// already has >= ops.ForkShareMaxDepth members must NOT share — it
+// materializes a fresh snapshot floor in its own lineage (Base nil, no
+// base.json), so no fork spine's resolved chain ever exceeds the bound. A
+// control fork taken while the chain was still shallow shares as usual.
+func TestForkTimeFloorMaterializesDeepChain(t *testing.T) {
+	if _, err := exec.LookPath("sqlite3"); err != nil {
+		t.Skip("sqlite3 CLI not on PATH")
+	}
+	w := newWS(t)
+	if err := w.Create("app"); err != nil {
+		t.Fatal(err)
+	}
+	// SnapshotEvery far above the flush count: after the settling flush's
+	// forced full snapshot, every flush appends a segment, growing the
+	// resolved chain by one per flush.
+	s, err := session.Open(context.Background(), session.Options{
+		WS: w, DB: "app", Branch: "main", SnapshotEvery: 1000,
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer s.Close()
+	if out, err := exec.Command("sqlite3", s.CheckoutPath(), "CREATE TABLE t (v);").CombinedOutput(); err != nil {
+		t.Fatalf("CREATE TABLE: %v: %s", err, out)
+	}
+	// Settling flush: the chain's one snapshot.
+	if _, err := s.Flush("", nil); err != nil {
+		t.Fatal(err)
+	}
+
+	// Control: fork while the chain is shallow — must share.
+	if _, err := w.Fork("app", "main", "shallow", "", 0, nil); err != nil {
+		t.Fatal(err)
+	}
+	shallowRef, _, err := w.Store.GetRef("app", "shallow")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if shallowRef.Base == nil {
+		t.Fatal("control fork of a shallow chain must share (Base set)")
+	}
+
+	// Grow the chain to >= ForkShareMaxDepth members (snapshot + segments).
+	for i := 0; i < ops.ForkShareMaxDepth; i++ {
+		if out, err := exec.Command("sqlite3", s.CheckoutPath(),
+			fmt.Sprintf("INSERT INTO t VALUES (%d);", i)).CombinedOutput(); err != nil {
+			t.Fatalf("INSERT %d: %v: %s", i, err, out)
+		}
+		if _, err := s.Flush("", nil); err != nil {
+			t.Fatalf("flush %d: %v", i, err)
+		}
+	}
+	if err := s.Close(); err != nil {
+		t.Fatal(err)
+	}
+	ref, _, err := w.Store.GetRef("app", "main")
+	if err != nil {
+		t.Fatal(err)
+	}
+	chain, err := w.Store.Chain(ref.Lineage, ref.HeadTXID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(chain) < ops.ForkShareMaxDepth {
+		t.Fatalf("test precondition: resolved chain has %d members, want >= %d",
+			len(chain), ops.ForkShareMaxDepth)
+	}
+
+	// The floor: this fork must materialize, not share.
+	if _, err := w.Fork("app", "main", "deep", "", 0, nil); err != nil {
+		t.Fatal(err)
+	}
+	dref, _, err := w.Store.GetRef("app", "deep")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if dref.Base != nil {
+		t.Fatalf("deep fork must materialize (Base nil), got Base %+v", dref.Base)
+	}
+	if _, _, err := w.Store.B.Get(store.BaseKey(dref.Lineage)); !errors.Is(err, store.ErrNotFound) {
+		t.Fatalf("deep fork must write no base.json, Get err = %v", err)
+	}
+	keys, err := w.Store.B.List(store.LineagePrefix(dref.Lineage))
+	if err != nil {
+		t.Fatal(err)
+	}
+	sawSnapshot := false
+	for _, k := range keys {
+		if m, ok := store.ParseMemberKey(k); ok && m.Snapshot {
+			sawSnapshot = true
+		}
+	}
+	if !sawSnapshot {
+		t.Fatalf("deep fork must own a snapshot floor, lineage holds %v", keys)
+	}
+	// And its resolved chain is exactly that floor: depth reset to one.
+	dchain, err := w.Store.Chain(dref.Lineage, dref.HeadTXID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(dchain) != 1 || !dchain[0].Snapshot {
+		t.Fatalf("deep fork's resolved chain = %d members (snapshot=%v), want exactly its own snapshot",
+			len(dchain), len(dchain) > 0 && dchain[0].Snapshot)
+	}
+
+	// Functional: the materialized child reads the full state.
+	cpath, err := w.Checkout("app", "deep")
+	if err != nil {
+		t.Fatal(err)
+	}
+	got, err := exec.Command("sqlite3", cpath, "SELECT count(*) FROM t;").Output()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if string(got) != fmt.Sprintf("%d\n", ops.ForkShareMaxDepth) {
+		t.Fatalf("deep fork content = %q, want %d rows", got, ops.ForkShareMaxDepth)
+	}
+}

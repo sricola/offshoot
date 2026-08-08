@@ -655,8 +655,8 @@ func TestLineageBaseAbsentIsNilNil(t *testing.T) {
 // write is refused with ErrCAS, and the first value round-trips.
 func TestWriteLineageBaseImmutable(t *testing.T) {
 	s := newStore(t)
-	if err := s.writeLineageBase("child", BasePointer{Lineage: "parent", TXID: 3}); err != nil {
-		t.Fatalf("first writeLineageBase err = %v", err)
+	if err := s.WriteLineageBase("child", BasePointer{Lineage: "parent", TXID: 3}); err != nil {
+		t.Fatalf("first WriteLineageBase err = %v", err)
 	}
 	got, err := s.lineageBase("child")
 	if err != nil {
@@ -665,9 +665,27 @@ func TestWriteLineageBaseImmutable(t *testing.T) {
 	if got == nil || got.Lineage != "parent" || got.TXID != 3 {
 		t.Fatalf("round-trip base = %+v", got)
 	}
-	err = s.writeLineageBase("child", BasePointer{Lineage: "other", TXID: 9})
+	err = s.WriteLineageBase("child", BasePointer{Lineage: "other", TXID: 9})
 	if !errors.Is(err, ErrCAS) {
 		t.Fatalf("second write must be ErrCAS, got %v", err)
+	}
+}
+
+// TestWriteLineageBaseRejectsSelfBase: a base naming the lineage itself is
+// refused before any write lands — Chain resolves a based lineage by
+// recursing into its base, so a durable self-base would recurse forever.
+func TestWriteLineageBaseRejectsSelfBase(t *testing.T) {
+	s := newStore(t)
+	if err := s.WriteLineageBase("child", BasePointer{Lineage: "child", TXID: 3}); err == nil {
+		t.Fatal("self-base must be refused")
+	}
+	// Nothing durable may have landed: the refusal must happen before the write.
+	b, err := s.lineageBase("child")
+	if err != nil {
+		t.Fatalf("lineageBase err = %v", err)
+	}
+	if b != nil {
+		t.Fatalf("refused self-base must not persist, got %+v", b)
 	}
 }
 
@@ -694,7 +712,7 @@ func TestChainBaseConcatenatesChildSegments(t *testing.T) {
 	putObj(t, s, SegmentKey("parent", 1, 2, 2))
 	putObj(t, s, SegmentKey("parent", 1, 3, 3))
 	// Child C bases on P at txid 3, diverges with its own segments 4,5.
-	if err := s.writeLineageBase("child", BasePointer{Lineage: "parent", TXID: 3}); err != nil {
+	if err := s.WriteLineageBase("child", BasePointer{Lineage: "parent", TXID: 3}); err != nil {
 		t.Fatal(err)
 	}
 	putObj(t, s, SegmentKey("child", 1, 4, 4))
@@ -730,6 +748,57 @@ func TestChainBaseConcatenatesChildSegments(t *testing.T) {
 	}
 }
 
+// A shared child that has grown its OWN snapshot (a divergence floor —
+// ops.Checkpoint always writes one) must anchor resolution at that snapshot
+// for any target it covers: the whole chain lives in the child lineage and
+// the base is never consulted. Below the child snapshot, the seam path still
+// applies unchanged.
+func TestChainChildOwnSnapshotAnchorsResolution(t *testing.T) {
+	s := newStore(t)
+	// Parent P: snapshot@1 .. segment@3 (the fork point).
+	putObj(t, s, SnapshotKey("parent", 1, 1))
+	putObj(t, s, SegmentKey("parent", 1, 2, 2))
+	putObj(t, s, SegmentKey("parent", 1, 3, 3))
+	// Child C bases on P at 3, diverges with segment@4, then its own FULL
+	// snapshot@5 (what ops.Checkpoint writes), then segment@6.
+	if err := s.WriteLineageBase("child", BasePointer{Lineage: "parent", TXID: 3}); err != nil {
+		t.Fatal(err)
+	}
+	putObj(t, s, SegmentKey("child", 1, 4, 4))
+	putObj(t, s, SnapshotKey("child", 1, 5))
+	putObj(t, s, SegmentKey("child", 1, 6, 6))
+
+	// At/above the child snapshot: anchored at the child's own snapshot,
+	// no parent member anywhere.
+	got, err := s.Chain("child", 6)
+	if err != nil {
+		t.Fatalf("Chain err = %v", err)
+	}
+	want := []string{
+		SnapshotKey("child", 1, 5),
+		SegmentKey("child", 1, 6, 6),
+	}
+	if !reflect.DeepEqual(keysOf(got), want) {
+		t.Fatalf("chain keys =\n %v\nwant\n %v", keysOf(got), want)
+	}
+
+	// Below the child snapshot: the seam path is unchanged — parent chain to
+	// the fork point, then the child's segment.
+	got, err = s.Chain("child", 4)
+	if err != nil {
+		t.Fatalf("Chain err = %v", err)
+	}
+	want = []string{
+		SnapshotKey("parent", 1, 1),
+		SegmentKey("parent", 1, 2, 2),
+		SegmentKey("parent", 1, 3, 3),
+		SegmentKey("child", 1, 4, 4),
+	}
+	if !reflect.DeepEqual(keysOf(got), want) {
+		t.Fatalf("chain keys =\n %v\nwant\n %v", keysOf(got), want)
+	}
+}
+
 // (b) MUTATION test — the never-merge-across-lineages invariant. Child epoch 1
 // and parent epoch 2 both carry an object covering the SAME txid range just
 // past the fork seam. Chain MUST return the CHILD's bytes for the child's
@@ -746,7 +815,7 @@ func TestChainNeverMergesAcrossLineages(t *testing.T) {
 	putObj(t, s, SegmentKey("parent", 1, 3, 3))
 	putObj(t, s, SegmentKey("parent", 2, 4, 4)) // parent's OWN txid 4, epoch 2
 	// Child C bases on P at 3, writes its OWN txid 4 under epoch 1.
-	if err := s.writeLineageBase("child", BasePointer{Lineage: "parent", TXID: 3}); err != nil {
+	if err := s.WriteLineageBase("child", BasePointer{Lineage: "parent", TXID: 3}); err != nil {
 		t.Fatal(err)
 	}
 	putObj(t, s, SegmentKey("child", 1, 4, 4)) // child's txid 4, epoch 1
@@ -792,7 +861,7 @@ func TestChainFencedParentOrphanAtForkPoint(t *testing.T) {
 	putObj(t, s, SegmentKey("parent", 1, 2, 2))
 	putObj(t, s, SegmentKey("parent", 1, 3, 3)) // original fork-point object
 	putObj(t, s, SegmentKey("parent", 2, 3, 3)) // parent bumped epoch, rewrote txid 3
-	if err := s.writeLineageBase("child", BasePointer{Lineage: "parent", TXID: 3}); err != nil {
+	if err := s.WriteLineageBase("child", BasePointer{Lineage: "parent", TXID: 3}); err != nil {
 		t.Fatal(err)
 	}
 	putObj(t, s, SegmentKey("child", 1, 4, 4))
@@ -828,13 +897,13 @@ func TestChainForkOfForkTransitive(t *testing.T) {
 	putObj(t, s, SnapshotKey("a", 1, 1))
 	putObj(t, s, SegmentKey("a", 1, 2, 2))
 	// B bases on A at 2, has its own txids 3,4 (Tc=4).
-	if err := s.writeLineageBase("b", BasePointer{Lineage: "a", TXID: 2}); err != nil {
+	if err := s.WriteLineageBase("b", BasePointer{Lineage: "a", TXID: 2}); err != nil {
 		t.Fatal(err)
 	}
 	putObj(t, s, SegmentKey("b", 1, 3, 3))
 	putObj(t, s, SegmentKey("b", 1, 4, 4))
 	// C bases on B at 4, has its own txid 5.
-	if err := s.writeLineageBase("c", BasePointer{Lineage: "b", TXID: 4}); err != nil {
+	if err := s.WriteLineageBase("c", BasePointer{Lineage: "b", TXID: 4}); err != nil {
 		t.Fatal(err)
 	}
 	putObj(t, s, SegmentKey("c", 1, 5, 5))
@@ -865,7 +934,7 @@ func TestChainTargetAtOrBelowBaseResolvesInBase(t *testing.T) {
 	putObj(t, s, SnapshotKey("parent", 1, 1))
 	putObj(t, s, SegmentKey("parent", 1, 2, 2))
 	putObj(t, s, SegmentKey("parent", 1, 3, 3))
-	if err := s.writeLineageBase("child", BasePointer{Lineage: "parent", TXID: 3}); err != nil {
+	if err := s.WriteLineageBase("child", BasePointer{Lineage: "parent", TXID: 3}); err != nil {
 		t.Fatal(err)
 	}
 	// A child object that must NOT appear when reading at/below the fork point.
@@ -908,11 +977,11 @@ func TestChainResolvesWithoutAnyRefs(t *testing.T) {
 	// A -> B -> C, no PutRef anywhere in this test.
 	putObj(t, s, SnapshotKey("a", 1, 1))
 	putObj(t, s, SegmentKey("a", 1, 2, 2))
-	if err := s.writeLineageBase("b", BasePointer{Lineage: "a", TXID: 2}); err != nil {
+	if err := s.WriteLineageBase("b", BasePointer{Lineage: "a", TXID: 2}); err != nil {
 		t.Fatal(err)
 	}
 	putObj(t, s, SegmentKey("b", 1, 3, 3))
-	if err := s.writeLineageBase("c", BasePointer{Lineage: "b", TXID: 3}); err != nil {
+	if err := s.WriteLineageBase("c", BasePointer{Lineage: "b", TXID: 3}); err != nil {
 		t.Fatal(err)
 	}
 	putObj(t, s, SegmentKey("c", 1, 4, 4))
@@ -947,7 +1016,7 @@ func TestChainBaseErrorsOnChildHole(t *testing.T) {
 	s := newStore(t)
 	putObj(t, s, SnapshotKey("parent", 1, 1))
 	putObj(t, s, SegmentKey("parent", 1, 2, 2))
-	if err := s.writeLineageBase("child", BasePointer{Lineage: "parent", TXID: 2}); err != nil {
+	if err := s.WriteLineageBase("child", BasePointer{Lineage: "parent", TXID: 2}); err != nil {
 		t.Fatal(err)
 	}
 	// Child has txid 3 and 5, but not 4: a hole.

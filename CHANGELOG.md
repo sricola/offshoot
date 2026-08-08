@@ -15,6 +15,24 @@ version if you depend on format stability.
 
 ### Added
 
+- **Copy-on-write forks: base-pointer sharing with a fork-time snapshot
+  floor** (copy-on-write Task 3): `ops.Fork` no longer always copies a full
+  snapshot into the child's lineage. When the fork point's fully-resolved
+  chain is shallower than the new `ops.ForkShareMaxDepth` bound (16,
+  mirroring the session snapshot cadence), the fork SHARES: it writes zero
+  snapshot/segment objects — only the durable per-lineage base pointer
+  (`data/<lineage>/base.json`, now written via the exported
+  `store.WriteLineageBase`, which additionally refuses a self-referential
+  base) plus the child ref carrying the `Base` reporting mirror, after
+  `EnsureLayoutV2` bumps the manifest so pre-CoW binaries are locked out.
+  Reads resolve through the parent's chain (Task 2's base-following
+  `Chain`). When the resolved chain already reaches the bound, Fork falls
+  back to the existing materialize path (one fresh snapshot floor), so no
+  fork spine's resolved chain ever exceeds the bound; the M2
+  reflink/CopyObject fast path is now only reachable from Fork on that
+  fallback. `Chain` additionally anchors at a shared child's own snapshot
+  once one exists (e.g. a CLI `checkpoint` on the forked branch), keeping
+  every read on the child self-contained past its first divergence floor.
 - **Base-pointer field and LayoutVersion 2** (copy-on-write Task 1):
   `store.Ref` gains a new `Base *BasePointer` field (`BasePointer{Lineage
   string; TXID uint64}`, `json:"base,omitempty"`) — deliberately separate
