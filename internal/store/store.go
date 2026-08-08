@@ -365,6 +365,48 @@ func (s *Store) WriteLineageBase(lineage string, b BasePointer) error {
 	return nil
 }
 
+// BaseSpine returns every ANCESTOR lineage in lineage's base spine, nearest
+// first: the lineage's own base, that base's base, and so on until a lineage
+// with no base object. The starting lineage itself is NOT included; a lineage
+// with no base returns an empty spine. It is a thin walk over lineageBase —
+// deliberately NOT a reimplementation of Chain's member resolution — for
+// callers (GC's reachability mark) that need the set of lineages whose
+// base.json objects resolution will read, independent of which of them
+// contribute chain members: a pass-through lineage (forked but never
+// diverged) contributes zero members yet its base.json IS read.
+//
+// An INVARIANT of the walk: lineage L's base.json exists exactly when the
+// walk out of L found a base — i.e. BaseKey(L) exists for the starting
+// lineage iff the spine is non-empty, and for spine[i] iff i+1 < len(spine)
+// (the walk ended at spine[len-1] precisely because it has no base object).
+// GC leans on this to mark exactly the existing base.json objects without
+// extra existence probes.
+//
+// WriteLineageBase's create-only, must-point-at-an-existing-lineage rules
+// mean a cycle cannot be constructed through this binary's writers, but the
+// walk still guards against one defensively (a corrupt or hand-edited
+// store): revisiting a lineage fails loudly rather than looping forever.
+func (s *Store) BaseSpine(lineage string) ([]string, error) {
+	var spine []string
+	seen := map[string]bool{lineage: true}
+	cur := lineage
+	for {
+		b, err := s.lineageBase(cur)
+		if err != nil {
+			return nil, err
+		}
+		if b == nil {
+			return spine, nil
+		}
+		if seen[b.Lineage] {
+			return nil, fmt.Errorf("store: base spine of %s revisits lineage %s (cycle)", lineage, b.Lineage)
+		}
+		seen[b.Lineage] = true
+		spine = append(spine, b.Lineage)
+		cur = b.Lineage
+	}
+}
+
 // SegmentKey locates an incremental segment covering (minTXID, maxTXID].
 // Sorting by key sorts by maxTXID, so a lexical List is already in apply
 // order.

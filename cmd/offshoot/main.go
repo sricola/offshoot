@@ -657,7 +657,7 @@ func run(args []string) error {
 		if err != nil {
 			return err
 		}
-		fmt.Printf("gc: tombstoned %d, deleted %d lineages\n", tombstoned, deleted)
+		fmt.Printf("gc: tombstoned %d, deleted %d objects\n", tombstoned, deleted)
 		return nil
 	case "status":
 		// -ro-cache-budget is purely for DISPLAY here — like every other

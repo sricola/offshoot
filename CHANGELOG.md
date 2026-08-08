@@ -13,6 +13,43 @@ version if you depend on format stability.
 
 ## [Unreleased]
 
+### Changed
+
+- **GC is now an object-granular reachability collector** (copy-on-write
+  Task 5): the mark phase computes the live set as the union, over every
+  live branch, of its resolved chain (`store.Chain`, the same base-following
+  resolver the read path uses — never a reimplementation) at its head AND at
+  every checkpoint, transitively through copy-on-write base pointers, plus
+  the `base.json` object of every lineage along each branch's base spine
+  (a forked-but-never-diverged pass-through lineage contributes zero chain
+  members yet its `base.json` is still read during resolution, so it must
+  survive). This replaces the lineage-granular mark that could not see the
+  base closure at all — under it, a shared ancestor kept alive only by a
+  descendant's base pointer would have been swept out from under that
+  descendant (data loss). Sweep granularity follows: `gc/tombstones` now
+  maps individual object keys (stale lineage-keyed entries from the old
+  format are pruned harmlessly), the two-phase tombstone → grace → re-mark
+  → delete shape, the mint-this-run skip, and the clobber-safe unconditional
+  stone persist are all preserved at the new granularity, and both phases
+  follow the base closure. A destroyed parent now keeps exactly its
+  ≤ fork-point objects while its above-fork range (and any dead-below-head,
+  uncheckpointed objects in live lineages) is reclaimed. `GC`'s returned
+  `tombstoned`/`deleted` counts (and the `offshoot_gc_tombstoned_total` /
+  `offshoot_gc_deleted_total` / `offshoot_gc_backlog` metrics and the CLI
+  `gc` summary line) now count OBJECTS, not lineages. A per-pass cache
+  (memoized `List`/`Get` under the real resolver, plus per-(lineage, txid)
+  chain memoization) keeps a shared ancestor's prefix Listed once per pass
+  no matter how many descendants resolve into it. New `store.BaseSpine`
+  exposes the base-pointer ancestor walk. New tests cover: a parent kept
+  alive only by a child's base pointer; ≤base survives / >base reclaimed
+  after parent destroy; a MARK==READ equality property test against the
+  read path's own resolution; the ancestor-destroyed-mid-fork-of-fork
+  fault-injection race; a mixed store of full-copy and shared forks; old
+  checkpoints' snapshots surviving (union-over-checkpoints, not head-only);
+  and the pass-through lineage's `base.json` surviving — the head-only,
+  members-only-base-marking, and no-mint-skip regressions are each
+  mutation-verified to fail their test.
+
 ### Added
 
 - **Divergence floor: the session snapshot cadence now survives session
