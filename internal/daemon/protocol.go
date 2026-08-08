@@ -14,7 +14,8 @@ package daemon
 type Request struct {
 	// Op is one of: "open" | "flush" | "status" | "close" | "shutdown" |
 	// "create" | "checkout" | "fork" | "destroy" | "rollback" | "promote" |
-	// "touch" | "branches" | "dbs" | "export" | "checkout-at" | "subscribe".
+	// "compact" | "touch" | "branches" | "dbs" | "export" | "checkout-at" |
+	// "subscribe".
 	//
 	// "subscribe" (Milestone 4 Task 4a) is unlike every other op: it is
 	// UNIX-SOCKET-ONLY (a POST /rpc "subscribe" is refused — HTTP clients

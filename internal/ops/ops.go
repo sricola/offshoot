@@ -1326,3 +1326,92 @@ func (w *Workspace) Promote(db, source, target string, force bool) (uint64, erro
 	}
 	return txid, nil
 }
+
+// compactBeforeCASForTest, when non-nil, runs between Compact's snapshot
+// copy and its ref CAS — the window a concurrent ref write (a flush, a
+// touch) races. Test-only; process-global, restore via t.Cleanup, same
+// rules as forkSlowPathForTest.
+var compactBeforeCASForTest func()
+
+// Compact turns a shared fork back into a self-contained lineage — the
+// manual cord-cutter. The branch's full base-following chain at head is
+// re-encoded as ONE snapshot in a fresh lineage (copySnapshotToNewLineage,
+// exactly Promote's materialize step) and the ref is CAS-repointed at it
+// with Base cleared. The old lineage — including its base.json — is then
+// unreferenced by this branch, so once nothing else reads through it,
+// reachability GC reclaims it (and, transitively, whatever of the
+// ancestor's storage only this branch was keeping alive). No explicit
+// old-object deletion happens here; GC owns reclaim.
+//
+// A branch with no base pointer (Base == nil) is already self-contained:
+// compact is a NO-OP returning the current head txid — the postcondition
+// already holds, and erroring would make scripted "compact everything"
+// loops fail on exactly the branches that need nothing done.
+//
+// Checkpoints are RESET to {"compact": head txid}, like Promote (and
+// unlike Rollback's kept-checkpoint snapshot copies): old checkpoints
+// anchored on the shared ancestor would not resolve in the new
+// self-contained lineage. Preserving them Rollback-style (copy each kept
+// checkpoint's state into the new lineage) is a noted follow-up.
+//
+// The ref CAS is the point of no return, exactly as in Promote: a CAS
+// loss (a concurrent flush advanced the head) deletes the orphan snapshot
+// and returns a retry error — no internal retry loop, which would orphan
+// a lineage per attempt. The checkout refresh that follows is best-effort
+// and reports partial success on failure, same as Promote.
+func (w *Workspace) Compact(db, branch string) (uint64, error) {
+	if err := store.ValidateName(db); err != nil {
+		return 0, err
+	}
+	if err := store.ValidateName(branch); err != nil {
+		return 0, err
+	}
+	ref, etag, err := w.Store.GetRef(db, branch)
+	if err != nil {
+		return 0, err
+	}
+	if ref.Base == nil {
+		// Already self-contained: no-op, see the doc comment.
+		return ref.HeadTXID, nil
+	}
+	cp := headCheckpoint(ref)
+	txid := cp.TXID
+	lineage, _, err := w.copySnapshotToNewLineage(ref, cp)
+	if err != nil {
+		return 0, err
+	}
+	next := ref
+	next.Lineage, next.Epoch, next.HeadTXID, next.HeadEpoch = lineage, 1, txid, 1
+	next.Base = nil
+	next.Checkpoints = nil
+	next.SetCheckpoint("compact", store.Checkpoint{TXID: txid, Epoch: 1, CreatedAt: nowStamp()})
+	// A repoint is itself a revocation — same reasoning as Promote: clear
+	// the lease so the branch is immediately acquirable post-repoint.
+	next.LeaseHolder, next.LeaseExpiry = "", ""
+	next.Touch(time.Now())
+	if compactBeforeCASForTest != nil {
+		compactBeforeCASForTest()
+	}
+	if _, err := w.Store.PutRef(db, branch, next, etag); err != nil {
+		w.Store.B.Delete(store.SnapshotKey(lineage, 1, txid))
+		return 0, fmt.Errorf("ops: compact lost a race (retry): %w", err)
+	}
+	// Refresh the checkout if one exists and is quiescible.
+	path := w.CheckoutPath(db, branch)
+	if _, err := os.Stat(path); err == nil {
+		if err := quiesce(path); err != nil {
+			return txid, fmt.Errorf("ops: compacted, but checkout %s is in use and was NOT refreshed: %w", path, err)
+		}
+		checksum, err := w.materializeAt(next, headCheckpoint(next), path)
+		if err != nil {
+			return txid, fmt.Errorf("ops: compacted, but checkout %s could not be refreshed: %w", path, err)
+		}
+		// The checkout now equals committed state: refresh the fingerprint
+		// (identity too, since this repointed to a new lineage) so a later
+		// Fork sees it as clean rather than stale.
+		if err := writeSum(path, next.Lineage, next.HeadEpoch, txid, checksum); err != nil {
+			return txid, fmt.Errorf("ops: compacted, but checkout %s could not be refreshed: %w", path, err)
+		}
+	}
+	return txid, nil
+}

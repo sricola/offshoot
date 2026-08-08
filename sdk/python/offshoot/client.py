@@ -221,6 +221,12 @@ class Client:
         resp = self._call("promote", db=db, branch=source, name=onto, force=force)
         return cast(int, resp.get("txid", 0))
 
+    def compact(self, db: str, branch: str = "main") -> int:
+        """Make db@branch self-contained (drop its shared-fork base pointer);
+        returns the head txid. No-op on an already self-contained branch."""
+        resp = self._call("compact", db=db, branch=branch)
+        return cast(int, resp.get("txid", 0))
+
     def touch(self, db: str, branch: str, ttl: _TTL = None) -> None:
         """Reset db@branch's activity clock, optionally setting/clearing its TTL.
 

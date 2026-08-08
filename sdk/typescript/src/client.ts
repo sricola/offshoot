@@ -398,6 +398,13 @@ export class Client {
     return resp.txid ?? 0;
   }
 
+  /** Make db@branch self-contained (drop its shared-fork base pointer);
+   * returns the head txid. No-op on an already self-contained branch. */
+  async compact(db: string, branch: string): Promise<number> {
+    const resp = await this._call("compact", { db, branch });
+    return resp.txid ?? 0;
+  }
+
   /** Reset db@branch's activity clock, optionally setting/clearing its TTL.
    *
    * opts.ttl: omitted keeps the current TTL, a Go duration string sets it,
