@@ -132,3 +132,33 @@ func TestGCSweepEnumeratesRefsTwiceNotThrice(t *testing.T) {
 		t.Fatalf("stray object must be swept, Get err = %v", err)
 	}
 }
+
+// Repeated shared forks pay the EnsureLayoutV2 manifest Get ONCE per
+// process, not once per fork (perf audit L4): the layout version is
+// monotonic, so store.Store memoizes the ">= v2" observation after the
+// first check. Two shared forks: one manifest Get total.
+func TestSharedForksGetManifestOnce(t *testing.T) {
+	w := newWS(t)
+	if err := w.Create("app"); err != nil {
+		t.Fatal(err)
+	}
+	cb := newRPCCountBackend(w.Store.B)
+	w.Store.B = cb
+	for _, br := range []string{"fork1", "fork2"} {
+		if _, err := w.Fork("app", "main", br, "", 0, nil); err != nil {
+			t.Fatal(err)
+		}
+		ref, _, err := w.Store.GetRef("app", br)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if ref.Base == nil {
+			t.Fatalf("fork %s of a 1-member chain must share (Base set)", br)
+		}
+	}
+	// "offshoot.json" is store's manifest key (store.InitManifest/
+	// EnsureLayoutV2) — pinned here by name since the constant is unexported.
+	if n := cb.getCount("offshoot.json"); n != 1 {
+		t.Fatalf("two shared forks Got the manifest %d times, want exactly 1 (>= v2 must be memoized)", n)
+	}
+}

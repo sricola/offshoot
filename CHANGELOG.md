@@ -44,6 +44,13 @@ version if you depend on format stability.
   "never delete above a live head" rule sees exactly the refs the re-mark
   saw (one consistency window). GC results are identical.
 
+- **Repeated shared forks pay the layout-v2 manifest check once per
+  process, not once per fork** (perf audit L4). The layout version is
+  monotonic, so the store memoizes the "manifest already >= v2"
+  observation after the first EnsureLayoutV2; subsequent shared forks skip
+  the manifest Get entirely — 1 RPC saved per fork, ~15% of a shared
+  fork's total RPC bill.
+
 - **A CI image that loses sqlite3/sqldiff/promtool now fails loudly instead
   of silently skipping the integration suite green.** The ~96 copy-pasted
   `exec.LookPath` skip guards across the test suite collapsed into a shared

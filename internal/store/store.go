@@ -9,6 +9,7 @@ import (
 	"sort"
 	"strconv"
 	"strings"
+	"sync/atomic"
 	"time"
 )
 
@@ -212,7 +213,18 @@ func decodeRef(data []byte) (Ref, error) {
 	return r, nil
 }
 
-type Store struct{ B Backend }
+type Store struct {
+	B Backend
+
+	// layoutAtLeastV2 memoizes EnsureLayoutV2's "manifest already >=
+	// LayoutVersion" observation so repeated shared forks pay the manifest
+	// Get once per process instead of once per fork. Safe to cache because
+	// the layout version is monotonic (nothing ever lowers it): the flag
+	// only goes false -> true, a stale false merely re-does the (correct)
+	// Get, and a true is always still true. Atomic because a Store is
+	// shared across goroutines (e.g. the daemon's ops all hold one).
+	layoutAtLeastV2 atomic.Bool
+}
 
 func (s *Store) InitManifest() error {
 	m := Manifest{LayoutVersion: LayoutVersion, CreatedAt: time.Now().UTC().Format(time.RFC3339)}
@@ -247,7 +259,15 @@ func (s *Store) CheckManifest() error {
 // manifest to >= 2, that is re-checked and treated as success, not failure.
 // Called by ops.Fork's SHARE path before writing the first base ref, since
 // a base pointer must never land in a store an old binary could still open.
+//
+// The ">= 2" observation is memoized on the Store (layoutAtLeastV2, see its
+// field comment for why that is safe): after the first success this costs
+// zero RPCs, so a swarm of shared forks pays the manifest Get once, not once
+// per fork.
 func (s *Store) EnsureLayoutV2() error {
+	if s.layoutAtLeastV2.Load() {
+		return nil
+	}
 	for {
 		data, etag, err := s.B.Get(manifestKey)
 		if err != nil {
@@ -258,6 +278,7 @@ func (s *Store) EnsureLayoutV2() error {
 			return fmt.Errorf("store: corrupt manifest: %w", err)
 		}
 		if m.LayoutVersion >= LayoutVersion {
+			s.layoutAtLeastV2.Store(true)
 			return nil
 		}
 		m.LayoutVersion = LayoutVersion
@@ -273,6 +294,7 @@ func (s *Store) EnsureLayoutV2() error {
 			}
 			return err
 		}
+		s.layoutAtLeastV2.Store(true)
 		return nil
 	}
 }
