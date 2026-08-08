@@ -147,8 +147,8 @@ func TestRenewalEndsWhenBranchDestroyed(t *testing.T) {
 	defer s.Close()
 
 	// Force-destroy the branch this session holds the lease on. This deletes
-	// the ref directly via the same store call ops.Workspace.Destroy(force:
-	// true) makes (w.Store.DeleteRef), rather than going through Destroy
+	// the ref key directly on the backend (simulating an out-of-band
+	// destroy), rather than going through ops.Workspace.Destroy
 	// itself: Destroy also quiesces and removes the live checkout files,
 	// which — with a capture engine still actively polling that same
 	// checkout — triggers a second, unrelated race between the engine
@@ -170,7 +170,7 @@ func TestRenewalEndsWhenBranchDestroyed(t *testing.T) {
 	// again) present.
 	deadline := time.Now().Add(3 * time.Second)
 	for {
-		if err := w.Store.DeleteRef("app", "feature"); err != nil {
+		if err := w.Store.B.Delete(store.RefKey("app", "feature")); err != nil {
 			t.Fatal(err)
 		}
 		if _, _, err := w.Store.GetRef("app", "feature"); errors.Is(err, store.ErrNotFound) {
