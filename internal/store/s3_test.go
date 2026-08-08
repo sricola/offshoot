@@ -1,11 +1,14 @@
 package store_test
 
 import (
+	"bytes"
 	"context"
 	"errors"
 	"fmt"
 	"io"
 	"net/http"
+	"os"
+	"path/filepath"
 	"reflect"
 	"sort"
 	"strings"
@@ -114,6 +117,103 @@ func TestS3GetReader(t *testing.T) {
 
 	if _, _, err := rg.GetReader("nope"); !errors.Is(err, store.ErrNotFound) {
 		t.Fatalf("want ErrNotFound for a missing key, got %v", err)
+	}
+}
+
+// TestS3PutReaderIfWithFileBody exercises store.ReaderPutter against an
+// *os.File-backed io.Reader specifically — not the bytes.Reader the shared
+// conformance suite (storetest.RunConformance) uses everywhere. An *os.File
+// is the ACTUAL production shape: Session.flush's snapshot upload always
+// passes an *os.File opened on its encode-output scratch (see flush.go's
+// snapshot branch). That matters for the AWS SDK's SigV4 body handling —
+// this fake server is plain HTTP, so the SDK takes its
+// ComputePayloadSHA256-then-RewindStream path (see aws-sdk-go-v2's
+// aws/signer/v4/middleware.go: dynamicPayloadSigningMiddleware picks
+// UNSIGNED-PAYLOAD only over HTTPS), which reads the body once to hash it
+// then calls RewindStream to seek back to the start before the real send —
+// a real disk-backed io.Seeker exercises that rewind differently than an
+// already-in-memory bytes.Reader would. FakeS3's PUT handler reads the
+// request body fully (io.ReadAll(r.Body)) regardless of what produced it,
+// so a correct round-trip here proves the SDK actually sent the file's
+// bytes over the wire — not zero bytes, not a truncated read from a body
+// the rewind left mis-positioned.
+func TestS3PutReaderIfWithFileBody(t *testing.T) {
+	b := newFakeBacked(t)
+	rp, ok := b.(store.ReaderPutter)
+	if !ok {
+		t.Fatal("store.S3 must implement store.ReaderPutter")
+	}
+
+	dir := t.TempDir()
+	path := filepath.Join(dir, "snapshot-scratch.ltx")
+	// Larger than a single read buffer — meant to look like a real (if
+	// tiny) LTX encode-output scratch file, not a handful of bytes.
+	payload := []byte(strings.Repeat("file-backed-stream-", 4096))
+	if err := os.WriteFile(path, payload, 0o644); err != nil {
+		t.Fatal(err)
+	}
+
+	f, err := os.Open(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	etag, err := rp.PutReaderIf("data/x/from-file.ltx", f, int64(len(payload)), "")
+	f.Close()
+	if err != nil {
+		t.Fatalf("PutReaderIf with *os.File body: %v", err)
+	}
+	if etag == "" {
+		t.Error("PutReaderIf must return a non-empty etag")
+	}
+
+	// Round-trip via the buffered Get.
+	data, getEtag, err := b.Get("data/x/from-file.ltx")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !bytes.Equal(data, payload) {
+		t.Fatalf("Get after file-backed PutReaderIf: got %d bytes, want %d", len(data), len(payload))
+	}
+	if getEtag != etag {
+		t.Errorf("Get's etag %q != PutReaderIf's returned etag %q", getEtag, etag)
+	}
+
+	// Round-trip via GetReader too — proves both streaming directions
+	// (write from a file, read as a stream) agree on content.
+	rg, ok := b.(store.ReaderGetter)
+	if !ok {
+		t.Fatal("store.S3 must implement store.ReaderGetter")
+	}
+	r, _, err := rg.GetReader("data/x/from-file.ltx")
+	if err != nil {
+		t.Fatal(err)
+	}
+	got, err := io.ReadAll(r)
+	r.Close()
+	if err != nil || !bytes.Equal(got, payload) {
+		t.Fatalf("GetReader after file-backed PutReaderIf: got %d bytes, err %v", len(got), err)
+	}
+
+	// PutReader (unconditional overwrite) with a FRESH *os.File — mirrors
+	// flush.go's orphan-overwrite retry, which reopens the encode scratch
+	// from offset 0 after PutReaderIf's own reader is exhausted.
+	overwrite := []byte(strings.Repeat("file-backed-overwrite-", 2048))
+	if err := os.WriteFile(path, overwrite, 0o644); err != nil {
+		t.Fatal(err)
+	}
+	f2, err := os.Open(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	putErr := rp.PutReader("data/x/from-file.ltx", f2, int64(len(overwrite)))
+	f2.Close()
+	if putErr != nil {
+		t.Fatalf("PutReader with *os.File body: %v", putErr)
+	}
+
+	data, _, err = b.Get("data/x/from-file.ltx")
+	if err != nil || !bytes.Equal(data, overwrite) {
+		t.Fatalf("Get after file-backed PutReader overwrite: got %d bytes, err %v", len(data), err)
 	}
 }
 

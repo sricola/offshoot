@@ -296,6 +296,17 @@ func RunConformance(t *testing.T, keyPrefix string, newBackend func(t *testing.T
 			t.Fatalf("want ErrCAS on stale streamed etag, got %v", err)
 		}
 
+		// A CAS against a key that was NEVER written must also fail with
+		// ErrCAS, exactly like PutIf's CASOnMissingKeyFails subtest above —
+		// a nonempty ifMatch has nothing to compare against on an absent
+		// key, so it's a failed compare, not a create.
+		if _, err := rp.PutReaderIf(k("stream/never-written"), bytes.NewReader([]byte("v")), 1, "some-etag"); !errors.Is(err, store.ErrCAS) {
+			t.Fatalf("want ErrCAS for streamed CAS against an absent key, got %v", err)
+		}
+		if _, _, err := b.Get(k("stream/never-written")); !errors.Is(err, store.ErrNotFound) {
+			t.Fatalf("a rejected CAS against an absent key must not create it, got %v", err)
+		}
+
 		// PutReader is an unconditional overwrite, same as Put.
 		third := []byte("third-streamed-value-overwrite")
 		if err := rp.PutReader(k("stream/create-only"), bytes.NewReader(third), int64(len(third))); err != nil {
