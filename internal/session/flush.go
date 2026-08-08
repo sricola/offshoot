@@ -430,11 +430,12 @@ func (s *Session) flush(name string, meta map[string]string, auto bool) (txid ui
 		// whose job is preventing exactly that. Leave the object alone; at
 		// worst it's a harmless orphan that a future flush's overwrite path
 		// (above) reclaims, if and when it computes this same txid again.
-		// GC does NOT help here: it only tombstones and sweeps whole
-		// lineages once they become entirely unreachable (see
-		// ops.Workspace.GC) — it has no per-object sweep for an orphaned
-		// object sitting inside a still-live lineage. Reclaiming those is
-		// future work.
+		// GC (ops.Workspace.GC) is object-granular now, but its sweep's
+		// compensating rule deliberately never deletes a member object above
+		// a live ref's head in that ref's own lineage — precisely so this
+		// orphan stays re-creatable at the same key by the overwrite path
+		// above without racing a sweep; it is only reclaimed once the branch
+		// itself is gone.
 		if errors.Is(err, store.ErrCAS) {
 			if cur, _, gerr := st.GetRef(s.db, s.branch); gerr == nil &&
 				(cur.Lineage != ref.Lineage || cur.HeadTXID < txid) {

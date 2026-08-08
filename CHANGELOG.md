@@ -48,7 +48,18 @@ version if you depend on format stability.
   checkpoints' snapshots surviving (union-over-checkpoints, not head-only);
   and the pass-through lineage's `base.json` surviving — the head-only,
   members-only-base-marking, and no-mint-skip regressions are each
-  mutation-verified to fail their test.
+  mutation-verified to fail their test. Two review-driven hardenings close
+  data-loss windows the finer sweep granularity widened: (1) a tombstone
+  rescued by phase 2's re-mark (its object became reachable again) is now
+  *pruned* rather than kept, so the object's later legitimate death always
+  earns a fresh tombstone and a full grace period instead of being swept
+  against the stale timestamp; and (2) a **compensating rule** — the sweep
+  never deletes a member object above a live branch's head in that branch's
+  own lineage, because a session flush retrying an ambiguous ref write
+  re-creates exactly that key (such an orphan is unreachable by definition,
+  so reachability alone cannot protect it); it becomes sweepable once the
+  branch itself is gone. Both hardenings are mutation-verified by their own
+  tests.
 
 ### Added
 
