@@ -31,6 +31,11 @@ type Workspace struct {
 	Store *store.Store
 	Root  string
 	Spec  string
+	// SnapshotEvery is the snapshot cadence the fork-time floor bounds a
+	// shared fork's resolved base chain against; 0 means use the default
+	// (ForkShareMaxDepth). Set by the daemon from its configured session
+	// SnapshotEvery so the fork floor and the divergence floor agree.
+	SnapshotEvery int
 }
 
 // Metadata caps (design spec § Metadata; Milestone 3 Global Constraints):
@@ -838,13 +843,16 @@ var forkSlowPathForTest bool
 // materialize machinery at all from Fork.
 var forkMaterializeForTest bool
 
-// ForkShareMaxDepth is the fork-time snapshot-floor bound: a shared fork
-// whose FULLY-resolved base chain (transitive ancestors included) already
-// reaches this many members materializes a fresh floor snapshot instead of
+// ForkShareMaxDepth is the DEFAULT fork-time snapshot-floor bound, used
+// when Workspace.SnapshotEvery is unset (0): a shared fork whose
+// FULLY-resolved base chain (transitive ancestors included) already
+// reaches the bound materializes a fresh floor snapshot instead of
 // sharing, so no fork spine's resolved chain exceeds it. Mirrors
 // session.DefaultSnapshotEvery — the bound that keeps materialization
-// bounded (ops must not import internal/session, hence the local constant).
-// Not yet configurable per-session; follow-up.
+// bounded (ops must not import internal/session, hence the local
+// constant). A configured cadence overrides it via Workspace.SnapshotEvery
+// (the daemon sets that from its session SnapshotEvery, keeping the fork
+// floor and the divergence floor in agreement).
 const ForkShareMaxDepth = 16
 
 // forkFastPathHits counts how many times copySnapshotToNewLineage has taken
@@ -1063,12 +1071,19 @@ func (w *Workspace) Fork(db, srcBranch, newBranch, at string, ttl time.Duration,
 		base         *store.BasePointer
 		fast         bool
 	)
-	if len(baseMembers) >= ForkShareMaxDepth || forkMaterializeForTest || forkSlowPathForTest {
+	// The effective bound is the configured session cadence when set, so a
+	// daemon running SnapshotEvery below the default can't mint shared forks
+	// whose resolved chains exceed its own cadence.
+	bound := w.SnapshotEvery
+	if bound <= 0 {
+		bound = ForkShareMaxDepth
+	}
+	if len(baseMembers) >= bound || forkMaterializeForTest || forkSlowPathForTest {
 		// MATERIALIZE (the hybrid floor): copy the source snapshot into the
 		// child's own lineage so the child never references parent storage —
 		// exactly the pre-CoW fork. The M2 reflink/CopyObject fast path is
 		// now only reachable from Fork through here (and in practice fires
-		// only under the test hooks: the floor trips at ForkShareMaxDepth
+		// only under the test hooks: the floor trips at the bound's worth of
 		// members while the fast copy needs a single-member chain; Rollback
 		// and Promote remain its everyday callers).
 		//

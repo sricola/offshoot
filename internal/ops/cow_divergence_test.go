@@ -12,7 +12,6 @@ import (
 	"strings"
 	"testing"
 
-	"github.com/sricola/offshoot/internal/ops"
 	"github.com/sricola/offshoot/internal/session"
 	"github.com/sricola/offshoot/internal/store"
 )
@@ -47,13 +46,14 @@ func flushInserts(t *testing.T, s *session.Session, n int, val string) {
 //     resolves wholly in-child).
 //
 // Bound justification: a resolved chain is at most the shared spine below
-// the last materialized floor (< ForkShareMaxDepth members by the fork-time
-// floor's own trigger condition) plus the head level's own members since its
-// last snapshot (< SnapshotEvery by the cadence). ForkShareMaxDepth +
-// SnapshotEvery = 16 + 4 = 20 is therefore a safe ceiling a correct
-// implementation can never exceed, REGARDLESS of how many levels deep the
-// spine grows — which is exactly what makes 40 levels a falsifying probe
-// rather than a tautology.
+// the last materialized floor (< the fork floor's bound, by its own trigger
+// condition — here Workspace.SnapshotEvery = 4, set below the way the
+// daemon's SetSnapshotEvery sets it, so the fork floor tracks the session
+// cadence) plus the head level's own members since its last snapshot
+// (< SnapshotEvery by the cadence). SnapshotEvery + SnapshotEvery =
+// 4 + 4 = 8 is therefore a safe ceiling a correct implementation can never
+// exceed, REGARDLESS of how many levels deep the spine grows — which is
+// exactly what makes 40 levels a falsifying probe rather than a tautology.
 func TestDeepForkChainStaysBounded(t *testing.T) {
 	if _, err := exec.LookPath("sqlite3"); err != nil {
 		t.Skip("sqlite3 CLI not on PATH")
@@ -64,6 +64,10 @@ func TestDeepForkChainStaysBounded(t *testing.T) {
 		perLevel      = 2 // flushes (one insert each) written at every level
 	)
 	w := newWS(t)
+	// Align the fork-time floor with the session cadence, exactly as the
+	// daemon's SetSnapshotEvery does — this is what tightens the bound below
+	// from ForkShareMaxDepth+SnapshotEvery (16+4) to SnapshotEvery*2 (4+4).
+	w.SnapshotEvery = snapshotEvery
 	if err := w.Create("app"); err != nil {
 		t.Fatal(err)
 	}
@@ -114,7 +118,9 @@ func TestDeepForkChainStaysBounded(t *testing.T) {
 	// chain — not just the deepest level: a bug that let one mid-spine
 	// lineage's segments leak into every descendant would show up at the
 	// level where it happens, possibly below the deepest.
-	const bound = ops.ForkShareMaxDepth + snapshotEvery
+	// Fork floor bound (Workspace.SnapshotEvery, set above) + the head
+	// level's own members since its last snapshot (< SnapshotEvery).
+	const bound = snapshotEvery + snapshotEvery
 	maxSeen := 0
 	seamCrossed := false
 	for _, b := range branches {
@@ -127,7 +133,7 @@ func TestDeepForkChainStaysBounded(t *testing.T) {
 			t.Fatalf("chain for %s@%d: %v", b, ref.HeadTXID, err)
 		}
 		if len(chain) > bound {
-			t.Errorf("%s: resolved chain has %d members, bound is %d (ForkShareMaxDepth+SnapshotEvery)", b, len(chain), bound)
+			t.Errorf("%s: resolved chain has %d members, bound is %d (fork floor + SnapshotEvery)", b, len(chain), bound)
 		}
 		if len(chain) == 0 || !chain[0].Snapshot {
 			t.Errorf("%s: chain must start at a snapshot, got %+v", b, chain)
