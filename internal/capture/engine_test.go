@@ -473,6 +473,98 @@ func TestEngineTakeoverExpectedRestartIsNotRebase(t *testing.T) {
 	}
 }
 
+// TestOffsetPersistsOncePerBurst is the regression test for the batched
+// offset persistence scheme (audit M3): drainStep must NOT fsync the state
+// file per applied transaction — a burst of N transactions costs exactly one
+// state write (persistConsumed at the burst boundary, afterDrain), and an
+// idle pass with nothing drained costs zero. Poll is disabled (time.Hour) so
+// DrainNow is the only thing that can trigger a drain, making the burst
+// boundaries — and therefore the expected save count — fully deterministic.
+func TestOffsetPersistsOncePerBurst(t *testing.T) {
+	testutil.RequireSQLite3(t)
+	dir := t.TempDir()
+	src := filepath.Join(dir, "src.db")
+	db, err := sql.Open("sqlite3", src+"?_busy_timeout=5000")
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer db.Close()
+	if _, err := db.Exec("PRAGMA journal_mode=WAL"); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := db.Exec("CREATE TABLE t (id INTEGER PRIMARY KEY, v BLOB)"); err != nil {
+		t.Fatal(err)
+	}
+
+	rep := replay.New(filepath.Join(dir, "replica.db"))
+	e := NewEngine(Options{
+		DBPath:   src,
+		StateDir: dir,
+		Sink:     replicaSink{rep},
+		Poll:     time.Hour, // only DrainNow can trigger a drain
+	})
+	ctx, cancel := context.WithCancel(context.Background())
+	done := make(chan error, 1)
+	go func() { done <- e.Run(ctx) }()
+	defer func() { cancel(); <-done }()
+
+	// Wait for the initial rebase to complete DETERMINISTICALLY (not a
+	// sleep): rebase binds the reader and reacquires the read lock strictly
+	// before e.rebased increments, so once Rebased() == 1 every write below
+	// lands in the WAL and is captured via drainStep — not folded into the
+	// initial snapshot, which would silently shrink the burst this test is
+	// counting saves against.
+	waitDeadline := time.Now().Add(10 * time.Second)
+	for e.Rebased() == 0 {
+		if time.Now().After(waitDeadline) {
+			t.Fatal("initial rebase never completed")
+		}
+		time.Sleep(10 * time.Millisecond)
+	}
+
+	const txns = 50 // stays under the 64-frame takeover threshold
+	for i := 0; i < txns; i++ {
+		if _, err := db.Exec("INSERT INTO t (v) VALUES (randomblob(128))"); err != nil {
+			t.Fatal(err)
+		}
+	}
+
+	dctx, dcancel := context.WithTimeout(context.Background(), 10*time.Second)
+	defer dcancel()
+	if err := e.DrainNow(dctx); err != nil {
+		t.Fatalf("DrainNow() = %v, want nil", err)
+	}
+
+	// The burst applied all 50 transactions (verified below via waitEqual)
+	// with exactly ONE state persist — per-burst, not per-transaction.
+	if got := e.offsetSaves.Load(); got != 1 {
+		t.Errorf("offset saves after a %d-txn burst = %d, want exactly 1 (per-burst, not per-txn)", txns, got)
+	}
+
+	// The persisted state must reflect the burst: a real, advanced offset
+	// with Clean=false — batching moves WHEN the offset is written, not
+	// whether it is. Do not weaken this into "some file exists".
+	st, ok, err := LoadState(StatePath(dir))
+	if err != nil || !ok {
+		t.Fatalf("LoadState after burst: ok=%v err=%v", ok, err)
+	}
+	if st.Off == 0 || st.Clean {
+		t.Errorf("persisted state after burst = %+v, want a nonzero Off with Clean=false", st)
+	}
+
+	// An idle drain (nothing new committed) must not fsync at all.
+	dctx2, dcancel2 := context.WithTimeout(context.Background(), 10*time.Second)
+	defer dcancel2()
+	if err := e.DrainNow(dctx2); err != nil {
+		t.Fatalf("idle DrainNow() = %v, want nil", err)
+	}
+	if got := e.offsetSaves.Load(); got != 1 {
+		t.Errorf("offset saves after an idle drain = %d, want still 1 (idle passes must not fsync)", got)
+	}
+
+	waitEqual(t, src, rep, 10*time.Second)
+}
+
 // TestEngineDetectsMissedWritesAfterCrash is Task 7's core safety test:
 // after the engine is stopped (context cancelled, which exercises Run's
 // graceful ctx.Done()/shutdown() path — drain, lock release — strictly
