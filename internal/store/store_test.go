@@ -884,6 +884,47 @@ func TestChainSharedChildBackendErrorPropagates(t *testing.T) {
 	}
 }
 
+// A base-pointer cycle between lineages — constructible only by corrupting
+// the store directly (WriteLineageBase is create-only, rejects a self-base,
+// and always points at an already-existing lineage) — must make Chain fail
+// loudly with a cycle error, never recurse until the stack overflows.
+// Mirrors TestBaseSpine's hand-built cycle for the other base walker.
+func TestChainBasePointerCycleErrors(t *testing.T) {
+	s := newStore(t)
+	// x -> y -> x, via raw backend puts (bypassing WriteLineageBase's guards).
+	for from, to := range map[string]string{"x": "y", "y": "x"} {
+		data, err := json.Marshal(BasePointer{Lineage: to, TXID: 1})
+		if err != nil {
+			t.Fatal(err)
+		}
+		if err := s.B.Put(BaseKey(from), data); err != nil {
+			t.Fatal(err)
+		}
+	}
+	// Above the fork point (target > base.TXID): the seam path recurses
+	// x -> y -> x and must detect the revisit.
+	if _, err := s.Chain("x", 5); err == nil || !strings.Contains(err.Error(), "cycle") {
+		t.Fatalf("Chain over a base cycle must return a cycle error, got %v", err)
+	}
+	// At/below the fork point (target <= base.TXID): the resolve-in-base
+	// branch recurses the same way and must also be guarded.
+	if _, err := s.Chain("x", 1); err == nil || !strings.Contains(err.Error(), "cycle") {
+		t.Fatalf("Chain at the fork point over a base cycle must return a cycle error, got %v", err)
+	}
+	// A hand-corrupted SELF-base (WriteLineageBase refuses to write one)
+	// must be caught by the same guard.
+	data, err := json.Marshal(BasePointer{Lineage: "z", TXID: 1})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := s.B.Put(BaseKey("z"), data); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := s.Chain("z", 2); err == nil || !strings.Contains(err.Error(), "cycle") {
+		t.Fatalf("Chain over a self-base must return a cycle error, got %v", err)
+	}
+}
+
 // (b) MUTATION test — the never-merge-across-lineages invariant. Child epoch 1
 // and parent epoch 2 both carry an object covering the SAME txid range just
 // past the fork seam. Chain MUST return the CHILD's bytes for the child's

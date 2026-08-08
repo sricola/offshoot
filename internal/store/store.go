@@ -506,7 +506,23 @@ func keepHighestEpoch(members []ChainMember) []ChainMember {
 // lineage's List, and keepHighestEpoch is only ever run on a single lineage's
 // members. A cross-lineage union would let a higher-epoch parent object win
 // the child's own txid range and silently serve the parent's timeline.
+//
+// Like BaseSpine, the base recursion guards defensively against a cycle:
+// WriteLineageBase's create-only, no-self-base, must-point-at-an-existing-
+// lineage rules mean this binary's writers cannot construct one, but a
+// corrupt or hand-edited store could — revisiting a lineage fails loudly
+// with a cycle error rather than recursing until the stack overflows.
 func (s *Store) Chain(lineage string, target uint64) ([]ChainMember, error) {
+	return s.chainFrom(lineage, target, map[string]bool{lineage: true})
+}
+
+// chainFrom is Chain's recursive body, threading the set of lineages already
+// visited along the base recursion (seeded with the starting lineage) so a
+// corrupt store's base-pointer cycle is detected instead of recursed into —
+// see Chain's doc comment. Chain is the only entry point; both recursion
+// sites below go through chainFrom so the same seen set covers the whole
+// resolution.
+func (s *Store) chainFrom(lineage string, target uint64, seen map[string]bool) ([]ChainMember, error) {
 	base, err := s.lineageBase(lineage)
 	if err != nil {
 		return nil, err
@@ -516,11 +532,16 @@ func (s *Store) Chain(lineage string, target uint64) ([]ChainMember, error) {
 		// for every pre-CoW branch.
 		return s.chainSelf(lineage, target)
 	}
+	if seen[base.Lineage] {
+		return nil, fmt.Errorf("store: chain %s: base pointer cycle detected at lineage %s",
+			lineage, base.Lineage)
+	}
+	seen[base.Lineage] = true
 	if target <= base.TXID {
 		// At or below the fork point: resolve entirely in the base lineage
 		// (transitively, via the base's own base). The child contributes
 		// nothing.
-		return s.Chain(base.Lineage, target)
+		return s.chainFrom(base.Lineage, target, seen)
 	}
 	// Above the fork point: if the child has grown its OWN snapshot covering
 	// target (a divergence floor — ops.Checkpoint always writes one, and the
@@ -547,7 +568,7 @@ func (s *Store) Chain(lineage string, target uint64) ([]ChainMember, error) {
 	// ancestors, via recursion) up to base.TXID; the child half is this
 	// lineage's own contiguous segment run in (base.TXID, target]. Neither
 	// half ever sees the other's members.
-	parentChain, err := s.Chain(base.Lineage, base.TXID)
+	parentChain, err := s.chainFrom(base.Lineage, base.TXID, seen)
 	if err != nil {
 		return nil, fmt.Errorf("store: chain %s@%d: resolving base %s@%d: %w",
 			lineage, target, base.Lineage, base.TXID, err)
