@@ -13,6 +13,27 @@ version if you depend on format stability.
 
 ## [Unreleased]
 
+### Added
+
+- **Base-pointer field and LayoutVersion 2** (copy-on-write Task 1):
+  `store.Ref` gains a new `Base *BasePointer` field (`BasePointer{Lineage
+  string; TXID uint64}`, `json:"base,omitempty"`) — deliberately separate
+  from the existing `Parent` breadcrumb, which stays a human-readable
+  string with no resolution/GC meaning. `Base` carries no epoch by design:
+  an epoch here would let a fenced writer's stale base pointer survive past
+  the point it was superseded, re-creating the fenced-orphan bug epoch
+  fencing exists to prevent (see the copy-on-write design spec's "The base
+  pointer" section). `store.LayoutVersion` is bumped to 2; `InitManifest`
+  now stamps new stores with it, and a v2 binary still reads a v1 store
+  fine (no base pointers exist there yet). A new `Store.EnsureLayoutV2()`
+  CAS-bumps an existing v1 manifest to v2, idempotent and safe under
+  concurrent callers (a concurrent bump to v2 is success, not a CAS
+  failure); nothing calls it yet — it lands ahead of the shared-fork path
+  (a later copy-on-write task) that will call it before writing the first
+  base ref. This task changes no resolution or GC logic: `Chain` and every
+  reachability computation are untouched, and `Base` is not yet read
+  anywhere.
+
 ## [0.1.3] - 2026-08-07
 
 Milestone 4: operable at scale. A platform running hundreds of agent
