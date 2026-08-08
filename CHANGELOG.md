@@ -13,6 +13,28 @@ version if you depend on format stability.
 
 ## [Unreleased]
 
+### Changed
+
+- **Best-effort orphan cleanup is now loud.** The seven orphan-cleanup
+  deletes in ops (lost ref-CAS paths in create, checkpoint, fork, rollback,
+  promote, compact) and Destroy's checkout-file removals now log to stderr
+  when the underlying delete/remove fails, instead of failing silently.
+  Behavior is otherwise unchanged: cleanup remains best-effort and
+  reachability GC still reclaims anything left behind.
+- Named previously-hardcoded values: the session `DrainNow` budget (30s,
+  shared by flush and close), the capture engine's checkpoint-takeover
+  thresholds (64 frames / 5s idle), and the two deliberately different
+  SQLite busy timeouts (ops quiesce 3000ms, capture engine 5000ms). Values
+  unchanged.
+- Refreshed doc comments that still described pre-daemon/pre-CoW behavior
+  (`Ref.Base`, `Ref.Epoch`, `EnsureLayoutV2`, the ops package doc, the
+  capture `Sink` contract and `hashSrc` cost note).
+
+### Removed
+
+- `store.Store.DeleteRef` (unused in production; `Destroy` uses the
+  claim-guarded `DeleteRefIf`). Internal API only.
+
 ## [0.2.1] - 2026-08-08
 
 ### Added
