@@ -1,8 +1,19 @@
 .PHONY: test test-torture build test-s3 bench bench-s3 test-python-sdk test-ts-sdk test-sdks \
 	check-sdk-versions dry-run-python-sdk dry-run-ts-sdk dry-run-sdks test-pytest-plugin \
-	ci-local ci-local-host ci-local-linux ci-local-minio ci-local-sdks
+	ci-local ci-local-host ci-local-linux ci-local-minio ci-local-sdks lint
 test:
 	go test ./... -count=1
+
+# lint fails if any file is unformatted (gofmt -l prints offenders; the
+# `(! read)` trick makes any output a nonzero exit) or go vet finds a
+# problem; staticcheck runs best-effort last (`go run` fetches it, so it
+# needs network — the || clause keeps an offline run from failing the two
+# gates that already passed). ci.yml runs the same gofmt/vet pair on every
+# PR so an unformatted non-test file can't ship silently again (audit §7).
+lint:
+	gofmt -l . | tee /dev/stderr | (! read)
+	go vet ./...
+	go run honnef.co/go/tools/cmd/staticcheck@latest ./... || echo "staticcheck failed or unavailable (non-blocking)"
 test-torture:
 	go test ./internal/capture -tags=torture -run TestTorture -count=1 -timeout 30m -v
 build:

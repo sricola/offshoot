@@ -28,7 +28,7 @@
 #
 # Jobs (mirroring ci.yml's job names):
 #   host   -> the `test` job's ubuntu/macos matrix, run on THIS host
-#             (go vet + go test -race)
+#             (gofmt -l + go vet + go test -race)
 #   linux  -> the same suite, inside a golang:<go.mod version>-bookworm
 #             container, so Linux-only bugs (this repo has real history
 #             there) surface without needing a Linux box. Module/build
@@ -91,6 +91,14 @@ job_host() {
 	fi
 	sqldiff --help >/dev/null || return 1
 
+	log "gofmt -l ."
+	unformatted="$(gofmt -l .)"
+	if [ -n "${unformatted}" ]; then
+		err "unformatted files (run gofmt -w):"
+		err "${unformatted}"
+		return 1
+	fi
+
 	log "go vet ./..."
 	go vet ./... || return 1
 
@@ -125,6 +133,14 @@ job_linux() {
 			apt-get install -y -qq --no-install-recommends sqlite3 sqlite3-tools
 			sqlite3 --version
 			sqldiff --help >/dev/null
+
+			echo "--- gofmt -l . ---"
+			unformatted="$(gofmt -l .)"
+			if [ -n "${unformatted}" ]; then
+				echo "unformatted files (run gofmt -w):" >&2
+				echo "${unformatted}" >&2
+				exit 1
+			fi
 
 			echo "--- go vet ./... ---"
 			go vet ./...
@@ -266,8 +282,8 @@ fmt_secs() {
 }
 
 cmd_all() {
-	run_job host  "ci-local-host  (go vet + go test -race, this host)"        job_host
-	run_job linux "ci-local-linux (go vet + go test -race, docker/linux)"     job_linux
+	run_job host  "ci-local-host  (gofmt + go vet + go test -race, this host)" job_host
+	run_job linux "ci-local-linux (gofmt + vet + go test -race, docker/linux)" job_linux
 	run_job minio "ci-local-minio (MinIO in docker + make test-s3)"           job_minio
 	run_job sdks  "ci-local-sdks  (make test-sdks + pytest-plugin + dry-run)" job_sdks
 
