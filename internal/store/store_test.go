@@ -1,8 +1,10 @@
 package store
 
 import (
+	"encoding/json"
 	"errors"
 	"strings"
+	"sync"
 	"testing"
 	"time"
 )
@@ -464,5 +466,153 @@ func TestRefMetaAndCheckpointFieldsRoundTripAndOldRefsDecode(t *testing.T) {
 	}
 	if v1cp.CreatedAt != "" || v1cp.Meta != nil {
 		t.Fatalf("decodeRef fabricated CreatedAt/Meta for a v1 ref's checkpoint: %+v", v1cp)
+	}
+}
+
+// TestBasePointerRoundTrip is copy-on-write Task 1: Ref.Base is a NEW field,
+// distinct from the existing Parent breadcrumb, that survives a PutRef ->
+// GetRef round trip with its values intact.
+func TestBasePointerRoundTrip(t *testing.T) {
+	s := newStore(t)
+	r := Ref{
+		Schema: RefSchema, Lineage: NewLineageID(), Epoch: 1, HeadTXID: 1, HeadEpoch: 1,
+		Base: &BasePointer{Lineage: "L", TXID: 42},
+	}
+	r.SetCheckpoint("init", Checkpoint{TXID: 1, Epoch: 1})
+	if _, err := s.PutRef("app", "based", r, ""); err != nil {
+		t.Fatal(err)
+	}
+	got, _, err := s.GetRef("app", "based")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got.Base == nil {
+		t.Fatal("want Base set after round trip, got nil")
+	}
+	if got.Base.Lineage != "L" || got.Base.TXID != 42 {
+		t.Fatalf("Base round trip mismatch: %+v", got.Base)
+	}
+}
+
+// TestDecodeRefOldShapeHasNilBase is copy-on-write Task 1: a ref written by
+// a binary that predates the base pointer (no "base" key at all) must
+// decode with Base == nil, not a fabricated zero-value pointer — the
+// tolerant-decode path, mirroring how TTL/Meta/Reaping are already handled.
+func TestDecodeRefOldShapeHasNilBase(t *testing.T) {
+	raw := []byte(`{"schema":2,"lineage":"lin5","epoch":1,"head_txid":1,"head_epoch":1,` +
+		`"checkpoints":{"init":{"txid":1,"epoch":1}}}`)
+	decoded, err := decodeRef(raw)
+	if err != nil {
+		t.Fatalf("decodeRef: %v", err)
+	}
+	if decoded.Base != nil {
+		t.Fatalf("decodeRef fabricated Base for an old-shaped ref: %+v", decoded.Base)
+	}
+}
+
+// TestEnsureLayoutV2 is copy-on-write Task 1: EnsureLayoutV2 CAS-bumps an
+// existing v1 manifest to v2, and calling it again once already at v2 is a
+// no-op, not an error.
+func TestEnsureLayoutV2(t *testing.T) {
+	s := newStore(t)
+	// Simulate a pre-existing v1 store: write a v1 manifest directly, since
+	// InitManifest now always writes v2 for brand-new stores.
+	v1 := Manifest{LayoutVersion: 1, CreatedAt: time.Now().UTC().Format(time.RFC3339)}
+	data, _ := json.Marshal(v1)
+	if _, err := s.B.PutIf(manifestKey, data, ""); err != nil {
+		t.Fatal(err)
+	}
+
+	if err := s.EnsureLayoutV2(); err != nil {
+		t.Fatalf("EnsureLayoutV2: %v", err)
+	}
+	got, _, err := s.B.Get(manifestKey)
+	if err != nil {
+		t.Fatal(err)
+	}
+	var m Manifest
+	if err := json.Unmarshal(got, &m); err != nil {
+		t.Fatal(err)
+	}
+	if m.LayoutVersion != LayoutVersion {
+		t.Fatalf("want LayoutVersion %d after bump, got %d", LayoutVersion, m.LayoutVersion)
+	}
+
+	// Idempotent: calling it again on an already-v2 manifest must not error
+	// or touch the manifest.
+	if err := s.EnsureLayoutV2(); err != nil {
+		t.Fatalf("EnsureLayoutV2 (already v2): %v", err)
+	}
+	got2, _, err := s.B.Get(manifestKey)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if string(got2) != string(got) {
+		t.Fatalf("EnsureLayoutV2 rewrote an already-v2 manifest: before %s, after %s", got, got2)
+	}
+}
+
+// TestEnsureLayoutV2ConcurrentBump is copy-on-write Task 1: EnsureLayoutV2
+// must be CAS-safe under concurrent callers racing to bump the same v1
+// manifest — a concurrent bump to v2 is success for every caller, not a
+// failure for whoever lost the CAS race.
+func TestEnsureLayoutV2ConcurrentBump(t *testing.T) {
+	s := newStore(t)
+	v1 := Manifest{LayoutVersion: 1, CreatedAt: time.Now().UTC().Format(time.RFC3339)}
+	data, _ := json.Marshal(v1)
+	if _, err := s.B.PutIf(manifestKey, data, ""); err != nil {
+		t.Fatal(err)
+	}
+
+	const n = 8
+	var wg sync.WaitGroup
+	errs := make([]error, n)
+	for i := 0; i < n; i++ {
+		wg.Add(1)
+		go func(i int) {
+			defer wg.Done()
+			errs[i] = s.EnsureLayoutV2()
+		}(i)
+	}
+	wg.Wait()
+	for i, err := range errs {
+		if err != nil {
+			t.Fatalf("goroutine %d: EnsureLayoutV2: %v", i, err)
+		}
+	}
+
+	got, _, err := s.B.Get(manifestKey)
+	if err != nil {
+		t.Fatal(err)
+	}
+	var m Manifest
+	if err := json.Unmarshal(got, &m); err != nil {
+		t.Fatal(err)
+	}
+	if m.LayoutVersion != LayoutVersion {
+		t.Fatalf("want LayoutVersion %d after concurrent bump, got %d", LayoutVersion, m.LayoutVersion)
+	}
+}
+
+// TestCheckManifestRefusesNewerLayout is copy-on-write Task 1: a manifest
+// whose LayoutVersion is newer than this binary supports must refuse the
+// whole store. This is the exact mechanism a real pre-CoW (v1) binary hits
+// against a v2 manifest once LayoutVersion is bumped to 2; the test writes
+// LayoutVersion+1 rather than the literal value 2 so it keeps proving "a
+// binary refuses a manifest newer than itself" regardless of what the
+// current const is.
+func TestCheckManifestRefusesNewerLayout(t *testing.T) {
+	s := newStore(t)
+	m := Manifest{LayoutVersion: LayoutVersion + 1, CreatedAt: time.Now().UTC().Format(time.RFC3339)}
+	data, _ := json.Marshal(m)
+	if _, err := s.B.PutIf(manifestKey, data, ""); err != nil {
+		t.Fatal(err)
+	}
+	err := s.CheckManifest()
+	if err == nil {
+		t.Fatal("want error for a manifest newer than this binary supports")
+	}
+	if !strings.Contains(err.Error(), "newer than this binary supports") {
+		t.Fatalf("unexpected error: %v", err)
 	}
 }

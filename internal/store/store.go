@@ -4,6 +4,7 @@ import (
 	"crypto/rand"
 	"encoding/hex"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"sort"
 	"strconv"
@@ -12,7 +13,7 @@ import (
 )
 
 const (
-	LayoutVersion = 1
+	LayoutVersion = 2
 	RefSchema     = 2
 	manifestKey   = "offshoot.json"
 	maxNameLen    = 128
@@ -96,6 +97,31 @@ type Ref struct {
 	// ref written before this field existed decodes with it nil, same as
 	// the TTL fields above.
 	Meta map[string]string `json:"meta,omitempty"`
+	// Base is the copy-on-write shared-fork pointer: when set, this
+	// lineage's objects alone do not cover reads at targetTXID <= Base.TXID
+	// — resolution must fall through to Base.Lineage (transitively, if that
+	// lineage has its own Base) for anything at or below the fork point.
+	// This is DELIBERATELY DISTINCT from Parent (a human-readable breadcrumb
+	// with no resolution or GC meaning): Base is live, load-bearing data
+	// that both Chain resolution and GC reachability must consult once a
+	// later task wires them up. Nil means this ref has no base — every
+	// pre-CoW ref, and every fork that fully materializes today (a plain
+	// Fork remains as it is; Task 3 introduces a NEW shared-fork path that
+	// sets this). No epoch field: an epoch here would let a fenced writer's
+	// stale base survive past the point it was superseded, re-creating the
+	// fenced-orphan bug epoch fencing exists to prevent — see the design
+	// spec's "The base pointer" section. Omitempty, no schema bump: a ref
+	// written before this field existed decodes with it nil.
+	Base *BasePointer `json:"base,omitempty"`
+}
+
+// BasePointer names the fork point a shared child reads through for
+// anything at or below Base.TXID: Lineage identifies the ancestor lineage,
+// TXID is the fork point within it. Deliberately just these two fields — no
+// epoch (see Ref.Base's doc comment for why).
+type BasePointer struct {
+	Lineage string `json:"lineage"`
+	TXID    uint64 `json:"txid"`
 }
 
 // SetCheckpoint records name -> cp, allocating the map if needed.
@@ -132,6 +158,7 @@ type refWire struct {
 	Deleting    bool                       `json:"deleting,omitempty"`
 	DeletingAt  string                     `json:"deleting_at,omitempty"`
 	Meta        map[string]string          `json:"meta,omitempty"`
+	Base        *BasePointer               `json:"base,omitempty"`
 }
 
 // decodeRef parses the on-disk ref shape, upgrading a v1 ref (schema 1,
@@ -155,7 +182,7 @@ func decodeRef(data []byte) (Ref, error) {
 		LeaseHolder: w.LeaseHolder, LeaseExpiry: w.LeaseExpiry,
 		TTL: w.TTL, TouchedAt: w.TouchedAt, Reaping: w.Reaping,
 		Deleting: w.Deleting, DeletingAt: w.DeletingAt,
-		Meta: w.Meta,
+		Meta: w.Meta, Base: w.Base,
 	}
 	// A v1 ref predates per-checkpoint epochs: everything it references was
 	// written under the ref's own epoch.
@@ -206,6 +233,44 @@ func (s *Store) CheckManifest() error {
 			m.LayoutVersion, LayoutVersion)
 	}
 	return nil
+}
+
+// EnsureLayoutV2 CAS-bumps the store's manifest to LayoutVersion 2 if it is
+// currently below that; it is a no-op if the manifest is already at 2 or
+// newer. It is idempotent and CAS-safe under concurrent callers: if this
+// call's CAS loses the race because another caller already bumped the
+// manifest to >= 2, that is re-checked and treated as success, not failure.
+// Nothing calls this yet — it is wired in by the shared-fork path (a later
+// task) before writing the first base ref, since a base pointer must never
+// land in a store an old binary could still open.
+func (s *Store) EnsureLayoutV2() error {
+	for {
+		data, etag, err := s.B.Get(manifestKey)
+		if err != nil {
+			return err
+		}
+		var m Manifest
+		if err := json.Unmarshal(data, &m); err != nil {
+			return fmt.Errorf("store: corrupt manifest: %w", err)
+		}
+		if m.LayoutVersion >= LayoutVersion {
+			return nil
+		}
+		m.LayoutVersion = LayoutVersion
+		newData, err := json.Marshal(m)
+		if err != nil {
+			return err
+		}
+		if _, err := s.B.PutIf(manifestKey, newData, etag); err != nil {
+			if errors.Is(err, ErrCAS) {
+				// Someone else changed the manifest since our Get; re-read
+				// and either retry the bump or discover they already did it.
+				continue
+			}
+			return err
+		}
+		return nil
+	}
 }
 
 func ValidateName(name string) error {
