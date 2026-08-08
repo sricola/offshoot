@@ -3,7 +3,10 @@
 // and the typed manifest/ref schema on top.
 package store
 
-import "errors"
+import (
+	"errors"
+	"io"
+)
 
 var (
 	ErrNotFound = errors.New("store: not found")
@@ -63,4 +66,24 @@ type Backend interface {
 // no-op: (nil, nil).
 type BatchDeleter interface {
 	DeleteObjects(keys []string) (deleted []string, err error)
+}
+
+// ReaderGetter is an optional Backend capability: fetch an object as a
+// stream instead of a fully-buffered []byte, so a caller applying a large
+// object (e.g. ops' chain materialization — perf audit H3) need not hold it
+// all in memory at once. Like BatchDeleter, it is deliberately NOT part of
+// Backend itself: test wrappers and backends that only ever handle small
+// objects keep working unchanged, and callers type-assert and fall back to
+// the buffered Get.
+//
+// The caller MUST Close the returned reader on every path, including a
+// mid-read error — the underlying stream (an S3 response body, an open
+// local file descriptor) is not otherwise released. etag follows Get's
+// contract where the backend can supply it without reading the body (S3:
+// the GetObject response's ETag header, free); a backend for which
+// computing a real content etag would require reading the whole object
+// (defeating the point of streaming) MAY return "" instead — a caller that
+// needs a content etag should use Get, not GetReader.
+type ReaderGetter interface {
+	GetReader(key string) (r io.ReadCloser, etag string, err error)
 }

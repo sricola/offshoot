@@ -155,6 +155,30 @@ func (s *S3) Get(key string) ([]byte, string, error) {
 	return data, aws.ToString(out.ETag), nil
 }
 
+// GetReader implements store.ReaderGetter: it returns the GetObject
+// response's Body directly, without buffering it into memory first (unlike
+// Get, which io.ReadAlls it) — so a caller applying a large object (e.g. a
+// snapshot/segment during chain materialization) holds only the current
+// object's stream open, not its full bytes. Same key namespacing and
+// ErrNotFound mapping as Get. The caller MUST Close the returned reader;
+// leaving it open leaks the underlying HTTP connection.
+func (s *S3) GetReader(key string) (io.ReadCloser, string, error) {
+	fk, err := s.full(key)
+	if err != nil {
+		return nil, "", err
+	}
+	out, err := s.cl.GetObject(context.Background(), &s3.GetObjectInput{
+		Bucket: aws.String(s.bucket), Key: aws.String(fk),
+	})
+	if err != nil {
+		if isNotFound(err) {
+			return nil, "", ErrNotFound
+		}
+		return nil, "", fmt.Errorf("store: s3 get %s: %w", key, err)
+	}
+	return out.Body, aws.ToString(out.ETag), nil
+}
+
 func (s *S3) Put(key string, data []byte) error {
 	fk, err := s.full(key)
 	if err != nil {

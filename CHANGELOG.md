@@ -21,6 +21,24 @@ version if you depend on format stability.
 
 ### Changed
 
+- **Materializing a chain (checkout/fork/rollback/promote/compact's read
+  path) no longer holds every resolved object in memory at once** (perf
+  audit H3, read-side). `ops.materializeMembersAt` now type-asserts the
+  backend for a new optional `store.ReaderGetter` capability
+  (`GetReader(key) (io.ReadCloser, etag, error)`, implemented by both `S3`
+  — the raw `GetObject` response body, no `io.ReadAll` — and `Local` — a
+  plain `os.Open`) and, when present, applies the chain through lazily-
+  opened, self-closing streams: each member's stream opens on first Read
+  and closes on EOF, so at most one snapshot/segment is resident at a time
+  instead of the whole chain. Safe because `ltxio.MaterializeChain` already
+  consumes its inputs strictly sequentially (snapshot fully, then each
+  segment fully, in order). A backend without `ReaderGetter` falls back to
+  the prior fully-buffered path unchanged. Materialized output, the
+  returned checksum, and every stream's close-on-every-path (success and
+  mid-apply error) are unaffected — pinned by a counting-backend test
+  asserting max concurrently-open streams <= 1 and open count == close
+  count. Read-side only; flush/capture (H3's write side) is unchanged.
+
 - **Snapshot flushes no longer hold the replica lock across the full-file
   encode** (perf audit M2). `Session.flush`'s snapshot branch now clones the
   replica to a per-flush scratch file under `replicaMu` (a copy-on-write
