@@ -3,6 +3,7 @@ package store
 import (
 	"encoding/json"
 	"errors"
+	"reflect"
 	"strings"
 	"sync"
 	"testing"
@@ -614,5 +615,345 @@ func TestCheckManifestRefusesNewerLayout(t *testing.T) {
 	}
 	if !strings.Contains(err.Error(), "newer than this binary supports") {
 		t.Fatalf("unexpected error: %v", err)
+	}
+}
+
+// --- Copy-on-write base-following resolution (Task 2) ---
+
+// putObj is a small helper for the base-following tests: it writes a
+// throwaway body under a snapshot/segment key so Chain can resolve it.
+func putObj(t *testing.T, s *Store, key string) {
+	t.Helper()
+	if err := s.B.Put(key, []byte("x")); err != nil {
+		t.Fatal(err)
+	}
+}
+
+// keysOf extracts the member keys of a chain for prefix assertions.
+func keysOf(chain []ChainMember) []string {
+	out := make([]string, len(chain))
+	for i, m := range chain {
+		out[i] = m.Key
+	}
+	return out
+}
+
+// TestLineageBaseAbsentIsNilNil: a lineage with no base object resolves to
+// (nil, nil) — the non-shared, pre-CoW path.
+func TestLineageBaseAbsentIsNilNil(t *testing.T) {
+	s := newStore(t)
+	b, err := s.lineageBase("nolin")
+	if err != nil {
+		t.Fatalf("lineageBase err = %v", err)
+	}
+	if b != nil {
+		t.Fatalf("want nil base for a lineage with no base object, got %+v", b)
+	}
+}
+
+// TestWriteLineageBaseImmutable: a lineage's base is create-only; a second
+// write is refused with ErrCAS, and the first value round-trips.
+func TestWriteLineageBaseImmutable(t *testing.T) {
+	s := newStore(t)
+	if err := s.writeLineageBase("child", BasePointer{Lineage: "parent", TXID: 3}); err != nil {
+		t.Fatalf("first writeLineageBase err = %v", err)
+	}
+	got, err := s.lineageBase("child")
+	if err != nil {
+		t.Fatalf("lineageBase err = %v", err)
+	}
+	if got == nil || got.Lineage != "parent" || got.TXID != 3 {
+		t.Fatalf("round-trip base = %+v", got)
+	}
+	err = s.writeLineageBase("child", BasePointer{Lineage: "other", TXID: 9})
+	if !errors.Is(err, ErrCAS) {
+		t.Fatalf("second write must be ErrCAS, got %v", err)
+	}
+}
+
+// TestBaseKeyNotAChainMember: the base.json object lives under the lineage
+// prefix but must never be parsed as a chain member (neither snapshot- nor
+// segment-prefixed).
+func TestBaseKeyNotAChainMember(t *testing.T) {
+	if _, ok := ParseMemberKey(BaseKey("lin")); ok {
+		t.Fatalf("BaseKey %q must not parse as a chain member", BaseKey("lin"))
+	}
+	// And it must live under the lineage prefix so it is swept with the lineage.
+	if !strings.HasPrefix(BaseKey("lin"), LineagePrefix("lin")) {
+		t.Fatalf("BaseKey %q must live under LineagePrefix %q", BaseKey("lin"), LineagePrefix("lin"))
+	}
+}
+
+// (a) A shared child reading target > base.TXID gets the parent's
+// snapshot-anchored chain up to base.TXID, then the child's own segments in
+// (base.TXID, target], in apply order and contiguous.
+func TestChainBaseConcatenatesChildSegments(t *testing.T) {
+	s := newStore(t)
+	// Parent P: snapshot@1, segments to txid 3 (the fork point).
+	putObj(t, s, SnapshotKey("parent", 1, 1))
+	putObj(t, s, SegmentKey("parent", 1, 2, 2))
+	putObj(t, s, SegmentKey("parent", 1, 3, 3))
+	// Child C bases on P at txid 3, diverges with its own segments 4,5.
+	if err := s.writeLineageBase("child", BasePointer{Lineage: "parent", TXID: 3}); err != nil {
+		t.Fatal(err)
+	}
+	putObj(t, s, SegmentKey("child", 1, 4, 4))
+	putObj(t, s, SegmentKey("child", 1, 5, 5))
+
+	got, err := s.Chain("child", 5)
+	if err != nil {
+		t.Fatalf("Chain err = %v", err)
+	}
+	want := []string{
+		SnapshotKey("parent", 1, 1),
+		SegmentKey("parent", 1, 2, 2),
+		SegmentKey("parent", 1, 3, 3),
+		SegmentKey("child", 1, 4, 4),
+		SegmentKey("child", 1, 5, 5),
+	}
+	if !reflect.DeepEqual(keysOf(got), want) {
+		t.Fatalf("chain keys =\n %v\nwant\n %v", keysOf(got), want)
+	}
+	if !got[0].Snapshot {
+		t.Fatalf("resolved chain must still start at a snapshot: %+v", got[0])
+	}
+	// Contiguity 1..5 with no hole.
+	prev := got[0].MaxTXID
+	for _, m := range got[1:] {
+		if m.MinTXID != prev+1 {
+			t.Fatalf("hole at %+v (prevMax=%d)", m, prev)
+		}
+		prev = m.MaxTXID
+	}
+	if prev != 5 {
+		t.Fatalf("chain reaches %d, want 5", prev)
+	}
+}
+
+// (b) MUTATION test — the never-merge-across-lineages invariant. Child epoch 1
+// and parent epoch 2 both carry an object covering the SAME txid range just
+// past the fork seam. Chain MUST return the CHILD's bytes for the child's
+// range. A naive resolver that unioned both lineages' members BEFORE
+// keepHighestEpoch would pick the parent's higher-epoch object — so we assert
+// on the returned member's lineage-prefixed Key and epoch, which a union
+// implementation fails.
+func TestChainNeverMergesAcrossLineages(t *testing.T) {
+	s := newStore(t)
+	// Parent P: snapshot@1 .. txid 3 (fork point), PLUS its own post-fork
+	// divergence at txid 4 under a bumped epoch 2 (the parent's timeline).
+	putObj(t, s, SnapshotKey("parent", 1, 1))
+	putObj(t, s, SegmentKey("parent", 1, 2, 2))
+	putObj(t, s, SegmentKey("parent", 1, 3, 3))
+	putObj(t, s, SegmentKey("parent", 2, 4, 4)) // parent's OWN txid 4, epoch 2
+	// Child C bases on P at 3, writes its OWN txid 4 under epoch 1.
+	if err := s.writeLineageBase("child", BasePointer{Lineage: "parent", TXID: 3}); err != nil {
+		t.Fatal(err)
+	}
+	putObj(t, s, SegmentKey("child", 1, 4, 4)) // child's txid 4, epoch 1
+
+	got, err := s.Chain("child", 4)
+	if err != nil {
+		t.Fatalf("Chain err = %v", err)
+	}
+	if len(got) != 4 {
+		t.Fatalf("chain len = %d, want 4: %v", len(got), keysOf(got))
+	}
+	last := got[len(got)-1]
+	if last.MaxTXID != 4 {
+		t.Fatalf("last member covers %d, want 4: %+v", last.MaxTXID, last)
+	}
+	// The load-bearing assertion: the txid-4 member is the CHILD's object
+	// (epoch 1), NOT the parent's higher-epoch orphan. A union-then-
+	// keepHighestEpoch resolver returns the parent's epoch-2 key here.
+	if !strings.HasPrefix(last.Key, LineagePrefix("child")) {
+		t.Fatalf("txid-4 member is not the child's object: %q (union bug picks parent's epoch-2 object)", last.Key)
+	}
+	if last.Epoch != 1 {
+		t.Fatalf("txid-4 member epoch = %d, want child epoch 1", last.Epoch)
+	}
+	if last.Key != SegmentKey("child", 1, 4, 4) {
+		t.Fatalf("txid-4 member = %q, want %q", last.Key, SegmentKey("child", 1, 4, 4))
+	}
+	// The base half members must all be the parent's (no child key sneaks in).
+	for _, m := range got[:3] {
+		if !strings.HasPrefix(m.Key, LineagePrefix("parent")) {
+			t.Fatalf("base-half member is not the parent's: %q", m.Key)
+		}
+	}
+}
+
+// (c) Fenced-orphan: the parent bumps to epoch 2 AFTER the fork, leaving a
+// higher-epoch object at the fork txid. Resolution within the parent half must
+// pick the highest epoch (fencing) and the child still resolves — no
+// regression.
+func TestChainFencedParentOrphanAtForkPoint(t *testing.T) {
+	s := newStore(t)
+	putObj(t, s, SnapshotKey("parent", 1, 1))
+	putObj(t, s, SegmentKey("parent", 1, 2, 2))
+	putObj(t, s, SegmentKey("parent", 1, 3, 3)) // original fork-point object
+	putObj(t, s, SegmentKey("parent", 2, 3, 3)) // parent bumped epoch, rewrote txid 3
+	if err := s.writeLineageBase("child", BasePointer{Lineage: "parent", TXID: 3}); err != nil {
+		t.Fatal(err)
+	}
+	putObj(t, s, SegmentKey("child", 1, 4, 4))
+
+	got, err := s.Chain("child", 4)
+	if err != nil {
+		t.Fatalf("Chain err = %v", err)
+	}
+	if len(got) != 4 {
+		t.Fatalf("chain len = %d, want 4: %v", len(got), keysOf(got))
+	}
+	// The fork-txid (3) member must be the higher-epoch (live) parent object.
+	var forkMember *ChainMember
+	for i := range got {
+		if got[i].MaxTXID == 3 {
+			forkMember = &got[i]
+		}
+	}
+	if forkMember == nil || forkMember.Epoch != 2 {
+		t.Fatalf("fork-point member must be parent epoch 2: %+v", forkMember)
+	}
+	if forkMember.Key != SegmentKey("parent", 2, 3, 3) {
+		t.Fatalf("fork-point member = %q, want %q", forkMember.Key, SegmentKey("parent", 2, 3, 3))
+	}
+}
+
+// (d) Fork-of-fork transitive: C bases on B at Tc=4, B bases on A at Tb=2,
+// Tc > Tb. C at target=5 resolves A's snapshot + A's (.,2] + B's (2,4] segs +
+// C's (4,5] segs, all contiguous, each member in its own lineage.
+func TestChainForkOfForkTransitive(t *testing.T) {
+	s := newStore(t)
+	// A: snapshot@1, segment txid 2 (Tb).
+	putObj(t, s, SnapshotKey("a", 1, 1))
+	putObj(t, s, SegmentKey("a", 1, 2, 2))
+	// B bases on A at 2, has its own txids 3,4 (Tc=4).
+	if err := s.writeLineageBase("b", BasePointer{Lineage: "a", TXID: 2}); err != nil {
+		t.Fatal(err)
+	}
+	putObj(t, s, SegmentKey("b", 1, 3, 3))
+	putObj(t, s, SegmentKey("b", 1, 4, 4))
+	// C bases on B at 4, has its own txid 5.
+	if err := s.writeLineageBase("c", BasePointer{Lineage: "b", TXID: 4}); err != nil {
+		t.Fatal(err)
+	}
+	putObj(t, s, SegmentKey("c", 1, 5, 5))
+
+	got, err := s.Chain("c", 5)
+	if err != nil {
+		t.Fatalf("Chain err = %v", err)
+	}
+	want := []string{
+		SnapshotKey("a", 1, 1),
+		SegmentKey("a", 1, 2, 2),
+		SegmentKey("b", 1, 3, 3),
+		SegmentKey("b", 1, 4, 4),
+		SegmentKey("c", 1, 5, 5),
+	}
+	if !reflect.DeepEqual(keysOf(got), want) {
+		t.Fatalf("chain keys =\n %v\nwant\n %v", keysOf(got), want)
+	}
+	if !got[0].Snapshot {
+		t.Fatalf("chain must start at A's snapshot: %+v", got[0])
+	}
+}
+
+// (e) target <= base.TXID resolves purely in the base lineage; the child
+// contributes nothing.
+func TestChainTargetAtOrBelowBaseResolvesInBase(t *testing.T) {
+	s := newStore(t)
+	putObj(t, s, SnapshotKey("parent", 1, 1))
+	putObj(t, s, SegmentKey("parent", 1, 2, 2))
+	putObj(t, s, SegmentKey("parent", 1, 3, 3))
+	if err := s.writeLineageBase("child", BasePointer{Lineage: "parent", TXID: 3}); err != nil {
+		t.Fatal(err)
+	}
+	// A child object that must NOT appear when reading at/below the fork point.
+	putObj(t, s, SegmentKey("child", 1, 4, 4))
+
+	// target == base.TXID
+	got, err := s.Chain("child", 3)
+	if err != nil {
+		t.Fatalf("Chain err = %v", err)
+	}
+	want := []string{
+		SnapshotKey("parent", 1, 1),
+		SegmentKey("parent", 1, 2, 2),
+		SegmentKey("parent", 1, 3, 3),
+	}
+	if !reflect.DeepEqual(keysOf(got), want) {
+		t.Fatalf("chain keys = %v, want %v", keysOf(got), want)
+	}
+	for _, m := range got {
+		if strings.HasPrefix(m.Key, LineagePrefix("child")) {
+			t.Fatalf("child key leaked into an at/below-fork read: %q", m.Key)
+		}
+	}
+	// target < base.TXID
+	got, err = s.Chain("child", 2)
+	if err != nil {
+		t.Fatalf("Chain err (target<base) = %v", err)
+	}
+	if len(got) != 2 || got[len(got)-1].MaxTXID != 2 {
+		t.Fatalf("chain at target 2 = %v", keysOf(got))
+	}
+}
+
+// (f) Destroyed-intermediate: build the base records and objects for C -> B ->
+// A with NO refs created at all, and assert Chain still resolves fully. This
+// proves resolution follows the DURABLE per-lineage base object, never a ref —
+// the reason the base pointer is a per-lineage object rather than Ref.Base.
+func TestChainResolvesWithoutAnyRefs(t *testing.T) {
+	s := newStore(t)
+	// A -> B -> C, no PutRef anywhere in this test.
+	putObj(t, s, SnapshotKey("a", 1, 1))
+	putObj(t, s, SegmentKey("a", 1, 2, 2))
+	if err := s.writeLineageBase("b", BasePointer{Lineage: "a", TXID: 2}); err != nil {
+		t.Fatal(err)
+	}
+	putObj(t, s, SegmentKey("b", 1, 3, 3))
+	if err := s.writeLineageBase("c", BasePointer{Lineage: "b", TXID: 3}); err != nil {
+		t.Fatal(err)
+	}
+	putObj(t, s, SegmentKey("c", 1, 4, 4))
+
+	// Sanity: no refs exist.
+	refs, err := s.ListRefs()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(refs) != 0 {
+		t.Fatalf("test must create no refs, got %v", refs)
+	}
+
+	got, err := s.Chain("c", 4)
+	if err != nil {
+		t.Fatalf("Chain err = %v", err)
+	}
+	want := []string{
+		SnapshotKey("a", 1, 1),
+		SegmentKey("a", 1, 2, 2),
+		SegmentKey("b", 1, 3, 3),
+		SegmentKey("c", 1, 4, 4),
+	}
+	if !reflect.DeepEqual(keysOf(got), want) {
+		t.Fatalf("chain keys = %v, want %v", keysOf(got), want)
+	}
+}
+
+// TestChainBaseErrorsOnChildHole: a shared child whose own segment run has a
+// hole past the fork point errors loudly rather than returning a gapped chain.
+func TestChainBaseErrorsOnChildHole(t *testing.T) {
+	s := newStore(t)
+	putObj(t, s, SnapshotKey("parent", 1, 1))
+	putObj(t, s, SegmentKey("parent", 1, 2, 2))
+	if err := s.writeLineageBase("child", BasePointer{Lineage: "parent", TXID: 2}); err != nil {
+		t.Fatal(err)
+	}
+	// Child has txid 3 and 5, but not 4: a hole.
+	putObj(t, s, SegmentKey("child", 1, 3, 3))
+	putObj(t, s, SegmentKey("child", 1, 5, 5))
+	if _, err := s.Chain("child", 5); err == nil {
+		t.Fatal("a hole in the child's own segment run must be an error")
 	}
 }

@@ -33,6 +33,29 @@ version if you depend on format stability.
   base ref. This task changes no resolution or GC logic: `Chain` and every
   reachability computation are untouched, and `Base` is not yet read
   anywhere.
+- **Base-following chain resolution** (copy-on-write Task 2 — the
+  correctness core): `store.Chain(lineage, target)` now follows a durable
+  per-lineage base pointer, resolving a shared fork's reads under the one
+  hard rule — *resolution never merges members across lineages*. The base
+  pointer is stored as its own immutable per-lineage object
+  (`store.BaseKey(lineage)` -> `data/<lineage>/base.json`), read via
+  `Store.lineageBase` and written create-only via `Store.writeLineageBase`,
+  deliberately NOT read from `Ref.Base` (a reporting mirror only): a shared
+  parent branch can have its ref destroyed while a live descendant still
+  bases on it, so resolution must follow a base that outlives any ref. When
+  a lineage has a base: `target <= base.TXID` resolves entirely in the base
+  lineage (transitively); `target > base.TXID` concatenates the base's
+  snapshot-anchored chain up to `base.TXID` with the child's own contiguous
+  segment run in `(base.TXID, target]`, each half resolved wholly within one
+  lineage's List so `keepHighestEpoch` never sees a cross-lineage union (a
+  union would let a higher-epoch parent object win the child's txid range and
+  silently serve the parent's timeline). The seam is verified contiguous and
+  errors loudly otherwise. Recursion follows base pointers down through
+  fork-of-fork chains until the target lands in an ancestor's own objects;
+  a non-shared lineage (no base object) takes the existing single-lineage
+  path unchanged, so every pre-CoW caller is unaffected. `writeLineageBase`
+  exists in this task so shared-lineage scenarios can be built directly; the
+  shared-fork path (Task 3) is its real caller.
 
 ## [0.1.3] - 2026-08-07
 

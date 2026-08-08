@@ -309,6 +309,52 @@ func SnapshotKey(lineage string, epoch, txid uint64) string {
 
 func LineagePrefix(lineage string) string { return "data/" + lineage + "/" }
 
+// BaseKey locates a lineage's durable base pointer. It lives under
+// LineagePrefix(lineage) alongside the lineage's snapshot/segment objects, so
+// it is swept together with the lineage by GC. It is deliberately NEITHER
+// snapshot- nor segment-prefixed, so ParseMemberKey returns ok=false for it
+// and Chain never mistakes it for a materialization member.
+func BaseKey(lineage string) string { return "data/" + lineage + "/base.json" }
+
+// lineageBase loads the durable per-lineage base pointer — the copy-on-write
+// resolution source. It is a per-lineage OBJECT (not a field read from the
+// ref) precisely because a shared parent branch can be destroyed (its ref
+// deleted) while a live descendant still bases on it: resolution must follow
+// the base pointer of a lineage that no longer has a ref at all. Returns
+// (nil, nil) when the lineage has no base object — a non-shared, pre-CoW
+// lineage (today's path). Ref.Base is only a reporting mirror; it is NEVER the
+// resolution source.
+func (s *Store) lineageBase(lineage string) (*BasePointer, error) {
+	data, _, err := s.B.Get(BaseKey(lineage))
+	if err != nil {
+		if errors.Is(err, ErrNotFound) {
+			return nil, nil
+		}
+		return nil, err
+	}
+	var b BasePointer
+	if err := json.Unmarshal(data, &b); err != nil {
+		return nil, fmt.Errorf("store: base %s: %w", lineage, err)
+	}
+	return &b, nil
+}
+
+// writeLineageBase durably records a lineage's base pointer, create-only: a
+// lineage's base is immutable once written, so a second write is refused with
+// ErrCAS (surfaced as-is). The shared-fork path (Task 3) is the real caller;
+// it exists in this task so tests can construct shared-lineage scenarios
+// directly, without the ops layer.
+func (s *Store) writeLineageBase(lineage string, b BasePointer) error {
+	data, err := json.Marshal(b)
+	if err != nil {
+		return err
+	}
+	if _, err := s.B.PutIf(BaseKey(lineage), data, ""); err != nil {
+		return err
+	}
+	return nil
+}
+
 // SegmentKey locates an incremental segment covering (minTXID, maxTXID].
 // Sorting by key sorts by maxTXID, so a lexical List is already in apply
 // order.
@@ -400,7 +446,65 @@ func keepHighestEpoch(members []ChainMember) []ChainMember {
 // costs one List regardless of epoch count — segments from superseded
 // epochs are simply members like any other, since an epoch bump does not
 // move objects.
+//
+// Copy-on-write base following (the one hard rule): if the lineage has a
+// durable base pointer (see lineageBase), resolution follows it under a
+// STRICT, non-negotiable invariant — resolution NEVER merges members across
+// lineages. Each half of a shared chain is resolved wholly within one
+// lineage's List, and keepHighestEpoch is only ever run on a single lineage's
+// members. A cross-lineage union would let a higher-epoch parent object win
+// the child's own txid range and silently serve the parent's timeline.
 func (s *Store) Chain(lineage string, target uint64) ([]ChainMember, error) {
+	base, err := s.lineageBase(lineage)
+	if err != nil {
+		return nil, err
+	}
+	if base == nil {
+		// No base pointer: the self-contained single-lineage path, unchanged
+		// for every pre-CoW branch.
+		return s.chainSelf(lineage, target)
+	}
+	if target <= base.TXID {
+		// At or below the fork point: resolve entirely in the base lineage
+		// (transitively, via the base's own base). The child contributes
+		// nothing.
+		return s.Chain(base.Lineage, target)
+	}
+	// Above the fork point: concatenate two INDEPENDENTLY-resolved halves.
+	// The base half is resolved wholly within the base lineage (and its
+	// ancestors, via recursion) up to base.TXID; the child half is this
+	// lineage's own contiguous segment run in (base.TXID, target]. Neither
+	// half ever sees the other's members.
+	parentChain, err := s.Chain(base.Lineage, base.TXID)
+	if err != nil {
+		return nil, fmt.Errorf("store: chain %s@%d: resolving base %s@%d: %w",
+			lineage, target, base.Lineage, base.TXID, err)
+	}
+	childSegs, err := s.segmentsInRange(lineage, base.TXID, target)
+	if err != nil {
+		return nil, fmt.Errorf("store: chain %s@%d: %w", lineage, target, err)
+	}
+	// Verify the seam is contiguous: the base half must end exactly at
+	// base.TXID and the child half must begin at base.TXID+1 (the latter is
+	// enforced inside segmentsInRange). Error loudly if the base half did not
+	// land where the fork point says it should.
+	if len(parentChain) == 0 || parentChain[len(parentChain)-1].MaxTXID != base.TXID {
+		var got uint64
+		if len(parentChain) > 0 {
+			got = parentChain[len(parentChain)-1].MaxTXID
+		}
+		return nil, fmt.Errorf(
+			"store: chain %s@%d: base seam broken (base %s@%d resolved to end %d, want %d)",
+			lineage, target, base.Lineage, base.TXID, got, base.TXID)
+	}
+	return append(parentChain, childSegs...), nil
+}
+
+// chainSelf is the single-lineage resolver: the newest snapshot with
+// MaxTXID <= target followed by every segment up to target, in apply order,
+// resolved wholly within this one lineage's List. It is the base==nil path of
+// Chain and, via recursion, resolves each ancestor half of a shared chain.
+func (s *Store) chainSelf(lineage string, target uint64) ([]ChainMember, error) {
 	keys, err := s.B.List(LineagePrefix(lineage))
 	if err != nil {
 		return nil, err
@@ -476,6 +580,60 @@ func (s *Store) Chain(lineage string, target uint64) ([]ChainMember, error) {
 	}
 	return nil, fmt.Errorf("store: chain %s@%d: no contiguous run reaches target (stopped at %d)",
 		lineage, target, prevMax)
+}
+
+// segmentsInRange resolves ONE lineage's own contiguous segment run covering
+// (lo, hi], with NO leading snapshot — the child half of a shared chain has no
+// snapshot of its own in this range (its snapshot, if any, lives in the base
+// lineage). It Lists ONLY this lineage's prefix, runs keepHighestEpoch on THIS
+// lineage's segments alone (never a cross-lineage union — the one hard rule),
+// sorts, and walks for contiguity: the first segment must start at lo+1, the
+// run must have no hole, and it must reach hi exactly. It errors, mirroring
+// Chain, when the run has a hole or stops short.
+func (s *Store) segmentsInRange(lineage string, lo, hi uint64) ([]ChainMember, error) {
+	keys, err := s.B.List(LineagePrefix(lineage))
+	if err != nil {
+		return nil, err
+	}
+	var segments []ChainMember
+	for _, k := range keys {
+		m, ok := ParseMemberKey(k)
+		if !ok || m.Snapshot {
+			continue
+		}
+		segments = append(segments, m)
+	}
+	// keepHighestEpoch on THIS lineage's segments only.
+	segments = keepHighestEpoch(segments)
+	sort.Slice(segments, func(i, j int) bool {
+		if segments[i].MaxTXID != segments[j].MaxTXID {
+			return segments[i].MaxTXID < segments[j].MaxTXID
+		}
+		return segments[i].MinTXID < segments[j].MinTXID
+	})
+	var run []ChainMember
+	prevMax := lo
+	for _, seg := range segments {
+		if seg.MaxTXID <= lo {
+			continue // wholly at/below the fork point — belongs to the base half
+		}
+		if seg.MinTXID != prevMax+1 {
+			return nil, fmt.Errorf(
+				"store: segments %s(%d,%d]: hole before segment %s (expected minTXID %d, got %d)",
+				lineage, lo, hi, seg.Key, prevMax+1, seg.MinTXID)
+		}
+		run = append(run, seg)
+		prevMax = seg.MaxTXID
+		if prevMax == hi {
+			return run, nil
+		}
+		if prevMax > hi {
+			break
+		}
+	}
+	return nil, fmt.Errorf(
+		"store: segments %s(%d,%d]: no contiguous run reaches target (stopped at %d)",
+		lineage, lo, hi, prevMax)
 }
 
 func (s *Store) GetRef(db, branch string) (Ref, string, error) {
