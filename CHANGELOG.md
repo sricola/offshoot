@@ -42,6 +42,9 @@ version if you depend on format stability.
   unchanged.
 - internal: split the checkout-fingerprint (.sum sidecar) subsystem out of
   `internal/ops/ops.go` into `internal/ops/sidecar.go` (no behavior change).
+- internal: split the janitor (reap/stale-claim healing/GC/ro-cache
+  eviction loop) out of `internal/daemon/server.go` into
+  `internal/daemon/janitor.go` (no behavior change).
 - Refreshed doc comments that still described pre-daemon/pre-CoW behavior
   (`Ref.Base`, `Ref.Epoch`, `EnsureLayoutV2`, the ops package doc, the
   capture `Sink` contract and `hashSrc` cost note).
