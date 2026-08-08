@@ -773,10 +773,6 @@ func (s *Store) PutRef(db, branch string, r Ref, ifMatch string) (string, error)
 	return s.B.PutIf(RefKey(db, branch), data, ifMatch)
 }
 
-func (s *Store) DeleteRef(db, branch string) error {
-	return s.B.Delete(RefKey(db, branch))
-}
-
 // ConditionalDeleter is an optional Backend capability: DeleteIf removes key
 // only if its current content still matches ifMatch's etag, refusing with
 // ErrCAS if the key has since changed or is already gone. It is the delete-
