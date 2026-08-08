@@ -33,6 +33,14 @@ version if you depend on format stability.
 
 ### Fixed
 
+- **Daemon `compact` now refuses while the branch has an open session on
+  this daemon** ("close the session first"), matching `rollback` and
+  `promote`: compact repoints the branch to a new self-contained lineage,
+  so a live session's next flush would CAS-fail against the repointed
+  ref. Previously the daemon flushed the session and compacted anyway,
+  leaving the session fenced. With no session open the durable head is
+  already current, so compact materializes exactly that head — behavior
+  with no open session is unchanged.
 - **`store.Chain` now detects base-pointer cycles** in a corrupt or
   hand-edited store and returns a clear `base pointer cycle detected`
   error instead of recursing until the stack overflows. Not reachable

@@ -424,13 +424,16 @@ state (~G bytes for a G-byte database), the same cost class a single
 `promote` or `rollback` pays — not a cheap metadata flip. (The N×G figure
 elsewhere in this page is the *aggregate* cost of N materialized forks;
 one compact pays ~G, once.) Through the daemon (the
-`compact` op, SDK `compact()`), an open session on the branch is flushed
-first so unflushed writes land in the head being compacted; a concurrent
-flush that advances the head between the copy and the ref swap loses the
-CAS and returns a retry error.
+`compact` op, SDK `compact()`), compact refuses while this daemon has an
+open session on the branch — close it first, exactly like `rollback` and
+`promote`: the session owns the checkout compact would repoint out from
+under it. With no session open, the durable head is already current (the
+last flush persisted), so compact materializes exactly that head. A
+concurrent flush from elsewhere that advances the head between the copy
+and the ref swap loses the CAS and returns a retry error.
 
-**Errors:** no such `db@branch`; lost a concurrent CAS race to a flush
-(retry).
+**Errors:** no such `db@branch`; branch has an open session on this daemon
+(close it first); lost a concurrent CAS race to a flush (retry).
 
 ## `offshoot destroy <db>[@branch] [--force]`
 
