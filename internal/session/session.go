@@ -940,16 +940,17 @@ func (s *Session) prepareSidecarRefresh() bool {
 	if s.Err() != nil {
 		return false
 	}
-	// 30s matches Flush's own DrainNow budget (see its doc comment for the
-	// full worst-case-latency reasoning this borrows: the capture engine's
-	// takeover/retry budgets can legitimately run into the tens of
-	// seconds under contention) rather than a shorter one specific to
-	// Close: a tighter budget here would risk spuriously abandoning this
-	// best-effort optimization under exactly the same contention DrainNow
-	// already has to ride out elsewhere, for no real benefit — Close still
-	// blocks the caller either way, and skipping the refresh on a false
-	// timeout only costs a future reopen's materialize, never correctness.
-	dctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
+	// drainNowBudget is shared with Flush's pre-encode drain (see the
+	// const's doc comment for the full worst-case-latency reasoning: the
+	// capture engine's takeover/retry budgets can legitimately run into the
+	// tens of seconds under contention) rather than a shorter budget
+	// specific to Close: a tighter one here would risk spuriously
+	// abandoning this best-effort optimization under exactly the same
+	// contention DrainNow already has to ride out elsewhere, for no real
+	// benefit — Close still blocks the caller either way, and skipping the
+	// refresh on a false timeout only costs a future reopen's materialize,
+	// never correctness.
+	dctx, cancel := context.WithTimeout(context.Background(), drainNowBudget)
 	err := s.captured.DrainNow(dctx)
 	cancel()
 	if err != nil {

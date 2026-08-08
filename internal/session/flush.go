@@ -16,6 +16,23 @@ import (
 // it must not write. Fencing is terminal for a session.
 var ErrFenced = errors.New("session: fenced — lease lost")
 
+// drainNowBudget bounds a DrainNow catch-up call (Flush's pre-encode drain
+// and Close's prepareSidecarRefresh). It must comfortably exceed DrainNow's
+// own worst case, not just approximate it: a single pollOnce triggered by
+// DrainNow can, under write contention, spend up to ~25s inside the capture
+// engine alone — drainUntil's own drainSafetyDeadline (15s) backstopping
+// the drain-to-target phase itself, plus up to ~10s more if a takeover
+// follows: checkpoint() retries busy for up to 5s, and a takeover that
+// completes its checkpoint but then needs beginReadRetry to reacquire the
+// read lock retries for up to another 5s (see internal/capture/engine.go's
+// drainSafetyDeadline, checkpoint, and beginReadRetry). A tighter budget
+// could then spuriously fire under exactly the contention DrainNow exists
+// to ride out. 30s leaves a real (if not huge) margin above that ~25s
+// worst case; if the engine's own retry or drain-safety budgets ever grow,
+// this constant should be revisited rather than left silently coupled to
+// them.
+const drainNowBudget = 30 * time.Second
+
 // Flush uploads the replica's current state as a snapshot under the session's
 // lease epoch and advances the branch head. name is optional: when non-empty
 // the flushed state is also recorded as a named checkpoint; Flush checks
@@ -119,22 +136,9 @@ func (s *Session) flush(name string, meta map[string]string, auto bool) (txid ui
 	// caller already committed to the checkout: Flush would then encode a
 	// stale replica, advance the branch head to reference a snapshot that
 	// silently omits that write, and still report success. See
-	// capture.Engine.DrainNow's doc comment.
-	// This timeout must comfortably exceed DrainNow's own worst case, not
-	// just approximate it: a single pollOnce triggered by DrainNow can, under
-	// write contention, spend up to ~25s inside the capture engine alone —
-	// drainUntil's own drainSafetyDeadline (15s) backstopping the drain-to-
-	// target phase itself, plus up to ~10s more if a takeover follows:
-	// checkpoint() retries busy for up to 5s, and a takeover that completes
-	// its checkpoint but then needs beginReadRetry to reacquire the read
-	// lock retries for up to another 5s (see internal/capture/engine.go's
-	// drainSafetyDeadline, checkpoint, and beginReadRetry). A tighter
-	// flush-side timeout could then spuriously fire under exactly the
-	// contention DrainNow exists to ride out. 30s leaves a real (if not
-	// huge) margin above that ~25s budget; if the engine's own retry or
-	// drain-safety budgets ever grow, this constant should be revisited
-	// rather than left silently coupled to them.
-	dctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
+	// capture.Engine.DrainNow's doc comment, and drainNowBudget's for the
+	// worst-case-latency derivation behind the timeout.
+	dctx, cancel := context.WithTimeout(context.Background(), drainNowBudget)
 	err = s.captured.DrainNow(dctx)
 	cancel()
 	if err != nil {
