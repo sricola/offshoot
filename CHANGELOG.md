@@ -21,6 +21,17 @@ version if you depend on format stability.
 
 ### Changed
 
+- **Capture no longer fsyncs its resume-offset state file per transaction**
+  (perf audit M3). `drainStep` now records the applied position in memory
+  and the engine persists it once per drain burst (plus at shutdown's final
+  drain), lifting the ~200 txn/s capture ceiling the per-commit ~5ms fsync
+  imposed. Safe because the persisted `Off`/`Salt1`/`Salt2` are operator
+  observability only — resume eligibility rests solely on the verified-clean
+  marker (`Clean` + empty WAL + `MainHash`), which is unchanged — and the
+  persisted offset can now lag the replica by up to one in-flight burst but
+  never lead it. Clean shutdown/restart behavior (resume without rebase) is
+  unchanged; a kill -9 mid-burst still safely rebases on the next start.
+
 - **Chain resolution of a diverged shared fork now Lists the child's prefix
   once instead of twice** (perf audit H1). The seam path — a shared child
   with its own segments but no divergence-floor snapshot yet, the normal

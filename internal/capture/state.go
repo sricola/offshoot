@@ -11,12 +11,17 @@ import (
 // Two shapes matter:
 //
 //   - In-progress capture: Off/Salt1/Salt2 describe the reader's position in
-//     the live WAL generation (see drain(), which saves this after every
-//     applied transaction). Clean is false. This is NOT a valid resume point
-//     on its own — a WAL offset only means something in the context of a
-//     specific reader with live running-checksum state, which does not
-//     survive a process restart, so tryResume never trusts it. It exists so
-//     an operator/debugger can see how far capture had gotten.
+//     the live WAL generation as of the last completed drain burst — see
+//     persistConsumed in engine.go: drainStep records the position in memory
+//     per applied transaction, and it is persisted here once per burst
+//     (afterDrain) and at shutdown's final drain, not per transaction (that
+//     cost an fsync per commit — audit M3). Clean is false. This is NOT a
+//     valid resume point on its own — a WAL offset only means something in
+//     the context of a specific reader with live running-checksum state,
+//     which does not survive a process restart, so tryResume never trusts
+//     it. It exists so an operator/debugger can see how far capture had
+//     gotten (and, with batching, it can lag the replica's true position by
+//     up to one in-flight burst — never lead it).
 //
 //   - Clean shutdown: Clean is true; Off/Salt1/Salt2 are left zero and
 //     unused. This is produced ONLY by shutdown()'s successful

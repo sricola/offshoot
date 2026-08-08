@@ -136,6 +136,36 @@ type Engine struct {
 	// handling.
 	expectRestart bool
 
+	// pendState holds the latest reader position (Off/Salt1/Salt2) whose
+	// transaction has been successfully applied to the Sink but not yet
+	// persisted to the state file, and stateDirty reports whether it has
+	// advanced since the last persist. drainStep records here (cheap, in
+	// memory) instead of calling SaveState per transaction — SaveState's
+	// fsync measured ~5ms/txn, a ~200 txn/s capture ceiling (audit M3) — and
+	// persistConsumed() writes the batch out at burst boundaries instead:
+	// after each drain/drainUntil pass (afterDrain) and at shutdown()'s
+	// final drain. Safe to batch because the persisted Off/Salt1/Salt2 are
+	// operator observability only, never a resume input — tryResume ignores
+	// them entirely (see state.go's doc comment and tryResume's: resume
+	// eligibility rests solely on Clean+empty-WAL+MainHash) — and because
+	// pendState only ever records positions ALREADY applied to the Sink, the
+	// persisted offset can lag the replica (harmless; a crash mid-burst just
+	// leaves a stale offset and the next start rebases) but never lead it.
+	// Both fields are touched only by Run's own goroutine (drainStep,
+	// afterDrain, the restart-continuation branches, rebase, shutdown), so
+	// they need no synchronization; e.consumed remains the atomic,
+	// any-goroutine-readable mirror of the reader's position and is still
+	// updated per transaction.
+	pendState  State
+	stateDirty bool
+
+	// offsetSaves counts persistConsumed's actual SaveState writes. Test
+	// observability only (see TestOffsetPersistsOncePerBurst): it is how a
+	// test proves a burst of N transactions costs 1 state fsync, not N,
+	// without hooking SaveState itself. Atomic for the same
+	// read-from-test-goroutine reason as rebased/resumed above.
+	offsetSaves atomic.Int64
+
 	// reqs carries DrainNow requests into Run's select loop, so an immediate
 	// catch-up poll is serviced by the same goroutine that owns e.reader and
 	// e.conn — never concurrently with the ticker-driven path. See DrainNow
@@ -659,6 +689,7 @@ func (e *Engine) pollOnce(ctx context.Context, idle *time.Time) error {
 			e.expectRestart = false
 			e.reader = wal.NewReader(e.o.DBPath + "-wal")
 			e.consumed.Store(0) // fresh generation: nothing consumed from it yet
+			e.clearPendState()  // pending position describes the superseded generation
 			e.armDeadTailBaseline()
 			e.captured = 0
 			return nil
@@ -727,6 +758,7 @@ func (e *Engine) pollOnceTo(ctx context.Context, idle *time.Time, target int64, 
 				e.expectRestart = false
 				e.reader = wal.NewReader(e.o.DBPath + "-wal")
 				e.consumed.Store(0) // fresh generation: nothing consumed from it yet
+				e.clearPendState()  // pending position describes the superseded generation
 				e.captured = 0
 				newTarget, terr := e.drainTarget()
 				if terr != nil {
@@ -772,10 +804,21 @@ const (
 )
 
 // afterDrain runs the bookkeeping shared by pollOnce and pollOnceTo once a
-// drain phase has completed without error: update the idle timestamp and
-// cumulative captured count, and perform checkpoint takeover once enough has
-// accumulated.
+// drain phase has completed without error: persist the burst's final
+// consumed position (one state-file fsync per burst, not per transaction —
+// see persistConsumed; a no-op when the pass drained nothing, so idle ticks
+// cost no fsync), update the idle timestamp and cumulative captured count,
+// and perform checkpoint takeover once enough has accumulated. The persist
+// runs BEFORE takeover on purpose: takeover can rebase, and rebase rewrites
+// the state file (State{}) then clears the pending position — persisting
+// after it would either be a no-op or, worse, resurrect a pre-rebase offset
+// over the fresh baseline. A persist failure is fatal exactly as the
+// per-transaction SaveState failure was before batching: the error
+// propagates to Run and stops the engine loudly.
 func (e *Engine) afterDrain(ctx context.Context, idle *time.Time, n int) error {
+	if err := e.persistConsumed(); err != nil {
+		return err
+	}
 	if n > 0 {
 		*idle = time.Now()
 		e.captured += n
@@ -881,13 +924,25 @@ func (e *Engine) shutdown() {
 		// consumed while the sink never actually received it: silently
 		// excluding it from the replica forever, at the exact moment we're
 		// about to persist a Clean=true marker asserting nothing is pending.
-		// Abort the entire clean-state save — end the read tx and return,
-		// leaving the last successfully drain()-written state (Clean=false)
-		// on disk, so tryResume rejects it and the next start rebases
-		// instead of silently dropping this transaction.
+		// Abort the entire clean-state save — persist the last SUCCESSFULLY
+		// applied position (best-effort; pendState only ever holds positions
+		// the Sink fully applied, never the failed transaction), end the
+		// read tx and return, leaving a Clean=false state on disk so
+		// tryResume rejects it and the next start rebases instead of
+		// silently dropping this transaction.
+		e.persistConsumed()
 		e.endRead(sctx)
 		return
 	}
+	// Persist the final drain's position now (one fsync, dirty-checked),
+	// BEFORE the verified-clean checkpoint attempt below: every early return
+	// past this point deliberately leaves the on-disk state as-is for
+	// tryResume to reject, and with batched offset persistence "as-is" would
+	// otherwise mean a burst-stale offset rather than the freshest one. Like
+	// every other failure in shutdown, a persist error is swallowed: it only
+	// costs observability freshness (and, at worst, the resume optimization),
+	// never correctness — tryResume never reads Off/Salt1/Salt2.
+	e.persistConsumed()
 	off, _, _ := e.reader.Offset()
 	var consumed int64
 	if off != 0 {
@@ -1058,10 +1113,49 @@ func (e *Engine) drainStep() ([]wal.Frame, error) {
 	}
 	off, s1, s2 := e.reader.Offset()
 	e.consumed.Store(off)
-	if err := SaveState(e.statePath(), State{Off: off, Salt1: s1, Salt2: s2}); err != nil {
-		return nil, err
-	}
+	// Record — do not persist — the newly applied position. Persisting here,
+	// per transaction, cost an fsync per commit (see pendState's doc
+	// comment); persistConsumed() writes the latest recorded position out
+	// once per burst instead, at the call sites listed there. Ordering
+	// invariant: this runs strictly AFTER Sink.Apply succeeded above, so
+	// anything persistConsumed later writes is a position the replica has
+	// already fully applied — the persisted offset lags, never leads.
+	e.pendState = State{Off: off, Salt1: s1, Salt2: s2}
+	e.stateDirty = true
 	return frames, nil
+}
+
+// persistConsumed writes the latest applied-but-unpersisted reader position
+// (see pendState) to the state file, if it advanced since the last persist —
+// a no-op (no write, no fsync) otherwise, so calling it on an idle pass costs
+// nothing. This is the burst-boundary half of the batched-offset scheme:
+// drainStep records positions in memory per transaction; this persists the
+// newest one once per drain/drainUntil pass (afterDrain) and at shutdown()'s
+// final drain, dropping the state-file fsync cost from once per transaction
+// to once per burst.
+func (e *Engine) persistConsumed() error {
+	if !e.stateDirty {
+		return nil
+	}
+	if err := SaveState(e.statePath(), e.pendState); err != nil {
+		return err
+	}
+	e.offsetSaves.Add(1)
+	e.stateDirty = false
+	return nil
+}
+
+// clearPendState discards any recorded-but-unpersisted reader position.
+// Called exactly where the reader re-binds to a fresh WAL generation (the
+// expectRestart-continuation branches) or the state file was just rewritten
+// wholesale (rebase) — in both cases the pending position describes a
+// superseded generation and persisting it later would be stale noise.
+// Discarding, rather than persisting first, is safe for the same reason
+// batching is at all: the persisted Off/Salt1/Salt2 are observability only,
+// never consumed by resume (see pendState's doc comment).
+func (e *Engine) clearPendState() {
+	e.pendState = State{}
+	e.stateDirty = false
 }
 
 // drain consumes committed transactions until none are immediately available
@@ -1491,6 +1585,7 @@ func (e *Engine) rebase(ctx context.Context) error {
 	e.deadTail.Store(0) // the checkpoint(TRUNCATE) above physically emptied the WAL: no dead tail
 	e.rebased.Add(1)
 	e.captured = 0
+	e.clearPendState() // the fresh-baseline State{} below supersedes any pending position
 	return SaveState(e.statePath(), State{})
 }
 
