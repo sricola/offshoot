@@ -9,6 +9,7 @@ import (
 
 	"github.com/sricola/offshoot/internal/ltxio"
 	"github.com/sricola/offshoot/internal/store"
+	"github.com/sricola/offshoot/internal/testutil"
 )
 
 // TestCleanResumeRebaselinesBeforeFirstSegment guards fix 1 of the
@@ -25,7 +26,7 @@ import (
 // starting from 0 — every later segment's declared preApplyChecksum stays
 // permanently wrong, so reads hard-fail chain verification.
 func TestCleanResumeRebaselinesBeforeFirstSegment(t *testing.T) {
-	requireSQLite(t)
+	testutil.RequireSQLite3(t)
 	w := newWS(t)
 	if err := w.Create("app"); err != nil {
 		t.Fatal(err)
@@ -103,7 +104,7 @@ func TestCleanResumeRebaselinesBeforeFirstSegment(t *testing.T) {
 // the agent had at that moment, whether it was stored as a snapshot or a
 // segment.
 func TestEveryFlushIsExactlyMaterializable(t *testing.T) {
-	requireSQLite(t)
+	testutil.RequireSQLite3(t)
 	w := newWS(t)
 	if err := w.Create("app"); err != nil {
 		t.Fatal(err)
@@ -190,7 +191,7 @@ func TestEveryFlushIsExactlyMaterializable(t *testing.T) {
 // TestChainSurvivesSessionRestart proves a chain written by one session is
 // readable and extendable by the next.
 func TestChainSurvivesSessionRestart(t *testing.T) {
-	requireSQLite(t)
+	testutil.RequireSQLite3(t)
 	w := newWS(t)
 	if err := w.Create("app"); err != nil {
 		t.Fatal(err)
@@ -258,7 +259,7 @@ func TestChainSurvivesSessionRestart(t *testing.T) {
 // TestMissingSegmentIsLoud proves a chain with a deleted member fails closed
 // rather than silently materializing an older state.
 func TestMissingSegmentIsLoud(t *testing.T) {
-	requireSQLite(t)
+	testutil.RequireSQLite3(t)
 	w := newWS(t)
 	if err := w.Create("app"); err != nil {
 		t.Fatal(err)

@@ -7,18 +7,9 @@ import (
 	"sync"
 	"testing"
 	"time"
-)
 
-// requireSQLiteCLI skips the test if the sqlite3 CLI isn't on PATH — every
-// test in this file that needs to write real content into a checkout uses
-// it, matching the skip pattern already established across ops_test.go
-// (e.g. TestForkWarnsOnStaleCheckout).
-func requireSQLiteCLI(t *testing.T) {
-	t.Helper()
-	if _, err := exec.LookPath("sqlite3"); err != nil {
-		t.Skip("sqlite3 CLI not on PATH")
-	}
-}
+	"github.com/sricola/offshoot/internal/testutil"
+)
 
 // TestBranchStateIdleFreshBranch: a brand-new branch has no lease, no
 // checkout — none of active/dirty/detached apply, so it reads idle. This is
@@ -66,7 +57,7 @@ func TestBranchStateActiveWithLiveLease(t *testing.T) {
 // checkoutState's "modified" verdict — un-checkpointed local edits, exactly
 // what "dirty" names.
 func TestBranchStateDirtyAfterUncheckpointedEdit(t *testing.T) {
-	requireSQLiteCLI(t)
+	testutil.RequireSQLite3(t)
 	w := newWS(t)
 	if err := w.Create("app"); err != nil {
 		t.Fatal(err)
@@ -253,7 +244,7 @@ func TestBranchStateConcurrentCallsOnCleanCheckoutNeverFlapToDirty(t *testing.T)
 // specifically per this task's own guidance to "verify by reading
 // Promote".
 func TestBranchStateDetachedAfterPromoteRefreshFailure(t *testing.T) {
-	requireSQLiteCLI(t)
+	testutil.RequireSQLite3(t)
 	w := newWS(t)
 	if err := w.Create("app"); err != nil {
 		t.Fatal(err)
@@ -355,7 +346,7 @@ func TestBranchStateIdleForStaleSameLineageCheckout(t *testing.T) {
 // active (a live lease) outranks dirty (local un-checkpointed edits) even
 // when both conditions hold on the same branch at once.
 func TestBranchStatePrecedenceActiveOverDirty(t *testing.T) {
-	requireSQLiteCLI(t)
+	testutil.RequireSQLite3(t)
 	w := newWS(t)
 	if err := w.Create("app"); err != nil {
 		t.Fatal(err)
@@ -413,7 +404,7 @@ func TestBranchStateIdleForCorruptSidecar(t *testing.T) {
 // an operator would actually see them, not just via isolated single-branch
 // BranchState calls.
 func TestStatusReportsExactlyOneStateAcrossAMatrixOfBranches(t *testing.T) {
-	requireSQLiteCLI(t)
+	testutil.RequireSQLite3(t)
 	w := newWS(t)
 	if err := w.Create("app"); err != nil {
 		t.Fatal(err)

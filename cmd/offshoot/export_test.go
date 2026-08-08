@@ -6,14 +6,9 @@ import (
 	"path/filepath"
 	"strings"
 	"testing"
-)
 
-func requireSQLite3ForCLI(t *testing.T) {
-	t.Helper()
-	if _, err := exec.LookPath("sqlite3"); err != nil {
-		t.Skip("sqlite3 CLI not on PATH")
-	}
-}
+	"github.com/sricola/offshoot/internal/testutil"
+)
 
 func sqliteRows(t *testing.T, dbPath string) string {
 	t.Helper()
@@ -28,7 +23,7 @@ func sqliteRows(t *testing.T, dbPath string) string {
 // CLI's "db@branch@checkpoint" target parsing end to end: it must resolve
 // to the NAMED checkpoint's content, not the branch's current head.
 func TestExportCLIParsesTripleAtFormAndExportsHistoricalCheckpoint(t *testing.T) {
-	requireSQLite3ForCLI(t)
+	testutil.RequireSQLite3(t)
 	store := filepath.Join(t.TempDir(), "s")
 	call(t, store, "init")
 	call(t, store, "create", "app")
@@ -63,7 +58,7 @@ func TestExportCLIParsesTripleAtFormAndExportsHistoricalCheckpoint(t *testing.T)
 // TestExportCLIRefusesOverwriteWithoutForce pins the CLI wiring for
 // ops.Export's refuse/force semantics.
 func TestExportCLIRefusesOverwriteWithoutForce(t *testing.T) {
-	requireSQLite3ForCLI(t)
+	testutil.RequireSQLite3(t)
 	store := filepath.Join(t.TempDir(), "s")
 	call(t, store, "init")
 	call(t, store, "create", "app")
@@ -119,7 +114,7 @@ func TestCheckoutAtCLIRequiresBothFlagsTogether(t *testing.T) {
 // TestCheckoutAtCLIMaterializesSeparateReadOnlyPath exercises the full
 // `checkout --at <checkpoint> --read-only [--force]` CLI path.
 func TestCheckoutAtCLIMaterializesSeparateReadOnlyPath(t *testing.T) {
-	requireSQLite3ForCLI(t)
+	testutil.RequireSQLite3(t)
 	store := filepath.Join(t.TempDir(), "s")
 	call(t, store, "init")
 	call(t, store, "create", "app")
@@ -162,7 +157,7 @@ func TestCheckoutAtCLIMaterializesSeparateReadOnlyPath(t *testing.T) {
 // the branch's own writable checkout path) must be refused, not served as
 // a "cache hit".
 func TestCheckoutAtCLIRejectsPathTraversalCheckpoint(t *testing.T) {
-	requireSQLite3ForCLI(t)
+	testutil.RequireSQLite3(t)
 	store := filepath.Join(t.TempDir(), "s")
 	call(t, store, "init")
 	call(t, store, "create", "app")

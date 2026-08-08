@@ -10,14 +10,13 @@ import (
 
 	"github.com/sricola/offshoot/internal/ltxio"
 	"github.com/sricola/offshoot/internal/store"
+	"github.com/sricola/offshoot/internal/testutil"
 )
 
 // TestCheckoutReadsASnapshotPlusSegments builds a chain by hand in the store
 // and proves every read path resolves it.
 func TestCheckoutReadsASnapshotPlusSegments(t *testing.T) {
-	if _, err := exec.LookPath("sqlite3"); err != nil {
-		t.Skip("sqlite3 CLI not on PATH")
-	}
+	testutil.RequireSQLite3(t)
 	w := newWS(t)
 	if err := w.Create("app"); err != nil {
 		t.Fatal(err)
@@ -88,9 +87,7 @@ func TestCheckoutReadsASnapshotPlusSegments(t *testing.T) {
 // so this pins the materialize branch — the fork-time snapshot floor — via
 // the test hook.
 func TestForkFromAChainProducesASingleSnapshot(t *testing.T) {
-	if _, err := exec.LookPath("sqlite3"); err != nil {
-		t.Skip("sqlite3 CLI not on PATH")
-	}
+	testutil.RequireSQLite3(t)
 	SetForkMaterializeForTest(true)
 	t.Cleanup(func() { SetForkMaterializeForTest(false) })
 	w := newWS(t)
@@ -128,9 +125,7 @@ func TestForkFromAChainProducesASingleSnapshot(t *testing.T) {
 // branch via the test hook — see TestForkFromAChainProducesASingleSnapshot's
 // doc comment.
 func TestForkAtHeadAfterASegmentProducesASingleSnapshot(t *testing.T) {
-	if _, err := exec.LookPath("sqlite3"); err != nil {
-		t.Skip("sqlite3 CLI not on PATH")
-	}
+	testutil.RequireSQLite3(t)
 	SetForkMaterializeForTest(true)
 	t.Cleanup(func() { SetForkMaterializeForTest(false) })
 	w := newWS(t)
@@ -262,9 +257,7 @@ func changedPagesForTest(t *testing.T, before, after string) (uint32, uint32, []
 // writes the same TXID under a higher epoch. A checkout must materialize the
 // live writer's content, never the orphan's.
 func TestCheckoutIgnoresAFencedWritersObject(t *testing.T) {
-	if _, err := exec.LookPath("sqlite3"); err != nil {
-		t.Skip("sqlite3 CLI not on PATH")
-	}
+	testutil.RequireSQLite3(t)
 	w := newWS(t)
 	if err := w.Create("app"); err != nil {
 		t.Fatal(err)

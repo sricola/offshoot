@@ -14,6 +14,7 @@ import (
 
 	_ "github.com/mattn/go-sqlite3"
 	"github.com/sricola/offshoot/internal/replay"
+	"github.com/sricola/offshoot/internal/testutil"
 	"github.com/sricola/offshoot/internal/wal"
 )
 
@@ -77,9 +78,7 @@ func waitEqual(t *testing.T, src string, rep *replay.Replica, deadline time.Dura
 }
 
 func TestEngineCapturesForeignGoWriter(t *testing.T) {
-	if _, err := exec.LookPath("sqlite3"); err != nil {
-		t.Skip("sqlite3 CLI not on PATH")
-	}
+	testutil.RequireSQLite3(t)
 	src := filepath.Join(t.TempDir(), "src.db")
 	db, err := sql.Open("sqlite3", src)
 	if err != nil {
@@ -105,9 +104,7 @@ func TestEngineCapturesForeignGoWriter(t *testing.T) {
 }
 
 func TestEngineCapturesStockCLIWriter(t *testing.T) {
-	if _, err := exec.LookPath("sqlite3"); err != nil {
-		t.Skip("sqlite3 CLI not on PATH")
-	}
+	testutil.RequireSQLite3(t)
 	src := filepath.Join(t.TempDir(), "src.db")
 	// Create + WAL mode via the CLI itself — the engine never owns the writer.
 	if out, err := exec.Command("sqlite3", src,
@@ -187,9 +184,7 @@ func sqlite3UnlinksWALOnExit(t *testing.T) bool {
 // cannot observe the failure. It runs for real against any stock sqlite3
 // build (Linux distributions, Homebrew, and the GitHub-hosted runners).
 func TestEngineHoldsReadLockAcrossSnapshotCopy(t *testing.T) {
-	if _, err := exec.LookPath("sqlite3"); err != nil {
-		t.Skip("sqlite3 CLI not on PATH")
-	}
+	testutil.RequireSQLite3(t)
 	if !sqlite3UnlinksWALOnExit(t) {
 		v, _ := exec.Command("sqlite3", "--version").Output()
 		t.Skipf("this platform's sqlite3 does not unlink the WAL when the last "+
@@ -270,9 +265,7 @@ func TestEngineHoldsReadLockAcrossSnapshotCopy(t *testing.T) {
 // It is verified for stability with `-count=15`; if it ever flakes, that is
 // itself informative (a fold race actually occurred) rather than a bug.
 func TestEngineTakeoverUnderConcurrentWrites(t *testing.T) {
-	if _, err := exec.LookPath("sqlite3"); err != nil {
-		t.Skip("sqlite3 CLI not on PATH")
-	}
+	testutil.RequireSQLite3(t)
 	src := filepath.Join(t.TempDir(), "src.db")
 	db, err := sql.Open("sqlite3", src+"?_busy_timeout=5000")
 	if err != nil {
@@ -385,9 +378,7 @@ func TestEngineTakeoverUnderConcurrentWrites(t *testing.T) {
 //     verified-clean (log==consumed) path is not just likely but
 //     guaranteed.
 func TestEngineTakeoverExpectedRestartIsNotRebase(t *testing.T) {
-	if _, err := exec.LookPath("sqlite3"); err != nil {
-		t.Skip("sqlite3 CLI not on PATH")
-	}
+	testutil.RequireSQLite3(t)
 	dir := t.TempDir()
 	src := filepath.Join(dir, "src.db")
 	db, err := sql.Open("sqlite3", src+"?_busy_timeout=5000")
@@ -491,9 +482,7 @@ func TestEngineTakeoverExpectedRestartIsNotRebase(t *testing.T) {
 // through unseen. On restart, the engine must NOT silently resume: it must
 // detect the divergence and rebase, and Rebased() must report it.
 func TestEngineDetectsMissedWritesAfterCrash(t *testing.T) {
-	if _, err := exec.LookPath("sqlite3"); err != nil {
-		t.Skip("sqlite3 CLI not on PATH")
-	}
+	testutil.RequireSQLite3(t)
 	dir := t.TempDir()
 	src := filepath.Join(dir, "src.db")
 	if out, err := exec.Command("sqlite3", src,
@@ -564,9 +553,7 @@ func TestEngineDetectsMissedWritesAfterCrash(t *testing.T) {
 // Engine.shutdown() saves state, gone by the time Run() returns) before
 // adding the foreign connection fixed it.
 func TestEngineResumesCleanly(t *testing.T) {
-	if _, err := exec.LookPath("sqlite3"); err != nil {
-		t.Skip("sqlite3 CLI not on PATH")
-	}
+	testutil.RequireSQLite3(t)
 	dir := t.TempDir()
 	src := filepath.Join(dir, "src.db")
 	if out, err := exec.Command("sqlite3", src,
@@ -642,9 +629,7 @@ func TestEngineResumesCleanly(t *testing.T) {
 // ("session 2 resumed but re-applied 1 already-captured transaction(s)
 // before any new write").
 func TestEngineResumeAppliesNothingBeforeNewWrite(t *testing.T) {
-	if _, err := exec.LookPath("sqlite3"); err != nil {
-		t.Skip("sqlite3 CLI not on PATH")
-	}
+	testutil.RequireSQLite3(t)
 	dir := t.TempDir()
 	src := filepath.Join(dir, "src.db")
 	if out, err := exec.Command("sqlite3", src,
@@ -749,9 +734,7 @@ func TestEngineResumeAppliesNothingBeforeNewWrite(t *testing.T) {
 // still provably empty) and rebase rather than silently resume, and the
 // replica must converge to include the UPDATE.
 func TestEngineDetectsInPlaceUpdateAfterCleanShutdown(t *testing.T) {
-	if _, err := exec.LookPath("sqlite3"); err != nil {
-		t.Skip("sqlite3 CLI not on PATH")
-	}
+	testutil.RequireSQLite3(t)
 	dir := t.TempDir()
 	src := filepath.Join(dir, "src.db")
 	if out, err := exec.Command("sqlite3", src,
@@ -831,9 +814,7 @@ func TestEngineDetectsInPlaceUpdateAfterCleanShutdown(t *testing.T) {
 // reuses this exact hook to verify Session.commitSidecarRefresh's gate on
 // this same State.
 func TestEngineShutdownLeavesUnverifiedStateAfterRacedRestart(t *testing.T) {
-	if _, err := exec.LookPath("sqlite3"); err != nil {
-		t.Skip("sqlite3 CLI not on PATH")
-	}
+	testutil.RequireSQLite3(t)
 	dir := t.TempDir()
 	src := filepath.Join(dir, "src.db")
 	if out, err := exec.Command("sqlite3", src,
@@ -892,9 +873,7 @@ func TestEngineShutdownLeavesUnverifiedStateAfterRacedRestart(t *testing.T) {
 }
 
 func TestEngineSurvivesForeignPassiveCheckpoint(t *testing.T) {
-	if _, err := exec.LookPath("sqlite3"); err != nil {
-		t.Skip("sqlite3 CLI not on PATH")
-	}
+	testutil.RequireSQLite3(t)
 	src := filepath.Join(t.TempDir(), "src.db")
 	if out, err := exec.Command("sqlite3", src,
 		"PRAGMA journal_mode=WAL; CREATE TABLE t (id INTEGER PRIMARY KEY, v BLOB);").CombinedOutput(); err != nil {
@@ -921,9 +900,7 @@ func TestEngineSurvivesForeignPassiveCheckpoint(t *testing.T) {
 // a pending transaction to the Sink, and a second DrainNow with nothing left
 // pending must return quickly (it should not block for anywhere near Poll).
 func TestDrainNowCapturesPendingTransaction(t *testing.T) {
-	if _, err := exec.LookPath("sqlite3"); err != nil {
-		t.Skip("sqlite3 CLI not on PATH")
-	}
+	testutil.RequireSQLite3(t)
 	dir := t.TempDir()
 	src := filepath.Join(dir, "src.db")
 	if out, err := exec.Command("sqlite3", src,
@@ -996,9 +973,7 @@ func TestDrainNowCapturesPendingTransaction(t *testing.T) {
 // test exists to catch. See task-6-report.md for the captured failure
 // output.
 func TestDrainNowFatalErrorStopsRun(t *testing.T) {
-	if _, err := exec.LookPath("sqlite3"); err != nil {
-		t.Skip("sqlite3 CLI not on PATH")
-	}
+	testutil.RequireSQLite3(t)
 	dir := t.TempDir()
 	src := filepath.Join(dir, "src.db")
 	if out, err := exec.Command("sqlite3", src,
@@ -1055,9 +1030,7 @@ func TestDrainNowFatalErrorStopsRun(t *testing.T) {
 // explicit DrainNow call, so Lag() has a real, deterministic backlog to
 // report in between.
 func TestEngineLagReportsPendingBacklogThenZero(t *testing.T) {
-	if _, err := exec.LookPath("sqlite3"); err != nil {
-		t.Skip("sqlite3 CLI not on PATH")
-	}
+	testutil.RequireSQLite3(t)
 	dir := t.TempDir()
 	src := filepath.Join(dir, "src.db")
 	if out, err := exec.Command("sqlite3", src,
@@ -1187,9 +1160,7 @@ func TestEngineLagOrderingUndercountsAcrossARestartRace(t *testing.T) {
 // before the fix is restored) — see the task-8 report's "Whole-branch fix
 // wave" section for that run.
 func TestEngineLagRetiresPhantomAfterIdleTakeover(t *testing.T) {
-	if _, err := exec.LookPath("sqlite3"); err != nil {
-		t.Skip("sqlite3 CLI not on PATH")
-	}
+	testutil.RequireSQLite3(t)
 	dir := t.TempDir()
 	src := filepath.Join(dir, "src.db")
 	if out, err := exec.Command("sqlite3", src,

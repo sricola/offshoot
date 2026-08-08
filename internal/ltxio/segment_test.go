@@ -13,6 +13,8 @@ import (
 
 	_ "github.com/mattn/go-sqlite3"
 	"github.com/superfly/ltx"
+
+	"github.com/sricola/offshoot/internal/testutil"
 )
 
 // buildDB makes a quiesced SQLite file and returns its path.
@@ -76,9 +78,7 @@ func checksumOf(t *testing.T, path string) uint64 {
 }
 
 func TestSegmentAppliedToSnapshotEqualsTheLaterDatabase(t *testing.T) {
-	if _, err := exec.LookPath("sqlite3"); err != nil {
-		t.Skip("sqlite3 CLI not on PATH")
-	}
+	testutil.RequireSQLite3(t)
 	// v1: the snapshot's state. v2: after more writes.
 	v1 := buildDB(t, "CREATE TABLE t (id INTEGER PRIMARY KEY, v TEXT)",
 		"INSERT INTO t (v) VALUES ('a'), ('b')")
@@ -149,9 +149,7 @@ func TestSegmentAppliedToSnapshotEqualsTheLaterDatabase(t *testing.T) {
 // as a tested primitive for decoding a trailer without materializing
 // content.
 func TestTrailerPostApplyChecksumMatchesEncodedValue(t *testing.T) {
-	if _, err := exec.LookPath("sqlite3"); err != nil {
-		t.Skip("sqlite3 CLI not on PATH")
-	}
+	testutil.RequireSQLite3(t)
 	v1 := buildDB(t, "CREATE TABLE t (id INTEGER PRIMARY KEY, v TEXT)",
 		"INSERT INTO t (v) VALUES ('a'), ('b')")
 	var snap bytes.Buffer
@@ -195,9 +193,7 @@ func TestTrailerPostApplyChecksumMatchesEncodedValue(t *testing.T) {
 }
 
 func TestMaterializeChainWithNoSegmentsIsJustTheSnapshot(t *testing.T) {
-	if _, err := exec.LookPath("sqlite3"); err != nil {
-		t.Skip("sqlite3 CLI not on PATH")
-	}
+	testutil.RequireSQLite3(t)
 	v1 := buildDB(t, "CREATE TABLE t (v)", "INSERT INTO t VALUES ('only')")
 	var snap bytes.Buffer
 	if _, err := EncodeSnapshot(v1, 5, &snap); err != nil {
@@ -217,9 +213,7 @@ func TestMaterializeChainWithNoSegmentsIsJustTheSnapshot(t *testing.T) {
 }
 
 func TestChainRejectsAGap(t *testing.T) {
-	if _, err := exec.LookPath("sqlite3"); err != nil {
-		t.Skip("sqlite3 CLI not on PATH")
-	}
+	testutil.RequireSQLite3(t)
 	v1 := buildDB(t, "CREATE TABLE t (v)", "INSERT INTO t VALUES ('x')")
 	var snap bytes.Buffer
 	if _, err := EncodeSnapshot(v1, 1, &snap); err != nil {
@@ -258,9 +252,7 @@ func TestEncodeSegmentRejectsUnsortedOrDuplicatePages(t *testing.T) {
 }
 
 func TestCorruptSegmentFailsClosed(t *testing.T) {
-	if _, err := exec.LookPath("sqlite3"); err != nil {
-		t.Skip("sqlite3 CLI not on PATH")
-	}
+	testutil.RequireSQLite3(t)
 	v1 := buildDB(t, "CREATE TABLE t (v)", "INSERT INTO t VALUES ('x')")
 	var snap bytes.Buffer
 	if _, err := EncodeSnapshot(v1, 1, &snap); err != nil {
@@ -326,9 +318,7 @@ func insertManySQL(n, blobSize int) string {
 // shrinking (trailing pages are dropped), since those are the two cases
 // MaterializeChain's incremental checksum maintenance has to get right.
 func TestUpdateChecksumMatchesFullRescan(t *testing.T) {
-	if _, err := exec.LookPath("sqlite3"); err != nil {
-		t.Skip("sqlite3 CLI not on PATH")
-	}
+	testutil.RequireSQLite3(t)
 
 	assertIncrementalMatchesRescan := func(t *testing.T, before, after string) {
 		t.Helper()
@@ -408,9 +398,7 @@ func TestUpdateChecksumMatchesFullRescan(t *testing.T) {
 // materialized result with ChecksumDatabase and checks it against the last
 // segment's declared post-apply checksum.
 func TestMaterializeChainIncrementalChecksumMatchesFullRescan(t *testing.T) {
-	if _, err := exec.LookPath("sqlite3"); err != nil {
-		t.Skip("sqlite3 CLI not on PATH")
-	}
+	testutil.RequireSQLite3(t)
 
 	v1 := buildDB(t, "CREATE TABLE t (id INTEGER PRIMARY KEY, v BLOB)",
 		"INSERT INTO t (v) VALUES (randomblob(50))")

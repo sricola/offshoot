@@ -11,17 +11,8 @@ import (
 
 	"github.com/sricola/offshoot/internal/ltxio"
 	"github.com/sricola/offshoot/internal/store"
+	"github.com/sricola/offshoot/internal/testutil"
 )
-
-// requireSQLite3 skips the test if the sqlite3 CLI isn't on PATH — every
-// test in this file drives a checkout through it, mirroring
-// materialize_test.go's own convention.
-func requireSQLite3(t *testing.T) {
-	t.Helper()
-	if _, err := exec.LookPath("sqlite3"); err != nil {
-		t.Skip("sqlite3 CLI not on PATH")
-	}
-}
 
 func rowCount(t *testing.T, dbPath string) int {
 	t.Helper()
@@ -37,7 +28,7 @@ func rowCount(t *testing.T, dbPath string) int {
 }
 
 func TestExportHeadWritesAPlainFileWithNoSidecar(t *testing.T) {
-	requireSQLite3(t)
+	testutil.RequireSQLite3(t)
 	w := newWS(t)
 	if err := w.Create("app"); err != nil {
 		t.Fatal(err)
@@ -67,7 +58,7 @@ func TestExportHeadWritesAPlainFileWithNoSidecar(t *testing.T) {
 }
 
 func TestExportNamedCheckpointExportsHistoricalContentNotHead(t *testing.T) {
-	requireSQLite3(t)
+	testutil.RequireSQLite3(t)
 	w := newWS(t)
 	if err := w.Create("app"); err != nil {
 		t.Fatal(err)
@@ -109,7 +100,7 @@ func TestExportNamedCheckpointExportsHistoricalContentNotHead(t *testing.T) {
 }
 
 func TestExportRefusesToOverwriteWithoutForce(t *testing.T) {
-	requireSQLite3(t)
+	testutil.RequireSQLite3(t)
 	w := newWS(t)
 	if err := w.Create("app"); err != nil {
 		t.Fatal(err)
@@ -178,7 +169,7 @@ func TestExportErrorsOnMissingBranch(t *testing.T) {
 }
 
 func TestExportCreatesDestinationDirectory(t *testing.T) {
-	requireSQLite3(t)
+	testutil.RequireSQLite3(t)
 	w := newWS(t)
 	if err := w.Create("app"); err != nil {
 		t.Fatal(err)
@@ -209,7 +200,7 @@ func TestExportCreatesDestinationDirectory(t *testing.T) {
 // ltxio.MaterializeChain's doc comment: the temp file lives in dst's own
 // directory and is removed on any error return).
 func TestExportAtomicOnMidWriteFailureLeavesNoTempOrPartialFile(t *testing.T) {
-	requireSQLite3(t)
+	testutil.RequireSQLite3(t)
 	w := newWS(t)
 	if err := w.Create("app"); err != nil {
 		t.Fatal(err)
@@ -285,7 +276,7 @@ func TestExportAtomicOnMidWriteFailureLeavesNoTempOrPartialFile(t *testing.T) {
 }
 
 func TestExportDiscardsChecksumRegardlessOfChainLength(t *testing.T) {
-	requireSQLite3(t)
+	testutil.RequireSQLite3(t)
 	w := newWS(t)
 	if err := w.Create("app"); err != nil {
 		t.Fatal(err)
@@ -307,7 +298,7 @@ func TestExportDiscardsChecksumRegardlessOfChainLength(t *testing.T) {
 // --- checkout-at (read-only historical checkout) ---
 
 func TestCheckoutAtMaterializesHistoricalCheckpointReadOnly(t *testing.T) {
-	requireSQLite3(t)
+	testutil.RequireSQLite3(t)
 	w := newWS(t)
 	if err := w.Create("app"); err != nil {
 		t.Fatal(err)
@@ -381,7 +372,7 @@ func TestCheckoutAtErrorsOnMissingCheckpoint(t *testing.T) {
 // call with force=false returns it without touching the store at all — even
 // once the underlying branch has been destroyed entirely.
 func TestCheckoutAtWithoutForceIsACacheHitWithNoStoreAccess(t *testing.T) {
-	requireSQLite3(t)
+	testutil.RequireSQLite3(t)
 	w := newWS(t)
 	if err := w.Create("app"); err != nil {
 		t.Fatal(err)
@@ -415,7 +406,7 @@ func TestCheckoutAtWithoutForceIsACacheHitWithNoStoreAccess(t *testing.T) {
 // the branch is destroyed, a forced re-materialize of the same checkpoint
 // must fail, not silently keep serving the stale cached file.
 func TestCheckoutAtForceRematerializesAndCanFail(t *testing.T) {
-	requireSQLite3(t)
+	testutil.RequireSQLite3(t)
 	w := newWS(t)
 	if err := w.Create("app"); err != nil {
 		t.Fatal(err)
@@ -446,7 +437,7 @@ func TestCheckoutAtForceRematerializesAndCanFail(t *testing.T) {
 // ref.Checkpoints was ever consulted. store.ValidateName must reject every
 // such value before CheckoutAtPath is ever computed.
 func TestCheckoutAtRejectsPathTraversalCheckpoint(t *testing.T) {
-	requireSQLite3(t)
+	testutil.RequireSQLite3(t)
 	w := newWS(t)
 	if err := w.Create("app"); err != nil {
 		t.Fatal(err)
@@ -507,7 +498,7 @@ func TestCheckoutAtRejectsPathTraversalCheckpoint(t *testing.T) {
 // call (chmod restored) succeeds cleanly rather than tripping over a
 // leftover.
 func TestCheckoutAtChmodFailureRemovesFileSoLaterCallsRematerialize(t *testing.T) {
-	requireSQLite3(t)
+	testutil.RequireSQLite3(t)
 	w := newWS(t)
 	if err := w.Create("app"); err != nil {
 		t.Fatal(err)

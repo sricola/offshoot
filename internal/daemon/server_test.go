@@ -14,13 +14,12 @@ import (
 	"github.com/sricola/offshoot/internal/ops"
 	"github.com/sricola/offshoot/internal/session"
 	"github.com/sricola/offshoot/internal/store"
+	"github.com/sricola/offshoot/internal/testutil"
 )
 
 func newServer(t *testing.T) (*Server, *ops.Workspace) {
 	t.Helper()
-	if _, err := exec.LookPath("sqlite3"); err != nil {
-		t.Skip("sqlite3 CLI not on PATH")
-	}
+	testutil.RequireSQLite3(t)
 	dir := t.TempDir()
 	w, err := ops.Init(filepath.Join(dir, "store"))
 	if err != nil {

@@ -4,14 +4,14 @@ import (
 	"os/exec"
 	"strings"
 	"testing"
+
+	"github.com/sricola/offshoot/internal/testutil"
 )
 
 // TestDemoRunsEndToEnd runs the published demo exactly as a reader would.
 // If this fails, the demo in the README is broken for everyone.
 func TestDemoRunsEndToEnd(t *testing.T) {
-	if _, err := exec.LookPath("sqlite3"); err != nil {
-		t.Skip("sqlite3 CLI not on PATH")
-	}
+	testutil.RequireSQLite3(t)
 	cmd := exec.Command("bash", "run.sh")
 	cmd.Env = append(cmd.Environ(), "OFFSHOOT_DEMO_DIR="+t.TempDir())
 	out, err := cmd.CombinedOutput()

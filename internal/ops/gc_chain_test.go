@@ -11,6 +11,7 @@ import (
 	"github.com/sricola/offshoot/internal/ops"
 	"github.com/sricola/offshoot/internal/session"
 	"github.com/sricola/offshoot/internal/store"
+	"github.com/sricola/offshoot/internal/testutil"
 )
 
 // newWS initializes a fresh Workspace for testing. Mirrors the internal
@@ -25,9 +26,7 @@ func newWS(t *testing.T) *ops.Workspace {
 }
 
 func TestReplayStaysBoundedAcrossManyFlushes(t *testing.T) {
-	if _, err := exec.LookPath("sqlite3"); err != nil {
-		t.Skip("sqlite3 CLI not on PATH")
-	}
+	testutil.RequireSQLite3(t)
 	w := newWS(t)
 	if err := w.Create("app"); err != nil {
 		t.Fatal(err)
@@ -67,9 +66,7 @@ func TestReplayStaysBoundedAcrossManyFlushes(t *testing.T) {
 }
 
 func TestGCSweepsSegmentsWithTheirLineage(t *testing.T) {
-	if _, err := exec.LookPath("sqlite3"); err != nil {
-		t.Skip("sqlite3 CLI not on PATH")
-	}
+	testutil.RequireSQLite3(t)
 	w := newWS(t)
 	if err := w.Create("app"); err != nil {
 		t.Fatal(err)
@@ -142,9 +139,7 @@ func TestGCSweepsSegmentsWithTheirLineage(t *testing.T) {
 // external ops_test package (not internal ops_test.go) because it needs
 // session, which imports ops — see this file's package doc comment.
 func TestForkFastPathSkipsMultiMemberChains(t *testing.T) {
-	if _, err := exec.LookPath("sqlite3"); err != nil {
-		t.Skip("sqlite3 CLI not on PATH")
-	}
+	testutil.RequireSQLite3(t)
 	w := newWS(t)
 	if err := w.Create("app"); err != nil {
 		t.Fatal(err)

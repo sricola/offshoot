@@ -9,6 +9,8 @@ import (
 	"testing"
 
 	_ "github.com/mattn/go-sqlite3"
+
+	"github.com/sricola/offshoot/internal/testutil"
 )
 
 func makeDB(t *testing.T, rows int) string {
@@ -49,9 +51,7 @@ func dump(t *testing.T, path string) string {
 }
 
 func TestSnapshotRoundTrip(t *testing.T) {
-	if _, err := exec.LookPath("sqlite3"); err != nil {
-		t.Skip("sqlite3 CLI not on PATH")
-	}
+	testutil.RequireSQLite3(t)
 	src := makeDB(t, 50)
 	var buf bytes.Buffer
 	if _, err := EncodeSnapshot(src, 7, &buf); err != nil {

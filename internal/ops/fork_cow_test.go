@@ -14,6 +14,7 @@ import (
 	"github.com/sricola/offshoot/internal/ops"
 	"github.com/sricola/offshoot/internal/session"
 	"github.com/sricola/offshoot/internal/store"
+	"github.com/sricola/offshoot/internal/testutil"
 )
 
 // TestForkTimeFloorMaterializesDeepChain: a fork whose resolved base chain
@@ -22,9 +23,7 @@ import (
 // base.json), so no fork spine's resolved chain ever exceeds the bound. A
 // control fork taken while the chain was still shallow shares as usual.
 func TestForkTimeFloorMaterializesDeepChain(t *testing.T) {
-	if _, err := exec.LookPath("sqlite3"); err != nil {
-		t.Skip("sqlite3 CLI not on PATH")
-	}
+	testutil.RequireSQLite3(t)
 	w := newWS(t)
 	if err := w.Create("app"); err != nil {
 		t.Fatal(err)
@@ -144,9 +143,7 @@ func TestForkTimeFloorMaterializesDeepChain(t *testing.T) {
 // This is what keeps a daemon configured with a small session cadence from
 // minting shared forks whose resolved chains exceed that cadence.
 func TestForkFloorTracksConfiguredSnapshotEvery(t *testing.T) {
-	if _, err := exec.LookPath("sqlite3"); err != nil {
-		t.Skip("sqlite3 CLI not on PATH")
-	}
+	testutil.RequireSQLite3(t)
 	const cadence = 4
 	w := newWS(t)
 	if err := w.Create("app"); err != nil {

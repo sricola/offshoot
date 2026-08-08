@@ -12,15 +12,14 @@ import (
 
 	"github.com/sricola/offshoot/internal/session"
 	"github.com/sricola/offshoot/internal/store"
+	"github.com/sricola/offshoot/internal/testutil"
 )
 
 // TestCompactMakesBranchSelfContained: after compact, the branch owns ONE
 // snapshot in a brand-new lineage, its ref's Base is nil, the new lineage
 // has NO base.json, and the checkpoint map was reset to {"compact"}.
 func TestCompactMakesBranchSelfContained(t *testing.T) {
-	if _, err := exec.LookPath("sqlite3"); err != nil {
-		t.Skip("sqlite3 CLI not on PATH")
-	}
+	testutil.RequireSQLite3(t)
 	w := newWS(t)
 	if err := w.Create("app"); err != nil {
 		t.Fatal(err)
@@ -127,9 +126,7 @@ func TestCompactMakesBranchSelfContained(t *testing.T) {
 // (materialized and read BEFORE the reclaim). The child's abandoned old
 // lineage (its base.json) is reclaimed too.
 func TestCompactAllowsAncestorReclaim(t *testing.T) {
-	if _, err := exec.LookPath("sqlite3"); err != nil {
-		t.Skip("sqlite3 CLI not on PATH")
-	}
+	testutil.RequireSQLite3(t)
 	w := newWS(t)
 	if err := w.Create("app"); err != nil {
 		t.Fatal(err)
@@ -222,9 +219,7 @@ func TestCompactAllowsAncestorReclaim(t *testing.T) {
 // byte-identical `.dump` as before compact — folding the base chain into
 // one snapshot changes storage, never content.
 func TestCompactPreservesContent(t *testing.T) {
-	if _, err := exec.LookPath("sqlite3"); err != nil {
-		t.Skip("sqlite3 CLI not on PATH")
-	}
+	testutil.RequireSQLite3(t)
 	w := newWS(t)
 	if err := w.Create("app"); err != nil {
 		t.Fatal(err)

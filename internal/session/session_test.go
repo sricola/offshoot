@@ -12,6 +12,7 @@ import (
 	"time"
 
 	"github.com/sricola/offshoot/internal/ops"
+	"github.com/sricola/offshoot/internal/testutil"
 )
 
 // captureStderr redirects os.Stderr for the duration of fn and returns
@@ -41,13 +42,6 @@ func newWS(t *testing.T) *ops.Workspace {
 	return w
 }
 
-func requireSQLite(t *testing.T) {
-	t.Helper()
-	if _, err := exec.LookPath("sqlite3"); err != nil {
-		t.Skip("sqlite3 CLI not on PATH")
-	}
-}
-
 // waitFor polls until cond is true or the deadline passes.
 func waitFor(t *testing.T, d time.Duration, what string, cond func() bool) {
 	t.Helper()
@@ -62,7 +56,7 @@ func waitFor(t *testing.T, d time.Duration, what string, cond func() bool) {
 }
 
 func TestOpenHoldsLeaseAndCaptures(t *testing.T) {
-	requireSQLite(t)
+	testutil.RequireSQLite3(t)
 	w := newWS(t)
 	if err := w.Create("app"); err != nil {
 		t.Fatal(err)
@@ -102,7 +96,7 @@ func TestOpenHoldsLeaseAndCaptures(t *testing.T) {
 }
 
 func TestOpenRefusesLeasedBranch(t *testing.T) {
-	requireSQLite(t)
+	testutil.RequireSQLite3(t)
 	w := newWS(t)
 	if err := w.Create("app"); err != nil {
 		t.Fatal(err)
@@ -118,7 +112,7 @@ func TestOpenRefusesLeasedBranch(t *testing.T) {
 }
 
 func TestCloseReleasesLeaseAndCleansUp(t *testing.T) {
-	requireSQLite(t)
+	testutil.RequireSQLite3(t)
 	w := newWS(t)
 	if err := w.Create("app"); err != nil {
 		t.Fatal(err)
@@ -185,7 +179,7 @@ func TestOpenReleasesLeaseWhenCheckoutFails(t *testing.T) {
 // the single "flushed" line asserted below is unambiguously this test's own
 // manual call, not a background auto-flush tick.
 func TestSessionTransitionLogsOpenedFlushedClosed(t *testing.T) {
-	requireSQLite(t)
+	testutil.RequireSQLite3(t)
 	w := newWS(t)
 	if err := w.Create("app"); err != nil {
 		t.Fatal(err)
@@ -232,7 +226,7 @@ func TestSessionTransitionLogsOpenedFlushedClosed(t *testing.T) {
 // one "offshoot: session: db@branch: fenced cause=..." line, quoting the
 // underlying ErrFenced cause.
 func TestSessionFencedTransitionIsLogged(t *testing.T) {
-	requireSQLite(t)
+	testutil.RequireSQLite3(t)
 	w := newWS(t)
 	if err := w.Create("app"); err != nil {
 		t.Fatal(err)

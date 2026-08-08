@@ -10,12 +10,11 @@ import (
 	"time"
 
 	"github.com/sricola/offshoot/internal/store"
+	"github.com/sricola/offshoot/internal/testutil"
 )
 
 func TestDestroyAndGC(t *testing.T) {
-	if _, err := exec.LookPath("sqlite3"); err != nil {
-		t.Skip("sqlite3 CLI not on PATH")
-	}
+	testutil.RequireSQLite3(t)
 	w := newWS(t)
 	w.Create("app")
 	path, _ := w.Checkout("app", "main")
@@ -105,9 +104,7 @@ func TestDestroyRefusesLiveLeaseWithoutForce(t *testing.T) {
 // version: phase 1 tombstones without deleting, phase 2 with zero grace
 // sweeps the data, and live lineages are left untouched throughout.
 func TestDestroyAndGCOnS3(t *testing.T) {
-	if _, err := exec.LookPath("sqlite3"); err != nil {
-		t.Skip("sqlite3 CLI not on PATH")
-	}
+	testutil.RequireSQLite3(t)
 	w := newWSOnFakeS3(t)
 	w.Create("app")
 	path, _ := w.Checkout("app", "main")
@@ -158,9 +155,7 @@ func TestDestroyAndGCOnS3(t *testing.T) {
 // before its old ref went away, without yet having landed its own ref.
 // Sweeping must always wait for an independent, later GC run.
 func TestGCSingleRunDoesNotSweepStonesMintedThisRun(t *testing.T) {
-	if _, err := exec.LookPath("sqlite3"); err != nil {
-		t.Skip("sqlite3 CLI not on PATH")
-	}
+	testutil.RequireSQLite3(t)
 	w := newWS(t)
 	w.Create("app")
 	path, _ := w.Checkout("app", "main")
@@ -255,9 +250,7 @@ func querySQL(t *testing.T, path, stmt string) string {
 // must never be swept — the child's resolved chain reaches into it, and the
 // old single-hop liveLineages mark could not see that.
 func TestGCKeepsParentAliveViaChildBase(t *testing.T) {
-	if _, err := exec.LookPath("sqlite3"); err != nil {
-		t.Skip("sqlite3 CLI not on PATH")
-	}
+	testutil.RequireSQLite3(t)
 	w := newWS(t)
 	if err := w.Create("app"); err != nil {
 		t.Fatal(err)
@@ -327,9 +320,7 @@ func TestGCKeepsParentAliveViaChildBase(t *testing.T) {
 // checkpoint's snapshot AND its pre-fork-point init snapshot no ref anchors
 // anymore — is reclaimed.
 func TestGCReclaimsDestroyedParentAboveForkPoint(t *testing.T) {
-	if _, err := exec.LookPath("sqlite3"); err != nil {
-		t.Skip("sqlite3 CLI not on PATH")
-	}
+	testutil.RequireSQLite3(t)
 	w := newWS(t)
 	if err := w.Create("app"); err != nil {
 		t.Fatal(err)
@@ -395,9 +386,7 @@ func TestGCReclaimsDestroyedParentAboveForkPoint(t *testing.T) {
 // plus the base.json objects resolution reads along each ref's base spine.
 // Any divergence between the mark and the read path can sweep a live member.
 func TestGCMarkEqualsReadPathResolution(t *testing.T) {
-	if _, err := exec.LookPath("sqlite3"); err != nil {
-		t.Skip("sqlite3 CLI not on PATH")
-	}
+	testutil.RequireSQLite3(t)
 	w := newWS(t)
 	if err := w.Create("app"); err != nil {
 		t.Fatal(err)
@@ -489,9 +478,7 @@ func TestGCMarkEqualsReadPathResolution(t *testing.T) {
 // 2's re-mark on a later run sees the now-landed child) must protect the
 // in-flight fork's source objects.
 func TestGCRaceAncestorDestroyedMidForkOfFork(t *testing.T) {
-	if _, err := exec.LookPath("sqlite3"); err != nil {
-		t.Skip("sqlite3 CLI not on PATH")
-	}
+	testutil.RequireSQLite3(t)
 	w := newWS(t)
 	if err := w.Create("app"); err != nil {
 		t.Fatal(err)
@@ -568,9 +555,7 @@ func TestGCRaceAncestorDestroyedMidForkOfFork(t *testing.T) {
 // shared (base-pointer) fork coexist; reachability handles both uniformly
 // when their common parent branch is destroyed.
 func TestGCMixedStoreV1AndV2Forks(t *testing.T) {
-	if _, err := exec.LookPath("sqlite3"); err != nil {
-		t.Skip("sqlite3 CLI not on PATH")
-	}
+	testutil.RequireSQLite3(t)
 	w := newWS(t)
 	if err := w.Create("app"); err != nil {
 		t.Fatal(err)
@@ -640,9 +625,7 @@ func TestGCMixedStoreV1AndV2Forks(t *testing.T) {
 // chain no longer needs. A head-only mark would sweep it and break
 // Fork(at=cp)/Rollback(to=cp); the checkpoint union must keep it.
 func TestGCPreservesCheckpointAnchoredSnapshot(t *testing.T) {
-	if _, err := exec.LookPath("sqlite3"); err != nil {
-		t.Skip("sqlite3 CLI not on PATH")
-	}
+	testutil.RequireSQLite3(t)
 	w := newWS(t)
 	if err := w.Create("app"); err != nil {
 		t.Fatal(err)
@@ -700,9 +683,7 @@ func TestGCPreservesCheckpointAnchoredSnapshot(t *testing.T) {
 // base.json to fall through to A. After B's branch is destroyed, B's
 // base.json must survive GC via C's base spine, or C can never materialize.
 func TestGCKeepsPassThroughLineageBaseJSON(t *testing.T) {
-	if _, err := exec.LookPath("sqlite3"); err != nil {
-		t.Skip("sqlite3 CLI not on PATH")
-	}
+	testutil.RequireSQLite3(t)
 	w := newWS(t)
 	if err := w.Create("app"); err != nil {
 		t.Fatal(err)
@@ -774,9 +755,7 @@ func TestGCKeepsPassThroughLineageBaseJSON(t *testing.T) {
 // exists to protect. Pruned, the later death mints a FRESH stone and gets a
 // full grace period.
 func TestGCRescuedStoneGetsFreshGrace(t *testing.T) {
-	if _, err := exec.LookPath("sqlite3"); err != nil {
-		t.Skip("sqlite3 CLI not on PATH")
-	}
+	testutil.RequireSQLite3(t)
 	w := newWS(t)
 	if err := w.Create("app"); err != nil {
 		t.Fatal(err)
@@ -854,9 +833,7 @@ func TestGCRescuedStoneGetsFreshGrace(t *testing.T) {
 // old its stone; once the branch itself dies, the same object becomes
 // sweepable.
 func TestGCCompensatingRuleProtectsAboveHeadOrphan(t *testing.T) {
-	if _, err := exec.LookPath("sqlite3"); err != nil {
-		t.Skip("sqlite3 CLI not on PATH")
-	}
+	testutil.RequireSQLite3(t)
 	w := newWS(t)
 	if err := w.Create("app"); err != nil {
 		t.Fatal(err)
