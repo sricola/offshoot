@@ -42,6 +42,20 @@ type Workspace struct {
 	SnapshotEvery int
 }
 
+// bestEffortDelete removes key from the backend, logging to stderr (never
+// failing) on error. It exists for orphan cleanup after a lost ref CAS:
+// every caller deletes keys in a freshly-minted lineage no rival can
+// reference (or a CAS-confirmed orphan), so a failed delete is safe to
+// leave behind — reachability GC reclaims it eventually — but should be
+// LOUD rather than invisible, matching the janitor's logging convention.
+func (w *Workspace) bestEffortDelete(key string) {
+	if err := w.Store.B.Delete(key); err != nil {
+		fmt.Fprintf(os.Stderr,
+			"offshoot: best-effort cleanup of %s failed (reachability GC will reclaim it): %v\n",
+			key, err)
+	}
+}
+
 // Metadata caps (design spec § Metadata; Milestone 3 Global Constraints):
 // branch-level lineage is the grain, not row-level provenance, so the map
 // stays small. Enforced here, at the ops layer, so every caller — CLI,
@@ -218,7 +232,7 @@ func (w *Workspace) createFromQuiesced(db, quiescedPath string) error {
 	if _, err := w.Store.PutRef(db, "main", ref, ""); err != nil {
 		// Freshly-minted lineage no rival can reference: safe to delete the
 		// orphaned snapshot (mirrors Fork's cleanup on the same failure).
-		w.Store.B.Delete(store.SnapshotKey(lineage, 1, 1))
+		w.bestEffortDelete(store.SnapshotKey(lineage, 1, 1))
 		return fmt.Errorf("ops: create %s: %w", db, err)
 	}
 	return nil
@@ -699,7 +713,7 @@ func (w *Workspace) Checkpoint(db, branch, name string, meta map[string]string) 
 		// later GC pass.
 		if errors.Is(err, store.ErrCAS) {
 			if cur, _, gerr := w.Store.GetRef(db, branch); gerr == nil && (cur.Lineage != ref.Lineage || cur.HeadTXID < txid) {
-				w.Store.B.Delete(snapKey)
+				w.bestEffortDelete(snapKey)
 			}
 			return 0, fmt.Errorf("ops: ref update lost a race (retry): %w", err)
 		}
@@ -1136,9 +1150,9 @@ func (w *Workspace) Fork(db, srcBranch, newBranch, at string, ttl time.Duration,
 		// base object on the shared path (there is no snapshot to delete),
 		// the snapshot on the materialize path.
 		if base != nil {
-			w.Store.B.Delete(store.BaseKey(childLineage))
+			w.bestEffortDelete(store.BaseKey(childLineage))
 		} else {
-			w.Store.B.Delete(store.SnapshotKey(childLineage, 1, txid))
+			w.bestEffortDelete(store.SnapshotKey(childLineage, 1, txid))
 		}
 		return 0, fmt.Errorf("ops: fork %s@%s: %w", db, newBranch, err)
 	}
@@ -1199,7 +1213,7 @@ func (w *Workspace) Rollback(db, branch, to string) (string, error) {
 	copiedKeys := []string{store.SnapshotKey(lineage, 1, txid)}
 	cleanup := func() {
 		for _, k := range copiedKeys {
-			w.Store.B.Delete(k)
+			w.bestEffortDelete(k)
 		}
 	}
 
@@ -1343,7 +1357,7 @@ func (w *Workspace) Promote(db, source, target string, force bool) (uint64, erro
 	next.LeaseHolder, next.LeaseExpiry = "", ""
 	next.Touch(time.Now())
 	if _, err := w.Store.PutRef(db, target, next, tgtEtag); err != nil {
-		w.Store.B.Delete(store.SnapshotKey(lineage, 1, txid))
+		w.bestEffortDelete(store.SnapshotKey(lineage, 1, txid))
 		return 0, fmt.Errorf("ops: promote lost a race (retry): %w", err)
 	}
 	// Refresh the target checkout if one exists and is quiescible.
@@ -1445,7 +1459,7 @@ func (w *Workspace) Compact(db, branch string) (uint64, error) {
 		compactBeforeCASForTest()
 	}
 	if _, err := w.Store.PutRef(db, branch, next, etag); err != nil {
-		w.Store.B.Delete(store.SnapshotKey(lineage, 1, txid))
+		w.bestEffortDelete(store.SnapshotKey(lineage, 1, txid))
 		return 0, fmt.Errorf("ops: compact lost a race (retry): %w", err)
 	}
 	// Refresh the checkout if one exists and is quiescible.

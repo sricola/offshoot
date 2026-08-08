@@ -91,10 +91,16 @@ func (w *Workspace) Destroy(db, branch string, force bool) error {
 		w.unwindDeletingClaim(db, branch)
 		return err
 	}
-	os.Remove(path)
-	os.Remove(path + "-wal")
-	os.Remove(path + "-shm")
-	os.Remove(path + ".sum")
+	// Best-effort checkout removal: the ref is already gone, so a failed
+	// remove cannot corrupt anything (a re-created branch's Checkout
+	// overwrites), but nothing else ever cleans checkouts/ — log so the
+	// stale files aren't a silent disk leak.
+	for _, p := range []string{path, path + "-wal", path + "-shm", path + ".sum"} {
+		if err := os.Remove(p); err != nil && !os.IsNotExist(err) {
+			fmt.Fprintf(os.Stderr, "offshoot: destroy %s@%s: remove checkout file %s: %v\n",
+				db, branch, p, err)
+		}
+	}
 	return nil
 }
 
