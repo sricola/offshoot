@@ -1,6 +1,7 @@
 package ops
 
 import (
+	"errors"
 	"sync"
 	"testing"
 
@@ -91,5 +92,43 @@ func TestForkMaterializeResolvesSourceChainOnce(t *testing.T) {
 	}
 	if n := cb.listCount(store.LineagePrefix(src.Lineage)); n != 1 {
 		t.Fatalf("materializing Fork Listed the source prefix %d times, want exactly 1 (floor decision's resolution must be reused)", n)
+	}
+}
+
+// A sweeping GC pass enumerates refs exactly TWICE — phase 1's mark and
+// phase 2's re-mark — never a third time: the compensating rule's live-head
+// set is derived from the re-mark's own ref fetch
+// (reachableObjectsAndHeads), not a separate ListRefs + per-ref GetRefs as
+// the former standalone liveHeadLineages helper did (perf audit M4).
+func TestGCSweepEnumeratesRefsTwiceNotThrice(t *testing.T) {
+	w := newWS(t)
+	if err := w.Create("app"); err != nil {
+		t.Fatal(err)
+	}
+	// A stray, unreachable object: tombstoned by the first pass, swept by
+	// the second (a stone minted in the same run is never swept — sweeps
+	// always wait for a later, independent run).
+	stray := "data/straylineage/1/snapshot-0000000000000001.ltx"
+	if err := w.Store.B.Put(stray, []byte("x")); err != nil {
+		t.Fatal(err)
+	}
+	if tombstoned, _, err := w.GC(0); err != nil || tombstoned != 1 {
+		t.Fatalf("first GC pass: tombstoned=%d err=%v, want 1 tombstoned", tombstoned, err)
+	}
+
+	cb := newRPCCountBackend(w.Store.B)
+	w.Store.B = cb
+	_, deleted, err := w.GC(0)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if deleted != 1 {
+		t.Fatalf("second GC pass deleted %d objects, want 1 (the sweep must actually run)", deleted)
+	}
+	if n := cb.listCount("refs/"); n != 2 {
+		t.Fatalf("sweeping GC pass Listed refs/ %d times, want exactly 2 (mark + re-mark; live heads must reuse the re-mark's refs)", n)
+	}
+	if _, _, err := w.Store.B.Get(stray); !errors.Is(err, store.ErrNotFound) {
+		t.Fatalf("stray object must be swept, Get err = %v", err)
 	}
 }
