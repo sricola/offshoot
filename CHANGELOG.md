@@ -15,6 +15,26 @@ version if you depend on format stability.
 
 ### Added
 
+- **Divergence floor: the session snapshot cadence now survives session
+  restarts** (copy-on-write Task 4): a session's first flush seeds its
+  snapshot counter from the branch's DURABLE divergence — the trailing run
+  of segment members in the resolved chain at head — instead of restarting
+  at zero with every process. Previously, the settling-flush suppression
+  let each new session on a clean checkout keep appending segments directly
+  onto the branch's pre-session chain, so a branch written through many
+  short sessions (each flushing fewer than `SnapshotEvery` times) grew its
+  resolved chain without bound — and a shared (base-pointer) fork's child
+  doing the same never wrote its own divergence-floor snapshot, dragging
+  its parent's chain into every read forever. The seed costs one store
+  List, paid only on the first flush of a session whose settling snapshot
+  was suppressed (read-only sessions never pay it; a non-suppressed first
+  flush snapshots without it), and fails toward writing a full snapshot if
+  the probe errors. With it, the `SnapshotEvery` bound on resolved chain
+  length is a property of the branch, not the process. New tests cover the
+  cross-session bound on a shared child, the divergence self-snapshot plus
+  wholly-in-child resolution above it, bounded materialization across a
+  40-level fork spine with content verification at the deepest level, and
+  end-to-end parent/child divergence isolation on a shared fork.
 - **Copy-on-write forks: base-pointer sharing with a fork-time snapshot
   floor** (copy-on-write Task 3): `ops.Fork` no longer always copies a full
   snapshot into the child's lineage. When the fork point's fully-resolved

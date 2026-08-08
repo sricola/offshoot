@@ -304,9 +304,28 @@ type Session struct {
 
 	// snapshotEvery and flushesSinceSnapshot are read and written only from
 	// within Flush, which already holds flushMu for its entire body — no
-	// separate lock needed.
+	// separate lock needed. divergenceSeeded (same flushMu-only discipline)
+	// records whether flushesSinceSnapshot has been seeded from the branch's
+	// DURABLE divergence — the trailing run of segment members in the
+	// resolved chain at head — rather than trusting its in-memory zero.
+	//
+	// Why seeding exists (the divergence floor, copy-on-write Task 4): the
+	// counter alone restarts at 0 with every process, but the settling-flush
+	// suppression (see rebaseline) lets a session on a clean checkout keep
+	// appending SEGMENTS directly onto the branch's pre-session chain. A
+	// branch written through many short suppressed sessions — each flushing
+	// fewer than snapshotEvery times — would then grow its chain without
+	// ever crossing the in-memory cadence, unbounded; a shared (base-
+	// pointer) fork's child doing the same would additionally drag its
+	// parent half into every descendant's resolution forever. Seeding the
+	// counter from the durable chain makes the cadence a property of the
+	// BRANCH, not the process: the SnapshotEvery bound on chain length holds
+	// across session restarts exactly as it does within one session. See
+	// flush.go's seeding site for when the (single, first-flush-only) chain
+	// List is and isn't paid.
 	snapshotEvery        int
 	flushesSinceSnapshot int
+	divergenceSeeded     bool
 
 	// flushMu serializes the entire body of Flush: two goroutines calling
 	// Flush concurrently would otherwise both read the same ref (same etag,
