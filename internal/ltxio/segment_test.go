@@ -11,8 +11,8 @@ import (
 	"strings"
 	"testing"
 
-	"github.com/superfly/ltx"
 	_ "github.com/mattn/go-sqlite3"
+	"github.com/superfly/ltx"
 )
 
 // buildDB makes a quiesced SQLite file and returns its path.
