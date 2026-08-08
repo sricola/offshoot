@@ -307,6 +307,66 @@ func TestRollbackGuard(t *testing.T) {
 	}
 }
 
+// TestCompactGuard covers compact's open-session guard, mirroring
+// TestRollbackGuard: compact is a cord-cutter that repoints the branch to a
+// new self-contained lineage — exactly the repoint rollback/promote perform —
+// so it must REFUSE while the branch has an open session here (whose next
+// flush would CAS-fail against the repointed ref) and succeed once closed.
+func TestCompactGuard(t *testing.T) {
+	srv, w := newServer(t)
+	sock := srv.SocketPath()
+
+	// A shared fork: compact on it is a real repoint (new lineage, base
+	// pointer dropped), so "not repointed" is observable.
+	if r := call(t, sock, Request{Op: "fork", DB: "app", Branch: "main", Name: "kid"}); !r.OK {
+		t.Fatalf("fork = %+v", r)
+	}
+	before, _, err := w.Store.GetRef("app", "kid")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if before.Base == nil {
+		t.Fatal("test precondition: fork of a shallow chain must share (Base set)")
+	}
+
+	open := call(t, sock, Request{Op: "open", DB: "app", Branch: "kid"})
+	if !open.OK {
+		t.Fatalf("open = %+v", open)
+	}
+
+	c := call(t, sock, Request{Op: "compact", DB: "app", Branch: "kid"})
+	if c.OK {
+		t.Fatal("compact of a branch with an open session must be refused")
+	}
+	if !strings.Contains(c.Error, "close") {
+		t.Fatalf("compact error = %q, want it to mention closing the session", c.Error)
+	}
+	after, _, err := w.Store.GetRef("app", "kid")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if after.Lineage != before.Lineage || after.Base == nil {
+		t.Fatalf("refused compact must not repoint: before lineage=%s base=%+v, after lineage=%s base=%+v",
+			before.Lineage, before.Base, after.Lineage, after.Base)
+	}
+
+	if cl := call(t, sock, Request{Op: "close", DB: "app", Branch: "kid"}); !cl.OK {
+		t.Fatalf("close = %+v", cl)
+	}
+	c2 := call(t, sock, Request{Op: "compact", DB: "app", Branch: "kid"})
+	if !c2.OK {
+		t.Fatalf("compact after close = %+v", c2)
+	}
+	compacted, _, err := w.Store.GetRef("app", "kid")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if compacted.Base != nil || compacted.Lineage == before.Lineage {
+		t.Fatalf("compact after close must repoint to a self-contained lineage, got lineage=%s base=%+v",
+			compacted.Lineage, compacted.Base)
+	}
+}
+
 // TestUnknownOpStillErrors guards dispatch's default case as the op list
 // grows: an op the server does not recognize must fail cleanly rather than
 // panic or silently succeed.
@@ -385,6 +445,9 @@ func TestGuardsRefuseDuringInFlightOpen(t *testing.T) {
 	}
 	if r := call(t, sock, Request{Op: "fork", DB: "app", Branch: "mid", Name: "mid-fork"}); r.OK || !strings.Contains(r.Error, "close") {
 		t.Fatalf("fork from an in-flight-open source = %+v, want a close-session refusal", r)
+	}
+	if r := call(t, sock, Request{Op: "compact", DB: "app", Branch: "mid"}); r.OK || !strings.Contains(r.Error, "close") {
+		t.Fatalf("compact during in-flight open = %+v, want a close-session refusal", r)
 	}
 
 	openDelay = nil
