@@ -9,6 +9,9 @@ import (
 	"io"
 	"net/http"
 	"net/http/httptest"
+	"os"
+	"os/exec"
+	"path/filepath"
 	"reflect"
 	"regexp"
 	"strconv"
@@ -961,5 +964,61 @@ func TestHTTPPathTrickMatrixNeverBypassesAuth(t *testing.T) {
 					c.path, resp.StatusCode, c.want)
 			}
 		})
+	}
+}
+
+// ---- filesystem-escaping ops are socket-only ----
+
+// TestHTTPExportRejectedSocketExportStillWorks pins the httpForbiddenOps
+// gate (handleRPC): "export" — the one op that writes to an unconfined,
+// client-chosen path on the daemon host's filesystem — is rejected on the
+// HTTP surface BEFORE dispatch (400, nothing written), while the byte-
+// identical request over the unix socket still succeeds. Request.Path's
+// same-host/same-user trust model holds only for the socket; see
+// httpForbiddenOps' doc comment.
+func TestHTTPExportRejectedSocketExportStillWorks(t *testing.T) {
+	srv, w, base, token := newHTTPServer(t)
+	sock := srv.SocketPath()
+
+	// A durable checkpoint so export has something real to materialize
+	// (mirrors export_test.go's setup).
+	path, err := w.Checkout("app", "main")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if out, err := exec.Command("sqlite3", path,
+		"CREATE TABLE t (v); INSERT INTO t VALUES ('one');").CombinedOutput(); err != nil {
+		t.Fatalf("%v: %s", err, out)
+	}
+	if _, err := w.Checkpoint("app", "main", "v1", nil); err != nil {
+		t.Fatal(err)
+	}
+
+	dst := filepath.Join(t.TempDir(), "out.db")
+	req := Request{Op: "export", DB: "app", Branch: "main", Path: dst}
+
+	// Over HTTP: 400, an explanatory message, and — the load-bearing part —
+	// no dispatch: the destination file must not exist afterward.
+	resp := httpRPC(t, base, "Bearer "+token, req)
+	body, _ := io.ReadAll(resp.Body)
+	resp.Body.Close()
+	if resp.StatusCode != http.StatusBadRequest {
+		t.Fatalf("export over HTTP: status = %d (body %q), want 400", resp.StatusCode, body)
+	}
+	if !strings.Contains(string(body), "not available over HTTP") {
+		t.Fatalf("export over HTTP: body = %q, want a 'not available over HTTP' explanation", body)
+	}
+	if _, err := os.Stat(dst); !errors.Is(err, os.ErrNotExist) {
+		t.Fatalf("export over HTTP must not touch the filesystem; Stat(%s) = %v", dst, err)
+	}
+
+	// The gate is HTTP-only: the SAME request over the unix socket succeeds
+	// and writes the destination.
+	r := call(t, sock, req)
+	if !r.OK {
+		t.Fatalf("export over the unix socket = %+v, want ok", r)
+	}
+	if got := dRowCount(t, dst); got != 1 {
+		t.Fatalf("socket-exported rows = %d, want 1", got)
 	}
 }
