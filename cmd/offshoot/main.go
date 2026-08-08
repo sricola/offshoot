@@ -64,6 +64,9 @@ Usage:
   offshoot touch <db>[@branch] [--ttl duration|none]   reset a branch's activity clock, optionally (re)setting its TTL
   offshoot rollback <db>[@branch] --to <cp>       repoint a branch at a checkpoint
   offshoot promote <db>@<src> --onto <target> [--force]   repoint target at src's head
+  offshoot compact <db>[@branch]     make a shared fork self-contained (its
+                                     ancestor's storage becomes reclaimable
+                                     by gc); no-op if already self-contained
   offshoot destroy <db>[@branch] [--force]   delete a branch (requires --force for protected)
   offshoot gc [--grace duration]     garbage collect unreachable lineages (default grace: 1h)
   offshoot path <db>[@branch]        print the checkout path
@@ -535,6 +538,20 @@ func run(args []string) error {
 			return err
 		}
 		fmt.Printf("promoted %s@%s -> %s@%s at txid %d\n", db, srcBranch, db, fs[2], txid)
+		return nil
+	case "compact":
+		if len(rest) != 1 {
+			return fmt.Errorf("usage: offshoot compact <db>[@branch]")
+		}
+		db, branch, err := ops.ParseTarget(rest[0])
+		if err != nil {
+			return err
+		}
+		txid, err := w.Compact(db, branch)
+		if err != nil {
+			return err
+		}
+		fmt.Printf("compacted %s@%s to txid %d\n", db, branch, txid)
 		return nil
 	case "path":
 		if len(rest) != 1 {

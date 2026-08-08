@@ -63,6 +63,25 @@ version if you depend on format stability.
 
 ### Added
 
+- **`offshoot compact <db>[@branch]` — cut a shared fork's cord**
+  (copy-on-write Task 6): `ops.Compact` re-encodes a shared branch's full
+  base-following chain at head as ONE self-contained snapshot in a fresh
+  lineage, CAS-repoints the ref with its base pointer cleared, and
+  refreshes the checkout if present (best-effort, like promote). The
+  previously shared ancestor storage — including the abandoned lineage's
+  `base.json` — becomes unreferenced and is reclaimed by the reachability
+  GC; compact deletes nothing itself. An already self-contained branch is
+  a NO-OP returning the current head txid, so scripted "compact
+  everything" loops never fail on branches with nothing to do. The
+  checkpoint map is reset to `{"compact": head}`, matching promote and
+  rollback's repoint semantics (old checkpoints anchored on the shared
+  ancestor would not resolve in the new lineage; preserving them
+  rollback-style is a noted follow-up). A CAS loss to a concurrent flush
+  deletes the orphan snapshot and returns a retry error — no internal
+  retry. New daemon op `compact` (an open session on the branch is
+  flushed first, like fork's source flush, so unflushed writes land in
+  the head compact materializes), plus SDK one-liners
+  (`Client.compact(db, branch)` in Python and TypeScript).
 - **Divergence floor: the session snapshot cadence now survives session
   restarts** (copy-on-write Task 4): a session's first flush seeds its
   snapshot counter from the branch's DURABLE divergence — the trailing run

@@ -505,6 +505,8 @@ func (s *Server) dispatch(req Request) Response {
 		return s.opRollback(req)
 	case "promote":
 		return s.opPromote(req)
+	case "compact":
+		return s.opCompact(req)
 	case "touch":
 		return s.opTouch(req)
 	case "branches":
@@ -997,6 +999,32 @@ func (s *Server) opPromote(req Request) Response {
 		return errResp(err)
 	}
 	txid, err := s.ws.Promote(req.DB, source, target, req.Force)
+	if err != nil {
+		return errResp(err)
+	}
+	return Response{OK: true, TXID: txid}
+}
+
+// opCompact makes db@branch self-contained (ops.Compact): its full chain is
+// re-encoded as one snapshot in a fresh lineage and its base pointer is
+// dropped, so the previously shared ancestor storage becomes reclaimable by
+// GC. If this daemon has an open session on the branch, that session is
+// flushed (unnamed) FIRST, matching opFork's source flush: an un-flushed
+// write must land in the durable head before compact materializes it, else
+// compact would re-encode a stale head and the ref CAS would fence the
+// session's next flush against a head that silently lost those writes. A
+// branch that is merely reserved (open in flight) is refused by
+// flushIfOpen the same way. Returns the compacted head txid (no-op — an
+// already self-contained branch — returns the current head txid).
+func (s *Server) opCompact(req Request) Response {
+	branch := req.Branch
+	if branch == "" {
+		branch = "main"
+	}
+	if err := s.flushIfOpen(req.DB, branch, "compact"); err != nil {
+		return errResp(err)
+	}
+	txid, err := s.ws.Compact(req.DB, branch)
 	if err != nil {
 		return errResp(err)
 	}
