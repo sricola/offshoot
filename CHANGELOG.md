@@ -32,7 +32,10 @@ version if you depend on format stability.
   reflink/CopyObject fast path is now only reachable from Fork on that
   fallback. `Chain` additionally anchors at a shared child's own snapshot
   once one exists (e.g. a CLI `checkpoint` on the forked branch), keeping
-  every read on the child self-contained past its first divergence floor.
+  every read on the child self-contained past its first divergence floor;
+  only the specific "no snapshot covers target" case falls through to the
+  base seam — any other failure there (e.g. a transient backend error)
+  propagates unchanged instead of being misreported as a chain hole.
 - **Base-pointer field and LayoutVersion 2** (copy-on-write Task 1):
   `store.Ref` gains a new `Base *BasePointer` field (`BasePointer{Lineage
   string; TXID uint64}`, `json:"base,omitempty"`) — deliberately separate

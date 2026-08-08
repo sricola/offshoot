@@ -799,6 +799,49 @@ func TestChainChildOwnSnapshotAnchorsResolution(t *testing.T) {
 	}
 }
 
+// listErrBackend wraps a real Backend and fails List for one exact prefix
+// with a fixed error, leaving every other operation (and every other
+// prefix's List) untouched. It exists to prove Chain propagates transient
+// backend failures instead of misreporting them.
+type listErrBackend struct {
+	Backend
+	failPrefix string
+	err        error
+}
+
+func (b listErrBackend) List(prefix string) ([]string, error) {
+	if prefix == b.failPrefix {
+		return nil, b.err
+	}
+	return b.Backend.List(prefix)
+}
+
+// A transient backend error while resolving a shared child's OWN half must
+// propagate as-is — not be swallowed by the chainSelf-first divergence-floor
+// probe and re-reported as a bogus seam "hole". Only the sentinel "no
+// snapshot covers target" may fall through to the seam path.
+func TestChainSharedChildBackendErrorPropagates(t *testing.T) {
+	s := newStore(t)
+	putObj(t, s, SnapshotKey("parent", 1, 1))
+	putObj(t, s, SegmentKey("parent", 1, 2, 2))
+	putObj(t, s, SegmentKey("parent", 1, 3, 3))
+	if err := s.WriteLineageBase("child", BasePointer{Lineage: "parent", TXID: 3}); err != nil {
+		t.Fatal(err)
+	}
+	putObj(t, s, SegmentKey("child", 1, 4, 4))
+
+	boom := errors.New("transient backend failure")
+	s.B = listErrBackend{Backend: s.B, failPrefix: LineagePrefix("child"), err: boom}
+
+	_, err := s.Chain("child", 4)
+	if !errors.Is(err, boom) {
+		t.Fatalf("Chain must propagate the backend error, got %v", err)
+	}
+	if err != nil && strings.Contains(err.Error(), "hole") {
+		t.Fatalf("backend error misreported as a chain hole: %v", err)
+	}
+}
+
 // (b) MUTATION test — the never-merge-across-lineages invariant. Child epoch 1
 // and parent epoch 2 both carry an object covering the SAME txid range just
 // past the fork seam. Chain MUST return the CHILD's bytes for the child's
