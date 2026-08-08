@@ -248,6 +248,15 @@ func (s *Session) flush(name string, meta map[string]string, auto bool) (txid ui
 
 	txid = ref.HeadTXID + 1
 	var buf bytes.Buffer
+	// encodeScratch/encodeSize are set only on the snapshot+useStream path
+	// (see useStream below): the encoded LTX goes to this scratch FILE
+	// instead of buf, so a multi-GB snapshot's encoded bytes are never
+	// resident in memory at once. Both stay zero-valued and unreferenced by
+	// the branch actually taken whenever useStream is false (the segment
+	// branch, or a backend without store.ReaderPutter) — that path is
+	// byte-for-byte what this function did before this task.
+	var encodeScratch string
+	var encodeSize int64
 
 	// replicaMu excludes the capture engine's Rebase/Apply for the duration
 	// of this section, so the replica file — and the pages/checksum/commit
@@ -336,6 +345,23 @@ func (s *Session) flush(name string, meta map[string]string, auto bool) (txid ui
 		pageFrac >= largeSegmentFraction ||
 		s.pageSize == 0
 
+	// useStream picks the streaming upload path for the SNAPSHOT branch
+	// only (perf audit H3, write side): EncodeSnapshot writes its output to
+	// a scratch FILE instead of buf, and the upload/overwrite sites below
+	// stream from that file via store.ReaderPutter instead of buf.Bytes(),
+	// so the encoded object is never fully resident in memory. The segment
+	// branch stays on the buffered path unconditionally — EncodeSegment is
+	// already O(changed pages), not O(database size), so there is nothing
+	// worth streaming (see store.ReaderPutter's doc comment). A backend
+	// without store.ReaderPutter (rp == nil) also stays on the buffered
+	// path for the snapshot branch: this is exactly this function's
+	// pre-task behavior, preserved unchanged as the fallback.
+	var rp store.ReaderPutter
+	if p, ok := st.B.(store.ReaderPutter); ok {
+		rp = p
+	}
+	useStream := snapshot && rp != nil
+
 	// Either branch below consumes the pending pageSet: a snapshot makes it
 	// stale (it's now fully reflected in the fresh full state) and a segment
 	// consumes it as its payload. Capture the checksum this attempt is
@@ -411,7 +437,44 @@ func (s *Session) flush(name string, meta map[string]string, auto bool) (txid ui
 		// EncodeSnapshot independently (re-)computes over the scratch (a
 		// byte-identical image of that same frozen replica), and there is
 		// nothing new to learn from asking again here.
-		_, err = ltxio.EncodeSnapshot(scratch, txid, &buf)
+		if useStream {
+			// A SECOND scratch file, distinct from the replica-clone scratch
+			// above — both must survive to the upload below, hence separate
+			// names. EncodeSnapshot's read side is unaffected (it still
+			// reads the replica clone at scratch page by page); only its
+			// destination (w) changes from &buf to this file, so the
+			// encoded bytes — and the postApply checksum computed over
+			// them, discarded either way per the comment above — are
+			// identical to the buffered path.
+			encodeScratch = filepath.Join(s.dir, fmt.Sprintf("flush-encode-%d.ltx", txid))
+			// Same crash-leftover reasoning as the replica scratch above:
+			// the only way this can already exist is a resumed process
+			// retrying this same txid after a crash mid-encode or
+			// mid-upload.
+			os.Remove(encodeScratch)
+			var ef *os.File
+			ef, err = os.Create(encodeScratch)
+			if err != nil {
+				return 0, fmt.Errorf("session: create snapshot encode scratch: %w", err)
+			}
+			// Remove on every exit path from here, exactly like the
+			// replica scratch's defer above — both scratch files are
+			// cleaned up before flushMu releases (LIFO), so neither can
+			// race Close's scratch-dir teardown.
+			defer os.Remove(encodeScratch)
+			_, err = ltxio.EncodeSnapshot(scratch, txid, ef)
+			if cerr := ef.Close(); err == nil {
+				err = cerr
+			}
+			if err == nil {
+				var fi os.FileInfo
+				if fi, err = os.Stat(encodeScratch); err == nil {
+					encodeSize = fi.Size()
+				}
+			}
+		} else {
+			_, err = ltxio.EncodeSnapshot(scratch, txid, &buf)
+		}
 	} else {
 		// pageSizeAtEncode is guaranteed non-zero here: snapshot's own
 		// condition above already covers s.pageSize == 0, so this branch is
@@ -438,7 +501,42 @@ func (s *Session) flush(name string, meta map[string]string, auto bool) (txid ui
 	} else {
 		objKey, kind = store.SegmentKey(ref.Lineage, lease.Epoch, txid, txid), "segment"
 	}
-	if _, err := st.B.PutIf(objKey, buf.Bytes(), ""); err != nil {
+	if useStream {
+		// Stream the encode-output scratch straight to the backend instead
+		// of buf.Bytes() — see useStream's doc comment above. Create-only
+		// first, exactly like the buffered PutIf below; the only thing that
+		// can already occupy objKey is an orphan from a crashed prior
+		// attempt (HeadTXID only advances on a successful ref write, so
+		// nothing references txid beyond head yet).
+		f, ferr := os.Open(encodeScratch)
+		if ferr != nil {
+			return 0, fmt.Errorf("session: open snapshot encode scratch for upload: %w", ferr)
+		}
+		_, uerr := rp.PutReaderIf(objKey, f, encodeSize, "")
+		if cerr := f.Close(); uerr == nil {
+			uerr = cerr
+		}
+		if uerr != nil {
+			if !errors.Is(uerr, store.ErrCAS) {
+				return 0, fmt.Errorf("session: upload %s: %w", kind, uerr)
+			}
+			// Re-open a FRESH reader at offset 0 for the overwrite retry:
+			// the reader PutReaderIf consumed above is exhausted (and
+			// closed), so PutReader needs its own from-scratch stream over
+			// the same scratch file's bytes.
+			f2, ferr := os.Open(encodeScratch)
+			if ferr != nil {
+				return 0, fmt.Errorf("session: reopen snapshot encode scratch for overwrite: %w", ferr)
+			}
+			operr := rp.PutReader(objKey, f2, encodeSize)
+			if cerr := f2.Close(); operr == nil {
+				operr = cerr
+			}
+			if operr != nil {
+				return 0, fmt.Errorf("session: overwrite orphaned %s: %w", kind, operr)
+			}
+		}
+	} else if _, err := st.B.PutIf(objKey, buf.Bytes(), ""); err != nil {
 		if !errors.Is(err, store.ErrCAS) {
 			return 0, fmt.Errorf("session: upload %s: %w", kind, err)
 		}

@@ -222,6 +222,75 @@ func (s *S3) PutIf(key string, data []byte, ifMatch string) (string, error) {
 	return aws.ToString(out.ETag), nil
 }
 
+// PutReader implements store.ReaderPutter's unconditional overwrite: an
+// ordinary PutObject with Body: r and ContentLength: size, so the SDK never
+// needs to buffer r's content to determine its length (unlike Put, which
+// wraps an already-in-memory []byte in bytes.NewReader). The SDK's own
+// payload-hash-for-signing step (SigV4) does not require buffering either:
+// over HTTPS (the normal case) S3 uses UNSIGNED-PAYLOAD and skips hashing
+// the body at all; over plain HTTP it streams the body through a SHA256
+// hasher and rewinds (r must support io.Seeker, true of the *os.File this
+// backend's only caller — flush.go's snapshot upload — passes) rather than
+// holding it in memory.
+//
+// Same 5 GiB single-PutObject ceiling as PutIf below applies here too — see
+// PutReaderIf's doc comment.
+func (s *S3) PutReader(key string, r io.Reader, size int64) error {
+	fk, err := s.full(key)
+	if err != nil {
+		return err
+	}
+	_, err = s.cl.PutObject(context.Background(), &s3.PutObjectInput{
+		Bucket: aws.String(s.bucket), Key: aws.String(fk),
+		Body: r, ContentLength: aws.Int64(size),
+	})
+	if err != nil {
+		return fmt.Errorf("store: s3 put %s: %w", key, err)
+	}
+	return nil
+}
+
+// PutReaderIf implements store.ReaderPutter's CAS write: identical
+// ifMatch-to-precondition-header translation as PutIf (create-only via
+// IfNoneMatch: "*", CAS via IfMatch), with Body: r/ContentLength: size in
+// place of a buffered []byte — see PutReader's doc comment for why that
+// does not require buffering the object.
+//
+// PutReaderIf inherits S3's single-request PutObject ceiling of 5 GiB (the
+// same limit store.S3.CopyObject enforces for server-side copies — see
+// copyObjectMaxBytes) rather than checking for or rejecting it explicitly:
+// offshoot's snapshot objects are already bounded there in practice by the
+// same constraint CopyObject documents, and multipart upload (which would
+// lift this ceiling) is a noted, out-of-scope follow-up, not implemented
+// here — same posture as CopyObject's own multipart gap.
+func (s *S3) PutReaderIf(key string, r io.Reader, size int64, ifMatch string) (string, error) {
+	fk, err := s.full(key)
+	if err != nil {
+		return "", err
+	}
+	in := &s3.PutObjectInput{
+		Bucket: aws.String(s.bucket), Key: aws.String(fk),
+		Body: r, ContentLength: aws.Int64(size),
+	}
+	if ifMatch == "" {
+		in.IfNoneMatch = aws.String("*")
+	} else {
+		in.IfMatch = aws.String(ifMatch)
+	}
+	out, err := s.cl.PutObject(context.Background(), in)
+	if err != nil {
+		if isPreconditionFailed(err) {
+			return "", fmt.Errorf("%w: %s", ErrCAS, key)
+		}
+		// An If-Match against a missing key is a failed compare, not an error.
+		if ifMatch != "" && isNotFound(err) {
+			return "", fmt.Errorf("%w: key absent, expected etag %s", ErrCAS, ifMatch)
+		}
+		return "", fmt.Errorf("store: s3 conditional put %s: %w", key, err)
+	}
+	return aws.ToString(out.ETag), nil
+}
+
 func (s *S3) List(prefix string) ([]string, error) {
 	fp, err := s.full(prefix + "x") // validate; the sentinel char is discarded
 	if err != nil {

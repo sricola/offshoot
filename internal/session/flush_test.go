@@ -6,6 +6,7 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"io"
 	"os"
 	"os/exec"
 	"path/filepath"
@@ -2039,5 +2040,239 @@ func TestSnapshotFlushEncodesOutsideReplicaMu(t *testing.T) {
 	if !bytes.Equal(a, b) {
 		t.Fatalf("scratch-clone encode diverged from direct encode: materialized %d vs %d bytes",
 			len(a), len(b))
+	}
+}
+
+// streamCountingBackend wraps a store.Backend that ALSO implements
+// store.ReaderPutter (e.g. *store.Local, w.Store's default) and counts each
+// method separately: PutReaderIf/PutReader (the streaming path) vs.
+// PutIf/Put restricted to the "data/" key prefix — snapshot/segment object
+// keys (see store.SnapshotKey/SegmentKey), as opposed to "refs/" ref writes
+// and lease bookkeeping, which legitimately keep using buffered PutIf
+// regardless of this task (they are tiny; nothing about H3 concerns them).
+// This lets TestSnapshotFlushStreamsUploadWithoutBuffering assert a
+// snapshot flush's OBJECT upload specifically went through the streaming
+// methods and never through a buffered []byte call, without the assertion
+// being defeated by the ref write's own, unrelated PutIf call.
+//
+// Embeds store.Backend for every other method (Get, List, Delete,
+// CopyObject, ...); PutReaderIf/PutReader are defined directly on this
+// type (not promoted through the embedded interface, which does not itself
+// declare them) so a *streamCountingBackend value satisfies
+// store.ReaderPutter in its own right — exactly the shape flush.go's
+// `st.B.(store.ReaderPutter)` type assertion needs to succeed.
+type streamCountingBackend struct {
+	store.Backend
+	rp store.ReaderPutter
+
+	mu                      sync.Mutex
+	dataPutIfCalls          int
+	dataPutCalls            int
+	dataMaxBufferedPutBytes int
+	putReaderIfCalls        int
+	putReaderCalls          int
+}
+
+func newStreamCountingBackend(t *testing.T, b store.Backend) *streamCountingBackend {
+	t.Helper()
+	rp, ok := b.(store.ReaderPutter)
+	if !ok {
+		t.Fatalf("streamCountingBackend requires an underlying store.ReaderPutter, got %T", b)
+	}
+	return &streamCountingBackend{Backend: b, rp: rp}
+}
+
+func (s *streamCountingBackend) PutIf(key string, data []byte, ifMatch string) (string, error) {
+	if strings.HasPrefix(key, "data/") {
+		s.mu.Lock()
+		s.dataPutIfCalls++
+		if len(data) > s.dataMaxBufferedPutBytes {
+			s.dataMaxBufferedPutBytes = len(data)
+		}
+		s.mu.Unlock()
+	}
+	return s.Backend.PutIf(key, data, ifMatch)
+}
+
+func (s *streamCountingBackend) Put(key string, data []byte) error {
+	if strings.HasPrefix(key, "data/") {
+		s.mu.Lock()
+		s.dataPutCalls++
+		if len(data) > s.dataMaxBufferedPutBytes {
+			s.dataMaxBufferedPutBytes = len(data)
+		}
+		s.mu.Unlock()
+	}
+	return s.Backend.Put(key, data)
+}
+
+func (s *streamCountingBackend) PutReaderIf(key string, r io.Reader, size int64, ifMatch string) (string, error) {
+	s.mu.Lock()
+	s.putReaderIfCalls++
+	s.mu.Unlock()
+	return s.rp.PutReaderIf(key, r, size, ifMatch)
+}
+
+func (s *streamCountingBackend) PutReader(key string, r io.Reader, size int64) error {
+	s.mu.Lock()
+	s.putReaderCalls++
+	s.mu.Unlock()
+	return s.rp.PutReader(key, r, size)
+}
+
+// TestSnapshotFlushStreamsUploadWithoutBuffering pins task 9b (audit-
+// performance H3, write side): a snapshot flush against a backend that
+// implements store.ReaderPutter must upload via PutReaderIf — streaming the
+// encode-output scratch file — and must NEVER pass the encoded snapshot
+// through the buffered PutIf/Put []byte path. It also proves both scratch
+// files task 8 (the replica clone) and task 9b (the encode output) create
+// are removed once Flush returns, and that the streamed upload's content is
+// byte-identical (via Materialize equivalence, same technique as
+// TestSnapshotFlushEncodesOutsideReplicaMu) to a direct, unbuffered encode
+// of the live replica.
+func TestSnapshotFlushStreamsUploadWithoutBuffering(t *testing.T) {
+	testutil.RequireSQLite3(t)
+	w := newWS(t)
+	if err := w.Create("app"); err != nil {
+		t.Fatal(err)
+	}
+	scb := newStreamCountingBackend(t, w.Store.B)
+	w.Store.B = scb
+
+	s, err := Open(context.Background(), Options{WS: w, DB: "app", Branch: "main"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer s.Close()
+
+	if out, err := exec.Command("sqlite3", s.CheckoutPath(),
+		"CREATE TABLE t (v); INSERT INTO t VALUES ('x'),('y');").CombinedOutput(); err != nil {
+		t.Fatalf("%v: %s", err, out)
+	}
+
+	txid, err := s.Flush("", nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	scb.mu.Lock()
+	putReaderIfCalls, dataPutIfCalls, dataPutCalls, maxBuffered := scb.putReaderIfCalls, scb.dataPutIfCalls, scb.dataPutCalls, scb.dataMaxBufferedPutBytes
+	scb.mu.Unlock()
+	if putReaderIfCalls == 0 {
+		t.Fatal("snapshot flush must call PutReaderIf (the streaming path) at least once")
+	}
+	if dataPutIfCalls != 0 || dataPutCalls != 0 {
+		t.Fatalf("snapshot flush must never call buffered PutIf/Put for a data/ object key when the backend supports streaming: PutIf=%d Put=%d (max buffered bytes seen: %d)",
+			dataPutIfCalls, dataPutCalls, maxBuffered)
+	}
+
+	// Both scratch files (task 8's replica clone, task 9b's encode output)
+	// must be gone once Flush has returned.
+	if m, _ := filepath.Glob(filepath.Join(s.dir, "flush-scratch-*.db")); len(m) != 0 {
+		t.Fatalf("replica-clone scratch not cleaned up: %v", m)
+	}
+	if m, _ := filepath.Glob(filepath.Join(s.dir, "flush-encode-*.ltx")); len(m) != 0 {
+		t.Fatalf("encode-output scratch not cleaned up: %v", m)
+	}
+
+	// Content equivalence with a direct, unbuffered encode of the live
+	// replica — same technique as TestSnapshotFlushEncodesOutsideReplicaMu:
+	// materialize both and compare the resulting database bytes (the raw
+	// LTX streams differ in their timestamp header field alone).
+	ref, _, err := w.Store.GetRef("app", "main")
+	if err != nil {
+		t.Fatal(err)
+	}
+	uploaded, _, err := w.Store.B.Get(store.SnapshotKey(ref.Lineage, ref.HeadEpoch, txid))
+	if err != nil {
+		t.Fatalf("uploaded snapshot object: %v", err)
+	}
+	var direct bytes.Buffer
+	s.replicaMu.Lock()
+	_, err = ltxio.EncodeSnapshot(s.replica.Path(), txid, &direct)
+	s.replicaMu.Unlock()
+	if err != nil {
+		t.Fatal(err)
+	}
+	fromUpload := filepath.Join(t.TempDir(), "from-upload.db")
+	fromDirect := filepath.Join(t.TempDir(), "from-direct.db")
+	if _, err := ltxio.Materialize(bytes.NewReader(uploaded), fromUpload); err != nil {
+		t.Fatalf("materialize uploaded snapshot: %v", err)
+	}
+	if _, err := ltxio.Materialize(bytes.NewReader(direct.Bytes()), fromDirect); err != nil {
+		t.Fatalf("materialize direct encode: %v", err)
+	}
+	a, err := os.ReadFile(fromUpload)
+	if err != nil {
+		t.Fatal(err)
+	}
+	b, err := os.ReadFile(fromDirect)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !bytes.Equal(a, b) {
+		t.Fatalf("streamed upload diverged from direct encode: materialized %d vs %d bytes", len(a), len(b))
+	}
+}
+
+// TestSnapshotFlushFallsBackToBufferedWithoutReaderPutter proves the
+// fallback this task must leave unchanged: a backend that does NOT
+// implement store.ReaderPutter (countingBackend, which forwards only
+// store.Backend's mandatory methods — no PutReaderIf/PutReader of its own)
+// makes flush.go's `st.B.(store.ReaderPutter)` type assertion fail, so
+// useStream is false and the snapshot branch takes the pre-task buffered
+// PutIf/Put path exactly as before. Flush must still succeed, the object
+// must still materialize as valid, checksum-verified content, and — since
+// useStream never becomes true — the encode-output scratch file must never
+// even be created.
+func TestSnapshotFlushFallsBackToBufferedWithoutReaderPutter(t *testing.T) {
+	testutil.RequireSQLite3(t)
+	w := newWS(t)
+	if err := w.Create("app"); err != nil {
+		t.Fatal(err)
+	}
+	cb := &countingBackend{Backend: w.Store.B}
+	w.Store.B = cb
+
+	s, err := Open(context.Background(), Options{WS: w, DB: "app", Branch: "main"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer s.Close()
+
+	if out, err := exec.Command("sqlite3", s.CheckoutPath(),
+		"CREATE TABLE t (v); INSERT INTO t VALUES ('x'),('y');").CombinedOutput(); err != nil {
+		t.Fatalf("%v: %s", err, out)
+	}
+
+	txid, err := s.Flush("", nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if cb.Count() == 0 {
+		t.Fatal("fallback flush must still write via the buffered Put/PutIf path")
+	}
+
+	ref, _, err := w.Store.GetRef("app", "main")
+	if err != nil {
+		t.Fatal(err)
+	}
+	uploaded, _, err := w.Store.B.Get(store.SnapshotKey(ref.Lineage, ref.HeadEpoch, txid))
+	if err != nil {
+		t.Fatalf("uploaded snapshot object: %v", err)
+	}
+	dst := filepath.Join(t.TempDir(), "from-fallback.db")
+	if _, err := ltxio.Materialize(bytes.NewReader(uploaded), dst); err != nil {
+		t.Fatalf("materialize fallback-uploaded snapshot: %v", err)
+	}
+	if fi, err := os.Stat(dst); err != nil || fi.Size() == 0 {
+		t.Fatalf("materialized fallback snapshot missing or empty: %v", err)
+	}
+
+	if m, _ := filepath.Glob(filepath.Join(s.dir, "flush-scratch-*.db")); len(m) != 0 {
+		t.Fatalf("replica-clone scratch not cleaned up: %v", m)
+	}
+	if m, _ := filepath.Glob(filepath.Join(s.dir, "flush-encode-*.ltx")); len(m) != 0 {
+		t.Fatalf("encode-output scratch must never be created on the fallback (no ReaderPutter) path, found %v", m)
 	}
 }
