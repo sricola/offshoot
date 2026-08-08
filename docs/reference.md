@@ -419,8 +419,11 @@ before its target). Old checkpoints were anchored on the shared ancestor's
 storage and would not resolve in the new self-contained lineage. If you
 need a pre-compact checkpoint, `export` it first.
 
-Cost class: compact is a full materialize — the same N×G copy `promote`
-and `rollback` pay — not a cheap metadata flip. Through the daemon (the
+Cost class: compact is a full materialize — one full copy of the branch's
+state (~G bytes for a G-byte database), the same cost class a single
+`promote` or `rollback` pays — not a cheap metadata flip. (The N×G figure
+elsewhere in this page is the *aggregate* cost of N materialized forks;
+one compact pays ~G, once.) Through the daemon (the
 `compact` op, SDK `compact()`), an open session on the branch is flushed
 first so unflushed writes land in the head being compacted; a concurrent
 flush that advances the head between the copy and the ref swap loses the

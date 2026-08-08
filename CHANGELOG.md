@@ -13,6 +13,43 @@ version if you depend on format stability.
 
 ## [Unreleased]
 
+### Added
+
+- **`offshoot_fork_mode_total{mode="shared"|"materialized"}`** — a
+  fork-time counter for the copy-on-write storage mode, completing the
+  0.2.0 observability story: `status`/`branches` already report
+  shared-vs-materialized per branch at read time; this records it as a
+  rate at fork time. `shared` = a base pointer into the parent's chain,
+  zero data objects copied; `materialized` = a full snapshot copy (the
+  fork-time snapshot floor). Orthogonal to `offshoot_fork_total{path}`,
+  which names the materialize path's copy strategy. Both label values
+  pre-registered at `0`; documented in docs/operations.md.
+- **`offshoot_gc_errors_total`** — counts janitor GC passes that returned
+  an error. GC deliberately **fails closed** (an incomplete reachability
+  mark deletes nothing), which previously left a stalled GC silent while
+  the store bloated: the error went to stderr only, with no alertable
+  signal. The stderr line still carries the cause; the counter is the
+  signal to alert on.
+
+### Fixed
+
+- **`store.Chain` now detects base-pointer cycles** in a corrupt or
+  hand-edited store and returns a clear `base pointer cycle detected`
+  error instead of recursing until the stack overflows. Not reachable
+  through this binary's writers (`WriteLineageBase` is create-only,
+  rejects a self-base, and always points at an existing lineage) — this
+  is crash-hardening for a corrupt store, mirroring `BaseSpine`'s
+  existing defensive cycle guard.
+- Docs: `offshoot compact`'s cost class in docs/reference.md no longer
+  claims a single compact pays "the same N×G copy" — N×G is the
+  aggregate across N materialized forks; one compact/promote/rollback
+  pays ~G (one full copy). README's install line no longer says tagged
+  binaries land "with the first 0.1.x release" (stale since 0.2.0
+  shipped; binaries are published per tagged release). The original
+  design spec's launch-demo bullet gained a superseded-note: under
+  copy-on-write there is no async-upload/pending window for a shared
+  fork to caveat.
+
 ## [0.2.0] - 2026-08-07
 
 **Copy-on-write forks.** `offshoot fork` no longer materializes a full

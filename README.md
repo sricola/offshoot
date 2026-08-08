@@ -10,8 +10,10 @@ segments, leases and TTL reaping, an MCP server, and Python/TypeScript SDKs. See
 what's shipped-but-unverified, and what's still on the [roadmap](ROADMAP.md).
 Requires Go 1.24+, cgo, and the `sqlite3` CLI for tests. Linux and macOS only.
 
-**Install:** build from source (see Quickstart below) — tagged binaries land
-with the first 0.1.x release. No package-manager install yet.
+**Install:** build from source (see Quickstart below), or grab a prebuilt
+binary from the [releases page](https://github.com/sricola/offshoot/releases)
+— binaries are published for each tagged release. No package-manager install
+yet.
 
 **Docs:** [FAQ](docs/faq.md) (why not Litestream / LiteFS / Turso / Dolt / `cp`) ·
 [CLI reference](docs/reference.md) · [architecture](docs/architecture.md) ·
