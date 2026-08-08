@@ -81,7 +81,16 @@ version if you depend on format stability.
   retry. New daemon op `compact` (an open session on the branch is
   flushed first, like fork's source flush, so unflushed writes land in
   the head compact materializes), plus SDK one-liners
-  (`Client.compact(db, branch)` in Python and TypeScript).
+  (`Client.compact(db, branch)` in Python and TypeScript). Review fix:
+  `Promote` and `Rollback` now clear the ref's `Base` mirror when they
+  repoint a formerly-shared branch at a fresh self-contained lineage
+  (previously the stale non-nil mirror survived, misreporting the branch
+  as shared — and a later compact trusting it would needlessly
+  re-materialize and wipe the checkpoints Rollback had preserved), and
+  compact's no-op decision now consults the DURABLE base spine
+  (`store.BaseSpine`, the base.json chain) rather than the mirror, so
+  this destructive op stays a no-op on a self-contained branch even if a
+  stale mirror is ever left behind.
 - **Divergence floor: the session snapshot cadence now survives session
   restarts** (copy-on-write Task 4): a session's first flush seeds its
   snapshot counter from the branch's DURABLE divergence — the trailing run

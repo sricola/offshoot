@@ -1210,6 +1210,13 @@ func (w *Workspace) Rollback(db, branch, to string) (string, error) {
 
 	next := ref
 	next.Lineage, next.Epoch, next.HeadTXID, next.HeadEpoch, next.Checkpoints = lineage, 1, txid, 1, kept
+	// The new lineage is self-contained (copySnapshotToNewLineage writes no
+	// base.json), so the ref's Base mirror must say so too — carrying a
+	// formerly-shared branch's Base forward would break the invariant that
+	// Ref.Base != nil iff base.json(Ref.Lineage) exists, and downstream
+	// readers of the mirror (status, and any op deciding "is this shared?")
+	// would see a share that no longer exists.
+	next.Base = nil
 	// A repoint is itself a revocation: the old holder is already fenced (its
 	// epoch no longer matches), but carrying its lease forward would leave a
 	// fresh acquirer refused ErrLeaseHeld by a holder that can never renew —
@@ -1293,6 +1300,9 @@ func (w *Workspace) Promote(db, source, target string, force bool) (uint64, erro
 	}
 	next := tgt
 	next.Lineage, next.Epoch, next.HeadTXID, next.HeadEpoch = lineage, 1, txid, 1
+	// Self-contained new lineage → the Base mirror must clear, exactly as in
+	// Rollback's repoint (see the comment there for the invariant).
+	next.Base = nil
 	next.Checkpoints = nil
 	next.SetCheckpoint("promote", store.Checkpoint{TXID: txid, Epoch: 1, CreatedAt: nowStamp()})
 	next.Parent = fmt.Sprintf("%s@%s@%d", db, source, txid)
@@ -1343,10 +1353,12 @@ var compactBeforeCASForTest func()
 // ancestor's storage only this branch was keeping alive). No explicit
 // old-object deletion happens here; GC owns reclaim.
 //
-// A branch with no base pointer (Base == nil) is already self-contained:
-// compact is a NO-OP returning the current head txid — the postcondition
-// already holds, and erroring would make scripted "compact everything"
-// loops fail on exactly the branches that need nothing done.
+// A branch whose lineage has an empty DURABLE base spine
+// (store.BaseSpine — the base.json chain, the resolution source of truth,
+// not the ref's reporting mirror) is already self-contained: compact is a
+// NO-OP returning the current head txid — the postcondition already
+// holds, and erroring would make scripted "compact everything" loops fail
+// on exactly the branches that need nothing done.
 //
 // Checkpoints are RESET to {"compact": head txid}, like Promote (and
 // unlike Rollback's kept-checkpoint snapshot copies): old checkpoints
@@ -1370,7 +1382,18 @@ func (w *Workspace) Compact(db, branch string) (uint64, error) {
 	if err != nil {
 		return 0, err
 	}
-	if ref.Base == nil {
+	// The no-op decision consults the DURABLE base spine (base.json chain),
+	// not the ref's Base mirror: compact is destructive (it resets the
+	// checkpoint map), so it must be authoritative even if some code path
+	// left a stale mirror behind — a stale non-nil mirror on a genuinely
+	// self-contained branch must not trigger a needless materialize that
+	// wipes checkpoints. An empty spine means resolution never leaves this
+	// lineage: already self-contained, nothing to cut.
+	spine, err := w.Store.BaseSpine(ref.Lineage)
+	if err != nil {
+		return 0, fmt.Errorf("ops: compact %s@%s: resolving base spine: %w", db, branch, err)
+	}
+	if len(spine) == 0 {
 		// Already self-contained: no-op, see the doc comment.
 		return ref.HeadTXID, nil
 	}
