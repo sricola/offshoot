@@ -584,6 +584,7 @@ func TestGCMixedStoreV1AndV2Forks(t *testing.T) {
 		t.Fatal(err)
 	}
 	SetForkMaterializeForTest(true)
+	t.Cleanup(func() { SetForkMaterializeForTest(false) })
 	_, ferr := w.Fork("app", "main", "fullcopy", "", 0, nil)
 	SetForkMaterializeForTest(false)
 	if ferr != nil {
