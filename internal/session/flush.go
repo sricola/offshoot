@@ -5,10 +5,13 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"os"
+	"path/filepath"
 	"time"
 
 	"github.com/sricola/offshoot/internal/ltxio"
 	"github.com/sricola/offshoot/internal/ops"
+	"github.com/sricola/offshoot/internal/ops/reflink"
 	"github.com/sricola/offshoot/internal/store"
 )
 
@@ -250,7 +253,10 @@ func (s *Session) flush(name string, meta map[string]string, auto bool) (txid ui
 	// of this section, so the replica file — and the pages/checksum/commit
 	// state recordApply and rebaseline maintain alongside it (see
 	// replicaMu's doc comment) — are frozen at a single transaction boundary
-	// while this flush decides what to write and encodes it.
+	// while this flush decides what to write and captures what it needs. The
+	// segment branch encodes entirely under the lock (cheap: O(changed
+	// pages)); the snapshot branch only CLONES the replica under the lock and
+	// releases it before the O(database size) encode — see the branch itself.
 	s.replicaMu.Lock()
 	if FlushEncodeHook != nil {
 		FlushEncodeHook() // test hook; nil (a no-op) in production
@@ -358,21 +364,66 @@ func (s *Session) flush(name string, meta map[string]string, auto bool) (txid ui
 	s.forceSnapshot = true
 
 	if snapshot {
+		// A snapshot encode is O(database size) — EncodeSnapshot reads,
+		// LTX-encodes, and checksums the ENTIRE replica file — and replicaMu
+		// is the very lock the capture engine's Apply/Rebase need, so holding
+		// it across the encode would stall capture (and spike Lag()) for the
+		// whole encode on a large replica. Instead: take a cheap consistent
+		// point-in-time COPY of the replica here, under the lock (which
+		// freezes the replica at this flush's transaction boundary), release
+		// replicaMu, and encode from the copy outside the lock.
+		// reflink.CopyFile clones via copy-on-write — near-constant-time
+		// regardless of size — on clone-capable filesystems (APFS, btrfs, xfs
+		// with reflink=1; the same fast path ops.Fork uses), and falls back to
+		// a plain byte copy elsewhere; even that fallback is strictly cheaper
+		// under the lock than EncodeSnapshot's read+encode+checksum over the
+		// same bytes. Because the clone happens while the replica is frozen,
+		// the scratch is byte-identical to what encoding the live replica
+		// under the lock would have read: the uploaded bytes and checksum are
+		// unchanged by this restructuring, only WHEN replicaMu is released.
+		scratch := filepath.Join(s.dir, fmt.Sprintf("flush-scratch-%d.db", txid))
+		// CopyFile requires dst to not already exist. flushMu serializes
+		// flushes in this process and the deferred remove below cleans up
+		// every exit path, so the only way scratch can exist here is as a
+		// leftover from a CRASHED prior process that resumed with the same
+		// Options.Dir and is now retrying this same txid (the head never
+		// advanced). Clear it first; a leftover is never live state.
+		os.Remove(scratch)
+		if _, cerr := reflink.CopyFile(scratch, s.replica.Path()); cerr != nil {
+			s.replicaMu.Unlock()
+			return 0, fmt.Errorf("session: clone replica for snapshot encode: %w", cerr)
+		}
+		s.replicaMu.Unlock()
+		// Remove the scratch on every exit path from here on, success and
+		// error alike. Deferred funcs run LIFO, so this remove fires BEFORE
+		// the deferred flushMu.Unlock at the top of flush — i.e. while flushMu
+		// is still held — and therefore cannot race Close's removal of the
+		// scratch dir, which itself takes flushMu first (see Close).
+		defer os.Remove(scratch)
+		if flushSnapshotEncodeHook != nil {
+			flushSnapshotEncodeHook() // test hook; nil (a no-op) in production
+		}
 		// The returned checksum is discarded: Session already tracks its
 		// own running checksum incrementally (s.checksum, maintained by
-		// recordApply/rebaseline) and checksumAtEncode below is captured
-		// from exactly that — it necessarily already equals whatever
-		// EncodeSnapshot independently (re-)computes over this same replica
-		// file, so there is nothing new to learn from asking again here.
-		_, err = ltxio.EncodeSnapshot(s.replica.Path(), txid, &buf)
+		// recordApply/rebaseline) and checksumAtEncode above was captured
+		// from exactly that, under the same replicaMu hold that froze the
+		// replica for the clone — so it necessarily already equals whatever
+		// EncodeSnapshot independently (re-)computes over the scratch (a
+		// byte-identical image of that same frozen replica), and there is
+		// nothing new to learn from asking again here.
+		_, err = ltxio.EncodeSnapshot(scratch, txid, &buf)
 	} else {
 		// pageSizeAtEncode is guaranteed non-zero here: snapshot's own
 		// condition above already covers s.pageSize == 0, so this branch is
 		// only ever reached once recordApply has run at least once.
+		//
+		// Unlike the snapshot branch above, the segment encode stays under
+		// replicaMu: it is O(changed pages), not O(database size), so there
+		// is nothing worth restructuring the lock discipline for.
 		err = ltxio.EncodeSegment(pageSizeAtEncode, commitAtEncode, txid, txid,
 			s.flushChecksum, checksumAtEncode, pages, &buf)
+		s.replicaMu.Unlock()
 	}
-	s.replicaMu.Unlock()
 	if err != nil {
 		return 0, fmt.Errorf("session: encode replica: %w", err)
 	}
@@ -524,16 +575,30 @@ const largeSegmentFraction = 0.5
 // is skipped entirely and the SnapshotEvery cadence alone decides.
 const minPagesForFractionCheck = 64
 
-// FlushEncodeHook, when non-nil, is invoked by Flush immediately before it
-// calls ltxio.EncodeSnapshot or ltxio.EncodeSegment, while still holding both
-// flushMu and replicaMu. It exists purely for tests exercising Close/Flush
-// concurrency (holding a Flush paused mid-encode so a concurrent Close can be
-// observed waiting on flushMu); nil (the default) is a no-op and imposes no
-// cost in production.
+// FlushEncodeHook, when non-nil, is invoked by Flush at the top of its
+// replicaMu section — before the snapshot/segment decision and before either
+// branch's encode work (for the snapshot branch that now means before the
+// scratch clone; the encode itself runs after replicaMu is released) — while
+// still holding both flushMu and replicaMu. It exists purely for tests
+// exercising Close/Flush concurrency (holding a Flush paused inside its
+// locked section so a concurrent Close can be observed waiting on flushMu);
+// nil (the default) is a no-op and imposes no cost in production.
 var FlushEncodeHook func()
 
-// FlushUploadHook, when non-nil, is invoked by Flush immediately after it
-// releases replicaMu following a successful encode — i.e. exactly inside the
+// flushSnapshotEncodeHook, when non-nil, is invoked by Flush's SNAPSHOT
+// branch after it has cloned the replica to its scratch path and released
+// replicaMu, immediately before ltxio.EncodeSnapshot runs over the scratch.
+// It exists purely so tests can prove replicaMu is genuinely free during the
+// snapshot encode (the whole point of the scratch-clone restructuring —
+// audit-performance M2); nil (the default) is a no-op and imposes no cost in
+// production. Unexported: unlike FlushEncodeHook/FlushUploadHook it has no
+// cross-package callers.
+var flushSnapshotEncodeHook func()
+
+// FlushUploadHook, when non-nil, is invoked by Flush after a successful
+// encode, with replicaMu no longer held (the segment branch releases it right
+// after encoding; the snapshot branch released it even earlier, before its
+// encode) — i.e. exactly inside the
 // window where Flush's own upload (PutIf/PutRef) runs without replicaMu
 // held, and a concurrent Rebase (a real one via the capture engine, or a
 // test driving replicaSink.Rebase directly) can race in and change rebaseGen
