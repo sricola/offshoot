@@ -161,6 +161,49 @@ func (s *Session) flush(name string, meta map[string]string, auto bool) (txid ui
 		}
 	}
 
+	// Divergence-floor seeding (copy-on-write Task 4 — see divergenceSeeded's
+	// doc comment on Session for the full argument): on this session's first
+	// flush, initialize flushesSinceSnapshot from the branch's DURABLE
+	// divergence — the trailing run of segment members in the resolved chain
+	// at head — so the snapshot cadence continues across sessions instead of
+	// restarting at zero with every process. Only the settling-flush
+	// suppression makes this observable (every other first flush writes a
+	// full snapshot and resets the counter regardless), so the probe is
+	// skipped whenever this first flush is already bound for the snapshot
+	// path: a brand-new lineage (HeadTXID 0 → txid 1), forceSnapshot still
+	// set (no suppression fired), or pageSize 0 (recordApply never ran).
+	// That gating is also the cost story: read-only sessions never flush and
+	// never pay the List; a non-suppressed writer's first flush snapshots
+	// without paying it; only a suppressed writer's first flush costs one
+	// store List — on the write path, alongside the GetRef/upload/PutRef it
+	// is already paying. Peeking forceSnapshot/pageSize takes replicaMu
+	// briefly (flushMu → replicaMu is this package's documented lock order);
+	// a rebase racing in AFTER the peek can only turn this flush INTO a
+	// snapshot, wasting the probe's List, never the reverse.
+	if !s.divergenceSeeded {
+		s.divergenceSeeded = true
+		s.replicaMu.Lock()
+		suppressed := !s.forceSnapshot && s.pageSize != 0
+		s.replicaMu.Unlock()
+		if suppressed && ref.HeadTXID > 0 {
+			if chain, cerr := st.Chain(ref.Lineage, ref.HeadTXID); cerr == nil {
+				trailing := 0
+				for i := len(chain) - 1; i >= 0 && !chain[i].Snapshot; i-- {
+					trailing++
+				}
+				s.flushesSinceSnapshot = trailing
+			} else {
+				// Fail toward the bounded outcome: with no durable count to
+				// trust, treat the cadence as due so this flush writes a full
+				// snapshot (always safe — it depends on nothing pending) and
+				// resets the counter, rather than propagating a probe-only
+				// error or silently under-counting and letting the chain grow
+				// past the floor.
+				s.flushesSinceSnapshot = s.snapshotEvery - 1
+			}
+		}
+	}
+
 	txid = ref.HeadTXID + 1
 	var buf bytes.Buffer
 
