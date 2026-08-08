@@ -15,6 +15,7 @@ import (
 	"path/filepath"
 	"sort"
 	"sync"
+	"syscall"
 	"time"
 
 	"github.com/sricola/offshoot/internal/ops"
@@ -134,10 +135,26 @@ func NewServer(ws *ops.Workspace, socketPath string) (*Server, error) {
 	if err := os.Remove(socketPath); err != nil && !os.IsNotExist(err) {
 		return nil, err
 	}
+	// The socket must be 0600 from its very first instant: net.Listen
+	// creates the socket file at the process umask's default mode, and a
+	// Chmod-after-the-fact leaves a window in which — if socketPath's
+	// parent directory is reachable by other users (an operator-supplied
+	// -socket in /tmp, say; the DEFAULT path's parent is 0700) — any local
+	// user could connect and get a full daemon client. A 0o077 umask
+	// around the Listen closes that window. syscall.Umask is process-wide
+	// and not goroutine-safe, but NewServer runs exactly once at startup,
+	// before Serve accepts anything and before this package spawns any
+	// concurrent work, so the momentary swap is safe. Restored
+	// immediately after Listen, before the error check, so every path —
+	// success or failure — leaves the process umask untouched.
+	oldUmask := syscall.Umask(0o077)
 	ln, err := net.Listen("unix", socketPath)
+	syscall.Umask(oldUmask)
 	if err != nil {
 		return nil, fmt.Errorf("daemon: listen %s: %w", socketPath, err)
 	}
+	// Belt-and-suspenders: the umask above already yields 0600 at creation;
+	// this pins the exact final mode regardless of platform quirks.
 	if err := os.Chmod(socketPath, 0o600); err != nil {
 		ln.Close()
 		return nil, err
