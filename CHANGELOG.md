@@ -21,6 +21,21 @@ version if you depend on format stability.
 
 ### Changed
 
+- **Snapshot flushes no longer hold the replica lock across the full-file
+  encode** (perf audit M2). `Session.flush`'s snapshot branch now clones the
+  replica to a per-flush scratch file under `replicaMu` (a copy-on-write
+  reflink — near-O(1) — on APFS/btrfs/xfs, plain byte copy elsewhere),
+  releases the lock, and runs `EncodeSnapshot` over the scratch outside it,
+  so the capture engine's `Apply`/`Rebase` no longer stall for the O(DB
+  size) encode+checksum on every snapshot flush (multi-GB replicas: seconds
+  of `Lag()` spike per snapshot, gone). The clone is taken while `replicaMu`
+  freezes the replica at the flush's transaction boundary, so the uploaded
+  bytes and checksum are exactly what encoding the live replica under the
+  lock produced before; upload/ref-CAS ordering, `forceSnapshot`/pageSet
+  drain semantics, and the segment path (already O(changed pages), still
+  encoded under the lock) are unchanged. The scratch is removed on every
+  exit path.
+
 - **Capture no longer fsyncs its resume-offset state file per transaction**
   (perf audit M3). `drainStep` now records the applied position in memory
   and the engine persists it once per drain burst (plus at shutdown's final

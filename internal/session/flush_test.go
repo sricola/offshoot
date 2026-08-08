@@ -1933,3 +1933,111 @@ func TestFlushRejectsMetaOverCap(t *testing.T) {
 		t.Fatal("a rejected named flush must not have created the checkpoint")
 	}
 }
+
+// TestSnapshotFlushEncodesOutsideReplicaMu proves the audit-performance M2
+// restructuring: a snapshot flush clones the replica to a scratch file under
+// replicaMu, then RELEASES replicaMu before the O(database size)
+// EncodeSnapshot — so the capture engine's Apply/Rebase are never stalled
+// behind the encode. flushSnapshotEncodeHook fires exactly between the
+// release and the encode; inside it the test must be able to acquire
+// replicaMu (the lock is genuinely free during the encode) and must see the
+// scratch clone on disk. It then proves the scratch path changes nothing
+// about WHAT is written: the uploaded snapshot object is byte-identical to
+// encoding the live replica directly (the pre-M2 behavior), and the scratch
+// file is gone once Flush returns.
+func TestSnapshotFlushEncodesOutsideReplicaMu(t *testing.T) {
+	testutil.RequireSQLite3(t)
+	w := newWS(t)
+	if err := w.Create("app"); err != nil {
+		t.Fatal(err)
+	}
+	s, err := Open(context.Background(), Options{WS: w, DB: "app", Branch: "main"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer s.Close()
+
+	if out, err := exec.Command("sqlite3", s.CheckoutPath(),
+		"CREATE TABLE t (v); INSERT INTO t VALUES ('x'),('y');").CombinedOutput(); err != nil {
+		t.Fatalf("%v: %s", err, out)
+	}
+
+	var hookFired, lockWasFree, scratchExisted atomic.Bool
+	flushSnapshotEncodeHook = func() {
+		hookFired.Store(true)
+		if s.replicaMu.TryLock() {
+			lockWasFree.Store(true)
+			s.replicaMu.Unlock()
+		}
+		if m, _ := filepath.Glob(filepath.Join(s.dir, "flush-scratch-*.db")); len(m) == 1 {
+			scratchExisted.Store(true)
+		}
+	}
+	defer func() { flushSnapshotEncodeHook = nil }()
+
+	// A session's first flush is forced to the snapshot path (startup rebase
+	// sets forceSnapshot), so the hook must fire.
+	txid, err := s.Flush("", nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !hookFired.Load() {
+		t.Fatal("first flush must take the snapshot path and hit flushSnapshotEncodeHook")
+	}
+	if !lockWasFree.Load() {
+		t.Fatal("replicaMu must be released before the snapshot encode runs")
+	}
+	if !scratchExisted.Load() {
+		t.Fatal("the scratch clone must exist on disk while the encode runs")
+	}
+	if m, _ := filepath.Glob(filepath.Join(s.dir, "flush-scratch-*.db")); len(m) != 0 {
+		t.Fatalf("Flush must remove its scratch clone on return, found %v", m)
+	}
+
+	// Content equivalence with the pre-M2 behavior: encoding the live replica
+	// directly (under replicaMu, as the old code did) must produce a snapshot
+	// that materializes to exactly the same database bytes, with the same
+	// verified trailer checksum, as what the flush uploaded from the scratch.
+	// (The raw LTX streams cannot be compared byte-for-byte: EncodeSnapshot
+	// stamps time.Now() into the header, so even two back-to-back direct
+	// encodes differ there — a variance the old code had too. Materialize
+	// verifies each stream's trailer checksum against its actual content, so
+	// equal materialized files IS the full "same durable bytes, same
+	// checksum" claim.) Nothing has written to the checkout since the flush
+	// drained it, so the replica is still frozen at txid.
+	ref, _, err := w.Store.GetRef("app", "main")
+	if err != nil {
+		t.Fatal(err)
+	}
+	uploaded, _, err := w.Store.B.Get(store.SnapshotKey(ref.Lineage, ref.HeadEpoch, txid))
+	if err != nil {
+		t.Fatalf("uploaded snapshot object: %v", err)
+	}
+	var direct bytes.Buffer
+	s.replicaMu.Lock()
+	_, err = ltxio.EncodeSnapshot(s.replica.Path(), txid, &direct)
+	s.replicaMu.Unlock()
+	if err != nil {
+		t.Fatal(err)
+	}
+	fromUpload := filepath.Join(t.TempDir(), "from-upload.db")
+	fromDirect := filepath.Join(t.TempDir(), "from-direct.db")
+	if _, err := ltxio.Materialize(bytes.NewReader(uploaded), fromUpload); err != nil {
+		t.Fatalf("materialize uploaded snapshot: %v", err)
+	}
+	if _, err := ltxio.Materialize(bytes.NewReader(direct.Bytes()), fromDirect); err != nil {
+		t.Fatalf("materialize direct encode: %v", err)
+	}
+	a, err := os.ReadFile(fromUpload)
+	if err != nil {
+		t.Fatal(err)
+	}
+	b, err := os.ReadFile(fromDirect)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !bytes.Equal(a, b) {
+		t.Fatalf("scratch-clone encode diverged from direct encode: materialized %d vs %d bytes",
+			len(a), len(b))
+	}
+}
