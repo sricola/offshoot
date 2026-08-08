@@ -250,9 +250,10 @@ anything is written; a rejected `--meta` leaves the branch untouched. This is
 branch/checkpoint-level metadata, not row-level provenance — see the design
 spec's metadata note.
 
-Children never inherit a parent's checkpoints — a fork's storage begins at
-its fork point, so a checkpoint made before the fork isn't materializable
-from the child; resolve it on the parent instead.
+Children never inherit a parent's checkpoints — a fork's own history
+begins at its fork point (even a shared, copy-on-write fork's ref carries
+only its auto-created `fork` checkpoint), so a checkpoint made before the
+fork isn't addressable from the child; resolve it on the parent instead.
 
 **Errors:** checkpoint name already exists on this branch; no checkout
 exists yet (run `checkout` first); checkout is busy; `--meta` over a cap
@@ -268,10 +269,39 @@ offshoot fork app attempt-1 --meta eval_run=42 --meta git_sha=abc123
 ```
 
 Creates `new-branch` as an independent branch from `db@branch`'s head, or
-from a named checkpoint via `--at`. The fork **materializes**: the child
-gets its own storage lineage, seeded by copying the source's snapshot state,
-and never references the parent's storage again afterward — destroying the
-parent never endangers a child. `branch` (the source) defaults to `main`.
+from a named checkpoint via `--at`. `branch` (the source) defaults to
+`main`.
+
+**Fork is copy-on-write.** A fork **shares** the parent's already-durable
+store objects through a base pointer — it records where in the parent's
+chain it forked from and writes new objects only as it diverges, so N
+forks of a G-byte database no longer cost N×G in the store; they cost
+near-zero until each child actually writes. Reads on the child resolve
+through the parent's objects below the fork point and the child's own
+objects above it. The exception is the **fork-time snapshot floor**: when
+the fork point's fully-resolved chain is already at the depth bound, fork
+falls back to materializing one fresh snapshot in the child's own lineage
+(a full copy, the pre-copy-on-write behavior), which keeps read
+materialization bounded no matter how deep a fork-of-fork spine grows. A
+shared child also self-snapshots on the ordinary snapshot cadence once its
+own divergence crosses it, after which its reads never touch the parent.
+`offshoot status` reports which class each branch is in
+(`storage=shared` vs `storage=materialized` — see `offshoot status`
+below), and `offshoot compact` converts a shared branch into a
+self-contained one on demand (see `offshoot compact` below).
+
+Destroying a parent remains **instant and always allowed** — but under
+sharing, the parent's *bytes* can outlive its ref: they are reclaimed by
+GC only once no surviving child's chain still reads through them (see
+`offshoot destroy` below for the full semantics).
+
+**The first shared fork upgrades the store to layout version 2.** This is
+one-way and intentional: pre-copy-on-write binaries refuse the entire
+store from that point on (their GC reasons about whole lineages and would
+sweep shared objects out from under live children — silent data loss —
+so they are locked out up front by the manifest check rather than allowed
+to corrupt). Don't point an old binary at a store any new binary has
+forked in.
 
 If forking at head (no `--at`) and the source's local checkout has
 un-checkpointed changes or is busy, a warning is printed and the fork
@@ -365,6 +395,40 @@ semantics as rollback.
 target checkout is busy (repoint still lands; checkout refresh is skipped
 and reported); lost a concurrent CAS race (retry).
 
+## `offshoot compact <db>[@branch]`
+
+```
+offshoot compact app@attempt-1
+```
+
+Turns a **shared** (copy-on-write) fork into a self-contained branch: its
+full state at head is re-encoded as one snapshot in a fresh lineage and
+the branch's base pointer is dropped, so it stops reading through — and
+stops pinning — its ancestors' storage. This is the manual "pay the full
+copy now to release a dead ancestor" lever: after compacting the last
+sharing child, a destroyed ancestor's lingering bytes become reclaimable
+by the next `offshoot gc` pass (compact itself deletes nothing; GC owns
+reclaim). A branch that is already self-contained is a **no-op** (prints
+the current head txid), so scripted "compact everything" loops never fail
+on branches with nothing to do.
+
+**The flagged tradeoff: compact resets the branch's checkpoints** to a
+single `compact` checkpoint at the new head, exactly like `promote` resets
+to `promote` (and unlike `rollback`, which preserves checkpoints at or
+before its target). Old checkpoints were anchored on the shared ancestor's
+storage and would not resolve in the new self-contained lineage. If you
+need a pre-compact checkpoint, `export` it first.
+
+Cost class: compact is a full materialize — the same N×G copy `promote`
+and `rollback` pay — not a cheap metadata flip. Through the daemon (the
+`compact` op, SDK `compact()`), an open session on the branch is flushed
+first so unflushed writes land in the head being compacted; a concurrent
+flush that advances the head between the copy and the ref swap loses the
+CAS and returns a retry error.
+
+**Errors:** no such `db@branch`; lost a concurrent CAS race to a flush
+(retry).
+
 ## `offshoot destroy <db>[@branch] [--force]`
 
 ```
@@ -373,12 +437,27 @@ offshoot destroy app@attempt-1 --force
 ```
 
 Deletes the branch's ref and its local checkout files (`.db`, `-wal`,
-`-shm`, `.sum`). Destroying a parent is always safe and allowed regardless
-of live children — children are storage-independent once forked, so a
-parent's destruction can never corrupt them. `--force` is required to
-destroy a protected branch (`main` by default), and also to destroy a branch
-under an active lease (a live holder may still be mid-write; without
-`--force` this is refused outright).
+`-shm`, `.sum`). Destroying a parent is always safe, instant, and allowed
+regardless of live children — a parent's destruction can never corrupt a
+child, whether that child is a shared (copy-on-write) fork or a
+materialized one. `--force` is required to destroy a protected branch
+(`main` by default), and also to destroy a branch under an active lease (a
+live holder may still be mid-write; without `--force` this is refused
+outright).
+
+**Under copy-on-write, "destroyed" and "reclaimed" are different events.**
+Destroying a branch removes its ref immediately, but if any surviving
+child still shares its storage (forked from it and hasn't diverged past
+it), the destroyed parent's *bytes* linger in the store: GC's reachability
+mark follows every live branch's chain through its base pointers, so a
+shared ancestor's objects stay live for exactly as long as some
+descendant's reads still resolve through them. The lingering bytes are
+reclaimed once the last sharing child is itself destroyed — or compacted
+(`offshoot compact`, the manual release valve). Objects of the destroyed
+parent that no child ever needed (e.g. everything above the last fork
+point) are reclaimed on the normal GC schedule right away. In short:
+**destroy is instant; the storage refund waits for the last sharing
+child.**
 
 **Errors:** protected without `--force`; live lease without `--force`;
 checkout is busy (close connections first); the destroy lost a race to a
@@ -462,10 +541,10 @@ offshoot status -ro-cache-budget 500MB
 ```
 
 Prints every branch across every database: its computed **state** (see
-below), head transaction id, named checkpoints, `protected` and
-`checked-out` flags (when applicable), and — for a branch with a TTL — the
-TTL itself and time remaining until it's reap-eligible
-(`remaining=expired` once past the deadline). TTL remaining is computed
+below), its **storage class** (see below), head transaction id, named
+checkpoints, `protected` and `checked-out` flags (when applicable), and —
+for a branch with a TTL — the TTL itself and time remaining until it's
+reap-eligible (`remaining=expired` once past the deadline). TTL remaining is computed
 from the later of the branch's last-touch time and its lease expiry,
 whichever is later — matching exactly what the janitor's reap logic uses,
 so `status` never disagrees with what will actually happen.
@@ -482,6 +561,31 @@ flag), so this at-rest command has no other way to know what a *running*
 daemon was actually started with. Omitted, the line reads
 `(budget: unlimited)` regardless of what any running daemon's own
 `-ro-cache-budget` is actually set to.
+
+### Storage class: `storage=shared` vs `storage=materialized`
+
+Every branch line carries its copy-on-write cost class, because the two
+classes have genuinely different storage bills and hiding that would be
+dishonest:
+
+- **`storage=shared`** — the branch is a base-pointer fork: it reads
+  through an ancestor's durable objects and added near-zero storage of its
+  own at fork time. Cheap to hold, but it **pins** whatever ancestor
+  storage its chain still resolves through (see `offshoot destroy` above).
+- **`storage=materialized`** — the branch is a fully self-contained
+  lineage: created roots, the results of `promote`/`rollback`/`compact`,
+  and forks that tripped the fork-time snapshot floor. It pins nothing and
+  nothing else's destruction can defer its reclaim.
+
+The asymmetry to internalize: **`fork` shares (near-free);
+`promote`, `rollback`, and `compact` each materialize a full copy.**
+"Fork at checkpoint X is free but rollback to X costs a full copy" is a
+real, deliberate wart — rollback and promote abandon their old lineage
+(base-pointing into a lineage that is meant to die would pin it forever),
+so they pay up front. The daemon's `branches` op reports the same bit as
+`BranchInfo.shared` (wire-additive; an older client simply doesn't read
+the key), computed from the same ref field, so the CLI and daemon surfaces
+can never disagree.
 
 ### Branch states
 

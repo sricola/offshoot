@@ -40,25 +40,64 @@ The engineer at an agent-product or eval-infrastructure team who runs N parallel
 - **Branch** — a ref object holding: lineage id, current epoch, head TXID, checkpoint map (name → TXID), parent info, TTL, protected flag. All mutations to a ref are CAS'd.
 - **Commit (background)** — the daemon continuously captures WAL frames and ships LTX segments on an interval. The API exposes per-branch durability ("durable through TXID X"); writes between shipments are acknowledged by SQLite but not yet durable in the bucket, and the API never hides that.
 - **Checkpoint (explicit)** — `checkpoint <db>@<branch> <name>` synchronously flushes (WAL → LTX → upload) and records name → TXID in the ref. This is the only operation called "checkpoint"; the background shipping is "commit/sync." Checkpoints are per-branch. **Children do not inherit parent checkpoints** — a child's storage begins at its fork point, so pre-fork states are not materializable from the child; resolve them on the parent.
-- **Fork** — creates a child branch with a **materialized fork point**: the child gets its own lineage in its own storage prefix and never references parent segments. Contract: a fork contains everything committed to SQLite before the fork call returned. Mechanics below.
+- **Fork** — creates a child branch with its own lineage. Contract: a fork contains everything committed to SQLite before the fork call returned. *(Superseded in part by the copy-on-write design, [2026-08-07-offshoot-copy-on-write-design.md](2026-08-07-offshoot-copy-on-write-design.md): the common case is now a **shared** fork — a base pointer into the parent's durable chain, zero new objects — rather than this spec's original always-materialized fork point. Mechanics below, rewritten to match what shipped.)*
 - **Checkout** — a materialized local SQLite file. The agent opens it with any stock SQLite client at native speed; the daemon never proxies SQL. Checkout paths are immutable-per-materialization. **One writable checkout per branch per daemon**; additional checkouts of the same branch are read-only (`--read-only`) or refused.
 - **Rollback** — `rollback <db>@<branch> --to <checkpoint>` repoints the branch at a new lineage seeded from the checkpoint state (internally the fork machinery). The branch's old lineage is orphaned, retained for the GC grace period, then collected. The old checkout (and any acknowledged-but-not-durable writes) is closed into `detached` state; rollback prints what TXID range was abandoned. A **new checkout path** is returned — we never rewrite a file under a live connection.
 - **Promote** — `promote <db>@<source> --onto <target>` repoints the target branch at a **new lineage seeded from the source's head** (fork machinery again; source must be flushed first). Because promote creates a fresh lineage, the one-writer-per-lineage invariant holds — no epoch collisions are possible. The target's old lineage is orphaned → grace period → GC. An active checkout on the target transitions to `detached`. The source branch survives unchanged (typically TTL-reaped later). Protected targets require `--force`.
-- **Destroy / GC** — explicit destroy, TTL expiry, and a background collector. Destroying a parent is always safe and allowed regardless of live children (children are storage-independent). Destroying a branch with an active leased checkout requires `--force` and transitions that checkout to an error state. Fork-spam is the expected workload; leaking orphan branches into a user's bucket is a launch-killing bug class.
+- **Destroy / GC** — explicit destroy, TTL expiry, and a background collector. Destroying a parent is always safe and allowed regardless of live children. *(Post-copy-on-write nuance: children are no longer necessarily storage-independent — a destroyed parent's ref is removed instantly, but its bytes are GC-reclaimed only once no surviving shared child's chain still reads through them; see the copy-on-write spec's destroy-semantics section.)* Destroying a branch with an active leased checkout requires `--force` and transitions that checkout to an error state. Fork-spam is the expected workload; leaking orphan branches into a user's bucket is a launch-killing bug class.
 
 ### Fork mechanics and cost
 
-| Case | Mechanism | Cost class |
+> **Rewritten post-copy-on-write.** This section originally described a
+> single fork model: an always-materialized fork point seeded by an
+> **asynchronous** snapshot upload, tracked by a `pending` marker on the
+> child ref and a **fork pin** that GC honored on the parent's segments
+> until the upload landed. That model was superseded by the copy-on-write
+> design ([2026-08-07-offshoot-copy-on-write-design.md](2026-08-07-offshoot-copy-on-write-design.md))
+> before the async machinery ever became the shipped behavior; the text
+> below describes what shipped, so the two models aren't each
+> half-described.
+
+Fork has exactly two store-side cost classes, decided at fork time:
+
+| Case | Mechanism | Store cost class |
 |---|---|---|
-| fork at head, warm parent checkout | flush parent → reflink the checkout file (APFS `clonefile`, XFS/btrfs `FICLONE`); fallback: byte copy | ~ms (reflink) / ~s per 10GB (copy) |
-| fork at head, cold parent (bucket only) | restore parent to local cache, then as above | restore cost + above |
-| `fork --at <checkpoint>` | materialize checkpoint state from parent snapshot + segments, then seed child | restore cost |
+| **Shared fork** (the common case) | flush parent if a session is open → write the child's durable base pointer + ref: an O(1) pointer into the parent's already-durable chain | **zero new data objects**, near-instant |
+| **Materialized fork** (the fork-time snapshot floor: the fork point's fully-resolved chain is already at the depth bound) | copy the fork-point snapshot into the child's own lineage — server-side `CopyObject`/reflink when the fork point is a single snapshot object, materialize-and-re-encode otherwise — then write the ref | one full snapshot (~G bytes) |
 
-Concurrent forks of the same parent are serialized by the daemon (single flush, then N reflinks).
+Local checkout materialization (reflink/`clonefile` with byte-copy
+fallback, warm vs cold cache) is unchanged by all of this and orthogonal
+to the store cost above.
 
-**Durability window:** fork returns when the local child checkout exists and the child ref is written. The child's fork-point snapshot uploads to the bucket **asynchronously**; until it completes, the child ref carries a `pending` marker and a **fork pin** that GC honors on the parent's segments. Once the snapshot lands, the pin is released and the child is fully storage-independent. `status` reports per-branch bucket durability. Where the fork point coincides with an existing parent compacted snapshot, the upload is a server-side `CopyObject` (no re-upload).
+**Durability window: there is none for a shared fork.** A shared fork
+uploads nothing asynchronously — it can only ever point into objects that
+are *already durable* (forking a live session flushes the parent first),
+and the fork is complete the moment its base pointer and ref land. The
+`pending` marker and fork-pin machinery this section originally specified
+are therefore **removed** for shared forks: there is no upload to wait
+for, no window for GC to pin the parent across, and no `pending` branch
+state arising from fork. The full-materialize paths — promote, rollback,
+and the fork-time-floor fork above — keep the durability handshake they
+already have: the snapshot copy completes synchronously *before* the ref
+CAS lands, so there is no pending window there either; nothing about
+those paths is deferred to the background.
 
-**Storage amplification, stated honestly:** N materialized forks of a G-byte database cost up to N×G in the bucket (less with `CopyObject` dedupe at snapshot boundaries). This is the price of GC simplicity and parent-independence; TTLs on attempt branches are the mitigation. v2 may add content-addressed page-level dedupe.
+**What GC honors instead of a fork pin:** reachability. The copy-on-write
+GC marks every object any live branch's chain resolves through,
+transitively across base pointers — a shared child keeps its ancestors'
+shared objects live by construction, permanently rather than for an
+upload window (see the copy-on-write spec's GC section).
+
+**Storage amplification, restated honestly:** the original text here said
+N materialized forks of a G-byte database cost up to N×G in the bucket,
+with TTLs as the mitigation and page-level dedupe as a v2 idea. Shared
+forks resolve that for the fork-heavy workload: N forks now cost near-zero
+added bytes until each child diverges. The honest costs that *remain*:
+promote, rollback, and `compact` still each materialize a full ~G-byte
+copy (fork-at-X is free; rollback-to-X is not — a deliberate, documented
+asymmetry), and a destroyed parent's bytes linger until no surviving
+child's chain reads through them. Content-addressed page-level dedupe
+across unrelated databases remains out of scope.
 
 ## Storage layout (epoch-fenced, versioned)
 
@@ -162,7 +201,7 @@ Linux and macOS (daemon and CLI). Windows is unsupported in v1 (the capture path
 
 ## v1 scope summary
 
-**In:** create (incl. `--from` import) / checkout / fork / checkpoint / rollback / promote / destroy / touch / status · TTL + two-phase GC · local-dir + S3/R2/Tigris/MinIO backends with CAS probe · epoch fencing (segments and snapshots) · reflink fork with copy fallback + async fork-point upload · connection-contract enforcement · vendored Litestream capture · CLI + daemon in one binary · MCP server · Python/TS SDKs · LangGraph adapter · single-token auth + protected branches · checksum verification everywhere · Prometheus metrics · layout versioning.
+**In:** create (incl. `--from` import) / checkout / fork / checkpoint / rollback / promote / destroy / touch / status · TTL + two-phase GC · local-dir + S3/R2/Tigris/MinIO backends with CAS probe · epoch fencing (segments and snapshots) · reflink fork with copy fallback (the async fork-point upload originally listed here was superseded by copy-on-write shared forks before it shipped — see §Fork mechanics) · connection-contract enforcement · vendored Litestream capture · CLI + daemon in one binary · MCP server · Python/TS SDKs · LangGraph adapter · single-token auth + protected branches · checksum verification everywhere · Prometheus metrics · layout versioning.
 
 **Out (v2 arc):** multi-node orchestration, fleet schema migrations, cross-tenant analytics, arbitrary-TXID PITR (named checkpoints only), tiered compaction beyond L0→snapshot, page-level dedupe, web UI, fine-grained authz, GCS, Windows.
 

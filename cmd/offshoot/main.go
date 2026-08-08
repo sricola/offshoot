@@ -71,7 +71,10 @@ Usage:
   offshoot gc [--grace duration]     garbage collect unreachable lineages (default grace: 1h)
   offshoot path <db>[@branch]        print the checkout path
   offshoot status [-ro-cache-budget BYTES]
-                                     print all branches and their state, plus
+                                     print all branches, each with its state and
+                                     storage class (shared = base-pointer fork,
+                                     near-zero added storage; materialized =
+                                     self-contained full copy), plus
                                      a checkouts-ro usage summary; -ro-cache-budget
                                      is display-only (echoes serve's own flag;
                                      not persisted anywhere)
@@ -708,8 +711,18 @@ func run(args []string) error {
 			if s.CheckedOut {
 				flags += " checked-out"
 			}
-			line := fmt.Sprintf("%s@%s state=%s txid=%d checkpoints=[%s]%s",
-				s.DB, s.Branch, s.State, s.HeadTXID, strings.Join(s.Checkpoints, ","), flags)
+			// storage= is the copy-on-write cost class, reported honestly on
+			// every line: "shared" means this branch is a base-pointer fork
+			// (near-zero added storage, reading through an ancestor's durable
+			// objects); "materialized" means a fully self-contained lineage.
+			// fork shares; promote/rollback/compact each materialize a full
+			// copy — the asymmetry is deliberate and worth seeing per branch.
+			storage := "materialized"
+			if s.Shared {
+				storage = "shared"
+			}
+			line := fmt.Sprintf("%s@%s state=%s storage=%s txid=%d checkpoints=[%s]%s",
+				s.DB, s.Branch, s.State, storage, s.HeadTXID, strings.Join(s.Checkpoints, ","), flags)
 			if s.TTL != "" {
 				line += fmt.Sprintf(" ttl=%s remaining=%s", s.TTL, s.TTLRemaining)
 			}

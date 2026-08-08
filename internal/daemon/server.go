@@ -1118,7 +1118,13 @@ func (s *Server) opBranches(req Request) Response {
 			Branch: br, HeadTXID: ref.HeadTXID, Protected: ref.Protected,
 			TTL: ref.TTL, TTLRemaining: ops.FormatTTLRemaining(ref, now), LeaseHolder: ref.LeaseHolder,
 			Checkpoints: cps, TouchedAt: ref.TouchedAt, CheckpointsV2: cpsV2,
-			State: s.branchState(req.DB, br, ref),
+			// Shared reads the ref's Base reporting mirror — non-nil exactly
+			// when the branch is a shared (base-pointer) fork; Promote,
+			// Rollback, and Compact all clear it when they repoint the branch
+			// at a self-contained lineage, so this stays truthful across the
+			// materializing ops (see BranchInfo.Shared's doc comment).
+			Shared: ref.Base != nil,
+			State:  s.branchState(req.DB, br, ref),
 		})
 	}
 	sort.Slice(infos, func(i, j int) bool { return infos[i].Branch < infos[j].Branch })

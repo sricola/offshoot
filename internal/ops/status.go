@@ -20,6 +20,15 @@ type BranchStatus struct {
 	CheckedOut  bool
 	// TTL is the branch's TTL verbatim from the ref ("" if none).
 	TTL string
+	// Shared is this branch's storage cost class under copy-on-write: true
+	// when the ref carries a base pointer (a shared fork — near-zero added
+	// storage, reading through an ancestor's durable objects), false when
+	// the branch is materialized (a self-contained lineage — created roots,
+	// promote/rollback/compact results, and forks that tripped the
+	// fork-time snapshot floor). The daemon's "branches" op reports the
+	// identical bit (daemon.BranchInfo.Shared), read from the same
+	// Ref.Base mirror, so the two surfaces can never disagree.
+	Shared bool
 	// TTLRemaining is how long until the branch is eligible for reaping,
 	// measured from the later of TouchedAt and LeaseExpiry ("" if TTL is
 	// unset; "expired" once past the deadline).
@@ -326,7 +335,8 @@ func (w *Workspace) Status() ([]BranchStatus, error) {
 			out = append(out, BranchStatus{
 				DB: db, Branch: br, HeadTXID: r.HeadTXID, Checkpoints: cps,
 				Protected: r.Protected, Parent: r.Parent, CheckedOut: coErr == nil,
-				TTL: r.TTL, TTLRemaining: FormatTTLRemaining(r, now),
+				Shared: r.Base != nil,
+				TTL:    r.TTL, TTLRemaining: FormatTTLRemaining(r, now),
 				State: BranchStateAt(r, path, now),
 			})
 		}

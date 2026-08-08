@@ -12,8 +12,10 @@ Ground rules carried over from the design spec: correctness stays paranoid
 (limits documented as plainly as features), and the storage format carries a
 layout version so incompatibility is always detected, never guessed.
 
-Releases use the 0.1.x prerelease series (tags `v0.1.0`, `v0.1.1`, …); 1.0 is
-reserved for the storage-format freeze.
+Releases use the 0.x prerelease series (tags `v0.1.0` … `v0.2.0`); 1.0 is
+reserved for the storage-format freeze. 0.2.0 is the copy-on-write release —
+a minor (not patch) bump because it changes the storage format
+(LayoutVersion 1 → 2; see the copy-on-write milestone below).
 
 ---
 
@@ -264,6 +266,43 @@ what's left that no further engineering resolves.
   `DeleteObject` has no real preconditions); typed TS response shapes
   shipped ahead of any 1.0 SDK claim.
 
+## Copy-on-write storage — the storage-amplification arc
+
+*Bar: N forks of a G-byte database stop costing N×G in the bucket, without
+giving up bounded reads, GC safety, or destroy-anytime.*
+
+**Status: shipped**, as the [0.2.0] release (see
+[CHANGELOG.md](CHANGELOG.md) and the design spec,
+`docs/superpowers/specs/2026-08-07-offshoot-copy-on-write-design.md`).
+This closes the "storage amplification" risk the v1 design carried as its
+open wart (its own spec said "N materialized forks cost up to N×G").
+
+- ✅ **Storage amplification, killed for the fork workload.** A fork now
+  shares its parent's durable objects through a base pointer and writes
+  new objects only as it diverges — N forks of a G-byte database cost
+  near-zero added bytes (N×G → shared). Bounded reads survive via two
+  automatic snapshot floors; GC is rewritten as object-granular
+  reachability over the transitive base closure; `offshoot compact` is
+  the manual cord-cutter; the first shared fork bumps the store to
+  LayoutVersion 2 and locks pre-0.2.0 binaries out of the store
+  (deliberately — their lineage-granular GC would sweep shared objects).
+- ✅ **Honesty preserved:** `status`/`branches` report each branch's cost
+  class (`storage=shared` vs `storage=materialized`); the fork-shares vs
+  promote/rollback/compact-materialize asymmetry and the
+  destroy-lingers-until-last-child reclaim semantics are documented
+  rather than hidden.
+- ⏸ **Page-level / content-addressed cross-database dedupe — still
+  deferred, explicitly out of scope for this arc.** Copy-on-write shares
+  whole objects between a fork and its ancestors only; deduping unrelated
+  databases (or sub-object pages) remains the standing non-goal below,
+  to be revisited only on evidence that per-object fork sharing isn't
+  enough.
+- ⏸ **Promote/rollback (and compact) on sharing — deferred.** All three
+  still materialize a full copy, by design (they abandon or replace a
+  lineage; base-pointing into a lineage meant to die would pin it
+  forever). Rollback-to-a-*kept*-checkpoint onto base pointers is the
+  named follow-up in the design spec, not scoped here.
+
 ## Launch track (parallel to v0.1–v0.3)
 
 1. **Foundations** — org + transfer, names claimed, dead links fixed.
@@ -288,7 +327,10 @@ what's left that no further engineering resolves.
 - **Merge.** Forks are for pick-a-winner (`promote`), not three-way merge.
   The escape hatch is application-level reconciliation over two checkouts.
 - **Windows.** The capture path and lock probing are POSIX-dependent.
-- **Page-level dedupe / content-addressed storage.** Revisit only if the v0.2
-  benchmarks show TTLs + reflink + CopyObject aren't enough.
+- **Page-level dedupe / content-addressed storage.** Still a non-goal even
+  after 0.2.0's copy-on-write forks: that arc shares whole objects between
+  a fork and its own ancestors, never sub-object pages and never across
+  unrelated databases. Revisit only on evidence that per-object fork
+  sharing plus TTLs isn't enough.
 - **Row-level provenance.** Branch-level lineage plus checkpoint metadata is
   the right grain for the attempt workload.
