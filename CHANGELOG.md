@@ -40,6 +40,8 @@ version if you depend on format stability.
   thresholds (64 frames / 5s idle), and the two deliberately different
   SQLite busy timeouts (ops quiesce 3000ms, capture engine 5000ms). Values
   unchanged.
+- internal: split the checkout-fingerprint (.sum sidecar) subsystem out of
+  `internal/ops/ops.go` into `internal/ops/sidecar.go` (no behavior change).
 - Refreshed doc comments that still described pre-daemon/pre-CoW behavior
   (`Ref.Base`, `Ref.Epoch`, `EnsureLayoutV2`, the ops package doc, the
   capture `Sink` contract and `hashSrc` cost note).
