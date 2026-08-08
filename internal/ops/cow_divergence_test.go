@@ -116,6 +116,7 @@ func TestDeepForkChainStaysBounded(t *testing.T) {
 	// level where it happens, possibly below the deepest.
 	const bound = ops.ForkShareMaxDepth + snapshotEvery
 	maxSeen := 0
+	seamCrossed := false
 	for _, b := range branches {
 		ref, _, err := w.Store.GetRef("app", b)
 		if err != nil {
@@ -131,11 +132,26 @@ func TestDeepForkChainStaysBounded(t *testing.T) {
 		if len(chain) == 0 || !chain[0].Snapshot {
 			t.Errorf("%s: chain must start at a snapshot, got %+v", b, chain)
 		}
+		for _, m := range chain {
+			if !strings.HasPrefix(m.Key, store.LineagePrefix(ref.Lineage)) {
+				seamCrossed = true
+			}
+		}
 		if len(chain) > maxSeen {
 			maxSeen = len(chain)
 		}
 	}
 	t.Logf("deepest resolved chain across %d levels: %d members (bound %d)", levels+1, maxSeen, bound)
+	// Teeth check: the bound above only guards anything if the settling-flush
+	// suppression actually armed and levels appended SEGMENTS over the shared
+	// seam. If suppression silently broke, every level's first flush would be
+	// its own settle snapshot, every resolved chain would live wholly in its
+	// own lineage at 1-2 members, and the bound would hold vacuously. At
+	// least one level's head chain must therefore cross the seam — contain a
+	// member inherited from an ancestor lineage.
+	if !seamCrossed {
+		t.Fatal("suppression did not arm anywhere: no level's resolved chain contains an ancestor-lineage member — every level self-anchored on a settle snapshot, so the bound assertion is vacuous")
+	}
 
 	// Content correctness at the deepest level: a bounded-but-wrong chain
 	// (e.g. one that dropped an ancestor's segments to stay short) must fail
@@ -342,6 +358,17 @@ func TestSharedChildShortSessionsStayBounded(t *testing.T) {
 		}
 		if len(chain) > snapshotEvery {
 			t.Fatalf("round %d: resolved chain has %d members, bound is SnapshotEvery=%d — the divergence floor must hold across session restarts", round, len(chain), snapshotEvery)
+		}
+		// Teeth check: this test only guards anything if the settling-flush
+		// suppression actually armed, i.e. round 0's two flushes were
+		// SEGMENTS over the seam. If suppression silently broke, the first
+		// flush would write the child's OWN snapshot and the bound above
+		// would hold vacuously at 1-2 members forever. After round 0 (2
+		// flushes, seeded trailing run 0, both under the cadence) the
+		// covering snapshot must therefore still be the PARENT's — the child
+		// lineage must not have produced one yet.
+		if round == 0 && strings.HasPrefix(chain[0].Key, store.LineagePrefix(cref.Lineage)) {
+			t.Fatalf("suppression did not arm: round 0's covering snapshot %s is already in the child lineage — first flush was a settle snapshot, not a segment, so this test's bound is vacuous", chain[0].Key)
 		}
 	}
 

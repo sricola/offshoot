@@ -180,12 +180,47 @@ func (s *Session) flush(name string, meta map[string]string, auto bool) (txid ui
 	// briefly (flushMu → replicaMu is this package's documented lock order);
 	// a rebase racing in AFTER the peek can only turn this flush INTO a
 	// snapshot, wasting the probe's List, never the reverse.
+	//
+	// divergenceSeeded burns ONLY when the seed has actually been applied or
+	// is provably unnecessary — never on a skip whose premise a race can
+	// invalidate before the snapshot decision re-reads fresh state under
+	// replicaMu below:
+	//
+	//   - HeadTXID == 0: txid (assigned just below, from this same ref, under
+	//     flushMu) is 1, and txid == 1 alone forces the snapshot path — no
+	//     later state change can turn this flush into a segment. Snapshot
+	//     success resets the counter to 0, which IS the durable trailing run
+	//     after a head snapshot. Burn.
+	//   - forceSnapshot set at the peek: it stays set through this flush's
+	//     decision — the only clear sites are this flush's own post-success
+	//     bookkeeping (unreachable mid-flush; we hold flushMu) and
+	//     rebaseline's settling suppression, which is first-rebaseline-only
+	//     and so cannot fire after something already SET the flag; every
+	//     other rebaseline can only set it again. Snapshot guaranteed. Burn.
+	//   - pageSize == 0 at the peek: NOT stable — an Apply can land between
+	//     this peek and the decision's replicaMu section (replicaMu is not
+	//     held across the gap), making the decision see pageSize != 0 with
+	//     forceSnapshot false and pick SEGMENT over an unseeded counter,
+	//     transiently stretching the resolved chain to durable-trailing-k +
+	//     snapshotEvery-1. Do NOT burn: if this flush does snapshot after
+	//     all, the next flush re-seeds from a durable trailing run of 0
+	//     (harmless, one cheap List, once — not per-flush: that next flush
+	//     takes the seed branch and burns); if it raced into a segment, the
+	//     next flush seeds trailing k+1 and restores the bound in exactly
+	//     one flush.
 	if !s.divergenceSeeded {
-		s.divergenceSeeded = true
 		s.replicaMu.Lock()
-		suppressed := !s.forceSnapshot && s.pageSize != 0
+		forceSnap, pageSizeZero := s.forceSnapshot, s.pageSize == 0
 		s.replicaMu.Unlock()
-		if suppressed && ref.HeadTXID > 0 {
+		switch {
+		case ref.HeadTXID == 0 || forceSnap:
+			// This flush provably snapshots (see the case-by-case argument
+			// above); the seed is unnecessary.
+			s.divergenceSeeded = true
+		case pageSizeZero:
+			// Premise not race-stable — skip WITHOUT burning; see above.
+		default:
+			s.divergenceSeeded = true
 			if chain, cerr := st.Chain(ref.Lineage, ref.HeadTXID); cerr == nil {
 				trailing := 0
 				for i := len(chain) - 1; i >= 0 && !chain[i].Snapshot; i-- {
