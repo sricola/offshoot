@@ -439,15 +439,19 @@ Two steps in one command. First, **reap**: destroys every branch whose TTL
 has expired (same logic the daemon's janitor runs on a timer — see `serve
 -reap-every`); a failure reaping one branch (e.g. its checkout is busy) is
 reported to stderr but doesn't stop the rest of GC. Second, **collect**:
-two-phase garbage collection over storage lineages no longer referenced by
-any ref — first tombstoned (marked, timestamped), then actually deleted once
-a tombstone is older than `--grace` (default `1h`) *and* still unreferenced
-at sweep time (a lineage re-referenced during the grace window, e.g. by a
-fork racing GC, is left alone). `--grace 0` makes a lineage eligible for
-deletion on the very next `gc` run after being tombstoned, rather than
-disabling collection.
+two-phase garbage collection over storage *objects* no live branch can reach
+— reachability follows every branch's resolved chain at its head and at
+every checkpoint, transitively through copy-on-write base pointers, so a
+shared ancestor's objects stay live as long as any descendant's chain still
+reads through them, while a destroyed parent's above-fork objects are
+reclaimed. Unreachable objects are first tombstoned (marked, timestamped),
+then actually deleted once a tombstone is older than `--grace` (default
+`1h`) *and* still unreachable at sweep time (an object re-referenced during
+the grace window, e.g. by a fork racing GC, is left alone). `--grace 0`
+makes an object eligible for deletion on the very next `gc` run after being
+tombstoned, rather than disabling collection.
 
-Prints which branches were reaped, and how many lineages were tombstoned vs.
+Prints which branches were reaped, and how many objects were tombstoned vs.
 actually deleted.
 
 ## `offshoot status [-ro-cache-budget BYTES]`

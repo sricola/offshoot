@@ -50,9 +50,9 @@ build a dashboard against a name not in this table.
 | `offshoot_fork_duration_seconds` | histogram | — | Successful fork latency. |
 | `offshoot_checkpoint_duration_seconds` | histogram | — | **At-rest** checkpoint latency only — a process that calls `ops.Workspace.Checkpoint` directly (the CLI or `offshoot mcp`, no daemon session involved). A live session's named `flush` is *not* counted here; it's a flush, tallied under `offshoot_flush_duration_seconds` instead. This histogram reads all-zero on a daemon that only ever serves live sessions and never itself runs an at-rest checkpoint. |
 | `offshoot_reap_total` | counter | — | Branches reaped (TTL-expired, destroyed) by the janitor. |
-| `offshoot_gc_tombstoned_total` | counter | — | Lineages newly tombstoned by a GC pass. |
-| `offshoot_gc_deleted_total` | counter | — | Lineages actually deleted by GC, after their grace period. |
-| `offshoot_gc_backlog` | gauge | — | Tombstoned lineages currently sitting inside their grace period, awaiting deletion. A sustained climb here means GC isn't keeping up with tombstoning, not (by itself) a leak — check `-gc-grace` against your churn rate. |
+| `offshoot_gc_tombstoned_total` | counter | — | Objects newly tombstoned by a GC pass. |
+| `offshoot_gc_deleted_total` | counter | — | Objects actually deleted by GC, after their grace period. |
+| `offshoot_gc_backlog` | gauge | — | Tombstoned objects currently sitting inside their grace period, awaiting deletion. A sustained climb here means GC isn't keeping up with tombstoning, not (by itself) a leak — check `-gc-grace` against your churn rate. |
 | `offshoot_ro_cache_bytes` | gauge | — | Bytes currently used by `checkouts-ro` (the read-only checkpoint cache). Updated **once per janitor pass**, not continuously — see [Budgets](#budgets) below for what that staleness window means in practice. |
 | `offshoot_ro_cache_evictions_total` | counter | — | `checkouts-ro` entries evicted by the janitor's LRU pass under `-ro-cache-budget`. Zero forever on a daemon started with the default (unlimited) budget. |
 | `offshoot_janitor_runs_total` | counter | `result` (`ok`/`error`) | Janitor loop ticks, by whether the tick completed cleanly. Both values pre-registered at `0`; stays entirely at `0` if `-reap-every 0` disabled the janitor. |

@@ -702,6 +702,48 @@ func TestBaseKeyNotAChainMember(t *testing.T) {
 	}
 }
 
+// TestBaseSpine: the ancestor walk GC's mark uses to find every base.json
+// resolution would read. Nearest-first order, starting lineage excluded, an
+// un-based lineage returns an empty spine, and a (hand-constructed — the
+// writer can't produce one) cycle fails loudly instead of looping.
+func TestBaseSpine(t *testing.T) {
+	s := newStore(t)
+	// No base at all.
+	spine, err := s.BaseSpine("solo")
+	if err != nil || len(spine) != 0 {
+		t.Fatalf("BaseSpine(solo) = %v, %v; want empty, nil", spine, err)
+	}
+	// c -> b -> a, a un-based.
+	if err := s.WriteLineageBase("b", BasePointer{Lineage: "a", TXID: 2}); err != nil {
+		t.Fatal(err)
+	}
+	if err := s.WriteLineageBase("c", BasePointer{Lineage: "b", TXID: 5}); err != nil {
+		t.Fatal(err)
+	}
+	spine, err = s.BaseSpine("c")
+	if err != nil {
+		t.Fatalf("BaseSpine(c) err = %v", err)
+	}
+	if !reflect.DeepEqual(spine, []string{"b", "a"}) {
+		t.Fatalf("BaseSpine(c) = %v, want [b a]", spine)
+	}
+	spine, err = s.BaseSpine("b")
+	if err != nil || !reflect.DeepEqual(spine, []string{"a"}) {
+		t.Fatalf("BaseSpine(b) = %v, %v; want [a], nil", spine, err)
+	}
+	// Cycle x -> y -> x, constructed via raw backend puts (WriteLineageBase
+	// cannot build one): the walk must error, not loop.
+	for from, to := range map[string]string{"x": "y", "y": "x"} {
+		data, _ := json.Marshal(BasePointer{Lineage: to, TXID: 1})
+		if err := s.B.Put(BaseKey(from), data); err != nil {
+			t.Fatal(err)
+		}
+	}
+	if _, err := s.BaseSpine("x"); err == nil {
+		t.Fatal("BaseSpine over a cycle must error, not loop")
+	}
+}
+
 // (a) A shared child reading target > base.TXID gets the parent's
 // snapshot-anchored chain up to base.TXID, then the child's own segments in
 // (base.TXID, target], in apply order and contiguous.

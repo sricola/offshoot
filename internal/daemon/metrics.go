@@ -111,10 +111,10 @@ func newMetrics() *Metrics {
 				"ObserveCheckpoint doc comment.", metrics.DefaultDurationBuckets),
 
 		ReapTotal:         r.NewCounter("offshoot_reap_total", "Branches reaped by the janitor."),
-		GCTombstonedTotal: r.NewCounter("offshoot_gc_tombstoned_total", "Lineages newly tombstoned by GC."),
-		GCDeletedTotal:    r.NewCounter("offshoot_gc_deleted_total", "Lineages deleted by GC after their grace period."),
+		GCTombstonedTotal: r.NewCounter("offshoot_gc_tombstoned_total", "Objects newly tombstoned by GC."),
+		GCDeletedTotal:    r.NewCounter("offshoot_gc_deleted_total", "Objects deleted by GC after their grace period."),
 		GCBacklog: r.NewGauge("offshoot_gc_backlog",
-			"Tombstoned lineages currently awaiting GC's grace period before deletion."),
+			"Tombstoned objects currently awaiting GC's grace period before deletion."),
 
 		ROCacheBytes: r.NewGauge("offshoot_ro_cache_bytes",
 			"Bytes used by the read-only checkout cache (checkouts-ro). Updated once per janitor pass, not continuously; see docs/reference.md."),

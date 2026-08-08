@@ -6,7 +6,6 @@ import (
 	"fmt"
 	"os"
 	"sort"
-	"strings"
 	"time"
 
 	"github.com/sricola/offshoot/internal/store"
@@ -201,7 +200,7 @@ func (w *Workspace) loadTombstones() (map[string]string, string, error) {
 	return m, etag, nil
 }
 
-// TombstoneBacklog reports how many lineages are currently tombstoned and
+// TombstoneBacklog reports how many OBJECTS are currently tombstoned and
 // awaiting GC's grace period before deletion — offshoot_gc_backlog's data
 // source. A plain len() of loadTombstones' map: cheap (one store.Get), no
 // separate bookkeeping to keep in sync with GC's own phase-1/phase-2 logic.
@@ -228,47 +227,190 @@ func (w *Workspace) tombstone(m map[string]string) error {
 	return nil
 }
 
-// liveLineages returns every lineage referenced by any ref.
-func (w *Workspace) liveLineages() (map[string]bool, error) {
+// markCache is a read-through store.Backend wrapper memoizing List and Get
+// results for the duration of ONE reachability mark pass — the per-pass cache
+// the GC redesign requires for scale: store.Chain Lists a lineage's prefix
+// (and Gets its base.json) every time it resolves into that lineage, so
+// without memoization a shared ancestor would be Listed once per descendant
+// per txid instead of once per pass. Wrapping the backend (rather than
+// caching resolved member sets in GC itself) keeps the mark on the REAL
+// Chain/keepHighestEpoch code path — never a reimplementation.
+//
+// A Get's ErrNotFound is memoized too (lineageBase probes base.json and
+// treats absence as "no base"); any other error is NOT cached, so a
+// transient backend failure never sticks for the pass. Write methods
+// delegate untouched — the mark path never calls them. Not safe for
+// concurrent use; each mark pass builds its own.
+type markCache struct {
+	b     store.Backend
+	lists map[string][]string
+	gets  map[string]markCacheGet
+}
+
+type markCacheGet struct {
+	data     []byte
+	etag     string
+	notFound bool
+}
+
+func newMarkCache(b store.Backend) *markCache {
+	return &markCache{b: b, lists: map[string][]string{}, gets: map[string]markCacheGet{}}
+}
+
+func (c *markCache) Get(key string) ([]byte, string, error) {
+	if g, ok := c.gets[key]; ok {
+		if g.notFound {
+			return nil, "", store.ErrNotFound
+		}
+		return g.data, g.etag, nil
+	}
+	data, etag, err := c.b.Get(key)
+	if errors.Is(err, store.ErrNotFound) {
+		c.gets[key] = markCacheGet{notFound: true}
+		return nil, "", err
+	}
+	if err != nil {
+		return nil, "", err
+	}
+	c.gets[key] = markCacheGet{data: data, etag: etag}
+	return data, etag, nil
+}
+
+func (c *markCache) List(prefix string) ([]string, error) {
+	if keys, ok := c.lists[prefix]; ok {
+		return keys, nil
+	}
+	keys, err := c.b.List(prefix)
+	if err != nil {
+		return nil, err
+	}
+	c.lists[prefix] = keys
+	return keys, nil
+}
+
+func (c *markCache) Put(key string, data []byte) error { return c.b.Put(key, data) }
+func (c *markCache) PutIf(key string, data []byte, ifMatch string) (string, error) {
+	return c.b.PutIf(key, data, ifMatch)
+}
+func (c *markCache) Delete(key string) error          { return c.b.Delete(key) }
+func (c *markCache) CopyObject(dst, src string) error { return c.b.CopyObject(dst, src) }
+
+// reachableObjects computes GC's live object set: the union, over every live
+// ref, of
+//
+//   - the ref's resolved chain members at its HEAD and at EVERY checkpoint
+//     (store.Chain, the real base-following resolver — target <= Base.TXID
+//     resolves transitively into ancestor lineages, so an ancestor kept
+//     alive only by a descendant's base pointer is marked here), and
+//   - the base.json object of every lineage in the ref's base SPINE
+//     ({r.Lineage} ∪ BaseSpine(r.Lineage)) that actually exists.
+//
+// The checkpoint union is essential, not optional: marking only the head
+// chain would sweep the older snapshot an old checkpoint anchors on and
+// break Fork(at=cp)/Rollback(to=cp). And base.json marking must follow the
+// SPINE, not the member-contributing lineages: a pass-through lineage
+// (forked but never diverged) contributes zero members yet its base.json IS
+// read during resolution — sweeping it would break every descendant.
+// BaseSpine's walk already learns exactly which spine lineages have a
+// base.json (see its invariant note), so existence needs no extra probes:
+// spine[i]'s base.json exists iff the walk continued past it.
+//
+// Errors fail the whole mark (and with it the GC pass) rather than being
+// skipped: an incomplete mark under-approximates reachability, and sweeping
+// against an under-approximation deletes live data. A ref that disappears
+// between ListRefs and GetRef (a completed Destroy) is the one benign case
+// and is skipped.
+//
+// Everything Chain/BaseSpine reads goes through one markCache (see its doc
+// comment), so a shared ancestor's prefix is Listed once per pass no matter
+// how many descendants resolve into it; Chain results are additionally
+// memoized per (lineage, txid) so shared fork points re-walk nothing.
+func (w *Workspace) reachableObjects() (map[string]bool, error) {
+	ms := &store.Store{B: newMarkCache(w.Store.B)}
 	refs, err := w.Store.ListRefs()
 	if err != nil {
 		return nil, err
 	}
-	live := map[string]bool{}
-	for db, branches := range refs {
-		for _, br := range branches {
-			r, _, err := w.Store.GetRef(db, br)
+	reachable := map[string]bool{}
+	spines := map[string][]string{}
+	chainsDone := map[string]bool{} // "lineage@txid" -> already marked
+	dbs := make([]string, 0, len(refs))
+	for db := range refs {
+		dbs = append(dbs, db)
+	}
+	sort.Strings(dbs)
+	for _, db := range dbs {
+		for _, branch := range refs[db] {
+			r, _, err := w.Store.GetRef(db, branch)
 			if err != nil {
-				return nil, err
+				if errors.Is(err, store.ErrNotFound) {
+					continue // destroyed since ListRefs
+				}
+				return nil, fmt.Errorf("ops: gc mark %s@%s: %w", db, branch, err)
 			}
-			live[r.Lineage] = true
+			spine, ok := spines[r.Lineage]
+			if !ok {
+				spine, err = ms.BaseSpine(r.Lineage)
+				if err != nil {
+					return nil, fmt.Errorf("ops: gc mark %s@%s: %w", db, branch, err)
+				}
+				spines[r.Lineage] = spine
+			}
+			// Mark the base.json objects that exist along the spine: the
+			// ref's own iff it has a base at all (spine non-empty), and each
+			// ancestor's iff the walk continued past it.
+			if len(spine) > 0 {
+				reachable[store.BaseKey(r.Lineage)] = true
+			}
+			for i := 0; i+1 < len(spine); i++ {
+				reachable[store.BaseKey(spine[i])] = true
+			}
+			txids := map[uint64]bool{r.HeadTXID: true}
+			for _, cp := range r.Checkpoints {
+				txids[cp.TXID] = true
+			}
+			for t := range txids {
+				ck := fmt.Sprintf("%s@%d", r.Lineage, t)
+				if chainsDone[ck] {
+					continue
+				}
+				chainsDone[ck] = true
+				members, err := ms.Chain(r.Lineage, t)
+				if err != nil {
+					return nil, fmt.Errorf("ops: gc mark %s@%s at txid %d: %w", db, branch, t, err)
+				}
+				for _, m := range members {
+					reachable[m.Key] = true
+				}
+			}
 		}
 	}
-	return live, nil
+	return reachable, nil
 }
 
-// allLineages lists every lineage present under data/.
-func (w *Workspace) allLineages() (map[string]bool, error) {
-	keys, err := w.Store.B.List("data/")
-	if err != nil {
-		return nil, err
-	}
-	all := map[string]bool{}
-	for _, k := range keys {
-		parts := strings.Split(k, "/")
-		if len(parts) >= 2 {
-			all[parts[1]] = true
-		}
-	}
-	return all, nil
-}
-
+// GC is the object-granular reachability collector: phase 1 tombstones every
+// object under data/ that no live ref can reach (see reachableObjects — the
+// transitive base closure of every ref's head and checkpoints), phase 2
+// sweeps tombstoned objects whose grace has passed and that are STILL
+// unreachable under a fresh re-mark. It returns how many OBJECTS (not
+// lineages — reachability is finer than a lineage: a destroyed parent's
+// below-fork objects stay live through a descendant's base pointer while its
+// above-fork range is reclaimed) were newly tombstoned and deleted.
+//
+// grace must exceed the maximum plausible fork duration: an in-flight fork
+// reads its source's chain before its own ref lands, and the tombstone→grace
+// →re-mark→delete two-phase (plus the mint-this-run skip below) is what
+// keeps that window safe.
 func (w *Workspace) GC(grace time.Duration) (tombstoned, deleted int, err error) {
-	live, err := w.liveLineages()
+	reachable, err := w.reachableObjects()
 	if err != nil {
 		return 0, 0, err
 	}
-	all, err := w.allLineages()
+	// List AFTER marking: an object that lands in the gap (a fork's base.json,
+	// a flush's segment) may be listed as unreachable and tombstoned, but the
+	// mint-this-run skip plus phase 2's re-mark on a later run rescue it —
+	// the reverse order could miss marking an object it then never re-lists.
+	all, err := w.Store.B.List("data/")
 	if err != nil {
 		return 0, 0, err
 	}
@@ -277,14 +419,15 @@ func (w *Workspace) GC(grace time.Duration) (tombstoned, deleted int, err error)
 		return 0, 0, err
 	}
 
-	// Phase 1: tombstone unreachable lineages not already marked.
+	// Phase 1: tombstone unreachable objects not already marked.
 	newStones := map[string]string{}
-	for lineage := range all {
-		if !live[lineage] {
-			if _, marked := stones[lineage]; !marked {
-				newStones[lineage] = time.Now().UTC().Format(time.RFC3339Nano)
-				tombstoned++
-			}
+	for _, key := range all {
+		if reachable[key] {
+			continue
+		}
+		if _, marked := stones[key]; !marked {
+			newStones[key] = time.Now().UTC().Format(time.RFC3339Nano)
+			tombstoned++
 		}
 	}
 	if len(newStones) > 0 {
@@ -299,50 +442,63 @@ func (w *Workspace) GC(grace time.Duration) (tombstoned, deleted int, err error)
 	}
 
 	// Phase 2: sweep stones older than grace that are STILL unreachable
-	// (re-list refs after the grace check — a fork could have re-referenced).
+	// under a re-mark (recomputed lazily, once, when the first grace-eligible
+	// stone is found — a fork or flush could have re-referenced an object
+	// since phase 1's mark, and since a previous run's). The re-list of
+	// data/ alongside it prunes stones whose object is already gone —
+	// including any lineage-keyed stone left by the pre-object-granular
+	// format, which names no real object key and so re-lists to nothing.
 	cutoff := time.Now().Add(-grace)
-	for lineage, markedAt := range stones {
-		if _, mintedThisRun := newStones[lineage]; mintedThisRun {
+	var reMark, existing map[string]bool
+	for key, markedAt := range stones {
+		if _, mintedThisRun := newStones[key]; mintedThisRun {
 			// A stone minted in phase 1 above is timestamped `time.Now()`,
 			// which trivially satisfies a grace=0 cutoff computed moments
 			// later in this same call. Without this skip, one gc(0) call
-			// could tombstone AND sweep a lineage in a single run — e.g. one
-			// a fork is mid-flight copying a snapshot out of, in the narrow
-			// window between the fork's read and its own ref landing. Sweeps
-			// must always wait for a later, independent GC run.
+			// could tombstone AND sweep a newly unreachable object in a
+			// single run — e.g. one a fork is mid-flight reading, in the
+			// narrow window between the fork's read and its own ref landing.
+			// Sweeps must always wait for a later, independent GC run.
 			continue
 		}
 		ts, perr := time.Parse(time.RFC3339Nano, markedAt)
 		if perr != nil || !ts.Before(cutoff) {
 			continue
 		}
-		liveNow, err := w.liveLineages()
-		if err != nil {
-			return tombstoned, deleted, err
-		}
-		if liveNow[lineage] {
-			continue // re-referenced during grace; keep the stone for review
-		}
-		keys, err := w.Store.B.List(store.LineagePrefix(lineage))
-		if err != nil {
-			return tombstoned, deleted, err
-		}
-		for _, k := range keys {
-			if err := w.Store.B.Delete(k); err != nil {
+		if reMark == nil {
+			if reMark, err = w.reachableObjects(); err != nil {
 				return tombstoned, deleted, err
 			}
+			relisted, lerr := w.Store.B.List("data/")
+			if lerr != nil {
+				return tombstoned, deleted, lerr
+			}
+			existing = make(map[string]bool, len(relisted))
+			for _, k := range relisted {
+				existing[k] = true
+			}
+		}
+		if reMark[key] {
+			continue // re-referenced during grace; keep the stone for review
+		}
+		if !existing[key] {
+			delete(stones, key) // already gone (or a legacy lineage-keyed stone): prune
+			continue
+		}
+		if err := w.Store.B.Delete(key); err != nil {
+			return tombstoned, deleted, err
 		}
 		deleted++
-		delete(stones, lineage)
+		delete(stones, key)
 	}
 	// Persist the pruned stone list. This is an unconditional Put, not a
 	// CAS: it can clobber phase-1 additions from a concurrent GC run that
 	// landed after we loaded `stones` above. That's safe in only one
-	// direction — the clobbered lineage isn't lost, it just isn't tombstoned
-	// yet; the next GC run's phase 1 re-derives it from liveLineages/
-	// allLineages and re-marks it with a fresh timestamp, at worst delaying
-	// its eventual sweep by one grace period. It can never cause a live or
-	// still-within-grace lineage to be deleted early.
+	// direction — the clobbered object isn't lost, it just isn't tombstoned
+	// yet; the next GC run's phase 1 re-derives it from reachableObjects and
+	// the data/ listing and re-marks it with a fresh timestamp, at worst
+	// delaying its eventual sweep by one grace period. It can never cause a
+	// live or still-within-grace object to be deleted early.
 	data, _ := json.Marshal(stones)
 	if err := w.Store.B.Put(tombstoneKey, data); err != nil {
 		return tombstoned, deleted, err
