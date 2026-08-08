@@ -13,6 +13,8 @@ version if you depend on format stability.
 
 ## [Unreleased]
 
+## [0.2.1] - 2026-08-08
+
 ### Added
 
 - **`offshoot_fork_mode_total{mode="shared"|"materialized"}`** — a
