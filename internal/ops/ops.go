@@ -869,6 +869,15 @@ var forkFastPathHits atomic.Int64
 // unlike forkFastPathHits (test-only, package-internal, never reset), this
 // hook is the real production signal.
 //
+// shared reports the fork's STORAGE MODE — the copy-on-write feature's
+// headline number: true for a shared fork (a base pointer into the parent's
+// chain, zero data objects copied), false for a materialized one (a full
+// copy in the child's own lineage — the fork-time snapshot floor, or the
+// test hooks that force it). fast is orthogonal and only meaningful when
+// shared is false: it names the materialize path's copy strategy (a shared
+// fork copies nothing, so it always reports fast=false). The daemon feeds
+// shared into offshoot_fork_mode_total{mode="shared"|"materialized"}.
+//
 // Injection shape: a package-level, nil-checked func var — the same pattern
 // this file already uses for its own test hooks (forkSlowPathForTest,
 // FlushEncodeHook/FlushUploadHook over in flush.go) — rather than an
@@ -882,7 +891,7 @@ var forkFastPathHits atomic.Int64
 // daemon assigns both hooks once, at server construction, closing over its
 // own *metrics.Registry-backed counters/histograms so ops never needs to
 // know metrics exists.
-var ObserveFork func(dur time.Duration, fast bool)
+var ObserveFork func(dur time.Duration, fast, shared bool)
 
 // ObserveCheckpoint, when non-nil, is invoked by Checkpoint immediately
 // before it returns successfully (never on error, matching ObserveFork's
@@ -1117,9 +1126,10 @@ func (w *Workspace) Fork(db, srcBranch, newBranch, at string, ttl time.Duration,
 	if ObserveFork != nil {
 		// A shared fork reports fast=false: the fast/slow split was defined
 		// for the materialize path's copy strategy, and a shared fork copies
-		// nothing. A dedicated "shared" path label for the fork metrics is a
-		// follow-up, not smuggled into this bool.
-		ObserveFork(time.Since(start), fast)
+		// nothing. Its storage mode travels in the dedicated shared bool
+		// instead (base != nil is exactly the SHARE branch above) — see
+		// ObserveFork's doc comment.
+		ObserveFork(time.Since(start), fast, base != nil)
 	}
 	return txid, nil
 }

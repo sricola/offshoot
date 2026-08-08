@@ -13,6 +13,7 @@ import (
 	"strings"
 	"sync"
 	"testing"
+	"time"
 
 	_ "github.com/mattn/go-sqlite3"
 	"github.com/sricola/offshoot/internal/store"
@@ -305,6 +306,48 @@ func TestCheckpointFailsCleanlyUnderLiveWriter(t *testing.T) {
 		t.Fatal("checkpoint under live write txn must fail")
 	}
 	tx.Rollback()
+}
+
+// TestObserveForkReportsStorageMode pins ObserveFork's shared bool to the
+// fork's actual storage mode: true for the default (SHARE) path — a base
+// pointer, zero data objects copied — and false for the materialize path
+// (forced here via the fork-time-floor test hook). This bool is the
+// daemon's source for offshoot_fork_mode_total{mode} — see ObserveFork's
+// doc comment.
+func TestObserveForkReportsStorageMode(t *testing.T) {
+	if _, err := exec.LookPath("sqlite3"); err != nil {
+		t.Skip("sqlite3 CLI not on PATH")
+	}
+	var sharedSeen []bool
+	prev := ObserveFork
+	ObserveFork = func(_ time.Duration, _, shared bool) { sharedSeen = append(sharedSeen, shared) }
+	t.Cleanup(func() { ObserveFork = prev })
+
+	w := newWS(t)
+	if err := w.Create("app"); err != nil {
+		t.Fatal(err)
+	}
+	path, _ := w.Checkout("app", "main")
+	exec.Command("sqlite3", path, "CREATE TABLE t (v); INSERT INTO t VALUES (1);").Run()
+	if _, err := w.Checkpoint("app", "main", "v1", nil); err != nil {
+		t.Fatal(err)
+	}
+
+	// Default fork: shares (the chain at the fork point is far under
+	// ForkShareMaxDepth), so the hook must report shared=true.
+	if _, err := w.Fork("app", "main", "shared-child", "", 0, nil); err != nil {
+		t.Fatal(err)
+	}
+	// Forced materialize (the fork-time snapshot floor's branch): shared=false.
+	SetForkMaterializeForTest(true)
+	t.Cleanup(func() { SetForkMaterializeForTest(false) })
+	if _, err := w.Fork("app", "main", "materialized-child", "", 0, nil); err != nil {
+		t.Fatal(err)
+	}
+
+	if want := []bool{true, false}; !reflect.DeepEqual(sharedSeen, want) {
+		t.Fatalf("ObserveFork shared bools = %v, want %v (shared fork then materialized fork)", sharedSeen, want)
+	}
 }
 
 // TestForkIsIndependentOfParent covers the MATERIALIZED fork path
