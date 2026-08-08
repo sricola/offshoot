@@ -749,10 +749,17 @@ func (w *Workspace) Checkpoint(db, branch, name string, meta map[string]string) 
 // warnIfUncheckpointed) sees byte-identical output.
 var errQuiesceBusy = errors.New("ops: database is busy (live writer or reader); close connections and retry")
 
+// quiesceBusyTimeoutMS is the SQLite busy timeout (milliseconds) quiesce
+// opens with. Deliberately DIFFERENT from the capture engine's 5000ms
+// (internal/capture/engine.go's captureBusyTimeoutMS): quiesce fails
+// cleanly on a busy database (errQuiesceBusy) and its callers treat that as
+// an answer, so it gives up sooner rather than stalling the caller.
+const quiesceBusyTimeoutMS = 3000
+
 // quiesce checkpoints the WAL fully, failing cleanly on a busy database (see
 // errQuiesceBusy).
 func quiesce(path string) error {
-	conn, err := sql.Open("sqlite3", path+"?_busy_timeout=3000")
+	conn, err := sql.Open("sqlite3", fmt.Sprintf("%s?_busy_timeout=%d", path, quiesceBusyTimeoutMS))
 	if err != nil {
 		return err
 	}

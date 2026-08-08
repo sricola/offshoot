@@ -3,6 +3,7 @@ package main
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"math"
 	"os"
@@ -744,7 +745,7 @@ func run(args []string) error {
 		return nil
 	case "lease":
 		if len(rest) == 0 {
-			return fmt.Errorf("usage: offshoot lease list|acquire|release ...")
+			return fmt.Errorf("usage: offshoot lease list|acquire|release [args]")
 		}
 		switch rest[0] {
 		case "list":
@@ -910,7 +911,7 @@ func run(args []string) error {
 		}
 		allowNonLoopback, rest := extractBoolFlag(rest, "-http-allow-non-loopback")
 		if len(rest) != 0 {
-			return fmt.Errorf(serveUsage)
+			return errors.New(serveUsage)
 		}
 		// -token/-http-allow-non-loopback only mean anything alongside
 		// -http; given without it, they'd otherwise be silently ignored —

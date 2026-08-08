@@ -440,6 +440,13 @@ func (e *Engine) DrainNow(ctx context.Context) error {
 	}
 }
 
+// captureBusyTimeoutMS is the SQLite busy timeout (milliseconds) the
+// engine's own connection opens with. Deliberately DIFFERENT from ops'
+// quiesce (internal/ops/ops.go's quiesceBusyTimeoutMS, 3000ms): the engine
+// rides out contention rather than reporting it, so it waits longer before
+// surfacing SQLITE_BUSY.
+const captureBusyTimeoutMS = 5000
+
 // Run blocks, capturing until ctx is cancelled. It performs the initial
 // rebase (checkpoint + snapshot copy), holds the read-lock dance, polls for
 // committed transactions, and periodically performs checkpoint takeover.
@@ -476,7 +483,7 @@ func (e *Engine) Run(ctx context.Context) error {
 	// for the POSIX (process, inode) lock semantics that make an engine-owned
 	// descriptor unsafe no matter how carefully its close is ordered.
 	e.db, err = sql.Open("sqlite3",
-		e.o.DBPath+"?_busy_timeout=5000&_journal_mode=WAL")
+		fmt.Sprintf("%s?_busy_timeout=%d&_journal_mode=WAL", e.o.DBPath, captureBusyTimeoutMS))
 	if err != nil {
 		return err
 	}
@@ -753,6 +760,17 @@ func (e *Engine) pollOnceTo(ctx context.Context, idle *time.Time, target int64, 
 	}
 }
 
+// takeoverFrameThreshold and takeoverIdleAfter decide checkpoint-takeover
+// cadence (afterDrain): a takeover fires once takeoverFrameThreshold frames
+// have accumulated since the last one, or once any captured frames have sat
+// idle — no new commits — for takeoverIdleAfter. The frame threshold bounds
+// WAL growth under sustained writes; the idle timer bounds how long a
+// trickle of writes can defer the checkpoint indefinitely.
+const (
+	takeoverFrameThreshold = 64
+	takeoverIdleAfter      = 5 * time.Second
+)
+
 // afterDrain runs the bookkeeping shared by pollOnce and pollOnceTo once a
 // drain phase has completed without error: update the idle timestamp and
 // cumulative captured count, and perform checkpoint takeover once enough has
@@ -762,7 +780,7 @@ func (e *Engine) afterDrain(ctx context.Context, idle *time.Time, n int) error {
 		*idle = time.Now()
 		e.captured += n
 	}
-	if e.captured >= 64 || (e.captured > 0 && time.Since(*idle) > 5*time.Second) {
+	if e.captured >= takeoverFrameThreshold || (e.captured > 0 && time.Since(*idle) > takeoverIdleAfter) {
 		if err := e.takeover(ctx); err != nil {
 			if ctx.Err() != nil {
 				// Shutting down: let Run's ctx.Done() branch perform the
