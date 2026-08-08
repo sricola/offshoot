@@ -13,7 +13,21 @@ version if you depend on format stability.
 
 ## [Unreleased]
 
+### Added
+
+- `make lint`: gofmt -l (fails on any unformatted file) + `go vet` +
+  best-effort staticcheck. ci.yml and ci-local run the same gofmt/vet gate
+  on every PR, so an unformatted file can no longer ship silently.
+
 ### Changed
+
+- **A CI image that loses sqlite3/sqldiff/promtool now fails loudly instead
+  of silently skipping the integration suite green.** The ~96 copy-pasted
+  `exec.LookPath` skip guards across the test suite collapsed into a shared
+  `internal/testutil` helper (`RequireSQLite3`/`RequireSQLdiff`/
+  `RequirePromtool`): locally a missing binary still skips the test, but
+  under CI (`CI` non-empty; `OFFSHOOT_REQUIRE_PROMTOOL` for promtool's
+  dedicated metrics-lint job) it is a hard failure. Test/CI-only change.
 
 - **Best-effort orphan cleanup is now loud.** The seven orphan-cleanup
   deletes in ops (lost ref-CAS paths in create, checkpoint, fork, rollback,

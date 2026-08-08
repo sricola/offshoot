@@ -50,9 +50,24 @@ jobs:
       - name: Verify sqlite3 CLI is present
         run: sqlite3 --version && sqldiff --help >/dev/null
 
+      - name: gofmt
+        # Fails when gofmt would rewrite any file (offenders are printed);
+        # keeps an unformatted file — test or not — from shipping silently
+        # (make lint runs the same check locally).
+        run: |
+          out="$(gofmt -l .)"
+          if [ -n "$out" ]; then
+            echo "unformatted files:" >&2
+            echo "$out" >&2
+            exit 1
+          fi
+
       - name: go vet
         run: go vet ./...
 
+      # GitHub Actions sets CI=true, which arms testutil.RequireExec: if the
+      # sqlite3/sqldiff installs above ever break, the affected tests hard-fail
+      # here instead of silently skipping the integration suite green.
       - name: go test
         run: go test ./... -count=1 -race
 
@@ -97,6 +112,13 @@ jobs:
           promtool --version
 
       - name: promtool check metrics
+        # OFFSHOOT_REQUIRE_PROMTOOL arms testutil.RequirePromtool's hard-fail
+        # path: if the pinned install above ever breaks or is removed, these
+        # tests fail instead of skipping and letting the gate go green. (Bare
+        # CI=true can't be the trigger for promtool: the main `test` job runs
+        # `go test ./...` without promtool by design, skipping these loudly.)
+        env:
+          OFFSHOOT_REQUIRE_PROMTOOL: "1"
         run: go test ./internal/metrics ./internal/daemon -run TestPromtoolCheck -v -count=1
 
   sdks:
