@@ -733,7 +733,6 @@ var ObserveCheckpoint func(dur time.Duration)
 // single-request CopyObject limit, so the sentinel still fires for anything
 // larger — see store.S3.CopyObject's doc comment.
 func (w *Workspace) copySnapshotToNewLineage(src store.Ref, cp store.Checkpoint) (string, bool, error) {
-	lineage := store.NewLineageID()
 	// Resolved once, up front, and threaded through both the fast-path
 	// attempt and the slow-path fallback — see materializeMembersAt's doc
 	// comment for why sharing this one store.Chain call (rather than each
@@ -742,6 +741,18 @@ func (w *Workspace) copySnapshotToNewLineage(src store.Ref, cp store.Checkpoint)
 	if err != nil {
 		return "", false, fmt.Errorf("ops: resolving chain for lineage %s to txid %d: %w", src.Lineage, cp.TXID, err)
 	}
+	return w.copySnapshotToNewLineageFromChain(src, cp, members)
+}
+
+// copySnapshotToNewLineageFromChain is copySnapshotToNewLineage's guts,
+// taking src's already-resolved chain at cp instead of re-resolving it.
+// Fork's snapshot-floor branch calls this directly with the baseMembers it
+// already resolved for the floor decision (the floor trips exactly when the
+// chain is long, i.e. when re-resolving is most expensive — perf audit M1);
+// Rollback and Promote, which hold no prior resolution, go through the
+// wrapper above.
+func (w *Workspace) copySnapshotToNewLineageFromChain(src store.Ref, cp store.Checkpoint, members []store.ChainMember) (string, bool, error) {
+	lineage := store.NewLineageID()
 	if !forkSlowPathForTest {
 		ok, err := w.tryFastForkCopy(members, cp, lineage)
 		if err != nil {
@@ -869,11 +880,11 @@ func (w *Workspace) Fork(db, srcBranch, newBranch, at string, ttl time.Duration,
 		// members while the fast copy needs a single-member chain; Rollback
 		// and Promote remain its everyday callers).
 		//
-		// copySnapshotToNewLineage re-resolves the chain it needs; the extra
-		// Chain call over baseMembers above is accepted here because the
-		// floor is the rare branch and threading members through would touch
-		// its other callers (Rollback, Promote) for no behavioral gain.
-		childLineage, fast, err = w.copySnapshotToNewLineage(src, cp)
+		// baseMembers, resolved above for the floor decision, is passed
+		// straight through — re-resolving the identical (lineage, txid) here
+		// would repeat the whole chain walk's Lists/Gets, and the floor trips
+		// exactly when that chain is long (perf audit M1).
+		childLineage, fast, err = w.copySnapshotToNewLineageFromChain(src, cp, baseMembers)
 		if err != nil {
 			return 0, err
 		}
