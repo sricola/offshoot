@@ -333,12 +333,31 @@ func (c *markCache) CopyObject(dst, src string) error { return c.b.CopyObject(ds
 // how many descendants resolve into it; Chain results are additionally
 // memoized per (lineage, txid) so shared fork points re-walk nothing.
 func (w *Workspace) reachableObjects() (map[string]bool, error) {
+	reachable, _, err := w.reachableObjectsAndHeads()
+	return reachable, err
+}
+
+// reachableObjectsAndHeads is reachableObjects' full form: alongside the
+// reachable set it returns, for every lineage some live ref names as its OWN
+// (head) lineage, the smallest HeadTXID among the refs naming it — the input
+// to GC's compensating rule (see the phase-2 sweep): an object ABOVE a live
+// ref's head in that ref's own lineage may be an orphan a session flush is
+// entitled to re-create at the same key (session/flush.go's ambiguous-
+// ref-write retry overwrites the SAME (lineage, epoch, txid) key), so the
+// sweep must never delete there. Smallest head because that is the txid a
+// retrying writer would build up from. Deriving heads from the SAME
+// ListRefs+GetRef fetch as the mark (rather than a separate re-enumeration,
+// as a standalone liveHeadLineages helper once did) both saves 1 ListRefs +
+// R GetRef RPCs per sweeping pass and guarantees the compensating rule sees
+// exactly the refs the re-mark saw — one consistency window, not two.
+func (w *Workspace) reachableObjectsAndHeads() (map[string]bool, map[string]uint64, error) {
 	ms := &store.Store{B: newMarkCache(w.Store.B)}
 	refs, err := w.Store.ListRefs()
 	if err != nil {
-		return nil, err
+		return nil, nil, err
 	}
 	reachable := map[string]bool{}
+	heads := map[string]uint64{}
 	spines := map[string][]string{}
 	chainsDone := map[string]bool{} // "lineage@txid" -> already marked
 	dbs := make([]string, 0, len(refs))
@@ -353,13 +372,16 @@ func (w *Workspace) reachableObjects() (map[string]bool, error) {
 				if errors.Is(err, store.ErrNotFound) {
 					continue // destroyed since ListRefs
 				}
-				return nil, fmt.Errorf("ops: gc mark %s@%s: %w", db, branch, err)
+				return nil, nil, fmt.Errorf("ops: gc mark %s@%s: %w", db, branch, err)
+			}
+			if h, ok := heads[r.Lineage]; !ok || r.HeadTXID < h {
+				heads[r.Lineage] = r.HeadTXID
 			}
 			spine, ok := spines[r.Lineage]
 			if !ok {
 				spine, err = ms.BaseSpine(r.Lineage)
 				if err != nil {
-					return nil, fmt.Errorf("ops: gc mark %s@%s: %w", db, branch, err)
+					return nil, nil, fmt.Errorf("ops: gc mark %s@%s: %w", db, branch, err)
 				}
 				spines[r.Lineage] = spine
 			}
@@ -384,7 +406,7 @@ func (w *Workspace) reachableObjects() (map[string]bool, error) {
 				chainsDone[ck] = true
 				members, err := ms.Chain(r.Lineage, t)
 				if err != nil {
-					return nil, fmt.Errorf("ops: gc mark %s@%s at txid %d: %w", db, branch, t, err)
+					return nil, nil, fmt.Errorf("ops: gc mark %s@%s at txid %d: %w", db, branch, t, err)
 				}
 				for _, m := range members {
 					reachable[m.Key] = true
@@ -392,39 +414,7 @@ func (w *Workspace) reachableObjects() (map[string]bool, error) {
 			}
 		}
 	}
-	return reachable, nil
-}
-
-// liveHeadLineages returns, for every lineage some live ref names as its OWN
-// (head) lineage, the smallest HeadTXID among the refs naming it — the input
-// to GC's compensating rule (see the phase-2 sweep): an object ABOVE a live
-// ref's head in that ref's own lineage may be an orphan a session flush is
-// entitled to re-create at the same key (session/flush.go's ambiguous-
-// ref-write retry overwrites the SAME (lineage, epoch, txid) key), so the
-// sweep must never delete there. Smallest head because that is the txid a
-// retrying writer would build up from. A ref gone between ListRefs and
-// GetRef (a completed Destroy) is skipped, matching reachableObjects.
-func (w *Workspace) liveHeadLineages() (map[string]uint64, error) {
-	refs, err := w.Store.ListRefs()
-	if err != nil {
-		return nil, err
-	}
-	heads := map[string]uint64{}
-	for db, branches := range refs {
-		for _, br := range branches {
-			r, _, err := w.Store.GetRef(db, br)
-			if err != nil {
-				if errors.Is(err, store.ErrNotFound) {
-					continue
-				}
-				return nil, fmt.Errorf("ops: gc live heads %s@%s: %w", db, br, err)
-			}
-			if h, ok := heads[r.Lineage]; !ok || r.HeadTXID < h {
-				heads[r.Lineage] = r.HeadTXID
-			}
-		}
-	}
-	return heads, nil
+	return reachable, heads, nil
 }
 
 // lineageOfDataKey extracts the lineage component of a data/{lineage}/...
@@ -520,7 +510,11 @@ func (w *Workspace) GC(grace time.Duration) (tombstoned, deleted int, err error)
 			continue
 		}
 		if reMark == nil {
-			if reMark, err = w.reachableObjects(); err != nil {
+			// The re-mark's own ref fetch doubles as the compensating rule's
+			// live-head input (see reachableObjectsAndHeads): one ListRefs +
+			// R GetRefs instead of two, and liveHeads reflects exactly the
+			// refs this re-mark resolved — one consistency window.
+			if reMark, liveHeads, err = w.reachableObjectsAndHeads(); err != nil {
 				return tombstoned, deleted, err
 			}
 			relisted, lerr := w.Store.B.List("data/")
@@ -530,9 +524,6 @@ func (w *Workspace) GC(grace time.Duration) (tombstoned, deleted int, err error)
 			existing = make(map[string]bool, len(relisted))
 			for _, k := range relisted {
 				existing[k] = true
-			}
-			if liveHeads, err = w.liveHeadLineages(); err != nil {
-				return tombstoned, deleted, err
 			}
 		}
 		if reMark[key] {

@@ -37,6 +37,13 @@ version if you depend on format stability.
   long chain. Rollback and Promote are unchanged; fork results are
   byte-identical.
 
+- **A sweeping GC pass no longer re-enumerates refs a third time** (perf
+  audit M4). The compensating rule's live-head set is derived from the same
+  ListRefs + GetRefs the phase-2 re-mark already performed, saving
+  1 ListRefs + one GetRef per ref per sweeping pass — and guaranteeing the
+  "never delete above a live head" rule sees exactly the refs the re-mark
+  saw (one consistency window). GC results are identical.
+
 - **A CI image that loses sqlite3/sqldiff/promtool now fails loudly instead
   of silently skipping the integration suite green.** The ~96 copy-pasted
   `exec.LookPath` skip guards across the test suite collapsed into a shared
