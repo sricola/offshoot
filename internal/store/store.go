@@ -560,7 +560,17 @@ func (s *Store) chainFrom(lineage string, target uint64, seen map[string]bool) (
 	// other chainSelf error (a backend List failure, a hole past the child's
 	// own snapshot) propagates unchanged: swallowing it into the seam path
 	// would misreport e.g. a transient backend error as a bogus "hole".
-	selfChain, selfErr := s.chainSelf(lineage, target)
+	// One List serves BOTH walks below: the snapshot-anchored self attempt
+	// and, if that reports no own snapshot, the seam-range walk over the
+	// SAME parsed segments. Both operate strictly on THIS lineage's members
+	// (listMembers already ran keepHighestEpoch per-lineage), so sharing the
+	// parse changes nothing about the never-merge-across-lineages rule — it
+	// only removes a second List of the identical prefix.
+	snapshots, segments, err := s.listMembers(lineage)
+	if err != nil {
+		return nil, err
+	}
+	selfChain, selfErr := resolveSelf(lineage, target, snapshots, segments)
 	if selfErr == nil {
 		return selfChain, nil
 	}
@@ -577,13 +587,13 @@ func (s *Store) chainFrom(lineage string, target uint64, seen map[string]bool) (
 		return nil, fmt.Errorf("store: chain %s@%d: resolving base %s@%d: %w",
 			lineage, target, base.Lineage, base.TXID, err)
 	}
-	childSegs, err := s.segmentsInRange(lineage, base.TXID, target)
+	childSegs, err := resolveRange(lineage, base.TXID, target, segments)
 	if err != nil {
 		return nil, fmt.Errorf("store: chain %s@%d: %w", lineage, target, err)
 	}
 	// Verify the seam is contiguous: the base half must end exactly at
 	// base.TXID and the child half must begin at base.TXID+1 (the latter is
-	// enforced inside segmentsInRange). Error loudly if the base half did not
+	// enforced inside resolveRange). Error loudly if the base half did not
 	// land where the fork point says it should.
 	if len(parentChain) == 0 || parentChain[len(parentChain)-1].MaxTXID != base.TXID {
 		var got uint64
@@ -607,16 +617,19 @@ func (s *Store) chainFrom(lineage string, target uint64, seen map[string]bool) (
 // into a seam-path retry.
 var errNoSnapshotCoversTarget = errors.New("no snapshot covers target")
 
-// chainSelf is the single-lineage resolver: the newest snapshot with
-// MaxTXID <= target followed by every segment up to target, in apply order,
-// resolved wholly within this one lineage's List. It is the base==nil path of
-// Chain and, via recursion, resolves each ancestor half of a shared chain.
-func (s *Store) chainSelf(lineage string, target uint64) ([]ChainMember, error) {
+// listMembers Lists ONE lineage's prefix exactly once and parses it into
+// that lineage's snapshot and segment members, each collapsed by
+// keepHighestEpoch and sorted by TXID. It is the single List+parse step
+// behind chain resolution: chainSelf feeds its output to resolveSelf, and
+// chainFrom's seam path feeds the SAME parsed slices to both resolveSelf and
+// resolveRange, so a shared child's prefix is Listed once per resolution, not
+// twice. keepHighestEpoch runs here, on this one lineage's members only —
+// never on a cross-lineage union (the one hard rule; see Chain).
+func (s *Store) listMembers(lineage string) (snapshots, segments []ChainMember, err error) {
 	keys, err := s.B.List(LineagePrefix(lineage))
 	if err != nil {
-		return nil, err
+		return nil, nil, err
 	}
-	var snapshots, segments []ChainMember
 	for _, k := range keys {
 		m, ok := ParseMemberKey(k)
 		if !ok {
@@ -650,6 +663,28 @@ func (s *Store) chainSelf(lineage string, target uint64) ([]ChainMember, error) 
 		}
 		return segments[i].MinTXID < segments[j].MinTXID
 	})
+	return snapshots, segments, nil
+}
+
+// chainSelf is the single-lineage resolver: the newest snapshot with
+// MaxTXID <= target followed by every segment up to target, in apply order,
+// resolved wholly within this one lineage's List. It is the base==nil path of
+// Chain and, via recursion, resolves each ancestor half of a shared chain.
+func (s *Store) chainSelf(lineage string, target uint64) ([]ChainMember, error) {
+	snapshots, segments, err := s.listMembers(lineage)
+	if err != nil {
+		return nil, err
+	}
+	return resolveSelf(lineage, target, snapshots, segments)
+}
+
+// resolveSelf is chainSelf's pure resolution half, operating on one
+// lineage's already-parsed members (listMembers' output — deduped and
+// sorted). Split out so chainFrom's seam path can run it and, on the
+// no-own-snapshot sentinel, run resolveRange over the SAME parsed segments
+// without a second List of the prefix. lineage and target appear only in
+// error messages.
+func resolveSelf(lineage string, target uint64, snapshots, segments []ChainMember) ([]ChainMember, error) {
 	// Newest snapshot with MaxTXID <= target: snapshot keys sort by TXID
 	// ascending, so scan from the end.
 	var base *ChainMember
@@ -689,35 +724,16 @@ func (s *Store) chainSelf(lineage string, target uint64) ([]ChainMember, error) 
 		lineage, target, prevMax)
 }
 
-// segmentsInRange resolves ONE lineage's own contiguous segment run covering
+// resolveRange resolves ONE lineage's own contiguous segment run covering
 // (lo, hi], with NO leading snapshot — the child half of a shared chain has no
 // snapshot of its own in this range (its snapshot, if any, lives in the base
-// lineage). It Lists ONLY this lineage's prefix, runs keepHighestEpoch on THIS
-// lineage's segments alone (never a cross-lineage union — the one hard rule),
-// sorts, and walks for contiguity: the first segment must start at lo+1, the
-// run must have no hole, and it must reach hi exactly. It errors, mirroring
-// Chain, when the run has a hole or stops short.
-func (s *Store) segmentsInRange(lineage string, lo, hi uint64) ([]ChainMember, error) {
-	keys, err := s.B.List(LineagePrefix(lineage))
-	if err != nil {
-		return nil, err
-	}
-	var segments []ChainMember
-	for _, k := range keys {
-		m, ok := ParseMemberKey(k)
-		if !ok || m.Snapshot {
-			continue
-		}
-		segments = append(segments, m)
-	}
-	// keepHighestEpoch on THIS lineage's segments only.
-	segments = keepHighestEpoch(segments)
-	sort.Slice(segments, func(i, j int) bool {
-		if segments[i].MaxTXID != segments[j].MaxTXID {
-			return segments[i].MaxTXID < segments[j].MaxTXID
-		}
-		return segments[i].MinTXID < segments[j].MinTXID
-	})
+// lineage). It operates on the lineage's already-parsed segments (listMembers'
+// output: keepHighestEpoch was run on THIS lineage's segments alone, never a
+// cross-lineage union — the one hard rule — and they arrive sorted), walking
+// for contiguity: the first segment must start at lo+1, the run must have no
+// hole, and it must reach hi exactly. It errors, mirroring Chain, when the
+// run has a hole or stops short. lineage appears only in error messages.
+func resolveRange(lineage string, lo, hi uint64, segments []ChainMember) ([]ChainMember, error) {
 	var run []ChainMember
 	prevMax := lo
 	for _, seg := range segments {
