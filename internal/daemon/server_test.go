@@ -8,6 +8,7 @@ import (
 	"os"
 	"os/exec"
 	"path/filepath"
+	"syscall"
 	"testing"
 	"time"
 
@@ -481,5 +482,30 @@ func TestConcurrentFlushAndCloseIsSafe(t *testing.T) {
 		if in.DB == "app" && in.Branch == "main" {
 			t.Fatalf("session still listed after close: %+v", in)
 		}
+	}
+}
+
+// TestSocketMode0600UnderPermissiveUmask pins the socket's on-disk mode
+// under the most permissive umask a caller could run the daemon with.
+// NewServer creates the socket under a temporary 0o077 umask (so it is
+// 0600 from its very first instant — see NewServer's comment on the
+// Listen/Chmod TOCTOU window) and then Chmods it 0600 as belt-and-
+// suspenders. The window itself (socket mode between Listen and Chmod) is
+// not observable from a test without hooking between the two calls, so
+// this asserts the strongest externally visible contract: even with
+// umask(0), the socket ends up exactly 0600. Manipulating the process
+// umask is safe here because package tests in a binary run sequentially
+// unless they call t.Parallel(), which none in this package do.
+func TestSocketMode0600UnderPermissiveUmask(t *testing.T) {
+	old := syscall.Umask(0)
+	defer syscall.Umask(old)
+
+	srv, _ := newServer(t)
+	fi, err := os.Stat(srv.SocketPath())
+	if err != nil {
+		t.Fatal(err)
+	}
+	if perm := fi.Mode().Perm(); perm != 0o600 {
+		t.Fatalf("socket perm under umask(0) = %o, want 600", perm)
 	}
 }

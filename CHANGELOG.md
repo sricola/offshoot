@@ -63,6 +63,12 @@ version if you depend on format stability.
   model, but an arbitrary-file-write/exfiltration primitive for an
   authenticated network client on a non-loopback bind. Unix-socket
   export is unchanged.
+- **The daemon's unix socket is created 0600 from the first instant**
+  (a 0o077 umask around the listen), closing the window between
+  `net.Listen` and the subsequent chmod in which — for a `-socket` path
+  in a world-accessible directory — another local user could connect
+  and get a full daemon client. The default socket path (0700 parent
+  dir) was never exposed.
 
 ## [0.2.1] - 2026-08-08
 
