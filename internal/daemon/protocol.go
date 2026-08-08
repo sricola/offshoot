@@ -56,6 +56,9 @@ type Request struct {
 	// enforced at the RPC boundary (opExport): it must be ABSOLUTE. A
 	// relative path is refused rather than resolved against the daemon's
 	// own working directory, which the client cannot see or control.
+	// That same-host/same-user premise does NOT hold for the HTTP surface,
+	// so handleRPC rejects "export" — the only op consuming Path — before
+	// dispatch (see httpForbiddenOps in http.go).
 	Path string `json:"path,omitempty"`
 	// Meta is a small string->string map (capped by ops.ValidateMeta; see
 	// its doc comment for the exact limits), used by "fork" (stored on the

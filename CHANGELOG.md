@@ -54,6 +54,16 @@ version if you depend on format stability.
 - `store.Store.DeleteRef` (unused in production; `Destroy` uses the
   claim-guarded `DeleteRefIf`). Internal API only.
 
+### Security
+
+- **`export` is no longer reachable over HTTP `/rpc`** (400, "not
+  available over HTTP; use the local socket"). It is the one op that
+  writes to an unconfined, client-chosen path on the daemon host's
+  filesystem — safe under the unix socket's same-host/same-user trust
+  model, but an arbitrary-file-write/exfiltration primitive for an
+  authenticated network client on a non-loopback bind. Unix-socket
+  export is unchanged.
+
 ## [0.2.1] - 2026-08-08
 
 ### Added

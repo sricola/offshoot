@@ -42,6 +42,26 @@ import (
 // client can't tie up daemon memory/CPU decoding an arbitrarily large body.
 const maxRPCBodyBytes = 1 << 20 // 1MiB
 
+// httpForbiddenOps are ops handleRPC rejects on the HTTP surface while they
+// remain fully available over the unix socket. Rationale: Request.Path's
+// trust model (protocol.go) — "the caller can already open the socket file,
+// so it is same-host, same-user, and an arbitrary absolute path is just a
+// path that caller could write anyway" — holds for the unix socket ONLY. An
+// HTTP caller on a non-loopback bind is neither same-host nor same-user, so
+// an op that writes to an unconfined, client-chosen path on the DAEMON
+// host's filesystem is simultaneously (a) meaningless to that remote caller
+// (the file lands on the daemon's disk, not theirs) and (b) an
+// arbitrary-file-write/overwrite and data-exfiltration primitive running as
+// the daemon user. "export" is the only such op today — every other op's
+// filesystem writes are confined to the store / checkout / checkouts-ro
+// trees built from ValidateName-checked components (Request.Path is consumed
+// by opExport alone). Deliberately a denylist of filesystem-escaping ops,
+// not an allowlist of safe ones: adding a future escaping op here is a
+// one-liner, and a denylist can't accidentally break a safe op.
+var httpForbiddenOps = map[string]bool{
+	"export": true,
+}
+
 // HTTP timeouts. Justification for each (PM Amendment 6 asks for explicit,
 // sane values, not stdlib's unbounded defaults):
 //
@@ -488,6 +508,13 @@ func (s *Server) handleRPC(w http.ResponseWriter, r *http.Request) {
 			return
 		}
 		http.Error(w, "invalid JSON request", http.StatusBadRequest)
+		return
+	}
+
+	// Rejected BEFORE dispatch: these ops must never run on behalf of an
+	// HTTP caller — see httpForbiddenOps for the trust-model rationale.
+	if httpForbiddenOps[req.Op] {
+		http.Error(w, fmt.Sprintf("daemon: %s is not available over HTTP; use the local socket", req.Op), http.StatusBadRequest)
 		return
 	}
 
