@@ -49,11 +49,13 @@ build a dashboard against a name not in this table.
 | `offshoot_flush_duration_seconds` | histogram | — | Flush latency, fixed buckets (see [Histogram buckets](#histogram-buckets) below). |
 | `offshoot_fork_total` | counter | `path` (`fast`/`slow`) | Successful forks, by path — `fast` = single-snapshot object copy (reflink/clonefile locally, server-side `CopyObject` on S3-compatible backends), `slow` = materialize + re-encode. Both label values are pre-registered at `0`. |
 | `offshoot_fork_duration_seconds` | histogram | — | Successful fork latency. |
+| `offshoot_fork_mode_total` | counter | `mode` (`shared`/`materialized`) | Successful forks, by **storage mode** — `shared` = a base pointer into the parent's chain, zero data objects copied (the copy-on-write common case); `materialized` = a full snapshot copy in the child's own lineage (the fork-time snapshot floor). Orthogonal to `offshoot_fork_total{path}`, which names the materialize path's copy strategy. Both label values pre-registered at `0`. |
 | `offshoot_checkpoint_duration_seconds` | histogram | — | **At-rest** checkpoint latency only — a process that calls `ops.Workspace.Checkpoint` directly (the CLI or `offshoot mcp`, no daemon session involved). A live session's named `flush` is *not* counted here; it's a flush, tallied under `offshoot_flush_duration_seconds` instead. This histogram reads all-zero on a daemon that only ever serves live sessions and never itself runs an at-rest checkpoint. |
 | `offshoot_reap_total` | counter | — | Branches reaped (TTL-expired, destroyed) by the janitor. |
 | `offshoot_gc_tombstoned_total` | counter | — | Objects newly tombstoned by a GC pass. |
 | `offshoot_gc_deleted_total` | counter | — | Objects actually deleted by GC, after their grace period. |
 | `offshoot_gc_backlog` | gauge | — | Tombstoned objects currently sitting inside their grace period, awaiting deletion. A sustained climb here means GC isn't keeping up with tombstoning, not (by itself) a leak — check `-gc-grace` against your churn rate. |
+| `offshoot_gc_errors_total` | counter | — | Janitor GC passes that returned an error. GC **fails closed** — an incomplete reachability mark deletes nothing — so a persistently increasing value means garbage is accumulating unreclaimed; the paired `offshoot: janitor: gc:` stderr line carries the cause. |
 | `offshoot_ro_cache_bytes` | gauge | — | Bytes currently used by `checkouts-ro` (the read-only checkpoint cache). Updated **once per janitor pass**, not continuously — see [Budgets](#budgets) below for what that staleness window means in practice. |
 | `offshoot_ro_cache_evictions_total` | counter | — | `checkouts-ro` entries evicted by the janitor's LRU pass under `-ro-cache-budget`. Zero forever on a daemon started with the default (unlimited) budget. |
 | `offshoot_janitor_runs_total` | counter | `result` (`ok`/`error`) | Janitor loop ticks, by whether the tick completed cleanly. Both values pre-registered at `0`; stays entirely at `0` if `-reap-every 0` disabled the janitor. |
@@ -91,17 +93,19 @@ $ curl -s -H "Authorization: Bearer verify-token-123" http://127.0.0.1:18080/met
 # TYPE offshoot_flush_duration_seconds histogram
 # TYPE offshoot_fork_total counter
 # TYPE offshoot_fork_duration_seconds histogram
+# TYPE offshoot_fork_mode_total counter
 # TYPE offshoot_checkpoint_duration_seconds histogram
 # TYPE offshoot_reap_total counter
 # TYPE offshoot_gc_tombstoned_total counter
 # TYPE offshoot_gc_deleted_total counter
 # TYPE offshoot_gc_backlog gauge
+# TYPE offshoot_gc_errors_total counter
 # TYPE offshoot_ro_cache_bytes gauge
 # TYPE offshoot_ro_cache_evictions_total counter
 # TYPE offshoot_janitor_runs_total counter
 ```
 
-Sixteen `# TYPE` lines, matching the sixteen rows in the table above exactly
+Eighteen `# TYPE` lines, matching the eighteen rows in the table above exactly
 — that grep is the whole verification: run it yourself against a running
 daemon any time this table is in doubt.
 

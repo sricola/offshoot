@@ -48,6 +48,13 @@ type Metrics struct {
 
 	ForkTotal    *metrics.CounterVec // {path}
 	ForkDuration *metrics.Histogram
+	// ForkModeTotal (offshoot_fork_mode_total{mode}) post-dates the
+	// Milestone 4 locked list — added in v0.2.1 to complete the
+	// copy-on-write observability story: shared vs materialized IS the
+	// feature's storage cost, and status/branches only report it per-branch
+	// at read time, not as a fork-time rate. Once shipped it is as locked as
+	// the rest: renaming it is a breaking change.
+	ForkModeTotal *metrics.CounterVec // {mode} — shared|materialized
 
 	CheckpointDuration *metrics.Histogram
 
@@ -55,6 +62,12 @@ type Metrics struct {
 	GCTombstonedTotal *metrics.Counter
 	GCDeletedTotal    *metrics.Counter
 	GCBacklog         *metrics.Gauge
+	// GCErrorsTotal (offshoot_gc_errors_total) post-dates the Milestone 4
+	// locked list — added in v0.2.1 because GC fails CLOSED (a mark that
+	// cannot resolve every ref deletes nothing, by design), so a persistent
+	// GC error means the store bloats silently unless it is surfaced. Once
+	// shipped it is as locked as the rest: renaming it is a breaking change.
+	GCErrorsTotal *metrics.Counter
 
 	// ROCacheBytes/ROCacheEvictionsTotal: driven by the janitor's ro-cache
 	// pass (Milestone 4 Task 5) — see this type's doc comment and
@@ -68,7 +81,8 @@ type Metrics struct {
 // newMetrics builds a fresh Metrics with every locked-list family
 // registered (see Metrics's doc comment), and pre-populates every metric
 // whose label set is a small, fixed, enumerable set of values (flush_total's
-// result x kind, fork_total's path, janitor_runs_total's result) so those
+// result x kind, fork_total's path, fork_mode_total's mode,
+// janitor_runs_total's result) so those
 // combinations expose a real "0" sample from the very first scrape rather
 // than being entirely absent until their first occurrence — a rate() query
 // over a combination that has genuinely never happened reads as 0, not "no
@@ -103,6 +117,11 @@ func newMetrics() *Metrics {
 			"path"),
 		ForkDuration: r.NewHistogram("offshoot_fork_duration_seconds",
 			"Successful fork latency in seconds.", metrics.DefaultDurationBuckets),
+		ForkModeTotal: r.NewCounterVec("offshoot_fork_mode_total",
+			"Successful forks, by storage mode (shared = a base pointer into the parent's chain, "+
+				"zero data objects copied; materialized = a full snapshot copy in the child's own "+
+				"lineage — the fork-time snapshot floor).",
+			"mode"),
 
 		CheckpointDuration: r.NewHistogram("offshoot_checkpoint_duration_seconds",
 			"Successful at-rest checkpoint latency in seconds. Only populated by a process that calls "+
@@ -115,6 +134,10 @@ func newMetrics() *Metrics {
 		GCDeletedTotal:    r.NewCounter("offshoot_gc_deleted_total", "Objects deleted by GC after their grace period."),
 		GCBacklog: r.NewGauge("offshoot_gc_backlog",
 			"Tombstoned objects currently awaiting GC's grace period before deletion."),
+		GCErrorsTotal: r.NewCounter("offshoot_gc_errors_total",
+			"Janitor GC passes that returned an error. GC fails closed (an incomplete reachability "+
+				"mark deletes nothing), so a persistently increasing value means garbage is "+
+				"accumulating unreclaimed — see the paired offshoot: janitor: gc: stderr line for the cause."),
 
 		ROCacheBytes: r.NewGauge("offshoot_ro_cache_bytes",
 			"Bytes used by the read-only checkout cache (checkouts-ro). Updated once per janitor pass, not continuously; see docs/reference.md."),
@@ -135,6 +158,9 @@ func newMetrics() *Metrics {
 	}
 	for _, path := range []string{"fast", "slow"} {
 		m.ForkTotal.WithLabelValues(path)
+	}
+	for _, mode := range []string{"shared", "materialized"} {
+		m.ForkModeTotal.WithLabelValues(mode)
 	}
 	return m
 }
@@ -213,12 +239,17 @@ func kvFloat(kv []any, key string) (float64, bool) {
 // implementations for this daemon — see those package-level hooks' doc
 // comments in internal/ops for the injection shape and why ops itself
 // cannot import internal/metrics.
-func (m *Metrics) observeFork(dur time.Duration, fast bool) {
+func (m *Metrics) observeFork(dur time.Duration, fast, shared bool) {
 	path := "slow"
 	if fast {
 		path = "fast"
 	}
+	mode := "materialized"
+	if shared {
+		mode = "shared"
+	}
 	m.ForkTotal.WithLabelValues(path).Inc()
+	m.ForkModeTotal.WithLabelValues(mode).Inc()
 	m.ForkDuration.Observe(dur.Seconds())
 }
 

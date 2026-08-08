@@ -7,6 +7,8 @@ import (
 	"strings"
 	"testing"
 	"time"
+
+	"github.com/sricola/offshoot/internal/store"
 )
 
 // TestMetricsSmokeOpenWriteFlushFork is Milestone 4 Task 2's instrumentation
@@ -104,6 +106,14 @@ func TestMetricsSmokeOpenWriteFlushFork(t *testing.T) {
 	if strings.Contains(afterFork, "offshoot_fork_duration_seconds_count 0") {
 		t.Fatalf("expected fork_duration_seconds_count > 0 after a successful fork:\n%s", afterFork)
 	}
+	// The default fork SHARES (copy-on-write): the mode counter must record
+	// it as shared, with materialized still at its pre-populated zero.
+	if !strings.Contains(afterFork, `offshoot_fork_mode_total{mode="shared"} 1`) {
+		t.Fatalf("expected fork_mode_total{mode=shared} 1 after a default (shared) fork:\n%s", afterFork)
+	}
+	if !strings.Contains(afterFork, `offshoot_fork_mode_total{mode="materialized"} 0`) {
+		t.Fatalf("expected fork_mode_total{mode=materialized} still 0:\n%s", afterFork)
+	}
 
 	closeResp := call(t, sock, Request{Op: "close", DB: "app", Branch: "main"})
 	if !closeResp.OK {
@@ -180,6 +190,42 @@ func TestJanitorTickUpdatesMetrics(t *testing.T) {
 	// behavior for grace=0.
 	if !strings.Contains(out, "offshoot_gc_tombstoned_total 1") {
 		t.Fatalf("expected one tombstoned lineage:\n%s", out)
+	}
+}
+
+// TestJanitorTickCountsGCError forces the failure mode GC fails CLOSED on —
+// a ref whose chain cannot resolve (here: a hand-written ref naming a
+// lineage with no objects at all), which fails the reachability mark and
+// makes GC return an error having deleted nothing — and asserts the janitor
+// surfaces it: offshoot_gc_errors_total increments (the alertable signal for
+// "GC is stalled and the store is bloating") and the tick counts under
+// janitor_runs_total{result="error"}, rather than the error staying a
+// stderr-only whisper.
+func TestJanitorTickCountsGCError(t *testing.T) {
+	srv, w := newServer(t)
+
+	if _, err := w.Store.PutRef("app", "broken", store.Ref{
+		Lineage: "no-such-lineage", Epoch: 1, HeadTXID: 5, HeadEpoch: 1,
+	}, ""); err != nil {
+		t.Fatal(err)
+	}
+
+	before := srv.metrics.GCErrorsTotal.Value()
+	srv.janitorTick(time.Hour)
+	if got := srv.metrics.GCErrorsTotal.Value(); got != before+1 {
+		t.Fatalf("offshoot_gc_errors_total = %v, want %v (a failed GC pass must increment it)", got, before+1)
+	}
+
+	var buf bytes.Buffer
+	if err := srv.WritePrometheus(&buf); err != nil {
+		t.Fatal(err)
+	}
+	out := buf.String()
+	if !strings.Contains(out, "offshoot_gc_errors_total 1") {
+		t.Fatalf("expected offshoot_gc_errors_total 1 in exposition:\n%s", out)
+	}
+	if !strings.Contains(out, `offshoot_janitor_runs_total{result="error"} 1`) {
+		t.Fatalf("expected the failed tick under janitor_runs_total{result=error}:\n%s", out)
 	}
 }
 

@@ -258,8 +258,9 @@ func (s *Server) StartJanitor(every, grace time.Duration) {
 
 // janitorTick runs one reap+GC+ro-cache+stale-delete-claim pass and updates every
 // janitor-sourced metric (offshoot_reap_total, offshoot_gc_tombstoned_total,
-// offshoot_gc_deleted_total, offshoot_gc_backlog, offshoot_ro_cache_bytes,
-// offshoot_ro_cache_evictions_total, offshoot_janitor_runs_total{result})
+// offshoot_gc_deleted_total, offshoot_gc_errors_total, offshoot_gc_backlog,
+// offshoot_ro_cache_bytes, offshoot_ro_cache_evictions_total,
+// offshoot_janitor_runs_total{result})
 // from its results — split out of StartJanitor's ticker loop so a test can
 // drive exactly one tick deterministically instead of waiting on a real
 // ticker. Reap/GC results are counted even when they also return an error:
@@ -310,7 +311,13 @@ func (s *Server) janitorTick(grace time.Duration) {
 
 	tombstoned, deleted, gcErr := s.ws.GC(grace)
 	if gcErr != nil {
+		// LOUD by design: GC fails closed (a mark that cannot resolve every
+		// ref deletes nothing — see ops.Workspace.GC/reachableObjects), so a
+		// recurring error here means the store is bloating with nothing
+		// reclaimed. The counter is the alertable signal; this stderr line
+		// carries the cause.
 		fmt.Fprintf(os.Stderr, "offshoot: janitor: gc: %v\n", gcErr)
+		s.metrics.GCErrorsTotal.Inc()
 		failed = true
 	}
 	if tombstoned > 0 {
