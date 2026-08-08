@@ -307,10 +307,19 @@ func TestCheckpointFailsCleanlyUnderLiveWriter(t *testing.T) {
 	tx.Rollback()
 }
 
+// TestForkIsIndependentOfParent covers the MATERIALIZED fork path
+// specifically: a materialized child copies its seed into its own lineage
+// and never references parent storage, so deleting the entire parent lineage
+// must leave it readable. A plain Fork now SHARES (copy-on-write) and is
+// deliberately NOT storage-independent — its isolation story is base-pointer
+// resolution plus reachability GC, covered by the shared-fork tests — so
+// this test pins the materialize branch via the test hook.
 func TestForkIsIndependentOfParent(t *testing.T) {
 	if _, err := exec.LookPath("sqlite3"); err != nil {
 		t.Skip("sqlite3 CLI not on PATH")
 	}
+	SetForkMaterializeForTest(true)
+	t.Cleanup(func() { SetForkMaterializeForTest(false) })
 	w := newWS(t)
 	if err := w.Create("app"); err != nil {
 		t.Fatal(err)
@@ -335,8 +344,8 @@ func TestForkIsIndependentOfParent(t *testing.T) {
 		t.Fatalf("child content: %q", got)
 	}
 
-	// Storage independence: delete the ENTIRE parent lineage; child must
-	// still materialize (spec: children never reference parent segments).
+	// Storage independence: delete the ENTIRE parent lineage; a MATERIALIZED
+	// child must still materialize (it never references parent segments).
 	parentRef, _, _ := w.Store.GetRef("app", "main")
 	keys, _ := w.Store.B.List(store.LineagePrefix(parentRef.Lineage))
 	for _, k := range keys {

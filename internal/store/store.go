@@ -487,11 +487,18 @@ func (s *Store) Chain(lineage string, target uint64) ([]ChainMember, error) {
 	// A shared child is born with zero objects and only ever writes txids
 	// above its fork point, so a child snapshot is necessarily > base.TXID
 	// and chainSelf succeeding is always a complete, single-lineage answer.
-	// When chainSelf cannot anchor (no child snapshot at or below target, or
-	// its segment run has a genuine hole), fall through to the seam path,
-	// which reports its own error for real holes.
-	if selfChain, err := s.chainSelf(lineage, target); err == nil {
+	// Fall through to the seam path ONLY when chainSelf failed specifically
+	// because no child snapshot covers target (the sentinel) — the expected
+	// state of a shared child that has not written its own floor yet. Every
+	// other chainSelf error (a backend List failure, a hole past the child's
+	// own snapshot) propagates unchanged: swallowing it into the seam path
+	// would misreport e.g. a transient backend error as a bogus "hole".
+	selfChain, selfErr := s.chainSelf(lineage, target)
+	if selfErr == nil {
 		return selfChain, nil
+	}
+	if !errors.Is(selfErr, errNoSnapshotCoversTarget) {
+		return nil, selfErr
 	}
 	// Concatenate two INDEPENDENTLY-resolved halves.
 	// The base half is resolved wholly within the base lineage (and its
@@ -522,6 +529,16 @@ func (s *Store) Chain(lineage string, target uint64) ([]ChainMember, error) {
 	}
 	return append(parentChain, childSegs...), nil
 }
+
+// errNoSnapshotCoversTarget is chainSelf's distinguishable "this lineage has
+// no snapshot at or below target" failure — the one chainSelf error Chain's
+// base path treats as expected (a shared child that has not written its own
+// divergence-floor snapshot yet) and answers via the seam path instead. Its
+// wording is part of chainSelf's error message ("store: chain X@N: no
+// snapshot covers target"), preserved verbatim from before it became a
+// sentinel. Every other chainSelf error must propagate, never be swallowed
+// into a seam-path retry.
+var errNoSnapshotCoversTarget = errors.New("no snapshot covers target")
 
 // chainSelf is the single-lineage resolver: the newest snapshot with
 // MaxTXID <= target followed by every segment up to target, in apply order,
@@ -576,7 +593,7 @@ func (s *Store) chainSelf(lineage string, target uint64) ([]ChainMember, error) 
 		}
 	}
 	if base == nil {
-		return nil, fmt.Errorf("store: chain %s@%d: no snapshot covers target", lineage, target)
+		return nil, fmt.Errorf("store: chain %s@%d: %w", lineage, target, errNoSnapshotCoversTarget)
 	}
 	chain := []ChainMember{*base}
 	if base.MaxTXID == target {
