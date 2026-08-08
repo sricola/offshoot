@@ -21,6 +21,22 @@ version if you depend on format stability.
 
 ### Changed
 
+- **Chain resolution of a diverged shared fork now Lists the child's prefix
+  once instead of twice** (perf audit H1). The seam path — a shared child
+  with its own segments but no divergence-floor snapshot yet, the normal
+  working state of an active fork — reuses one parsed member listing for
+  both the snapshot-anchored walk and the seam-range walk. One less List
+  RPC per affected lineage per resolution (Checkout, Fork, Compact, flush's
+  divergence seed); resolution results are byte-identical.
+
+- **A materializing (snapshot-floor) fork resolves the source chain once,
+  not twice** (perf audit M1). Fork passes the chain it already resolved
+  for the floor decision straight to the snapshot copy instead of letting
+  the copy re-resolve the identical (lineage, txid) — the redundant
+  resolution was most expensive exactly when the floor trips, i.e. on a
+  long chain. Rollback and Promote are unchanged; fork results are
+  byte-identical.
+
 - **A CI image that loses sqlite3/sqldiff/promtool now fails loudly instead
   of silently skipping the integration suite green.** The ~96 copy-pasted
   `exec.LookPath` skip guards across the test suite collapsed into a shared
