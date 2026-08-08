@@ -39,6 +39,35 @@ version if you depend on format stability.
   asserting max concurrently-open streams <= 1 and open count == close
   count. Read-side only; flush/capture (H3's write side) is unchanged.
 
+- **A snapshot flush no longer buffers the whole encoded snapshot in memory
+  before uploading it** (perf audit H3, write-side companion to the
+  read-side entry above). `Session.flush`'s snapshot branch now
+  `ltxio.EncodeSnapshot`s to a second per-flush scratch FILE (alongside
+  task 8's replica-clone scratch) instead of a `bytes.Buffer`, then streams
+  that file to the backend via a new optional `store.ReaderPutter`
+  capability (`PutReaderIf`/`PutReader`, implemented by both `S3` — a plain
+  `PutObject` with `Body: r`/`ContentLength: size`, no `io.ReadAll` — and
+  `Local` — write-to-temp-then-rename streamed via `io.Copy`, computing the
+  sha256 etag incrementally alongside the write) instead of buffering the
+  object as a `[]byte` for `PutIf`/`Put`. `PutReaderIf`/`PutReader` mirror
+  `PutIf`/`Put`'s exact CAS/create-only/overwrite contract, including the
+  orphan-overwrite retry (a fresh reader reopened from offset 0, since the
+  first attempt's reader is exhausted after `PutReaderIf`). The segment
+  branch (already O(changed pages)) and any backend without `ReaderPutter`
+  are entirely unchanged — still buffered, byte-for-byte the prior
+  behavior. Upload→ref-CAS ordering, the durable checksum, and every other
+  flush invariant (task 8's clone-then-release-`replicaMu` discipline,
+  `forceSnapshot`/pageSet drain semantics) are unaffected — pinned by a
+  counting-backend test asserting the streaming methods are used and the
+  buffered ones never are, that both scratch files are cleaned up on every
+  path, and that streamed output materializes byte-identically to a direct
+  encode; a separate test pins the no-`ReaderPutter` fallback unchanged.
+  S3's `PutReaderIf`/`PutReader` inherit `PutObject`'s single-request 5 GiB
+  ceiling (same limit `CopyObject` already documents); multipart upload to
+  lift it is a noted follow-up, not implemented here. `make test-torture`:
+  3168 rounds, 316 kill -9 bounces, 316/316 resumed cleanly, zero
+  corruption.
+
 - **Snapshot flushes no longer hold the replica lock across the full-file
   encode** (perf audit M2). `Session.flush`'s snapshot branch now clones the
   replica to a per-flush scratch file under `replicaMu` (a copy-on-write

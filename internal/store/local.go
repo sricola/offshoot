@@ -135,6 +135,115 @@ func (l *Local) Put(key string, data []byte) error {
 	return l.write(p, data)
 }
 
+// writeReader is write()'s streaming counterpart: it copies r (exactly size
+// bytes) into a uniquely-named temp file in the same dir as p, fsyncs, and
+// renames into place — same write-to-temp-then-rename discipline as write(),
+// same unique-per-call temp name (see write()'s doc comment for why: no
+// per-key lock here either, since PutReader mirrors Put's last-write-wins
+// contract). The only difference is the data source: this never holds more
+// than one io.Copy buffer's worth of the object in memory, where write()
+// already has the whole []byte resident (its caller built it that way).
+//
+// The returned etag is a sha256 over the streamed content, computed
+// incrementally via io.MultiWriter alongside the write to disk — the same
+// digest etagOf(data) would produce over the same bytes read back, without
+// a second full-file pass to compute it after the fact.
+func (l *Local) writeReader(p string, r io.Reader, size int64) (etag string, err error) {
+	dir := filepath.Dir(p)
+	if err := os.MkdirAll(dir, 0o755); err != nil {
+		return "", err
+	}
+	f, err := os.CreateTemp(dir, filepath.Base(p)+".tmp-*")
+	if err != nil {
+		return "", err
+	}
+	tmp := f.Name()
+	h := sha256.New()
+	n, err := io.Copy(io.MultiWriter(f, h), r)
+	if err != nil {
+		f.Close()
+		os.Remove(tmp)
+		return "", err
+	}
+	if n != size {
+		f.Close()
+		os.Remove(tmp)
+		return "", fmt.Errorf("store: streamed %d bytes for %s, want %d", n, p, size)
+	}
+	if err := f.Sync(); err != nil {
+		f.Close()
+		os.Remove(tmp)
+		return "", err
+	}
+	if err := f.Close(); err != nil {
+		os.Remove(tmp)
+		return "", err
+	}
+	if err := os.Rename(tmp, p); err != nil {
+		os.Remove(tmp)
+		return "", err
+	}
+	return hex.EncodeToString(h.Sum(nil)), nil
+}
+
+// PutReader implements store.ReaderPutter's unconditional overwrite: same
+// contract as Put, streamed via writeReader instead of write.
+func (l *Local) PutReader(key string, r io.Reader, size int64) error {
+	p, err := l.path(key)
+	if err != nil {
+		return err
+	}
+	_, err = l.writeReader(p, r, size)
+	return err
+}
+
+// PutReaderIf implements store.ReaderPutter's CAS write: same contract and
+// same per-key lock as PutIf, streamed via writeReader instead of write.
+//
+// The ifMatch == "" (create-only) case deliberately checks existence with
+// os.Stat rather than PutIf's os.ReadFile: PutIf already holds its new
+// payload buffered in the caller's []byte, so reading the old content too
+// (needed for the ifMatch != "" comparison below) costs nothing extra
+// end-to-end. Here the whole point of the call is to avoid buffering a
+// large object — reading a potentially-large EXISTING orphan into memory
+// just to discover it exists (flush.go's create-only retry after a crashed
+// prior attempt is exactly this case: an existing, possibly multi-GB,
+// object at objKey) would defeat that for the one case this method's
+// caller actually uses. The ifMatch != "" branch still needs the old
+// content's hash to compare, same as PutIf, and reads it the same way; no
+// caller in this codebase exercises that branch on a large object today.
+func (l *Local) PutReaderIf(key string, r io.Reader, size int64, ifMatch string) (string, error) {
+	p, err := l.path(key)
+	if err != nil {
+		return "", err
+	}
+	release, err := l.lock(p)
+	if err != nil {
+		return "", err
+	}
+	defer release()
+
+	if ifMatch == "" {
+		if _, statErr := os.Stat(p); statErr == nil {
+			return "", fmt.Errorf("%w: key exists", ErrCAS)
+		} else if !os.IsNotExist(statErr) {
+			return "", statErr
+		}
+	} else {
+		cur, readErr := os.ReadFile(p)
+		if os.IsNotExist(readErr) {
+			return "", fmt.Errorf("%w: key absent, expected etag %s", ErrCAS, ifMatch)
+		}
+		if readErr != nil {
+			return "", readErr
+		}
+		if etagOf(cur) != ifMatch {
+			return "", fmt.Errorf("%w: etag mismatch", ErrCAS)
+		}
+	}
+	return l.writeReader(p, r, size)
+}
+
 func (l *Local) lock(p string) (release func(), err error) {
 	lockPath := p + ".lock"
 	if err := os.MkdirAll(filepath.Dir(p), 0o755); err != nil {

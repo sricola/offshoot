@@ -4,8 +4,11 @@
 package storetest
 
 import (
+	"bytes"
 	"errors"
 	"fmt"
+	"io"
+	"strings"
 	"sync"
 	"testing"
 
@@ -227,6 +230,106 @@ func RunConformance(t *testing.T, keyPrefix string, newBackend func(t *testing.T
 		data, _, err = b.Get(k("data/copy/dst"))
 		if err != nil || string(data) != "overwritten" {
 			t.Fatalf("dst after overwrite = %q, want %q: %v", data, "overwritten", err)
+		}
+	})
+
+	// ReaderPutter: an optional capability (perf audit H3, write side —
+	// task 9b), not part of Backend itself, so this subtest skips outright
+	// on a backend that doesn't implement it rather than failing. Both
+	// backends offshoot ships (Local, S3) DO implement it, so this runs for
+	// real on both here; it pins that PutReaderIf/PutReader produce content
+	// and CAS/create-only outcomes byte-identical to PutIf/Put over the
+	// exact same bytes, sourced from an io.Reader instead of a []byte.
+	t.Run("ReaderPutter", func(t *testing.T) {
+		b := newBackend(t)
+		rp, ok := b.(store.ReaderPutter)
+		if !ok {
+			t.Skip("backend does not implement store.ReaderPutter")
+		}
+
+		payload := []byte(strings.Repeat("stream-me-", 4096)) // exercise more than one io.Copy buffer's worth
+		etag, err := rp.PutReaderIf(k("stream/create-only"), bytes.NewReader(payload), int64(len(payload)), "")
+		if err != nil {
+			t.Fatal(err)
+		}
+		if etag == "" {
+			t.Error("PutReaderIf must return a non-empty etag")
+		}
+		data, getEtag, err := b.Get(k("stream/create-only"))
+		if err != nil {
+			t.Fatal(err)
+		}
+		if !bytes.Equal(data, payload) {
+			t.Fatalf("streamed create-only content mismatch: got %d bytes, want %d", len(data), len(payload))
+		}
+		if getEtag != etag {
+			t.Errorf("Get's etag %q != PutReaderIf's returned etag %q", getEtag, etag)
+		}
+
+		// Create-only over an existing key must fail with ErrCAS and must
+		// not touch the existing content — same contract as PutIf.
+		if _, err := rp.PutReaderIf(k("stream/create-only"), bytes.NewReader([]byte("nope")), 4, ""); !errors.Is(err, store.ErrCAS) {
+			t.Fatalf("want ErrCAS on streamed create-only over existing, got %v", err)
+		}
+		data, _, err = b.Get(k("stream/create-only"))
+		if err != nil || !bytes.Equal(data, payload) {
+			t.Fatalf("rejected streamed create-only must not modify content: got %d bytes, err %v", len(data), err)
+		}
+
+		// A real CAS (ifMatch = the prior etag) must succeed and change the
+		// stored content and etag, same as PutIf.
+		second := []byte("second-streamed-value")
+		etag2, err := rp.PutReaderIf(k("stream/create-only"), bytes.NewReader(second), int64(len(second)), etag)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if etag2 == etag {
+			t.Error("etag must change when streamed CAS content changes")
+		}
+		data, _, err = b.Get(k("stream/create-only"))
+		if err != nil || !bytes.Equal(data, second) {
+			t.Fatalf("content after streamed CAS = %q, want %q: %v", data, second, err)
+		}
+
+		// A stale etag must fail with ErrCAS, same as PutIf.
+		if _, err := rp.PutReaderIf(k("stream/create-only"), bytes.NewReader([]byte("stale")), 5, etag); !errors.Is(err, store.ErrCAS) {
+			t.Fatalf("want ErrCAS on stale streamed etag, got %v", err)
+		}
+
+		// PutReader is an unconditional overwrite, same as Put.
+		third := []byte("third-streamed-value-overwrite")
+		if err := rp.PutReader(k("stream/create-only"), bytes.NewReader(third), int64(len(third))); err != nil {
+			t.Fatal(err)
+		}
+		data, _, err = b.Get(k("stream/create-only"))
+		if err != nil || !bytes.Equal(data, third) {
+			t.Fatalf("content after PutReader overwrite = %q, want %q: %v", data, third, err)
+		}
+
+		// PutReader on a brand-new key (no prior content at all) must also
+		// succeed unconditionally, same as Put.
+		fresh := []byte("fresh-key-via-put-reader")
+		if err := rp.PutReader(k("stream/fresh"), bytes.NewReader(fresh), int64(len(fresh))); err != nil {
+			t.Fatal(err)
+		}
+		data, _, err = b.Get(k("stream/fresh"))
+		if err != nil || !bytes.Equal(data, fresh) {
+			t.Fatalf("PutReader on a fresh key: content = %q, want %q: %v", data, fresh, err)
+		}
+
+		// A stream-written object must be readable back via GetReader too,
+		// on backends that implement both optional capabilities — proves
+		// the two streaming paths (write and read) agree on content.
+		if rg, ok := b.(store.ReaderGetter); ok {
+			r, _, err := rg.GetReader(k("stream/fresh"))
+			if err != nil {
+				t.Fatal(err)
+			}
+			got, err := io.ReadAll(r)
+			r.Close()
+			if err != nil || !bytes.Equal(got, fresh) {
+				t.Fatalf("GetReader over a PutReader-written key: got %d bytes, err %v", len(got), err)
+			}
 		}
 	})
 }

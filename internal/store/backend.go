@@ -87,3 +87,28 @@ type BatchDeleter interface {
 type ReaderGetter interface {
 	GetReader(key string) (r io.ReadCloser, etag string, err error)
 }
+
+// ReaderPutter is an optional Backend capability: upload an object by
+// STREAMING from r (exactly size bytes) instead of a fully-buffered []byte,
+// so a caller uploading a large object (e.g. a session flush's snapshot
+// encode — perf audit H3, write side) need not hold it all in memory at
+// once. Like BatchDeleter/ReaderGetter, it is deliberately NOT part of
+// Backend itself: test wrappers and backends that only ever handle small
+// objects keep working unchanged, and callers type-assert and fall back to
+// the buffered Put/PutIf.
+//
+// PutReaderIf mirrors PutIf's CAS contract exactly: ifMatch == "" means
+// create-only (fails with store.ErrCAS if the key already exists),
+// otherwise it is a compare-and-swap against the given etag, failing with
+// store.ErrCAS on a mismatch or on a missing key. PutReader mirrors Put: an
+// unconditional overwrite.
+//
+// r must yield exactly size bytes. A conforming implementation MUST NOT
+// buffer the whole object in memory to satisfy either method — S3's streams
+// the SDK's PutObject body directly (ContentLength: size); Local's streams
+// to a temp file and renames into place, matching Put/PutIf's existing
+// write-then-rename discipline.
+type ReaderPutter interface {
+	PutReaderIf(key string, r io.Reader, size int64, ifMatch string) (etag string, err error)
+	PutReader(key string, r io.Reader, size int64) error
+}
