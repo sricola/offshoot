@@ -1,7 +1,9 @@
 // Package ops implements offshoot's branch lifecycle operations over a
-// store.Backend: create, checkout, checkpoint, fork, rollback, promote,
-// destroy, and GC. Plan-2 scope is CLI/at-rest mode: full-snapshot
-// checkpoints, fixed checkout paths, no daemon.
+// store.Backend: create, checkout, checkpoint, fork (copy-on-write shared
+// by default), rollback, promote, compact, destroy, leases, TTL/reap, and
+// reachability GC. It backs both the CLI's at-rest mode (full-snapshot
+// checkpoints against fixed checkout paths) and the daemon (which layers
+// live sessions and segment flushes from internal/session on top).
 package ops
 
 import (
@@ -30,7 +32,9 @@ import (
 type Workspace struct {
 	Store *store.Store
 	Root  string
-	Spec  string
+	// Spec is the store spec this Workspace was opened with, retained so
+	// callers/tests can reopen the same store.
+	Spec string
 	// SnapshotEvery is the snapshot cadence the fork-time floor bounds a
 	// shared fork's resolved base chain against; 0 means use the default
 	// (ForkShareMaxDepth). Set by the daemon from its configured session
