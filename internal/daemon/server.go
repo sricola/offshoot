@@ -205,9 +205,14 @@ func (s *Server) SetROCacheBudget(bytes int64) {
 // cmd/offshoot's `serve` command rejects a non-positive -snapshot-every N at
 // the flag-parsing layer (a mistake, not a supported "unlimited" value) and
 // only calls this method when N was actually given.
+// It also sets Workspace.SnapshotEvery, so the fork-time snapshot floor
+// (ops.Fork's share-vs-materialize bound) uses the same cadence this
+// daemon's sessions do — keeping the fork floor and the divergence floor
+// in agreement instead of the fork floor silently staying at the default.
 func (s *Server) SetSnapshotEvery(n int) {
 	s.mu.Lock()
 	s.snapshotEvery = n
+	s.ws.SnapshotEvery = n
 	s.mu.Unlock()
 }
 

@@ -135,3 +135,110 @@ func TestForkTimeFloorMaterializesDeepChain(t *testing.T) {
 		t.Fatalf("deep fork content = %q, want %d rows", got, ops.ForkShareMaxDepth)
 	}
 }
+
+// TestForkFloorTracksConfiguredSnapshotEvery: the fork-time floor's bound
+// must be Workspace.SnapshotEvery when set, not the hardcoded default. A
+// parent whose resolved chain has >= 4 members forks MATERIALIZED under
+// Workspace.SnapshotEvery=4 (its own snapshot, Base nil, no base.json),
+// while the SAME parent under the default (SnapshotEvery 0 -> 16) SHARES.
+// This is what keeps a daemon configured with a small session cadence from
+// minting shared forks whose resolved chains exceed that cadence.
+func TestForkFloorTracksConfiguredSnapshotEvery(t *testing.T) {
+	if _, err := exec.LookPath("sqlite3"); err != nil {
+		t.Skip("sqlite3 CLI not on PATH")
+	}
+	const cadence = 4
+	w := newWS(t)
+	if err := w.Create("app"); err != nil {
+		t.Fatal(err)
+	}
+	// Grow main's resolved chain to >= cadence members but well under the
+	// default 16: settling snapshot + `cadence` segments = cadence+1.
+	s, err := session.Open(context.Background(), session.Options{
+		WS: w, DB: "app", Branch: "main", SnapshotEvery: 1000,
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer s.Close()
+	if out, err := exec.Command("sqlite3", s.CheckoutPath(), "CREATE TABLE t (v);").CombinedOutput(); err != nil {
+		t.Fatalf("CREATE TABLE: %v: %s", err, out)
+	}
+	if _, err := s.Flush("", nil); err != nil {
+		t.Fatal(err)
+	}
+	for i := 0; i < cadence; i++ {
+		if out, err := exec.Command("sqlite3", s.CheckoutPath(),
+			fmt.Sprintf("INSERT INTO t VALUES (%d);", i)).CombinedOutput(); err != nil {
+			t.Fatalf("INSERT %d: %v: %s", i, err, out)
+		}
+		if _, err := s.Flush("", nil); err != nil {
+			t.Fatalf("flush %d: %v", i, err)
+		}
+	}
+	if err := s.Close(); err != nil {
+		t.Fatal(err)
+	}
+	ref, _, err := w.Store.GetRef("app", "main")
+	if err != nil {
+		t.Fatal(err)
+	}
+	chain, err := w.Store.Chain(ref.Lineage, ref.HeadTXID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(chain) < cadence || len(chain) >= ops.ForkShareMaxDepth {
+		t.Fatalf("test precondition: resolved chain has %d members, want >= %d and < %d",
+			len(chain), cadence, ops.ForkShareMaxDepth)
+	}
+
+	// Control: SnapshotEvery 0 defaults to ForkShareMaxDepth — this chain is
+	// under it, so the fork SHARES exactly as before the field existed.
+	if _, err := w.Fork("app", "main", "under-default", "", 0, nil); err != nil {
+		t.Fatal(err)
+	}
+	uref, _, err := w.Store.GetRef("app", "under-default")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if uref.Base == nil {
+		t.Fatal("fork under the default bound must share (Base set)")
+	}
+
+	// The configured bound: the same parent, forked with SnapshotEvery=4,
+	// trips the floor and MATERIALIZES.
+	w.SnapshotEvery = cadence
+	if _, err := w.Fork("app", "main", "at-cadence", "", 0, nil); err != nil {
+		t.Fatal(err)
+	}
+	cref, _, err := w.Store.GetRef("app", "at-cadence")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if cref.Base != nil {
+		t.Fatalf("fork at the configured cadence must materialize (Base nil), got Base %+v", cref.Base)
+	}
+	if _, _, err := w.Store.B.Get(store.BaseKey(cref.Lineage)); !errors.Is(err, store.ErrNotFound) {
+		t.Fatalf("materialized fork must write no base.json, Get err = %v", err)
+	}
+	cchain, err := w.Store.Chain(cref.Lineage, cref.HeadTXID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(cchain) != 1 || !cchain[0].Snapshot {
+		t.Fatalf("materialized fork's resolved chain = %d members, want exactly its own snapshot", len(cchain))
+	}
+
+	// Functional: the materialized child reads the full state.
+	cpath, err := w.Checkout("app", "at-cadence")
+	if err != nil {
+		t.Fatal(err)
+	}
+	got, err := exec.Command("sqlite3", cpath, "SELECT count(*) FROM t;").Output()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if string(got) != fmt.Sprintf("%d\n", cadence) {
+		t.Fatalf("materialized fork content = %q, want %d rows", got, cadence)
+	}
+}

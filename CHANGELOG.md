@@ -41,6 +41,15 @@ version if you depend on format stability.
   leaving the session fenced. With no session open the durable head is
   already current, so compact materializes exactly that head — behavior
   with no open session is unchanged.
+- **The fork-time snapshot floor now tracks the configured snapshot
+  cadence** instead of the hardcoded default (16). A daemon started with
+  `-snapshot-every N` below 16 could previously mint shared forks whose
+  resolved base chains reached up to 15 members — bounded, but looser
+  than the session's own `len(chain) <= SnapshotEvery` cadence. The
+  daemon now passes its cadence through to the fork floor
+  (`Workspace.SnapshotEvery`), so the fork floor and the divergence floor
+  agree. The at-rest CLI `fork` and any daemon without `-snapshot-every`
+  keep the default bound of 16 — behavior unchanged.
 - **`store.Chain` now detects base-pointer cycles** in a corrupt or
   hand-edited store and returns a clear `base pointer cycle detected`
   error instead of recursing until the stack overflows. Not reachable
