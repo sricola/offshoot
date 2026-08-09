@@ -53,6 +53,17 @@ version if you depend on format stability.
   (Create/UploadPart/Complete/Abort) to make the path genuinely testable,
   not just compiled.
 
+### Changed
+
+- **Doc note on `store.BatchDeleter`/`ReaderGetter`/`ReaderPutter`**: these
+  optional capabilities are discovered by type assertion, so a `store.Backend`
+  wrapper that embeds another Backend (e.g. for instrumentation/caching)
+  silently hides them — callers fall back to the buffered/per-key path,
+  which stays correct but loses the batching/streaming benefit. No code
+  change: `ops.markCache` (the one in-repo wrapper today) implements
+  `Backend` directly rather than embedding, and needs none of these three,
+  so nothing is affected today.
+
 ## [0.2.2] - 2026-08-08
 
 ### Added

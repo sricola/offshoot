@@ -52,6 +52,23 @@ type Backend interface {
 	CopyObject(dst, src string) error
 }
 
+// BatchDeleter, ReaderGetter, and ReaderPutter (below) are all discovered by
+// TYPE ASSERTION against a caller's store.Backend value (b.(store.BatchDeleter),
+// etc.), never through the Backend interface itself. That means a wrapper
+// type that implements Backend by embedding another Backend (e.g. for
+// instrumentation, caching, or retry logic) SILENTLY HIDES whichever of
+// these three the embedded value actually implements: the embedding type's
+// own method set does not include them unless it redeclares each one, so
+// the type assertion fails and the caller falls back to the buffered/
+// per-key path. That fallback stays CORRECT — nothing breaks — but it
+// silently loses the batching/streaming benefit the capability exists for
+// (perf audits H2/H3). A wrapper that wants to preserve a capability must
+// forward that method explicitly, not just embed and hope. The one
+// in-repo wrapper today, ops.markCache (internal/ops/gc.go, used only in
+// the GC mark walk), implements store.Backend directly rather than
+// embedding one, and needs none of these three capabilities for what it
+// does (Get/List only) — so nothing is affected today.
+//
 // BatchDeleter is an optional Backend capability: delete many keys in as few
 // round trips as the backend allows (S3: the DeleteObjects API, 1000 keys
 // per request — perf audit H2; Local: a plain loop, no RPC to save but the
