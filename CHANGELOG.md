@@ -13,6 +13,8 @@ version if you depend on format stability.
 
 ## [Unreleased]
 
+## [0.2.2] - 2026-08-08
+
 ### Added
 
 - `make lint`: gofmt -l (fails on any unformatted file) + `go vet` +
