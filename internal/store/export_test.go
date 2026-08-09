@@ -31,3 +31,16 @@ func SetPartSizeForTest(v int64) (restore func()) {
 	defaultPartSize = v
 	return func() { defaultPartSize = prev }
 }
+
+// SetMultipartConcurrencyForTest overrides the worker count store.S3's
+// putMultipart uses on the io.ReaderAt path (multipartConcurrency in
+// s3.go), returning a restore func that puts back the previous value (call
+// it via t.Cleanup). Tests force this to 1 for a deterministic sequential
+// run, or leave/raise it above 1 (paired with a fake that can observe
+// overlap, e.g. blocking each part until N have arrived) to prove parts
+// really do upload in parallel. Test-only: never call this outside a test.
+func SetMultipartConcurrencyForTest(v int) (restore func()) {
+	prev := multipartConcurrency
+	multipartConcurrency = v
+	return func() { multipartConcurrency = prev }
+}

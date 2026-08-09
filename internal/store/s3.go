@@ -10,6 +10,7 @@ import (
 	"net/url"
 	"sort"
 	"strings"
+	"sync"
 
 	"github.com/aws/aws-sdk-go-v2/aws"
 	awsconfig "github.com/aws/aws-sdk-go-v2/config"
@@ -228,14 +229,16 @@ const minPartSize = 5 * 1024 * 1024 // 5 MiB
 
 // defaultPartSize is the part size store.S3 uses for a multipart upload
 // when the object isn't large enough to force a bigger size via maxParts
-// (see partSizeFor) — 64 MiB. Parts upload strictly sequentially (no
-// concurrency — see putMultipart's doc comment), so part size directly sets
-// the RPC count and therefore the wall-clock cost of a large upload: at 64
-// MiB a 5 GiB snapshot is ~80 sequential UploadPart round trips; the AWS
-// CLI's smaller 8 MiB default is only cheap there because it's paired with
-// 10 concurrent part uploads, which this backend does not (yet) do — with
-// no concurrency, a smaller default part size is strictly worse, not a
-// safer/more conservative choice.
+// (see partSizeFor) — 64 MiB. Part size sets the RPC count and therefore
+// (bounded by multipartConcurrency's fan-out) the wall-clock cost of a
+// large upload: at 64 MiB and multipartConcurrency==4, a 5 GiB snapshot is
+// ~80 UploadPart round trips, 4 in flight at a time — the AWS CLI's smaller
+// 8 MiB default is only cheap there because it's paired with 10 concurrent
+// part uploads; this backend deliberately uses fewer, larger parts with
+// fewer workers (see multipartConcurrency's doc comment for why). Note this
+// concurrency only applies on the io.ReaderAt path (putMultipart's doc
+// comment); the non-ReaderAt fallback is still strictly sequential, so a
+// smaller part size there is still strictly worse, never safer.
 //
 // This also sets the non-io.ReaderAt (or non-io.Seeker) fallback's
 // per-part buffer size, which scales with it — up to ~524 MiB for a
@@ -256,6 +259,31 @@ var defaultPartSize int64 = 64 * 1024 * 1024 // 64 MiB
 // maxParts is S3's hard limit on the number of parts a single multipart
 // upload may have (S3 API constraint).
 const maxParts = 10000
+
+// multipartConcurrency is the number of parts store.S3.putMultipart
+// (and store.S3.copyObjectMultipart, for its own client-side bookkeeping —
+// though that path's UploadPartCopy calls are server-side and copy
+// sequentially, see copyObjectMultipart's doc comment) uploads in parallel
+// on the io.ReaderAt path — see putMultipart's doc comment for why the
+// non-ReaderAt fallback can NEVER use this and stays at effective
+// concurrency 1 regardless of this value.
+//
+// 4 is a deliberately small default, not a "use all available parallelism"
+// number: parts are already large (partSizeFor keeps them at least 5 MiB,
+// 64 MiB by default — see defaultPartSize), so a handful of concurrent
+// large-part transfers already saturates a typical link; more workers
+// mostly adds goroutine/connection overhead and widens the blast radius of
+// a burst of S3 503 SlowDown responses, without a proportional throughput
+// gain the way many-small-part concurrency (e.g. the AWS CLI's 10 workers
+// over 8 MiB parts) needs to get the same effect.
+//
+// This is a package var, not a const, ONLY so tests can override it — down
+// to 1 for a deterministic sequential run (TestS3PutReaderIfMultipartConcurrency1),
+// or left/raised above 1 to prove parts really do upload in parallel
+// (TestS3PutReaderIfMultipartConcurrencyParallel). Never set it outside a
+// test; production code must never assign to it. See
+// SetMultipartConcurrencyForTest (export_test.go).
+var multipartConcurrency = 4
 
 // multipartThreshold is the object size above which PutReader/PutReaderIf
 // switch from a single PutObject to a multipart upload (CreateMultipartUpload
@@ -414,9 +442,20 @@ func (s *S3) PutReaderIf(key string, r io.Reader, size int64, ifMatch string) (s
 // single reused buffer sized to one part (bounded memory: at most one
 // part's worth, reused across parts, never the whole object).
 //
-// Parts are uploaded sequentially, not concurrently — correctness first;
-// concurrent part uploads are a plausible future improvement once this
-// path has real production mileage.
+// CONCURRENCY IS ONLY SAFE ON THE io.ReaderAt PATH. When useReaderAt, parts
+// upload in parallel (bounded to multipartConcurrency workers — see
+// concurrentPartUpload) because io.ReaderAt is documented safe for parallel
+// ReadAt calls on the same underlying data: each worker reads its own part
+// via its own io.NewSectionReader, no shared mutable state. The non-
+// ReaderAt fallback reads every part sequentially from r into ONE REUSED
+// buffer — a second worker there would race the shared buffer AND consume r
+// out of order (r has no seek/random-access story at all in this branch,
+// that's exactly why it's the fallback). So the fallback stays strictly
+// sequential, deliberately: giving it a buffer per worker would "fix" the
+// race but multiply memory by the worker count for precisely the callers
+// who couldn't afford a single partSize-sized buffer in the first place —
+// worse, not better. See putMultipart's abort/ordering/checksum guarantees
+// below; concurrentPartUpload preserves all three under parallelism.
 func (s *S3) putMultipart(key string, r io.Reader, size int64, ifMatch string, conditional bool) (etag string, err error) {
 	fk, err := s.full(key)
 	if err != nil {
@@ -487,62 +526,69 @@ func (s *S3) putMultipart(key string, r io.Reader, size int64, ifMatch string, c
 	}
 
 	var parts []types.CompletedPart
-	partNum := int32(1)
-	for offset := int64(0); offset < size; offset += partSize {
-		n := partSize
-		if remain := size - offset; remain < n {
-			n = remain
+	if useReaderAt {
+		// Safe to parallelize — see the CONCURRENCY paragraph in
+		// putMultipart's doc comment above and concurrentPartUpload's own
+		// doc comment for the worker/ordering/error-handling design.
+		numParts := int32((size + partSize - 1) / partSize)
+		parts, err = s.concurrentPartUpload(ctx, key, fk, uploadID, ra, base, size, partSize, numParts)
+		if err != nil {
+			return "", err
 		}
+	} else {
+		// NOT safe to parallelize — see the CONCURRENCY paragraph above.
+		// Strictly sequential: one reused buffer, r read in order.
+		partNum := int32(1)
+		for offset := int64(0); offset < size; offset += partSize {
+			n := partSize
+			if remain := size - offset; remain < n {
+				n = remain
+			}
 
-		var body io.Reader
-		if useReaderAt {
-			body = io.NewSectionReader(ra, base+offset, n)
-		} else {
 			if _, rerr := io.ReadFull(io.LimitReader(r, n), buf[:n]); rerr != nil {
 				return "", fmt.Errorf("store: s3 read part %d for %s: %w", partNum, key, rerr)
 			}
-			body = bytes.NewReader(buf[:n])
-		}
 
-		up, uerr := s.cl.UploadPart(ctx, &s3.UploadPartInput{
-			Bucket: aws.String(s.bucket), Key: aws.String(fk),
-			UploadId: uploadID, PartNumber: aws.Int32(partNum),
-			Body: body, ContentLength: aws.Int64(n),
-			// Explicit here too, not just on CreateMultipartUpload above —
-			// DO NOT simplify this back out. The SDK only defaults a part's
-			// checksum algorithm when RequestChecksumCalculation ==
-			// WhenSupported (the SDK default); a caller running with
-			// when_required (the common workaround third-party S3-compatible
-			// stores need after the Jan-2025 default-checksum change — and
-			// this backend explicitly targets R2/Tigris/MinIO via S3Config)
-			// would otherwise send this UploadPart with NO checksum while
-			// CreateMultipartUpload already declared the upload CRC32,
-			// making every CompletedPart's checksum silently absent and
-			// CompleteMultipartUpload's declared-vs-supplied check fail on
-			// real S3. Setting it here makes the SDK compute CRC32
-			// unconditionally, so declared and supplied always agree
-			// regardless of RequestChecksumCalculation.
-			ChecksumAlgorithm: types.ChecksumAlgorithmCrc32,
-		})
-		if uerr != nil {
-			return "", fmt.Errorf("store: s3 upload part %d for %s: %w", partNum, key, uerr)
+			up, uerr := s.cl.UploadPart(ctx, &s3.UploadPartInput{
+				Bucket: aws.String(s.bucket), Key: aws.String(fk),
+				UploadId: uploadID, PartNumber: aws.Int32(partNum),
+				Body: bytes.NewReader(buf[:n]), ContentLength: aws.Int64(n),
+				// Explicit here too, not just on CreateMultipartUpload above —
+				// DO NOT simplify this back out. The SDK only defaults a part's
+				// checksum algorithm when RequestChecksumCalculation ==
+				// WhenSupported (the SDK default); a caller running with
+				// when_required (the common workaround third-party S3-compatible
+				// stores need after the Jan-2025 default-checksum change — and
+				// this backend explicitly targets R2/Tigris/MinIO via S3Config)
+				// would otherwise send this UploadPart with NO checksum while
+				// CreateMultipartUpload already declared the upload CRC32,
+				// making every CompletedPart's checksum silently absent and
+				// CompleteMultipartUpload's declared-vs-supplied check fail on
+				// real S3. Setting it here makes the SDK compute CRC32
+				// unconditionally, so declared and supplied always agree
+				// regardless of RequestChecksumCalculation.
+				ChecksumAlgorithm: types.ChecksumAlgorithmCrc32,
+			})
+			if uerr != nil {
+				return "", fmt.Errorf("store: s3 upload part %d for %s: %w", partNum, key, uerr)
+			}
+			// Carry every checksum field UploadPart returned (whichever the
+			// SDK actually computed — see CreateMultipartUploadInput's
+			// ChecksumAlgorithm comment above for why one is always present
+			// in practice) forward into CompletedPart. Dropping these (ETag/
+			// PartNumber alone) is what makes CompleteMultipartUpload below
+			// fail against real S3 once a checksum was attached to the part.
+			parts = append(parts, types.CompletedPart{
+				ETag:              up.ETag,
+				PartNumber:        aws.Int32(partNum),
+				ChecksumCRC32:     up.ChecksumCRC32,
+				ChecksumCRC32C:    up.ChecksumCRC32C,
+				ChecksumCRC64NVME: up.ChecksumCRC64NVME,
+				ChecksumSHA1:      up.ChecksumSHA1,
+				ChecksumSHA256:    up.ChecksumSHA256,
+			})
+			partNum++
 		}
-		// Carry every checksum field UploadPart returned (whichever the SDK
-		// actually computed — see CreateMultipartUploadInput's
-		// ChecksumAlgorithm comment above for why one is always present in
-		// practice) forward into CompletedPart. Dropping these (ETag/
-		// PartNumber alone) is what makes CompleteMultipartUpload below fail
-		// against real S3 once a checksum was attached to the part.
-		parts = append(parts, types.CompletedPart{
-			ETag:              up.ETag,
-			PartNumber:        aws.Int32(partNum),
-			ChecksumCRC32:     up.ChecksumCRC32,
-			ChecksumCRC32C:    up.ChecksumCRC32C,
-			ChecksumCRC64NVME: up.ChecksumCRC64NVME,
-			ChecksumSHA1:      up.ChecksumSHA1,
-			ChecksumSHA256:    up.ChecksumSHA256,
-		})
-		partNum++
 	}
 
 	completeIn := &s3.CompleteMultipartUploadInput{
@@ -572,6 +618,118 @@ func (s *S3) putMultipart(key string, r io.Reader, size int64, ifMatch string, c
 	}
 	completed = true
 	return aws.ToString(out.ETag), nil
+}
+
+// concurrentPartUpload uploads all parts of a putMultipart call in
+// parallel, bounded to multipartConcurrency simultaneous UploadPart calls.
+// Callers MUST only use this on the io.ReaderAt path (see putMultipart's
+// CONCURRENCY paragraph) — it reads each part via its own
+// io.NewSectionReader(ra, ...), which is what makes concurrent reads of the
+// same underlying source (ra) safe with no shared mutable state at all.
+//
+// Work distribution: part numbers 1..numParts are fed one at a time over an
+// UNBUFFERED channel to a small pool of worker goroutines, so a worker
+// blocks for its next assignment rather than a producer racing ahead of
+// the pool — there is never more than one part's worth of "assigned but not
+// yet started" work outstanding per idle worker.
+//
+// Ordering with no locking: parts is pre-sized to numParts up front, and
+// each worker writes its result to parts[partNum-1] — its own, permanently
+// distinct index. Go permits concurrent writes to DIFFERENT elements of the
+// same slice with no synchronization (only same-element access races), so
+// results land in ascending PartNumber order for free, regardless of which
+// order the underlying UploadPart calls actually complete in — no sort
+// step, no mutex, no risk of the eventual CompleteMultipartUpload seeing
+// gaps or duplicates.
+//
+// First-error-wins, cancel-the-rest: the first UploadPart failure is
+// captured via sync.Once (so a second failure — including one caused by the
+// cancellation below — can never overwrite the actually-first error) and
+// immediately cancels a context.WithCancel derived from ctx. Every
+// in-flight and not-yet-started UploadPart call observes that cancellation
+// promptly (the producer goroutine also stops handing out new part numbers
+// once it sees Done()), so a large upload fails fast on the first bad part
+// instead of paying for every remaining one. The function still waits
+// (sync.WaitGroup) for every worker to actually return before it returns
+// itself, so putMultipart's caller never issues AbortMultipartUpload while
+// one of this upload's UploadPart calls might still be in flight.
+func (s *S3) concurrentPartUpload(ctx context.Context, key, fk string, uploadID *string, ra io.ReaderAt, base, size, partSize int64, numParts int32) ([]types.CompletedPart, error) {
+	cctx, cancel := context.WithCancel(ctx)
+	defer cancel()
+
+	parts := make([]types.CompletedPart, numParts)
+	jobs := make(chan int32)
+
+	var firstErrOnce sync.Once
+	var firstErr error
+	recordErr := func(e error) {
+		firstErrOnce.Do(func() {
+			firstErr = e
+			cancel()
+		})
+	}
+
+	workers := multipartConcurrency
+	if workers < 1 {
+		workers = 1
+	}
+	if int32(workers) > numParts {
+		workers = int(numParts)
+	}
+
+	var wg sync.WaitGroup
+	wg.Add(workers)
+	for i := 0; i < workers; i++ {
+		go func() {
+			defer wg.Done()
+			for partNum := range jobs {
+				offset := int64(partNum-1) * partSize
+				n := partSize
+				if remain := size - offset; remain < n {
+					n = remain
+				}
+				up, uerr := s.cl.UploadPart(cctx, &s3.UploadPartInput{
+					Bucket: aws.String(s.bucket), Key: aws.String(fk),
+					UploadId: uploadID, PartNumber: aws.Int32(partNum),
+					Body: io.NewSectionReader(ra, base+offset, n), ContentLength: aws.Int64(n),
+					// See the identical ChecksumAlgorithm comment on the
+					// sequential-fallback UploadPart call in putMultipart —
+					// the same "must be explicit, not inferred" reasoning
+					// applies here unchanged.
+					ChecksumAlgorithm: types.ChecksumAlgorithmCrc32,
+				})
+				if uerr != nil {
+					recordErr(fmt.Errorf("store: s3 upload part %d for %s: %w", partNum, key, uerr))
+					continue
+				}
+				// Same checksum-field carry-forward as the sequential path;
+				// see putMultipart's CompletedPart construction comment.
+				parts[partNum-1] = types.CompletedPart{
+					ETag:              up.ETag,
+					PartNumber:        aws.Int32(partNum),
+					ChecksumCRC32:     up.ChecksumCRC32,
+					ChecksumCRC32C:    up.ChecksumCRC32C,
+					ChecksumCRC64NVME: up.ChecksumCRC64NVME,
+					ChecksumSHA1:      up.ChecksumSHA1,
+					ChecksumSHA256:    up.ChecksumSHA256,
+				}
+			}
+		}()
+	}
+
+	go func() {
+		defer close(jobs)
+		for partNum := int32(1); partNum <= numParts; partNum++ {
+			select {
+			case <-cctx.Done():
+				return
+			case jobs <- partNum:
+			}
+		}
+	}()
+
+	wg.Wait()
+	return parts, firstErr
 }
 
 func (s *S3) List(prefix string) ([]string, error) {
