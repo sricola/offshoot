@@ -13,6 +13,8 @@ version if you depend on format stability.
 
 ## [Unreleased]
 
+## [0.2.3] - 2026-08-09
+
 ### Added
 
 - **S3 snapshot uploads over 5 GiB no longer fail.** `store.S3.PutReader`/
