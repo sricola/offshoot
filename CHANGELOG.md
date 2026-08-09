@@ -13,6 +13,46 @@ version if you depend on format stability.
 
 ## [Unreleased]
 
+### Added
+
+- **S3 snapshot uploads over 5 GiB no longer fail.** `store.S3.PutReader`/
+  `PutReaderIf` previously issued a single `PutObject`, which S3 caps at 5
+  GiB — a snapshot of a larger database failed to upload. Both now switch to
+  a real multipart upload (`CreateMultipartUpload` + sequential `UploadPart`
+  + `CompleteMultipartUpload`) once size exceeds `multipartThreshold`
+  (default: 5 GiB, matching the single-PUT ceiling it replaces). Part size
+  is computed to respect S3's two hard limits — parts >= 5 MiB, at most
+  10,000 parts — so any object up to S3's 5 TiB per-object limit stays
+  within the part-count ceiling. `PutReaderIf`'s CAS condition
+  (`IfNoneMatch: "*"`/`IfMatch`) is placed on `CompleteMultipartUpload`, not
+  on `Create`/`UploadPart`, and a precondition rejection there maps to
+  `store.ErrCAS` exactly as the single-PUT path does — CAS semantics are
+  indistinguishable to callers regardless of which path an object's size
+  took. Below the threshold, behavior is byte-for-byte unchanged: the
+  original single-`PutObject` path, untouched.
+
+  Cost-critical: an abandoned multipart upload leaves its uploaded parts
+  billed on S3 indefinitely, so every error exit after a successful
+  `CreateMultipartUpload` — a part-upload failure, a part-read failure, a
+  `Complete` failure including a CAS rejection — runs `AbortMultipartUpload`
+  via a `defer`; only a successful `Complete` skips it. An abort failure is
+  appended to (never masks) the original error.
+
+  Part bodies avoid buffering the whole object: when the caller's reader is
+  an `io.ReaderAt` (true of the `*os.File` the only production caller —
+  `flush.go`'s snapshot upload — passes), each part streams directly from
+  the file via `io.NewSectionReader`, zero buffering. A non-`io.ReaderAt`
+  reader falls back to reading one part at a time into a reused,
+  part-sized buffer. `store.S3.CopyObject`'s separate 5 GiB server-side-copy
+  limit is untouched — that's a documented, unrelated fallback (to the slow
+  materialize-and-re-encode path), not a failure.
+
+  `multipartThreshold` is overridable in tests only (`export_test.go`'s
+  `SetMultipartThresholdForTest`) since a real >5 GiB upload can't be
+  exercised in a test; `storetest.FakeS3` now models the full multipart API
+  (Create/UploadPart/Complete/Abort) to make the path genuinely testable,
+  not just compiled.
+
 ## [0.2.2] - 2026-08-08
 
 ### Added
