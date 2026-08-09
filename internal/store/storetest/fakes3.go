@@ -62,6 +62,31 @@ type FakeS3 struct {
 	multipartUploadParts int
 	multipartCompletes   int
 	multipartAborts      int
+
+	// partGateMu/partGateN/partGateSeen/partGateCh implement a one-shot
+	// rendezvous gate for UploadPart requests — see ArmPartGate. Guarded by
+	// its own mutex, never f.mu: f.mu is held for a request's ENTIRE
+	// handling (see handle()), so gating on it would serialize every
+	// request through the lock itself and make concurrent overlap
+	// impossible to ever observe — exactly what this gate exists to prove.
+	partGateMu   sync.Mutex
+	partGateN    int
+	partGateSeen int
+	partGateCh   chan struct{}
+
+	// partDelayMu/partDelays let a test force a specific PartNumber's
+	// UploadPart request to sleep before being processed — see
+	// SetPartDelay. Also guarded independently of f.mu, for the same
+	// reason as the gate above.
+	partDelayMu sync.Mutex
+	partDelays  map[int32]time.Duration
+
+	// partTrackMu/partsInFlight/maxPartsInFlight record how many UploadPart
+	// requests are simultaneously "arrived but not yet fully handled" —
+	// see MaxPartsInFlight.
+	partTrackMu      sync.Mutex
+	partsInFlight    int
+	maxPartsInFlight int
 }
 
 // fakeMultipartUpload is one Created-but-not-yet-Completed-or-Aborted
@@ -120,6 +145,115 @@ func (f *FakeS3) SetBatchDeleteError(key string) {
 		f.batchDeleteErrs = map[string]bool{}
 	}
 	f.batchDeleteErrs[key] = true
+}
+
+// partGateTimeout bounds how long an UploadPart request armed by
+// ArmPartGate will wait for the gate to reach its target count. If
+// store.S3.putMultipart's concurrent path regresses to issuing UploadPart
+// calls one at a time, the gate never fires and every waiter would
+// otherwise hang forever; bounding the wait turns that into an ordinary
+// (if slow) test failure — visible via MaxPartsInFlight staying below the
+// armed count — instead of a hung test run.
+const partGateTimeout = 5 * time.Second
+
+// ArmPartGate arms a one-shot rendezvous gate for UploadPart requests: the
+// first n UploadPart requests to arrive all block until the nth one
+// arrives, at which point every one of them — and only them; later
+// requests, or requests beyond the first n, proceed immediately without
+// waiting — is released at the same moment. This is what makes "n parts
+// really were in flight at the same time" a deterministic assertion rather
+// than a timing-dependent guess: n genuinely-serialized requests can never
+// reach the gate's target and will each block until partGateTimeout, which
+// MaxPartsInFlight (staying < n) then reveals. Call before starting the
+// upload the gate is meant to observe; the gate is one-shot, so a test that
+// issues more than one multipart upload must re-arm it for each.
+func (f *FakeS3) ArmPartGate(n int) {
+	f.partGateMu.Lock()
+	defer f.partGateMu.Unlock()
+	f.partGateN = n
+	f.partGateSeen = 0
+	f.partGateCh = make(chan struct{})
+}
+
+// awaitPartGate blocks the calling UploadPart request per the gate armed by
+// ArmPartGate (a no-op if no gate is armed, i.e. partGateN <= 0). Must be
+// called BEFORE f.mu is acquired — see partGateMu's field doc comment.
+func (f *FakeS3) awaitPartGate() {
+	f.partGateMu.Lock()
+	if f.partGateN <= 0 {
+		f.partGateMu.Unlock()
+		return
+	}
+	f.partGateSeen++
+	seen, n, ch := f.partGateSeen, f.partGateN, f.partGateCh
+	f.partGateMu.Unlock()
+
+	if seen == n {
+		// The arrival that completes the rendezvous: release every other
+		// waiter at once; this request needs no further wait.
+		close(ch)
+		return
+	}
+	// seen < n: still waiting for the rendezvous to complete. seen > n
+	// (a request beyond the armed count): the gate already fired for an
+	// earlier arrival, ch is already closed, so this read returns
+	// immediately — same code path, no special case needed.
+	select {
+	case <-ch:
+	case <-time.After(partGateTimeout):
+	}
+}
+
+// SetPartDelay makes the UploadPart request for partNumber sleep d before
+// being processed. A test uses this to force out-of-order completion
+// (delay an early part so later parts finish first) and prove
+// store.S3.putMultipart's concurrent path reconstructs an in-order
+// CompletedPart list from out-of-order completions, not from luck. Must be
+// set before the upload it targets begins.
+func (f *FakeS3) SetPartDelay(partNumber int32, d time.Duration) {
+	f.partDelayMu.Lock()
+	defer f.partDelayMu.Unlock()
+	if f.partDelays == nil {
+		f.partDelays = map[int32]time.Duration{}
+	}
+	f.partDelays[partNumber] = d
+}
+
+func (f *FakeS3) partDelay(partNumber int32) time.Duration {
+	f.partDelayMu.Lock()
+	defer f.partDelayMu.Unlock()
+	return f.partDelays[partNumber]
+}
+
+// MaxPartsInFlight returns the highest number of UploadPart requests this
+// fake has ever observed simultaneously in flight (arrived but not yet
+// fully handled) since it was created. A test asserts this stays 1 for the
+// non-ReaderAt fallback and for multipartConcurrency==1, and rises above 1
+// (or matches an armed multipartConcurrency) when proving the concurrent
+// io.ReaderAt path actually overlaps requests.
+func (f *FakeS3) MaxPartsInFlight() int {
+	f.partTrackMu.Lock()
+	defer f.partTrackMu.Unlock()
+	return f.maxPartsInFlight
+}
+
+// trackPartInFlight records one more UploadPart request as in flight and
+// returns a func that un-records it; the caller defers that func for the
+// remainder of the request's handling. Guarded by its own mutex (not f.mu)
+// so the tracked count reflects requests that have ARRIVED, independent of
+// how the rest of this fake happens to serialize their processing.
+func (f *FakeS3) trackPartInFlight() (untrack func()) {
+	f.partTrackMu.Lock()
+	f.partsInFlight++
+	if f.partsInFlight > f.maxPartsInFlight {
+		f.maxPartsInFlight = f.partsInFlight
+	}
+	f.partTrackMu.Unlock()
+	return func() {
+		f.partTrackMu.Lock()
+		f.partsInFlight--
+		f.partTrackMu.Unlock()
+	}
 }
 
 // MultipartStats returns how many CreateMultipartUpload, UploadPart,
@@ -183,6 +317,27 @@ func (f *FakeS3) handle(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	key := keyOf(r.URL.Path)
+
+	// A genuine UploadPart request (not UploadPartCopy, which carries the
+	// same partNumber/uploadId query params but never has anything to gate
+	// or delay): run the concurrency-testing hooks BEFORE f.mu is acquired
+	// below. See partGateMu's field doc comment for why — f.mu is held for
+	// this request's entire handling, so blocking here while holding it
+	// would serialize every request through the lock itself.
+	if r.Method == http.MethodPut {
+		q := r.URL.Query()
+		if q.Get("partNumber") != "" && q.Get("uploadId") != "" && r.Header.Get("X-Amz-Copy-Source") == "" {
+			untrack := f.trackPartInFlight()
+			defer untrack()
+			f.awaitPartGate()
+			if n, err := strconv.Atoi(q.Get("partNumber")); err == nil {
+				if d := f.partDelay(int32(n)); d > 0 {
+					time.Sleep(d)
+				}
+			}
+		}
+	}
+
 	f.mu.Lock()
 	defer f.mu.Unlock()
 
