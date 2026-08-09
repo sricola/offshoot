@@ -1,9 +1,11 @@
 package store_test
 
 import (
+	"bytes"
 	"context"
 	"crypto/rand"
 	"encoding/hex"
+	"errors"
 	"os"
 	"testing"
 
@@ -51,6 +53,69 @@ func TestS3RealProvider(t *testing.T) {
 	})
 	t.Run("Conformance", func(t *testing.T) {
 		storetest.RunConformance(t, "", newBackend)
+	})
+	t.Run("Multipart", func(t *testing.T) {
+		// storetest.FakeS3 can never catch a real provider rejecting
+		// CompleteMultipartUpload (e.g. AWS's own "InvalidRequest: ... must
+		// include the checksum for each part" when a checksum algorithm was
+		// attached to the upload but a part's CompletedPart entry dropped
+		// it) — it's plain HTTP, so the SDK never even takes the code path
+		// that matters here, and it doesn't model per-provider checksum
+		// enforcement at all. CAS-on-Complete is precondition handling on a
+		// comparatively new API surface, unevenly implemented across S3-
+		// compatible providers — exactly the class of thing this file's own
+		// doc comment says only a real provider can prove.
+		restoreThreshold := store.SetMultipartThresholdForTest(1024) // 1 KiB
+		restorePartSize := store.SetPartSizeForTest(5 * 1024 * 1024) // 5 MiB: S3's real minimum part size
+		t.Cleanup(func() {
+			restorePartSize()
+			restoreThreshold()
+		})
+
+		b := newBackend(t)
+		rp, ok := b.(store.ReaderPutter)
+		if !ok {
+			t.Fatal("store.S3 must implement store.ReaderPutter")
+		}
+
+		// Two full parts plus a partial third, at the overridden 5 MiB part
+		// size — enough to force a genuine multipart upload against the
+		// real provider without pushing a several-hundred-MiB payload
+		// through an integration test.
+		payload := make([]byte, 2*5*1024*1024+1024*1024)
+		if _, err := rand.Read(payload); err != nil {
+			t.Fatal(err)
+		}
+
+		etag, err := rp.PutReaderIf("multipart/big.ltx", bytes.NewReader(payload), int64(len(payload)), "")
+		if err != nil {
+			t.Fatalf("PutReaderIf (multipart) against a real provider: %v", err)
+		}
+		if etag == "" {
+			t.Error("PutReaderIf (multipart) must return a non-empty etag")
+		}
+
+		got, _, err := b.Get("multipart/big.ltx")
+		if err != nil {
+			t.Fatal(err)
+		}
+		if !bytes.Equal(got, payload) {
+			t.Fatalf("Get after real-provider multipart PutReaderIf: got %d bytes, want %d bytes, equal=false",
+				len(got), len(payload))
+		}
+
+		// Create-only CAS conflict must be reported correctly by the real
+		// provider's CompleteMultipartUpload IfNoneMatch handling — the
+		// fake proves this backend's own precondition-mapping logic is
+		// right, but only a real provider proves the header is actually
+		// honored server-side.
+		second := make([]byte, len(payload))
+		if _, err := rand.Read(second); err != nil {
+			t.Fatal(err)
+		}
+		if _, err := rp.PutReaderIf("multipart/big.ltx", bytes.NewReader(second), int64(len(second)), ""); !errors.Is(err, store.ErrCAS) {
+			t.Fatalf("create-only multipart write to an existing key on a real provider: got %v, want store.ErrCAS", err)
+		}
 	})
 }
 

@@ -228,12 +228,20 @@ const minPartSize = 5 * 1024 * 1024 // 5 MiB
 
 // defaultPartSize is the part size store.S3 uses for a multipart upload
 // when the object isn't large enough to force a bigger size via maxParts
-// (see partSizeFor) — 8 MiB, the same default the AWS CLI's own
-// multipart_chunksize uses. Large enough to keep the part count (and
-// therefore UploadPart round trips) reasonable for a multi-GiB snapshot,
-// small enough to keep the non-io.ReaderAt fallback's per-part buffer a
-// modest, fixed amount of memory.
-const defaultPartSize = 8 * 1024 * 1024 // 8 MiB
+// (see partSizeFor) — 64 MiB. Parts upload strictly sequentially (no
+// concurrency — see putMultipart's doc comment), so part size directly sets
+// the RPC count and therefore the wall-clock cost of a large upload: at 64
+// MiB a 5 GiB snapshot is ~80 sequential UploadPart round trips; the AWS
+// CLI's smaller 8 MiB default is only cheap there because it's paired with
+// 10 concurrent part uploads, which this backend does not (yet) do — with
+// no concurrency, a smaller default part size is strictly worse, not a
+// safer/more conservative choice.
+//
+// This is a package var, not a const, ONLY so tests can shrink it —
+// exercising "several real parts" against a real ~1 GiB+ payload isn't a
+// reasonable ask of a unit test. Never set it outside a test; production
+// code must never assign to it. See SetPartSizeForTest (export_test.go).
+var defaultPartSize int64 = 64 * 1024 * 1024 // 64 MiB
 
 // maxParts is S3's hard limit on the number of parts a single multipart
 // upload may have (S3 API constraint).
@@ -259,7 +267,7 @@ var multipartThreshold int64 = 5 * 1024 * 1024 * 1024 // 5 GiB
 // S3's 5 TiB per-object limit within the 10,000-part ceiling. The final part
 // is always whatever remains (<= the computed part size), never padded.
 func partSizeFor(size int64) int64 {
-	ps := int64(defaultPartSize)
+	ps := defaultPartSize
 	if need := (size + maxParts - 1) / maxParts; need > ps {
 		ps = need
 	}
@@ -381,13 +389,20 @@ func (s *S3) PutReaderIf(key string, r io.Reader, size int64, ifMatch string) (s
 // still needs to know the write failed, and the abort failure is surfaced
 // too so an operator can investigate the now-possibly-lingering upload.
 //
-// Part sourcing avoids buffering the whole object: when r is an
-// io.ReaderAt (true for the *os.File the production caller — flush.go's
-// snapshot upload — passes), each part is an io.NewSectionReader(ra,
-// offset, n) — zero buffering, the SDK reads directly from the file at each
-// part's offset. When r is not an io.ReaderAt, each part is instead read
-// fully into a single reused buffer sized to one part (bounded memory: at
-// most one part's worth, reused across parts, never the whole object).
+// Part sourcing avoids buffering the whole object: when r is BOTH an
+// io.ReaderAt and an io.Seeker (true for the *os.File the production
+// caller — flush.go's snapshot upload — passes), each part is an
+// io.NewSectionReader(ra, base+offset, n), where base is r's position at
+// entry (via Seek(0, SeekCurrent)) — zero buffering, the SDK reads directly
+// from the file at each part's offset. The Seeker requirement (not just
+// ReaderAt) matters: ReadAt always takes an absolute offset from the start
+// of the underlying data, so without capturing base a seeked-then-passed
+// reader would silently upload the wrong bytes above multipartThreshold
+// while the single-PUT path below it (which reads from r's current
+// position via Body: r) would not — see the base offset comment in the
+// loop below. When r is not both, each part is instead read fully into a
+// single reused buffer sized to one part (bounded memory: at most one
+// part's worth, reused across parts, never the whole object).
 //
 // Parts are uploaded sequentially, not concurrently — correctness first;
 // concurrent part uploads are a plausible future improvement once this
@@ -401,6 +416,18 @@ func (s *S3) putMultipart(key string, r io.Reader, size int64, ifMatch string, c
 
 	created, err := s.cl.CreateMultipartUpload(ctx, &s3.CreateMultipartUploadInput{
 		Bucket: aws.String(s.bucket), Key: aws.String(fk),
+		// Explicit, not inferred: the SDK's default RequestChecksumCalculation
+		// is WhenSupported (not WhenRequired), so every UploadPart call below
+		// gets a CRC32 checksum attached whether or not this field is set —
+		// S3 then infers the whole multipart upload's checksum algorithm from
+		// the first part it sees. Declaring it here up front makes that
+		// contract explicit rather than accidental, and matches what
+		// CompleteMultipartUpload below must now supply per part (see the
+		// CompletedPart construction in the loop) — S3 rejects Complete with
+		// "InvalidRequest: ... must include the checksum for each part" if a
+		// part's checksum is dropped, which types.CompletedPart{ETag,
+		// PartNumber} alone (the pre-fix shape) silently did.
+		ChecksumAlgorithm: types.ChecksumAlgorithmCrc32,
 	})
 	if err != nil {
 		return "", fmt.Errorf("store: s3 create multipart upload %s: %w", key, err)
@@ -421,9 +448,31 @@ func (s *S3) putMultipart(key string, r io.Reader, size int64, ifMatch string, c
 	}()
 
 	partSize := partSizeFor(size)
+	// The zero-buffer path needs BOTH io.ReaderAt (to read a part without
+	// consuming r) AND io.Seeker (to learn r's CURRENT position, since
+	// io.ReaderAt.ReadAt always takes an ABSOLUTE offset from the start of
+	// the underlying data, not from wherever r happens to be positioned
+	// now). Using ReaderAt alone would silently read from absolute offset 0
+	// regardless of where the caller had already Seek'd r to — correct for
+	// the common case (a freshly opened file) but wrong, silently, for any
+	// caller that seeks first and expects the single-PUT path's semantics
+	// (Body: r, which always reads from r's current position — see
+	// PutReader's doc comment) to carry over. A reader that fails Seek(0,
+	// SeekCurrent) (satisfies the interface but errors, e.g. a pipe) also
+	// falls back rather than risk reading from the wrong place.
 	ra, isReaderAt := r.(io.ReaderAt)
+	seeker, isSeeker := r.(io.Seeker)
+	var base int64
+	useReaderAt := isReaderAt && isSeeker
+	if useReaderAt {
+		var serr error
+		base, serr = seeker.Seek(0, io.SeekCurrent)
+		if serr != nil {
+			useReaderAt = false
+		}
+	}
 	var buf []byte
-	if !isReaderAt {
+	if !useReaderAt {
 		buf = make([]byte, partSize)
 	}
 
@@ -436,8 +485,8 @@ func (s *S3) putMultipart(key string, r io.Reader, size int64, ifMatch string, c
 		}
 
 		var body io.Reader
-		if isReaderAt {
-			body = io.NewSectionReader(ra, offset, n)
+		if useReaderAt {
+			body = io.NewSectionReader(ra, base+offset, n)
 		} else {
 			if _, rerr := io.ReadFull(io.LimitReader(r, n), buf[:n]); rerr != nil {
 				return "", fmt.Errorf("store: s3 read part %d for %s: %w", partNum, key, rerr)
@@ -453,13 +502,31 @@ func (s *S3) putMultipart(key string, r io.Reader, size int64, ifMatch string, c
 		if uerr != nil {
 			return "", fmt.Errorf("store: s3 upload part %d for %s: %w", partNum, key, uerr)
 		}
-		parts = append(parts, types.CompletedPart{ETag: up.ETag, PartNumber: aws.Int32(partNum)})
+		// Carry every checksum field UploadPart returned (whichever the SDK
+		// actually computed — see CreateMultipartUploadInput's
+		// ChecksumAlgorithm comment above for why one is always present in
+		// practice) forward into CompletedPart. Dropping these (ETag/
+		// PartNumber alone) is what makes CompleteMultipartUpload below fail
+		// against real S3 once a checksum was attached to the part.
+		parts = append(parts, types.CompletedPart{
+			ETag:              up.ETag,
+			PartNumber:        aws.Int32(partNum),
+			ChecksumCRC32:     up.ChecksumCRC32,
+			ChecksumCRC32C:    up.ChecksumCRC32C,
+			ChecksumCRC64NVME: up.ChecksumCRC64NVME,
+			ChecksumSHA1:      up.ChecksumSHA1,
+			ChecksumSHA256:    up.ChecksumSHA256,
+		})
 		partNum++
 	}
 
 	completeIn := &s3.CompleteMultipartUploadInput{
 		Bucket: aws.String(s.bucket), Key: aws.String(fk), UploadId: uploadID,
 		MultipartUpload: &types.CompletedMultipartUpload{Parts: parts},
+		// Free defense-in-depth against this backend's own offset-arithmetic
+		// bugs: S3 rejects Complete with a 400 if the parts' total length
+		// doesn't match, instead of silently storing a wrong-length object.
+		MpuObjectSize: aws.Int64(size),
 	}
 	if conditional {
 		if ifMatch == "" {

@@ -6,11 +6,37 @@ import (
 	"errors"
 	"io"
 	"net/http"
+	"os"
+	"path/filepath"
 	"testing"
 
 	"github.com/sricola/offshoot/internal/store"
 	"github.com/sricola/offshoot/internal/store/storetest"
 )
+
+// testPartSize is the part size these tests drive store.S3's multipart path
+// with, via store.SetPartSizeForTest — S3's real 5 MiB minimum part size
+// (store's own minPartSize floor prevents going any lower), not production's
+// 64 MiB default. Exercising "several real parts" at the real default would
+// need a several-hundred-MiB test payload; overriding down to the true S3
+// floor keeps a several-part round trip to a ~10 MiB payload while still
+// respecting a real S3 constraint (not an arbitrary shrink).
+const testPartSize = 5 * 1024 * 1024 // 5 MiB, == store's minPartSize
+
+// smallMultipartSettings overrides both multipartThreshold and the
+// multipart part size low enough that a modest test payload takes the
+// multipart path and splits into multiple genuine parts, restoring both via
+// t.Cleanup. Every test below that wants to exercise the multipart path
+// calls this first.
+func smallMultipartSettings(t *testing.T) {
+	t.Helper()
+	restoreThreshold := store.SetMultipartThresholdForTest(1024) // 1 KiB
+	restorePartSize := store.SetPartSizeForTest(testPartSize)
+	t.Cleanup(func() {
+		restorePartSize()
+		restoreThreshold()
+	})
+}
 
 // newFakeBackedWithFake is newFakeBacked (s3_test.go) but also returns the
 // underlying *storetest.FakeS3, so a test can inspect its multipart-request
@@ -33,25 +59,19 @@ func newFakeBackedWithFake(t *testing.T) (store.Backend, *storetest.FakeS3) {
 }
 
 // onlyReader wraps an io.Reader and exposes nothing else — in particular
-// NOT io.ReaderAt, even though the underlying *bytes.Reader would satisfy
-// it. Used to force store.S3.putMultipart onto its buffered-read fallback
-// path (TestS3PutReaderIfMultipartNonReaderAtFallback), the same way a
-// non-seekable network stream would in production.
+// NEITHER io.ReaderAt NOR io.Seeker, even though the underlying
+// *bytes.Reader would satisfy both. Used to force store.S3.putMultipart
+// onto its buffered-read fallback path (TestS3PutReaderIfMultipartNonReaderAtFallback),
+// the same way a non-seekable network stream would in production.
 type onlyReader struct{ r io.Reader }
 
 func (o *onlyReader) Read(p []byte) (int, error) { return o.r.Read(p) }
 
 // multipartPayload returns a payload deterministic and large enough to
-// force several real parts at store.S3's actual (un-overridden)
-// defaultPartSize (8 MiB): two full parts plus a partial third, so the
-// round-trip test below exercises part-boundary handling and last-part
-// truncation with the real production part size, not a shrunk test-only
-// one — only multipartThreshold is overridden low, per
-// SetMultipartThresholdForTest's doc comment (a real multi-GiB object is
-// the only thing that's actually untestable).
+// force several real parts at testPartSize: two full parts plus a partial
+// third, so tests exercise part-boundary handling and last-part truncation.
 func multipartPayload() []byte {
-	const partSize = 8 * 1024 * 1024 // must match store.defaultPartSize
-	size := 2*partSize + 1024*1024   // two full parts + a 1 MiB partial third
+	size := 2*testPartSize + 1024*1024 // two full parts + a 1 MiB partial third
 	b := make([]byte, size)
 	for i := range b {
 		// A non-repeating-per-part pattern: catches a part-ordering bug
@@ -62,14 +82,13 @@ func multipartPayload() []byte {
 }
 
 // TestS3PutReaderIfMultipartRoundTrip pins the core multipart write path:
-// with the threshold forced low, a payload larger than a single part
-// uploads via CreateMultipartUpload/UploadPart*/CompleteMultipartUpload and
-// reads back byte-identical via Get — proving part ordering, concatenation,
-// and no corruption — and the fake actually saw a multipart upload (more
-// than one part), not a single PUT.
+// with the threshold and part size forced low, a payload larger than a
+// single part uploads via CreateMultipartUpload/UploadPart*/
+// CompleteMultipartUpload and reads back byte-identical via Get — proving
+// part ordering, concatenation, and no corruption — and the fake actually
+// saw a multipart upload (more than one part), not a single PUT.
 func TestS3PutReaderIfMultipartRoundTrip(t *testing.T) {
-	restore := store.SetMultipartThresholdForTest(1024) // 1 KiB
-	t.Cleanup(restore)
+	smallMultipartSettings(t)
 
 	b, f := newFakeBackedWithFake(t)
 	rp := b.(store.ReaderPutter)
@@ -104,34 +123,107 @@ func TestS3PutReaderIfMultipartRoundTrip(t *testing.T) {
 	}
 }
 
+// TestS3PutReaderIfMultipartSeekedReaderAt pins the fix for a silent-
+// corruption bug: putMultipart's zero-buffer io.ReaderAt path used to read
+// each part from ABSOLUTE offset 0 in the underlying data, ignoring
+// wherever the caller's reader was actually positioned — correct only for a
+// freshly opened file (today's only production caller), wrong for any
+// reader a caller had already Seek'd, and wrong silently, only above
+// multipartThreshold, only in production. This test opens a real *os.File
+// (both io.ReaderAt and io.Seeker, the same shape flush.go passes), seeks
+// it partway in, uploads from there, and asserts the object matches only
+// the bytes from the seek point onward — not the whole file from byte 0.
+func TestS3PutReaderIfMultipartSeekedReaderAt(t *testing.T) {
+	smallMultipartSettings(t)
+
+	b, _ := newFakeBackedWithFake(t)
+	rp := b.(store.ReaderPutter)
+
+	prefix := bytes.Repeat([]byte{0xEE}, 1024*1024) // 1 MiB of filler before the seek point
+	payload := multipartPayload()
+	full := append(append([]byte{}, prefix...), payload...)
+
+	dir := t.TempDir()
+	path := filepath.Join(dir, "seeked-source.bin")
+	if err := os.WriteFile(path, full, 0o644); err != nil {
+		t.Fatal(err)
+	}
+	f, err := os.Open(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer f.Close()
+	if _, err := f.Seek(int64(len(prefix)), io.SeekStart); err != nil {
+		t.Fatal(err)
+	}
+
+	etag, err := rp.PutReaderIf("data/x/seeked.ltx", f, int64(len(payload)), "")
+	if err != nil {
+		t.Fatalf("PutReaderIf (multipart, seeked *os.File): %v", err)
+	}
+	if etag == "" {
+		t.Error("PutReaderIf must return a non-empty etag")
+	}
+
+	got, _, err := b.Get("data/x/seeked.ltx")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !bytes.Equal(got, payload) {
+		t.Fatalf("Get after seeked multipart PutReaderIf: got %d bytes, want %d bytes matching the POST-SEEK content "+
+			"(a base-offset bug would instead return the file's first %d bytes, i.e. the filler prefix)",
+			len(got), len(payload), len(payload))
+	}
+}
+
 // TestS3PutReaderIfMultipartCASParity pins that CAS semantics are
 // indistinguishable between the single-PUT and multipart paths — the same
 // create-only and never-written-key cases storetest.RunConformance already
-// pins for the single-PUT path (see conformance.go's ReaderPutter subtest).
+// pins for the single-PUT path (see conformance.go's ReaderPutter subtest)
+// — AND that a losing CAS race still aborts the multipart upload it made:
+// this is the highest-frequency real leak path (every retried, losing
+// writer uploads a full object's worth of parts before losing the
+// Complete), so each ErrCAS assertion below is paired with an abort check.
 func TestS3PutReaderIfMultipartCASParity(t *testing.T) {
-	restore := store.SetMultipartThresholdForTest(1024) // 1 KiB
-	t.Cleanup(restore)
+	smallMultipartSettings(t)
 
-	b, _ := newFakeBackedWithFake(t)
+	b, f := newFakeBackedWithFake(t)
 	rp := b.(store.ReaderPutter)
 
 	payload := multipartPayload()
 	if _, err := rp.PutReaderIf("data/x/cas.ltx", bytes.NewReader(payload), int64(len(payload)), ""); err != nil {
 		t.Fatalf("first create-only multipart write: %v", err)
 	}
+	if _, _, completes, aborts := f.MultipartStats(); completes != 1 || aborts != 0 {
+		t.Fatalf("after the first (winning) write: completes=%d aborts=%d, want completes=1 aborts=0", completes, aborts)
+	}
 
 	// A second create-only (ifMatch == "") write to the SAME key must
-	// conflict — key already exists.
+	// conflict — key already exists — and MUST abort its multipart upload:
+	// every part of `second` was already uploaded by the time Complete is
+	// rejected.
 	second := multipartPayload()
 	if _, err := rp.PutReaderIf("data/x/cas.ltx", bytes.NewReader(second), int64(len(second)), ""); !errors.Is(err, store.ErrCAS) {
 		t.Fatalf("second create-only multipart write to an existing key: got %v, want store.ErrCAS", err)
 	}
+	if _, _, completes, aborts := f.MultipartStats(); completes != 1 || aborts != 1 {
+		t.Fatalf("after the losing create-only write: completes=%d aborts=%d, want completes=1 (unchanged) aborts=1", completes, aborts)
+	}
+	if pending := f.PendingMultipartUploads(); pending != 0 {
+		t.Fatalf("PendingMultipartUploads = %d after a losing create-only CAS, want 0", pending)
+	}
 
 	// A CAS (ifMatch != "") write against a key that was never written must
-	// also conflict — nothing to compare against.
+	// also conflict — nothing to compare against — and also abort.
 	third := multipartPayload()
 	if _, err := rp.PutReaderIf("data/x/cas-never-written.ltx", bytes.NewReader(third), int64(len(third)), "some-etag"); !errors.Is(err, store.ErrCAS) {
 		t.Fatalf("multipart CAS write against a never-written key: got %v, want store.ErrCAS", err)
+	}
+	if _, _, completes, aborts := f.MultipartStats(); completes != 1 || aborts != 2 {
+		t.Fatalf("after the never-written-key CAS: completes=%d aborts=%d, want completes=1 (unchanged) aborts=2", completes, aborts)
+	}
+	if pending := f.PendingMultipartUploads(); pending != 0 {
+		t.Fatalf("PendingMultipartUploads = %d after a never-written-key CAS, want 0", pending)
 	}
 }
 
@@ -143,8 +235,7 @@ func TestS3PutReaderIfMultipartCASParity(t *testing.T) {
 // call to fail via storetest.FakeS3.SetFault, then asserts the error
 // propagates AND no upload is left pending.
 func TestS3PutReaderIfMultipartAbortsOnFailure(t *testing.T) {
-	restore := store.SetMultipartThresholdForTest(1024) // 1 KiB
-	t.Cleanup(restore)
+	smallMultipartSettings(t)
 
 	b, f := newFakeBackedWithFake(t)
 	rp := b.(store.ReaderPutter)
@@ -215,22 +306,25 @@ func TestS3PutReaderBelowThresholdUnchanged(t *testing.T) {
 }
 
 // TestS3PutReaderIfMultipartNonReaderAtFallback pins putMultipart's
-// buffered-read fallback: when r is NOT an io.ReaderAt (unlike the
-// production caller's *os.File), each part is still read and uploaded
-// correctly via the io.LimitReader + reused-buffer path.
+// buffered-read fallback: when r is NEITHER an io.ReaderAt NOR an
+// io.Seeker (unlike the production caller's *os.File), each part is still
+// read and uploaded correctly via the io.LimitReader + reused-buffer path.
 func TestS3PutReaderIfMultipartNonReaderAtFallback(t *testing.T) {
-	restore := store.SetMultipartThresholdForTest(1024) // 1 KiB
-	t.Cleanup(restore)
+	smallMultipartSettings(t)
 
 	b, f := newFakeBackedWithFake(t)
 	rp := b.(store.ReaderPutter)
 
 	payload := multipartPayload()
 	r := &onlyReader{r: bytes.NewReader(payload)}
-	// Sanity: onlyReader must not accidentally satisfy io.ReaderAt via some
-	// promoted method, or this test would not exercise the fallback at all.
+	// Sanity: onlyReader must not accidentally satisfy io.ReaderAt or
+	// io.Seeker via some promoted method, or this test would not exercise
+	// the fallback at all.
 	if _, ok := io.Reader(r).(io.ReaderAt); ok {
 		t.Fatal("onlyReader must not implement io.ReaderAt")
+	}
+	if _, ok := io.Reader(r).(io.Seeker); ok {
+		t.Fatal("onlyReader must not implement io.Seeker")
 	}
 
 	etag, err := rp.PutReaderIf("data/x/non-readerat.ltx", r, int64(len(payload)), "")

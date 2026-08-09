@@ -39,19 +39,46 @@ version if you depend on format stability.
   appended to (never masks) the original error.
 
   Part bodies avoid buffering the whole object: when the caller's reader is
-  an `io.ReaderAt` (true of the `*os.File` the only production caller —
-  `flush.go`'s snapshot upload — passes), each part streams directly from
-  the file via `io.NewSectionReader`, zero buffering. A non-`io.ReaderAt`
-  reader falls back to reading one part at a time into a reused,
-  part-sized buffer. `store.S3.CopyObject`'s separate 5 GiB server-side-copy
-  limit is untouched — that's a documented, unrelated fallback (to the slow
+  both an `io.ReaderAt` AND an `io.Seeker` (true of the `*os.File` the only
+  production caller — `flush.go`'s snapshot upload — passes), each part
+  streams directly from the file via `io.NewSectionReader`, zero buffering
+  — the reader's current position (via `Seek(0, SeekCurrent)`) is captured
+  as a base offset so a reader the caller already seeked into uploads the
+  same bytes the single-`PutObject` path would have (that path reads from
+  `r`'s current position via `Body: r`); `io.ReaderAt` alone would silently
+  read from absolute offset 0 instead. A reader missing either falls back
+  to reading one part at a time into a reused, part-sized buffer.
+  `store.S3.CopyObject`'s separate 5 GiB server-side-copy limit is
+  untouched — that's a documented, unrelated fallback (to the slow
   materialize-and-re-encode path), not a failure.
 
-  `multipartThreshold` is overridable in tests only (`export_test.go`'s
-  `SetMultipartThresholdForTest`) since a real >5 GiB upload can't be
-  exercised in a test; `storetest.FakeS3` now models the full multipart API
+  Each part's checksum (S3's default `RequestChecksumCalculation:
+  WhenSupported` attaches a CRC32 checksum to every `UploadPart` whether or
+  not this backend asks for one) is carried from `UploadPartOutput` into
+  its `CompletedPart` entry, and `CreateMultipartUpload` now declares
+  `ChecksumAlgorithm: CRC32` explicitly rather than leaving it inferred —
+  dropping a part's checksum makes a real S3 `CompleteMultipartUpload` fail
+  with `InvalidRequest`, a case the in-process fake cannot reproduce (plain
+  HTTP takes a different SDK code path than the `aws-chunked` framing
+  production traffic uses over TLS). `CompleteMultipartUploadInput` also
+  now sets `MpuObjectSize` to the expected total, so a length mismatch from
+  this backend's own offset arithmetic is rejected by S3 with a 400 instead
+  of silently storing a wrong-length object.
+
+  Part size defaults to 64 MiB (`defaultPartSize`), not a smaller
+  "AWS-CLI-like" default — parts upload strictly sequentially (no
+  concurrency yet), so a smaller default part size only means more
+  sequential round trips for no benefit. Both `multipartThreshold` and
+  `defaultPartSize` are overridable in tests only
+  (`export_test.go`'s `SetMultipartThresholdForTest` /
+  `SetPartSizeForTest`) since a real >5 GiB upload, or one with a
+  production-sized 64 MiB part, can't be exercised in a test;
+  `storetest.FakeS3` now models the full multipart API
   (Create/UploadPart/Complete/Abort) to make the path genuinely testable,
-  not just compiled.
+  not just compiled. `TestS3RealProvider` (env-gated on
+  `OFFSHOOT_S3_TEST_BUCKET`) gained a multipart subtest — a real provider's
+  `CompleteMultipartUpload` precondition/checksum handling is the only
+  evidence the in-process fake can never substitute for.
 
 ### Changed
 
