@@ -316,6 +316,22 @@ from under live children — silent data loss. Upgrade every binary that
 touches a store before any of them starts forking; there is no downgrade
 path once a base pointer exists.
 
+**On S3-compatible backends, configure a bucket lifecycle rule to expire
+incomplete multipart uploads.** Every multipart write and multipart
+server-side copy this backend issues (large snapshot uploads, and `fork`'s
+fast path / `CopyObject` for objects over 5 GiB) aborts on any error path,
+but an abort is a best-effort client-side call, not a transactional
+guarantee — S3 may already be persisting a part the client just canceled,
+so an abort can occasionally need to be effectively re-issued (AWS's own
+documentation notes this), and a process that crashes or loses its network
+mid-upload never gets to call abort at all. Either way, an abandoned
+part is billed by S3 indefinitely on its own — offshoot's GC only reasons
+about *completed* objects it knows about, not in-progress multipart
+uploads, so it will never clean these up. S3's own bucket lifecycle rules
+(`AbortIncompleteMultipartUpload`, configurable in days) are the standard
+operational answer to this and cost nothing to set up once per bucket;
+offshoot does not configure this for you.
+
 ## HTTP/auth threat model
 
 **This is single-tenant, same-host-or-trusted-network auth — not a
