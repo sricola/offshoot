@@ -814,15 +814,17 @@ func TestForkFastPathMatchesSlowPath(t *testing.T) {
 // TestForkFastPathFiresOnS3WithinSizeLimit pins Task 6b's behavior: S3
 // server-side CopyObject means forking a single-snapshot chain over an S3
 // backend now takes the SAME fast path the local backend does (Task 6a),
-// for any object at or under S3's 5GB single-request CopyObject limit —
-// this is no longer the "S3 always falls back" world Task 6a shipped with.
-// The size-gated fallback itself (over the limit, store.ErrCopyUnsupported)
-// is pinned directly against store.S3.CopyObject in
-// internal/store/s3_test.go's TestS3CopyObjectOverSizeLimitFallsBack — that
-// path shares tryFastForkCopy's generic errors.Is(err,
-// store.ErrCopyUnsupported) fallback wiring with
-// TestForkFastPathSkipsMultiMemberChains (gc_chain_test.go), so it isn't
-// duplicated again here at the ops level.
+// for any object up to S3's actual 5TiB per-object ceiling — CopyObject
+// now performs a real multipart server-side copy above the 5GB
+// single-request limit instead of falling back, so that limit no longer
+// bounds the fast path at all. This is no longer the "S3 always falls
+// back" world Task 6a shipped with. The size-gated fallback itself (over
+// 5TiB, store.ErrCopyUnsupported) is pinned directly against
+// store.S3.CopyObject in internal/store/s3_test.go's
+// TestS3CopyObjectOverSizeLimitFallsBack — that path shares
+// tryFastForkCopy's generic errors.Is(err, store.ErrCopyUnsupported)
+// fallback wiring with TestForkFastPathSkipsMultiMemberChains
+// (gc_chain_test.go), so it isn't duplicated again here at the ops level.
 func TestForkFastPathFiresOnS3WithinSizeLimit(t *testing.T) {
 	testutil.RequireSQLite3(t)
 	// Force the materialize branch (a plain Fork now shares) — see

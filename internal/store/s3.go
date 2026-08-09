@@ -652,7 +652,24 @@ func (s *S3) putMultipart(key string, r io.Reader, size int64, ifMatch string, c
 // instead of paying for every remaining one. The function still waits
 // (sync.WaitGroup) for every worker to actually return before it returns
 // itself, so putMultipart's caller never issues AbortMultipartUpload while
-// one of this upload's UploadPart calls might still be in flight.
+// this GO PROCESS still has an UploadPart call outstanding — that is a
+// client-side guarantee only. S3 itself may already be finishing a part
+// whose request context we just canceled: canceling the client-side call
+// doesn't retroactively un-happen the write S3 was partway through
+// executing, so a part can still materialize on S3's side after the
+// client-side call "returned" canceled and after AbortMultipartUpload
+// lands (AWS's own docs note an abort can need repeating for exactly this
+// reason). The prior strictly-sequential code never canceled anything
+// in-flight, so this is a genuine, new-to-concurrency possibility, not a
+// pre-existing one — but it is also the ordinary shape of ANY concurrent
+// multipart failure against real S3, not specific to this implementation,
+// and every offshoot caller already tolerates an abort that doesn't
+// instantly free 100% of a failed upload's storage (see
+// docs/operations.md's note on configuring a bucket lifecycle rule for
+// incomplete multipart uploads — the standard operational answer to this
+// class of race, not a gap this function needs to close itself). This
+// function deliberately does not follow up with a ListParts sweep to
+// verify the abort actually caught everything.
 func (s *S3) concurrentPartUpload(ctx context.Context, key, fk string, uploadID *string, ra io.ReaderAt, base, size, partSize int64, numParts int32) ([]types.CompletedPart, error) {
 	cctx, cancel := context.WithCancel(ctx)
 	defer cancel()
@@ -729,6 +746,28 @@ func (s *S3) concurrentPartUpload(ctx context.Context, key, fk string, uploadID 
 	}()
 
 	wg.Wait()
+	if firstErr == nil {
+		// The producer's ONLY early exit is <-cctx.Done(), so "the producer
+		// bailed before feeding every part" and "firstErr != nil" are
+		// supposed to be the same event — but that's only true because
+		// cancel() is called from exactly one place, recordErr, and
+		// putMultipart always passes context.Background() in, which itself
+		// is never Done(). Nothing here enforces that invariant: this
+		// function's signature takes a ctx parameter and does the (correct,
+		// ordinary) thing of deriving cctx from it, which is exactly what
+		// invites a future caller to thread a real request-scoped context
+		// through — at which point an external cancellation would stop the
+		// producer via <-cctx.Done() with firstErr still nil, and this
+		// would silently return a parts slice with zero-value
+		// (unfilled) CompletedPart entries for the parts that never ran.
+		// Checking ctx.Err() directly (not cctx.Err(), which is always
+		// non-nil once ANY cancellation — including our own on a part
+		// failure — has fired) catches exactly that case without
+		// depending on the single-call-site invariant holding forever.
+		if e := ctx.Err(); e != nil {
+			return nil, e
+		}
+	}
 	return parts, firstErr
 }
 
@@ -906,12 +945,48 @@ func (s *S3) CopyObject(dst, src string) error {
 // there is no client-side round-trip-bandwidth motivation to parallelize
 // it the way client-uploaded parts have. A future improvement, not
 // required here.
+//
+// Checksum declaration: unlike putMultipart, CreateMultipartUpload here
+// deliberately does NOT declare a ChecksumAlgorithm — see the comment on
+// that call below for why declaring one would break copies of exactly the
+// sources this method exists to handle.
+//
+// Undocumented-until-now divergence from the single-request path above:
+// this method does not set ContentType or any other user metadata on
+// CreateMultipartUpload, so dst ends up with none, whereas the
+// single-request CopyObject call preserves the source's Content-Type and
+// metadata by default (S3's MetadataDirective defaults to COPY). Harmless
+// today — this backend never sets metadata on any write, single-request
+// or multipart, upload or copy — but a real divergence between this
+// method's two branches if that ever changes; a future caller that starts
+// relying on metadata surviving a copy would need to explicitly read the
+// source's HeadObjectOutput and pass it through here too.
 func (s *S3) copyObjectMultipart(dst, fsrc, fdst string, size int64) (err error) {
 	ctx := context.Background()
 
 	created, cerr := s.cl.CreateMultipartUpload(ctx, &s3.CreateMultipartUploadInput{
 		Bucket: aws.String(s.bucket), Key: aws.String(fdst),
-		ChecksumAlgorithm: types.ChecksumAlgorithmCrc32,
+		// DELIBERATELY no ChecksumAlgorithm here — the opposite choice from
+		// putMultipart's CreateMultipartUpload, and not an oversight to be
+		// "fixed" into consistency later. putMultipart declares CRC32
+		// because the SDK computes it CLIENT-SIDE from the body it is
+		// uploading, so a value is always available to satisfy whatever
+		// algorithm Create declares. UploadPartCopy has NO client-side body
+		// at all — S3 copies server-side, and a part's checksum (if any)
+		// comes back on CopyPartResult only when the SOURCE object's own
+		// checksum state allows it to be derived: an object written by an
+		// older offshoot, by a third-party writer, with a different
+		// algorithm (e.g. SHA256), or whose stored checksum doesn't
+		// decompose cleanly at THIS copy's part boundaries can all
+		// legitimately yield an all-nil CopyPartResult. Declaring CRC32 on
+		// Create here would then make CompleteMultipartUpload reject every
+		// such copy with "InvalidRequest: ... must include the checksum for
+		// each part" — exactly the failure putMultipart's own explicit
+		// declaration exists to PREVENT, inflicted here on precisely the
+		// sources this method was written to handle. So: declare nothing,
+		// and forward whatever checksum fields UploadPartCopy actually
+		// returns (see the CompletedPart construction below) — harmless and
+		// useful when present, never required.
 	})
 	if cerr != nil {
 		return fmt.Errorf("store: s3 create multipart copy %s: %w", dst, cerr)
@@ -954,10 +1029,12 @@ func (s *S3) copyObjectMultipart(dst, fsrc, fdst string, size int64) (err error)
 		if up.CopyPartResult == nil {
 			return fmt.Errorf("store: s3 upload part copy %d for %s: empty CopyPartResult", partNum, dst)
 		}
-		// Carry every checksum field UploadPartCopy returned, same as
-		// putMultipart's UploadPart results — see that function's
-		// CompletedPart construction comment for why dropping these makes
-		// CompleteMultipartUpload fail against real S3.
+		// Carry whatever checksum fields UploadPartCopy actually returned —
+		// unlike putMultipart's UploadPart results, these may legitimately
+		// all be nil (see the "DELIBERATELY no ChecksumAlgorithm" comment on
+		// CreateMultipartUpload above for why that's fine here and MUST NOT
+		// be "fixed" by declaring one): forwarding them when present costs
+		// nothing and helps S3 verify integrity when it can.
 		parts = append(parts, types.CompletedPart{
 			ETag:              up.CopyPartResult.ETag,
 			PartNumber:        aws.Int32(partNum),

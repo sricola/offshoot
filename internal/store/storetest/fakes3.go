@@ -90,12 +90,25 @@ type FakeS3 struct {
 }
 
 // fakeMultipartUpload is one Created-but-not-yet-Completed-or-Aborted
-// multipart upload: the destination key it targets, and its uploaded parts
+// multipart upload: the destination key it targets, its uploaded parts
 // keyed by PartNumber (not necessarily contiguous or complete until
-// CompleteMultipartUpload arrives).
+// CompleteMultipartUpload arrives), and the checksum algorithm (if any) it
+// was created with — see checksumAlgorithm's own comment.
 type fakeMultipartUpload struct {
 	key   string
 	parts map[int32][]byte
+
+	// checksumAlgorithm is CreateMultipartUploadInput.ChecksumAlgorithm as
+	// sent on the wire (the "X-Amz-Checksum-Algorithm" request header,
+	// e.g. "CRC32"), or "" if the create request declared none. Real S3
+	// enforces this at CompleteMultipartUpload: if an algorithm was
+	// declared, EVERY submitted part must carry that algorithm's checksum,
+	// or Complete is rejected with InvalidRequest — see
+	// completeMultipartUpload's enforcement of this below. This is what
+	// makes store.S3.copyObjectMultipart's deliberate choice not to declare
+	// an algorithm (its source may have no derivable checksum) actually
+	// load-bearing in a test, instead of a distinction this fake ignores.
+	checksumAlgorithm string
 }
 
 func NewFakeS3(t *testing.T) *FakeS3 {
@@ -238,10 +251,12 @@ func (f *FakeS3) MaxPartsInFlight() int {
 }
 
 // trackPartInFlight records one more UploadPart request as in flight and
-// returns a func that un-records it; the caller defers that func for the
-// remainder of the request's handling. Guarded by its own mutex (not f.mu)
-// so the tracked count reflects requests that have ARRIVED, independent of
-// how the rest of this fake happens to serialize their processing.
+// returns a func that un-records it. The returned func MUST run at the
+// EARLIEST possible moment the response starts being written — see
+// partInFlightWriter below for why a plain `defer untrack()` at the end of
+// handle() is too late. Guarded by its own mutex (not f.mu) so the tracked
+// count reflects requests that have ARRIVED, independent of how the rest
+// of this fake happens to serialize their processing.
 func (f *FakeS3) trackPartInFlight() (untrack func()) {
 	f.partTrackMu.Lock()
 	f.partsInFlight++
@@ -254,6 +269,40 @@ func (f *FakeS3) trackPartInFlight() (untrack func()) {
 		f.partsInFlight--
 		f.partTrackMu.Unlock()
 	}
+}
+
+// partInFlightWriter wraps http.ResponseWriter so untrack (from
+// trackPartInFlight) fires at the EARLIEST possible moment — the instant
+// this request's response actually starts being written (its first
+// WriteHeader or Write call) — instead of via a plain `defer untrack()` at
+// the end of handle(). A deferred call only runs after control has
+// returned back up through every handler in the call chain, which is
+// LATER than when response bytes reach the client: a fast client can
+// receive this part's response and issue the next part's request —
+// incrementing partsInFlight again — before this goroutine's own deferred
+// untrack has actually executed. That's a genuine, if rare, race (a
+// scheduler/GC pause between "response written" and "defer runs" is all it
+// takes) that would make MaxPartsInFlight briefly read one higher than it
+// should, flaking the exact-equality assertions the concurrency=1 and
+// non-io.ReaderAt-fallback tests make. Untracking at first-byte-written
+// closes that window: it fires before the ResponseWriter call that could
+// let the client proceed, not after.
+type partInFlightWriter struct {
+	http.ResponseWriter
+	untrack func()
+	once    sync.Once
+}
+
+func (w *partInFlightWriter) untrackOnce() { w.once.Do(w.untrack) }
+
+func (w *partInFlightWriter) WriteHeader(code int) {
+	w.untrackOnce()
+	w.ResponseWriter.WriteHeader(code)
+}
+
+func (w *partInFlightWriter) Write(b []byte) (int, error) {
+	w.untrackOnce()
+	return w.ResponseWriter.Write(b)
 }
 
 // MultipartStats returns how many CreateMultipartUpload, UploadPart,
@@ -327,8 +376,9 @@ func (f *FakeS3) handle(w http.ResponseWriter, r *http.Request) {
 	if r.Method == http.MethodPut {
 		q := r.URL.Query()
 		if q.Get("partNumber") != "" && q.Get("uploadId") != "" && r.Header.Get("X-Amz-Copy-Source") == "" {
-			untrack := f.trackPartInFlight()
-			defer untrack()
+			piw := &partInFlightWriter{ResponseWriter: w, untrack: f.trackPartInFlight()}
+			defer piw.untrackOnce() // safety net: guarantees untrack runs even if nothing is ever written
+			w = piw
 			f.awaitPartGate()
 			if n, err := strconv.Atoi(q.Get("partNumber")); err == nil {
 				if d := f.partDelay(int32(n)); d > 0 {
@@ -434,7 +484,7 @@ func (f *FakeS3) handle(w http.ResponseWriter, r *http.Request) {
 		// Route before the batch-delete/complete checks below since it
 		// carries a non-empty key, unlike batch delete.
 		if _, ok := r.URL.Query()["uploads"]; ok {
-			f.createMultipartUpload(w, key)
+			f.createMultipartUpload(w, r, key)
 			return
 		}
 		// CompleteMultipartUpload: POST /{bucket}/{key}?uploadId=X, body is
@@ -536,13 +586,19 @@ func decodeCopySource(v string) (string, error) {
 // a new UploadId and starts tracking a pending upload for key. Real S3
 // issues opaque, globally-unique upload IDs; this fake's single-process
 // counter is unique enough for a server that never restarts mid-test.
-func (f *FakeS3) createMultipartUpload(w http.ResponseWriter, key string) {
+// Records the request's declared checksum algorithm, if any (the
+// "X-Amz-Checksum-Algorithm" header) — see fakeMultipartUpload.
+// checksumAlgorithm's doc comment for what that drives at Complete.
+func (f *FakeS3) createMultipartUpload(w http.ResponseWriter, r *http.Request, key string) {
 	f.nextUploadID++
 	id := fmt.Sprintf("fake-upload-%d", f.nextUploadID)
 	if f.multipart == nil {
 		f.multipart = map[string]*fakeMultipartUpload{}
 	}
-	f.multipart[id] = &fakeMultipartUpload{key: key, parts: map[int32][]byte{}}
+	f.multipart[id] = &fakeMultipartUpload{
+		key: key, parts: map[int32][]byte{},
+		checksumAlgorithm: r.Header.Get("X-Amz-Checksum-Algorithm"),
+	}
 	f.multipartCreates++
 	w.Header().Set("Content-Type", "application/xml")
 	w.WriteHeader(http.StatusOK)
@@ -550,10 +606,32 @@ func (f *FakeS3) createMultipartUpload(w http.ResponseWriter, key string) {
 		fakeBucket, key, id)
 }
 
+// checksumHeaders lists every "x-amz-checksum-*" request/response header
+// name this fake knows about, matching types.CompletedPart's checksum
+// fields (and CopyPartResult's). uploadPart echoes whichever of these the
+// request actually carried back onto the response — real S3 does the same
+// (UploadPartOutput's checksum fields come from response headers), and
+// store.S3.putMultipart's CompletedPart construction reads them from
+// there. Without this echo, every part's checksum would be silently nil
+// even on the declared-CRC32 put path, making
+// completeMultipartUpload's declared-vs-supplied enforcement below unable
+// to distinguish "the SDK legitimately supplied a checksum" (put path)
+// from "there was nothing to supply" (copy path) — see
+// TestS3PutReaderIfMultipartRoundTrip and friends, which would spuriously
+// fail InvalidRequest under enforcement without this.
+var checksumHeaders = []string{
+	"X-Amz-Checksum-Crc32",
+	"X-Amz-Checksum-Crc32c",
+	"X-Amz-Checksum-Crc64nvme",
+	"X-Amz-Checksum-Sha1",
+	"X-Amz-Checksum-Sha256",
+}
+
 // uploadPart serves UploadPart (PUT ?partNumber=N&uploadId=X): stores the
 // request body under the pending upload's PartNumber and returns an ETag —
 // the per-part content MD5, same formula etagOf uses for a whole object,
-// which is what real S3 returns for a part too.
+// which is what real S3 returns for a part too — plus an echo of whatever
+// checksum header(s) the request carried (see checksumHeaders).
 func (f *FakeS3) uploadPart(w http.ResponseWriter, r *http.Request, key string) {
 	q := r.URL.Query()
 	up, ok := f.multipart[q.Get("uploadId")]
@@ -580,6 +658,11 @@ func (f *FakeS3) uploadPart(w http.ResponseWriter, r *http.Request, key string) 
 	up.parts[int32(n)] = cp
 	f.multipartUploadParts++
 	w.Header().Set("ETag", etagOf(cp))
+	for _, h := range checksumHeaders {
+		if v := r.Header.Get(h); v != "" {
+			w.Header().Set(h, v)
+		}
+	}
 	w.WriteHeader(http.StatusOK)
 }
 
@@ -669,15 +752,48 @@ func parseCopySourceRange(v string, srcLen int64) (start, end int64, err error) 
 	return start, end, nil
 }
 
+// completedPartXML is one <Part> element of a CompleteMultipartUpload
+// request body: <PartNumber>n</PartNumber><ETag>e</ETag>
+// <ChecksumCRC32>c</ChecksumCRC32>.... The checksum fields are what
+// checksumForAlgorithm below reads to enforce the declared-vs-supplied
+// contract real S3 enforces at Complete.
+type completedPartXML struct {
+	PartNumber        int32  `xml:"PartNumber"`
+	ETag              string `xml:"ETag"`
+	ChecksumCRC32     string `xml:"ChecksumCRC32"`
+	ChecksumCRC32C    string `xml:"ChecksumCRC32C"`
+	ChecksumCRC64NVME string `xml:"ChecksumCRC64NVME"`
+	ChecksumSHA1      string `xml:"ChecksumSHA1"`
+	ChecksumSHA256    string `xml:"ChecksumSHA256"`
+}
+
 // completeMultipartUploadRequest mirrors the S3 CompleteMultipartUpload
-// request body: <CompleteMultipartUpload><Part><PartNumber>n</PartNumber>
-// <ETag>e</ETag></Part>...</CompleteMultipartUpload>.
+// request body: <CompleteMultipartUpload><Part>...</Part>...
+// </CompleteMultipartUpload>.
 type completeMultipartUploadRequest struct {
-	XMLName xml.Name `xml:"CompleteMultipartUpload"`
-	Parts   []struct {
-		PartNumber int32  `xml:"PartNumber"`
-		ETag       string `xml:"ETag"`
-	} `xml:"Part"`
+	XMLName xml.Name           `xml:"CompleteMultipartUpload"`
+	Parts   []completedPartXML `xml:"Part"`
+}
+
+// checksumForAlgorithm returns the field of p that corresponds to the
+// declared algorithm name (as sent in "X-Amz-Checksum-Algorithm", e.g.
+// "CRC32"), or "" if algorithm is unrecognized. Used by
+// completeMultipartUpload's enforcement below.
+func checksumForAlgorithm(p completedPartXML, algorithm string) string {
+	switch strings.ToUpper(algorithm) {
+	case "CRC32":
+		return p.ChecksumCRC32
+	case "CRC32C":
+		return p.ChecksumCRC32C
+	case "CRC64NVME":
+		return p.ChecksumCRC64NVME
+	case "SHA1":
+		return p.ChecksumSHA1
+	case "SHA256":
+		return p.ChecksumSHA256
+	default:
+		return ""
+	}
 }
 
 // completeMultipartUpload serves CompleteMultipartUpload (POST
@@ -706,6 +822,28 @@ func (f *FakeS3) completeMultipartUpload(w http.ResponseWriter, r *http.Request,
 		w.WriteHeader(http.StatusBadRequest)
 		io.WriteString(w, `<Error><Code>MalformedXML</Code></Error>`)
 		return
+	}
+
+	// Declared-vs-supplied checksum enforcement: if this upload was
+	// created with a declared ChecksumAlgorithm (up.checksumAlgorithm),
+	// real S3 requires EVERY part in this request to carry that
+	// algorithm's checksum, and rejects Complete with InvalidRequest
+	// otherwise. This is what makes store.S3.putMultipart's explicit
+	// per-part ChecksumAlgorithm declaration (and store.S3.
+	// copyObjectMultipart's deliberate choice NOT to declare one, since a
+	// copy's source may have no derivable checksum) load-bearing in a
+	// test, not a distinction this fake silently ignores.
+	if up.checksumAlgorithm != "" {
+		for _, p := range req.Parts {
+			if checksumForAlgorithm(p, up.checksumAlgorithm) == "" {
+				w.Header().Set("Content-Type", "application/xml")
+				w.WriteHeader(http.StatusBadRequest)
+				fmt.Fprintf(w, `<Error><Code>InvalidRequest</Code><Message>The upload was created using a %s checksum. `+
+					`The complete request must include the checksum for each part.</Message></Error>`,
+					up.checksumAlgorithm)
+				return
+			}
+		}
 	}
 
 	if !f.ignore {

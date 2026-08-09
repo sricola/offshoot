@@ -50,6 +50,14 @@ version if you depend on format stability.
   a capability limit. Same abort-on-every-error-path discipline as the
   multipart upload path; `CompleteMultipartUpload` sets no conditions,
   matching `CopyObject`'s existing overwrite-on-existing-dst contract.
+  Unlike the multipart *upload* path, `CreateMultipartUpload` here
+  deliberately does NOT declare a `ChecksumAlgorithm`: `UploadPartCopy` has
+  no client-side body to checksum, and a source object's checksum may not
+  be derivable at all (an older writer, a third-party object, a different
+  algorithm, or a stored checksum that doesn't decompose at this copy's
+  part boundaries) — declaring one would make `CompleteMultipartUpload`
+  reject exactly those copies. Whatever checksum fields S3 does return per
+  part are still forwarded when present.
 
 ## [0.2.3] - 2026-08-09
 
