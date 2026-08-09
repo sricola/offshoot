@@ -52,18 +52,25 @@ version if you depend on format stability.
   untouched — that's a documented, unrelated fallback (to the slow
   materialize-and-re-encode path), not a failure.
 
-  Each part's checksum (S3's default `RequestChecksumCalculation:
-  WhenSupported` attaches a CRC32 checksum to every `UploadPart` whether or
-  not this backend asks for one) is carried from `UploadPartOutput` into
-  its `CompletedPart` entry, and `CreateMultipartUpload` now declares
-  `ChecksumAlgorithm: CRC32` explicitly rather than leaving it inferred —
-  dropping a part's checksum makes a real S3 `CompleteMultipartUpload` fail
-  with `InvalidRequest`, a case the in-process fake cannot reproduce (plain
-  HTTP takes a different SDK code path than the `aws-chunked` framing
-  production traffic uses over TLS). `CompleteMultipartUploadInput` also
-  now sets `MpuObjectSize` to the expected total, so a length mismatch from
-  this backend's own offset arithmetic is rejected by S3 with a 400 instead
-  of silently storing a wrong-length object.
+  Both `CreateMultipartUpload` and every `UploadPart` call now declare
+  `ChecksumAlgorithm: CRC32` explicitly, and each part's returned checksum
+  is carried from `UploadPartOutput` into its `CompletedPart` entry.
+  Declaring it on both calls (not just Create) matters regardless of the
+  SDK's `RequestChecksumCalculation` setting: left to its default
+  (`WhenSupported`) the SDK attaches a CRC32 checksum to every `UploadPart`
+  on its own, but under `when_required` (the common workaround for
+  third-party S3-compatible stores after the Jan-2025 default-checksum
+  change — exactly the audience `S3Config` names via R2/Tigris/MinIO) it
+  would not, leaving `CreateMultipartUpload`'s declared algorithm
+  unmatched by any part's supplied checksum. Either way, a real S3
+  `CompleteMultipartUpload` rejects a mismatch with `InvalidRequest` — a
+  case the in-process fake cannot reproduce (plain HTTP takes a different
+  SDK code path than the `aws-chunked` framing production traffic uses
+  over TLS, and the fake ignores checksum headers entirely).
+  `CompleteMultipartUploadInput` also now sets `MpuObjectSize` to the
+  expected total, so a length mismatch from this backend's own offset
+  arithmetic is rejected by S3 with a 400 instead of silently storing a
+  wrong-length object.
 
   Part size defaults to 64 MiB (`defaultPartSize`), not a smaller
   "AWS-CLI-like" default — parts upload strictly sequentially (no

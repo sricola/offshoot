@@ -237,6 +237,16 @@ const minPartSize = 5 * 1024 * 1024 // 5 MiB
 // no concurrency, a smaller default part size is strictly worse, not a
 // safer/more conservative choice.
 //
+// This also sets the non-io.ReaderAt (or non-io.Seeker) fallback's
+// per-part buffer size, which scales with it — up to ~524 MiB for a
+// single part of a 5 TiB object once maxParts forces partSizeFor above
+// this default. That's a real memory cost, but production never pays it:
+// this backend's only caller (flush.go's snapshot upload) always passes an
+// *os.File, which satisfies both io.ReaderAt and io.Seeker and so always
+// takes the zero-buffer io.NewSectionReader path (see putMultipart's doc
+// comment). Only a caller passing some other reader shape — not exercised
+// in production today — would actually allocate a partSize-sized buffer.
+//
 // This is a package var, not a const, ONLY so tests can shrink it —
 // exercising "several real parts" against a real ~1 GiB+ payload isn't a
 // reasonable ask of a unit test. Never set it outside a test; production
@@ -498,6 +508,21 @@ func (s *S3) putMultipart(key string, r io.Reader, size int64, ifMatch string, c
 			Bucket: aws.String(s.bucket), Key: aws.String(fk),
 			UploadId: uploadID, PartNumber: aws.Int32(partNum),
 			Body: body, ContentLength: aws.Int64(n),
+			// Explicit here too, not just on CreateMultipartUpload above —
+			// DO NOT simplify this back out. The SDK only defaults a part's
+			// checksum algorithm when RequestChecksumCalculation ==
+			// WhenSupported (the SDK default); a caller running with
+			// when_required (the common workaround third-party S3-compatible
+			// stores need after the Jan-2025 default-checksum change — and
+			// this backend explicitly targets R2/Tigris/MinIO via S3Config)
+			// would otherwise send this UploadPart with NO checksum while
+			// CreateMultipartUpload already declared the upload CRC32,
+			// making every CompletedPart's checksum silently absent and
+			// CompleteMultipartUpload's declared-vs-supplied check fail on
+			// real S3. Setting it here makes the SDK compute CRC32
+			// unconditionally, so declared and supplied always agree
+			// regardless of RequestChecksumCalculation.
+			ChecksumAlgorithm: types.ChecksumAlgorithmCrc32,
 		})
 		if uerr != nil {
 			return "", fmt.Errorf("store: s3 upload part %d for %s: %w", partNum, key, uerr)
