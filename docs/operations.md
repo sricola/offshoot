@@ -411,8 +411,12 @@ depth at which a shared `fork` falls back to materializing — see `offshoot
 fork` in [docs/reference.md](reference.md)). Because it's never written to
 the store, an at-rest CLI `fork` against a store this daemon serves has no
 way to learn it and always uses the library default of 16 instead — still
-correct (materialization stays bounded), just looser than a lower
-configured cadence would have been.
+correct (materialization stays bounded either way), just DIFFERENT from
+what this daemon's cadence would have used: looser than a lower configured
+N (shares a few more levels before materializing), tighter than a higher
+one (materializes sooner). `N` has no upper bound, only the `>= 1` floor
+(see the table above), so a daemon tuned above 16 makes the CLI's fixed
+bound the *stricter* of the two.
 
 **The flush-cost/replay interaction, in one place:** `-flush-every` and
 `-snapshot-every` compose. Under continuous writing, the default

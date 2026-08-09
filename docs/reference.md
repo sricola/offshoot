@@ -299,10 +299,14 @@ in the serving process's memory; nothing about it is written to the store.
 An at-rest CLI `fork` (no daemon involved) therefore always uses the
 default of 16, even against a store a daemon elsewhere serves with a
 different `-snapshot-every N`. This is harmless — materialization stays
-bounded either way — just potentially looser than a daemon's lower
-configured cadence would have used (a fork shares for a few more levels
-before falling back to materializing). There's no mechanism today for the
-CLI to learn a daemon's flag, since it isn't persisted anywhere the CLI
+bounded either way — just potentially DIFFERENT from what a daemon's
+configured cadence would have used: looser (shares for a few more levels
+before falling back to materializing) if the daemon runs a lower N than 16,
+tighter (falls back to materializing sooner) if the daemon runs a higher N.
+`N` can be any value `>= 1` (`-snapshot-every`'s only floor), so either
+direction is possible depending on how a given daemon is tuned. There's no
+mechanism today for the CLI to learn a daemon's flag, since it isn't
+persisted anywhere the CLI
 could read it.
 
 Destroying a parent remains **instant and always allowed** — but under
