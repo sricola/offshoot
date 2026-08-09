@@ -369,9 +369,17 @@ func (f *FakeS3) handle(w http.ResponseWriter, r *http.Request) {
 	case http.MethodPut:
 		// store.S3.putMultipart issues one PUT per part, carrying
 		// partNumber and uploadId query params — S3's UploadPart contract.
-		// Route it separately, before both the copy-source and plain-body
-		// PUT handling below, neither of which applies to a part upload.
+		// store.S3.copyObjectMultipart issues the SAME query params for
+		// UploadPartCopy, distinguished only by carrying X-Amz-Copy-Source
+		// too (S3 overloads the same query shape for both operations).
+		// Route both separately, before the plain copy-source and
+		// plain-body PUT handling below, neither of which applies to a
+		// part upload.
 		if q := r.URL.Query(); q.Get("partNumber") != "" && q.Get("uploadId") != "" {
+			if copySrc := r.Header.Get("X-Amz-Copy-Source"); copySrc != "" {
+				f.uploadPartCopy(w, r, key, copySrc)
+				return
+			}
 			f.uploadPart(w, r, key)
 			return
 		}
@@ -573,6 +581,92 @@ func (f *FakeS3) uploadPart(w http.ResponseWriter, r *http.Request, key string) 
 	f.multipartUploadParts++
 	w.Header().Set("ETag", etagOf(cp))
 	w.WriteHeader(http.StatusOK)
+}
+
+// uploadPartCopy serves UploadPartCopy (PUT ?partNumber=N&uploadId=X,
+// carrying X-Amz-Copy-Source + X-Amz-Copy-Source-Range instead of a body):
+// looks up the named source object, slices it by the range header's
+// INCLUSIVE byte range (S3's contract — "bytes=start-end", both ends
+// included), and stores that slice under the pending upload's PartNumber —
+// exactly what makes store.S3.copyObjectMultipart's CopySourceRange
+// arithmetic testable. An off-by-one in the caller (e.g. sending
+// start-(start+n) instead of start-(start+n-1)) would ask this handler for
+// a range that either overlaps the next part (silently duplicating bytes
+// into the copy) or runs past the source's actual length; parseCopySourceRange
+// rejects both rather than silently clamping, so a caller bug surfaces as a
+// hard request failure here, not a quietly wrong byte-identical-looking copy.
+func (f *FakeS3) uploadPartCopy(w http.ResponseWriter, r *http.Request, dstKey, copySource string) {
+	q := r.URL.Query()
+	up, ok := f.multipart[q.Get("uploadId")]
+	if !ok || up.key != dstKey {
+		w.Header().Set("Content-Type", "application/xml")
+		w.WriteHeader(http.StatusNotFound)
+		io.WriteString(w, `<Error><Code>NoSuchUpload</Code></Error>`)
+		return
+	}
+	n, err := strconv.Atoi(q.Get("partNumber"))
+	if err != nil || n < 1 {
+		w.Header().Set("Content-Type", "application/xml")
+		w.WriteHeader(http.StatusBadRequest)
+		io.WriteString(w, `<Error><Code>InvalidArgument</Code></Error>`)
+		return
+	}
+	srcKey, err := decodeCopySource(copySource)
+	if err != nil {
+		w.Header().Set("Content-Type", "application/xml")
+		w.WriteHeader(http.StatusBadRequest)
+		io.WriteString(w, `<Error><Code>InvalidArgument</Code></Error>`)
+		return
+	}
+	src, ok := f.objs[srcKey]
+	if !ok {
+		w.Header().Set("Content-Type", "application/xml")
+		w.WriteHeader(http.StatusNotFound)
+		io.WriteString(w, `<Error><Code>NoSuchKey</Code></Error>`)
+		return
+	}
+	start, end, err := parseCopySourceRange(r.Header.Get("X-Amz-Copy-Source-Range"), int64(len(src)))
+	if err != nil {
+		w.Header().Set("Content-Type", "application/xml")
+		w.WriteHeader(http.StatusBadRequest)
+		io.WriteString(w, `<Error><Code>InvalidArgument</Code></Error>`)
+		return
+	}
+	slice := make([]byte, end-start+1) // +1: end is inclusive
+	copy(slice, src[start:end+1])
+	up.parts[int32(n)] = slice
+	f.multipartUploadParts++
+	w.Header().Set("Content-Type", "application/xml")
+	w.WriteHeader(http.StatusOK)
+	fmt.Fprintf(w, `<CopyPartResult><ETag>%s</ETag><LastModified>%s</LastModified></CopyPartResult>`,
+		etagOf(slice), time.Now().UTC().Format("2006-01-02T15:04:05.000Z"))
+}
+
+// parseCopySourceRange parses an S3 "bytes=start-end" copy-source range
+// header — BOTH ends inclusive, S3's contract for CopySourceRange, NOT Go
+// slicing's half-open convention — and validates it against srcLen, the
+// source object's actual length. A range that starts or ends outside
+// [0, srcLen) is rejected rather than silently clamped, so a caller's
+// off-by-one arithmetic surfaces as a request failure in a test instead of
+// a quietly truncated or duplicated copy.
+func parseCopySourceRange(v string, srcLen int64) (start, end int64, err error) {
+	v = strings.TrimPrefix(v, "bytes=")
+	lo, hi, ok := strings.Cut(v, "-")
+	if !ok {
+		return 0, 0, fmt.Errorf("invalid copy-source range %q", v)
+	}
+	start, err = strconv.ParseInt(lo, 10, 64)
+	if err != nil {
+		return 0, 0, fmt.Errorf("invalid copy-source range %q: %w", v, err)
+	}
+	end, err = strconv.ParseInt(hi, 10, 64)
+	if err != nil {
+		return 0, 0, fmt.Errorf("invalid copy-source range %q: %w", v, err)
+	}
+	if start < 0 || end < start || end >= srcLen {
+		return 0, 0, fmt.Errorf("copy-source range %q out of bounds for source of length %d", v, srcLen)
+	}
+	return start, end, nil
 }
 
 // completeMultipartUploadRequest mirrors the S3 CompleteMultipartUpload

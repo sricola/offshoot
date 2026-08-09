@@ -756,18 +756,32 @@ func (s *S3) List(prefix string) ([]string, error) {
 }
 
 // copyObjectMaxBytes is the largest object store.S3.CopyObject will copy
-// server-side. S3's single-request "PUT Object - Copy" (what CopyObject
-// below issues) supports source objects up to 5 GiB; anything larger
-// requires the multipart UploadPartCopy API, which this backend does not
-// implement — that's out of scope for Task 6b (server-side CopyObject),
-// same as it was for Task 6a (reflink locally). Rather than let an
-// oversized copy fail loudly with an opaque SDK/API error, CopyObject
-// checks the source's size first (a HEAD request) and returns the
-// ErrCopyUnsupported sentinel for anything over the limit — the same
-// signal Task 6a already wired ops.Fork's fast path to treat as "fall back
-// to the slow, materialize-and-re-encode path", which handles objects of
-// any size (at a real per-byte cost, but correctly).
-const copyObjectMaxBytes = 5 * 1024 * 1024 * 1024 // 5 GiB
+// via a single-request "PUT Object - Copy" (what CopyObject issues below).
+// S3 caps that API at 5 GiB source objects; above it, CopyObject switches
+// to a multipart server-side copy instead (CreateMultipartUpload + a
+// sequence of UploadPartCopy calls + CompleteMultipartUpload — see
+// copyObjectMultipart), which is NOT limited by this constant — only by
+// s3MaxObjectBytes, S3's actual per-object ceiling. This constant is
+// therefore a strategy-selection threshold, not a capability limit: it
+// picks the cheaper single-request path when the source is small enough
+// for it, not the point past which a copy becomes unsupported.
+//
+// This is a package var, not a const, ONLY so tests can shrink it — a real
+// multi-gigabyte source object isn't a reasonable ask of a unit test, so
+// tests lower this (paired with SetPartSizeForTest) to drive a modest real
+// payload through the multipart-copy path instead. Never set it outside a
+// test; production code must never assign to it. See
+// SetCopyObjectMaxBytesForTest (export_test.go).
+var copyObjectMaxBytes int64 = 5 * 1024 * 1024 * 1024 // 5 GiB
+
+// s3MaxObjectBytes is S3's hard ceiling on any single object's size, under
+// any upload/copy strategy (single PUT, multipart upload, or multipart
+// copy) — an S3 API constraint, not something this backend chooses.
+// CopyObject returns ErrCopyUnsupported for a source over this size because
+// there is genuinely no S3 mechanism that could copy it, unlike the
+// copyObjectMaxBytes threshold above, which this backend routes around via
+// multipart copy rather than declining.
+const s3MaxObjectBytes = 5 * 1024 * 1024 * 1024 * 1024 // 5 TiB
 
 // s3CopySource builds the value CopyObjectInput.CopySource requires:
 // "bucket/key", with the bucket and each key path segment percent-encoded
@@ -787,12 +801,15 @@ func s3CopySource(bucket, key string) string {
 }
 
 // CopyObject makes dst a server-side copy of src, without downloading or
-// re-uploading the bytes through this process — see copyObjectMaxBytes for
-// the one case (objects over S3's 5GB single-request CopyObject limit)
-// where it declines and returns ErrCopyUnsupported instead, and
+// re-uploading the bytes through this process — for sources at or under
+// copyObjectMaxBytes (S3's 5 GiB single-request CopyObject limit) via one
+// CopyObject call below; for larger sources, up to s3MaxObjectBytes (S3's
+// 5 TiB per-object ceiling), via copyObjectMultipart's multipart
+// UploadPartCopy sequence instead. Only a source over s3MaxObjectBytes — a
+// size no S3 mechanism can copy at all — returns ErrCopyUnsupported; see
 // store.Backend's doc comment for the overwrite-on-existing-dst contract
-// this honors (S3's CopyObject overwrites dst natively; there is nothing
-// extra to do here for that).
+// this honors either way (S3's Copy/CompleteMultipartUpload overwrite dst
+// natively; there is nothing extra to do here for that).
 //
 // The size check is a HEAD request before the copy, not a check against
 // whatever CopyObject itself returns on failure: S3's actual behavior for
@@ -823,8 +840,12 @@ func (s *S3) CopyObject(dst, src string) error {
 		}
 		return fmt.Errorf("store: s3 head %s (for copy): %w", src, err)
 	}
-	if size := aws.ToInt64(head.ContentLength); size > copyObjectMaxBytes {
+	size := aws.ToInt64(head.ContentLength)
+	if size > s3MaxObjectBytes {
 		return ErrCopyUnsupported
+	}
+	if size > copyObjectMaxBytes {
+		return s.copyObjectMultipart(dst, fsrc, fdst, size)
 	}
 
 	_, err = s.cl.CopyObject(context.Background(), &s3.CopyObjectInput{
@@ -843,6 +864,123 @@ func (s *S3) CopyObject(dst, src string) error {
 		}
 		return fmt.Errorf("store: s3 copy %s -> %s: %w", src, dst, err)
 	}
+	return nil
+}
+
+// copyObjectMultipart implements CopyObject for a source over
+// copyObjectMaxBytes (S3's 5 GiB single-request PUT-Copy ceiling), via
+// CreateMultipartUpload + a sequence of UploadPartCopy calls (one per byte
+// range, sized the same way putMultipart sizes its parts — see
+// partSizeFor, which already keeps every part within UploadPartCopy's own
+// 5 GiB per-part maximum) + CompleteMultipartUpload. fsrc and fdst are
+// already-prefixed bucket keys (CopyObject has already validated and
+// mapped both); size is the source's HEAD-reported length.
+//
+// Same abort discipline as putMultipart: once CreateMultipartUpload
+// succeeds, a deferred AbortMultipartUpload runs on every exit that is not
+// a successful Complete (a part-copy failure, an empty/malformed
+// CopyPartResult, or a Complete failure), via the same named-`completed`-
+// flag pattern — see putMultipart's doc comment for the full reasoning
+// (an abandoned multipart upload bills its uploaded parts on S3 forever).
+// CompleteMultipartUpload here sets no conditions, matching CopyObject's
+// documented OVERWRITE semantics for dst (same as the single-request path
+// above).
+//
+// CopySourceRange arithmetic: UploadPartCopy's CopySourceRange header is
+// "bytes=<start>-<end>" with BOTH ends INCLUSIVE — unlike Go slice
+// bounds, which are half-open. For a part covering n bytes starting at
+// offset, the correct end is offset+n-1, NOT offset+n: using offset+n
+// would ask S3 to copy one byte beyond this part (silently pulling in the
+// first byte of the next part, or erroring on the source's last part),
+// and using offset+n-2 (or any other short end) would silently drop bytes
+// from the copy. This is computed once below and worth restating loudly
+// because getting it wrong doesn't fail loudly — it produces a copy that
+// looks superficially fine (right total length, if the error is
+// off-by-one in a way that still sums correctly) but is not actually
+// byte-identical to the source.
+//
+// Parts are copied sequentially, not concurrently like putMultipart's
+// client-uploaded parts: UploadPartCopy is a server-side operation (S3
+// reads the source and writes the destination itself; no object bytes
+// flow through this process or this backend's network link at all), so
+// there is no client-side round-trip-bandwidth motivation to parallelize
+// it the way client-uploaded parts have. A future improvement, not
+// required here.
+func (s *S3) copyObjectMultipart(dst, fsrc, fdst string, size int64) (err error) {
+	ctx := context.Background()
+
+	created, cerr := s.cl.CreateMultipartUpload(ctx, &s3.CreateMultipartUploadInput{
+		Bucket: aws.String(s.bucket), Key: aws.String(fdst),
+		ChecksumAlgorithm: types.ChecksumAlgorithmCrc32,
+	})
+	if cerr != nil {
+		return fmt.Errorf("store: s3 create multipart copy %s: %w", dst, cerr)
+	}
+	uploadID := created.UploadId
+
+	completed := false
+	defer func() {
+		if completed {
+			return
+		}
+		_, aerr := s.cl.AbortMultipartUpload(context.Background(), &s3.AbortMultipartUploadInput{
+			Bucket: aws.String(s.bucket), Key: aws.String(fdst), UploadId: uploadID,
+		})
+		if aerr != nil {
+			err = fmt.Errorf("%w (additionally, aborting the multipart copy also failed, so its parts may be left billed on S3: %v)", err, aerr)
+		}
+	}()
+
+	copySource := s3CopySource(s.bucket, fsrc)
+	partSize := partSizeFor(size)
+	var parts []types.CompletedPart
+	partNum := int32(1)
+	for offset := int64(0); offset < size; offset += partSize {
+		n := partSize
+		if remain := size - offset; remain < n {
+			n = remain
+		}
+		end := offset + n - 1 // INCLUSIVE end — see the doc comment above.
+
+		up, uerr := s.cl.UploadPartCopy(ctx, &s3.UploadPartCopyInput{
+			Bucket: aws.String(s.bucket), Key: aws.String(fdst),
+			UploadId: uploadID, PartNumber: aws.Int32(partNum),
+			CopySource:      aws.String(copySource),
+			CopySourceRange: aws.String(fmt.Sprintf("bytes=%d-%d", offset, end)),
+		})
+		if uerr != nil {
+			return fmt.Errorf("store: s3 upload part copy %d for %s: %w", partNum, dst, uerr)
+		}
+		if up.CopyPartResult == nil {
+			return fmt.Errorf("store: s3 upload part copy %d for %s: empty CopyPartResult", partNum, dst)
+		}
+		// Carry every checksum field UploadPartCopy returned, same as
+		// putMultipart's UploadPart results — see that function's
+		// CompletedPart construction comment for why dropping these makes
+		// CompleteMultipartUpload fail against real S3.
+		parts = append(parts, types.CompletedPart{
+			ETag:              up.CopyPartResult.ETag,
+			PartNumber:        aws.Int32(partNum),
+			ChecksumCRC32:     up.CopyPartResult.ChecksumCRC32,
+			ChecksumCRC32C:    up.CopyPartResult.ChecksumCRC32C,
+			ChecksumCRC64NVME: up.CopyPartResult.ChecksumCRC64NVME,
+			ChecksumSHA1:      up.CopyPartResult.ChecksumSHA1,
+			ChecksumSHA256:    up.CopyPartResult.ChecksumSHA256,
+		})
+		partNum++
+	}
+
+	_, cerr2 := s.cl.CompleteMultipartUpload(ctx, &s3.CompleteMultipartUploadInput{
+		Bucket: aws.String(s.bucket), Key: aws.String(fdst), UploadId: uploadID,
+		MultipartUpload: &types.CompletedMultipartUpload{Parts: parts},
+		// Same free defense-in-depth as putMultipart: S3 rejects Complete
+		// with a 400 if the parts' total length doesn't match size.
+		MpuObjectSize: aws.Int64(size),
+	})
+	if cerr2 != nil {
+		return fmt.Errorf("store: s3 complete multipart copy %s: %w", dst, cerr2)
+	}
+	completed = true
 	return nil
 }
 

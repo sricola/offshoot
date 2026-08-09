@@ -15,10 +15,10 @@ var (
 	// perform a server-side or filesystem-level copy of THIS particular
 	// object — every backend offshoot ships supports CopyObject in general
 	// (local: a filesystem clone or plain-copy fallback; S3: a real
-	// server-side CopyObject call), but S3's is gated to objects at or
-	// under its 5GB single-request CopyObject limit, so the sentinel still
-	// fires for anything larger (see store.S3.CopyObject's doc comment;
-	// multipart UploadPartCopy is not implemented, out of scope). Callers
+	// server-side CopyObject call, single-request under 5GB and multipart
+	// UploadPartCopy above it), but S3 still cannot copy a source over its
+	// own 5TiB per-object ceiling under any strategy, so the sentinel fires
+	// for that case (see store.S3.CopyObject's doc comment). Callers
 	// (ops.Fork's fast path) must treat this as "fall back to the slow,
 	// materialize-and-re-encode path" — it is a capability signal, not a
 	// hard failure.

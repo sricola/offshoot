@@ -41,15 +41,18 @@ func TestS3Conformance(t *testing.T) {
 	storetest.RunConformance(t, "", newFakeBacked)
 }
 
-// TestS3CopyObjectOverSizeLimitFallsBack pins the >5GB guard documented on
-// store.S3.CopyObject: S3's single-request "PUT Object - Copy" supports
-// source objects up to 5 GiB, so CopyObject HEADs the source first and
-// returns ErrCopyUnsupported for anything over that limit rather than
-// letting the copy fail with an opaque API error — the same signal
-// ops.Fork's fast path already treats as "fall back to the slow path"
-// (Task 6a). Uses storetest.FakeS3's SetSizeOverride to make a tiny stored
-// object report a >5GB Content-Length on HEAD, so this test exercises the
-// gate without allocating or uploading a real multi-gigabyte object.
+// TestS3CopyObjectOverSizeLimitFallsBack pins the ACTUAL "cannot copy this
+// at all" guard on store.S3.CopyObject: S3's own 5 TiB per-object ceiling,
+// not the 5 GiB single-request CopyObject limit (that boundary now selects
+// a strategy — single-request under it, multipart UploadPartCopy over it,
+// see TestS3CopyObjectMultipartLargeObject in s3_copy_multipart_test.go —
+// it no longer means "unsupported"). CopyObject HEADs the source first and
+// returns ErrCopyUnsupported only for a source over 5 TiB, the one size no
+// S3 mechanism can copy — the same signal ops.Fork's fast path already
+// treats as "fall back to the slow path" (Task 6a). Uses storetest.FakeS3's
+// SetSizeOverride to make a tiny stored object report an over-5TiB
+// Content-Length on HEAD, so this test exercises the gate without
+// allocating or uploading a real multi-terabyte object.
 func TestS3CopyObjectOverSizeLimitFallsBack(t *testing.T) {
 	f := storetest.NewFakeS3(t)
 	t.Setenv("AWS_ACCESS_KEY_ID", "test")
@@ -60,26 +63,28 @@ func TestS3CopyObjectOverSizeLimitFallsBack(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if err := b.Put("data/huge/src", []byte("not actually 6GB")); err != nil {
+	if err := b.Put("data/huge/src", []byte("not actually 6TB")); err != nil {
 		t.Fatal(err)
 	}
-	const sixGiB = 6 * 1024 * 1024 * 1024
-	f.SetSizeOverride("data/huge/src", sixGiB)
+	const sixTiB = 6 * 1024 * 1024 * 1024 * 1024 // over s3MaxObjectBytes (5 TiB)
+	f.SetSizeOverride("data/huge/src", sixTiB)
 
 	if err := b.CopyObject("data/huge/dst", "data/huge/src"); !errors.Is(err, store.ErrCopyUnsupported) {
-		t.Fatalf("want ErrCopyUnsupported copying a >5GB source, got %v", err)
+		t.Fatalf("want ErrCopyUnsupported copying a >5TiB source, got %v", err)
 	}
 	if _, _, err := b.Get("data/huge/dst"); !errors.Is(err, store.ErrNotFound) {
 		t.Fatalf("a declined copy must not create dst, got %v", err)
 	}
 
-	// Just under the limit: must proceed normally (a real, if small, copy).
+	// Comfortably under the limit: must proceed normally (a real, if small,
+	// copy) via the ordinary single-request CopyObject path.
+	const sixGiB = 6 * 1024 * 1024 * 1024
 	f.SetSizeOverride("data/huge/src", sixGiB/2)
 	if err := b.CopyObject("data/huge/dst", "data/huge/src"); err != nil {
-		t.Fatalf("copy under the 5GB limit must succeed: %v", err)
+		t.Fatalf("copy under the 5GB single-request limit must succeed: %v", err)
 	}
 	data, _, err := b.Get("data/huge/dst")
-	if err != nil || string(data) != "not actually 6GB" {
+	if err != nil || string(data) != "not actually 6TB" {
 		t.Fatalf("dst = %q, err = %v, want the source content copied", data, err)
 	}
 }
