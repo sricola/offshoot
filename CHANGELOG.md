@@ -59,6 +59,28 @@ version if you depend on format stability.
   reject exactly those copies. Whatever checksum fields S3 does return per
   part are still forwarded when present.
 
+### Fixed
+
+- **GC's compensating rule is now epoch-aware, closing a bounded space
+  leak.** The rule that protects a member object above a live ref's head in
+  that ref's own lineage (guarding a session flush's ambiguous-ref-write
+  retry, which re-Puts the SAME `(lineage, epoch, txid)` key) used to
+  protect such an object regardless of its epoch. An orphan left by a
+  writer that was later fenced (`Ref.Epoch` bumped out from under it by
+  `AcquireLease`, e.g. on lease reclaim) sits at an epoch strictly below the
+  lineage's current writer generation and can never win a future ref CAS —
+  `keepHighestEpoch` chain resolution and the CAS'd ref write both key off
+  the current epoch — so it can never become live, yet the epoch-blind rule
+  protected it forever while the branch stayed alive. The rule now compares
+  the object's epoch (`ChainMember.Epoch`) against the lineage's current
+  `Ref.Epoch` (the MINIMUM read across every ref naming that lineage, same
+  over-protect direction as the existing minimum-head rule) and protects
+  only `>=`; a strictly older epoch is provably fenced and is now swept once
+  its stone clears grace. A stale read of `Ref.Epoch` only ever protects
+  more, never less: an object at an epoch newer than what was read (a new
+  acquirer bumped it after the read) still satisfies `>=` and stays
+  protected.
+
 ## [0.2.3] - 2026-08-09
 
 ### Added

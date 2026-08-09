@@ -337,27 +337,54 @@ func (w *Workspace) reachableObjects() (map[string]bool, error) {
 	return reachable, err
 }
 
+// liveHead is the per-lineage input to GC's compensating rule: the live
+// ref's HeadTXID and current writer-generation Epoch (Ref.Epoch, NOT
+// HeadEpoch — see reachableObjectsAndHeads' doc comment on why the current
+// generation, not the head object's generation, is what a retry writes
+// under).
+type liveHead struct {
+	TXID, Epoch uint64
+}
+
 // reachableObjectsAndHeads is reachableObjects' full form: alongside the
 // reachable set it returns, for every lineage some live ref names as its OWN
-// (head) lineage, the smallest HeadTXID among the refs naming it — the input
-// to GC's compensating rule (see the phase-2 sweep): an object ABOVE a live
-// ref's head in that ref's own lineage may be an orphan a session flush is
-// entitled to re-create at the same key (session/flush.go's ambiguous-
-// ref-write retry overwrites the SAME (lineage, epoch, txid) key), so the
-// sweep must never delete there. Smallest head because that is the txid a
-// retrying writer would build up from. Deriving heads from the SAME
-// ListRefs+GetRef fetch as the mark (rather than a separate re-enumeration,
-// as a standalone liveHeadLineages helper once did) both saves 1 ListRefs +
-// R GetRef RPCs per sweeping pass and guarantees the compensating rule sees
-// exactly the refs the re-mark saw — one consistency window, not two.
-func (w *Workspace) reachableObjectsAndHeads() (map[string]bool, map[string]uint64, error) {
+// (head) lineage, a liveHead{TXID, Epoch} — the input to GC's compensating
+// rule (see the phase-2 sweep): an object ABOVE a live ref's head in that
+// ref's own lineage, and at an epoch a CURRENT writer could still make live,
+// may be an orphan a session flush is entitled to re-create at the same key
+// (session/flush.go's ambiguous-ref-write retry overwrites the SAME
+// (lineage, epoch, txid) key), so the sweep must never delete there.
+//
+// Both fields take the MINIMUM across every ref naming the lineage, and both
+// for the same reason: erring toward OVER-protection under a stale or
+// disagreeing read.
+//   - Smallest HeadTXID is the txid a retrying writer would build up from,
+//     and a smaller head protects MORE keys above it.
+//   - Smallest Epoch is the generation the compensating rule's ">="
+//     check compares against (see phase 2 below), and a smaller Epoch makes
+//     that check true — protecting — for MORE keys.
+//
+// The rule uses Ref.Epoch (bumped by AcquireLease on every fresh
+// acquisition or reclaim — the lineage's CURRENT writer generation), not
+// Ref.HeadEpoch (merely the generation the head object happened to be
+// written under, which lags Epoch whenever a lease was acquired or renewed
+// since the head was written). A retry by the current holder writes under
+// its live lease's epoch, i.e. Ref.Epoch — so that is the bound the rule
+// must compare against, not HeadEpoch.
+//
+// Deriving both from the SAME ListRefs+GetRef fetch as the mark (rather than
+// a separate re-enumeration, as a standalone liveHeadLineages helper once
+// did) both saves 1 ListRefs + R GetRef RPCs per sweeping pass and
+// guarantees the compensating rule sees exactly the refs the re-mark saw —
+// one consistency window, not two.
+func (w *Workspace) reachableObjectsAndHeads() (map[string]bool, map[string]liveHead, error) {
 	ms := &store.Store{B: newMarkCache(w.Store.B)}
 	refs, err := w.Store.ListRefs()
 	if err != nil {
 		return nil, nil, err
 	}
 	reachable := map[string]bool{}
-	heads := map[string]uint64{}
+	heads := map[string]liveHead{}
 	spines := map[string][]string{}
 	chainsDone := map[string]bool{} // "lineage@txid" -> already marked
 	dbs := make([]string, 0, len(refs))
@@ -374,8 +401,16 @@ func (w *Workspace) reachableObjectsAndHeads() (map[string]bool, map[string]uint
 				}
 				return nil, nil, fmt.Errorf("ops: gc mark %s@%s: %w", db, branch, err)
 			}
-			if h, ok := heads[r.Lineage]; !ok || r.HeadTXID < h {
-				heads[r.Lineage] = r.HeadTXID
+			if h, ok := heads[r.Lineage]; !ok {
+				heads[r.Lineage] = liveHead{TXID: r.HeadTXID, Epoch: r.Epoch}
+			} else {
+				if r.HeadTXID < h.TXID {
+					h.TXID = r.HeadTXID
+				}
+				if r.Epoch < h.Epoch {
+					h.Epoch = r.Epoch
+				}
+				heads[r.Lineage] = h
 			}
 			spine, ok := spines[r.Lineage]
 			if !ok {
@@ -493,7 +528,7 @@ func (w *Workspace) GC(grace time.Duration) (tombstoned, deleted int, err error)
 	// format, which names no real object key and so re-lists to nothing.
 	cutoff := time.Now().Add(-grace)
 	var reMark, existing map[string]bool
-	var liveHeads map[string]uint64
+	var liveHeads map[string]liveHead
 	var toDelete []string
 	for key, markedAt := range stones {
 		if _, mintedThisRun := newStones[key]; mintedThisRun {
@@ -545,23 +580,47 @@ func (w *Workspace) GC(grace time.Duration) (tombstoned, deleted int, err error)
 			continue
 		}
 		// Compensating rule: NEVER delete a member object above a live ref's
-		// head in that ref's OWN lineage. A session flush that hit an
-		// ambiguous ref-write failure retries by re-Putting the SAME
-		// (lineage, epoch, txid) key (see session/flush.go's orphan-overwrite
-		// path) — HeadTXID only advances on a successful ref write, so its
-		// retry txid is always head+1 and the sweep deleting that key in the
+		// head in that ref's OWN lineage, UNLESS the object is provably
+		// fenced — written under an epoch strictly older than the lineage's
+		// CURRENT writer generation, and so can never win the ref CAS that
+		// would make it live. A session flush that hit an ambiguous
+		// ref-write failure retries by re-Putting the SAME (lineage, epoch,
+		// txid) key (see session/flush.go's orphan-overwrite path) —
+		// HeadTXID only advances on a successful ref write, so its retry
+		// txid is always head+1 and the sweep deleting that key in the
 		// window between the retry's Put and its ref CAS would leave a live
 		// ref pointing at nothing. Such an orphan is unreachable by
 		// definition (nothing references beyond head), so reachability alone
 		// cannot protect it; this rule does, narrowly: only member-parseable
 		// keys (base.json never carries a txid), only in a lineage a live ref
-		// names as its head lineage, only above that head. The stone is KEPT:
-		// if the writer's retry lands, the object becomes reachable and the
-		// stone is rescued/pruned above; if the branch dies instead, the
-		// lineage drops out of liveHeads and a later run sweeps it.
+		// names as its head lineage, only above that head, only when the
+		// object's epoch could still become the live ref's epoch.
+		//
+		// Epoch-blind protection leaks: an orphan written by a writer that
+		// was later FENCED (AcquireLease bumped Epoch out from under it —
+		// see lease.go) sits at an epoch strictly below the lineage's
+		// current Epoch, can never win a future ref CAS (keepHighestEpoch
+		// resolution and the CAS'd ref write both key off the CURRENT
+		// epoch), and so can never become live — yet an epoch-blind rule
+		// protects it forever while the branch lives. Requiring
+		// m.Epoch >= refEpoch closes that leak while preserving the
+		// original guarantee: a retry by the CURRENT holder always writes
+		// under Ref.Epoch (its live lease's epoch), so its retry key always
+		// satisfies m.Epoch == refEpoch >= refEpoch and stays protected.
+		//
+		// Direction of safety: liveHeads' Epoch is the MINIMUM Epoch read
+		// across every ref naming the lineage (see reachableObjectsAndHeads),
+		// so a stale or racing read only ever makes refEpoch SMALLER, which
+		// only makes ">=" true for MORE keys — errs toward protecting, never
+		// toward sweeping something that might still become live. A key at
+		// an epoch NEWER than the (possibly stale) refEpoch we read — e.g. a
+		// new acquirer bumped Epoch after our read — still satisfies ">="
+		// and stays protected. Only a key at an epoch STRICTLY OLDER than
+		// what we read is reclaimed, and "strictly older than even our
+		// lower-bound read" is provably fenced under any interleaving.
 		if m, ok := store.ParseMemberKey(key); ok {
 			if lineage, lok := lineageOfDataKey(key); lok {
-				if head, live := liveHeads[lineage]; live && m.MaxTXID > head {
+				if h, live := liveHeads[lineage]; live && m.MaxTXID > h.TXID && m.Epoch >= h.Epoch {
 					continue
 				}
 			}

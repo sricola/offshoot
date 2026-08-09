@@ -891,3 +891,148 @@ func TestGCCompensatingRuleProtectsAboveHeadOrphan(t *testing.T) {
 		t.Fatalf("orphan must be sweepable once its branch is gone, Get err = %v", err)
 	}
 }
+
+// TestGCCompensatingRuleSweepsFencedEpochOrphan guards the epoch-aware fix
+// to the compensating rule: an above-head orphan written under an epoch
+// strictly older than the lineage's CURRENT writer generation (Ref.Epoch)
+// can never win a future ref CAS — keepHighestEpoch's same-range resolution
+// and the CAS'd ref write both key off the current epoch, so a fenced
+// writer's stragglers lose deterministically (see lease.go/store.go's
+// Epoch/keepHighestEpoch docs) — and so can never become live. Protecting
+// such an object forever, as an epoch-blind rule once did, is a bounded
+// space leak; this test proves it is now reclaimed once provably fenced.
+func TestGCCompensatingRuleSweepsFencedEpochOrphan(t *testing.T) {
+	testutil.RequireSQLite3(t)
+	w := newWS(t)
+	if err := w.Create("app"); err != nil {
+		t.Fatal(err)
+	}
+	path, err := w.Checkout("app", "main")
+	if err != nil {
+		t.Fatal(err)
+	}
+	mustSQL(t, path, "CREATE TABLE t (v); INSERT INTO t VALUES (1);")
+	head, err := w.Checkpoint("app", "main", "v1", nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	mref, metag, err := w.Store.GetRef("app", "main")
+	if err != nil {
+		t.Fatal(err)
+	}
+	// The orphan a writer left behind before it was fenced: a segment at
+	// head+1, written under the epoch active at the time (mref.Epoch).
+	orphanKey := store.SegmentKey(mref.Lineage, mref.Epoch, head+1, head+1)
+	if err := w.Store.B.Put(orphanKey, []byte("orphan")); err != nil {
+		t.Fatal(err)
+	}
+	if err := w.tombstone(map[string]string{orphanKey: "2000-01-01T00:00:00Z"}); err != nil {
+		t.Fatal(err)
+	}
+	// Simulate the branch's lease being reclaimed by a new holder (the same
+	// Epoch bump AcquireLease performs on a fresh acquisition/reclaim — see
+	// lease.go): the writer that left the orphan is now fenced, and the
+	// orphan can never win a ref CAS at the new epoch.
+	mref.Epoch++
+	if _, err := w.Store.PutRef("app", "main", mref, metag); err != nil {
+		t.Fatal(err)
+	}
+
+	if _, _, err := w.GC(0); err != nil {
+		t.Fatal(err)
+	}
+	if _, _, err := w.Store.B.Get(orphanKey); !errors.Is(err, store.ErrNotFound) {
+		t.Fatalf("fenced-epoch orphan must be swept once provably fenced, Get err = %v", err)
+	}
+}
+
+// TestGCCompensatingRuleProtectsNewerEpochOrphan pins the compensating
+// rule's direction-of-safety argument (see reachableObjectsAndHeads and the
+// phase-2 predicate's comment): liveHeads' Epoch is the MINIMUM read across
+// every ref naming the lineage, so a stale or racing read only ever makes
+// the compared-against epoch SMALLER — erring toward protecting. An object
+// at an epoch NEWER than the (possibly stale) epoch GC read — e.g. a new
+// acquirer bumped Ref.Epoch after GC's own read — must stay protected: only
+// a STRICTLY OLDER epoch than what was read is provably fenced under every
+// interleaving.
+func TestGCCompensatingRuleProtectsNewerEpochOrphan(t *testing.T) {
+	testutil.RequireSQLite3(t)
+	w := newWS(t)
+	if err := w.Create("app"); err != nil {
+		t.Fatal(err)
+	}
+	path, err := w.Checkout("app", "main")
+	if err != nil {
+		t.Fatal(err)
+	}
+	mustSQL(t, path, "CREATE TABLE t (v); INSERT INTO t VALUES (1);")
+	head, err := w.Checkpoint("app", "main", "v1", nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	mref, _, err := w.Store.GetRef("app", "main")
+	if err != nil {
+		t.Fatal(err)
+	}
+	// An orphan at an epoch NEWER than the ref's current epoch.
+	orphanKey := store.SegmentKey(mref.Lineage, mref.Epoch+1, head+1, head+1)
+	if err := w.Store.B.Put(orphanKey, []byte("orphan")); err != nil {
+		t.Fatal(err)
+	}
+	if err := w.tombstone(map[string]string{orphanKey: "2000-01-01T00:00:00Z"}); err != nil {
+		t.Fatal(err)
+	}
+
+	if _, _, err := w.GC(0); err != nil {
+		t.Fatal(err)
+	}
+	if _, _, err := w.Store.B.Get(orphanKey); err != nil {
+		t.Fatalf("newer-epoch orphan above head must stay protected: %v", err)
+	}
+}
+
+// TestGCCompensatingRuleSweepsAtHeadOrphanRegardlessOfEpoch confirms the
+// epoch change didn't touch the rule's other gate: it only ever protects
+// keys STRICTLY ABOVE a live ref's head (m.MaxTXID > head). A member key at
+// or below head is swept once unreachable and past grace no matter what
+// epoch it carries — including an epoch newer than the ref's own, which
+// would satisfy the epoch half of the predicate on its own.
+func TestGCCompensatingRuleSweepsAtHeadOrphanRegardlessOfEpoch(t *testing.T) {
+	testutil.RequireSQLite3(t)
+	w := newWS(t)
+	if err := w.Create("app"); err != nil {
+		t.Fatal(err)
+	}
+	path, err := w.Checkout("app", "main")
+	if err != nil {
+		t.Fatal(err)
+	}
+	mustSQL(t, path, "CREATE TABLE t (v); INSERT INTO t VALUES (1);")
+	head, err := w.Checkpoint("app", "main", "v1", nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	mref, _, err := w.Store.GetRef("app", "main")
+	if err != nil {
+		t.Fatal(err)
+	}
+	// A bogus, unreachable member key AT head (not above it), deliberately
+	// given an epoch NEWER than the ref's current epoch (mref.Epoch+1
+	// guarantees no collision with any real object, since nothing has been
+	// written at that epoch). If the above-head gate were broken this would
+	// be wrongly protected by the epoch half of the predicate alone.
+	orphanKey := store.SegmentKey(mref.Lineage, mref.Epoch+1, 0, head)
+	if err := w.Store.B.Put(orphanKey, []byte("orphan")); err != nil {
+		t.Fatal(err)
+	}
+	if err := w.tombstone(map[string]string{orphanKey: "2000-01-01T00:00:00Z"}); err != nil {
+		t.Fatal(err)
+	}
+
+	if _, _, err := w.GC(0); err != nil {
+		t.Fatal(err)
+	}
+	if _, _, err := w.Store.B.Get(orphanKey); !errors.Is(err, store.ErrNotFound) {
+		t.Fatalf("at/below-head orphan must sweep regardless of epoch, Get err = %v", err)
+	}
+}
