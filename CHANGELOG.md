@@ -69,9 +69,13 @@ version if you depend on format stability.
   writer that was later fenced (`Ref.Epoch` bumped out from under it by
   `AcquireLease`, e.g. on lease reclaim) sits at an epoch strictly below the
   lineage's current writer generation and can never win a future ref CAS —
-  `keepHighestEpoch` chain resolution and the CAS'd ref write both key off
-  the current epoch — so it can never become live, yet the epoch-blind rule
-  protected it forever while the branch stayed alive. The rule now compares
+  the fenced writer's own flush refuses outright on the epoch mismatch
+  (`session/flush.go`'s `ref.Epoch != lease.Epoch` check), and even setting
+  that aside, `AcquireLease`'s epoch bump is itself a CAS'd `PutRef` that
+  changes the ref's etag, so the fenced writer's terminal `PutRef` (built
+  from its now-stale `GetRef`) fails unconditionally — so it can never
+  become live, yet the epoch-blind rule protected it forever while the
+  branch stayed alive. The rule now compares
   the object's epoch (`ChainMember.Epoch`) against the lineage's current
   `Ref.Epoch` (the MINIMUM read across every ref naming that lineage, same
   over-protect direction as the existing minimum-head rule) and protects
@@ -91,8 +95,10 @@ version if you depend on format stability.
   to learn a daemon's configured value and always uses the library default
   of 16 (`ops.ForkShareMaxDepth`) instead, even against a store a daemon
   elsewhere serves with a different cadence. No behavior change: the bound
-  stays correct either way (materialization stays bounded), just looser
-  than a lower configured cadence would have been. Documented in
+  stays correct either way (materialization stays bounded), just DIFFERENT
+  from what the daemon's cadence would have used — looser than a lower
+  configured N, tighter than a higher one (`N` has no upper bound, only the
+  `>= 1` floor). Documented in
   [docs/reference.md](docs/reference.md) (`offshoot fork`) and
   [docs/operations.md](docs/operations.md) (tuning flags).
 

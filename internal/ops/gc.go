@@ -599,9 +599,20 @@ func (w *Workspace) GC(grace time.Duration) (tombstoned, deleted int, err error)
 		// Epoch-blind protection leaks: an orphan written by a writer that
 		// was later FENCED (AcquireLease bumped Epoch out from under it —
 		// see lease.go) sits at an epoch strictly below the lineage's
-		// current Epoch, can never win a future ref CAS (keepHighestEpoch
-		// resolution and the CAS'd ref write both key off the CURRENT
-		// epoch), and so can never become live — yet an epoch-blind rule
+		// current Epoch, and can never win a future ref CAS: the fenced
+		// writer's own flush would refuse outright (session/flush.go's
+		// ref.Epoch != lease.Epoch check, ErrFenced) before ever reaching
+		// its terminal PutRef, and even a writer that raced past that check
+		// somehow still loses the CAS itself — the epoch bump goes through
+		// AcquireLease, which writes a fresh etag (lease.go's PutRef), so
+		// the fenced writer's PutRef (built from its stale GetRef's etag)
+		// fails unconditionally, not just probabilistically. (The at-rest
+		// Checkpoint path is the same shape: one GetRef, one CAS'd PutRef.)
+		// keepHighestEpoch is NOT the mechanism here — it has no knowledge
+		// of Ref.Epoch at all; it only picks the higher-epoch member between
+		// two objects covering the IDENTICAL txid range, which is chain
+		// RESOLUTION's tie-break, not what stops a fenced writer's CAS.
+		// So a fenced orphan can never become live — yet an epoch-blind rule
 		// protects it forever while the branch lives. Requiring
 		// m.Epoch >= refEpoch closes that leak while preserving the
 		// original guarantee: a retry by the CURRENT holder always writes

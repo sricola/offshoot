@@ -895,10 +895,15 @@ func TestGCCompensatingRuleProtectsAboveHeadOrphan(t *testing.T) {
 // TestGCCompensatingRuleSweepsFencedEpochOrphan guards the epoch-aware fix
 // to the compensating rule: an above-head orphan written under an epoch
 // strictly older than the lineage's CURRENT writer generation (Ref.Epoch)
-// can never win a future ref CAS — keepHighestEpoch's same-range resolution
-// and the CAS'd ref write both key off the current epoch, so a fenced
-// writer's stragglers lose deterministically (see lease.go/store.go's
-// Epoch/keepHighestEpoch docs) — and so can never become live. Protecting
+// can never win a future ref CAS — a fenced writer's own flush refuses
+// outright (session/flush.go's ref.Epoch != lease.Epoch check, ErrFenced),
+// and even setting that aside, the epoch bump itself goes through
+// AcquireLease's own CAS'd PutRef (lease.go), which changes the ref's etag,
+// so the fenced writer's terminal PutRef — built from its now-stale GetRef —
+// fails unconditionally. (NOT keepHighestEpoch: that function has no
+// knowledge of Ref.Epoch at all — it only tie-breaks two members covering
+// the IDENTICAL txid range, which is chain resolution, not what stops a
+// fenced writer's CAS.) So a fenced orphan can never become live. Protecting
 // such an object forever, as an epoch-blind rule once did, is a bounded
 // space leak; this test proves it is now reclaimed once provably fenced.
 func TestGCCompensatingRuleSweepsFencedEpochOrphan(t *testing.T) {
@@ -916,7 +921,7 @@ func TestGCCompensatingRuleSweepsFencedEpochOrphan(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	mref, metag, err := w.Store.GetRef("app", "main")
+	mref, _, err := w.Store.GetRef("app", "main")
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -929,12 +934,14 @@ func TestGCCompensatingRuleSweepsFencedEpochOrphan(t *testing.T) {
 	if err := w.tombstone(map[string]string{orphanKey: "2000-01-01T00:00:00Z"}); err != nil {
 		t.Fatal(err)
 	}
-	// Simulate the branch's lease being reclaimed by a new holder (the same
-	// Epoch bump AcquireLease performs on a fresh acquisition/reclaim — see
-	// lease.go): the writer that left the orphan is now fenced, and the
-	// orphan can never win a ref CAS at the new epoch.
-	mref.Epoch++
-	if _, err := w.Store.PutRef("app", "main", mref, metag); err != nil {
+	// The branch's lease is reclaimed by a new holder — through the REAL
+	// AcquireLease path (lease.go), not a hand-rolled epoch bump, so a
+	// future change to where/how the bump happens would break this test
+	// too: a fresh acquisition (main has never been leased, so this one is
+	// "fresh," not a reclaim, but both bump the epoch identically — see
+	// AcquireLease's doc comment) fences the writer that left the orphan
+	// behind, and the orphan can never win a ref CAS at the new epoch.
+	if _, err := w.AcquireLease("app", "main", "fencer", DefaultLeaseTTL); err != nil {
 		t.Fatal(err)
 	}
 
