@@ -13,6 +13,44 @@ version if you depend on format stability.
 
 ## [Unreleased]
 
+### Added
+
+- **S3 multipart uploads now upload parts concurrently.** `store.S3`'s
+  `putMultipart` (backing `PutReader`/`PutReaderIf` above
+  `multipartThreshold`) previously uploaded parts strictly sequentially — a
+  5 GiB snapshot at the 64 MiB default part size paid ~80 sequential
+  `UploadPart` round trips. Parts now upload in parallel, bounded to
+  `multipartConcurrency` (default 4) simultaneous workers, but ONLY on the
+  `io.ReaderAt` path (the production `*os.File` case): `io.ReaderAt` is
+  documented safe for parallel `ReadAt` calls on the same source, so each
+  worker can read its own part independently. The non-`io.ReaderAt`
+  fallback — which reads every part sequentially into one reused buffer —
+  is unaffected and stays strictly sequential; parallelizing it would
+  either race the shared buffer or need a buffer per worker, multiplying
+  memory for exactly the callers who couldn't afford one `partSize` buffer
+  in the first place. Every part's result lands in a pre-sized slice at its
+  own `PartNumber` index, so the final `CompletedPart` list stays correctly
+  ordered regardless of completion order — no sort step needed. The
+  existing abort-on-every-error-path guarantee, per-part checksum
+  propagation, and first-error-wins-with-prompt-cancellation semantics all
+  carry over unchanged under concurrency.
+
+- **`store.S3.CopyObject` now server-side-copies objects over 5 GiB
+  instead of declining.** Previously, any source over S3's 5 GiB
+  single-request `CopyObject` limit returned `ErrCopyUnsupported`,
+  forcing callers (`ops.Fork`'s fast fork path) to fall back to a full
+  materialize-download-re-encode-upload of the whole database. `CopyObject`
+  now performs a real multipart server-side copy for sources up to S3's
+  actual 5 TiB per-object ceiling: `CreateMultipartUpload` + a sequence of
+  `UploadPartCopy` calls (each with an inclusive `CopySourceRange` byte
+  range, sized the same way multipart uploads size their parts) +
+  `CompleteMultipartUpload`. `ErrCopyUnsupported` is now reserved for
+  sources genuinely beyond any S3 mechanism's reach (over 5 TiB) — the 5
+  GiB boundary is now a strategy choice (single-request vs. multipart), not
+  a capability limit. Same abort-on-every-error-path discipline as the
+  multipart upload path; `CompleteMultipartUpload` sets no conditions,
+  matching `CopyObject`'s existing overwrite-on-existing-dst contract.
+
 ## [0.2.3] - 2026-08-09
 
 ### Added

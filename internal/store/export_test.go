@@ -44,3 +44,17 @@ func SetMultipartConcurrencyForTest(v int) (restore func()) {
 	multipartConcurrency = v
 	return func() { multipartConcurrency = prev }
 }
+
+// SetCopyObjectMaxBytesForTest overrides the source-size threshold above
+// which store.S3.CopyObject switches from a single-request CopyObject to a
+// multipart UploadPartCopy sequence (copyObjectMaxBytes in s3.go),
+// returning a restore func that puts back the previous value (call it via
+// t.Cleanup). A real >5GiB source can't be exercised in a test, so tests
+// lower this (paired with SetPartSizeForTest) to drive a modest real
+// payload through the multipart-copy path. Test-only: never call this
+// outside a test.
+func SetCopyObjectMaxBytesForTest(v int64) (restore func()) {
+	prev := copyObjectMaxBytes
+	copyObjectMaxBytes = v
+	return func() { copyObjectMaxBytes = prev }
+}

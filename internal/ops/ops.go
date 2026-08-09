@@ -729,9 +729,10 @@ var ObserveCheckpoint func(dur time.Duration)
 // that cannot perform CopyObject at all for this particular object (store.
 // ErrCopyUnsupported) also falls through to the slow path — every backend
 // offshoot ships (local since Task 6a, S3 since Task 6b) supports
-// CopyObject in general, but S3's is gated to objects at or under its 5GB
-// single-request CopyObject limit, so the sentinel still fires for anything
-// larger — see store.S3.CopyObject's doc comment.
+// CopyObject in general, including S3 objects over its 5GB single-request
+// limit (via multipart UploadPartCopy), so the sentinel now only fires for
+// a source over S3's actual 5TiB per-object ceiling — see
+// store.S3.CopyObject's doc comment.
 func (w *Workspace) copySnapshotToNewLineage(src store.Ref, cp store.Checkpoint) (string, bool, error) {
 	// Resolved once, up front, and threaded through both the fast-path
 	// attempt and the slow-path fallback — see materializeMembersAt's doc
