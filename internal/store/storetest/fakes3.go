@@ -10,6 +10,7 @@ import (
 	"net/http/httptest"
 	"net/url"
 	"sort"
+	"strconv"
 	"strings"
 	"sync"
 	"testing"
@@ -41,6 +42,35 @@ type FakeS3 struct {
 	// real S3 uses (a 200 response carrying Error entries), which
 	// store.S3.DeleteObjects must map to "not in deleted, named in err".
 	batchDeleteErrs map[string]bool
+
+	// multipart tracks in-progress (Created, not yet Completed or Aborted)
+	// multipart uploads, keyed by the fake-issued UploadId — what
+	// store.S3.putMultipart drives via CreateMultipartUpload/UploadPart/
+	// CompleteMultipartUpload/AbortMultipartUpload. nextUploadID is a
+	// counter, not randomness: this fake is single-process and holds f.mu
+	// for the whole request, so a counter is already unique and needs no
+	// extra dependency.
+	multipart    map[string]*fakeMultipartUpload
+	nextUploadID int
+
+	// multipart{Creates,UploadParts,Completes,Aborts} count how many of
+	// each multipart request this fake has served. Tests use these to
+	// assert a write actually took the multipart path (e.g. UploadParts >
+	// 1) rather than the single-PUT path, and that a forced mid-upload
+	// failure produced exactly one Abort with no upload left pending.
+	multipartCreates     int
+	multipartUploadParts int
+	multipartCompletes   int
+	multipartAborts      int
+}
+
+// fakeMultipartUpload is one Created-but-not-yet-Completed-or-Aborted
+// multipart upload: the destination key it targets, and its uploaded parts
+// keyed by PartNumber (not necessarily contiguous or complete until
+// CompleteMultipartUpload arrives).
+type fakeMultipartUpload struct {
+	key   string
+	parts map[int32][]byte
 }
 
 func NewFakeS3(t *testing.T) *FakeS3 {
@@ -90,6 +120,29 @@ func (f *FakeS3) SetBatchDeleteError(key string) {
 		f.batchDeleteErrs = map[string]bool{}
 	}
 	f.batchDeleteErrs[key] = true
+}
+
+// MultipartStats returns how many CreateMultipartUpload, UploadPart,
+// CompleteMultipartUpload, and AbortMultipartUpload requests this fake has
+// served, in that order. A test asserts a write actually took the
+// multipart path (uploadParts > 1, exactly one create, one complete) rather
+// than the single-PUT path, and that a forced mid-upload failure produced
+// exactly one abort.
+func (f *FakeS3) MultipartStats() (creates, uploadParts, completes, aborts int) {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	return f.multipartCreates, f.multipartUploadParts, f.multipartCompletes, f.multipartAborts
+}
+
+// PendingMultipartUploads returns the number of multipart uploads that have
+// been Created but neither Completed nor Aborted. store.S3's abort-on-
+// every-error-path guarantee means this is always 0 once a
+// PutReader/PutReaderIf call has returned, success or failure — a test
+// forcing a mid-upload failure asserts this to pin that guarantee.
+func (f *FakeS3) PendingMultipartUploads() int {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	return len(f.multipart)
 }
 
 // Seed stores data at key directly, bypassing HTTP. Exists so a test that
@@ -159,6 +212,14 @@ func (f *FakeS3) handle(w http.ResponseWriter, r *http.Request) {
 		w.Write(data)
 
 	case http.MethodPut:
+		// store.S3.putMultipart issues one PUT per part, carrying
+		// partNumber and uploadId query params — S3's UploadPart contract.
+		// Route it separately, before both the copy-source and plain-body
+		// PUT handling below, neither of which applies to a part upload.
+		if q := r.URL.Query(); q.Get("partNumber") != "" && q.Get("uploadId") != "" {
+			f.uploadPart(w, r, key)
+			return
+		}
 		// store.S3.CopyObject issues a PUT carrying X-Amz-Copy-Source
 		// instead of a body — S3's server-side copy contract. Route it
 		// separately: the ordinary PUT path below would otherwise treat
@@ -195,10 +256,30 @@ func (f *FakeS3) handle(w http.ResponseWriter, r *http.Request) {
 		w.WriteHeader(http.StatusOK)
 
 	case http.MethodDelete:
+		// store.S3.putMultipart issues AbortMultipartUpload as a DELETE
+		// carrying ?uploadId=X. Route it separately from a plain object
+		// delete, which carries no such query param.
+		if uploadID := r.URL.Query().Get("uploadId"); uploadID != "" {
+			f.abortMultipartUpload(w, key, uploadID)
+			return
+		}
 		delete(f.objs, key)
 		w.WriteHeader(http.StatusNoContent)
 
 	case http.MethodPost:
+		// CreateMultipartUpload: POST /{bucket}/{key}?uploads (empty value).
+		// Route before the batch-delete/complete checks below since it
+		// carries a non-empty key, unlike batch delete.
+		if _, ok := r.URL.Query()["uploads"]; ok {
+			f.createMultipartUpload(w, key)
+			return
+		}
+		// CompleteMultipartUpload: POST /{bucket}/{key}?uploadId=X, body is
+		// the XML part manifest.
+		if uploadID := r.URL.Query().Get("uploadId"); uploadID != "" {
+			f.completeMultipartUpload(w, r, key, uploadID)
+			return
+		}
 		// Batch delete: POST /{bucket}?delete with an XML key manifest —
 		// what store.S3.DeleteObjects issues (perf audit H2). No other POST
 		// operation is faked.
@@ -286,6 +367,165 @@ func decodeCopySource(v string) (string, error) {
 		return "", err
 	}
 	return dec, nil
+}
+
+// createMultipartUpload serves CreateMultipartUpload (POST ?uploads): mints
+// a new UploadId and starts tracking a pending upload for key. Real S3
+// issues opaque, globally-unique upload IDs; this fake's single-process
+// counter is unique enough for a server that never restarts mid-test.
+func (f *FakeS3) createMultipartUpload(w http.ResponseWriter, key string) {
+	f.nextUploadID++
+	id := fmt.Sprintf("fake-upload-%d", f.nextUploadID)
+	if f.multipart == nil {
+		f.multipart = map[string]*fakeMultipartUpload{}
+	}
+	f.multipart[id] = &fakeMultipartUpload{key: key, parts: map[int32][]byte{}}
+	f.multipartCreates++
+	w.Header().Set("Content-Type", "application/xml")
+	w.WriteHeader(http.StatusOK)
+	fmt.Fprintf(w, `<InitiateMultipartUploadResult><Bucket>%s</Bucket><Key>%s</Key><UploadId>%s</UploadId></InitiateMultipartUploadResult>`,
+		fakeBucket, key, id)
+}
+
+// uploadPart serves UploadPart (PUT ?partNumber=N&uploadId=X): stores the
+// request body under the pending upload's PartNumber and returns an ETag —
+// the per-part content MD5, same formula etagOf uses for a whole object,
+// which is what real S3 returns for a part too.
+func (f *FakeS3) uploadPart(w http.ResponseWriter, r *http.Request, key string) {
+	q := r.URL.Query()
+	up, ok := f.multipart[q.Get("uploadId")]
+	if !ok || up.key != key {
+		w.Header().Set("Content-Type", "application/xml")
+		w.WriteHeader(http.StatusNotFound)
+		io.WriteString(w, `<Error><Code>NoSuchUpload</Code></Error>`)
+		return
+	}
+	n, err := strconv.Atoi(q.Get("partNumber"))
+	if err != nil || n < 1 {
+		w.Header().Set("Content-Type", "application/xml")
+		w.WriteHeader(http.StatusBadRequest)
+		io.WriteString(w, `<Error><Code>InvalidArgument</Code></Error>`)
+		return
+	}
+	body, err := io.ReadAll(r.Body)
+	if err != nil {
+		w.WriteHeader(http.StatusBadRequest)
+		return
+	}
+	cp := make([]byte, len(body))
+	copy(cp, body)
+	up.parts[int32(n)] = cp
+	f.multipartUploadParts++
+	w.Header().Set("ETag", etagOf(cp))
+	w.WriteHeader(http.StatusOK)
+}
+
+// completeMultipartUploadRequest mirrors the S3 CompleteMultipartUpload
+// request body: <CompleteMultipartUpload><Part><PartNumber>n</PartNumber>
+// <ETag>e</ETag></Part>...</CompleteMultipartUpload>.
+type completeMultipartUploadRequest struct {
+	XMLName xml.Name `xml:"CompleteMultipartUpload"`
+	Parts   []struct {
+		PartNumber int32  `xml:"PartNumber"`
+		ETag       string `xml:"ETag"`
+	} `xml:"Part"`
+}
+
+// completeMultipartUpload serves CompleteMultipartUpload (POST
+// ?uploadId=X): concatenates the pending upload's parts IN THE REQUEST'S
+// PART ORDER (store.S3.putMultipart always sends them ascending by
+// PartNumber, the order S3 itself requires) into the final object, honoring
+// If-None-Match: "*" / If-Match exactly as the plain-PUT path above does —
+// store.S3.PutReaderIf's CAS condition lives on this call, not on Create or
+// UploadPart, so this is where a conflict must be detected.
+func (f *FakeS3) completeMultipartUpload(w http.ResponseWriter, r *http.Request, key, uploadID string) {
+	up, ok := f.multipart[uploadID]
+	if !ok || up.key != key {
+		w.Header().Set("Content-Type", "application/xml")
+		w.WriteHeader(http.StatusNotFound)
+		io.WriteString(w, `<Error><Code>NoSuchUpload</Code></Error>`)
+		return
+	}
+	body, err := io.ReadAll(r.Body)
+	if err != nil {
+		w.WriteHeader(http.StatusBadRequest)
+		return
+	}
+	var req completeMultipartUploadRequest
+	if xml.Unmarshal(body, &req) != nil || len(req.Parts) == 0 {
+		w.Header().Set("Content-Type", "application/xml")
+		w.WriteHeader(http.StatusBadRequest)
+		io.WriteString(w, `<Error><Code>MalformedXML</Code></Error>`)
+		return
+	}
+
+	if !f.ignore {
+		cur, exists := f.objs[key]
+		if inm := r.Header.Get("If-None-Match"); inm == "*" && exists {
+			w.Header().Set("Content-Type", "application/xml")
+			w.WriteHeader(http.StatusPreconditionFailed)
+			io.WriteString(w, `<Error><Code>PreconditionFailed</Code></Error>`)
+			return
+		}
+		if im := r.Header.Get("If-Match"); im != "" {
+			if !exists || etagOf(cur) != im {
+				w.Header().Set("Content-Type", "application/xml")
+				w.WriteHeader(http.StatusPreconditionFailed)
+				io.WriteString(w, `<Error><Code>PreconditionFailed</Code></Error>`)
+				return
+			}
+		}
+	}
+
+	var final []byte
+	var digests []byte
+	for _, p := range req.Parts {
+		pb, ok := up.parts[p.PartNumber]
+		if !ok {
+			w.Header().Set("Content-Type", "application/xml")
+			w.WriteHeader(http.StatusBadRequest)
+			io.WriteString(w, `<Error><Code>InvalidPart</Code></Error>`)
+			return
+		}
+		final = append(final, pb...)
+		sum := md5.Sum(pb)
+		digests = append(digests, sum[:]...)
+	}
+
+	f.objs[key] = final
+	delete(f.multipart, uploadID)
+	f.multipartCompletes++
+
+	// Real S3's multipart ETag is not the object's content MD5 — it's
+	// "<md5-of-the-concatenated-part-md5s>-<part count>" (see store.S3's
+	// PutReaderIf doc comment, which notes offshoot never parses this).
+	// Reproduced here for realism; nothing in this fake or store.S3 reads
+	// it back apart from opaque round-tripping.
+	sum := md5.Sum(digests)
+	etag := fmt.Sprintf(`"%s-%d"`, hex.EncodeToString(sum[:]), len(req.Parts))
+	w.Header().Set("Content-Type", "application/xml")
+	w.WriteHeader(http.StatusOK)
+	fmt.Fprintf(w, `<CompleteMultipartUploadResult><Bucket>%s</Bucket><Key>%s</Key><ETag>%s</ETag></CompleteMultipartUploadResult>`,
+		fakeBucket, key, etag)
+}
+
+// abortMultipartUpload serves AbortMultipartUpload (DELETE ?uploadId=X):
+// drops the pending upload and its buffered parts. store.S3.putMultipart
+// calls this on every error exit after a successful Create — the
+// cost-critical guarantee that keeps a failed upload from billing for
+// abandoned parts forever; PendingMultipartUploads lets a test confirm no
+// upload was left behind.
+func (f *FakeS3) abortMultipartUpload(w http.ResponseWriter, key, uploadID string) {
+	up, ok := f.multipart[uploadID]
+	if !ok || up.key != key {
+		w.Header().Set("Content-Type", "application/xml")
+		w.WriteHeader(http.StatusNotFound)
+		io.WriteString(w, `<Error><Code>NoSuchUpload</Code></Error>`)
+		return
+	}
+	delete(f.multipart, uploadID)
+	f.multipartAborts++
+	w.WriteHeader(http.StatusNoContent)
 }
 
 // deleteObjectsRequest mirrors the S3 DeleteObjects request body:

@@ -222,20 +222,74 @@ func (s *S3) PutIf(key string, data []byte, ifMatch string) (string, error) {
 	return aws.ToString(out.ETag), nil
 }
 
-// PutReader implements store.ReaderPutter's unconditional overwrite: an
-// ordinary PutObject with Body: r and ContentLength: size, so the SDK never
-// needs to buffer r's content to determine its length (unlike Put, which
-// wraps an already-in-memory []byte in bytes.NewReader). The SDK's own
-// payload-hash-for-signing step (SigV4) does not require buffering either:
-// over HTTPS (the normal case) S3 uses UNSIGNED-PAYLOAD and skips hashing
-// the body at all; over plain HTTP it streams the body through a SHA256
-// hasher and rewinds (r must support io.Seeker, true of the *os.File this
-// backend's only caller — flush.go's snapshot upload — passes) rather than
-// holding it in memory.
+// minPartSize is S3's minimum multipart part size: every part except the
+// last one must be at least this large (S3 API constraint).
+const minPartSize = 5 * 1024 * 1024 // 5 MiB
+
+// defaultPartSize is the part size store.S3 uses for a multipart upload
+// when the object isn't large enough to force a bigger size via maxParts
+// (see partSizeFor) — 8 MiB, the same default the AWS CLI's own
+// multipart_chunksize uses. Large enough to keep the part count (and
+// therefore UploadPart round trips) reasonable for a multi-GiB snapshot,
+// small enough to keep the non-io.ReaderAt fallback's per-part buffer a
+// modest, fixed amount of memory.
+const defaultPartSize = 8 * 1024 * 1024 // 8 MiB
+
+// maxParts is S3's hard limit on the number of parts a single multipart
+// upload may have (S3 API constraint).
+const maxParts = 10000
+
+// multipartThreshold is the object size above which PutReader/PutReaderIf
+// switch from a single PutObject to a multipart upload (CreateMultipartUpload
+// + UploadPart* + CompleteMultipartUpload). Its default is S3's single-
+// PutObject ceiling of 5 GiB — the same limit copyObjectMaxBytes documents
+// for CopyObject's separate, still-unimplemented multipart gap (CopyObject
+// is untouched by this).
 //
-// Same 5 GiB single-PutObject ceiling as PutIf below applies here too — see
-// PutReaderIf's doc comment.
+// This is a package var, not a const, ONLY so tests can override it — a
+// real >5 GiB upload can't be exercised in a test. Never set it outside a
+// test; production code must never assign to it. See
+// SetMultipartThresholdForTest (export_test.go).
+var multipartThreshold int64 = 5 * 1024 * 1024 * 1024 // 5 GiB
+
+// partSizeFor returns the per-part size store.S3 uses to multipart-upload
+// an object of the given total size: at least minPartSize and defaultPartSize,
+// and large enough that size splits into at most maxParts parts — S3's two
+// hard limits on part size and part count. This keeps ANY object size up to
+// S3's 5 TiB per-object limit within the 10,000-part ceiling. The final part
+// is always whatever remains (<= the computed part size), never padded.
+func partSizeFor(size int64) int64 {
+	ps := int64(defaultPartSize)
+	if need := (size + maxParts - 1) / maxParts; need > ps {
+		ps = need
+	}
+	if ps < minPartSize {
+		ps = minPartSize
+	}
+	return ps
+}
+
+// PutReader implements store.ReaderPutter's unconditional overwrite. For
+// size <= multipartThreshold it issues a single PutObject with Body: r and
+// ContentLength: size, so the SDK never needs to buffer r's content to
+// determine its length (unlike Put, which wraps an already-in-memory []byte
+// in bytes.NewReader). The SDK's own payload-hash-for-signing step (SigV4)
+// does not require buffering either: over HTTPS (the normal case) S3 uses
+// UNSIGNED-PAYLOAD and skips hashing the body at all; over plain HTTP it
+// streams the body through a SHA256 hasher and rewinds (r must support
+// io.Seeker, true of the *os.File this backend's only caller — flush.go's
+// snapshot upload — passes) rather than holding it in memory.
+//
+// For size > multipartThreshold (lifting S3's 5 GiB single-PutObject
+// ceiling) it instead uses a multipart upload — see putMultipart's doc
+// comment for the mechanics, part sizing, and the abort-on-every-error-path
+// guarantee that makes this safe to call. PutReader sets no conditions on
+// the multipart Complete (unconditional, matching the single-PUT path).
 func (s *S3) PutReader(key string, r io.Reader, size int64) error {
+	if size > multipartThreshold {
+		_, err := s.putMultipart(key, r, size, "", false)
+		return err
+	}
 	fk, err := s.full(key)
 	if err != nil {
 		return err
@@ -250,20 +304,34 @@ func (s *S3) PutReader(key string, r io.Reader, size int64) error {
 	return nil
 }
 
-// PutReaderIf implements store.ReaderPutter's CAS write: identical
-// ifMatch-to-precondition-header translation as PutIf (create-only via
-// IfNoneMatch: "*", CAS via IfMatch), with Body: r/ContentLength: size in
-// place of a buffered []byte — see PutReader's doc comment for why that
-// does not require buffering the object.
+// PutReaderIf implements store.ReaderPutter's CAS write. For size <=
+// multipartThreshold it issues identical ifMatch-to-precondition-header
+// translation as PutIf (create-only via IfNoneMatch: "*", CAS via IfMatch)
+// on a single PutObject, with Body: r/ContentLength: size in place of a
+// buffered []byte — see PutReader's doc comment for why that does not
+// require buffering the object.
 //
-// PutReaderIf inherits S3's single-request PutObject ceiling of 5 GiB (the
-// same limit store.S3.CopyObject enforces for server-side copies — see
-// copyObjectMaxBytes) rather than checking for or rejecting it explicitly:
-// offshoot's snapshot objects are already bounded there in practice by the
-// same constraint CopyObject documents, and multipart upload (which would
-// lift this ceiling) is a noted, out-of-scope follow-up, not implemented
-// here — same posture as CopyObject's own multipart gap.
+// For size > multipartThreshold it uses a multipart upload instead — see
+// putMultipart's doc comment. The condition (IfNoneMatch/IfMatch) is placed
+// on CompleteMultipartUpload, not on CreateMultipartUpload or any UploadPart
+// call (the SDK's CompleteMultipartUploadInput supports both fields), and a
+// precondition rejection there maps to store.ErrCAS via the same
+// isPreconditionFailed/isNotFound helpers and the same error wording as the
+// single-PUT path below, so CAS semantics are indistinguishable to a
+// caller regardless of which path an object's size took.
+//
+// One observable difference: a multipart object's ETag is NOT its MD5 the
+// way a single-PUT object's is — S3 returns "<md5-of-the-part-md5s>-<part
+// count>" instead (e.g. "d41d8cd9...-3"), a valid opaque etag for future
+// If-Match calls but not a content hash. offshoot never parses or hashes
+// etags (see S3's type doc comment), and this backend's only production
+// caller (flush.go's snapshot upload) discards PutReaderIf's returned etag
+// entirely, so this is harmless in practice — noted here for any future
+// caller that might assume otherwise.
 func (s *S3) PutReaderIf(key string, r io.Reader, size int64, ifMatch string) (string, error) {
+	if size > multipartThreshold {
+		return s.putMultipart(key, r, size, ifMatch, true)
+	}
 	fk, err := s.full(key)
 	if err != nil {
 		return "", err
@@ -288,6 +356,129 @@ func (s *S3) PutReaderIf(key string, r io.Reader, size int64, ifMatch string) (s
 		}
 		return "", fmt.Errorf("store: s3 conditional put %s: %w", key, err)
 	}
+	return aws.ToString(out.ETag), nil
+}
+
+// putMultipart uploads r (exactly size bytes) to key via S3's multipart
+// upload API: CreateMultipartUpload, then a sequential loop of UploadPart
+// calls (PartNumber 1-based, ascending), then CompleteMultipartUpload with
+// the collected parts in PartNumber order. It is the shared implementation
+// behind PutReader (conditional == false) and PutReaderIf (conditional ==
+// true, ifMatch translated to IfNoneMatch/IfMatch on the Complete call
+// exactly as PutReaderIf's doc comment describes).
+//
+// COST-CRITICAL: an abandoned multipart upload leaves its already-uploaded
+// parts stored (and billed) on S3 indefinitely — S3 does not garbage-collect
+// them on its own (outside of a bucket lifecycle rule this backend does not
+// configure). So once CreateMultipartUpload succeeds, a deferred cleanup
+// issues AbortMultipartUpload on EVERY exit path that is not a successful
+// Complete: a part-upload error, a part-read error (non-ReaderAt fallback),
+// a Complete error (including a CAS/precondition rejection), all funnel
+// through the same defer via the named `completed` flag, which is only set
+// true immediately after CompleteMultipartUpload succeeds. If the abort
+// itself also fails, that failure is appended to (not substituted for) the
+// original error, so the original failure is never masked — the caller
+// still needs to know the write failed, and the abort failure is surfaced
+// too so an operator can investigate the now-possibly-lingering upload.
+//
+// Part sourcing avoids buffering the whole object: when r is an
+// io.ReaderAt (true for the *os.File the production caller — flush.go's
+// snapshot upload — passes), each part is an io.NewSectionReader(ra,
+// offset, n) — zero buffering, the SDK reads directly from the file at each
+// part's offset. When r is not an io.ReaderAt, each part is instead read
+// fully into a single reused buffer sized to one part (bounded memory: at
+// most one part's worth, reused across parts, never the whole object).
+//
+// Parts are uploaded sequentially, not concurrently — correctness first;
+// concurrent part uploads are a plausible future improvement once this
+// path has real production mileage.
+func (s *S3) putMultipart(key string, r io.Reader, size int64, ifMatch string, conditional bool) (etag string, err error) {
+	fk, err := s.full(key)
+	if err != nil {
+		return "", err
+	}
+	ctx := context.Background()
+
+	created, err := s.cl.CreateMultipartUpload(ctx, &s3.CreateMultipartUploadInput{
+		Bucket: aws.String(s.bucket), Key: aws.String(fk),
+	})
+	if err != nil {
+		return "", fmt.Errorf("store: s3 create multipart upload %s: %w", key, err)
+	}
+	uploadID := created.UploadId
+
+	completed := false
+	defer func() {
+		if completed {
+			return
+		}
+		_, aerr := s.cl.AbortMultipartUpload(context.Background(), &s3.AbortMultipartUploadInput{
+			Bucket: aws.String(s.bucket), Key: aws.String(fk), UploadId: uploadID,
+		})
+		if aerr != nil {
+			err = fmt.Errorf("%w (additionally, aborting the multipart upload also failed, so its parts may be left billed on S3: %v)", err, aerr)
+		}
+	}()
+
+	partSize := partSizeFor(size)
+	ra, isReaderAt := r.(io.ReaderAt)
+	var buf []byte
+	if !isReaderAt {
+		buf = make([]byte, partSize)
+	}
+
+	var parts []types.CompletedPart
+	partNum := int32(1)
+	for offset := int64(0); offset < size; offset += partSize {
+		n := partSize
+		if remain := size - offset; remain < n {
+			n = remain
+		}
+
+		var body io.Reader
+		if isReaderAt {
+			body = io.NewSectionReader(ra, offset, n)
+		} else {
+			if _, rerr := io.ReadFull(io.LimitReader(r, n), buf[:n]); rerr != nil {
+				return "", fmt.Errorf("store: s3 read part %d for %s: %w", partNum, key, rerr)
+			}
+			body = bytes.NewReader(buf[:n])
+		}
+
+		up, uerr := s.cl.UploadPart(ctx, &s3.UploadPartInput{
+			Bucket: aws.String(s.bucket), Key: aws.String(fk),
+			UploadId: uploadID, PartNumber: aws.Int32(partNum),
+			Body: body, ContentLength: aws.Int64(n),
+		})
+		if uerr != nil {
+			return "", fmt.Errorf("store: s3 upload part %d for %s: %w", partNum, key, uerr)
+		}
+		parts = append(parts, types.CompletedPart{ETag: up.ETag, PartNumber: aws.Int32(partNum)})
+		partNum++
+	}
+
+	completeIn := &s3.CompleteMultipartUploadInput{
+		Bucket: aws.String(s.bucket), Key: aws.String(fk), UploadId: uploadID,
+		MultipartUpload: &types.CompletedMultipartUpload{Parts: parts},
+	}
+	if conditional {
+		if ifMatch == "" {
+			completeIn.IfNoneMatch = aws.String("*")
+		} else {
+			completeIn.IfMatch = aws.String(ifMatch)
+		}
+	}
+	out, cerr := s.cl.CompleteMultipartUpload(ctx, completeIn)
+	if cerr != nil {
+		if conditional && isPreconditionFailed(cerr) {
+			return "", fmt.Errorf("%w: %s", ErrCAS, key)
+		}
+		if conditional && ifMatch != "" && isNotFound(cerr) {
+			return "", fmt.Errorf("%w: key absent, expected etag %s", ErrCAS, ifMatch)
+		}
+		return "", fmt.Errorf("store: s3 complete multipart upload %s: %w", key, cerr)
+	}
+	completed = true
 	return aws.ToString(out.ETag), nil
 }
 
