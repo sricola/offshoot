@@ -81,6 +81,21 @@ version if you depend on format stability.
   acquirer bumped it after the read) still satisfies `>=` and stays
   protected.
 
+### Changed
+
+- **Documented the fork-floor/`-snapshot-every` divergence between a
+  daemon and an at-rest CLI fork.** `-snapshot-every N` (see `offshoot
+  serve`) is a per-process flag, never persisted to the store, and it also
+  sets the daemon's fork-time snapshot-floor bound (`ops.Workspace.
+  SnapshotEvery`). An at-rest CLI `fork` — no daemon involved — has no way
+  to learn a daemon's configured value and always uses the library default
+  of 16 (`ops.ForkShareMaxDepth`) instead, even against a store a daemon
+  elsewhere serves with a different cadence. No behavior change: the bound
+  stays correct either way (materialization stays bounded), just looser
+  than a lower configured cadence would have been. Documented in
+  [docs/reference.md](docs/reference.md) (`offshoot fork`) and
+  [docs/operations.md](docs/operations.md) (tuning flags).
+
 ## [0.2.3] - 2026-08-09
 
 ### Added

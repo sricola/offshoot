@@ -405,6 +405,15 @@ there's no config file).
 | `-gc-grace DURATION` | `15m` | How long a tombstoned (unreferenced) lineage sits before it's actually deleted. `0` makes it eligible on the very next `-reap-every` tick after tombstoning, rather than disabling GC. A lineage re-referenced during the grace window (e.g. a fork racing GC) is left alone. |
 | `-ro-cache-budget BYTES` | `0` (unlimited) | See [Budgets](#budgets) above in full; accepts a bare byte count or a `K`/`M`/`G`/`T` power-of-1024 suffix. |
 
+**`-snapshot-every` is a per-process tuning knob, not a persisted store
+setting.** It also sets this daemon's fork-time snapshot-floor bound (the
+depth at which a shared `fork` falls back to materializing — see `offshoot
+fork` in [docs/reference.md](reference.md)). Because it's never written to
+the store, an at-rest CLI `fork` against a store this daemon serves has no
+way to learn it and always uses the library default of 16 instead — still
+correct (materialization stays bounded), just looser than a lower
+configured cadence would have been.
+
 **The flush-cost/replay interaction, in one place:** `-flush-every` and
 `-snapshot-every` compose. Under continuous writing, the default
 `-flush-every 30s` × the default `-snapshot-every 16` means a full snapshot

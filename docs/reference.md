@@ -290,6 +290,21 @@ own divergence crosses it, after which its reads never touch the parent.
 below), and `offshoot compact` converts a shared branch into a
 self-contained one on demand (see `offshoot compact` below).
 
+**The fork-time floor is a per-process setting, not a persisted one.** The
+depth bound above defaults to 16 (`ops.ForkShareMaxDepth`) but is
+configurable — the daemon sets it from its own `-snapshot-every N` (see
+`offshoot serve` below) so the fork floor agrees with the cadence at which
+a daemon-managed session self-snapshots. That configured value lives only
+in the serving process's memory; nothing about it is written to the store.
+An at-rest CLI `fork` (no daemon involved) therefore always uses the
+default of 16, even against a store a daemon elsewhere serves with a
+different `-snapshot-every N`. This is harmless — materialization stays
+bounded either way — just potentially looser than a daemon's lower
+configured cadence would have used (a fork shares for a few more levels
+before falling back to materializing). There's no mechanism today for the
+CLI to learn a daemon's flag, since it isn't persisted anywhere the CLI
+could read it.
+
 Destroying a parent remains **instant and always allowed** — but under
 sharing, the parent's *bytes* can outlive its ref: they are reclaimed by
 GC only once no surviving child's chain still reads through them (see
