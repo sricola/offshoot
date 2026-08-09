@@ -1,10 +1,10 @@
 package store
 
 // This file exists only in test binaries (export_test.go is never compiled
-// into non-test builds). It exposes S3's unexported multipartThreshold test
-// knob (see s3.go's doc comment on that var) to the EXTERNAL store_test
-// package, following the same pattern internal/ops/export_test.go uses for
-// forkSlowPathForTest.
+// into non-test builds). It exposes S3's unexported multipartThreshold and
+// defaultPartSize test knobs (see s3.go's doc comments on those vars) to the
+// EXTERNAL store_test package, following the same pattern
+// internal/ops/export_test.go uses for forkSlowPathForTest.
 
 // SetMultipartThresholdForTest overrides the object-size threshold above
 // which store.S3.PutReader/PutReaderIf switch to a multipart upload,
@@ -16,4 +16,18 @@ func SetMultipartThresholdForTest(v int64) (restore func()) {
 	prev := multipartThreshold
 	multipartThreshold = v
 	return func() { multipartThreshold = prev }
+}
+
+// SetPartSizeForTest overrides the part size store.S3's multipart path uses
+// (defaultPartSize in partSizeFor), returning a restore func that puts back
+// the previous value (call it via t.Cleanup). Exercising "several real
+// parts" against production's 64 MiB default would need a several-hundred-
+// MiB test payload; tests instead shrink this (down to minPartSize, S3's
+// real 5 MiB floor — partSizeFor's own clamp prevents going lower) so a
+// modest payload still splits into multiple genuine parts. Test-only: never
+// call this outside a test.
+func SetPartSizeForTest(v int64) (restore func()) {
+	prev := defaultPartSize
+	defaultPartSize = v
+	return func() { defaultPartSize = prev }
 }

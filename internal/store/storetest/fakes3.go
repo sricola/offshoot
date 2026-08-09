@@ -500,7 +500,13 @@ func (f *FakeS3) completeMultipartUpload(w http.ResponseWriter, r *http.Request,
 	// "<md5-of-the-concatenated-part-md5s>-<part count>" (see store.S3's
 	// PutReaderIf doc comment, which notes offshoot never parses this).
 	// Reproduced here for realism; nothing in this fake or store.S3 reads
-	// it back apart from opaque round-tripping.
+	// it back apart from opaque round-tripping. Fake-fidelity limitation:
+	// the If-Match check above still compares against etagOf(cur) — a
+	// freshly recomputed content MD5, not this multipart-style value — so
+	// a REAL (non-create-only) CAS write against a key this fake wrote via
+	// multipart would behave differently here than against real S3. No
+	// production caller CASes against a multipart-written object's returned
+	// etag (flush.go discards it), so this is untested and, today, harmless.
 	sum := md5.Sum(digests)
 	etag := fmt.Sprintf(`"%s-%d"`, hex.EncodeToString(sum[:]), len(req.Parts))
 	w.Header().Set("Content-Type", "application/xml")

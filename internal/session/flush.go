@@ -521,9 +521,12 @@ func (s *Session) flush(name string, meta map[string]string, auto bool) (txid ui
 				return 0, fmt.Errorf("session: upload %s: %w", kind, uerr)
 			}
 			// Re-open a FRESH reader at offset 0 for the overwrite retry:
-			// the reader PutReaderIf consumed above is exhausted (and
-			// closed), so PutReader needs its own from-scratch stream over
-			// the same scratch file's bytes.
+			// f above is closed either way by now, and even on the
+			// multipart path (where store.S3.putMultipart's io.ReaderAt
+			// path never advances f's own read position) f is no longer
+			// usable once closed — so PutReader needs its own from-scratch
+			// stream over the same scratch file's bytes regardless of
+			// which path served the failed attempt.
 			f2, ferr := os.Open(encodeScratch)
 			if ferr != nil {
 				return 0, fmt.Errorf("session: reopen snapshot encode scratch for overwrite: %w", ferr)
