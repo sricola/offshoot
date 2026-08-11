@@ -104,6 +104,79 @@ func partSizeFor(size int64) int64 {
 	return ps
 }
 
+// partLen returns the byte length of the part starting at offset within an
+// object of the given total size: partSize for every part except the final
+// one, which is whatever remains (<= partSize, never padded — see
+// partSizeFor's doc comment).
+func partLen(size, offset, partSize int64) int64 {
+	if remain := size - offset; remain < partSize {
+		return remain
+	}
+	return partSize
+}
+
+// abortUnlessCompleted is the shared deferred cleanup behind putMultipart's
+// and copyObjectMultipart's COST-CRITICAL abort guarantee (see
+// putMultipart's doc comment: an abandoned multipart upload bills its parts
+// on S3 indefinitely): unless *completed was set true — which the callers
+// only ever do immediately after a successful CompleteMultipartUpload — it
+// issues AbortMultipartUpload for the upload, and if the abort itself also
+// fails, appends that failure to (never substitutes it for) *err, so the
+// original failure is never masked. what names the operation in the
+// appended error ("upload" or "copy"). Use it as
+// `defer s.abortUnlessCompleted(&completed, fk, uploadID, &err, "upload")`,
+// where completed is the caller's named flag and err its named error
+// return.
+func (s *S3) abortUnlessCompleted(completed *bool, fk string, uploadID *string, err *error, what string) {
+	if *completed {
+		return
+	}
+	_, aerr := s.cl.AbortMultipartUpload(context.Background(), &s3.AbortMultipartUploadInput{
+		Bucket: aws.String(s.bucket), Key: aws.String(fk), UploadId: uploadID,
+	})
+	if aerr != nil {
+		*err = fmt.Errorf("%w (additionally, aborting the multipart %s also failed, so its parts may be left billed on S3: %v)", *err, what, aerr)
+	}
+}
+
+// partChecksums is the ETag-plus-checksum field set a finished part carries
+// forward into its types.CompletedPart entry. *s3.UploadPartOutput and
+// *types.CopyPartResult expose these same fields under the same names but
+// are unrelated SDK types, so each gets a thin adaptor
+// (uploadPartChecksums / copyPartChecksums) rather than an interface or
+// generics machinery — three call sites don't justify more.
+type partChecksums struct {
+	etag, crc32, crc32c, crc64nvme, sha1, sha256 *string
+}
+
+func uploadPartChecksums(up *s3.UploadPartOutput) partChecksums {
+	return partChecksums{up.ETag, up.ChecksumCRC32, up.ChecksumCRC32C, up.ChecksumCRC64NVME, up.ChecksumSHA1, up.ChecksumSHA256}
+}
+
+func copyPartChecksums(cp *types.CopyPartResult) partChecksums {
+	return partChecksums{cp.ETag, cp.ChecksumCRC32, cp.ChecksumCRC32C, cp.ChecksumCRC64NVME, cp.ChecksumSHA1, cp.ChecksumSHA256}
+}
+
+// completedPart builds the types.CompletedPart entry for partNum, carrying
+// EVERY checksum field the part's response actually returned. This is the
+// one place the next SDK checksum algorithm must be added: dropping a field
+// here is what makes CompleteMultipartUpload fail against real S3 once a
+// checksum was attached to the part — see putMultipart's CompletedPart
+// comments at the call sites for the per-path reasoning (an UploadPart
+// result always carries one in practice; a CopyPartResult's may
+// legitimately all be nil).
+func completedPart(partNum int32, c partChecksums) types.CompletedPart {
+	return types.CompletedPart{
+		ETag:              c.etag,
+		PartNumber:        aws.Int32(partNum),
+		ChecksumCRC32:     c.crc32,
+		ChecksumCRC32C:    c.crc32c,
+		ChecksumCRC64NVME: c.crc64nvme,
+		ChecksumSHA1:      c.sha1,
+		ChecksumSHA256:    c.sha256,
+	}
+}
+
 // putMultipart uploads r (exactly size bytes) to key via S3's multipart
 // upload API: CreateMultipartUpload, then a sequential loop of UploadPart
 // calls (PartNumber 1-based, ascending), then CompleteMultipartUpload with
@@ -183,17 +256,7 @@ func (s *S3) putMultipart(key string, r io.Reader, size int64, ifMatch string, c
 	uploadID := created.UploadId
 
 	completed := false
-	defer func() {
-		if completed {
-			return
-		}
-		_, aerr := s.cl.AbortMultipartUpload(context.Background(), &s3.AbortMultipartUploadInput{
-			Bucket: aws.String(s.bucket), Key: aws.String(fk), UploadId: uploadID,
-		})
-		if aerr != nil {
-			err = fmt.Errorf("%w (additionally, aborting the multipart upload also failed, so its parts may be left billed on S3: %v)", err, aerr)
-		}
-	}()
+	defer s.abortUnlessCompleted(&completed, fk, uploadID, &err, "upload")
 
 	partSize := partSizeFor(size)
 	// The zero-buffer path needs BOTH io.ReaderAt (to read a part without
@@ -239,10 +302,7 @@ func (s *S3) putMultipart(key string, r io.Reader, size int64, ifMatch string, c
 		// Strictly sequential: one reused buffer, r read in order.
 		partNum := int32(1)
 		for offset := int64(0); offset < size; offset += partSize {
-			n := partSize
-			if remain := size - offset; remain < n {
-				n = remain
-			}
+			n := partLen(size, offset, partSize)
 
 			if _, rerr := io.ReadFull(io.LimitReader(r, n), buf[:n]); rerr != nil {
 				return "", fmt.Errorf("store: s3 read part %d for %s: %w", partNum, key, rerr)
@@ -274,18 +334,11 @@ func (s *S3) putMultipart(key string, r io.Reader, size int64, ifMatch string, c
 			// Carry every checksum field UploadPart returned (whichever the
 			// SDK actually computed — see CreateMultipartUploadInput's
 			// ChecksumAlgorithm comment above for why one is always present
-			// in practice) forward into CompletedPart. Dropping these (ETag/
-			// PartNumber alone) is what makes CompleteMultipartUpload below
-			// fail against real S3 once a checksum was attached to the part.
-			parts = append(parts, types.CompletedPart{
-				ETag:              up.ETag,
-				PartNumber:        aws.Int32(partNum),
-				ChecksumCRC32:     up.ChecksumCRC32,
-				ChecksumCRC32C:    up.ChecksumCRC32C,
-				ChecksumCRC64NVME: up.ChecksumCRC64NVME,
-				ChecksumSHA1:      up.ChecksumSHA1,
-				ChecksumSHA256:    up.ChecksumSHA256,
-			})
+			// in practice) forward into CompletedPart, via completedPart —
+			// dropping them (ETag/PartNumber alone) is what makes
+			// CompleteMultipartUpload below fail against real S3 once a
+			// checksum was attached to the part.
+			parts = append(parts, completedPart(partNum, uploadPartChecksums(up)))
 			partNum++
 		}
 	}
@@ -400,10 +453,7 @@ func (s *S3) concurrentPartUpload(ctx context.Context, key, fk string, uploadID 
 			defer wg.Done()
 			for partNum := range jobs {
 				offset := int64(partNum-1) * partSize
-				n := partSize
-				if remain := size - offset; remain < n {
-					n = remain
-				}
+				n := partLen(size, offset, partSize)
 				up, uerr := s.cl.UploadPart(cctx, &s3.UploadPartInput{
 					Bucket: aws.String(s.bucket), Key: aws.String(fk),
 					UploadId: uploadID, PartNumber: aws.Int32(partNum),
@@ -420,15 +470,7 @@ func (s *S3) concurrentPartUpload(ctx context.Context, key, fk string, uploadID 
 				}
 				// Same checksum-field carry-forward as the sequential path;
 				// see putMultipart's CompletedPart construction comment.
-				parts[partNum-1] = types.CompletedPart{
-					ETag:              up.ETag,
-					PartNumber:        aws.Int32(partNum),
-					ChecksumCRC32:     up.ChecksumCRC32,
-					ChecksumCRC32C:    up.ChecksumCRC32C,
-					ChecksumCRC64NVME: up.ChecksumCRC64NVME,
-					ChecksumSHA1:      up.ChecksumSHA1,
-					ChecksumSHA256:    up.ChecksumSHA256,
-				}
+				parts[partNum-1] = completedPart(partNum, uploadPartChecksums(up))
 			}
 		}()
 	}
@@ -558,27 +600,14 @@ func (s *S3) copyObjectMultipart(dst, fsrc, fdst string, size int64) (err error)
 	uploadID := created.UploadId
 
 	completed := false
-	defer func() {
-		if completed {
-			return
-		}
-		_, aerr := s.cl.AbortMultipartUpload(context.Background(), &s3.AbortMultipartUploadInput{
-			Bucket: aws.String(s.bucket), Key: aws.String(fdst), UploadId: uploadID,
-		})
-		if aerr != nil {
-			err = fmt.Errorf("%w (additionally, aborting the multipart copy also failed, so its parts may be left billed on S3: %v)", err, aerr)
-		}
-	}()
+	defer s.abortUnlessCompleted(&completed, fdst, uploadID, &err, "copy")
 
 	copySource := s3CopySource(s.bucket, fsrc)
 	partSize := partSizeFor(size)
 	var parts []types.CompletedPart
 	partNum := int32(1)
 	for offset := int64(0); offset < size; offset += partSize {
-		n := partSize
-		if remain := size - offset; remain < n {
-			n = remain
-		}
+		n := partLen(size, offset, partSize)
 		end := offset + n - 1 // INCLUSIVE end — see the doc comment above.
 
 		up, uerr := s.cl.UploadPartCopy(ctx, &s3.UploadPartCopyInput{
@@ -599,15 +628,7 @@ func (s *S3) copyObjectMultipart(dst, fsrc, fdst string, size int64) (err error)
 		// CreateMultipartUpload above for why that's fine here and MUST NOT
 		// be "fixed" by declaring one): forwarding them when present costs
 		// nothing and helps S3 verify integrity when it can.
-		parts = append(parts, types.CompletedPart{
-			ETag:              up.CopyPartResult.ETag,
-			PartNumber:        aws.Int32(partNum),
-			ChecksumCRC32:     up.CopyPartResult.ChecksumCRC32,
-			ChecksumCRC32C:    up.CopyPartResult.ChecksumCRC32C,
-			ChecksumCRC64NVME: up.CopyPartResult.ChecksumCRC64NVME,
-			ChecksumSHA1:      up.CopyPartResult.ChecksumSHA1,
-			ChecksumSHA256:    up.CopyPartResult.ChecksumSHA256,
-		})
+		parts = append(parts, completedPart(partNum, copyPartChecksums(up.CopyPartResult)))
 		partNum++
 	}
 

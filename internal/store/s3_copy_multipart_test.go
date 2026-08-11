@@ -3,7 +3,6 @@ package store_test
 import (
 	"bytes"
 	"errors"
-	"net/http"
 	"testing"
 
 	"github.com/sricola/offshoot/internal/store"
@@ -113,16 +112,8 @@ func TestS3CopyObjectMultipartAbortsOnFailure(t *testing.T) {
 	}
 
 	const dstKey = "data/x/copy-fail-dst.ltx"
-	var puts int
-	f.SetFault(func(method, k string) (int, bool) {
-		if method == http.MethodPut && k == dstKey {
-			puts++
-			if puts >= 2 { // fail every part-copy PUT to dst from the second attempt onward
-				return 500, true
-			}
-		}
-		return 0, false
-	})
+	// Fail every part-copy PUT to dst from the second attempt onward.
+	failPutsFromSecond(f, dstKey)
 
 	if err := b.CopyObject(dstKey, srcKey); err == nil {
 		t.Fatal("a failed UploadPartCopy mid-copy must surface as an error")
