@@ -13,6 +13,14 @@ version if you depend on format stability.
 
 ## [Unreleased]
 
+### Changed
+
+- Internal: `store.S3`'s multipart machinery moved from `s3.go` into a new
+  `internal/store/s3_multipart.go`, and its repeated mechanical fragments
+  (abort defer, `CompletedPart` checksum carry, part-length clamp, the
+  fake's XML error writes, the tests' fault-injection closure) were
+  deduplicated into helpers. No behavior change.
+
 ## [0.2.5] - 2026-08-11
 
 ### Fixed
@@ -68,9 +76,12 @@ version if you depend on format stability.
   in the first place. Every part's result lands in a pre-sized slice at its
   own `PartNumber` index, so the final `CompletedPart` list stays correctly
   ordered regardless of completion order — no sort step needed. The
-  existing abort-on-every-error-path guarantee, per-part checksum
-  propagation, and first-error-wins-with-prompt-cancellation semantics all
-  carry over unchanged under concurrency.
+  existing abort-on-every-error-path guarantee and per-part checksum
+  propagation carry over unchanged under concurrency; error handling is
+  first-error-wins with prompt cancellation of every in-flight and
+  not-yet-started part — the cancellation half is NEW with concurrency
+  (the prior strictly-sequential code never had anything in flight to
+  cancel), not carried over.
 
 - **`store.S3.CopyObject` now server-side-copies objects over 5 GiB
   instead of declining.** Previously, any source over S3's 5 GiB
@@ -138,6 +149,20 @@ version if you depend on format stability.
   `>= 1` floor). Documented in
   [docs/reference.md](docs/reference.md) (`offshoot fork`) and
   [docs/operations.md](docs/operations.md) (tuning flags).
+
+- **`storetest.FakeS3` now enforces declared-vs-supplied checksums at
+  `CompleteMultipartUpload`.** (Shipped in 0.2.4; this note was omitted
+  from the entry at release and is recorded here after the fact.) The fake
+  records the `ChecksumAlgorithm` a `CreateMultipartUpload` declares,
+  echoes each `UploadPart`'s checksum headers back on the response, and
+  rejects a `Complete` whose part manifest is missing the declared
+  algorithm's checksum with `InvalidRequest` — the same declared-vs-
+  supplied contract real S3 enforces. This supersedes the 0.2.3 entry's
+  "the fake ignores checksum headers entirely" caveat (accurate when
+  written): from 0.2.4 on, the fake does cover the checksum-mismatch
+  case, which is what makes the multipart *upload* path's explicit CRC32
+  declaration and the multipart *copy* path's deliberate non-declaration
+  both load-bearing in tests rather than untestable.
 
 ## [0.2.3] - 2026-08-09
 

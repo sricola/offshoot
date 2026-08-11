@@ -1,10 +1,14 @@
 package store
 
 // This file exists only in test binaries (export_test.go is never compiled
-// into non-test builds). It exposes S3's unexported multipartThreshold and
-// defaultPartSize test knobs (see s3.go's doc comments on those vars) to the
-// EXTERNAL store_test package, following the same pattern
-// internal/ops/export_test.go uses for forkSlowPathForTest.
+// into non-test builds). It exposes S3's four unexported test knobs —
+// multipartThreshold, defaultPartSize, and multipartConcurrency
+// (s3_multipart.go), and copyObjectMaxBytes (s3.go); see the doc comments
+// on those vars — to the EXTERNAL store_test package via
+// SetMultipartThresholdForTest, SetPartSizeForTest,
+// SetMultipartConcurrencyForTest, and SetCopyObjectMaxBytesForTest,
+// following the same pattern internal/ops/export_test.go uses for
+// forkSlowPathForTest.
 
 // SetMultipartThresholdForTest overrides the object-size threshold above
 // which store.S3.PutReader/PutReaderIf switch to a multipart upload,
@@ -34,8 +38,8 @@ func SetPartSizeForTest(v int64) (restore func()) {
 
 // SetMultipartConcurrencyForTest overrides the worker count store.S3's
 // putMultipart uses on the io.ReaderAt path (multipartConcurrency in
-// s3.go), returning a restore func that puts back the previous value (call
-// it via t.Cleanup). Tests force this to 1 for a deterministic sequential
+// s3_multipart.go), returning a restore func that puts back the previous
+// value (call it via t.Cleanup). Tests force this to 1 for a deterministic sequential
 // run, or leave/raise it above 1 (paired with a fake that can observe
 // overlap, e.g. blocking each part until N have arrived) to prove parts
 // really do upload in parallel. Test-only: never call this outside a test.

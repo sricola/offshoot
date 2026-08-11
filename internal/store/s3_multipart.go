@@ -77,9 +77,9 @@ var multipartConcurrency = 4
 // multipartThreshold is the object size above which PutReader/PutReaderIf
 // switch from a single PutObject to a multipart upload (CreateMultipartUpload
 // + UploadPart* + CompleteMultipartUpload). Its default is S3's single-
-// PutObject ceiling of 5 GiB — the same limit copyObjectMaxBytes documents
-// for CopyObject's separate, still-unimplemented multipart gap (CopyObject
-// is untouched by this).
+// PutObject ceiling of 5 GiB — the same 5 GiB boundary copyObjectMaxBytes
+// (s3.go) uses as CopyObject's own strategy-selection threshold between a
+// single-request copy and copyObjectMultipart's server-side multipart copy.
 //
 // This is a package var, not a const, ONLY so tests can override it — a
 // real >5 GiB upload can't be exercised in a test. Never set it outside a
