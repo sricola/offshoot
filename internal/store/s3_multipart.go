@@ -193,12 +193,30 @@ type partChecksums struct {
 	etag, crc32, crc32c, crc64nvme, sha1, sha256 *string
 }
 
+// Both adaptors use field-keyed (not positional) literals on purpose: all
+// six fields are *string, so a future reorder of partChecksums would
+// silently cross-wire positional literals — field keys make the compiler
+// guard the pairing.
 func uploadPartChecksums(up *s3.UploadPartOutput) partChecksums {
-	return partChecksums{up.ETag, up.ChecksumCRC32, up.ChecksumCRC32C, up.ChecksumCRC64NVME, up.ChecksumSHA1, up.ChecksumSHA256}
+	return partChecksums{
+		etag:      up.ETag,
+		crc32:     up.ChecksumCRC32,
+		crc32c:    up.ChecksumCRC32C,
+		crc64nvme: up.ChecksumCRC64NVME,
+		sha1:      up.ChecksumSHA1,
+		sha256:    up.ChecksumSHA256,
+	}
 }
 
 func copyPartChecksums(cp *types.CopyPartResult) partChecksums {
-	return partChecksums{cp.ETag, cp.ChecksumCRC32, cp.ChecksumCRC32C, cp.ChecksumCRC64NVME, cp.ChecksumSHA1, cp.ChecksumSHA256}
+	return partChecksums{
+		etag:      cp.ETag,
+		crc32:     cp.ChecksumCRC32,
+		crc32c:    cp.ChecksumCRC32C,
+		crc64nvme: cp.ChecksumCRC64NVME,
+		sha1:      cp.ChecksumSHA1,
+		sha256:    cp.ChecksumSHA256,
+	}
 }
 
 // completedPart builds the types.CompletedPart entry for partNum, carrying
