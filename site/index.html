@@ -4,389 +4,214 @@
 <meta charset="utf-8">
 <meta name="viewport" content="width=device-width, initial-scale=1">
 <title>offshoot — branchable SQLite for AI agents</title>
-<meta name="description" content="Fork the world your agent writes to. offshoot branches SQLite like git: create, fork, checkpoint, rollback, and promote — stock SQLite files, your storage, one binary.">
+<meta name="description" content="Branch SQLite like git: create, fork, checkpoint, rollback, promote. Stock SQLite files, your local disk or S3 bucket, one binary. Built for AI agents and eval harnesses.">
 <link rel="icon" href="data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 32 32'%3E%3Cpath d='M10 28V14M10 14v-4a4 4 0 0 1 4-4h0M10 14c0-4 3-7 8-7h4' stroke='%23a9cd7c' stroke-width='3.4' fill='none' stroke-linecap='round'/%3E%3Ccircle cx='10' cy='28' r='3' fill='%23a9cd7c'/%3E%3Ccircle cx='25' cy='7' r='3' fill='%23d9a05b'/%3E%3C/svg%3E">
-<link rel="preconnect" href="https://fonts.googleapis.com">
-<link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
-<link href="https://fonts.googleapis.com/css2?family=Fraunces:ital,opsz,wght@0,9..144,300..700;1,9..144,300..600&family=Martian+Mono:wght@300;400;600&display=swap" rel="stylesheet">
 <style>
 :root{
-  --bark:#16120e; --bark2:#1d1812; --panel:#0f0c09;
-  --ink:#ece4d3; --ink-dim:#a89e8a; --ink-faint:#6f6656;
-  --shoot:#a9cd7c; --shoot-bright:#d2eb9e; --ember:#d9a05b;
-  --line:#39312573; --rule:#2a2419;
-  --serif:"Fraunces",Georgia,serif; --mono:"Martian Mono",ui-monospace,monospace;
+  --bg:#fcfcfa; --ink:#18150f; --dim:#6b675d; --faint:#9b968a;
+  --accent:#3c7a1a; --code-bg:#f4f3ee; --border:#e4e2da; --rule:#ecebe4;
+  --mono:ui-monospace,"SF Mono","Cascadia Code",Menlo,Consolas,"Liberation Mono",monospace;
+}
+@media(prefers-color-scheme:dark){
+  :root{
+    --bg:#131211; --ink:#e6e3da; --dim:#97927f; --faint:#6b665a;
+    --accent:#a9cd7c; --code-bg:#1b1a17; --border:#2b2925; --rule:#232119;
+  }
 }
 *{box-sizing:border-box;margin:0;padding:0}
-html{scroll-behavior:smooth}
+html{-webkit-text-size-adjust:100%}
 body{
-  background:var(--bark); color:var(--ink);
-  font-family:var(--serif); font-weight:340; font-size:17.5px; line-height:1.65;
-  font-optical-sizing:auto; -webkit-font-smoothing:antialiased; overflow-x:hidden;
+  background:var(--bg); color:var(--ink); font-family:var(--mono);
+  font-size:14px; line-height:1.75; -webkit-font-smoothing:antialiased;
 }
-body::before{ /* grain */
-  content:""; position:fixed; inset:0; z-index:9; pointer-events:none; opacity:.05; mix-blend-mode:overlay;
-  background-image:url("data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' width='240' height='240'%3E%3Cfilter id='n'%3E%3CfeTurbulence type='fractalNoise' baseFrequency='0.9' numOctaves='2'/%3E%3C/filter%3E%3Crect width='240' height='240' filter='url(%23n)'/%3E%3C/svg%3E");
-}
-a{color:var(--shoot); text-decoration:none; border-bottom:1px solid transparent; transition:border-color .2s,color .2s}
-a:hover{color:var(--shoot-bright); border-bottom-color:var(--shoot-bright)}
-::selection{background:#a9cd7c33}
-.wrap{max-width:1060px; margin:0 auto; padding:0 28px}
-code,pre,kbd{font-family:var(--mono)}
-code{font-size:.82em; background:#ffffff0d; border:1px solid var(--rule); border-radius:4px; padding:.12em .4em; color:var(--shoot-bright); overflow-wrap:anywhere}
-pre code{background:none;border:none;padding:0;color:inherit}
+::selection{background:var(--accent); color:var(--bg)}
+.wrap{max-width:800px; margin:0 auto; padding:0 24px}
+a{color:var(--accent); text-decoration:none; border-bottom:1px solid transparent}
+a:hover{border-bottom-color:var(--accent)}
+code{background:var(--code-bg); border:1px solid var(--border); border-radius:3px;
+  padding:.08em .35em; font-size:13px; overflow-wrap:anywhere}
+strong{font-weight:600}
 
-/* ---------- nav ---------- */
-nav{position:sticky; top:0; z-index:20; backdrop-filter:blur(10px);
-  background:#16120ecc; border-bottom:1px solid var(--rule)}
-nav .wrap{display:flex; align-items:baseline; gap:2rem; padding-top:16px; padding-bottom:14px}
-.wordmark{font-family:var(--mono); font-weight:600; font-size:15px; letter-spacing:.02em; color:var(--ink); border:none}
-.wordmark .glyph{color:var(--shoot)}
-nav .links{margin-left:auto; display:flex; gap:1.6rem; font-family:var(--mono); font-size:11.5px; letter-spacing:.06em; text-transform:lowercase}
-nav .links a{color:var(--ink-dim); border:none}
-nav .links a:hover{color:var(--shoot-bright)}
-@media(max-width:640px){nav .links a:not(.gh){display:none}}
+header{padding:88px 0 0}
+.brand{display:flex; align-items:baseline; gap:14px; flex-wrap:wrap}
+.brand h1{font-size:21px; font-weight:700; letter-spacing:-.01em}
+.brand h1 .g{color:var(--accent); font-weight:400}
+.meta{font-size:12px; color:var(--faint); letter-spacing:.02em}
+.pitch{margin-top:28px; font-size:16px; line-height:1.7; max-width:60ch}
+.pitch b{font-weight:600}
+.sub{margin-top:14px; color:var(--dim); max-width:64ch}
 
-/* ---------- hero ---------- */
-header{position:relative; padding:96px 0 84px; overflow:hidden}
-.hero-grid{display:grid; grid-template-columns:1.05fr .95fr; gap:56px; align-items:center}
-@media(max-width:900px){.hero-grid{grid-template-columns:1fr}}
-.kicker{font-family:var(--mono); font-size:11.5px; letter-spacing:.14em; text-transform:uppercase; color:var(--ember); margin-bottom:22px}
-.kicker::before{content:"⑂ "; color:var(--shoot)}
-h1{font-size:clamp(42px,6.4vw,74px); line-height:1.02; font-weight:420; letter-spacing:-.015em}
-h1 em{font-style:italic; font-weight:340; color:var(--shoot)}
-.lede{margin-top:26px; font-size:20px; color:var(--ink-dim); max-width:34em}
-.lede strong{color:var(--ink); font-weight:500}
-.hero-ctas{margin-top:34px; display:flex; gap:14px; flex-wrap:wrap; font-family:var(--mono); font-size:13px}
-.btn{border:1px solid var(--shoot); border-radius:6px; padding:11px 18px; color:var(--shoot)}
-.btn:hover{background:#a9cd7c14; color:var(--shoot-bright); border-color:var(--shoot-bright)}
-.btn.solid{background:var(--shoot); color:#141109; font-weight:600}
-.btn.solid:hover{background:var(--shoot-bright); color:#141109}
-.hero-note{margin-top:18px; font-family:var(--mono); font-size:11px; color:var(--ink-faint); letter-spacing:.04em}
+section{padding:56px 0 0}
+section:last-of-type{padding-bottom:24px}
+h2{font-size:13px; font-weight:600; letter-spacing:.12em; text-transform:uppercase;
+  color:var(--dim); border-bottom:1px solid var(--border); padding-bottom:10px; margin-bottom:22px}
+h2::before{content:"# "; color:var(--accent)}
 
-/* branch watermark behind hero */
-.branches{position:absolute; right:-140px; top:-60px; width:720px; opacity:.5; pointer-events:none; z-index:-1}
-.branches path{fill:none; stroke:var(--line); stroke-width:2}
-.branches .lit{stroke:#a9cd7c2e}
-.branches circle{fill:var(--bark); stroke:var(--ink-faint); stroke-width:2}
-.branches .tip{stroke:var(--shoot); fill:#a9cd7c22}
-@media(prefers-reduced-motion:no-preference){
-  .branches path{stroke-dasharray:1200; stroke-dashoffset:1200; animation:draw 2.4s ease-out forwards}
-  .branches path:nth-child(2){animation-delay:.3s}.branches path:nth-child(3){animation-delay:.55s}.branches path:nth-child(4){animation-delay:.8s}
-  @keyframes draw{to{stroke-dashoffset:0}}
-}
+pre{background:var(--code-bg); border:1px solid var(--border); border-radius:6px;
+  padding:16px 18px; font-size:13px; line-height:1.85; overflow-x:auto}
+pre code{background:none; border:none; padding:0; font-size:inherit}
+pre .p{color:var(--accent); user-select:none}
+pre .c{color:var(--faint)}
+.demo{margin-top:32px}
+pre+pre, pre+p, p+pre{margin-top:14px}
+.note{margin-top:14px; color:var(--dim); font-size:13px; max-width:70ch}
+.note code{font-size:12px}
 
-/* ---------- terminal ---------- */
-.term{background:var(--panel); border:1px solid var(--rule); border-radius:10px;
-  box-shadow:0 30px 60px -30px #000c, 0 0 0 1px #ffffff06 inset; overflow:hidden}
-.term-bar{display:flex; align-items:center; gap:7px; padding:11px 14px; border-bottom:1px solid var(--rule); background:#171310}
-.term-bar i{width:10px;height:10px;border-radius:50%;background:#3a3228}
-.term-bar span{margin-left:auto; font-family:var(--mono); font-size:10.5px; color:var(--ink-faint); letter-spacing:.08em}
-.term pre{padding:18px 20px 22px; font-size:12.3px; line-height:1.95; overflow-x:auto}
-.term .c{color:var(--ink-faint)} .term .p{color:var(--shoot)} .term .o{color:var(--ink-dim)}
-.term .row{display:block; white-space:pre}
-@media(prefers-reduced-motion:no-preference){
-  .term .row{opacity:0; transform:translateY(4px); animation:type .45s ease-out forwards}
-  .term .row:nth-child(1){animation-delay:.2s}.term .row:nth-child(2){animation-delay:.55s}
-  .term .row:nth-child(3){animation-delay:.9s}.term .row:nth-child(4){animation-delay:1.25s}
-  .term .row:nth-child(5){animation-delay:1.6s}.term .row:nth-child(6){animation-delay:1.95s}
-  .term .row:nth-child(7){animation-delay:2.3s}.term .row:nth-child(8){animation-delay:2.65s}
-  .term .row:nth-child(9){animation-delay:3.0s}.term .row:nth-child(10){animation-delay:3.35s}
-  .term .row:nth-child(11){animation-delay:3.7s}.term .row:nth-child(12){animation-delay:4.05s}
-  @keyframes type{to{opacity:1;transform:none}}
-}
+ul.why{list-style:none}
+ul.why li{padding:14px 0; border-bottom:1px solid var(--rule); color:var(--dim); max-width:74ch}
+ul.why li:last-child{border-bottom:none}
+ul.why b{color:var(--ink); font-weight:600}
+ul.why b::after{content:" — "}
 
-/* ---------- sections ---------- */
-section{padding:72px 0; border-top:1px solid var(--rule); position:relative}
-.commit{font-family:var(--mono); font-size:11.5px; letter-spacing:.1em; color:var(--ink-faint); margin-bottom:14px; text-transform:lowercase}
-.commit b{color:var(--ember); font-weight:400}
-.commit::before{content:"● "; color:var(--shoot); font-size:9px; vertical-align:2px}
-h2{font-size:clamp(28px,3.6vw,40px); font-weight:400; letter-spacing:-.01em; line-height:1.15; max-width:20em}
-h2 em{font-style:italic; color:var(--shoot)}
-.prose{margin-top:22px; max-width:44em; color:var(--ink-dim)}
-.prose p+p{margin-top:1em}
-.prose strong{color:var(--ink); font-weight:500}
-.reveal{opacity:0; transform:translateY(18px); transition:opacity .7s ease,transform .7s ease}
-.reveal.in{opacity:1; transform:none}
-@media(prefers-reduced-motion:reduce){.reveal{opacity:1;transform:none;transition:none}}
+.tablewrap{overflow-x:auto; border:1px solid var(--border); border-radius:6px}
+table{width:100%; border-collapse:collapse; font-size:13px}
+td{padding:9px 14px; border-top:1px solid var(--rule); vertical-align:top}
+tr:first-child td{border-top:none}
+td.cmd{white-space:nowrap; color:var(--ink)}
+td.cmd .a{color:var(--accent)}
+td.d{color:var(--dim); min-width:22ch}
+tbody tr:hover td{background:var(--code-bg)}
 
-/* code blocks */
-.block{margin-top:26px; background:var(--panel); border:1px solid var(--rule); border-radius:10px; overflow:hidden}
-.block .label{font-family:var(--mono); font-size:10.5px; letter-spacing:.1em; color:var(--ink-faint);
-  padding:9px 16px; border-bottom:1px solid var(--rule); background:#171310; text-transform:lowercase}
-.block pre{padding:16px 18px; font-size:12.5px; line-height:1.9; overflow-x:auto}
-.block .p{color:var(--shoot)} .block .c{color:var(--ink-faint)} .block .s{color:var(--ember)} .block .k{color:var(--shoot-bright)}
+.cols{display:grid; grid-template-columns:1fr 1fr; gap:14px}
+@media(max-width:700px){.cols{grid-template-columns:1fr}}
+.cols pre{margin:0}
+.label{font-size:11px; letter-spacing:.08em; text-transform:uppercase; color:var(--faint); margin:0 0 6px}
+.cols>div+div{margin-top:0}
 
-/* two-col split */
-.split{display:grid; grid-template-columns:1fr 1fr; gap:44px; align-items:start; margin-top:8px}
-@media(max-width:820px){.split{grid-template-columns:1fr}}
+.soon{color:var(--faint); cursor:default; border-bottom:1px dotted var(--faint)}
 
-/* cards */
-.cards{display:grid; grid-template-columns:repeat(3,1fr); gap:14px; margin-top:34px}
-@media(max-width:820px){.cards{grid-template-columns:1fr}}
-.card{background:var(--bark2); border:1px solid var(--rule); border-radius:10px; padding:22px 20px;
-  transition:border-color .25s, transform .25s}
-.card:hover{border-color:#a9cd7c55; transform:translateY(-3px)}
-.card h3{font-family:var(--mono); font-weight:600; font-size:13px; letter-spacing:.03em; color:var(--shoot); margin-bottom:10px}
-.card p{font-size:14.5px; color:var(--ink-dim); line-height:1.6}
-.card p code{font-size:.85em}
-
-/* guarantees list */
-.guarantees{margin-top:30px; display:grid; gap:0; border-top:1px solid var(--rule)}
-.guarantees .g{display:grid; grid-template-columns:180px 1fr; gap:24px; padding:18px 0; border-bottom:1px solid var(--rule)}
-@media(max-width:640px){.guarantees .g{grid-template-columns:1fr; gap:6px}}
-.guarantees dt{font-family:var(--mono); font-size:12px; color:var(--ember); letter-spacing:.04em; padding-top:3px}
-.guarantees dd{color:var(--ink-dim); font-size:15.5px}
-.guarantees dd strong{color:var(--ink); font-weight:500}
-
-/* big stat strip */
-.stats{margin-top:40px; display:grid; grid-template-columns:repeat(4,1fr); gap:14px}
-@media(max-width:900px){.stats{grid-template-columns:repeat(2,1fr)}}
-@media(max-width:480px){.stats{grid-template-columns:1fr}}
-.stat{border:1px solid var(--rule); border-radius:10px; padding:20px; background:linear-gradient(180deg,#1d1812,#16120e)}
-.stat .n{font-size:34px; font-weight:430; color:var(--shoot-bright); letter-spacing:-.01em; font-variant-numeric:tabular-nums}
-.stat .n.small{font-size:23px}
-.stat .l{font-family:var(--mono); font-size:11px; color:var(--ink-faint); letter-spacing:.08em; margin-top:6px; text-transform:lowercase}
-
-/* honest limits */
-.limits li{margin:.55em 0 .55em 1.2em; color:var(--ink-dim); font-size:15.5px}
-.limits li::marker{content:"— "; color:var(--ember)}
-
-footer{border-top:1px solid var(--rule); padding:48px 0 72px; color:var(--ink-faint); font-family:var(--mono); font-size:11.5px; letter-spacing:.05em}
-footer .wrap{display:flex; gap:2rem; flex-wrap:wrap; align-items:baseline}
-footer a{color:var(--ink-dim); border:none}
+footer{margin-top:72px; border-top:1px solid var(--border); padding:22px 0 64px;
+  font-size:12px; color:var(--faint)}
+footer .wrap{display:flex; gap:1.5em; flex-wrap:wrap}
+footer .g{color:var(--accent)}
 </style>
 </head>
 <body>
 
-<nav><div class="wrap">
-  <a class="wordmark" href="#"><span class="glyph">⑂</span> offshoot</a>
-  <div class="links">
-    <a href="#quickstart">quickstart</a>
-    <a href="#how">how it works</a>
-    <a href="#agents">for agents</a>
-    <span class="gh" style="color:var(--ink-dim);opacity:.55;cursor:default" title="Private repo, currently v0.1.3 — opens publicly with the launch">github ↗</span>
+<header class="wrap">
+  <div class="brand">
+    <h1><span class="g">⑂</span> offshoot</h1>
+    <span class="meta">v0.2.6 · pre-release · apache-2.0 · linux/macos · go 1.24+</span>
   </div>
-</div></nav>
+  <p class="pitch"><b>Branch SQLite like git</b> — create, fork, checkpoint, rollback,
+  promote. Stock SQLite files, your local disk or S3 bucket, one binary.</p>
+  <p class="sub">For AI agents and eval harnesses: fork the database per attempt,
+  let the agent write to a real SQLite file, keep the winner, reap the rest.</p>
 
-<header>
-  <svg class="branches" viewBox="0 0 720 560" aria-hidden="true">
-    <path class="lit" d="M120 560 V80"/>
-    <path d="M120 300 C120 220 220 240 250 180 S330 60 430 60 H640"/>
-    <path d="M120 380 C120 320 260 340 320 300 S470 220 620 220"/>
-    <path d="M120 460 C120 420 300 440 380 400 S560 360 660 360"/>
-    <circle cx="120" cy="300" r="7"/><circle cx="120" cy="380" r="7"/><circle cx="120" cy="460" r="7"/>
-    <circle class="tip" cx="640" cy="60" r="8"/><circle class="tip" cx="620" cy="220" r="8"/><circle class="tip" cx="660" cy="360" r="8"/>
-  </svg>
-  <div class="wrap hero-grid">
-    <div>
-      <div class="kicker">branchable sqlite for ai agents</div>
-      <h1>Fork the <em>world</em> your agent writes&nbsp;to.</h1>
-      <p class="lede">Agent frameworks rewind the conversation. <strong>Nothing rewinds the database.</strong>
-      offshoot branches SQLite like git — create, fork, checkpoint, rollback, promote —
-      stock SQLite files, your local disk or S3 bucket, one binary.</p>
-      <div class="hero-ctas">
-        <a class="btn solid" href="#quickstart">60-second quickstart</a>
-        <span class="btn" style="opacity:.55;cursor:default" title="Private repo, currently v0.1.3 — code opens with the public launch">source opens with the public launch</span>
-      </div>
-      <p class="hero-note">go 1.24+ · linux &amp; macos · apache-2.0 · pre-release · v0.1.3</p>
-    </div>
-    <div class="term" aria-label="terminal demo">
-      <div class="term-bar"><i></i><i></i><i></i><span>the 60-second version</span></div>
-      <pre><span class="row"><span class="p">$</span> offshoot init</span><span class="row"><span class="p">$</span> offshoot create app</span><span class="row"><span class="p">$</span> sqlite3 "$(offshoot checkout app)" <span class="o">"CREATE TABLE users (name); INSERT INTO users VALUES ('ada');"</span></span><span class="row"><span class="p">$</span> offshoot checkpoint app v1</span><span class="row"><span class="c"># try something destructive — on a branch</span></span><span class="row"><span class="p">$</span> offshoot fork app attempt-1</span><span class="row"><span class="p">$</span> sqlite3 "$(offshoot checkout app@attempt-1)" <span class="o">"DELETE FROM users"</span></span><span class="row"><span class="c"># it went badly. undo the world:</span></span><span class="row"><span class="p">$</span> offshoot rollback app@attempt-1 --to fork</span><span class="row"><span class="c"># …or it went well. ship it:</span></span><span class="row"><span class="p">$</span> offshoot promote app@attempt-1 --onto main --force</span><span class="row"><span class="p">$</span> offshoot status</span></pre>
-    </div>
-  </div>
+  <pre class="demo"><code><span class="p">$</span> offshoot init
+<span class="p">$</span> offshoot create app
+<span class="p">$</span> sqlite3 "$(offshoot checkout app)" "CREATE TABLE users (name); INSERT INTO users VALUES ('ada');"
+<span class="p">$</span> offshoot checkpoint app v1
+<span class="p">$</span> offshoot fork app attempt-1 --ttl 2h   <span class="c"># copy-on-write branch, near-zero added storage</span>
+<span class="p">$</span> sqlite3 "$(offshoot checkout app@attempt-1)" "DELETE FROM users;"   <span class="c"># destructive experiment</span>
+<span class="p">$</span> offshoot rollback app@attempt-1 --to fork    <span class="c"># it went badly — undo the world</span>
+<span class="p">$</span> offshoot promote app@attempt-1 --onto main --force   <span class="c"># …or it went well — ship it</span>
+<span class="p">$</span> offshoot status</code></pre>
 </header>
 
-<section id="why">
-  <div class="wrap reveal">
-    <div class="commit"><b>01</b> · the problem</div>
-    <h2>Time travel for the chat, <em>amnesia</em> for the side effects.</h2>
-    <div class="split">
-      <div class="prose">
-        <p>LangGraph has checkpoint time-travel. Claude's agent tooling has session resume and
-        file checkpointing. What nobody forks is the <strong>world</strong> — the SQLite database
-        the agent's code wrote to. Rewind the thread, and every row the agent inserted is still there.</p>
-        <p>The same gap hits eval harnesses (reset the database between runs; today that means docker
-        teardowns and fixture reloads) and agent platforms (a database per user, forkable per attempt).</p>
-      </div>
-      <div class="prose">
-        <p>offshoot makes the database a first-class branchable object. A <strong>fork is a real,
-        independent SQLite file</strong> — open it with stock <code>sqlite3</code>, no forked engine,
-        no special VFS on the read path. Branches are cheap enough to be disposable:
-        fork per attempt, keep the winner, let TTLs reap the rest.</p>
-        <p>Try three migrations in parallel against three forks. Promote the one whose tests pass.
-        The demo in <code>examples/parallel-attempts/</code> does exactly that — watch
-        <span style="opacity:.7;cursor:default" title="Private repo — asciinema recording opens with the public launch">the recording ↗</span>
-        or read <span style="opacity:.7;cursor:default" title="Private repo — MCP walkthrough transcript opens with the public launch">an agent doing it over MCP ↗</span>.</p>
-      </div>
-    </div>
-  </div>
+<section class="wrap" id="install">
+  <h2>install</h2>
+  <pre><code><span class="c"># build from source (go 1.24+, cgo)</span>
+<span class="p">$</span> go build -o offshoot ./cmd/offshoot
+
+<span class="c"># same binary, any store</span>
+<span class="p">$</span> offshoot -store ./.offshoot init             <span class="c"># local directory (default)</span>
+<span class="p">$</span> offshoot -store s3://my-bucket/offshoot init <span class="c"># S3, R2, Tigris, MinIO</span></code></pre>
+  <p class="note">Prebuilt binaries (linux/darwin × amd64/arm64) ship with every tagged
+  release; <code>go install github.com/sricola/offshoot/cmd/offshoot@latest</code> resolves
+  when the repo opens publicly. At attach time offshoot probes the store and refuses to run
+  if conditional writes aren't enforced — fail-closed, never silently degraded.</p>
 </section>
 
-<section id="quickstart">
-  <div class="wrap reveal">
-    <div class="commit"><b>02</b> · quickstart</div>
-    <h2>No server. No bucket. <em>One binary.</em></h2>
-    <div class="split">
-      <div class="block">
-        <div class="label">cli · at rest, against a local directory</div>
-        <pre><code><span class="p">$</span> go build -o offshoot ./cmd/offshoot
-<span class="p">$</span> ./offshoot init
-<span class="p">$</span> ./offshoot create app
-<span class="p">$</span> sqlite3 "$(./offshoot checkout app)" <span class="s">\
-    "CREATE TABLE users (name); \
-     INSERT INTO users VALUES ('ada');"</span>
-<span class="p">$</span> ./offshoot checkpoint app v1
-<span class="p">$</span> ./offshoot fork app attempt-1
-<span class="p">$</span> ./offshoot rollback app@attempt-1 --to fork
-<span class="p">$</span> ./offshoot status</code></pre>
-      </div>
-      <div class="block">
-        <div class="label">daemon · live capture, writer never pauses</div>
-        <pre><code><span class="p">$</span> offshoot serve &amp;
+<section class="wrap" id="why">
+  <h2>why</h2>
+  <ul class="why">
+    <li><b>O(1) forks</b>a fork shares the parent's durable objects through a base
+    pointer and writes new ones only as it diverges — N forks of a G-byte database cost
+    near-zero added bytes. Fork per attempt; branches carry TTLs and reap themselves;
+    <code>compact</code> makes a fork self-contained on demand.</li>
+    <li><b>Bounded replay</b>a branch is a lineage of immutable snapshots plus
+    incremental segments. A read applies one snapshot and at most fifteen segments
+    (default cadence), checksum-verified member by member — a torn chain is a loud error,
+    never a short read.</li>
+    <li><b>kill&nbsp;-9 durable</b>one writer per branch, enforced by leases and epoch
+    fencing; every ref update is a compare-and-swap. Validated by a torture harness that
+    kill&nbsp;-9's a stock sqlite3 writer mid-write on roughly half of every round and requires the
+    replica to converge byte-identical, every round.</li>
+    <li><b>Stock everything</b>a checkout is a real SQLite file — open it with plain
+    <code>sqlite3</code>, no forked engine, no special VFS on the read path. Snapshots and
+    refs live in a local directory or any S3-compatible bucket with conditional writes.</li>
+  </ul>
+</section>
+
+<section class="wrap" id="agents">
+  <h2>for agents &amp; harnesses</h2>
+  <div class="cols">
+    <div>
+      <p class="label">daemon · live capture, writer never pauses</p>
+      <pre><code><span class="p">$</span> offshoot serve &amp;
 <span class="p">$</span> P=$(offshoot session open app)
-<span class="p">$</span> sqlite3 "$P" <span class="s">"INSERT INTO t \
-    VALUES ('agent wrote this')"</span>
-<span class="c"># durable in the store; writer never stopped</span>
+<span class="p">$</span> sqlite3 "$P" "INSERT INTO t VALUES ('x');"
 <span class="p">$</span> offshoot session flush app v1
-<span class="p">$</span> offshoot session status
-<span class="c"># attempt branches reap themselves</span>
-<span class="p">$</span> offshoot fork app try-2 --ttl 2h
-<span class="p">$</span> offshoot touch app@try-2 --ttl none</code></pre>
-      </div>
+<span class="p">$</span> offshoot session status  <span class="c"># durable txid</span></code></pre>
     </div>
-    <div class="prose">
-      <p>Same binary against a bucket: <code>offshoot -store s3://my-bucket/offshoot init</code> —
-      S3, R2, Tigris, and MinIO via conditional writes. At attach time offshoot <strong>probes the
-      store</strong> and refuses to run if compare-and-swap isn't enforced, rather than silently degrading.</p>
-      <p>Building from source (<code>go build</code>, above) is the fast path today. Four tagged
-      releases so far — <span style="opacity:.7;cursor:default" title="Private repo — releases page opens with the public launch">v0.1.0 through v0.1.3 ↗</span> —
-      already carry prebuilt binaries for linux/darwin × amd64/arm64; <code>go install
-      github.com/sricola/offshoot/cmd/offshoot@latest</code> resolves the moment the repo goes public,
-      since the module path is already <code>github.com/sricola/offshoot</code>, not an aspirational org.</p>
+    <div>
+      <p class="label">mcp · the agent branches on its own</p>
+      <pre><code><span class="p">$</span> claude mcp add offshoot -- offshoot mcp
+<span class="c"># seven tools: list, checkout, checkpoint,
+# fork, rollback, promote, destroy —
+# agent forks default to a 24h TTL</span></code></pre>
     </div>
   </div>
+  <p class="note">The daemon captures every committed transaction while your agent keeps
+  writing — a checkpoint never quiesces the database, <code>-flush-every 30s</code> bounds
+  what a crash can lose, and <code>-http</code> adds <code>/metrics</code>,
+  <code>/healthz</code>, <code>/rpc</code>, and an SSE <code>/events</code> stream.
+  Python and TypeScript SDKs drive the same API: pytest fixtures and a
+  vitest/jest testkit for seed-once, fork-per-test isolation.</p>
 </section>
 
-<section id="how">
-  <div class="wrap reveal">
-    <div class="commit"><b>03</b> · how it works</div>
-    <h2>Boring storage, <em>paranoid</em> coordination.</h2>
-    <div class="prose">
-      <p>Every branch is a <strong>lineage</strong> of immutable LTX objects in your store: a full snapshot,
-      then incremental segments holding only the pages that changed — the daemon's capture engine already
-      knows exactly which those are, so a flush never diffs the database. Every sixteenth flush snapshots,
-      so a read replays one snapshot plus a bounded chain, checksum-verified member by member.
-      A missing or torn chain member is a loud failure, never a silently short read.</p>
-    </div>
-    <dl class="guarantees">
-      <div class="g"><dt>one writer</dt><dd><strong>One writer per lineage, enforced by leases and epoch fencing.</strong> A writer that loses its lease is fenced: its epoch is dead, its objects unreachable by chain resolution, and it stops rather than write into a dead prefix.</dd></div>
-      <div class="g"><dt>real forks</dt><dd><strong>Children are storage-independent.</strong> A fork seeds a fresh lineage from one materialized snapshot. Destroying a parent never harms its children — fork-spam is the expected workload, not an abuse case.</dd></div>
-      <div class="g"><dt>cas everywhere</dt><dd><strong>Every ref update is a conditional write.</strong> Concurrent checkpoint, touch, reap, and lease operations have exactly one winner; the loser gets a clean error, never a silently lost branch.</dd></div>
-      <div class="g"><dt>explicit durability</dt><dd><strong>Durability is a statement, not a vibe.</strong> <code>session status</code> reports the exact transaction id each branch is durable through. Between flushes, writes are committed to SQLite but not yet in the store — and the tool says so.</dd></div>
-      <div class="g"><dt>ttl reaping</dt><dd><strong>Attempt branches clean up after themselves.</strong> TTL counts from the last durable write or lease renewal; a live lease is never reaped; protected branches never reap regardless.</dd></div>
-    </dl>
-    <div class="stats">
-      <div class="stat"><div class="n small">2.87s → ~200ms</div><div class="l">fork a 512mb db, local disk</div></div>
-      <div class="stat"><div class="n">2,309</div><div class="l">torture rounds, latest run</div></div>
-      <div class="stat"><div class="n">230 / 230</div><div class="l">capture-engine bounces resumed cleanly</div></div>
-      <div class="stat"><div class="n">0</div><div class="l">divergences, this run</div></div>
-    </div>
-    <div class="prose">
-      <p>The capture engine is validated by a torture harness: a stock <code>sqlite3</code> writer is
-      <code>kill&nbsp;-9</code>'d mid-write on roughly half of every round, while the capture engine itself
-      is bounced — a graceful restart that exercises its resume-vs-rebase logic, not a crash — every tenth
-      round; the replica must converge to a byte-identical dump of the source after every round or the run
-      fails immediately. <code>make test-torture</code> reproduces it; the numbers above are this repo's
-      latest run, not a historical best.</p>
-      <p>The fork numbers are the other headline numbers: <strong>2.87s → 198ms</strong> forking a 512MB
-      database on local disk (a reflink/clonefile object copy instead of decode-then-re-encode; ~9.3ms for
-      the copy alone, in isolation from an unrelated size-scaling check), and <strong>4.57s → 1.03s</strong>
-      over S3 via a server-side <code>CopyObject</code> call that never downloads or re-uploads the
-      snapshot. Full methodology and every raw number: <span style="opacity:.7;cursor:default"
-      title="Private repo — docs/benchmarks.md opens with the public launch">docs/benchmarks.md ↗</span>.</p>
-    </div>
-  </div>
+<section class="wrap" id="commands">
+  <h2>commands</h2>
+  <div class="tablewrap"><table><tbody>
+    <tr><td class="cmd"><span class="a">init</span></td><td class="d">create a store in ./.offshoot</td></tr>
+    <tr><td class="cmd"><span class="a">create</span> &lt;db&gt; [--from f]</td><td class="d">new database (branch main), or import a file</td></tr>
+    <tr><td class="cmd"><span class="a">checkout</span> &lt;db&gt;[@branch]</td><td class="d">materialize a working copy; prints its path (<code>--at cp --read-only</code> for history)</td></tr>
+    <tr><td class="cmd"><span class="a">checkpoint</span> &lt;db&gt;[@br] &lt;name&gt;</td><td class="d">snapshot the checkout as a named checkpoint</td></tr>
+    <tr><td class="cmd"><span class="a">fork</span> &lt;db&gt;[@br] &lt;new&gt; [--at cp] [--ttl d]</td><td class="d">branch from head or a checkpoint; copy-on-write</td></tr>
+    <tr><td class="cmd"><span class="a">rollback</span> &lt;db&gt;[@br] --to &lt;cp&gt;</td><td class="d">repoint a branch at a checkpoint</td></tr>
+    <tr><td class="cmd"><span class="a">promote</span> &lt;db&gt;@&lt;src&gt; --onto &lt;target&gt;</td><td class="d">repoint target at src's head (<code>--force</code> for protected)</td></tr>
+    <tr><td class="cmd"><span class="a">compact</span> &lt;db&gt;[@br]</td><td class="d">make a shared fork self-contained</td></tr>
+    <tr><td class="cmd"><span class="a">destroy</span> &lt;db&gt;[@br] [--force]</td><td class="d">delete a branch; children survive their parent</td></tr>
+    <tr><td class="cmd"><span class="a">touch</span> &lt;db&gt;[@br] [--ttl d|none]</td><td class="d">reset a branch's activity clock; set or clear its TTL</td></tr>
+    <tr><td class="cmd"><span class="a">diff</span> a b [--summary]</td><td class="d">sqldiff two branches or checkpoints</td></tr>
+    <tr><td class="cmd"><span class="a">export</span> &lt;db&gt;[@br[@cp]] out.db</td><td class="d">copy a checkpoint (or head) out to a plain file</td></tr>
+    <tr><td class="cmd"><span class="a">status</span></td><td class="d">all branches: state, storage class, TTL</td></tr>
+    <tr><td class="cmd"><span class="a">gc</span> [--grace d]</td><td class="d">collect unreachable lineages</td></tr>
+    <tr><td class="cmd"><span class="a">lease</span> list|acquire|release</td><td class="d">inspect or break branch leases</td></tr>
+    <tr><td class="cmd"><span class="a">serve</span></td><td class="d">daemon: live capture, TTL reaping, GC, optional HTTP/SSE</td></tr>
+    <tr><td class="cmd"><span class="a">session</span> open|flush|status|close|shutdown|dbs</td><td class="d">drive a running daemon from the CLI</td></tr>
+    <tr><td class="cmd"><span class="a">mcp</span> [-default-ttl d]</td><td class="d">serve the MCP tool set on stdio for an agent</td></tr>
+  </tbody></table></div>
+  <p class="note">Full semantics — flags, protected-branch rules, storage classes, branch
+  states — in <code>docs/reference.md</code>.</p>
 </section>
 
-<section id="agents">
-  <div class="wrap reveal">
-    <div class="commit"><b>04</b> · the integration surface</div>
-    <h2>Built to be driven <em>by the agent itself.</em></h2>
-    <div class="cards">
-      <div class="card"><h3>pytest fixture + ts testkit</h3>
-        <p><code>pip install "offshoot-db[pytest]"</code> wires three fixtures — <code>offshoot_daemon</code>,
-        <code>offshoot_db</code>, <code>offshoot_fork</code> — into seed-once-fork-many: one seed checkpoint,
-        a fresh forked branch per test, TTL-backstopped teardown — and xdist-safe: one daemon per worker
-        under <code>pytest-xdist -n</code>. <code>@offshoot-db/client/testkit</code> is the same shape for vitest/jest/<code>node:test</code>.
-        The full tutorial, install to CI, is in the eval-harness doc.</p></div>
-      <div class="card"><h3>mcp server</h3>
-        <p>One command: <code>claude mcp add offshoot -- offshoot mcp</code>. Seven tools with descriptions a model
-        can act on — fork before risky work, checkpoint when tests pass, roll back when they fail. Forks expire
-        in 24h by default, so an agent that forks and forgets doesn't leak branches forever; when a harness
-        already has a session open on a branch, MCP rides that live daemon session instead of going through disk.</p></div>
-      <div class="card"><h3>langgraph companion</h3>
-        <p><code>ThreadForks</code> maps agent threads to branches: checkpoint the database under the
-        conversation's checkpoint id, and when you rewind the thread, fork the world at that exact state.
-        <code>examples/langgraph-rewind/</code> runs it end to end.</p></div>
-    </div>
-    <div class="split">
-      <div class="block">
-        <div class="label">python · offshoot_fork, one branch per test</div>
-        <pre><code><span class="k">def</span> test_agent_spends_credits(offshoot_fork):
-    forked = offshoot_fork()  <span class="c"># fresh branch, seed's checkpoint</span>
-    conn = sqlite3.connect(forked.path)
-    conn.execute(<span class="s">"UPDATE users SET credits = credits - 10 ..."</span>)
-    conn.commit()
-    <span class="k">assert</span> credits_now(conn) == 90  <span class="c"># torn down + TTL-backstopped after</span></code></pre>
-      </div>
-      <div class="block">
-        <div class="label">python · fork a live agent's world mid-conversation</div>
-        <pre><code><span class="k">with</span> offshoot.connect(<span class="s">"offshoot.sock"</span>) <span class="k">as</span> c:
-    s = c.open(<span class="s">"app"</span>)          <span class="c"># leased, live-captured checkout</span>
-    agent_writes_to(s.path)      <span class="c"># stock sqlite3, no wrapper</span>
-    s.flush(<span class="s">"before-migration"</span>) <span class="c"># named, durable checkpoint</span>
-    c.fork(<span class="s">"app"</span>, <span class="s">"main"</span>, <span class="s">"attempt-1"</span>, ttl=<span class="s">"2h"</span>)</code></pre>
-      </div>
-    </div>
-    <div class="prose">
-      <p><strong>Operable, not orchestrated.</strong> A fifth surface rides alongside the four above without
-      changing any of them: <code>serve -http ADDR</code> exposes a hand-rolled Prometheus <code>/metrics</code>
-      endpoint, a token-authed <code>POST /rpc</code>, <code>/healthz</code>, and an <code>/events</code> stream
-      (SSE) over HTTP, alongside the unix socket. Every branch reports one of six computed states — active,
-      dirty, detached, idle, pending, error — and a <code>checkouts-ro</code> disk budget LRU-evicts read-only
-      checkouts once it fills. One daemon, one host, no cluster — see the operations doc and the Kubernetes
-      sidecar recipe for running it as exactly that.</p>
-    </div>
-  </div>
-</section>
-
-<section id="honest">
-  <div class="wrap reveal">
-    <div class="commit"><b>05</b> · the honest part</div>
-    <h2>What it <em>doesn't</em> do.</h2>
-    <div class="prose"><p>Infrastructure earns trust by stating its limits as plainly as its features:</p></div>
-    <ul class="limits prose">
-      <li><strong>Pre-release.</strong> The storage format and CLI may still change. Not yet recommended for data you can't regenerate.</li>
-      <li><strong>Linux and macOS only.</strong> The capture path and lock probing are POSIX-dependent; Windows is unsupported in v1.</li>
-      <li><strong>Not a cluster.</strong> Nodes sharing a bucket won't corrupt each other — fencing guarantees that — but there is no placement, failover, or cross-node routing.</li>
-      <li><strong>Materialized forks cost real bytes.</strong> N forks of a G-byte database cost up to N×G in the bucket. That's the price of GC simplicity and parent-independence — a fork never references its parent's storage, so destroying either one never endangers the other. TTLs are the operational mitigation; reflink/clonefile locally and server-side <code>CopyObject</code> on S3 avoid a real re-upload when they apply, but neither reduces the bytes actually stored. Page-level dedupe is the v2 arc, if TTLs and fast-fork together turn out not to be enough.</li>
-      <li><strong>At-rest checkpoints are full snapshots.</strong> Only the daemon writes incremental segments — it's the one that knows which pages changed. Checkpointing large databases in a loop? Run the daemon.</li>
-    </ul>
-  </div>
+<section class="wrap" id="links">
+  <h2>links</h2>
+  <p class="note">
+    <span class="soon" title="Private repo — opens with the public launch">github.com/sricola/offshoot ↗</span> ·
+    docs: <code>reference</code> <code>architecture</code> <code>faq</code>
+    <code>eval-harness</code> <code>operations</code> · <code>CHANGELOG</code> —
+    all in-repo, public at launch.
+  </p>
 </section>
 
 <footer><div class="wrap">
-  <span><span style="color:var(--shoot)">⑂</span> offshoot</span>
-  <span>code opens with the public launch · v0.1.3</span>
-  <span>apache-2.0</span>
-  <span style="margin-left:auto">stock sqlite · your storage · one binary</span>
+  <span><span class="g">⑂</span> offshoot</span>
+  <span>v0.2.6 · apache-2.0</span>
+  <span>stock sqlite · your storage · one binary</span>
 </div></footer>
 
-<script>
-const io=new IntersectionObserver(es=>es.forEach(e=>{if(e.isIntersecting){e.target.classList.add('in');io.unobserve(e.target)}}),{threshold:.12});
-document.querySelectorAll('.reveal').forEach(el=>io.observe(el));
-</script>
 </body>
 </html>
