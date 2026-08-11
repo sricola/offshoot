@@ -9,6 +9,7 @@ import (
 	"os"
 	"path/filepath"
 	"testing"
+	"time"
 
 	"github.com/sricola/offshoot/internal/store"
 	"github.com/sricola/offshoot/internal/store/storetest"
@@ -285,6 +286,58 @@ func TestS3PutReaderIfMultipartAbortsOnFailure(t *testing.T) {
 	}
 	if _, _, gerr := b.Get(key); !errors.Is(gerr, store.ErrNotFound) {
 		t.Fatalf("a failed multipart upload must not create the object, got %v", gerr)
+	}
+}
+
+// TestS3PutReaderIfMultipartPartRPCTimeoutAborts pins security audit 2's
+// LOW-1 fix at the per-call layer: an UploadPart whose response stalls
+// past multipartRPCTimeout (shrunk here via SetMultipartRPCTimeoutForTest
+// — the production 15-minute value obviously can't be waited out in a
+// unit test) must fail the upload with a context-deadline error instead of
+// blocking forever, and the deferred AbortMultipartUpload must still run
+// (its own multipartAbortTimeout-bounded context, not the expired one), so
+// no upload is left pending/billing. The fake's SetPartDelay sleeps BEFORE
+// touching any shared state, so the stalled part handlers can never block
+// the abort. Also pins how the failure surfaces through PutReaderIf: a
+// plain error, NOT store.ErrCAS — flush.go treats any non-CAS error as a
+// hard upload failure and must not mistake a timeout for a lost CAS race.
+func TestS3PutReaderIfMultipartPartRPCTimeoutAborts(t *testing.T) {
+	smallMultipartSettings(t)
+	t.Cleanup(store.SetMultipartRPCTimeoutForTest(100 * time.Millisecond))
+
+	b, f := newFakeBackedWithFake(t)
+	rp := b.(store.ReaderPutter)
+
+	// Stall every part's response 10x past the shrunk per-RPC deadline.
+	// The deadline fires on wall time regardless of scheduling, so the only
+	// way this test could see a non-deadline outcome is a part completing
+	// in under 100ms — impossible against a 1s server-side sleep.
+	for p := int32(1); p <= 3; p++ {
+		f.SetPartDelay(p, time.Second)
+	}
+
+	payload := multipartPayload() // 3 parts
+	_, err := rp.PutReaderIf("data/x/stalled.ltx", bytes.NewReader(payload), int64(len(payload)), "")
+	if err == nil {
+		t.Fatal("a part RPC exceeding multipartRPCTimeout must fail the upload, not hang or succeed")
+	}
+	if !errors.Is(err, context.DeadlineExceeded) {
+		t.Fatalf("err = %v, want a chain wrapping context.DeadlineExceeded (the per-RPC deadline firing)", err)
+	}
+	if errors.Is(err, store.ErrCAS) {
+		t.Fatalf("err = %v, must surface as a plain error, never store.ErrCAS", err)
+	}
+
+	creates, _, completes, aborts := f.MultipartStats()
+	if creates != 1 || completes != 0 || aborts != 1 {
+		t.Fatalf("MultipartStats: creates=%d completes=%d aborts=%d, want 1/0/1 (a timed-out upload must abort exactly once, never complete)",
+			creates, completes, aborts)
+	}
+	if pending := f.PendingMultipartUploads(); pending != 0 {
+		t.Fatalf("PendingMultipartUploads = %d after a timed-out upload, want 0 (the abort must run under its own bounded context)", pending)
+	}
+	if _, _, gerr := b.Get("data/x/stalled.ltx"); !errors.Is(gerr, store.ErrNotFound) {
+		t.Fatalf("a timed-out multipart upload must not create the object, got %v", gerr)
 	}
 }
 

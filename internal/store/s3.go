@@ -10,8 +10,10 @@ import (
 	"net/url"
 	"sort"
 	"strings"
+	"time"
 
 	"github.com/aws/aws-sdk-go-v2/aws"
+	awshttp "github.com/aws/aws-sdk-go-v2/aws/transport/http"
 	awsconfig "github.com/aws/aws-sdk-go-v2/config"
 	"github.com/aws/aws-sdk-go-v2/service/s3"
 	"github.com/aws/aws-sdk-go-v2/service/s3/types"
@@ -38,6 +40,24 @@ type S3 struct {
 	prefix string
 }
 
+// s3ResponseHeaderTimeout bounds how long any S3 call waits for its
+// response headers to BEGIN arriving once the request has been sent. It
+// deliberately does NOT bound the body transfer — a slow-but-progressing
+// multi-GiB download or upload can never be killed by it — which is
+// exactly why it is safe (and intended) to apply to EVERY call this
+// client makes, Get/Put/List included, not just the multipart path: a
+// healthy backend sends response headers within seconds regardless of
+// object size, while a stalled or hostile endpoint that accepts the TCP
+// connection and never responds would otherwise block a call forever (the
+// SDK's default HTTP client sets dial and TLS-handshake timeouts but no
+// response-header timeout at all — security audit 2, LOW-1: one such
+// stall in an UploadPart wedged flush AND Session.Close for good). 60s is
+// deliberately generous — the value only needs to be finite, not tight,
+// and must ride out an S3 brown-out without tripping. No TOTAL request
+// timeout is set at this layer, equally deliberately: that WOULD kill
+// legitimate large transfers mid-body.
+const s3ResponseHeaderTimeout = 60 * time.Second
+
 func NewS3(ctx context.Context, cfg S3Config) (*S3, error) {
 	if cfg.Bucket == "" {
 		return nil, errors.New("store: s3 bucket is required")
@@ -50,6 +70,14 @@ func NewS3(ctx context.Context, cfg S3Config) (*S3, error) {
 	if region != "" {
 		loadOpts = append(loadOpts, awsconfig.WithRegion(region))
 	}
+	// Bound every call's wait for response headers to begin — see
+	// s3ResponseHeaderTimeout's doc comment. BuildableClient is the SDK's
+	// own default client type, so its standard dial/TLS/connection-pool
+	// settings are preserved; only ResponseHeaderTimeout is added on top.
+	loadOpts = append(loadOpts, awsconfig.WithHTTPClient(
+		awshttp.NewBuildableClient().WithTransportOptions(func(tr *http.Transport) {
+			tr.ResponseHeaderTimeout = s3ResponseHeaderTimeout
+		})))
 	awsCfg, err := awsconfig.LoadDefaultConfig(ctx, loadOpts...)
 	if err != nil {
 		return nil, fmt.Errorf("store: load aws config: %w", err)
@@ -425,7 +453,9 @@ func (s *S3) CopyObject(dst, src string) error {
 		return ErrCopyUnsupported
 	}
 	if size > copyObjectMaxBytes {
-		return s.copyObjectMultipart(dst, fsrc, fdst, size)
+		// Background here, per-RPC multipartRPCTimeout deadlines inside —
+		// see copyObjectMultipart's doc comment.
+		return s.copyObjectMultipart(context.Background(), dst, fsrc, fdst, size)
 	}
 
 	_, err = s.cl.CopyObject(context.Background(), &s3.CopyObjectInput{

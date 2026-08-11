@@ -6,6 +6,7 @@ import (
 	"fmt"
 	"io"
 	"sync"
+	"time"
 
 	"github.com/aws/aws-sdk-go-v2/aws"
 	"github.com/aws/aws-sdk-go-v2/service/s3"
@@ -87,6 +88,43 @@ var multipartConcurrency = 4
 // SetMultipartThresholdForTest (export_test.go).
 var multipartThreshold int64 = 5 * 1024 * 1024 * 1024 // 5 GiB
 
+// multipartRPCTimeout is the per-call context.WithTimeout deadline every
+// individual multipart RPC (CreateMultipartUpload, each UploadPart /
+// UploadPartCopy, CompleteMultipartUpload, and putMultipart's HeadObject
+// preflight) runs under. It exists so a single stalled backend response
+// can only ever delay a multipart operation, never wedge it forever
+// (security audit 2, LOW-1: putMultipart runs on the flush path holding
+// flushMu, so an UploadPart that never returned hung every future Flush
+// AND Session.Close) — the transport-level s3ResponseHeaderTimeout (s3.go)
+// already catches a response that never BEGINS, and this layer addition-
+// ally bounds a response/transfer that begins but then stalls mid-body.
+//
+// 15 minutes is sized to the WORST-case single RPC, not the common one:
+// the largest part partSizeFor can produce is ~550 MiB (a 5 TiB object
+// split into maxParts parts), which at a deliberately pessimistic 1 MiB/s
+// floor throughput needs ~9.2 minutes to transfer; 15 minutes covers that
+// with headroom, and equally covers UploadPartCopy's server-side copy of a
+// same-sized part and CompleteMultipartUpload's assembly pause. The point
+// is "eventually unwedges", not "fails fast" — a deadline that is too
+// tight would kill legitimate slow transfers, which is precisely what the
+// transport layer's response-header-only timeout was chosen to avoid.
+//
+// This is a package var, not a const, ONLY so tests can shrink it — a
+// test proving the deadline fires cannot wait 15 real minutes. Never set
+// it outside a test; production code must never assign to it. See
+// SetMultipartRPCTimeoutForTest (export_test.go).
+var multipartRPCTimeout = 15 * time.Minute
+
+// multipartAbortTimeout bounds the deferred AbortMultipartUpload cleanup
+// (abortUnlessCompleted): abort is a small metadata-only RPC, so it gets a
+// much tighter bound than multipartRPCTimeout — the failure it cleans up
+// after may itself have been a stall, and cleanup hanging on the same
+// stalled backend would reintroduce exactly the wedge the per-RPC
+// deadlines exist to prevent. If the abort times out, its error is
+// appended to the original failure (never substituted for it), same as
+// any other abort failure.
+const multipartAbortTimeout = time.Minute
+
 // partSizeFor returns the per-part size store.S3 uses to multipart-upload
 // an object of the given total size: at least minPartSize and defaultPartSize,
 // and large enough that size splits into at most maxParts parts — S3's two
@@ -131,7 +169,13 @@ func (s *S3) abortUnlessCompleted(completed *bool, fk string, uploadID *string, 
 	if *completed {
 		return
 	}
-	_, aerr := s.cl.AbortMultipartUpload(context.Background(), &s3.AbortMultipartUploadInput{
+	// Fresh Background-derived context, deliberately not the (possibly
+	// already expired) context the failed upload ran under — the abort must
+	// get its own chance to run — but bounded by multipartAbortTimeout so
+	// cleanup against the very backend that just stalled cannot hang either.
+	actx, cancel := context.WithTimeout(context.Background(), multipartAbortTimeout)
+	defer cancel()
+	_, aerr := s.cl.AbortMultipartUpload(actx, &s3.AbortMultipartUploadInput{
 		Bucket: aws.String(s.bucket), Key: aws.String(fk), UploadId: uploadID,
 	})
 	if aerr != nil {
@@ -233,9 +277,15 @@ func (s *S3) putMultipart(key string, r io.Reader, size int64, ifMatch string, c
 	if err != nil {
 		return "", err
 	}
+	// Derived internally, not taken as a parameter: PutReader/PutReaderIf
+	// are interface methods whose signatures carry no context. Every RPC
+	// below runs under its own multipartRPCTimeout-bounded child of this
+	// context, so no single stalled response can wedge the upload (security
+	// audit 2, LOW-1 — see multipartRPCTimeout's doc comment).
 	ctx := context.Background()
 
-	created, err := s.cl.CreateMultipartUpload(ctx, &s3.CreateMultipartUploadInput{
+	crctx, crcancel := context.WithTimeout(ctx, multipartRPCTimeout)
+	created, err := s.cl.CreateMultipartUpload(crctx, &s3.CreateMultipartUploadInput{
 		Bucket: aws.String(s.bucket), Key: aws.String(fk),
 		// Explicit, not inferred: the SDK's default RequestChecksumCalculation
 		// is WhenSupported (not WhenRequired), so every UploadPart call below
@@ -250,6 +300,7 @@ func (s *S3) putMultipart(key string, r io.Reader, size int64, ifMatch string, c
 		// PartNumber} alone (the pre-fix shape) silently did.
 		ChecksumAlgorithm: types.ChecksumAlgorithmCrc32,
 	})
+	crcancel()
 	if err != nil {
 		return "", fmt.Errorf("store: s3 create multipart upload %s: %w", key, err)
 	}
@@ -308,7 +359,8 @@ func (s *S3) putMultipart(key string, r io.Reader, size int64, ifMatch string, c
 				return "", fmt.Errorf("store: s3 read part %d for %s: %w", partNum, key, rerr)
 			}
 
-			up, uerr := s.cl.UploadPart(ctx, &s3.UploadPartInput{
+			pctx, pcancel := context.WithTimeout(ctx, multipartRPCTimeout)
+			up, uerr := s.cl.UploadPart(pctx, &s3.UploadPartInput{
 				Bucket: aws.String(s.bucket), Key: aws.String(fk),
 				UploadId: uploadID, PartNumber: aws.Int32(partNum),
 				Body: bytes.NewReader(buf[:n]), ContentLength: aws.Int64(n),
@@ -328,6 +380,7 @@ func (s *S3) putMultipart(key string, r io.Reader, size int64, ifMatch string, c
 				// regardless of RequestChecksumCalculation.
 				ChecksumAlgorithm: types.ChecksumAlgorithmCrc32,
 			})
+			pcancel()
 			if uerr != nil {
 				return "", fmt.Errorf("store: s3 upload part %d for %s: %w", partNum, key, uerr)
 			}
@@ -358,7 +411,9 @@ func (s *S3) putMultipart(key string, r io.Reader, size int64, ifMatch string, c
 			completeIn.IfMatch = aws.String(ifMatch)
 		}
 	}
-	out, cerr := s.cl.CompleteMultipartUpload(ctx, completeIn)
+	cmctx, cmcancel := context.WithTimeout(ctx, multipartRPCTimeout)
+	out, cerr := s.cl.CompleteMultipartUpload(cmctx, completeIn)
+	cmcancel()
 	if cerr != nil {
 		if conditional && isPreconditionFailed(cerr) {
 			return "", fmt.Errorf("%w: %s", ErrCAS, key)
@@ -454,7 +509,14 @@ func (s *S3) concurrentPartUpload(ctx context.Context, key, fk string, uploadID 
 			for partNum := range jobs {
 				offset := int64(partNum-1) * partSize
 				n := partLen(size, offset, partSize)
-				up, uerr := s.cl.UploadPart(cctx, &s3.UploadPartInput{
+				// Per-RPC deadline layered on the shared cancel context:
+				// a part whose response stalls fails THIS part with
+				// context.DeadlineExceeded, which recordErr below then
+				// turns into cancellation of every other in-flight part —
+				// so one stalled response fails the upload promptly
+				// instead of wedging it (see multipartRPCTimeout).
+				pctx, pcancel := context.WithTimeout(cctx, multipartRPCTimeout)
+				up, uerr := s.cl.UploadPart(pctx, &s3.UploadPartInput{
 					Bucket: aws.String(s.bucket), Key: aws.String(fk),
 					UploadId: uploadID, PartNumber: aws.Int32(partNum),
 					Body: io.NewSectionReader(ra, base+offset, n), ContentLength: aws.Int64(n),
@@ -464,6 +526,7 @@ func (s *S3) concurrentPartUpload(ctx context.Context, key, fk string, uploadID 
 					// applies here unchanged.
 					ChecksumAlgorithm: types.ChecksumAlgorithmCrc32,
 				})
+				pcancel()
 				if uerr != nil {
 					recordErr(fmt.Errorf("store: s3 upload part %d for %s: %w", partNum, key, uerr))
 					continue
@@ -519,7 +582,10 @@ func (s *S3) concurrentPartUpload(ctx context.Context, key, fk string, uploadID 
 // partSizeFor, which already keeps every part within UploadPartCopy's own
 // 5 GiB per-part maximum) + CompleteMultipartUpload. fsrc and fdst are
 // already-prefixed bucket keys (CopyObject has already validated and
-// mapped both); size is the source's HEAD-reported length.
+// mapped both); size is the source's HEAD-reported length. Every RPC runs
+// under its own multipartRPCTimeout-bounded child of ctx, same as
+// putMultipart (security audit 2, LOW-1 — see multipartRPCTimeout's doc
+// comment).
 //
 // Same abort discipline as putMultipart: once CreateMultipartUpload
 // succeeds, a deferred AbortMultipartUpload runs on every exit that is not
@@ -567,10 +633,9 @@ func (s *S3) concurrentPartUpload(ctx context.Context, key, fk string, uploadID 
 // method's two branches if that ever changes; a future caller that starts
 // relying on metadata surviving a copy would need to explicitly read the
 // source's HeadObjectOutput and pass it through here too.
-func (s *S3) copyObjectMultipart(dst, fsrc, fdst string, size int64) (err error) {
-	ctx := context.Background()
-
-	created, cerr := s.cl.CreateMultipartUpload(ctx, &s3.CreateMultipartUploadInput{
+func (s *S3) copyObjectMultipart(ctx context.Context, dst, fsrc, fdst string, size int64) (err error) {
+	crctx, crcancel := context.WithTimeout(ctx, multipartRPCTimeout)
+	created, cerr := s.cl.CreateMultipartUpload(crctx, &s3.CreateMultipartUploadInput{
 		Bucket: aws.String(s.bucket), Key: aws.String(fdst),
 		// DELIBERATELY no ChecksumAlgorithm here — the opposite choice from
 		// putMultipart's CreateMultipartUpload, and not an oversight to be
@@ -594,6 +659,7 @@ func (s *S3) copyObjectMultipart(dst, fsrc, fdst string, size int64) (err error)
 		// returns (see the CompletedPart construction below) — harmless and
 		// useful when present, never required.
 	})
+	crcancel()
 	if cerr != nil {
 		return fmt.Errorf("store: s3 create multipart copy %s: %w", dst, cerr)
 	}
@@ -610,12 +676,14 @@ func (s *S3) copyObjectMultipart(dst, fsrc, fdst string, size int64) (err error)
 		n := partLen(size, offset, partSize)
 		end := offset + n - 1 // INCLUSIVE end — see the doc comment above.
 
-		up, uerr := s.cl.UploadPartCopy(ctx, &s3.UploadPartCopyInput{
+		pctx, pcancel := context.WithTimeout(ctx, multipartRPCTimeout)
+		up, uerr := s.cl.UploadPartCopy(pctx, &s3.UploadPartCopyInput{
 			Bucket: aws.String(s.bucket), Key: aws.String(fdst),
 			UploadId: uploadID, PartNumber: aws.Int32(partNum),
 			CopySource:      aws.String(copySource),
 			CopySourceRange: aws.String(fmt.Sprintf("bytes=%d-%d", offset, end)),
 		})
+		pcancel()
 		if uerr != nil {
 			return fmt.Errorf("store: s3 upload part copy %d for %s: %w", partNum, dst, uerr)
 		}
@@ -632,13 +700,15 @@ func (s *S3) copyObjectMultipart(dst, fsrc, fdst string, size int64) (err error)
 		partNum++
 	}
 
-	_, cerr2 := s.cl.CompleteMultipartUpload(ctx, &s3.CompleteMultipartUploadInput{
+	cmctx, cmcancel := context.WithTimeout(ctx, multipartRPCTimeout)
+	_, cerr2 := s.cl.CompleteMultipartUpload(cmctx, &s3.CompleteMultipartUploadInput{
 		Bucket: aws.String(s.bucket), Key: aws.String(fdst), UploadId: uploadID,
 		MultipartUpload: &types.CompletedMultipartUpload{Parts: parts},
 		// Same free defense-in-depth as putMultipart: S3 rejects Complete
 		// with a 400 if the parts' total length doesn't match size.
 		MpuObjectSize: aws.Int64(size),
 	})
+	cmcancel()
 	if cerr2 != nil {
 		return fmt.Errorf("store: s3 complete multipart copy %s: %w", dst, cerr2)
 	}

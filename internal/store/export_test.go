@@ -1,14 +1,16 @@
 package store
 
+import "time"
+
 // This file exists only in test binaries (export_test.go is never compiled
-// into non-test builds). It exposes S3's four unexported test knobs —
-// multipartThreshold, defaultPartSize, and multipartConcurrency
-// (s3_multipart.go), and copyObjectMaxBytes (s3.go); see the doc comments
-// on those vars — to the EXTERNAL store_test package via
-// SetMultipartThresholdForTest, SetPartSizeForTest,
-// SetMultipartConcurrencyForTest, and SetCopyObjectMaxBytesForTest,
-// following the same pattern internal/ops/export_test.go uses for
-// forkSlowPathForTest.
+// into non-test builds). It exposes S3's five unexported test knobs —
+// multipartThreshold, defaultPartSize, multipartConcurrency, and
+// multipartRPCTimeout (s3_multipart.go), and copyObjectMaxBytes (s3.go);
+// see the doc comments on those vars — to the EXTERNAL store_test package
+// via SetMultipartThresholdForTest, SetPartSizeForTest,
+// SetMultipartConcurrencyForTest, SetMultipartRPCTimeoutForTest, and
+// SetCopyObjectMaxBytesForTest, following the same pattern
+// internal/ops/export_test.go uses for forkSlowPathForTest.
 
 // SetMultipartThresholdForTest overrides the object-size threshold above
 // which store.S3.PutReader/PutReaderIf switch to a multipart upload,
@@ -47,6 +49,19 @@ func SetMultipartConcurrencyForTest(v int) (restore func()) {
 	prev := multipartConcurrency
 	multipartConcurrency = v
 	return func() { multipartConcurrency = prev }
+}
+
+// SetMultipartRPCTimeoutForTest overrides the per-call deadline every
+// individual multipart RPC runs under (multipartRPCTimeout in
+// s3_multipart.go), returning a restore func that puts back the previous
+// value (call it via t.Cleanup). A test proving the deadline actually
+// fires — and that the upload then fails with a context-deadline error and
+// still aborts — cannot wait out the production value of 15 minutes, so it
+// shrinks this instead. Test-only: never call this outside a test.
+func SetMultipartRPCTimeoutForTest(d time.Duration) (restore func()) {
+	prev := multipartRPCTimeout
+	multipartRPCTimeout = d
+	return func() { multipartRPCTimeout = prev }
 }
 
 // SetCopyObjectMaxBytesForTest overrides the source-size threshold above
