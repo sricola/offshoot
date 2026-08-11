@@ -32,8 +32,9 @@ version if you depend on format stability.
 
 ### Fixed
 
-- **A stalled S3 response can no longer wedge flush — and with it daemon
-  shutdown — forever.** The S3 client's HTTP transport now applies a
+- **A stalled S3 response can no longer wedge flush via the multipart
+  path, and a response that never begins is now bounded on every S3
+  call.** The S3 client's HTTP transport now applies a
   60-second response-header timeout to EVERY S3 call (Get/Put/List
   included, not just multipart): it bounds only how long a call waits for
   a response to begin, never the body transfer, so a slow-but-progressing
