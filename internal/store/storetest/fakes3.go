@@ -28,6 +28,33 @@ type FakeS3 struct {
 	// fault, when set and returning ok, replaces the response with status.
 	fault func(method, key string) (int, bool)
 
+	// stallMu guards the two stall hooks below. Its own mutex, never f.mu:
+	// requestStall runs BEFORE f.mu is acquired (so a stalled request never
+	// serializes the rest of the fake through the state lock), and
+	// getBodyStalls is read inside the GET handler which already holds f.mu
+	// but is SET from the test goroutine.
+	stallMu sync.Mutex
+
+	// requestStall, when set and returning true, makes handle() block the
+	// matching request BEFORE processing it — before f.mu, before the fault
+	// hook, before any response byte — until the CLIENT abandons the request
+	// (its context is canceled and the connection drops). The client-side
+	// per-call deadline is exactly what a test armed with a tiny
+	// store.SetSingleShotRPCTimeoutForTest is proving fires; blocking on
+	// r.Context().Done() rather than a fixed sleep means the handler
+	// unblocks the moment the deadline does its job, and can never outlive
+	// the test into srv.Close's handler drain.
+	requestStall func(method, key string) bool
+
+	// getBodyStalls maps a key to a byte count n: a GET for that key writes
+	// response headers (with the object's full Content-Length) and the first
+	// n bytes of the body, flushes them to the client, then stalls the rest
+	// of the body until the client gives up — the "response begins, then
+	// stalls mid-body" failure s3ResponseHeaderTimeout can never catch,
+	// which store.S3's Get deadline and GetReader's progress watchdog exist
+	// to bound. See SetGetBodyStall.
+	getBodyStalls map[string]int
+
 	// sizeOverrides, when a key is present, is the Content-Length this fake
 	// reports for that key's HEAD response instead of len(objs[key]). Exists
 	// so a test can exercise store.S3.CopyObject's 5GB size gate
@@ -147,6 +174,27 @@ func (f *FakeS3) SetFault(fn func(method, key string) (int, bool)) {
 	f.fault = fn
 }
 
+// SetRequestStall makes every request fn matches block, unprocessed and
+// with no response bytes written, until the client abandons it — see the
+// requestStall field's doc comment. Pass nil to clear.
+func (f *FakeS3) SetRequestStall(fn func(method, key string) bool) {
+	f.stallMu.Lock()
+	defer f.stallMu.Unlock()
+	f.requestStall = fn
+}
+
+// SetGetBodyStall makes a GET for key deliver its response headers and the
+// first n bytes of the body, then stall the remainder until the client
+// gives up — see the getBodyStalls field's doc comment.
+func (f *FakeS3) SetGetBodyStall(key string, n int) {
+	f.stallMu.Lock()
+	defer f.stallMu.Unlock()
+	if f.getBodyStalls == nil {
+		f.getBodyStalls = map[string]int{}
+	}
+	f.getBodyStalls[key] = n
+}
+
 // SetSizeOverride makes this fake report size for key's Content-Length on
 // HEAD, regardless of how much data is actually stored under it. See the
 // sizeOverrides field's doc comment for why this exists.
@@ -179,6 +227,17 @@ func (f *FakeS3) SetBatchDeleteError(key string) {
 // (if slow) test failure — visible via MaxPartsInFlight staying below the
 // armed count — instead of a hung test run.
 const partGateTimeout = 5 * time.Second
+
+// stallBackstop bounds every stall-hook park (SetRequestStall's pre-
+// processing park and SetGetBodyStall's mid-body park). The parks normally
+// end the moment the abandoning client's disconnect cancels r.Context() —
+// that detection is what the stalling tests exercise — but if detection
+// ever fails (e.g. a transport change that keeps the connection alive),
+// this turns a permanently parked handler (which would hang srv.Close at
+// test cleanup, and with it the whole test binary) into a slow-but-
+// finishing test instead. Far above every stalling test's shrunken
+// timeout, so it can never mask the deadline those tests prove fires.
+const stallBackstop = 30 * time.Second
 
 // ArmPartGate arms a one-shot rendezvous gate for UploadPart requests: the
 // first n UploadPart requests to arrive all block until the nth one
@@ -467,6 +526,27 @@ func (f *FakeS3) handle(w http.ResponseWriter, r *http.Request) {
 	}
 	key := keyOf(r.URL.Path)
 
+	// Stall hook — BEFORE f.mu (see the requestStall field's doc comment):
+	// a stalled request parks here until its client abandons it, without
+	// ever holding the fake's state lock.
+	f.stallMu.Lock()
+	stall := f.requestStall
+	f.stallMu.Unlock()
+	if stall != nil && stall(r.Method, key) {
+		// Drain the request body BEFORE parking: net/http's server only
+		// detects a client disconnect (and cancels r.Context()) via its
+		// background read, which it arms only once the request body has
+		// been fully consumed — parking with an unread body would leave
+		// this handler permanently blind to the client giving up, hanging
+		// srv.Close at test cleanup.
+		io.Copy(io.Discard, r.Body)
+		select {
+		case <-r.Context().Done():
+		case <-time.After(stallBackstop):
+		}
+		return
+	}
+
 	// A genuine UploadPart request (not UploadPartCopy, which carries the
 	// same partNumber/uploadId query params but never has anything to gate
 	// or delay): run the concurrency-testing hooks BEFORE f.mu is acquired
@@ -514,6 +594,32 @@ func (f *FakeS3) handle(w http.ResponseWriter, r *http.Request) {
 			return
 		}
 		w.Header().Set("ETag", etagOf(data))
+		f.stallMu.Lock()
+		n, stallBody := f.getBodyStalls[key]
+		f.stallMu.Unlock()
+		if stallBody {
+			// Mid-body stall (see SetGetBodyStall): declare the full length,
+			// deliver the first n bytes, flush them to the client, then park
+			// until the client gives up. f.mu is released for the duration of
+			// the park (and re-taken only to balance handle's deferred
+			// Unlock), so a stalled GET never wedges the rest of the fake.
+			// The partial body is sliced before the unlock; later writes
+			// replace f.objs[key] with a fresh slice, never mutate this one.
+			head := data[:n]
+			w.Header().Set("Content-Length", strconv.Itoa(len(data)))
+			w.WriteHeader(http.StatusOK)
+			w.Write(head)
+			if fl, ok := w.(http.Flusher); ok {
+				fl.Flush()
+			}
+			f.mu.Unlock()
+			select {
+			case <-r.Context().Done():
+			case <-time.After(stallBackstop):
+			}
+			f.mu.Lock()
+			return
+		}
 		w.Write(data)
 
 	case http.MethodPut:

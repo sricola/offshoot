@@ -13,6 +13,31 @@ version if you depend on format stability.
 
 ## [Unreleased]
 
+### Fixed
+
+- **Every single-shot S3 call is now bounded too — a backend that stalls
+  mid-body (or stops reading an upload) can no longer wedge Get, Put, or
+  the flush path's below-threshold snapshot upload.** 0.2.6 bounded the
+  multipart RPCs and added a 60-second response-header timeout to every
+  call, but the header timeout only bounds waiting for a response to
+  BEGIN: a request that was accepted and then stalled mid-body still hung
+  its caller forever, several of which sit on the daemon's flush path
+  under the flush lock (so `Session.Close` hung too). Now every buffered
+  single-shot RPC — `Get` (including its body read), `Put`, `PutIf`, each
+  `List` page, `Delete`, each `DeleteObjects` batch, `CopyObject`'s HEAD
+  and single-request copy, and the below-threshold single `PutObject`
+  inside `PutReader`/`PutReaderIf` — runs under the same generous
+  15-minute per-call deadline the multipart RPCs use (sized so a
+  legitimate just-under-5-GiB single-request transfer at a pessimistic
+  throughput floor still fits: "eventually unwedges", never "fails
+  fast"). `GetReader`'s stream gets no total deadline — that would kill
+  legitimate long reads of large objects — but is wrapped in a progress
+  watchdog instead: a single `Read` that blocks for 60 seconds with no
+  bytes at all cancels the request and fails the read with a recognizable
+  "read stalled" error, while any progress re-arms the window and a slow
+  CONSUMER (long pauses between `Read`s) is never affected, because the
+  watchdog is only armed while a `Read` is actually blocked.
+
 ## [0.2.6] - 2026-08-11
 
 ### Changed

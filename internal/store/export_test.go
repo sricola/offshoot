@@ -3,13 +3,15 @@ package store
 import "time"
 
 // This file exists only in test binaries (export_test.go is never compiled
-// into non-test builds). It exposes S3's five unexported test knobs —
+// into non-test builds). It exposes S3's seven unexported test knobs —
 // multipartThreshold, defaultPartSize, multipartConcurrency, and
-// multipartRPCTimeout (s3_multipart.go), and copyObjectMaxBytes (s3.go);
-// see the doc comments on those vars — to the EXTERNAL store_test package
-// via SetMultipartThresholdForTest, SetPartSizeForTest,
-// SetMultipartConcurrencyForTest, SetMultipartRPCTimeoutForTest, and
-// SetCopyObjectMaxBytesForTest, following the same pattern
+// multipartRPCTimeout (s3_multipart.go), and copyObjectMaxBytes,
+// singleShotRPCTimeout, and readProgressTimeout (s3.go); see the doc
+// comments on those vars — to the EXTERNAL store_test package via
+// SetMultipartThresholdForTest, SetPartSizeForTest,
+// SetMultipartConcurrencyForTest, SetMultipartRPCTimeoutForTest,
+// SetCopyObjectMaxBytesForTest, SetSingleShotRPCTimeoutForTest, and
+// SetReadProgressTimeoutForTest, following the same pattern
 // internal/ops/export_test.go uses for forkSlowPathForTest.
 
 // SetMultipartThresholdForTest overrides the object-size threshold above
@@ -62,6 +64,30 @@ func SetMultipartRPCTimeoutForTest(d time.Duration) (restore func()) {
 	prev := multipartRPCTimeout
 	multipartRPCTimeout = d
 	return func() { multipartRPCTimeout = prev }
+}
+
+// SetSingleShotRPCTimeoutForTest overrides the per-call deadline every
+// buffered single-shot S3 RPC runs under (singleShotRPCTimeout in s3.go),
+// returning a restore func that puts back the previous value (call it via
+// t.Cleanup). A test proving the deadline actually fires cannot wait out
+// the production value of 15 minutes, so it shrinks this instead.
+// Test-only: never call this outside a test.
+func SetSingleShotRPCTimeoutForTest(d time.Duration) (restore func()) {
+	prev := singleShotRPCTimeout
+	singleShotRPCTimeout = d
+	return func() { singleShotRPCTimeout = prev }
+}
+
+// SetReadProgressTimeoutForTest overrides GetReader's per-Read progress
+// watchdog window (readProgressTimeout in s3.go), returning a restore func
+// that puts back the previous value (call it via t.Cleanup). A test proving
+// the watchdog fires — or that a slow consumer with pauses LONGER than the
+// window is never killed — cannot wait out the production 60 seconds, so it
+// shrinks this instead. Test-only: never call this outside a test.
+func SetReadProgressTimeoutForTest(d time.Duration) (restore func()) {
+	prev := readProgressTimeout
+	readProgressTimeout = d
+	return func() { readProgressTimeout = prev }
 }
 
 // SetCopyObjectMaxBytesForTest overrides the source-size threshold above
