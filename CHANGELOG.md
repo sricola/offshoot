@@ -13,6 +13,37 @@ version if you depend on format stability.
 
 ## [Unreleased]
 
+### Fixed
+
+- **Silent data loss when a fenced writer's snapshot shared a txid with the
+  next writer's segment.** Chain resolution could serve a dead writer's
+  entire database and drop a committed transaction, with no error and no
+  checksum failure. The scenario: session A uploads a snapshot for txid T,
+  its ref write fails with an *ambiguous* (non-CAS) error — a timeout, a
+  network blip — so the uploaded object is deliberately left behind (deleting
+  it would risk a live ref pointing at a missing object, the worse bug), and
+  A dies. Session B takes the branch over under a higher epoch, writes a
+  **segment** for that same txid T, and wins the ref CAS. Both objects now
+  sit at T.
+
+  Resolution deduplicates same-txid objects and keeps the highest epoch,
+  which is what makes epoch fencing hold on the read path — but it keyed on
+  each object's txid *range* and ran over snapshots and segments separately.
+  A snapshot for txid T spans `(0, T]` while a segment for T spans `(T, T]`,
+  so A's snapshot and B's segment shared neither a key nor a list, and the
+  fenced snapshot always survived. Resolution then anchored on it as the
+  newest snapshot at or below the target and, since it landed exactly on the
+  target, returned it alone: B's committed transaction was silently gone, and
+  a read returned A's state as though it were current. The fenced snapshot is
+  internally valid — it is simply the wrong object — so nothing downstream
+  could detect it.
+
+  Deduplication now runs once over the combined set, keyed on the txid an
+  object establishes state at, so a snapshot and a segment for the same txid
+  do collide and the live (higher-epoch) writer wins. Reads are byte-identical
+  for any store without such a conflict, which is every store that has not hit
+  this race.
+
 ## [0.2.4] - 2026-08-11
 
 ### Added

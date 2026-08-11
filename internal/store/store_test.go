@@ -4,6 +4,7 @@ import (
 	"encoding/json"
 	"errors"
 	"reflect"
+	"slices"
 	"strings"
 	"sync"
 	"testing"
@@ -332,6 +333,150 @@ func TestChainPrefersTheHigherEpochForSegments(t *testing.T) {
 				i, got[1].Epoch)
 		}
 	}
+}
+
+// TestChainPrefersALiveSegmentOverAFencedSnapshotAtTheSameTXID is the
+// regression test for a SILENT DATA-LOSS bug in resolution: a fenced writer's
+// snapshot at txid T beat the live writer's segment at T, so a committed
+// transaction disappeared with no error and no checksum failure.
+//
+// The real shape: session A holds epoch 2 and flushes a SNAPSHOT at H+1; its
+// terminal PutRef fails with an ambiguous non-CAS error, so flush deliberately
+// leaves the uploaded object behind, and A dies. Session B acquires the lease
+// (epoch 3), the settling-flush suppression clears forceSnapshot, so B's first
+// real flush writes a SEGMENT at that same H+1 and wins the ref CAS. Both
+// objects now sit at txid H+1 under different epochs.
+//
+// Pre-fix, keepHighestEpoch keyed on {MinTXID, MaxTXID} and ran SEPARATELY
+// over the snapshots and the segments: A's snapshot is (0, H+1] and B's
+// segment is (H+1, H+1], so they shared neither a key nor a slice and could
+// never collide. resolveSelf then anchored on "newest snapshot with
+// MaxTXID <= target" — A's fenced snapshot — and, because its MaxTXID equals
+// the target, returned it ALONE. B's row was gone.
+//
+// Post-fix the collapse runs once over the combined set keyed on MaxTXID, so
+// the epoch-3 segment supersedes the epoch-2 snapshot and the chain anchors on
+// the real snapshot at H instead. Asserted on exact keys, so there is no
+// ambiguity about which object was chosen.
+func TestChainPrefersALiveSegmentOverAFencedSnapshotAtTheSameTXID(t *testing.T) {
+	const head = 4 // H
+	for i := 0; i < 50; i++ {
+		s := newStore(t)
+		putObj(t, s, SnapshotKey("lin", 2, head))          // the real, live snapshot at H
+		putObj(t, s, SnapshotKey("lin", 2, head+1))        // session A's fenced orphan at H+1
+		putObj(t, s, SegmentKey("lin", 3, head+1, head+1)) // session B's live segment at H+1
+
+		got, err := s.Chain("lin", head+1)
+		if err != nil {
+			t.Fatalf("iteration %d: %v", i, err)
+		}
+		want := []string{
+			SnapshotKey("lin", 2, head),
+			SegmentKey("lin", 3, head+1, head+1),
+		}
+		gotKeys := memberKeys(got)
+		if !slices.Equal(gotKeys, want) {
+			t.Fatalf("iteration %d: chain = %v, want %v (the fenced epoch-2 snapshot at %d must never be chosen)",
+				i, gotKeys, want, head+1)
+		}
+	}
+}
+
+// TestLiveSnapshotSupersedesAFencedSegmentAtTheSameTXID is the symmetric case
+// of the bug above: the fenced writer left a SEGMENT at txid T and the live
+// writer wrote a SNAPSHOT at T. The live snapshot must win — the fenced
+// segment must not survive into the member set at all.
+//
+// This asserts on listMembers, not on Chain, deliberately. Chain cannot
+// observe this direction of the collision: resolveSelf anchors on the newest
+// snapshot with MaxTXID <= target, so a snapshot at T is preferred as the
+// anchor whether or not a stale segment at T also survived, and a segment at
+// T is skipped by the post-anchor walk (its MaxTXID <= the anchor's). The
+// fenced segment is therefore inert for today's resolver but still WRONG to
+// keep: it is a superseded writer's object sitting in the set every resolver
+// walks, one resolver change away from being applied. Asserting at the member
+// level is what gives the symmetric guarantee teeth.
+func TestLiveSnapshotSupersedesAFencedSegmentAtTheSameTXID(t *testing.T) {
+	const head = 4
+	for i := 0; i < 50; i++ {
+		s := newStore(t)
+		putObj(t, s, SnapshotKey("lin", 2, head))          // the real, live snapshot at H
+		putObj(t, s, SegmentKey("lin", 2, head+1, head+1)) // the fenced writer's segment at H+1
+		putObj(t, s, SnapshotKey("lin", 3, head+1))        // the live writer's snapshot at H+1
+
+		snapshots, segments, err := s.listMembers("lin")
+		if err != nil {
+			t.Fatalf("iteration %d: %v", i, err)
+		}
+		wantSnapshots := []string{SnapshotKey("lin", 2, head), SnapshotKey("lin", 3, head+1)}
+		if got := memberKeys(snapshots); !slices.Equal(got, wantSnapshots) {
+			t.Fatalf("iteration %d: snapshots = %v, want %v", i, got, wantSnapshots)
+		}
+		if got := memberKeys(segments); len(got) != 0 {
+			t.Fatalf("iteration %d: segments = %v, want none — the epoch-2 segment at %d was "+
+				"superseded by the epoch-3 snapshot at the same txid and must not survive",
+				i, got, head+1)
+		}
+
+		// And the chain itself is the live snapshot alone.
+		got, err := s.Chain("lin", head+1)
+		if err != nil {
+			t.Fatalf("iteration %d: %v", i, err)
+		}
+		want := []string{SnapshotKey("lin", 3, head+1)}
+		if gotKeys := memberKeys(got); !slices.Equal(gotKeys, want) {
+			t.Fatalf("iteration %d: chain = %v, want %v", i, gotKeys, want)
+		}
+	}
+}
+
+// TestAMultiTXIDSegmentNeverEvictsASnapshotAtTheSameMaxTXID pins the
+// deliberate limit on the MaxTXID collapse above.
+//
+// Collapsing a snapshot and a segment at the same MaxTXID is justified by one
+// premise: every segment this binary's writers produce is SINGLE-TXID (the
+// sole production ltxio.EncodeSegment caller passes (txid, txid)), so a
+// segment's MaxTXID identifies it as completely as its range does. A
+// MULTI-txid segment is outside that premise — no writer here can make one, so
+// it is a hand-written fixture or corruption — and its MaxTXID does NOT
+// identify it. If the collapse applied to it anyway, a stray (0, T] object at
+// any epoch above the live one would EVICT the real snapshot at T and break
+// the chain outright: a loud failure, but a whole branch bricked by an object
+// that used to be inert. ops/gc_test.go's
+// TestGCCompensatingRuleSweepsAtHeadOrphanRegardlessOfEpoch fabricates
+// exactly that key.
+//
+// So multi-txid segments keep the original {MinTXID, MaxTXID} key and never
+// collide with a snapshot — which is safe precisely because they ARE inert:
+// resolveSelf prefers a snapshot as the anchor, and the post-anchor walk skips
+// any segment whose MaxTXID is at or below the anchor's.
+func TestAMultiTXIDSegmentNeverEvictsASnapshotAtTheSameMaxTXID(t *testing.T) {
+	for i := 0; i < 50; i++ {
+		s := newStore(t)
+		putObj(t, s, SnapshotKey("lin", 1, 2))   // the live snapshot at txid 2
+		putObj(t, s, SegmentKey("lin", 2, 0, 2)) // a bogus (0, 2] object at a HIGHER epoch
+		putObj(t, s, SegmentKey("lin", 1, 3, 3)) // the live segment at txid 3
+
+		got, err := s.Chain("lin", 3)
+		if err != nil {
+			t.Fatalf("iteration %d: %v", i, err)
+		}
+		want := []string{SnapshotKey("lin", 1, 2), SegmentKey("lin", 1, 3, 3)}
+		if gotKeys := memberKeys(got); !slices.Equal(gotKeys, want) {
+			t.Fatalf("iteration %d: chain = %v, want %v — a multi-txid segment must never "+
+				"evict the snapshot at its MaxTXID", i, gotKeys, want)
+		}
+	}
+}
+
+// memberKeys projects a resolved chain to its object keys, so a chain
+// assertion names the exact objects rather than a shape.
+func memberKeys(members []ChainMember) []string {
+	keys := make([]string, 0, len(members))
+	for _, m := range members {
+		keys = append(keys, m.Key)
+	}
+	return keys
 }
 
 func TestRefTTLFieldsRoundTripAndOldRefsDecode(t *testing.T) {
