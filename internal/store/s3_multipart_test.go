@@ -8,6 +8,7 @@ import (
 	"net/http"
 	"os"
 	"path/filepath"
+	"sync"
 	"testing"
 	"time"
 
@@ -200,11 +201,13 @@ func TestS3PutReaderIfMultipartSeekedReaderAt(t *testing.T) {
 // TestS3PutReaderIfMultipartCASParity pins that CAS semantics are
 // indistinguishable between the single-PUT and multipart paths — the same
 // create-only and never-written-key cases storetest.RunConformance already
-// pins for the single-PUT path (see conformance.go's ReaderPutter subtest)
-// — AND that a losing CAS race still aborts the multipart upload it made:
-// this is the highest-frequency real leak path (every retried, losing
-// writer uploads a full object's worth of parts before losing the
-// Complete), so each ErrCAS assertion below is paired with an abort check.
+// pins for the single-PUT path (see conformance.go's ReaderPutter subtest).
+// Since the INFO-1 preflight, the create-only conflict fails FAST (a
+// HeadObject sees the existing key before any multipart RPC — see
+// TestS3PutReaderIfMultipartCreateOnlyPreflightExistingKey for the full
+// zero-RPC pin); the ifMatch CAS conflict still pays the full upload and
+// must abort it — the highest-frequency real leak path, so its ErrCAS
+// assertion is paired with an abort check.
 func TestS3PutReaderIfMultipartCASParity(t *testing.T) {
 	smallMultipartSettings(t)
 
@@ -220,31 +223,161 @@ func TestS3PutReaderIfMultipartCASParity(t *testing.T) {
 	}
 
 	// A second create-only (ifMatch == "") write to the SAME key must
-	// conflict — key already exists — and MUST abort its multipart upload:
-	// every part of `second` was already uploaded by the time Complete is
-	// rejected.
+	// conflict — key already exists. Since the INFO-1 preflight it fails
+	// FAST: HeadObject sees the existing key before CreateMultipartUpload
+	// ever runs, so no upload exists to abort and no counters move. (The
+	// race variant — key created only AFTER the preflight passed — still
+	// pays the full upload and aborts at Complete;
+	// TestS3PutReaderIfMultipartPreflightRaceStillCAS pins that.)
 	second := multipartPayload()
 	if _, err := rp.PutReaderIf("data/x/cas.ltx", bytes.NewReader(second), int64(len(second)), ""); !errors.Is(err, store.ErrCAS) {
 		t.Fatalf("second create-only multipart write to an existing key: got %v, want store.ErrCAS", err)
 	}
-	if _, _, completes, aborts := f.MultipartStats(); completes != 1 || aborts != 1 {
-		t.Fatalf("after the losing create-only write: completes=%d aborts=%d, want completes=1 (unchanged) aborts=1", completes, aborts)
-	}
-	if pending := f.PendingMultipartUploads(); pending != 0 {
-		t.Fatalf("PendingMultipartUploads = %d after a losing create-only CAS, want 0", pending)
+	if creates, _, completes, aborts := f.MultipartStats(); creates != 1 || completes != 1 || aborts != 0 {
+		t.Fatalf("after the losing create-only write: creates=%d completes=%d aborts=%d, want 1/1/0 unchanged (preflight short-circuits before any multipart RPC)",
+			creates, completes, aborts)
 	}
 
 	// A CAS (ifMatch != "") write against a key that was never written must
-	// also conflict — nothing to compare against — and also abort.
+	// also conflict — nothing to compare against — and MUST abort the
+	// multipart upload it made: this path is deliberately not preflighted
+	// (it wants the real etag comparison at Complete), so every part of
+	// `third` was already uploaded by the time Complete rejects it.
 	third := multipartPayload()
 	if _, err := rp.PutReaderIf("data/x/cas-never-written.ltx", bytes.NewReader(third), int64(len(third)), "some-etag"); !errors.Is(err, store.ErrCAS) {
 		t.Fatalf("multipart CAS write against a never-written key: got %v, want store.ErrCAS", err)
 	}
-	if _, _, completes, aborts := f.MultipartStats(); completes != 1 || aborts != 2 {
-		t.Fatalf("after the never-written-key CAS: completes=%d aborts=%d, want completes=1 (unchanged) aborts=2", completes, aborts)
+	if _, _, completes, aborts := f.MultipartStats(); completes != 1 || aborts != 1 {
+		t.Fatalf("after the never-written-key CAS: completes=%d aborts=%d, want completes=1 (unchanged) aborts=1", completes, aborts)
 	}
 	if pending := f.PendingMultipartUploads(); pending != 0 {
 		t.Fatalf("PendingMultipartUploads = %d after a never-written-key CAS, want 0", pending)
+	}
+}
+
+// TestS3PutReaderIfMultipartCreateOnlyPreflightExistingKey pins security
+// audit 2's INFO-1 fix at its happy path: a create-only (ifMatch == "")
+// multipart write to a key that ALREADY exists — flush.go's
+// crashed-prior-attempt orphan, the production case — must fail with
+// store.ErrCAS from the HeadObject preflight alone, before any multipart
+// RPC at all: zero creates, zero parts uploaded (previously the full >5
+// GiB of parts transferred before Complete's IfNoneMatch rejected them),
+// zero aborts (there is no upload to abort), and the existing object
+// untouched.
+func TestS3PutReaderIfMultipartCreateOnlyPreflightExistingKey(t *testing.T) {
+	smallMultipartSettings(t)
+
+	b, f := newFakeBackedWithFake(t)
+	rp := b.(store.ReaderPutter)
+
+	const key = "data/x/orphan.ltx"
+	orphan := []byte("orphan from a crashed prior attempt")
+	f.Seed(key, orphan)
+
+	payload := multipartPayload()
+	if _, err := rp.PutReaderIf(key, bytes.NewReader(payload), int64(len(payload)), ""); !errors.Is(err, store.ErrCAS) {
+		t.Fatalf("create-only multipart write to an existing key: got %v, want store.ErrCAS", err)
+	}
+
+	creates, uploadParts, completes, aborts := f.MultipartStats()
+	if creates != 0 || uploadParts != 0 || completes != 0 || aborts != 0 {
+		t.Fatalf("MultipartStats = creates=%d uploadParts=%d completes=%d aborts=%d, want all 0 "+
+			"(the preflight must fail fast before a single multipart RPC or byte of transfer)",
+			creates, uploadParts, completes, aborts)
+	}
+	if got, _, gerr := b.Get(key); gerr != nil || !bytes.Equal(got, orphan) {
+		t.Fatalf("the existing object must be untouched: got %q, err %v, want %q", got, gerr, orphan)
+	}
+}
+
+// TestS3PutReaderIfMultipartPreflightHeadErrorStillUploads pins the
+// preflight's best-effort contract: a HeadObject ERROR (here an injected
+// 500; a network blip or 403 in production) must NOT fail the write — the
+// preflight is an optimization only, so the upload falls through to the
+// normal multipart path, whose Complete-side condition (authoritative)
+// then admits the create cleanly.
+func TestS3PutReaderIfMultipartPreflightHeadErrorStillUploads(t *testing.T) {
+	smallMultipartSettings(t)
+
+	b, f := newFakeBackedWithFake(t)
+	rp := b.(store.ReaderPutter)
+
+	const key = "data/x/head-fault.ltx"
+	f.SetFault(func(method, k string) (int, bool) {
+		if method == http.MethodHead && k == key {
+			return 500, true
+		}
+		return 0, false
+	})
+
+	payload := multipartPayload()
+	if _, err := rp.PutReaderIf(key, bytes.NewReader(payload), int64(len(payload)), ""); err != nil {
+		t.Fatalf("a preflight Head error must fall through to a normal upload, got %v", err)
+	}
+
+	got, _, err := b.Get(key)
+	if err != nil || !bytes.Equal(got, payload) {
+		t.Fatalf("Get after Head-faulted multipart PutReaderIf: got %d bytes, want %d bytes equal, err %v",
+			len(got), len(payload), err)
+	}
+	if creates, _, completes, _ := f.MultipartStats(); creates != 1 || completes != 1 {
+		t.Fatalf("MultipartStats: creates=%d completes=%d, want 1/1 (the upload must have proceeded normally)", creates, completes)
+	}
+}
+
+// seedOnFirstRead wraps an io.Reader so its FIRST Read seeds a key into
+// the fake — deterministically "creating" the object AFTER putMultipart's
+// HeadObject preflight (which runs before any byte of r is consumed) but
+// BEFORE CompleteMultipartUpload (which cannot run until every part, and
+// therefore every Read, has finished). It deliberately exposes neither
+// io.ReaderAt nor io.Seeker (same shape as onlyReader), so the upload
+// takes the sequential fallback; the race semantics under test don't
+// depend on which part-sourcing path runs.
+type seedOnFirstRead struct {
+	r    io.Reader
+	once sync.Once
+	seed func()
+}
+
+func (s *seedOnFirstRead) Read(p []byte) (int, error) {
+	s.once.Do(s.seed)
+	return s.r.Read(p)
+}
+
+// TestS3PutReaderIfMultipartPreflightRaceStillCAS pins the preflight's
+// race window: the preflight Head sees the key ABSENT, then the key is
+// created before CompleteMultipartUpload runs (seedOnFirstRead makes that
+// interleaving deterministic, not a timing gamble). Complete's IfNoneMatch
+// condition — the authoritative one — must still reject the write with
+// store.ErrCAS, the upload must abort (the full price of the race, exactly
+// as before the preflight existed), and the interloping object must
+// survive untouched.
+func TestS3PutReaderIfMultipartPreflightRaceStillCAS(t *testing.T) {
+	smallMultipartSettings(t)
+
+	b, f := newFakeBackedWithFake(t)
+	rp := b.(store.ReaderPutter)
+
+	const key = "data/x/race.ltx"
+	interloper := []byte("written between the preflight Head and Complete")
+	payload := multipartPayload()
+	r := &seedOnFirstRead{r: bytes.NewReader(payload), seed: func() { f.Seed(key, interloper) }}
+
+	if _, err := rp.PutReaderIf(key, r, int64(len(payload)), ""); !errors.Is(err, store.ErrCAS) {
+		t.Fatalf("key created between Head and Complete: got %v, want store.ErrCAS from Complete's condition", err)
+	}
+
+	creates, _, completes, aborts := f.MultipartStats()
+	if creates != 1 || completes != 0 || aborts != 1 {
+		t.Fatalf("MultipartStats: creates=%d completes=%d aborts=%d, want 1/0/1 "+
+			"(the race passes the preflight, uploads, loses at Complete, and must still abort)",
+			creates, completes, aborts)
+	}
+	if pending := f.PendingMultipartUploads(); pending != 0 {
+		t.Fatalf("PendingMultipartUploads = %d after the lost race, want 0", pending)
+	}
+	if got, _, gerr := b.Get(key); gerr != nil || !bytes.Equal(got, interloper) {
+		t.Fatalf("the interloping object must be untouched: got %q, err %v, want %q", got, gerr, interloper)
 	}
 }
 
