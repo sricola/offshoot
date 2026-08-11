@@ -13,6 +13,8 @@ version if you depend on format stability.
 
 ## [Unreleased]
 
+## [0.2.4] - 2026-08-11
+
 ### Added
 
 - **S3 multipart uploads now upload parts concurrently.** `store.S3`'s
