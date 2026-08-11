@@ -306,8 +306,7 @@ tighter (falls back to materializing sooner) if the daemon runs a higher N.
 `N` can be any value `>= 1` (`-snapshot-every`'s only floor), so either
 direction is possible depending on how a given daemon is tuned. There's no
 mechanism today for the CLI to learn a daemon's flag, since it isn't
-persisted anywhere the CLI
-could read it.
+persisted anywhere the CLI could read it.
 
 Destroying a parent remains **instant and always allowed** — but under
 sharing, the parent's *bytes* can outlive its ref: they are reclaimed by

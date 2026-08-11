@@ -10,8 +10,8 @@ import (
 )
 
 // This file pins store.S3.putMultipart's concurrent-part-upload path (see
-// s3.go's multipartConcurrency and concurrentPartUpload): parts really do
-// upload in parallel on the io.ReaderAt path (bounded by
+// s3_multipart.go's multipartConcurrency and concurrentPartUpload): parts
+// really do upload in parallel on the io.ReaderAt path (bounded by
 // multipartConcurrency), concurrency=1 stays a deterministic regression
 // case, out-of-order completions still land in an ordered CompletedPart
 // list, the abort-on-failure guarantee survives concurrency, and the
@@ -184,8 +184,9 @@ func TestS3PutReaderIfMultipartConcurrentAbortsOnFailure(t *testing.T) {
 // TestS3PutReaderIfMultipartNonReaderAtFallbackStaysSequential pins the
 // HARD CONSTRAINT that concurrency is ONLY safe on the io.ReaderAt path:
 // even with multipartConcurrency raised well above 1, a source that is
-// NEITHER io.ReaderAt NOR io.Seeker (storetest's onlyReader, same as
-// TestS3PutReaderIfMultipartNonReaderAtFallback in s3_multipart_test.go)
+// NEITHER io.ReaderAt NOR io.Seeker (onlyReader, defined in package
+// store_test's s3_multipart_test.go — not in storetest — same as
+// TestS3PutReaderIfMultipartNonReaderAtFallback)
 // must still upload its parts one at a time — it shares one reused buffer
 // and reads r strictly in order, so concurrent access would race the
 // buffer and read r out of order. MaxPartsInFlight staying at exactly 1

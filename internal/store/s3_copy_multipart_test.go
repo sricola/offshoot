@@ -9,8 +9,8 @@ import (
 )
 
 // This file pins store.S3.CopyObject's multipart UploadPartCopy path (see
-// s3.go's copyObjectMultipart): a source over copyObjectMaxBytes copies
-// server-side via multipart instead of returning ErrCopyUnsupported, a
+// s3_multipart.go's copyObjectMultipart): a source over copyObjectMaxBytes
+// copies server-side via multipart instead of returning ErrCopyUnsupported, a
 // source under it is unaffected (still the single-request path), and the
 // same abort-on-every-error-path discipline putMultipart established
 // covers a failed multipart copy too. See s3_test.go's
