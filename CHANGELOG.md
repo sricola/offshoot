@@ -15,11 +15,36 @@ version if you depend on format stability.
 
 ### Changed
 
+- Create-only multipart uploads (a `PutReaderIf` with no etag — in practice
+  a >5 GiB snapshot flush) now issue a best-effort `HeadObject` preflight
+  and fail fast with `ErrCAS` when the key already exists, instead of
+  uploading every part only to have `CompleteMultipartUpload`'s condition
+  reject them after the full transfer. The preflight is an optimization
+  only: any Head error (network, 403) falls through to the normal upload,
+  and Complete's `IfNoneMatch` condition remains authoritative for a key
+  created in the Head-to-Complete race window. The etag-CAS path and the
+  below-threshold single-PUT path are unchanged.
 - Internal: `store.S3`'s multipart machinery moved from `s3.go` into a new
   `internal/store/s3_multipart.go`, and its repeated mechanical fragments
   (abort defer, `CompletedPart` checksum carry, part-length clamp, the
   fake's XML error writes, the tests' fault-injection closure) were
   deduplicated into helpers. No behavior change.
+
+### Fixed
+
+- **A stalled S3 response can no longer wedge flush — and with it daemon
+  shutdown — forever.** The S3 client's HTTP transport now applies a
+  60-second response-header timeout to EVERY S3 call (Get/Put/List
+  included, not just multipart): it bounds only how long a call waits for
+  a response to begin, never the body transfer, so a slow-but-progressing
+  large download or upload is never affected. On top of that, each
+  individual multipart RPC (part upload/copy, create, complete, and the
+  new preflight above) runs under its own 15-minute deadline — sized to a
+  worst-case ~550 MiB part at a pessimistic throughput floor — and the
+  cleanup `AbortMultipartUpload` under a 1-minute one, so a response that
+  begins and then stalls mid-transfer fails the flush (which then retries
+  normally) instead of blocking an `UploadPart` forever while holding the
+  flush lock, which hung every later `Flush` and `Session.Close`.
 
 ## [0.2.5] - 2026-08-11
 
