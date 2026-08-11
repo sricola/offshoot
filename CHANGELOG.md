@@ -13,6 +13,8 @@ version if you depend on format stability.
 
 ## [Unreleased]
 
+## [0.2.6] - 2026-08-11
+
 ### Changed
 
 - Create-only multipart uploads (a `PutReaderIf` with no etag — in practice
