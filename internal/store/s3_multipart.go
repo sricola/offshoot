@@ -227,7 +227,11 @@ func completedPart(partNum int32, c partChecksums) types.CompletedPart {
 // the collected parts in PartNumber order. It is the shared implementation
 // behind PutReader (conditional == false) and PutReaderIf (conditional ==
 // true, ifMatch translated to IfNoneMatch/IfMatch on the Complete call
-// exactly as PutReaderIf's doc comment describes).
+// exactly as PutReaderIf's doc comment describes). The conditional
+// create-only case additionally issues a best-effort HeadObject preflight
+// before creating the upload, to fail an already-exists conflict fast
+// instead of after the full transfer — see the preflight comment in the
+// body for its exact (deliberately non-load-bearing) semantics.
 //
 // COST-CRITICAL: an abandoned multipart upload leaves its already-uploaded
 // parts stored (and billed) on S3 indefinitely — S3 does not garbage-collect
@@ -283,6 +287,38 @@ func (s *S3) putMultipart(key string, r io.Reader, size int64, ifMatch string, c
 	// context, so no single stalled response can wedge the upload (security
 	// audit 2, LOW-1 — see multipartRPCTimeout's doc comment).
 	ctx := context.Background()
+
+	// Fail-fast preflight for the create-only case (security audit 2,
+	// INFO-1): a create-only (ifMatch == "") multipart write whose key
+	// already exists — flush.go's crashed-prior-attempt orphan is the
+	// production case — would otherwise upload EVERY part (>5 GiB of
+	// transfer, since only above-threshold objects reach this method)
+	// before CompleteMultipartUpload's IfNoneMatch condition rejects it.
+	// A cheap HeadObject first returns the same ErrCAS with zero bytes
+	// uploaded. Strictly an optimization, never load-bearing:
+	//   - Complete's condition below remains authoritative — a key created
+	//     between this Head and the Complete (the unavoidable race window)
+	//     still ends in ErrCAS there, exactly as before.
+	//   - ANY Head error falls through to the normal upload: 404 is the
+	//     expected "key absent" answer, and a transient/permission error
+	//     (network, 403) must not fail a write that Complete's condition
+	//     would have adjudicated correctly anyway — best-effort only.
+	//   - The ifMatch != "" CAS path is deliberately NOT preflighted: it
+	//     wants the real etag comparison at Complete, which a Head
+	//     existence check cannot stand in for.
+	if conditional && ifMatch == "" {
+		hctx, hcancel := context.WithTimeout(ctx, multipartRPCTimeout)
+		_, herr := s.cl.HeadObject(hctx, &s3.HeadObjectInput{
+			Bucket: aws.String(s.bucket), Key: aws.String(fk),
+		})
+		hcancel()
+		if herr == nil {
+			// Same error shape as Complete's precondition rejection below,
+			// so callers cannot tell (and must not care) which layer failed
+			// the compare.
+			return "", fmt.Errorf("%w: %s", ErrCAS, key)
+		}
+	}
 
 	crctx, crcancel := context.WithTimeout(ctx, multipartRPCTimeout)
 	created, err := s.cl.CreateMultipartUpload(crctx, &s3.CreateMultipartUploadInput{
