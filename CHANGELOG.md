@@ -13,6 +13,8 @@ version if you depend on format stability.
 
 ## [Unreleased]
 
+## [0.2.7] - 2026-08-11
+
 ### Fixed
 
 - **Every single-shot S3 call is now bounded too — a backend that stalls
