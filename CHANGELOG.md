@@ -13,6 +13,8 @@ version if you depend on format stability.
 
 ## [Unreleased]
 
+## [0.2.5] - 2026-08-11
+
 ### Fixed
 
 - **Silent data loss when a fenced writer's snapshot shared a txid with the
