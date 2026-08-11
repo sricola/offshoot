@@ -81,6 +81,17 @@ type FakeS3 struct {
 	partDelayMu sync.Mutex
 	partDelays  map[int32]time.Duration
 
+	// partHoldMu and friends implement "hold this PartNumber's UploadPart
+	// until N UploadPart requests have fully COMPLETED" — see
+	// HoldPartUntilCompletions. Also guarded independently of f.mu, for
+	// the same reason as the gate above: the completions a held part waits
+	// for can only happen if other part requests can still take f.mu.
+	partHoldMu       sync.Mutex
+	partHolds        map[int32]int
+	partsCompleted   int
+	partCompletedCh  chan struct{}
+	partHoldTimedOut bool
+
 	// partTrackMu/partsInFlight/maxPartsInFlight record how many UploadPart
 	// requests are simultaneously "arrived but not yet fully handled" —
 	// see MaxPartsInFlight.
@@ -238,6 +249,86 @@ func (f *FakeS3) partDelay(partNumber int32) time.Duration {
 	return f.partDelays[partNumber]
 }
 
+// HoldPartUntilCompletions makes the UploadPart request for partNumber
+// block until n UploadPart requests have fully COMPLETED — their handlers
+// finished and this fake's state lock released, not merely arrived, which
+// is what ArmPartGate's rendezvous observes. A test uses this to FORCE
+// out-of-order completion deterministically: hold part 1 until parts 2
+// and 3 have completed, and part 1's response cannot be served before
+// theirs no matter how slow the machine or scheduler is — unlike a fixed
+// delay, which merely makes in-order completion unlikely and silently
+// stops exercising anything on a machine slower than the delay. The wait
+// is bounded by partGateTimeout so a regression that serializes parts
+// (part 1 held while parts 2 and 3 can never even be issued) turns into
+// an ordinary test failure — visible via PartHoldTimedOut — instead of a
+// hung test run. Call before the upload the hold targets begins.
+func (f *FakeS3) HoldPartUntilCompletions(partNumber int32, n int) {
+	f.partHoldMu.Lock()
+	defer f.partHoldMu.Unlock()
+	if f.partHolds == nil {
+		f.partHolds = map[int32]int{}
+	}
+	f.partHolds[partNumber] = n
+	if f.partCompletedCh == nil {
+		f.partCompletedCh = make(chan struct{})
+	}
+}
+
+// PartHoldTimedOut reports whether any hold installed by
+// HoldPartUntilCompletions gave up waiting (after partGateTimeout)
+// instead of being released by real completions. A test asserts this is
+// false to prove the ordering it relied on was actually exercised, not
+// waved through by the timeout escape hatch.
+func (f *FakeS3) PartHoldTimedOut() bool {
+	f.partHoldMu.Lock()
+	defer f.partHoldMu.Unlock()
+	return f.partHoldTimedOut
+}
+
+// awaitPartHold blocks the calling UploadPart request per any hold
+// installed for its part number (a no-op otherwise). Like awaitPartGate,
+// it MUST be called BEFORE f.mu is acquired — see partHoldMu's field doc
+// comment.
+func (f *FakeS3) awaitPartHold(partNumber int32) {
+	f.partHoldMu.Lock()
+	need, ok := f.partHolds[partNumber]
+	if !ok {
+		f.partHoldMu.Unlock()
+		return
+	}
+	timeout := time.After(partGateTimeout)
+	for f.partsCompleted < need {
+		ch := f.partCompletedCh
+		f.partHoldMu.Unlock()
+		select {
+		case <-ch: // a part completed; re-check the count
+		case <-timeout:
+			f.partHoldMu.Lock()
+			f.partHoldTimedOut = true
+			f.partHoldMu.Unlock()
+			return
+		}
+		f.partHoldMu.Lock()
+	}
+	f.partHoldMu.Unlock()
+}
+
+// signalPartCompleted records one UploadPart request as fully completed
+// and wakes every awaitPartHold waiter to re-check its target count. It
+// runs as a defer registered BEFORE f.mu is acquired in handle(), so —
+// deferred calls running last-in-first-out — it fires AFTER the deferred
+// f.mu.Unlock: "completed" genuinely means the handler finished and
+// released the fake's state, not "response headers started".
+func (f *FakeS3) signalPartCompleted() {
+	f.partHoldMu.Lock()
+	defer f.partHoldMu.Unlock()
+	f.partsCompleted++
+	if f.partCompletedCh != nil {
+		close(f.partCompletedCh)
+		f.partCompletedCh = make(chan struct{})
+	}
+}
+
 // MaxPartsInFlight returns the highest number of UploadPart requests this
 // fake has ever observed simultaneously in flight (arrived but not yet
 // fully handled) since it was created. A test asserts this stays 1 for the
@@ -387,9 +478,13 @@ func (f *FakeS3) handle(w http.ResponseWriter, r *http.Request) {
 		if q.Get("partNumber") != "" && q.Get("uploadId") != "" && r.Header.Get("X-Amz-Copy-Source") == "" {
 			piw := &partInFlightWriter{ResponseWriter: w, untrack: f.trackPartInFlight()}
 			defer piw.untrackOnce() // safety net: guarantees untrack runs even if nothing is ever written
+			// Registered before f.mu's deferred Unlock below, so (LIFO) it
+			// fires after it — see signalPartCompleted's doc comment.
+			defer f.signalPartCompleted()
 			w = piw
 			f.awaitPartGate()
 			if n, err := strconv.Atoi(q.Get("partNumber")); err == nil {
+				f.awaitPartHold(int32(n))
 				if d := f.partDelay(int32(n)); d > 0 {
 					time.Sleep(d)
 				}

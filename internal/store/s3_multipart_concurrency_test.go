@@ -4,7 +4,6 @@ import (
 	"bytes"
 	"errors"
 	"testing"
-	"time"
 
 	"github.com/sricola/offshoot/internal/store"
 )
@@ -102,14 +101,19 @@ func TestS3PutReaderIfMultipartConcurrency1(t *testing.T) {
 
 // TestS3PutReaderIfMultipartOutOfOrderCompletion proves ordering is
 // reconstructed from each part's OWN PartNumber, not from completion order:
-// it delays part 1's UploadPart response (storetest.FakeS3.SetPartDelay) so
-// parts 2 and 3 — uploaded concurrently — finish first, then asserts the
-// resulting object is byte-identical to the source. If
-// concurrentPartUpload instead built parts in completion order (e.g. via a
-// plain append under a mutex, rather than writing into
-// parts[partNum-1]), this would produce a shuffled/corrupted object, not a
-// clean byte mismatch — the assertion below would still catch it either
-// way, but the corruption framing is the point being pinned.
+// the fake HOLDS part 1's UploadPart (storetest.FakeS3.
+// HoldPartUntilCompletions) until parts 2 and 3 — uploaded concurrently —
+// have fully COMPLETED, then releases it, so the CompletedPart list is
+// GUARANTEED to be assembled out of order on every run and every machine
+// (the earlier version merely delayed part 1 by 200ms and hoped parts 2
+// and 3 finished first — on a slow machine it silently passed without
+// exercising out-of-order reconstruction at all; PartHoldTimedOut below
+// closes that silent-pass hole). If concurrentPartUpload instead built
+// parts in completion order (e.g. via a plain append under a mutex,
+// rather than writing into parts[partNum-1]), this would produce a
+// shuffled/corrupted object, not a clean byte mismatch — the assertion
+// below would still catch it either way, but the corruption framing is
+// the point being pinned.
 func TestS3PutReaderIfMultipartOutOfOrderCompletion(t *testing.T) {
 	smallMultipartSettings(t)
 	t.Cleanup(store.SetMultipartConcurrencyForTest(3))
@@ -118,7 +122,7 @@ func TestS3PutReaderIfMultipartOutOfOrderCompletion(t *testing.T) {
 	rp := b.(store.ReaderPutter)
 
 	payload := multipartPayload() // 3 parts
-	f.SetPartDelay(1, 200*time.Millisecond)
+	f.HoldPartUntilCompletions(1, 2)
 
 	etag, err := rp.PutReaderIf("data/x/outoforder.ltx", bytes.NewReader(payload), int64(len(payload)), "")
 	if err != nil {
@@ -127,11 +131,15 @@ func TestS3PutReaderIfMultipartOutOfOrderCompletion(t *testing.T) {
 	if etag == "" {
 		t.Error("PutReaderIf must return a non-empty etag")
 	}
+	if f.PartHoldTimedOut() {
+		t.Fatal("the part-1 hold timed out instead of being released by parts 2 and 3 completing — " +
+			"parts did not genuinely overlap, so out-of-order completion was never exercised")
+	}
 
 	got, _, err := b.Get("data/x/outoforder.ltx")
 	if err != nil || !bytes.Equal(got, payload) {
 		t.Fatalf("Get after out-of-order multipart completion: got %d bytes, want %d bytes equal, err %v "+
-			"(part 1 finished LAST but must still land first in the CompletedPart list)",
+			"(part 1 completed LAST — guaranteed by the hold — but must still land first in the CompletedPart list)",
 			len(got), len(payload), err)
 	}
 }
