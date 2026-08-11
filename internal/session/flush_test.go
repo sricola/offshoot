@@ -10,6 +10,7 @@ import (
 	"os"
 	"os/exec"
 	"path/filepath"
+	"slices"
 	"strings"
 	"sync"
 	"sync/atomic"
@@ -2274,5 +2275,164 @@ func TestSnapshotFlushFallsBackToBufferedWithoutReaderPutter(t *testing.T) {
 	}
 	if m, _ := filepath.Glob(filepath.Join(s.dir, "flush-encode-*.ltx")); len(m) != 0 {
 		t.Fatalf("encode-output scratch must never be created on the fallback (no ReaderPutter) path, found %v", m)
+	}
+}
+
+// TestFencedSnapshotOrphanDoesNotShadowTheNextSessionsSegment is the
+// end-to-end reproduction of a SILENT DATA-LOSS bug in chain resolution,
+// driven through two real sessions rather than hand-placed objects.
+//
+// Session A (epoch 1) writes its first real flush as a SNAPSHOT at txid 2.
+// Its terminal PutRef fails with an injected ambiguous non-CAS error, so
+// Flush deliberately leaves the uploaded snapshot behind (see
+// TestFlushDoesNotDeleteSnapshotOnNonCASRefFailure — deleting it would be the
+// worse bug), and A dies without ever advancing the ref.
+//
+// Session B reclaims A's expired lease at epoch 2. Its checkout is
+// materialized fresh against head (still txid 1), so it is clean at open and
+// the settling-flush suppression leaves forceSnapshot clear — its first real
+// flush is a SEGMENT at that same txid 2 (the shape
+// TestCleanAtOpenSessionsFirstRealFlushIsASegment pins), and it wins the ref
+// CAS. Two objects now sit at txid 2: A's fenced epoch-1 snapshot and B's
+// live epoch-2 segment.
+//
+// Before the fix, store.keepHighestEpoch keyed on {MinTXID, MaxTXID} and ran
+// separately over the snapshots and the segments, so A's (0, 2] snapshot and
+// B's (2, 2] segment shared neither a key nor a slice and could never
+// collide. Resolution anchored on A's snapshot — the newest snapshot with
+// MaxTXID <= target — and returned it ALONE, serving the DEAD writer's whole
+// database and silently dropping B's committed transaction. The two writers
+// insert distinguishable rows, so the read below reports exactly which
+// writer's timeline was served.
+func TestFencedSnapshotOrphanDoesNotShadowTheNextSessionsSegment(t *testing.T) {
+	testutil.RequireSQLite3(t)
+	w := newWS(t)
+	if err := w.Create("app"); err != nil {
+		t.Fatal(err)
+	}
+	ref0, _, err := w.Store.GetRef("app", "main")
+	if err != nil {
+		t.Fatal(err)
+	}
+	lineage, head := ref0.Lineage, ref0.HeadTXID
+	// Create's own snapshot at head, written under the pre-session epoch: the
+	// anchor the chain must fall back to once A's orphan stops shadowing it.
+	headSnapKey := store.SnapshotKey(lineage, ref0.Epoch, head)
+
+	// --- Session A: uploads a snapshot at head+1, then dies mid-commit.
+	// A nanosecond lease TTL makes A's lease immediately reclaimable, which
+	// is what lets B take the branch over the way it would after a crash.
+	a, err := Open(context.Background(), Options{WS: w, DB: "app", Branch: "main",
+		Holder: "session-a", LeaseTTL: time.Nanosecond})
+	if err != nil {
+		t.Fatal(err)
+	}
+	epochA := a.Lease().Epoch
+	mustExec(t, a.CheckoutPath(), "CREATE TABLE t (v); INSERT INTO t VALUES ('session-a');")
+	waitFor(t, 10*time.Second, "session A's write to reach the replica", func() bool {
+		out, err := exec.Command("sqlite3", a.ReplicaPath(), "SELECT count(*) FROM t;").Output()
+		return err == nil && string(out) == "1\n"
+	})
+
+	orig := w.Store.B
+	w.Store.B = failRefPutIf{orig}
+	if _, err := a.Flush("", nil); err == nil {
+		t.Fatal("session A's flush must fail when its ref write fails")
+	} else if errors.Is(err, store.ErrCAS) {
+		t.Fatalf("the injected failure must be ambiguous (non-CAS), got: %v", err)
+	}
+	// A dies. Close under the still-failing backend so nothing it does lands:
+	// its retry flush fails exactly like the one above, and it cannot release
+	// its (already expired) lease either. The error is the point.
+	_ = a.Close()
+	w.Store.B = orig
+
+	orphanKey := store.SnapshotKey(lineage, epochA, head+1)
+	if data, _, err := w.Store.B.Get(orphanKey); err != nil || len(data) == 0 {
+		t.Fatalf("session A's orphan snapshot at %s must survive its ambiguous ref failure: err=%v",
+			orphanKey, err)
+	}
+	if r, _, err := w.Store.GetRef("app", "main"); err != nil || r.HeadTXID != head {
+		t.Fatalf("session A must not have advanced head: head=%d err=%v", r.HeadTXID, err)
+	}
+
+	// --- Session B: takes over the branch on a checkout materialized fresh
+	// against head, so it is clean at open and its first real flush is a
+	// SEGMENT at the very txid A's orphan occupies.
+	if err := os.RemoveAll(filepath.Join(w.Root, "checkouts")); err != nil {
+		t.Fatal(err)
+	}
+	w2, err := ops.Open(w.Spec)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := w2.Checkout("app", "main"); err != nil {
+		t.Fatal(err)
+	}
+	b, err := Open(context.Background(), Options{WS: w2, DB: "app", Branch: "main",
+		Holder: "session-b"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !b.cleanAtOpen {
+		t.Fatal("session B must be clean at open for its first real flush to be a segment")
+	}
+	waitFor(t, 10*time.Second, "session B's suppressed startup rebase to settle", func() bool {
+		return !b.autoFlushPending()
+	})
+	epochB := b.Lease().Epoch
+	if epochB <= epochA {
+		t.Fatalf("session B must hold a higher epoch than A: %d <= %d", epochB, epochA)
+	}
+	mustExec(t, b.CheckoutPath(), "CREATE TABLE t (v); INSERT INTO t VALUES ('session-b');")
+	txid, err := b.Flush("", nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if txid != head+1 {
+		t.Fatalf("session B flushed txid %d, want %d (the txid A's orphan occupies)", txid, head+1)
+	}
+	segKey := store.SegmentKey(lineage, epochB, txid, txid)
+	if data, _, err := w2.Store.B.Get(segKey); err != nil || len(data) == 0 {
+		t.Fatalf("session B's first real flush must be a SEGMENT at %s: err=%v", segKey, err)
+	}
+
+	// The chain at that txid must be the real snapshot at head plus B's
+	// segment — never A's orphan snapshot alone.
+	got, err := w2.Store.Chain(lineage, txid)
+	if err != nil {
+		t.Fatal(err)
+	}
+	var gotKeys []string
+	for _, m := range got {
+		gotKeys = append(gotKeys, m.Key)
+	}
+	want := []string{headSnapKey, segKey}
+	if !slices.Equal(gotKeys, want) {
+		t.Fatalf("chain at txid %d = %v, want %v (%s is the dead writer's orphan)",
+			txid, gotKeys, want, orphanKey)
+	}
+
+	// And the end-to-end read: a fresh materialization must show B's row,
+	// not the dead writer's.
+	if err := b.Close(); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.RemoveAll(filepath.Join(w.Root, "checkouts")); err != nil {
+		t.Fatal(err)
+	}
+	w3, err := ops.Open(w.Spec)
+	if err != nil {
+		t.Fatal(err)
+	}
+	path, err := w3.Checkout("app", "main")
+	if err != nil {
+		t.Fatal(err)
+	}
+	out, err := exec.Command("sqlite3", path, "SELECT v FROM t;").Output()
+	if err != nil || string(out) != "session-b\n" {
+		t.Fatalf("read after the takeover = %q err=%v, want \"session-b\\n\" — "+
+			"%q means the fenced writer's snapshot at txid %d shadowed B's committed segment",
+			out, err, out, txid)
 	}
 }

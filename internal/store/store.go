@@ -53,9 +53,9 @@ type Ref struct {
 	// Epoch identifies a lineage's current writer generation. AcquireLease
 	// bumps it on every fresh acquisition (and on reclaim of a dead lease —
 	// see lease.go), fencing out whatever a superseded holder might still
-	// write: chain resolution collapses same-range members down to the
-	// highest epoch (keepHighestEpoch), so a fenced writer's stragglers
-	// lose deterministically.
+	// write: chain resolution collapses members establishing state at the
+	// same TXID down to the highest epoch (keepHighestEpoch), so a fenced
+	// writer's stragglers lose deterministically.
 	Epoch       uint64                `json:"epoch"`
 	HeadTXID    uint64                `json:"head_txid"`
 	HeadEpoch   uint64                `json:"head_epoch"`
@@ -494,24 +494,100 @@ func ParseMemberKey(key string) (ChainMember, bool) {
 	}
 }
 
-// keepHighestEpoch collapses members covering an identical TXID range down to
-// the one written under the highest epoch. A lower-epoch duplicate is an
-// orphan left by a writer that was fenced before its ref write landed, so it
-// must never be chosen — see the fencing note in Chain.
+// keepHighestEpoch collapses members that establish state at the same TXID
+// down to the one written under the highest epoch. A lower-epoch duplicate is
+// an orphan left by a writer that was fenced before its ref write landed, so
+// it must never be chosen — see the fencing note in Chain.
+//
+// It MUST be given ONE lineage's COMBINED member set — snapshots and segments
+// together — and it keys on MaxTXID ALONE, deliberately, not on the
+// {MinTXID, MaxTXID} range. Keying on the range and running the collapse
+// separately over the snapshots and the segments (what this did before) is a
+// silent data-loss bug: a fenced writer's SNAPSHOT at txid T has range (0, T]
+// while the live writer's SEGMENT at T has range (T, T], so the two never
+// share a key and never share a slice — the fenced snapshot survives the
+// collapse, resolveSelf anchors on it as the "newest snapshot with
+// MaxTXID <= target", and (because its MaxTXID == target) returns it ALONE.
+// That serves the fenced writer's whole state and drops the live writer's
+// committed transaction, with no error and no checksum failure: the fenced
+// snapshot is internally valid, it is just the wrong object.
+//
+// MaxTXID alone is the right key because a snapshot at T and a segment at T
+// both establish the lineage's state AT T, so at most one of them can be
+// live — and the live one is the writer holding the higher epoch.
+//
+// The MaxTXID key is applied ONLY where its justification actually holds:
+// members of the SHAPE this binary's writers produce. A snapshot always
+// qualifies; a segment qualifies when it is SINGLE-TXID, because that is what
+// makes its MaxTXID identify it as completely as its range does — and every
+// production segment is single-txid (the sole production ltxio.EncodeSegment
+// caller, session/flush.go, passes (txid, txid)). A MULTI-txid segment cannot
+// be produced by any writer in this binary; it is a hand-written fixture or
+// corruption, its MaxTXID does NOT identify it, and collapsing it against a
+// snapshot at the same MaxTXID would let a stray object EVICT the live
+// snapshot and break the chain outright. Those keep the original, conservative
+// {MinTXID, MaxTXID} key and never collide with a snapshot — exactly the
+// pre-fix behavior, which is inert: resolveSelf prefers a snapshot as the
+// anchor, and the post-anchor walk skips any segment whose MaxTXID is at or
+// below the anchor's.
+//
+// Within the MaxTXID bucket the winner is chosen by moreLive, a strict total
+// order, so it never depends on map iteration order.
+//
+// The one hard rule: the input is always a SINGLE lineage's members. A
+// cross-lineage union here would let a higher-epoch parent object win the
+// child's own txid and silently serve the parent's timeline — see Chain.
 func keepHighestEpoch(members []ChainMember) []ChainMember {
 	type rng struct{ min, max uint64 }
-	best := make(map[rng]ChainMember, len(members))
+	byTXID := make(map[uint64]ChainMember, len(members))
+	byRange := map[rng]ChainMember{}
 	for _, m := range members {
+		if m.Snapshot || m.MinTXID == m.MaxTXID {
+			if cur, ok := byTXID[m.MaxTXID]; !ok || moreLive(m, cur) {
+				byTXID[m.MaxTXID] = m
+			}
+			continue
+		}
 		k := rng{m.MinTXID, m.MaxTXID}
-		if cur, ok := best[k]; !ok || m.Epoch > cur.Epoch {
-			best[k] = m
+		if cur, ok := byRange[k]; !ok || m.Epoch > cur.Epoch {
+			byRange[k] = m
 		}
 	}
-	out := make([]ChainMember, 0, len(best))
-	for _, m := range best {
+	out := make([]ChainMember, 0, len(byTXID)+len(byRange))
+	for _, m := range byTXID {
+		out = append(out, m)
+	}
+	for _, m := range byRange {
 		out = append(out, m)
 	}
 	return out
+}
+
+// moreLive reports whether a supersedes b, for two members of the SAME
+// lineage establishing state at the same MaxTXID — a snapshot or a single-txid
+// segment, the only shapes keepHighestEpoch collapses on MaxTXID. It is a
+// strict total order on distinct members, which is what makes the winner
+// independent of map iteration order.
+//
+//  1. Higher epoch wins. Epochs only ever increase, and a writer at a lower
+//     epoch was fenced before its ref write landed, so its object is by
+//     definition an orphan. This is the whole fencing guarantee on the read
+//     path.
+//  2. Same epoch: the SNAPSHOT wins. This should not occur in practice — one
+//     flush writes either a snapshot or a segment for a given txid, never
+//     both, and txids only advance (ops.Checkpoint likewise snapshots at
+//     HeadTXID+1, a txid nothing else has written). If it somehow does, the
+//     snapshot is the safer pick: it is self-contained and can anchor a chain,
+//     whereas a segment can only extend one.
+//
+// No third rule is needed: two members of the same kind at the same MaxTXID
+// have the same range (a snapshot is (0, T], a single-txid segment is (T, T]),
+// so at the same epoch they are the same key and cannot both exist.
+func moreLive(a, b ChainMember) bool {
+	if a.Epoch != b.Epoch {
+		return a.Epoch > b.Epoch
+	}
+	return a.Snapshot && !b.Snapshot
 }
 
 // Chain returns the members needed to materialize lineage at target: the
@@ -639,41 +715,54 @@ func (s *Store) chainFrom(lineage string, target uint64, seen map[string]bool) (
 // into a seam-path retry.
 var errNoSnapshotCoversTarget = errors.New("no snapshot covers target")
 
-// listMembers Lists ONE lineage's prefix exactly once and parses it into
-// that lineage's snapshot and segment members, each collapsed by
-// keepHighestEpoch and sorted by TXID. It is the single List+parse step
-// behind chain resolution: chainSelf feeds its output to resolveSelf, and
-// chainFrom's seam path feeds the SAME parsed slices to both resolveSelf and
-// resolveRange, so a shared child's prefix is Listed once per resolution, not
-// twice. keepHighestEpoch runs here, on this one lineage's members only —
-// never on a cross-lineage union (the one hard rule; see Chain).
+// listMembers Lists ONE lineage's prefix exactly once and parses it into that
+// lineage's snapshot and segment members, collapsed by keepHighestEpoch over
+// the COMBINED set (so a fenced snapshot and a live segment at the same txid
+// do collide — see keepHighestEpoch) and then split and sorted by TXID. It is
+// the single List+parse step behind chain resolution: chainSelf feeds its
+// output to resolveSelf, and chainFrom's seam path feeds the SAME parsed
+// slices to both resolveSelf and resolveRange, so a shared child's prefix is
+// Listed once per resolution, not twice. keepHighestEpoch runs here, on this
+// one lineage's List output only — never on a cross-lineage union (the one
+// hard rule; see Chain).
 func (s *Store) listMembers(lineage string) (snapshots, segments []ChainMember, err error) {
 	keys, err := s.B.List(LineagePrefix(lineage))
 	if err != nil {
 		return nil, nil, err
 	}
+	members := make([]ChainMember, 0, len(keys))
 	for _, k := range keys {
 		m, ok := ParseMemberKey(k)
 		if !ok {
 			continue
 		}
+		members = append(members, m)
+	}
+	// Two members can establish state at the same TXID under different
+	// epochs: a writer uploads its object, loses the ref CAS, and is fenced,
+	// leaving an orphan; because HeadTXID only advances on a *successful* ref
+	// write, the next holder writes the same TXID under its own, higher
+	// epoch. Epochs only ever increase, so the live object is always the
+	// higher-epoch one and the lower-epoch one is by definition the
+	// superseded writer's. Keeping only the highest epoch per TXID is what
+	// makes Plan 4's fencing guarantee hold on this read path — otherwise a
+	// fenced writer's data could be materialized.
+	//
+	// The collapse runs ONCE over the COMBINED set, BEFORE the split into
+	// snapshots and segments, because the two kinds must be able to collide:
+	// the fenced writer's straggler at txid T is often a SNAPSHOT while the
+	// live writer's object at T is a SEGMENT (see keepHighestEpoch, which
+	// documents the exact data-loss shape this ordering prevents). Splitting
+	// first and collapsing each slice separately cannot see that conflict at
+	// all.
+	members = keepHighestEpoch(members)
+	for _, m := range members {
 		if m.Snapshot {
 			snapshots = append(snapshots, m)
 		} else {
 			segments = append(segments, m)
 		}
 	}
-	// Two members can cover the same TXID range under different epochs: a
-	// writer uploads its object, loses the ref CAS, and is fenced, leaving an
-	// orphan; because HeadTXID only advances on a *successful* ref write, the
-	// next holder writes the same TXID under its own, higher epoch. Epochs
-	// only ever increase, so the live object is always the higher-epoch one
-	// and the lower-epoch one is by definition the superseded writer's.
-	// Keeping only the highest epoch per range is what makes Plan 4's fencing
-	// guarantee hold on this read path — otherwise a fenced writer's data
-	// could be materialized.
-	snapshots = keepHighestEpoch(snapshots)
-	segments = keepHighestEpoch(segments)
 	// List sorts lexically on the full key, which only sorts by TXID within
 	// a single epoch directory (the epoch path segment isn't zero-padded, so
 	// e.g. epoch 10 would sort before epoch 2). A chain can span epochs, so
@@ -750,7 +839,7 @@ func resolveSelf(lineage string, target uint64, snapshots, segments []ChainMembe
 // (lo, hi], with NO leading snapshot — the child half of a shared chain has no
 // snapshot of its own in this range (its snapshot, if any, lives in the base
 // lineage). It operates on the lineage's already-parsed segments (listMembers'
-// output: keepHighestEpoch was run on THIS lineage's segments alone, never a
+// output: keepHighestEpoch was run on THIS lineage's members alone, never a
 // cross-lineage union — the one hard rule — and they arrive sorted), walking
 // for contiguity: the first segment must start at lo+1, the run must have no
 // hole, and it must reach hi exactly. It errors, mirroring Chain, when the
