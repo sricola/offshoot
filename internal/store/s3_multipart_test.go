@@ -58,6 +58,26 @@ func newFakeBackedWithFake(t *testing.T) (store.Backend, *storetest.FakeS3) {
 	return b, f
 }
 
+// failPutsFromSecond installs a fault on f that counts PUT requests to key
+// and fails every one from the second onward with HTTP 500 — the shared
+// fault pattern behind the abort-on-failure tests (upload, concurrent
+// upload, and multipart copy): the first part PUT succeeds so the upload is
+// genuinely under way, then every later attempt — including every SDK retry
+// — fails, robust to which of possibly-concurrent parts happens to be
+// attempted first.
+func failPutsFromSecond(f *storetest.FakeS3, key string) {
+	var puts int
+	f.SetFault(func(method, k string) (int, bool) {
+		if method == http.MethodPut && k == key {
+			puts++
+			if puts >= 2 {
+				return 500, true
+			}
+		}
+		return 0, false
+	})
+}
+
 // onlyReader wraps an io.Reader and exposes nothing else — in particular
 // NEITHER io.ReaderAt NOR io.Seeker, even though the underlying
 // *bytes.Reader would satisfy both. Used to force store.S3.putMultipart
@@ -241,16 +261,8 @@ func TestS3PutReaderIfMultipartAbortsOnFailure(t *testing.T) {
 	rp := b.(store.ReaderPutter)
 
 	const key = "data/x/fail.ltx"
-	var puts int
-	f.SetFault(func(method, k string) (int, bool) {
-		if method == http.MethodPut && k == key {
-			puts++
-			if puts >= 2 { // fail the second part's UploadPart, and every SDK retry of it
-				return 500, true
-			}
-		}
-		return 0, false
-	})
+	// Fail the second part's UploadPart, and every SDK retry of it.
+	failPutsFromSecond(f, key)
 
 	payload := multipartPayload()
 	_, err := rp.PutReaderIf(key, bytes.NewReader(payload), int64(len(payload)), "")

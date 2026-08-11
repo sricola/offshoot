@@ -344,6 +344,17 @@ func etagOf(b []byte) string {
 	return `"` + hex.EncodeToString(sum[:]) + `"`
 }
 
+// xmlError writes the minimal S3-style XML error response this fake's
+// handlers share: an application/xml Content-Type, the given status, and an
+// <Error><Code>code</Code></Error> body. A site that needs a different body
+// shape (completeMultipartUpload's InvalidRequest, which carries a Message)
+// writes its own instead.
+func xmlError(w http.ResponseWriter, status int, code string) {
+	w.Header().Set("Content-Type", "application/xml")
+	w.WriteHeader(status)
+	io.WriteString(w, `<Error><Code>`+code+`</Code></Error>`)
+}
+
 // bucketOf and keyOf split a request path on its first path-segment
 // boundary — the bucket, then the key — rather than stripping a bare string
 // prefix, so a bucket name that happens to prefix another string can't be
@@ -360,9 +371,7 @@ func keyOf(p string) string {
 
 func (f *FakeS3) handle(w http.ResponseWriter, r *http.Request) {
 	if bucketOf(r.URL.Path) != fakeBucket {
-		w.Header().Set("Content-Type", "application/xml")
-		w.WriteHeader(http.StatusNotFound)
-		io.WriteString(w, `<Error><Code>NoSuchBucket</Code></Error>`)
+		xmlError(w, http.StatusNotFound, "NoSuchBucket")
 		return
 	}
 	key := keyOf(r.URL.Path)
@@ -393,9 +402,7 @@ func (f *FakeS3) handle(w http.ResponseWriter, r *http.Request) {
 
 	if f.fault != nil {
 		if status, ok := f.fault(r.Method, key); ok {
-			w.Header().Set("Content-Type", "application/xml")
-			w.WriteHeader(status)
-			io.WriteString(w, `<Error><Code>InternalError</Code></Error>`)
+			xmlError(w, status, "InternalError")
 			return
 		}
 	}
@@ -408,9 +415,7 @@ func (f *FakeS3) handle(w http.ResponseWriter, r *http.Request) {
 		}
 		data, ok := f.objs[key]
 		if !ok {
-			w.Header().Set("Content-Type", "application/xml")
-			w.WriteHeader(http.StatusNotFound)
-			io.WriteString(w, `<Error><Code>NoSuchKey</Code></Error>`)
+			xmlError(w, http.StatusNotFound, "NoSuchKey")
 			return
 		}
 		w.Header().Set("ETag", etagOf(data))
@@ -450,16 +455,12 @@ func (f *FakeS3) handle(w http.ResponseWriter, r *http.Request) {
 		if !f.ignore {
 			cur, exists := f.objs[key]
 			if inm := r.Header.Get("If-None-Match"); inm == "*" && exists {
-				w.Header().Set("Content-Type", "application/xml")
-				w.WriteHeader(http.StatusPreconditionFailed)
-				io.WriteString(w, `<Error><Code>PreconditionFailed</Code></Error>`)
+				xmlError(w, http.StatusPreconditionFailed, "PreconditionFailed")
 				return
 			}
 			if im := r.Header.Get("If-Match"); im != "" {
 				if !exists || etagOf(cur) != im {
-					w.Header().Set("Content-Type", "application/xml")
-					w.WriteHeader(http.StatusPreconditionFailed)
-					io.WriteString(w, `<Error><Code>PreconditionFailed</Code></Error>`)
+					xmlError(w, http.StatusPreconditionFailed, "PreconditionFailed")
 					return
 				}
 			}
@@ -539,16 +540,12 @@ func (f *FakeS3) handle(w http.ResponseWriter, r *http.Request) {
 func (f *FakeS3) copyObject(w http.ResponseWriter, dstKey, copySource string) {
 	srcKey, err := decodeCopySource(copySource)
 	if err != nil {
-		w.Header().Set("Content-Type", "application/xml")
-		w.WriteHeader(http.StatusBadRequest)
-		io.WriteString(w, `<Error><Code>InvalidArgument</Code></Error>`)
+		xmlError(w, http.StatusBadRequest, "InvalidArgument")
 		return
 	}
 	data, ok := f.objs[srcKey]
 	if !ok {
-		w.Header().Set("Content-Type", "application/xml")
-		w.WriteHeader(http.StatusNotFound)
-		io.WriteString(w, `<Error><Code>NoSuchKey</Code></Error>`)
+		xmlError(w, http.StatusNotFound, "NoSuchKey")
 		return
 	}
 	cp := make([]byte, len(data))
@@ -636,16 +633,12 @@ func (f *FakeS3) uploadPart(w http.ResponseWriter, r *http.Request, key string) 
 	q := r.URL.Query()
 	up, ok := f.multipart[q.Get("uploadId")]
 	if !ok || up.key != key {
-		w.Header().Set("Content-Type", "application/xml")
-		w.WriteHeader(http.StatusNotFound)
-		io.WriteString(w, `<Error><Code>NoSuchUpload</Code></Error>`)
+		xmlError(w, http.StatusNotFound, "NoSuchUpload")
 		return
 	}
 	n, err := strconv.Atoi(q.Get("partNumber"))
 	if err != nil || n < 1 {
-		w.Header().Set("Content-Type", "application/xml")
-		w.WriteHeader(http.StatusBadRequest)
-		io.WriteString(w, `<Error><Code>InvalidArgument</Code></Error>`)
+		xmlError(w, http.StatusBadRequest, "InvalidArgument")
 		return
 	}
 	body, err := io.ReadAll(r.Body)
@@ -682,37 +675,27 @@ func (f *FakeS3) uploadPartCopy(w http.ResponseWriter, r *http.Request, dstKey, 
 	q := r.URL.Query()
 	up, ok := f.multipart[q.Get("uploadId")]
 	if !ok || up.key != dstKey {
-		w.Header().Set("Content-Type", "application/xml")
-		w.WriteHeader(http.StatusNotFound)
-		io.WriteString(w, `<Error><Code>NoSuchUpload</Code></Error>`)
+		xmlError(w, http.StatusNotFound, "NoSuchUpload")
 		return
 	}
 	n, err := strconv.Atoi(q.Get("partNumber"))
 	if err != nil || n < 1 {
-		w.Header().Set("Content-Type", "application/xml")
-		w.WriteHeader(http.StatusBadRequest)
-		io.WriteString(w, `<Error><Code>InvalidArgument</Code></Error>`)
+		xmlError(w, http.StatusBadRequest, "InvalidArgument")
 		return
 	}
 	srcKey, err := decodeCopySource(copySource)
 	if err != nil {
-		w.Header().Set("Content-Type", "application/xml")
-		w.WriteHeader(http.StatusBadRequest)
-		io.WriteString(w, `<Error><Code>InvalidArgument</Code></Error>`)
+		xmlError(w, http.StatusBadRequest, "InvalidArgument")
 		return
 	}
 	src, ok := f.objs[srcKey]
 	if !ok {
-		w.Header().Set("Content-Type", "application/xml")
-		w.WriteHeader(http.StatusNotFound)
-		io.WriteString(w, `<Error><Code>NoSuchKey</Code></Error>`)
+		xmlError(w, http.StatusNotFound, "NoSuchKey")
 		return
 	}
 	start, end, err := parseCopySourceRange(r.Header.Get("X-Amz-Copy-Source-Range"), int64(len(src)))
 	if err != nil {
-		w.Header().Set("Content-Type", "application/xml")
-		w.WriteHeader(http.StatusBadRequest)
-		io.WriteString(w, `<Error><Code>InvalidArgument</Code></Error>`)
+		xmlError(w, http.StatusBadRequest, "InvalidArgument")
 		return
 	}
 	slice := make([]byte, end-start+1) // +1: end is inclusive
@@ -806,9 +789,7 @@ func checksumForAlgorithm(p completedPartXML, algorithm string) string {
 func (f *FakeS3) completeMultipartUpload(w http.ResponseWriter, r *http.Request, key, uploadID string) {
 	up, ok := f.multipart[uploadID]
 	if !ok || up.key != key {
-		w.Header().Set("Content-Type", "application/xml")
-		w.WriteHeader(http.StatusNotFound)
-		io.WriteString(w, `<Error><Code>NoSuchUpload</Code></Error>`)
+		xmlError(w, http.StatusNotFound, "NoSuchUpload")
 		return
 	}
 	body, err := io.ReadAll(r.Body)
@@ -818,9 +799,7 @@ func (f *FakeS3) completeMultipartUpload(w http.ResponseWriter, r *http.Request,
 	}
 	var req completeMultipartUploadRequest
 	if xml.Unmarshal(body, &req) != nil || len(req.Parts) == 0 {
-		w.Header().Set("Content-Type", "application/xml")
-		w.WriteHeader(http.StatusBadRequest)
-		io.WriteString(w, `<Error><Code>MalformedXML</Code></Error>`)
+		xmlError(w, http.StatusBadRequest, "MalformedXML")
 		return
 	}
 
@@ -849,16 +828,12 @@ func (f *FakeS3) completeMultipartUpload(w http.ResponseWriter, r *http.Request,
 	if !f.ignore {
 		cur, exists := f.objs[key]
 		if inm := r.Header.Get("If-None-Match"); inm == "*" && exists {
-			w.Header().Set("Content-Type", "application/xml")
-			w.WriteHeader(http.StatusPreconditionFailed)
-			io.WriteString(w, `<Error><Code>PreconditionFailed</Code></Error>`)
+			xmlError(w, http.StatusPreconditionFailed, "PreconditionFailed")
 			return
 		}
 		if im := r.Header.Get("If-Match"); im != "" {
 			if !exists || etagOf(cur) != im {
-				w.Header().Set("Content-Type", "application/xml")
-				w.WriteHeader(http.StatusPreconditionFailed)
-				io.WriteString(w, `<Error><Code>PreconditionFailed</Code></Error>`)
+				xmlError(w, http.StatusPreconditionFailed, "PreconditionFailed")
 				return
 			}
 		}
@@ -869,9 +844,7 @@ func (f *FakeS3) completeMultipartUpload(w http.ResponseWriter, r *http.Request,
 	for _, p := range req.Parts {
 		pb, ok := up.parts[p.PartNumber]
 		if !ok {
-			w.Header().Set("Content-Type", "application/xml")
-			w.WriteHeader(http.StatusBadRequest)
-			io.WriteString(w, `<Error><Code>InvalidPart</Code></Error>`)
+			xmlError(w, http.StatusBadRequest, "InvalidPart")
 			return
 		}
 		final = append(final, pb...)
@@ -911,9 +884,7 @@ func (f *FakeS3) completeMultipartUpload(w http.ResponseWriter, r *http.Request,
 func (f *FakeS3) abortMultipartUpload(w http.ResponseWriter, key, uploadID string) {
 	up, ok := f.multipart[uploadID]
 	if !ok || up.key != key {
-		w.Header().Set("Content-Type", "application/xml")
-		w.WriteHeader(http.StatusNotFound)
-		io.WriteString(w, `<Error><Code>NoSuchUpload</Code></Error>`)
+		xmlError(w, http.StatusNotFound, "NoSuchUpload")
 		return
 	}
 	delete(f.multipart, uploadID)
@@ -957,16 +928,18 @@ type deleteObjectsError struct {
 // failures come back as <Error> entries in a 200 response, not an HTTP
 // error. batchDeleteErrs (SetBatchDeleteError) drives that last case.
 func (f *FakeS3) deleteObjects(w http.ResponseWriter, r *http.Request) {
+	// S3's hard per-request key limit for DeleteObjects — this fake's copy
+	// of the same limit the real backend names s3DeleteObjectsMaxKeys
+	// (internal/store/s3.go) and chunks to.
+	const deleteObjectsMaxKeys = 1000
 	body, err := io.ReadAll(r.Body)
 	if err != nil {
 		w.WriteHeader(http.StatusBadRequest)
 		return
 	}
 	var req deleteObjectsRequest
-	if xml.Unmarshal(body, &req) != nil || len(req.Objects) > 1000 {
-		w.Header().Set("Content-Type", "application/xml")
-		w.WriteHeader(http.StatusBadRequest)
-		io.WriteString(w, `<Error><Code>MalformedXML</Code></Error>`)
+	if xml.Unmarshal(body, &req) != nil || len(req.Objects) > deleteObjectsMaxKeys {
+		xmlError(w, http.StatusBadRequest, "MalformedXML")
 		return
 	}
 	var res deleteObjectsResult

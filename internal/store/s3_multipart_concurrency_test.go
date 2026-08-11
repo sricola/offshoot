@@ -3,7 +3,6 @@ package store_test
 import (
 	"bytes"
 	"errors"
-	"net/http"
 	"testing"
 	"time"
 
@@ -155,16 +154,8 @@ func TestS3PutReaderIfMultipartConcurrentAbortsOnFailure(t *testing.T) {
 	rp := b.(store.ReaderPutter)
 
 	const key = "data/x/concurrent-fail.ltx"
-	var puts int
-	f.SetFault(func(method, k string) (int, bool) {
-		if method == http.MethodPut && k == key {
-			puts++
-			if puts >= 2 { // fail every part upload from the second attempt onward
-				return 500, true
-			}
-		}
-		return 0, false
-	})
+	// Fail every part upload from the second attempt onward.
+	failPutsFromSecond(f, key)
 
 	payload := multipartPayload()
 	_, err := rp.PutReaderIf(key, bytes.NewReader(payload), int64(len(payload)), "")
