@@ -348,8 +348,9 @@ func TestChainPrefersTheHigherEpochForSegments(t *testing.T) {
 // objects now sit at txid H+1 under different epochs.
 //
 // Pre-fix, keepHighestEpoch keyed on {MinTXID, MaxTXID} and ran SEPARATELY
-// over the snapshots and the segments: A's snapshot is (0, H+1] and B's
-// segment is (H+1, H+1], so they shared neither a key nor a slice and could
+// over the snapshots and the segments: A's snapshot at H+1 keys as
+// {Min=0, Max=H+1} and B's single-txid segment at H+1 keys as
+// {Min=H+1, Max=H+1}, so they shared neither a key nor a slice and could
 // never collide. resolveSelf then anchored on "newest snapshot with
 // MaxTXID <= target" — A's fenced snapshot — and, because its MaxTXID equals
 // the target, returned it ALONE. B's row was gone.
@@ -439,8 +440,10 @@ func TestLiveSnapshotSupersedesAFencedSegmentAtTheSameTXID(t *testing.T) {
 // segment's MaxTXID identifies it as completely as its range does. A
 // MULTI-txid segment is outside that premise — no writer here can make one, so
 // it is a hand-written fixture or corruption — and its MaxTXID does NOT
-// identify it. If the collapse applied to it anyway, a stray (0, T] object at
-// any epoch above the live one would EVICT the real snapshot at T and break
+// identify it. If the collapse applied to it anyway, a stray {Min=0, Max=T}
+// segment at any epoch above the live one would EVICT the real snapshot at T
+// (which keys as {Min=0, Max=T} too, but is a SNAPSHOT, so the old dedupe
+// never compared them) and break
 // the chain outright: a loud failure, but a whole branch bricked by an object
 // that used to be inert. ops/gc_test.go's
 // TestGCCompensatingRuleSweepsAtHeadOrphanRegardlessOfEpoch fabricates
@@ -454,7 +457,7 @@ func TestAMultiTXIDSegmentNeverEvictsASnapshotAtTheSameMaxTXID(t *testing.T) {
 	for i := 0; i < 50; i++ {
 		s := newStore(t)
 		putObj(t, s, SnapshotKey("lin", 1, 2))   // the live snapshot at txid 2
-		putObj(t, s, SegmentKey("lin", 2, 0, 2)) // a bogus (0, 2] object at a HIGHER epoch
+		putObj(t, s, SegmentKey("lin", 2, 0, 2)) // a bogus {Min=0, Max=2} segment, HIGHER epoch
 		putObj(t, s, SegmentKey("lin", 1, 3, 3)) // the live segment at txid 3
 
 		got, err := s.Chain("lin", 3)
