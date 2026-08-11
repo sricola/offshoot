@@ -29,8 +29,10 @@ version if you depend on format stability.
   Resolution deduplicates same-txid objects and keeps the highest epoch,
   which is what makes epoch fencing hold on the read path — but it keyed on
   each object's txid *range* and ran over snapshots and segments separately.
-  A snapshot for txid T spans `(0, T]` while a segment for T spans `(T, T]`,
-  so A's snapshot and B's segment shared neither a key nor a list, and the
+  A snapshot for txid T covers everything up to T, so its range key is
+  `{first: 0, last: T}`, while a segment for T covers only T itself, so its
+  range key is `{first: T, last: T}` — different keys, and held in different
+  lists, so A's snapshot and B's segment could never be compared, and the
   fenced snapshot always survived. Resolution then anchored on it as the
   newest snapshot at or below the target and, since it landed exactly on the
   target, returned it alone: B's committed transaction was silently gone, and

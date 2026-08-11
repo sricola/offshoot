@@ -503,9 +503,12 @@ func ParseMemberKey(key string) (ChainMember, bool) {
 // together — and it keys on MaxTXID ALONE, deliberately, not on the
 // {MinTXID, MaxTXID} range. Keying on the range and running the collapse
 // separately over the snapshots and the segments (what this did before) is a
-// silent data-loss bug: a fenced writer's SNAPSHOT at txid T has range (0, T]
-// while the live writer's SEGMENT at T has range (T, T], so the two never
-// share a key and never share a slice — the fenced snapshot survives the
+// silent data-loss bug: a fenced writer's SNAPSHOT at txid T keys as
+// {Min=0, Max=T} while the live writer's single-txid SEGMENT at T keys as
+// {Min=T, Max=T} (MinTXID is the first txid the member covers, inclusive —
+// which is exactly how resolveSelf's seg.MinTXID != prevMax+1 contiguity
+// check reads it), so the two never share a key and never share a slice —
+// the fenced snapshot survives the
 // collapse, resolveSelf anchors on it as the "newest snapshot with
 // MaxTXID <= target", and (because its MaxTXID == target) returns it ALONE.
 // That serves the fenced writer's whole state and drops the live writer's
@@ -581,8 +584,9 @@ func keepHighestEpoch(members []ChainMember) []ChainMember {
 //     whereas a segment can only extend one.
 //
 // No third rule is needed: two members of the same kind at the same MaxTXID
-// have the same range (a snapshot is (0, T], a single-txid segment is (T, T]),
-// so at the same epoch they are the same key and cannot both exist.
+// have the same MinTXID too (a snapshot at T keys as {Min=0, Max=T}, a
+// single-txid segment at T keys as {Min=T, Max=T}), so at the same epoch they
+// are the same object key and cannot both exist.
 func moreLive(a, b ChainMember) bool {
 	if a.Epoch != b.Epoch {
 		return a.Epoch > b.Epoch

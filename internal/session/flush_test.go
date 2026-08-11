@@ -2297,8 +2297,9 @@ func TestSnapshotFlushFallsBackToBufferedWithoutReaderPutter(t *testing.T) {
 // live epoch-2 segment.
 //
 // Before the fix, store.keepHighestEpoch keyed on {MinTXID, MaxTXID} and ran
-// separately over the snapshots and the segments, so A's (0, 2] snapshot and
-// B's (2, 2] segment shared neither a key nor a slice and could never
+// separately over the snapshots and the segments, so A's snapshot at txid 2
+// (keyed {Min=0, Max=2}) and B's single-txid segment at txid 2 (keyed
+// {Min=2, Max=2}) shared neither a key nor a slice and could never
 // collide. Resolution anchored on A's snapshot — the newest snapshot with
 // MaxTXID <= target — and returned it ALONE, serving the DEAD writer's whole
 // database and silently dropping B's committed transaction. The two writers
