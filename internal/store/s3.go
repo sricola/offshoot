@@ -72,28 +72,70 @@ const s3ResponseHeaderTimeout = 60 * time.Second
 // several of which sit on the daemon's flush path under flushMu (so
 // Session.Close hung too, the same shape as security audit 2, LOW-1).
 //
-// The value deliberately reuses multipartRPCTimeout's 15-minute worst-case
-// reasoning rather than inventing a tighter one: these calls carry a whole
-// object in one request, and a snapshot just under the 5 GiB multipart
-// threshold is a legitimate single PutObject (as is Get of one), so the
-// bound must ride out a slow-but-progressing multi-GiB transfer. The point
-// is "eventually unwedges", never "fails fast".
+// This flat value is the WHOLE deadline only for calls with no meaningful
+// payload or no size known at call time — List pages, Delete, each
+// DeleteObjects batch, HeadObject, and Get (on this backend the buffered
+// Get carries refs/manifests/tombstones, small metadata objects; chain
+// members stream via GetReader, which has its own watchdog instead) — all
+// of which a healthy backend answers in seconds, so 15 minutes is already
+// absurdly generous headroom, matching multipartRPCTimeout's flat value
+// for its own metadata RPCs (Create/Complete). For calls whose payload
+// size IS known (Put/PutIf, the below-threshold single PutObject in
+// PutReader/PutReaderIf, and CopyObject's single-request copy),
+// singleShotDeadline additionally scales this base by the size — see its
+// doc comment: a flat 15 minutes alone would impose an effective ~5.7
+// MiB/s sustained-throughput floor on a just-under-5-GiB transfer, killing
+// exactly the legitimate slow transfer this layer must never kill.
 //
 // This is a package var, not a const, ONLY so tests can shrink it — a test
-// proving the deadline fires cannot wait 15 real minutes. Never set it
-// outside a test; production code must never assign to it. See
+// proving the deadline fires cannot wait 15 real minutes. It is the BASE
+// component of singleShotDeadline, so shrinking it shrinks every sized
+// deadline too (test payloads are small, so their size component is ~0 and
+// the hook value is effectively the whole deadline). Never set it outside
+// a test; production code must never assign to it. See
 // SetSingleShotRPCTimeoutForTest (export_test.go).
 var singleShotRPCTimeout = 15 * time.Minute
 
+// singleShotFloorBytesPerSecond is the pessimistic sustained-throughput
+// floor singleShotDeadline sizes a known payload's transfer allowance to —
+// the SAME 1 MiB/s floor multipartRPCTimeout's 15 minutes is derived from
+// (~550 MiB worst-case part / 1 MiB/s ≈ 9.2 min, plus headroom; see its
+// doc comment). Kept as a named constant so the two layers' sizing can
+// never silently diverge: if one floor is ever revisited, this comment and
+// that one point at each other.
+const singleShotFloorBytesPerSecond = 1 << 20 // 1 MiB/s
+
+// singleShotDeadline returns the per-call deadline for a buffered
+// single-shot RPC carrying a payload of the given size (0 for calls with
+// no meaningful payload or unknown size): the flat singleShotRPCTimeout
+// base plus the time the payload needs at singleShotFloorBytesPerSecond.
+// Mirroring multipartRPCTimeout's per-part math at whole-object scale is
+// what keeps this layer's promise honest: a single-shot call may carry up
+// to the full 5 GiB multipartThreshold in one request, which at the 1
+// MiB/s floor needs ~85 minutes — a flat 15 minutes would kill it on
+// every attempt, permanently (e.g. a ~4 GiB below-threshold snapshot
+// flush over a ~20 Mbps uplink legitimately takes ~27 minutes). The point
+// remains "eventually unwedges", never "fails fast".
+func singleShotDeadline(size int64) time.Duration {
+	d := singleShotRPCTimeout
+	if size > 0 {
+		d += time.Duration(size/singleShotFloorBytesPerSecond) * time.Second
+	}
+	return d
+}
+
 // singleShotCtx returns the context every buffered single-shot S3 RPC runs
-// under (see singleShotRPCTimeout). Every call site follows the same shape:
+// under: deadline singleShotDeadline(size), with size 0 for calls with no
+// meaningful payload or no size known at call time (see
+// singleShotRPCTimeout's doc comment for which calls those are and why the
+// flat base suffices for them). Every call site follows the same shape:
 // obtain the pair, make the SDK call, cancel as soon as the call's result —
 // INCLUDING any body read the method itself performs (Get's io.ReadAll) —
 // is fully consumed. Loops (List's pagination, DeleteObjects' batches) get
 // a fresh pair per iteration and cancel it before the next, never a
 // deferred cancel that would accumulate.
-func singleShotCtx() (context.Context, context.CancelFunc) {
-	return context.WithTimeout(context.Background(), singleShotRPCTimeout)
+func singleShotCtx(size int64) (context.Context, context.CancelFunc) {
+	return context.WithTimeout(context.Background(), singleShotDeadline(size))
 }
 
 // readProgressTimeout is GetReader's per-Read progress watchdog window: the
@@ -222,8 +264,12 @@ func (s *S3) Get(key string) ([]byte, string, error) {
 	// returns once headers arrive, but the body is read by the io.ReadAll
 	// below, which must still run under this deadline — canceling earlier
 	// would kill every Get's body read; canceling later than function exit
-	// is impossible. The deferred cancel covers every return path.
-	ctx, cancel := singleShotCtx()
+	// is impossible. The deferred cancel covers every return path. Size 0
+	// (flat deadline): the response size isn't known until headers arrive,
+	// and buffered Gets on this backend carry small metadata objects —
+	// large chain members stream via GetReader instead (see
+	// singleShotRPCTimeout's doc comment).
+	ctx, cancel := singleShotCtx(0)
 	defer cancel()
 	out, err := s.cl.GetObject(ctx, &s3.GetObjectInput{
 		Bucket: aws.String(s.bucket), Key: aws.String(fk),
@@ -347,7 +393,7 @@ func (s *S3) Put(key string, data []byte) error {
 	if err != nil {
 		return err
 	}
-	ctx, cancel := singleShotCtx()
+	ctx, cancel := singleShotCtx(int64(len(data)))
 	_, err = s.cl.PutObject(ctx, &s3.PutObjectInput{
 		Bucket: aws.String(s.bucket), Key: aws.String(fk),
 		Body: bytes.NewReader(data),
@@ -373,7 +419,7 @@ func (s *S3) PutIf(key string, data []byte, ifMatch string) (string, error) {
 	} else {
 		in.IfMatch = aws.String(ifMatch)
 	}
-	ctx, cancel := singleShotCtx()
+	ctx, cancel := singleShotCtx(int64(len(data)))
 	out, err := s.cl.PutObject(ctx, in)
 	cancel()
 	if err != nil {
@@ -414,7 +460,7 @@ func (s *S3) PutReader(key string, r io.Reader, size int64) error {
 	if err != nil {
 		return err
 	}
-	ctx, cancel := singleShotCtx()
+	ctx, cancel := singleShotCtx(size)
 	_, err = s.cl.PutObject(ctx, &s3.PutObjectInput{
 		Bucket: aws.String(s.bucket), Key: aws.String(fk),
 		Body: r, ContentLength: aws.Int64(size),
@@ -467,7 +513,7 @@ func (s *S3) PutReaderIf(key string, r io.Reader, size int64, ifMatch string) (s
 	} else {
 		in.IfMatch = aws.String(ifMatch)
 	}
-	ctx, cancel := singleShotCtx()
+	ctx, cancel := singleShotCtx(size)
 	out, err := s.cl.PutObject(ctx, in)
 	cancel()
 	if err != nil {
@@ -497,7 +543,7 @@ func (s *S3) List(prefix string) ([]string, error) {
 		// A fresh deadline per page, canceled before the next iteration —
 		// deliberately NOT a deferred cancel, which would accumulate one
 		// live context per page across the whole pagination.
-		ctx, cancel := singleShotCtx()
+		ctx, cancel := singleShotCtx(0)
 		page, err := p.NextPage(ctx)
 		cancel()
 		if err != nil {
@@ -587,7 +633,7 @@ func (s *S3) CopyObject(dst, src string) error {
 		return err
 	}
 
-	hctx, hcancel := singleShotCtx()
+	hctx, hcancel := singleShotCtx(0)
 	head, err := s.cl.HeadObject(hctx, &s3.HeadObjectInput{
 		Bucket: aws.String(s.bucket), Key: aws.String(fsrc),
 	})
@@ -608,7 +654,11 @@ func (s *S3) CopyObject(dst, src string) error {
 		return s.copyObjectMultipart(context.Background(), dst, fsrc, fdst, size)
 	}
 
-	ctx, cancel := singleShotCtx()
+	// Sized by the HEAD-reported source size: the copy is server-side (no
+	// bytes flow through this process), so it is normally far faster than a
+	// client upload of the same size, but a 5 GiB copy still deserves the
+	// same transfer headroom rather than betting the flat base covers it.
+	ctx, cancel := singleShotCtx(size)
 	_, err = s.cl.CopyObject(ctx, &s3.CopyObjectInput{
 		Bucket:     aws.String(s.bucket),
 		Key:        aws.String(fdst),
@@ -644,7 +694,7 @@ func (s *S3) Delete(key string) error {
 	if err != nil {
 		return err
 	}
-	ctx, cancel := singleShotCtx()
+	ctx, cancel := singleShotCtx(0)
 	_, err = s.cl.DeleteObject(ctx, &s3.DeleteObjectInput{
 		Bucket: aws.String(s.bucket), Key: aws.String(fk),
 	})
@@ -699,7 +749,7 @@ func (s *S3) DeleteObjects(keys []string) (deleted []string, err error) {
 		}
 		// A fresh deadline per batch, canceled before the next iteration —
 		// same no-deferred-cancel-in-a-loop discipline as List's pagination.
-		ctx, cancel := singleShotCtx()
+		ctx, cancel := singleShotCtx(0)
 		out, cerr := s.cl.DeleteObjects(ctx, &s3.DeleteObjectsInput{
 			Bucket: aws.String(s.bucket),
 			// Quiet=false so the response lists every Deleted key — the

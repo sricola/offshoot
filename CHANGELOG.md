@@ -26,11 +26,17 @@ version if you depend on format stability.
   single-shot RPC — `Get` (including its body read), `Put`, `PutIf`, each
   `List` page, `Delete`, each `DeleteObjects` batch, `CopyObject`'s HEAD
   and single-request copy, and the below-threshold single `PutObject`
-  inside `PutReader`/`PutReaderIf` — runs under the same generous
-  15-minute per-call deadline the multipart RPCs use (sized so a
-  legitimate just-under-5-GiB single-request transfer at a pessimistic
-  throughput floor still fits: "eventually unwedges", never "fails
-  fast"). `GetReader`'s stream gets no total deadline — that would kill
+  inside `PutReader`/`PutReaderIf` — runs under a per-call deadline.
+  Calls with a known payload size (`Put`/`PutIf`, the below-threshold
+  single `PutObject`, the single-request copy) get a size-scaled
+  deadline: a generous 15-minute base plus transfer time at the same
+  pessimistic 1 MiB/s throughput floor the multipart per-part deadline
+  is derived from, so a legitimate just-under-5-GiB single-request
+  transfer (~85 minutes at that floor) always fits — "eventually
+  unwedges", never "fails fast". Calls with no meaningful payload (List
+  pages, Delete, DeleteObjects batches, HEAD, and the buffered `Get`,
+  which on this backend carries small metadata objects — large chain
+  members stream via `GetReader`) get the flat 15-minute base. `GetReader`'s stream gets no total deadline — that would kill
   legitimate long reads of large objects — but is wrapped in a progress
   watchdog instead: a single `Read` that blocks for 60 seconds with no
   bytes at all cancels the request and fails the read with a recognizable

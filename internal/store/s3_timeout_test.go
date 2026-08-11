@@ -14,9 +14,11 @@ import (
 )
 
 // This file pins the single-shot S3 timeout layer (the pass-2 availability
-// residual): every buffered single-shot RPC runs under singleShotRPCTimeout
-// via the one shared singleShotCtx helper (s3.go), and GetReader's stream is
-// guarded by a per-Read progress watchdog (watchdogReader). Because the
+// residual): every buffered single-shot RPC runs under a singleShotDeadline-
+// bounded context via the one shared singleShotCtx helper (s3.go) — the flat
+// singleShotRPCTimeout base, size-scaled at the 1 MiB/s floor for calls with
+// a known payload — and GetReader's stream is guarded by a per-Read progress
+// watchdog (watchdogReader). Because the
 // buffered calls all wrap uniformly through singleShotCtx, one mid-body test
 // (Get — the call whose deadline must outlive the SDK call into ReadAll) and
 // one stalled-response test (PutIf — a call that never sees headers at all)
@@ -152,6 +154,39 @@ func TestS3GetReaderWatchdogKillsStalledProducer(t *testing.T) {
 	closec := make(chan error, 1)
 	go func() { closec <- r.Close() }()
 	waitOrFatal(t, closec, 5*time.Second, "Close after a watchdog fire")
+}
+
+// TestS3SingleShotDeadlineScalesWithSize pins singleShotDeadline's
+// size-scaling arithmetic: a call with a known payload earns transfer time
+// at the same pessimistic 1 MiB/s floor multipartRPCTimeout's own 15
+// minutes is derived from, ON TOP of the flat base — a just-under-5-GiB
+// below-threshold single PutObject needs ~85 minutes at that floor, which
+// the flat base alone (15 min, an effective ~5.7 MiB/s throughput floor)
+// would kill on every attempt, permanently. Size-0 calls (List pages,
+// Delete, HeadObject, buffered Get of small metadata objects) get exactly
+// the flat base.
+func TestS3SingleShotDeadlineScalesWithSize(t *testing.T) {
+	const flat = 15 * time.Minute // production singleShotRPCTimeout, not overridden here
+
+	if d := store.SingleShotDeadlineForTest(0); d != flat {
+		t.Fatalf("singleShotDeadline(0) = %v, want the flat base %v", d, flat)
+	}
+	// 5 GiB at the 1 MiB/s floor is 5120s ≈ 85.3 min of transfer allowance;
+	// the total must carry at least that ON TOP of nothing — i.e. strictly
+	// dominate the ~85 min a worst-case legitimate transfer needs.
+	fiveGiB := int64(5) << 30
+	if d := store.SingleShotDeadlineForTest(fiveGiB); d < 85*time.Minute {
+		t.Fatalf("singleShotDeadline(5GiB) = %v, want >= 85m (5 GiB at the 1 MiB/s floor)", d)
+	}
+	if d, want := store.SingleShotDeadlineForTest(fiveGiB), flat+5120*time.Second; d != want {
+		t.Fatalf("singleShotDeadline(5GiB) = %v, want exactly base+size/floor = %v", d, want)
+	}
+	// A small payload (every test fixture, most metadata writes) rounds to
+	// a 0s size component: the flat base — and therefore the test hook that
+	// replaces it — is effectively the whole deadline.
+	if d := store.SingleShotDeadlineForTest(64 * 1024); d != flat {
+		t.Fatalf("singleShotDeadline(64KiB) = %v, want the flat base %v (sub-floor payloads add nothing)", d, flat)
+	}
 }
 
 // TestS3GetReaderSlowConsumerNotKilled pins the watchdog's arm-only-during-

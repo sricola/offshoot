@@ -66,16 +66,31 @@ func SetMultipartRPCTimeoutForTest(d time.Duration) (restore func()) {
 	return func() { multipartRPCTimeout = prev }
 }
 
-// SetSingleShotRPCTimeoutForTest overrides the per-call deadline every
-// buffered single-shot S3 RPC runs under (singleShotRPCTimeout in s3.go),
+// SetSingleShotRPCTimeoutForTest overrides the BASE component of every
+// buffered single-shot S3 RPC's deadline (singleShotRPCTimeout in s3.go —
+// the whole deadline for size-0 calls, and the flat component of
+// singleShotDeadline's size-scaled one for calls with a known payload),
 // returning a restore func that puts back the previous value (call it via
 // t.Cleanup). A test proving the deadline actually fires cannot wait out
-// the production value of 15 minutes, so it shrinks this instead.
+// the production value of 15 minutes, so it shrinks this instead; test
+// payloads are far under singleShotFloorBytesPerSecond, so their size
+// component is 0s and the hook value is effectively the whole deadline —
+// the hook does not (and does not need to) scale the throughput floor.
 // Test-only: never call this outside a test.
 func SetSingleShotRPCTimeoutForTest(d time.Duration) (restore func()) {
 	prev := singleShotRPCTimeout
 	singleShotRPCTimeout = d
 	return func() { singleShotRPCTimeout = prev }
+}
+
+// SingleShotDeadlineForTest exposes singleShotDeadline (s3.go) so a test
+// can pin its size-scaling arithmetic directly — that a known multi-GiB
+// payload earns transfer time at the 1 MiB/s floor on top of the flat
+// base, instead of the flat base silently imposing a throughput floor on
+// large single-request transfers. Test-only: never call this outside a
+// test.
+func SingleShotDeadlineForTest(size int64) time.Duration {
+	return singleShotDeadline(size)
 }
 
 // SetReadProgressTimeoutForTest overrides GetReader's per-Read progress
