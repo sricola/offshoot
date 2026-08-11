@@ -10,6 +10,7 @@ import (
 	"net/url"
 	"sort"
 	"strings"
+	"sync/atomic"
 	"time"
 
 	"github.com/aws/aws-sdk-go-v2/aws"
@@ -57,6 +58,57 @@ type S3 struct {
 // timeout is set at this layer, equally deliberately: that WOULD kill
 // legitimate large transfers mid-body.
 const s3ResponseHeaderTimeout = 60 * time.Second
+
+// singleShotRPCTimeout is the per-call context.WithTimeout deadline every
+// buffered single-shot S3 RPC runs under: Get (including its io.ReadAll of
+// the body), Put, PutIf, each List page, Delete, each DeleteObjects batch,
+// CopyObject's HeadObject and single-request copy, and the below-threshold
+// single PutObject inside PutReader/PutReaderIf. It closes the residual the
+// multipart-only deadlines (multipartRPCTimeout, s3_multipart.go) left
+// open: s3ResponseHeaderTimeout only bounds waiting for response HEADERS to
+// begin (and only starts once the request body has been fully written), so
+// a backend that accepts a request and then stalls mid-body — or simply
+// stops reading an upload — could still wedge any of these calls forever,
+// several of which sit on the daemon's flush path under flushMu (so
+// Session.Close hung too, the same shape as security audit 2, LOW-1).
+//
+// The value deliberately reuses multipartRPCTimeout's 15-minute worst-case
+// reasoning rather than inventing a tighter one: these calls carry a whole
+// object in one request, and a snapshot just under the 5 GiB multipart
+// threshold is a legitimate single PutObject (as is Get of one), so the
+// bound must ride out a slow-but-progressing multi-GiB transfer. The point
+// is "eventually unwedges", never "fails fast".
+//
+// This is a package var, not a const, ONLY so tests can shrink it — a test
+// proving the deadline fires cannot wait 15 real minutes. Never set it
+// outside a test; production code must never assign to it. See
+// SetSingleShotRPCTimeoutForTest (export_test.go).
+var singleShotRPCTimeout = 15 * time.Minute
+
+// singleShotCtx returns the context every buffered single-shot S3 RPC runs
+// under (see singleShotRPCTimeout). Every call site follows the same shape:
+// obtain the pair, make the SDK call, cancel as soon as the call's result —
+// INCLUDING any body read the method itself performs (Get's io.ReadAll) —
+// is fully consumed. Loops (List's pagination, DeleteObjects' batches) get
+// a fresh pair per iteration and cancel it before the next, never a
+// deferred cancel that would accumulate.
+func singleShotCtx() (context.Context, context.CancelFunc) {
+	return context.WithTimeout(context.Background(), singleShotRPCTimeout)
+}
+
+// readProgressTimeout is GetReader's per-Read progress watchdog window: the
+// returned stream is killed only if a single blocking Read makes no
+// progress at all for this long (see watchdogReader). Unlike
+// singleShotRPCTimeout it never bounds a stream's TOTAL lifetime — a
+// legitimate hours-long read of a huge object is fine as long as bytes keep
+// arriving — so it can be tight: a healthy backend mid-body delivers SOME
+// bytes well within 60 seconds, the same order of patience as
+// s3ResponseHeaderTimeout's wait for headers.
+//
+// This is a package var, not a const, ONLY so tests can shrink it. Never
+// set it outside a test; production code must never assign to it. See
+// SetReadProgressTimeoutForTest (export_test.go).
+var readProgressTimeout = 60 * time.Second
 
 func NewS3(ctx context.Context, cfg S3Config) (*S3, error) {
 	if cfg.Bucket == "" {
@@ -166,7 +218,14 @@ func (s *S3) Get(key string) ([]byte, string, error) {
 	if err != nil {
 		return nil, "", err
 	}
-	out, err := s.cl.GetObject(context.Background(), &s3.GetObjectInput{
+	// Deferred, not called right after GetObject returns: the SDK call
+	// returns once headers arrive, but the body is read by the io.ReadAll
+	// below, which must still run under this deadline — canceling earlier
+	// would kill every Get's body read; canceling later than function exit
+	// is impossible. The deferred cancel covers every return path.
+	ctx, cancel := singleShotCtx()
+	defer cancel()
+	out, err := s.cl.GetObject(ctx, &s3.GetObjectInput{
 		Bucket: aws.String(s.bucket), Key: aws.String(fk),
 	})
 	if err != nil {
@@ -190,21 +249,97 @@ func (s *S3) Get(key string) ([]byte, string, error) {
 // object's stream open, not its full bytes. Same key namespacing and
 // ErrNotFound mapping as Get. The caller MUST Close the returned reader;
 // leaving it open leaks the underlying HTTP connection.
+//
+// Stall protection: the returned stream outlives this call, so it CANNOT
+// run under a singleShotRPCTimeout-style total deadline the way Get does —
+// that would kill a legitimate long read of a large object. Instead the
+// request runs under a cancelable context and the Body is wrapped in a
+// watchdogReader: a single Read that blocks for readProgressTimeout with no
+// bytes at all cancels the request, failing the Read with a recognizable
+// "read stalled" error, while any progress at all re-arms the window and a
+// slow CONSUMER (long pauses BETWEEN Reads) is never affected — see
+// watchdogReader's doc comment. The stream's only production consumer
+// (ops' lazyReader, chain materialization) treats any Read error as fatal
+// and closes everything, so the watchdog error needs no special handling.
 func (s *S3) GetReader(key string) (io.ReadCloser, string, error) {
 	fk, err := s.full(key)
 	if err != nil {
 		return nil, "", err
 	}
-	out, err := s.cl.GetObject(context.Background(), &s3.GetObjectInput{
+	ctx, cancel := context.WithCancel(context.Background())
+	out, err := s.cl.GetObject(ctx, &s3.GetObjectInput{
 		Bucket: aws.String(s.bucket), Key: aws.String(fk),
 	})
 	if err != nil {
+		cancel()
 		if isNotFound(err) {
 			return nil, "", ErrNotFound
 		}
 		return nil, "", fmt.Errorf("store: s3 get %s: %w", key, err)
 	}
-	return out.Body, aws.ToString(out.ETag), nil
+	return newWatchdogReader(out.Body, cancel, key), aws.ToString(out.ETag), nil
+}
+
+// watchdogReader wraps a GetObject response Body with a per-Read progress
+// watchdog: each Read arms a timer for readProgressTimeout on entry and
+// stops it on exit, so the timer can ONLY fire while a Read is actually
+// blocked inside the underlying body. That asymmetry is the whole design:
+// a stalled PRODUCER (the backend delivering no bytes) leaves Read blocked
+// until the timer fires and cancels the request context, which unblocks the
+// Read with an error; a slow CONSUMER (arbitrarily long pauses BETWEEN
+// Reads) never has an armed timer at all and is never killed. Any Read that
+// returns — even one byte — disarms the timer, so a slow-but-progressing
+// transfer re-earns a full window on every call.
+//
+// Concurrency/race notes:
+//   - The timer is created ONCE (already stopped) in newWatchdogReader, so
+//     Read and Close never race on the field itself; Timer.Reset/Stop are
+//     safe for concurrent use.
+//   - Timer-fire racing Close is harmless by construction: both just call
+//     cancel (idempotent) and Timer.Stop (idempotent).
+//   - A timer that fires just as its Read returns successfully has canceled
+//     the request context, so the NEXT Read fails — spurious in principle,
+//     but only reachable when a Read consumed the entire window anyway,
+//     i.e. the stream was already at the edge of the stall definition.
+//
+// The watchdog-fire error wraps the underlying transport error (which
+// carries context.Canceled) in a recognizable "read stalled" message.
+// Callers already treat any Read error from this stream as fatal — the only
+// production consumer is ops' lazyReader, whose error path closes every
+// stream and propagates — so no caller needs to distinguish it.
+type watchdogReader struct {
+	body    io.ReadCloser
+	cancel  context.CancelFunc
+	key     string
+	timer   *time.Timer
+	stalled atomic.Bool
+}
+
+func newWatchdogReader(body io.ReadCloser, cancel context.CancelFunc, key string) *watchdogReader {
+	w := &watchdogReader{body: body, cancel: cancel, key: key}
+	w.timer = time.AfterFunc(readProgressTimeout, func() {
+		w.stalled.Store(true)
+		w.cancel()
+	})
+	w.timer.Stop() // created disarmed; armed only for the duration of each Read
+	return w
+}
+
+func (w *watchdogReader) Read(p []byte) (int, error) {
+	w.timer.Reset(readProgressTimeout)
+	n, err := w.body.Read(p)
+	w.timer.Stop()
+	if err != nil && err != io.EOF && w.stalled.Load() {
+		err = fmt.Errorf("store: s3 read %s: read stalled for %v with no progress: %w",
+			w.key, readProgressTimeout, err)
+	}
+	return n, err
+}
+
+func (w *watchdogReader) Close() error {
+	w.timer.Stop()
+	w.cancel()
+	return w.body.Close()
 }
 
 func (s *S3) Put(key string, data []byte) error {
@@ -212,10 +347,12 @@ func (s *S3) Put(key string, data []byte) error {
 	if err != nil {
 		return err
 	}
-	_, err = s.cl.PutObject(context.Background(), &s3.PutObjectInput{
+	ctx, cancel := singleShotCtx()
+	_, err = s.cl.PutObject(ctx, &s3.PutObjectInput{
 		Bucket: aws.String(s.bucket), Key: aws.String(fk),
 		Body: bytes.NewReader(data),
 	})
+	cancel()
 	if err != nil {
 		return fmt.Errorf("store: s3 put %s: %w", key, err)
 	}
@@ -236,7 +373,9 @@ func (s *S3) PutIf(key string, data []byte, ifMatch string) (string, error) {
 	} else {
 		in.IfMatch = aws.String(ifMatch)
 	}
-	out, err := s.cl.PutObject(context.Background(), in)
+	ctx, cancel := singleShotCtx()
+	out, err := s.cl.PutObject(ctx, in)
+	cancel()
 	if err != nil {
 		if isPreconditionFailed(err) {
 			return "", fmt.Errorf("%w: %s", ErrCAS, key)
@@ -275,10 +414,12 @@ func (s *S3) PutReader(key string, r io.Reader, size int64) error {
 	if err != nil {
 		return err
 	}
-	_, err = s.cl.PutObject(context.Background(), &s3.PutObjectInput{
+	ctx, cancel := singleShotCtx()
+	_, err = s.cl.PutObject(ctx, &s3.PutObjectInput{
 		Bucket: aws.String(s.bucket), Key: aws.String(fk),
 		Body: r, ContentLength: aws.Int64(size),
 	})
+	cancel()
 	if err != nil {
 		return fmt.Errorf("store: s3 put %s: %w", key, err)
 	}
@@ -326,7 +467,9 @@ func (s *S3) PutReaderIf(key string, r io.Reader, size int64, ifMatch string) (s
 	} else {
 		in.IfMatch = aws.String(ifMatch)
 	}
-	out, err := s.cl.PutObject(context.Background(), in)
+	ctx, cancel := singleShotCtx()
+	out, err := s.cl.PutObject(ctx, in)
+	cancel()
 	if err != nil {
 		if isPreconditionFailed(err) {
 			return "", fmt.Errorf("%w: %s", ErrCAS, key)
@@ -351,7 +494,12 @@ func (s *S3) List(prefix string) ([]string, error) {
 		Bucket: aws.String(s.bucket), Prefix: aws.String(fp),
 	})
 	for p.HasMorePages() {
-		page, err := p.NextPage(context.Background())
+		// A fresh deadline per page, canceled before the next iteration —
+		// deliberately NOT a deferred cancel, which would accumulate one
+		// live context per page across the whole pagination.
+		ctx, cancel := singleShotCtx()
+		page, err := p.NextPage(ctx)
+		cancel()
 		if err != nil {
 			return nil, fmt.Errorf("store: s3 list %s: %w", prefix, err)
 		}
@@ -439,9 +587,11 @@ func (s *S3) CopyObject(dst, src string) error {
 		return err
 	}
 
-	head, err := s.cl.HeadObject(context.Background(), &s3.HeadObjectInput{
+	hctx, hcancel := singleShotCtx()
+	head, err := s.cl.HeadObject(hctx, &s3.HeadObjectInput{
 		Bucket: aws.String(s.bucket), Key: aws.String(fsrc),
 	})
+	hcancel()
 	if err != nil {
 		if isNotFound(err) {
 			return ErrNotFound
@@ -458,11 +608,13 @@ func (s *S3) CopyObject(dst, src string) error {
 		return s.copyObjectMultipart(context.Background(), dst, fsrc, fdst, size)
 	}
 
-	_, err = s.cl.CopyObject(context.Background(), &s3.CopyObjectInput{
+	ctx, cancel := singleShotCtx()
+	_, err = s.cl.CopyObject(ctx, &s3.CopyObjectInput{
 		Bucket:     aws.String(s.bucket),
 		Key:        aws.String(fdst),
 		CopySource: aws.String(s3CopySource(s.bucket, fsrc)),
 	})
+	cancel()
 	if err != nil {
 		if isNotFound(err) {
 			// The source existed at the HEAD above but is gone now (deleted
@@ -492,9 +644,11 @@ func (s *S3) Delete(key string) error {
 	if err != nil {
 		return err
 	}
-	_, err = s.cl.DeleteObject(context.Background(), &s3.DeleteObjectInput{
+	ctx, cancel := singleShotCtx()
+	_, err = s.cl.DeleteObject(ctx, &s3.DeleteObjectInput{
 		Bucket: aws.String(s.bucket), Key: aws.String(fk),
 	})
+	cancel()
 	if err != nil && !isNotFound(err) {
 		return fmt.Errorf("store: s3 delete %s: %w", key, err)
 	}
@@ -543,12 +697,16 @@ func (s *S3) DeleteObjects(keys []string) (deleted []string, err error) {
 		for _, fk := range full[start:end] {
 			ids = append(ids, types.ObjectIdentifier{Key: aws.String(fk)})
 		}
-		out, cerr := s.cl.DeleteObjects(context.Background(), &s3.DeleteObjectsInput{
+		// A fresh deadline per batch, canceled before the next iteration —
+		// same no-deferred-cancel-in-a-loop discipline as List's pagination.
+		ctx, cancel := singleShotCtx()
+		out, cerr := s.cl.DeleteObjects(ctx, &s3.DeleteObjectsInput{
 			Bucket: aws.String(s.bucket),
 			// Quiet=false so the response lists every Deleted key — the
 			// contract's "which keys actually succeeded" needs them.
 			Delete: &types.Delete{Objects: ids, Quiet: aws.Bool(false)},
 		})
+		cancel()
 		if cerr != nil {
 			return deleted, fmt.Errorf("store: s3 batch delete: %w", cerr)
 		}
