@@ -58,7 +58,7 @@ pre+pre, pre+p, p+pre{margin-top:14px}
 .note code{font-size:12px}
 
 ul.why{list-style:none}
-ul.why li{padding:14px 0; border-bottom:1px solid var(--rule); color:var(--dim); max-width:74ch}
+ul.why li{padding:16px 0; border-bottom:1px solid var(--rule); color:var(--dim); max-width:74ch}
 ul.why li:last-child{border-bottom:none}
 ul.why b{color:var(--ink); font-weight:600}
 ul.why b::after{content:" — "}
@@ -80,6 +80,26 @@ tbody tr:hover td{background:var(--code-bg)}
 
 .soon{color:var(--faint); cursor:default; border-bottom:1px dotted var(--faint)}
 
+.diagram{margin:34px 0 0; overflow-x:auto}
+.diagram svg{display:block; width:100%; min-width:600px; height:auto}
+#why .diagram{margin:0 0 30px}
+.dg text{font-family:var(--mono); font-size:12.5px; fill:var(--dim)}
+.dg .tk{fill:var(--ink); font-weight:600}
+.dg .ta{fill:var(--accent)}
+.dg .ts{font-size:11px; fill:var(--faint)}
+.dg .wire{fill:none; stroke:var(--dim); stroke-width:1.5; stroke-linecap:round}
+.dg .live{stroke:var(--accent); stroke-width:2}
+.dg .dead{stroke:var(--faint); stroke-dasharray:2 6}
+.dg .ptr{fill:none; stroke:var(--accent); stroke-dasharray:4 5; stroke-width:1.5}
+.dg .dot{fill:var(--ink); stroke:none}
+.dg .dot.cp{fill:var(--bg); stroke:var(--accent); stroke-width:2}
+.dg .dot.win{fill:var(--accent)}
+.dg .dot.rip{fill:var(--faint)}
+.dg .ah{fill:var(--dim); stroke:none}
+.dg .ah.live{fill:var(--accent)}
+.dg .box{fill:var(--code-bg); stroke:var(--border); stroke-width:1}
+.dg .store{fill:none; stroke:var(--border); stroke-width:1.5; stroke-dasharray:6 6}
+
 footer{margin-top:72px; border-top:1px solid var(--border); padding:22px 0 64px;
   font-size:12px; color:var(--faint)}
 footer .wrap{display:flex; gap:1.5em; flex-wrap:wrap}
@@ -98,6 +118,41 @@ footer .g{color:var(--accent)}
   <p class="sub">For AI agents and eval harnesses: fork the database per attempt,
   let the agent write to a real SQLite file, keep the winner, reap the rest.</p>
 
+  <figure class="diagram">
+  <svg class="dg" viewBox="0 0 640 210" role="img"
+    aria-label="Branch diagram. main is a horizontal line of commits with a checkpoint v1. attempt-1 forks from v1 and is promoted back onto main. attempt-2 forks from head with a 2 hour TTL and is destroyed when it expires.">
+    <title>fork · promote · destroy — branches, like git</title>
+    <!-- main -->
+    <path class="wire live" d="M28,110 H590"/>
+    <path class="ah live" d="M604,110 l-12,-5 v10 z"/>
+    <text class="tk" x="28" y="96">main</text>
+    <!-- attempt-1: fork at v1, promote onto main -->
+    <path class="wire" d="M150,110 C150,72 178,48 214,48 H356"/>
+    <path class="wire live" d="M356,48 C392,48 430,72 430,110"/>
+    <text text-anchor="end" x="144" y="80">fork --at v1</text>
+    <text class="ta" x="436" y="84">promote --onto main</text>
+    <text x="206" y="30">attempt-1</text>
+    <circle class="dot" cx="214" cy="48" r="4"/>
+    <circle class="dot" cx="285" cy="48" r="4"/>
+    <circle class="dot" cx="356" cy="48" r="4"/>
+    <!-- attempt-2: fork with ttl, reaped -->
+    <path class="wire" d="M230,110 C230,148 258,172 294,172 H366"/>
+    <path class="wire dead" d="M366,172 H414"/>
+    <text x="262" y="156">fork --ttl 2h</text>
+    <text class="ts" x="294" y="196">attempt-2 · ttl 2h</text>
+    <text class="ts" x="424" y="177">⏱ reaped → destroy</text>
+    <circle class="dot rip" cx="294" cy="172" r="4"/>
+    <circle class="dot rip" cx="366" cy="172" r="4"/>
+    <!-- main commits -->
+    <circle class="dot" cx="70" cy="110" r="4"/>
+    <circle class="dot cp" cx="150" cy="110" r="5"/>
+    <text class="ta" text-anchor="middle" x="150" y="136">v1</text>
+    <circle class="dot" cx="230" cy="110" r="4"/>
+    <circle class="dot win" cx="430" cy="110" r="4.5"/>
+    <circle class="dot" cx="515" cy="110" r="4"/>
+  </svg>
+  </figure>
+
   <pre class="demo"><code><span class="p">$</span> offshoot init
 <span class="p">$</span> offshoot create app
 <span class="p">$</span> sqlite3 "$(offshoot checkout app)" "CREATE TABLE users (name); INSERT INTO users VALUES ('ada');"
@@ -105,8 +160,7 @@ footer .g{color:var(--accent)}
 <span class="p">$</span> offshoot fork app attempt-1 --ttl 2h   <span class="c"># copy-on-write branch, near-zero added storage</span>
 <span class="p">$</span> sqlite3 "$(offshoot checkout app@attempt-1)" "DELETE FROM users;"   <span class="c"># destructive experiment</span>
 <span class="p">$</span> offshoot rollback app@attempt-1 --to fork    <span class="c"># it went badly — undo the world</span>
-<span class="p">$</span> offshoot promote app@attempt-1 --onto main --force   <span class="c"># …or it went well — ship it</span>
-<span class="p">$</span> offshoot status</code></pre>
+<span class="p">$</span> offshoot promote app@attempt-1 --onto main --force   <span class="c"># …or it went well — ship it</span></code></pre>
 </header>
 
 <section class="wrap" id="install">
@@ -125,6 +179,55 @@ footer .g{color:var(--accent)}
 
 <section class="wrap" id="why">
   <h2>why</h2>
+  <figure class="diagram">
+  <svg class="dg" viewBox="0 0 640 264" role="img"
+    aria-label="Architecture diagram. Your app and plain sqlite3 write to a checkout, a real database file with a WAL. The offshoot serve daemon captures WAL frames into LTX segments. Segments land in your storage, a local directory or S3-compatible bucket, as an immutable chain: a snapshot plus segments per branch. A fork's chain starts with a base pointer sharing the parent's snapshot, copy-on-write.">
+    <title>stock sqlite in, your storage out</title>
+    <!-- pipeline -->
+    <rect class="box" x="16" y="34" width="144" height="56" rx="6"/>
+    <text class="tk" text-anchor="middle" x="88" y="58">your app</text>
+    <text text-anchor="middle" x="88" y="78">plain sqlite3</text>
+    <text class="ts" text-anchor="middle" x="88" y="108">stock sqlite file</text>
+    <path class="wire" d="M160,62 H224"/><path class="ah" d="M232,62 l-10,-4.5 v9 z"/>
+    <text class="ts" text-anchor="middle" x="196" y="52">writes</text>
+    <rect class="box" x="232" y="34" width="144" height="56" rx="6"/>
+    <text class="tk" text-anchor="middle" x="304" y="58">checkout</text>
+    <text text-anchor="middle" x="304" y="78">app.db + wal</text>
+    <text class="ts" text-anchor="middle" x="304" y="108">a real file on disk</text>
+    <path class="wire" d="M376,62 H440"/><path class="ah" d="M448,62 l-10,-4.5 v9 z"/>
+    <text class="ts" text-anchor="middle" x="412" y="52">wal frames</text>
+    <rect class="box" x="448" y="34" width="176" height="56" rx="6"/>
+    <text class="tk" text-anchor="middle" x="536" y="58">offshoot serve</text>
+    <text text-anchor="middle" x="536" y="78">captures wal → ltx</text>
+    <path class="wire" d="M536,90 V124"/><path class="ah" d="M536,132 l-4.5,-10 h9 z"/>
+    <text class="ts" text-anchor="end" x="522" y="114">ltx segments</text>
+    <!-- store -->
+    <rect class="store" x="16" y="138" width="608" height="112" rx="8"/>
+    <text x="30" y="160">your storage — local dir · s3 · r2 · tigris · minio</text>
+    <!-- main chain -->
+    <text class="tk" x="30" y="192">main</text>
+    <rect class="box" x="88" y="176" width="78" height="24" rx="4"/>
+    <text text-anchor="middle" x="127" y="192">snapshot</text>
+    <path class="wire" d="M166,188 H182"/>
+    <rect class="box" x="182" y="176" width="44" height="24" rx="4"/>
+    <text text-anchor="middle" x="204" y="192">seg</text>
+    <path class="wire" d="M226,188 H242"/>
+    <rect class="box" x="242" y="176" width="44" height="24" rx="4"/>
+    <text text-anchor="middle" x="264" y="192">seg</text>
+    <path class="wire" d="M286,188 H302"/>
+    <rect class="box" x="302" y="176" width="44" height="24" rx="4"/>
+    <text text-anchor="middle" x="324" y="192">seg</text>
+    <text x="356" y="192">→ head</text>
+    <text class="ts" x="440" y="192">append-only · checksummed</text>
+    <!-- fork chain: shared base -->
+    <text x="30" y="230">attempt-1</text>
+    <path class="ptr" d="M178,226 C150,226 127,216 127,206"/>
+    <path class="ah live" d="M127,198 l-5,9 h10 z"/>
+    <rect class="box" x="182" y="214" width="44" height="24" rx="4"/>
+    <text text-anchor="middle" x="204" y="230">seg</text>
+    <text class="ts" x="236" y="230">base ptr (cow) — shares the parent's chain</text>
+  </svg>
+  </figure>
   <ul class="why">
     <li><b>O(1) forks</b>a fork shares the parent's durable objects through a base
     pointer and writes new ones only as it diverges — N forks of a G-byte database cost
