@@ -916,7 +916,7 @@ reference.
 
 | Method | Path | Auth | Body |
 |---|---|---|---|
-| `POST` | `/rpc` | Bearer | The same `Request`/`Response` JSON the unix socket speaks, one op per POST (`Content-Type: application/json` required; body capped at 1MiB, oversized -> `413`) |
+| `POST` | `/rpc` | Bearer | The same `Request`/`Response` JSON the unix socket speaks, one op per POST (`Content-Type: application/json` required; body capped at 1MiB, oversized -> `413`). Two ops are refused over HTTP: `subscribe` (use `GET /events`) and `export` — the one op that writes to an unconfined, client-chosen path on the daemon host, safe under the unix socket's same-host trust model but an arbitrary-file-write primitive for a network client, so it answers `400` here and stays socket-only |
 | `GET` | `/metrics` | Bearer | Prometheus text exposition of the locked `offshoot_*` metric set — see [docs/operations.md](operations.md#metrics) for the full name/type/label reference table |
 | `GET` | `/healthz` | **none** | `{"ok":true,"sessions":N}` — the one endpoint that needs no token, for liveness probes |
 | `GET` | `/events` | Bearer | Server-Sent Events: the daemon's event stream (Milestone 4 Task 4a — see [Eventing](#eventing-subscribe-op--get-events) below) |
@@ -1181,9 +1181,9 @@ but not durable in the bucket until this runs. An optional `name` also
 records a named checkpoint at the resulting transaction id (same checkpoint
 namespace as `offshoot checkpoint`, and stamped with the same `created_at`).
 Prints the transaction id now durable. The daemon writes a full snapshot
-every 16th flush and an incremental segment (only the changed pages)
-otherwise, so materializing state never replays more than one snapshot plus
-fifteen segments.
+every Nth flush (`serve -snapshot-every`, default 16) and an incremental
+segment (only the changed pages) otherwise, so materializing state never
+replays more than one snapshot plus N-1 segments.
 
 There is no separate daemon "checkpoint" op — a live session's named flush
 *is* how its checkpoints are created; the underlying daemon protocol's
@@ -1266,11 +1266,17 @@ daemon has a live session open on the target branch (unlike `checkout`/
 `rollback`/`promote`, which all refuse in that case) — it never touches the
 writable checkout.
 
-**Threat model:** the daemon speaks only a local unix socket (mode `0600`);
-any process able to open that socket already runs as the same user on the
-same host, so `export`'s destination path is trusted as an ordinary
-filesystem path that process can write — the daemon does not sandbox it or
-check it against an allow-list beyond requiring it be absolute.
+**Threat model:** these ops trust their caller the way the local unix
+socket (mode `0600`, created with that mode from the first instant) does:
+any process able to open it already runs as the same user on the same
+host, so `export`'s destination path is trusted as an ordinary filesystem
+path that process can write — the daemon does not sandbox it or check it
+against an allow-list beyond requiring it be absolute. That trust does NOT
+extend to the opt-in HTTP listener: `export` is refused over `POST /rpc`
+(it would be an arbitrary-file-write/exfiltration primitive for an
+authenticated network client) and remains unix-socket-only; `checkout-at`
+stays available over both transports since it only ever writes inside the
+store's own `checkouts-ro` tree.
 
 ---
 
