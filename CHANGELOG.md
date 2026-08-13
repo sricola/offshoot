@@ -13,6 +13,8 @@ version if you depend on format stability.
 
 ## [Unreleased]
 
+## [0.2.8] - 2026-08-12
+
 ### Added
 
 - **Packaging surfaces: in-repo Homebrew formula (`Formula/offshoot.rb`),
