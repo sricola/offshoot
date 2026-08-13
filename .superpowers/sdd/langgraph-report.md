@@ -64,13 +64,18 @@ Notes that shaped the design:
   delegate. Zero serialization code in this package.
 - **Value-add methods map 1:1 to offshoot ops** (documented in the module
   docstring + README table): `checkpoint(name)` → `Session.flush`;
-  `fork_thread(new, ttl=, from_checkpoint=, meta=)` → `Client.fork`
-  (flushes head first when no checkpoint named; returns a NEW saver with
-  its own daemon connection + session on the fork's checkout);
-  `rollback(to)` → `Client.rollback` (session+conn closed around the op —
-  the daemon refuses rollback with an open session — then reopened in
-  place, inner SqliteSaver replaced); `promote(onto, force=)` → flush +
-  `Client.promote`; `destroy()` → `Client.destroy` + full close.
+  `fork_thread(new, ttl=, from_checkpoint=, meta=)` → `Client.fork` (the
+  daemon's opFork flushes the branch's open session unconditionally, so a
+  head fork always includes LangGraph's latest writes — no client-side
+  flush; returns a NEW saver with its own daemon connection + session on
+  the fork's checkout); `rollback(to)` → `Client.rollback` (session+conn
+  closed around the op — the daemon refuses rollback with an open session
+  — then reopened in place, inner SqliteSaver replaced);
+  `promote(onto, force=)` → flush + `Client.promote`;
+  `destroy(force=False)` → `Client.destroy` + full close — the SDK's
+  protected-branch guard is preserved (review fix: a bare `destroy()` on
+  protected `main` refuses; the saver is closed either way, and destroy on
+  an already-closed saver is a documented silent no-op).
 - **Context manager + explicit `close()`**; closed-saver ops raise
   `OffshootError` naming db@branch.
 
@@ -95,7 +100,7 @@ mirrors sdk/python/tests/test_client.py's DaemonFixture), real langgraph
 from PyPI, real compiled `StateGraph`s:
 
 ```
-7 passed in 12.36s     (Python 3.14.6, langgraph 1.2.11, macOS arm64)
+8 passed in 12.33s     (Python 3.14.6, langgraph 1.2.11, macOS arm64)
 ```
 
 - `test_raw_put_get_tuple_round_trip` — BaseCheckpointSaver contract with
@@ -110,7 +115,11 @@ from PyPI, real compiled `StateGraph`s:
 - `test_promote_copies_winner_onto_target` — eval-loop ending: winner's
   state promoted onto protected `main` (session closed first, per daemon
   rule), fresh session on main sees it.
-- `test_destroy_deletes_branch` + `test_at_rest_is_stubbed`.
+- `test_destroy_deletes_branch` (unprotected fork deletes with the
+  default; destroy-after-close is a no-op) +
+  `test_destroy_default_respects_branch_protection` (bare `destroy()` on
+  protected main FAILS, branch survives; `force=True` from a fresh saver
+  succeeds) + `test_at_rest_is_stubbed`.
 
 Skip discipline (verified in a bare venv): no langgraph → `1 skipped`
 locally; with `CI=1` or `OFFSHOOT_REQUIRE_LANGGRAPH=1` → hard

@@ -184,10 +184,11 @@ class OffshootSaver(BaseCheckpointSaver):
         fork's own checkout, leaving this saver untouched.
 
         With ``from_checkpoint=None`` the fork is taken at this branch's
-        head — the live checkout is flushed first so the head includes
-        everything LangGraph has written up to now. With a named
-        checkpoint (previously created via :meth:`checkpoint`), the fork is
-        taken at exactly that state and no flush happens.
+        head; with a named checkpoint (previously created via
+        :meth:`checkpoint`), at exactly that state. Either way the daemon
+        flushes this branch's open session as part of the fork op, so a
+        head fork always includes everything LangGraph has written up to
+        now — no explicit flush is needed here.
 
         ``ttl`` (e.g. ``"1h"`` or a ``timedelta``) makes the fork
         self-reaping — the natural default for per-attempt / per-trial
@@ -196,8 +197,6 @@ class OffshootSaver(BaseCheckpointSaver):
         branch) independently of this one.
         """
         self._check_open()
-        if from_checkpoint is None:
-            self._session.flush()
         self._client.fork(self._db, self._branch, new_branch,
                           from_checkpoint=from_checkpoint, ttl=ttl, meta=meta)
         return OffshootSaver.session(self._socket_path, self._db, new_branch,
@@ -239,10 +238,18 @@ class OffshootSaver(BaseCheckpointSaver):
         self._session.flush()
         return self._client.promote(self._db, self._branch, onto, force=force)
 
-    def destroy(self, force: bool = True) -> None:
+    def destroy(self, force: bool = False) -> None:
         """Close this saver and delete its branch (``Client.destroy``).
-        ``force=True`` (default) also overrides the protected-branch
-        refusal — pass ``force=False`` to keep that guard."""
+
+        ``force=False`` (default) keeps the SDK's protected-branch guard:
+        destroying a protected branch (``main`` is protected by default)
+        raises ``OffshootError`` unless ``force=True``. Per-attempt fork
+        branches are unprotected and delete without it. Either way the
+        saver ends up CLOSED (SQLite connection, session, and daemon
+        socket released) — on a refused destroy the branch itself
+        survives; open a fresh saver (or use ``offshoot.Client.destroy``)
+        to retry with ``force=True``. On an already-closed saver this is
+        a silent no-op: nothing is deleted."""
         if self._closed:
             return
         self._conn.close()

@@ -173,16 +173,44 @@ def test_promote_copies_winner_onto_target(daemon):
 def test_destroy_deletes_branch(daemon):
     parent = OffshootSaver.session(daemon.sock, "destroydb")
     child = parent.fork_thread("doomed")
-    child.destroy()
+    child.destroy()  # unprotected fork: the force=False default suffices
     import offshoot
     with offshoot.connect(daemon.sock) as c:
         names = {b.branch for b in c.branches("destroydb")}
     assert "doomed" not in names
     parent.close()
-    # Idempotent / closed-saver guard.
+    # Closed-saver guards: ops raise; destroy is a documented silent no-op.
     from offshoot.client import OffshootError
     with pytest.raises(OffshootError):
         parent.checkpoint("nope")
+    parent.destroy()  # no-op, no raise
+    with offshoot.connect(daemon.sock) as c:
+        assert "main" in {b.branch for b in c.branches("destroydb")}
+
+
+def test_destroy_default_respects_branch_protection(daemon):
+    """A bare destroy() on protected main must FAIL with the protection
+    error (the SDK's Client.destroy(force=False) default is preserved);
+    destroy(force=True) succeeds."""
+    import offshoot
+    from offshoot.client import OffshootError
+
+    saver = OffshootSaver.session(daemon.sock, "protdb")
+    with pytest.raises(OffshootError):
+        saver.destroy()
+    # The branch survived the refusal...
+    with offshoot.connect(daemon.sock) as c:
+        assert "main" in {b.branch for b in c.branches("protdb")}
+    # ...but the saver is closed either way (documented): retry needs a
+    # fresh saver.
+    with pytest.raises(OffshootError):
+        saver.checkpoint("nope")
+
+    retry = OffshootSaver.session(daemon.sock, "protdb", create=False)
+    retry.destroy(force=True)
+    # main was protdb's only branch, so destroying it removes the db itself.
+    with offshoot.connect(daemon.sock) as c:
+        assert "protdb" not in c.dbs()
 
 
 def test_at_rest_is_stubbed():
