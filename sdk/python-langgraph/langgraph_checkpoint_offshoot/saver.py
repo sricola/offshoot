@@ -51,9 +51,10 @@ from typing import Any, TYPE_CHECKING
 from langgraph.checkpoint.base import BaseCheckpointSaver
 from langgraph.checkpoint.sqlite import SqliteSaver
 
-from offshoot.client import Client, OffshootError, Session, _TTL
+from offshoot.client import Client, OffshootError, Session, TTL
 
 if TYPE_CHECKING:
+    from contextlib import AbstractContextManager
     from langgraph.checkpoint.base import (
         ChannelVersions,
         Checkpoint,
@@ -177,7 +178,7 @@ class OffshootSaver(BaseCheckpointSaver):
         self._check_open()
         return self._session.flush(name, meta)
 
-    def fork_thread(self, new_branch: str, *, ttl: _TTL = None,
+    def fork_thread(self, new_branch: str, *, ttl: TTL = None,
                     from_checkpoint: str | None = None,
                     meta: dict[str, str] | None = None) -> "OffshootSaver":
         """Fork this branch (``Client.fork``) and return a NEW saver on the
@@ -353,6 +354,23 @@ class OffshootSaver(BaseCheckpointSaver):
         clone._inner = new_inner
         clone.serde = new_inner.serde
         return clone
+
+    # ------------------------------------------------------------------
+    # SqliteSaver extras (not on BaseCheckpointSaver): delegated too, so
+    # this wrapper stays a drop-in for code written against a SqliteSaver.
+    # Upstream documents both as internal-ish ("should not be called
+    # directly"), but they are public names, and
+    # tests/test_delegation_tripwire.py holds every public upstream method
+    # to explicit delegation — this pair included.
+    # ------------------------------------------------------------------
+
+    def setup(self) -> None:
+        return self._inner.setup()
+
+    def cursor(
+            self, transaction: bool = True,
+    ) -> "AbstractContextManager[sqlite3.Cursor]":
+        return self._inner.cursor(transaction)
 
     # Async variants: delegated as-is. SqliteSaver's async methods raise
     # NotImplementedError pointing at AsyncSqliteSaver — that behavior is

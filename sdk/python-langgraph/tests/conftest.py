@@ -67,6 +67,11 @@ class Daemon:
         subprocess.run([str(self.bin), "-store", str(self.store), "init"],
                        check=True, stdout=subprocess.DEVNULL, stderr=subprocess.PIPE)
         self.sock = str(self.dir / "d.sock")
+        # stderr=PIPE is only drained on early exit (below) — a pathologically
+        # chatty daemon could fill the OS pipe buffer and stall. Bounded risk,
+        # accepted deliberately: `offshoot serve` is quiet in steady state, and
+        # this mirrors sdk/python/tests/test_client.py's DaemonFixture; fixing
+        # it here alone would diverge the two fixtures.
         self.proc = subprocess.Popen(
             [str(self.bin), "-store", str(self.store), "serve", "-socket", self.sock],
             stdout=subprocess.DEVNULL, stderr=subprocess.PIPE)

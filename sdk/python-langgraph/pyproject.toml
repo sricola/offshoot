@@ -31,6 +31,11 @@ classifiers = [
 dependencies = [
   # Contract pinned against langgraph-checkpoint 4.2.0 /
   # langgraph-checkpoint-sqlite 3.1.1 (see README "Compatibility").
+  # langgraph-checkpoint is pinned directly (not only transitively via the
+  # sqlite package) because OffshootSaver's hand-written delegation surface
+  # is verified against BaseCheckpointSaver 4.2's method set — see
+  # tests/test_delegation_tripwire.py.
+  "langgraph-checkpoint>=4.2,<5",
   "langgraph-checkpoint-sqlite>=3.1,<4",
   # The offshoot daemon client (sdk/python). Not yet on PyPI: until launch,
   # install it from the repo first — `pip install -e sdk/python` — and this
