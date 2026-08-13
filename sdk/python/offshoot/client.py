@@ -15,9 +15,14 @@ from typing import Any, TypeAlias, cast
 
 # The TTL argument shape every `ttl=`-accepting method on this client (and
 # offshoot.langgraph.ThreadForks) takes — see `_ttl_str`'s docstring for how
-# each variant renders onto the wire. Not exported (module-private): purely
-# a typing convenience, not part of the public API surface.
-_TTL: TypeAlias = timedelta | int | str | None
+# each variant renders onto the wire. Public so out-of-repo wrappers (e.g.
+# langgraph-checkpoint-offshoot's OffshootSaver) can annotate their own
+# `ttl=` parameters without reaching for a private name.
+TTL: TypeAlias = timedelta | int | str | None
+
+# Backward-compatible private alias — TTL started life module-private and
+# in-repo callers imported `_TTL`; keep it working.
+_TTL = TTL
 
 
 class OffshootError(Exception):

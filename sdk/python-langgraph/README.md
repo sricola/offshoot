@@ -160,7 +160,11 @@ Pinned against `langgraph-checkpoint` 4.2.0 / `langgraph-checkpoint-sqlite`
 `get_tuple`, `list`, `delete_thread`, `get_next_version`, the async
 variants, plus the 4.x additions `copy_thread`, `delete_for_runs`, `prune`,
 `get_delta_channel_history`, `with_allowlist` — all delegated). Tested with
-`langgraph` 1.2.x.
+`langgraph` 1.2.x. Both packages are pinned directly in `pyproject.toml`
+(`langgraph-checkpoint>=4.2,<5`, `langgraph-checkpoint-sqlite>=3.1,<4`), and
+`tests/test_delegation_tripwire.py` re-introspects the installed surface so
+an upstream release that adds a public method fails the suite loudly instead
+of silently bypassing the inner saver.
 
 ## Tests
 
