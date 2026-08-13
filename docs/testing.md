@@ -83,7 +83,7 @@ that can't provide conditional writes: every store attach runs a CAS
 capability probe (`internal/store/probe_test.go` pins it), and backends
 that lack CAS — GCS's S3-interop API, notably — are rejected up front
 rather than degraded to a weaker guarantee
-([faq.md](faq.md#why-not-google-cloud-storage)). Destructive races have
+([faq.md](faq.md#why-no-google-cloud-storage)). Destructive races have
 their own guard: `destroy` CAS-writes a transient `Deleting` claim before
 doing anything irreversible, closing the check-then-delete window
 ([reference.md](reference.md#claim-guarded-delete-milestone-4-task-6b)).

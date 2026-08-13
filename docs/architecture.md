@@ -58,7 +58,8 @@ existing user file.
   ships LTX segments as sessions flush. The API exposes per-branch
   durability ("durable through txid X"); writes between shipments are
   acknowledged by SQLite but not yet durable in the store, and the API never
-  hides that (see [Durability](#durability) below).
+  hides that (see [Invariants](#invariants) below — durability is a
+  reported fact, not an assumption).
 - **Checkpoint (explicit)** — `checkpoint <db>@<branch> <name>`
   synchronously flushes (WAL → LTX → upload) and records `name → txid` in
   the ref. This is the only operation actually called "checkpoint"; the
