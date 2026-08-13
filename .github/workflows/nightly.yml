@@ -2,12 +2,17 @@ name: nightly
 
 on:
   schedule:
-    # 09:00 UTC daily — the cheap leg (ubuntu torture + conformance), and it
-    # skips itself when main hasn't moved since the last run.
-    - cron: "0 9 * * *"
+    # 09:00 UTC Monday–Saturday — the cheap daily leg (ubuntu torture +
+    # conformance), and it skips itself when main hasn't moved since the
+    # last run. Sunday is deliberately excluded: the weekly cron below is
+    # the only 09:00 Sunday run, so the two schedules can never double-fire
+    # (previously `* * *` made Sunday bill the ubuntu torture leg twice).
+    - cron: "0 9 * * 1-6"
     # 09:00 UTC Sunday — the expensive weekly leg (macOS at 10x billing:
     # full `go test ./...` + torture). This is where the macOS coverage
-    # removed from ci.yml's per-push matrix now lives.
+    # removed from ci.yml's per-push matrix now lives. This exact cron
+    # string is compared in ONE place — the activity job's `weekly` output
+    # below — keep the two byte-for-byte identical.
     - cron: "0 9 * * 0"
   workflow_dispatch:
 
@@ -24,11 +29,31 @@ jobs:
     runs-on: ubuntu-latest
     outputs:
       fresh: ${{ steps.check.outputs.fresh }}
+      # weekly=true selects the expensive leg (macOS torture + full macOS
+      # `go test`): the Sunday cron, and every manual dispatch. Computed
+      # here, ONCE — torture's matrix ternary and macos-test's `if` consume
+      # this output instead of re-comparing the cron string, so the string
+      # lives in exactly two places (on.schedule + the one comparison below).
+      weekly: ${{ steps.check.outputs.weekly }}
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
+        with:
+          persist-credentials: false
       - id: check
+        env:
+          EVENT_NAME: ${{ github.event_name }}
+          EVENT_SCHEDULE: ${{ github.event.schedule }}
         run: |
-          if [ "${{ github.event_name }}" != "schedule" ] || [ "${{ github.event.schedule }}" = "0 9 * * 0" ]; then
+          # The literal below must match the Sunday cron in on.schedule
+          # byte-for-byte — this is the ONLY place it is compared; every
+          # other job consumes the `weekly` output instead.
+          weekly=false
+          if [ "$EVENT_NAME" != "schedule" ] || [ "$EVENT_SCHEDULE" = "0 9 * * 0" ]; then
+            weekly=true   # manual dispatch and the Sunday leg
+          fi
+          echo "weekly=$weekly" >> "$GITHUB_OUTPUT"
+
+          if [ "$weekly" = "true" ]; then
             echo "fresh=true" >> "$GITHUB_OUTPUT"   # manual runs and the weekly leg never skip
           elif [ -n "$(git log -1 --since='25 hours ago' --format=%H)" ]; then
             echo "fresh=true" >> "$GITHUB_OUTPUT"
@@ -40,38 +65,28 @@ jobs:
   torture:
     needs: activity
     # Daily cron: ubuntu only (1x billing). Weekly Sunday cron + manual
-    # dispatch: both OSes — the macOS torture leg (10x billing) that used to
-    # run daily now runs weekly, alongside the full macOS `go test` below.
+    # dispatch (activity's weekly=true): both OSes — the macOS torture leg
+    # (10x billing) that used to run daily now runs weekly, alongside the
+    # full macOS `go test` below.
     if: github.ref == 'refs/heads/main' && needs.activity.outputs.fresh == 'true'
     strategy:
       fail-fast: false
       matrix:
-        os: ${{ (github.event_name != 'schedule' || github.event.schedule == '0 9 * * 0') && fromJSON('["ubuntu-latest", "macos-latest"]') || fromJSON('["ubuntu-latest"]') }}
+        os: ${{ needs.activity.outputs.weekly == 'true' && fromJSON('["ubuntu-latest", "macos-latest"]') || fromJSON('["ubuntu-latest"]') }}
     runs-on: ${{ matrix.os }}
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
+        with:
+          persist-credentials: false
 
-      - uses: actions/setup-go@v5
+      - uses: actions/setup-go@40f1582b2485089dde7abd97c1529aa768e1baff # v5.6.0
         with:
           go-version-file: go.mod
 
-      - name: Install sqlite3 CLI (ubuntu)
-        if: runner.os == 'Linux'
-        run: |
-          sudo apt-get update
-          sudo apt-get install -y sqlite3
+      # No sqldiff on either OS: torture never exercises offshoot diff.
+      - uses: ./.github/actions/setup-sqlite
 
-      - name: Install sqlite3 CLI (macos)
-        if: runner.os == 'macOS'
-        run: |
-          # macos-latest (macos-26 since 2026-07) no longer ships the sqlite3
-          # CLI on PATH; brew's sqlite is keg-only, so link it explicitly —
-          # same rationale and step as ci.yml's test job. Without this the
-          # unconditional verify below fails the job before any test runs.
-          brew install sqlite || true
-          echo "$(brew --prefix sqlite)/bin" >> "$GITHUB_PATH"
-
-      # If either install breaks, fail here — and testutil.RequireSQLite3
+      # If the install breaks, fail here — and testutil.RequireSQLite3
       # would hard-fail the tests anyway (CI=true), never silently skip.
       - name: Verify sqlite3 CLI is present
         run: sqlite3 --version
@@ -81,20 +96,23 @@ jobs:
 
   # The full macOS test suite (the coverage removed from ci.yml's per-push
   # matrix, where its 10x billing dominated the Actions bill): weekly
-  # Sunday leg and manual dispatch only.
+  # Sunday leg and manual dispatch only (activity's weekly output).
   macos-test:
     needs: activity
-    if: github.ref == 'refs/heads/main' && needs.activity.outputs.fresh == 'true' && (github.event_name != 'schedule' || github.event.schedule == '0 9 * * 0')
+    if: github.ref == 'refs/heads/main' && needs.activity.outputs.fresh == 'true' && needs.activity.outputs.weekly == 'true'
     runs-on: macos-latest
     steps:
-      - uses: actions/checkout@v4
-      - uses: actions/setup-go@v5
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
+        with:
+          persist-credentials: false
+      - uses: actions/setup-go@40f1582b2485089dde7abd97c1529aa768e1baff # v5.6.0
         with:
           go-version-file: go.mod
-      - name: Install sqlite3 + sqldiff (macos)
-        run: |
-          brew install sqlite sqldiff || true
-          echo "$(brew --prefix sqlite)/bin" >> "$GITHUB_PATH"
+      # sqldiff on: this full `go test ./...` includes cmd/offshoot's diff
+      # tests — the same coverage ci.yml's ubuntu test job gets.
+      - uses: ./.github/actions/setup-sqlite
+        with:
+          sqldiff: "true"
       - name: Verify CLIs present
         run: sqlite3 --version && sqldiff --help >/dev/null
       - name: go test
@@ -110,9 +128,11 @@ jobs:
     if: github.ref == 'refs/heads/main' && vars.NIGHTLY_S3 == 'true' && needs.activity.outputs.fresh == 'true'
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
+        with:
+          persist-credentials: false
 
-      - uses: actions/setup-go@v5
+      - uses: actions/setup-go@40f1582b2485089dde7abd97c1529aa768e1baff # v5.6.0
         with:
           go-version-file: go.mod
 

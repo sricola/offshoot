@@ -38,7 +38,10 @@ jobs:
   # `go test ./...` + torture on macos-latest) and in every release build.
   # Linux catches everything platform-independent; the known macOS-specific
   # breakages (sqlite3 CLI missing from the image, reflink/clonefile paths)
-  # are exercised weekly and at every tag.
+  # are exercised weekly and at every tag. The macOS sqlite3/brew install
+  # logic itself lives in .github/actions/setup-sqlite (consumed by
+  # nightly.yml's macos-test), so re-adding macOS to this matrix is a
+  # one-line change — no dead macOS step is kept here.
   test:
     strategy:
       fail-fast: false
@@ -46,36 +49,20 @@ jobs:
         os: [ubuntu-latest]
     runs-on: ${{ matrix.os }}
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
+        with:
+          persist-credentials: false
 
-      - uses: actions/setup-go@v5
+      - uses: actions/setup-go@40f1582b2485089dde7abd97c1529aa768e1baff # v5.6.0
         with:
           go-version-file: go.mod
 
-      - name: Install sqlite3 CLI (ubuntu)
-        if: runner.os == 'Linux'
-        run: |
-          sudo apt-get update
-          # sqlite3-tools is a SEPARATE package from sqlite3 (verified against
-          # the ubuntu-latest image: `apt-cache show sqlite3-tools` lists
-          # /usr/bin/sqldiff, /usr/bin/sqlite3_analyzer, /usr/bin/sqlite3_rsync)
-          # — offshoot diff's default (non --summary) mode needs sqldiff on
-          # PATH; the CLI tests that exercise it (cmd/offshoot/diff_test.go)
-          # gate on exec.LookPath("sqldiff") the same way requireSQLite3
-          # gates on sqlite3 itself, so this install is what turns those
-          # tests on in CI rather than silently skipping them.
-          sudo apt-get install -y sqlite3 sqlite3-tools
-
-      - name: Install sqlite3 CLI (macos)
-        if: runner.os == 'macOS'
-        run: |
-          # The macos-26 runner image (macos-latest since 2026-07) no longer
-          # ships the sqlite3 CLI on PATH — earlier images did, and this step's
-          # absence only bit when macos-latest rolled forward. brew's sqlite
-          # is keg-only, so link the binaries onto PATH explicitly; the
-          # `sqldiff` formula provides offshoot diff's default mode.
-          brew install sqlite sqldiff || true
-          echo "$(brew --prefix sqlite)/bin" >> "$GITHUB_PATH"
+      # sqldiff on: cmd/offshoot/diff_test.go exercises offshoot diff's
+      # default (sqldiff-backed) mode in this job — see the composite action
+      # for the full rationale.
+      - uses: ./.github/actions/setup-sqlite
+        with:
+          sqldiff: "true"
 
       - name: Verify sqlite3 CLI is present
         run: sqlite3 --version && sqldiff --help >/dev/null
@@ -116,27 +103,36 @@ jobs:
   metrics-lint:
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
+        with:
+          persist-credentials: false
 
-      - uses: actions/setup-go@v5
+      - uses: actions/setup-go@40f1582b2485089dde7abd97c1529aa768e1baff # v5.6.0
         with:
           go-version-file: go.mod
 
-      - name: Install sqlite3 CLI
-        run: |
-          sudo apt-get update
-          sudo apt-get install -y sqlite3
+      # No sqldiff: nothing in the promtool gate touches offshoot diff.
+      - uses: ./.github/actions/setup-sqlite
 
-      # Pinned version, not "latest": a promtool release changing its check
-      # rules out from under this job should be a deliberate version bump
-      # here, not a silent, unreviewed CI behavior change on some future PR
-      # that touches nothing metrics-related.
+      # Pinned version AND checksum, not "latest": a promtool release
+      # changing its check rules out from under this job should be a
+      # deliberate version bump here, not a silent, unreviewed CI behavior
+      # change — and release assets are replaceable upstream without the URL
+      # changing, so the sha256 is what actually freezes the bits.
       - name: Install promtool
         run: |
           set -euo pipefail
           ver=3.13.2
+          # sha256 of prometheus-3.13.2.linux-amd64.tar.gz, cross-checked
+          # against the v3.13.2 release's published sha256sums.txt. Bump the
+          # version and this hash together.
+          sha256=0e8c4d46101bd025ea8265e377d2caabc57f488fc1be1c367f37db69ea41be6f
           curl -sSfL -o /tmp/prometheus.tar.gz \
             "https://github.com/prometheus/prometheus/releases/download/v${ver}/prometheus-${ver}.linux-amd64.tar.gz"
+          if ! echo "${sha256}  /tmp/prometheus.tar.gz" | sha256sum -c -; then
+            echo "promtool tarball sha256 mismatch (expected ${sha256}) — refusing to extract" >&2
+            exit 1
+          fi
           tar -xzf /tmp/prometheus.tar.gz -C /tmp "prometheus-${ver}.linux-amd64/promtool"
           sudo mv "/tmp/prometheus-${ver}.linux-amd64/promtool" /usr/local/bin/promtool
           promtool --version
@@ -154,23 +150,23 @@ jobs:
   sdks:
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
+        with:
+          persist-credentials: false
 
-      - uses: actions/setup-go@v5
+      - uses: actions/setup-go@40f1582b2485089dde7abd97c1529aa768e1baff # v5.6.0
         with:
           go-version-file: go.mod
 
-      - uses: actions/setup-node@v4
+      - uses: actions/setup-node@49933ea5288caeca8642d1e84afbd3f7d6820020 # v4.4.0
         with:
           node-version: "22"
 
       - name: Verify system python3 is present
         run: python3 --version
 
-      - name: Install sqlite3 CLI
-        run: |
-          sudo apt-get update
-          sudo apt-get install -y sqlite3
+      # No sqldiff: the SDK suites drive the daemon, never offshoot diff.
+      - uses: ./.github/actions/setup-sqlite
 
       - name: make test-sdks
         run: make test-sdks
@@ -237,23 +233,31 @@ jobs:
     # MinIO is started with a plain `docker run` (see "Start MinIO" below)
     # rather than a `services:` container: the job-level services schema has
     # no way to pass `server /data` as the container command without
-    # replacing the image's entrypoint, and `docker run ... minio/minio:latest
+    # replacing the image's entrypoint, and `docker run ... minio/minio
     # server /data` is exactly the invocation the README's supported-provider
-    # table cites as verified, so this keeps CI matching that evidence.
+    # table cites as verified, so this keeps CI matching that evidence. The
+    # only CI-side deviation: both images are digest-pinned (immutable)
+    # instead of `:latest`, so a replaced upstream tag can't silently change
+    # what runs next to the checkout.
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
+        with:
+          persist-credentials: false
 
-      - uses: actions/setup-go@v5
+      - uses: actions/setup-go@40f1582b2485089dde7abd97c1529aa768e1baff # v5.6.0
         with:
           go-version-file: go.mod
 
       - name: Start MinIO
+        # Digest = what minio/minio:latest resolved to when last reviewed
+        # (# minio:RELEASE.2025-09-07T16-13-09Z). Bump deliberately, together
+        # with the mc digest below.
         run: |
           docker run -d --name minio \
             -p 9000:9000 \
             -e MINIO_ROOT_USER=minioadmin \
             -e MINIO_ROOT_PASSWORD=minioadmin \
-            minio/minio:latest server /data
+            minio/minio@sha256:14cea493d9a34af32f524e538b8346cf79f3321eff8e708c1e2960462bd8936e server /data
           for i in $(seq 1 30); do
             if curl -sSf http://127.0.0.1:9000/minio/health/live >/dev/null; then
               echo "minio is up"
@@ -264,10 +268,11 @@ jobs:
           curl -sSf http://127.0.0.1:9000/minio/health/live
 
       - name: Create test bucket
+        # Digest = minio/mc:latest at last review (# mc:RELEASE.2025-08-13T08-35-41Z).
         run: |
           docker run --rm --network host \
             -e MC_HOST_local=http://minioadmin:minioadmin@127.0.0.1:9000 \
-            minio/mc:latest mb -p local/offshoot-test
+            minio/mc@sha256:a7fe349ef4bd8521fb8497f55c6042871b2ae640607cf99d9bede5e9bdf11727 mb -p local/offshoot-test
 
       - name: make test-s3
         env:

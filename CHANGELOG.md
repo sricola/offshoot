@@ -13,6 +13,14 @@ version if you depend on format stability.
 
 ## [Unreleased]
 
+### Changed
+
+- CI/release supply-chain hardening: every GitHub Action SHA-pinned (with
+  Dependabot keeping pins fresh), least-privilege per-job release
+  permissions, checksum-verified promtool download, digest-pinned MinIO
+  images, no `${{ }}` interpolation in workflow shell, `:latest` Docker tag
+  only on real tag pushes, and one shared sqlite setup action.
+
 ## [0.2.8] - 2026-08-12
 
 ### Added

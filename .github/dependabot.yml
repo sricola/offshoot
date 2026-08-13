@@ -1,0 +1,14 @@
+version: 2
+updates:
+  # The workflows SHA-pin every action (supply-chain: immune to tag
+  # rewrites); this is what keeps those pins from rotting — Dependabot PRs
+  # bump the pinned SHA and its trailing `# vX.Y.Z` comment together.
+  - package-ecosystem: github-actions
+    directory: /
+    schedule:
+      interval: weekly
+
+  - package-ecosystem: gomod
+    directory: /
+    schedule:
+      interval: weekly
