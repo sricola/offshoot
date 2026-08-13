@@ -19,6 +19,11 @@ version if you depend on format stability.
   Nix flake (`flake.nix`, vendorHash pending first `nix build`), a README
   install matrix (brew/docker/nix/prebuilt/WSL2), and `sqldiff` in the
   Docker image so `offshoot diff` works in-container.**
+- Copy-on-write fork benchmark harness (`make bench-cow`,
+  `internal/ops/cow_bench_test.go`) and published measured numbers for
+  shared-fork latency, added bytes per fork, divergence cost, and the
+  read path — the new "Copy-on-write fork cost (v0.2.x)" section at the
+  top of docs/benchmarks.md.
 
 ## [0.2.7] - 2026-08-11
 

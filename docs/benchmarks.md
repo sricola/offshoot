@@ -1,5 +1,149 @@
 # Benchmarks
 
+## Copy-on-write fork cost (v0.2.x)
+
+Measured numbers for the claim the copy-on-write fork actually makes:
+**forking is storage-O(1) — a shared fork writes two tiny objects (the
+child lineage's `base.json` + the branch ref), regardless of database
+size — and a child pays only for what it changes.** Everything in this
+section was measured on this machine, at v0.2.7 + this harness
+(2026-08-12); every other section of this document predates copy-on-write
+(v0.1.x measurements) and describes the **materialize** path — see the
+version note below it.
+
+**Machine:** darwin/arm64, Apple M4 (10 cores), 16 GiB RAM, macOS 27.0
+(build 26A5388g), local APFS disk, Go 1.26.5. Local directory store
+backend (the default `make bench` target's backend). No other load.
+
+**Reproduce:** `make bench-cow` (benchmarks live in
+`internal/ops/cow_bench_test.go`; the target's invocations are exactly the
+ones below). Latency numbers are the **median of 5 samples**
+(`-count=5 -benchtime=3x`, each sample the mean of 3 iterations); byte
+numbers are exact object-store accounting (sum of stored object sizes,
+diffed before/after — what an S3 backend would bill), identical across
+repeat runs.
+
+### Shared fork latency vs database size
+
+| DB size | `Fork` at head (default), median | `Fork` at named checkpoint, median |
+|---|---|---|
+| 12 MB | 17.0 ms | 11.7 ms |
+| 100 MB | 50.3 ms | 11.3 ms |
+| 1 GB | 418.0 ms | **9.3 ms** |
+
+The share path itself (`at=checkpoint`) is **near-constant, ~9–12 ms from
+12 MB to 1 GB** — it writes two small objects and never touches the
+database's bytes. The honest flag on the default call shape: `Fork` at
+head (`at=""`) **still grows with size** — not from the share, but from
+the pre-existing safety check that SHA-256-hashes the whole checkout file
+to warn about uncheckpointed changes (~2.6 GB/s on this machine; the same
+O(size) check documented in "What's still O(size) after Task 6a" below).
+So "O(1) fork" is true of the storage work and of forking a named
+checkpoint, and NOT yet true of a default at-head fork's wall-clock
+latency. Raw samples:
+
+```
+BenchmarkCoWSharedFork/size=12MB/at=head-10          3  13807180 ns/op ... (5 samples: 13.8/17.1/21.3/17.0/13.6 ms)
+BenchmarkCoWSharedFork/size=12MB/at=checkpoint-10    3  10676945 ns/op ... (10.7/9.3/12.2/11.7/12.7 ms)
+BenchmarkCoWSharedFork/size=100MB/at=head-10         3  47628208 ns/op ... (47.6/53.3/50.3/51.0/48.6 ms)
+BenchmarkCoWSharedFork/size=100MB/at=checkpoint-10   3   8351125 ns/op ... (8.4/11.3/12.8/10.6/13.2 ms)
+BenchmarkCoWSharedFork/size=1GB/at=head-10           3 418239347 ns/op ... (418.2/409.3/410.6/418.4/418.0 ms)
+BenchmarkCoWSharedFork/size=1GB/at=checkpoint-10     3   8028959 ns/op ... (8.0/8.9/9.3/13.0/13.0 ms)
+```
+
+### Added object-store bytes per fork (100 MB database)
+
+| Fork kind | N forks | Added bytes per fork | Added objects per fork |
+|---|---|---|---|
+| Shared (CoW, the default) | 1 | 377 B | 2 |
+| Shared (CoW, the default) | 10 | 377 B | 2 |
+| Shared (CoW, the default) | 100 | 376.9 B | 2 |
+| Materialized (forced via test hook — the pre-CoW behavior / fork-time floor) | 1 and 10 | 105,807,581 B (~105.8 MB, one full snapshot) | 2 |
+| Plain `cp` of the SQLite file (no offshoot) | — | the full file (~105.8 MB) | — |
+
+A shared fork of a 100 MB database adds **377 bytes** — one `base.json`
+(the durable base pointer) plus one branch ref — about **280,000× less**
+than a materialized fork or a `cp`, and flat from N=1 to N=100. For
+latency context, plain `cp` of the same 105.8 MB file took a median
+**43.5 ms** (2.4 GB/s full byte copy) vs the share path's ~11 ms.
+
+```
+BenchmarkCoWSharedForkAddedBytes-10         100  47355148 ns/op  376.9 addedBytes/fork  2.000 addedObjects/fork
+BenchmarkCoWMaterializedForkAddedBytes-10    10  47614808 ns/op  105807581 addedBytes/fork  2.000 addedObjects/fork
+BenchmarkCoWCpBaseline-10                     3  42279986 ns/op  2483.08 MB/s   (5 samples: 42.3/44.5/43.5/57.7/40.2 ms)
+```
+
+### Divergence cost: what a shared child pays as it writes
+
+Fork a 100 MB database (share), pre-materialize the child's checkout (so
+the settling-flush suppression arms and flushes are segments — the
+steady-state, see `cow_divergence_test.go`), then write k single-row
+transactions with one `Flush` each at the default snapshot cadence
+(`SnapshotEvery=16`). Identical across 3 repeat runs:
+
+| k (transactions) | Added bytes total | Added bytes per transaction |
+|---|---|---|
+| 8 (stays under the cadence) | 6,209 B | **776 B** |
+| 20 (crosses the cadence once) | 105,822,553 B | 5.29 MB amortized |
+
+Under the cadence, divergence is **O(changed pages)**: ~776 B per
+single-row transaction against a 100 MB database — segments, the ref
+update, nothing size-proportional. The honest second row: every
+`SnapshotEvery`-th flush (16th, by default) writes a **full self-snapshot**
+(the divergence floor that keeps read chains bounded), which is O(DB) —
+105.8 MB here, visible as the 0.48 s flush in the raw log. Steady-state
+cost is therefore ~776 B/txn plus one full snapshot per 16 flushes.
+
+```
+BenchmarkCoWDivergenceAddedBytes/k=8-10    1   726884166 ns/op       6209 addedBytes/child     776.1 addedBytes/txn
+BenchmarkCoWDivergenceAddedBytes/k=20-10   1  1428649333 ns/op  105822553 addedBytes/child   5291128 addedBytes/txn
+```
+
+### Read-path sanity: checking out a shared fork
+
+Full checkout materialization from scratch (checkout file + sidecar
+deleted each iteration; 100 MB database; median of 5):
+
+| Branch | Checkout (full materialize), median |
+|---|---|
+| Parent (own snapshot) | 610.0 ms |
+| Shared child (resolves through `base.json` into the parent's chain) | 357.7 ms |
+
+The shared child's checkout is in the same regime as the parent's — the
+bounded-replay claim holds at this shape (the child's resolved chain is
+the parent's snapshot plus zero own segments, one extra `base.json` read).
+Run-to-run spread is wide (parent samples 421–689 ms; child 336–539 ms),
+so read the table as "no read penalty for a shared fork beyond noise,"
+not as "children are faster."
+
+### Caveats (read before quoting these numbers)
+
+- **Local backend, APFS, one machine.** S3 adds per-request network
+  latency to every number here, but the **object math is identical by
+  construction**: a shared fork issues the same two small writes
+  (`base.json` + ref) against S3 — no snapshot copy, no data-plane
+  traffic — so the "377 B / 2 objects per fork" accounting carries over
+  even though the milliseconds do not.
+- Added bytes are **logical stored-object bytes** (what S3 would bill).
+  On APFS the local backend's materialize path clones (`clonefile`), so
+  the materialized fork's *physical* local disk usage is far below its
+  105.8 MB logical footprint — the logical number is the one that
+  transfers to a real object store.
+- Default at-head `Fork` latency is O(size) (the uncheckpointed-changes
+  hash), not O(1) — see the latency table's note.
+- A shared child's write path snapshots in full every `SnapshotEvery`
+  (default 16) flushes — divergence is O(changed pages) *between* those
+  floors, not unconditionally.
+- Seeded databases are freshly checkpointed single-snapshot chains — the
+  share path's common case. Forking a branch whose resolved chain has
+  reached the fork-time floor (`ForkShareMaxDepth`, or the configured
+  session cadence) materializes instead, at the "Materialized" row's cost.
+
+---
+
+Everything below this line was measured **before** copy-on-write existed
+and is preserved as published; the next section's version note scopes it.
+
 Measured baselines for `ops.Workspace.Fork`, `Checkout`'s clean-skip fast
 path (Task 1 of Milestone 2), and `session.Open` — **before** and **after**
 Task 6a's fast-path fork. The point of this document is to make the
