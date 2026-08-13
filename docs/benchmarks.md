@@ -7,6 +7,23 @@ before/after comparison honest: these are real numbers from real runs, not
 estimates. The "before" column is exactly what was measured and published
 prior to Task 6a; it is kept, not replaced, so the comparison is checkable.
 
+> **Version note — every number below was measured on a pre-copy-on-write
+> build (the v0.1.x line, 2026-08-06), and is kept as measured rather than
+> re-invented.** Since v0.2.0 the default `fork` **shares** (a base
+> pointer, no object copy at all), so the `ForkAtHead` numbers below no
+> longer describe the common-case fork's storage work — they describe the
+> **materialize path**: a fork that trips the fork-time snapshot floor,
+> and every `promote`/`rollback`/`compact`, all of which still use exactly
+> the snapshot-copy machinery measured here. The O(size)
+> uncheckpointed-changes check these numbers are dominated by (see
+> "Isolating the fast path itself") still runs on a shared fork at head
+> too. The `CheckoutCleanSkip` and `SessionOpen` numbers are unaffected by
+> the copy-on-write change. Also superseded since measurement: S3
+> `CopyObject`'s 5 GiB ceiling is now a strategy boundary, not a limit —
+> v0.2.4 added multipart `UploadPartCopy` for sources up to S3's 5 TiB
+> per-object ceiling, so the ">5GB falls back to materialize" behavior
+> described below no longer applies (only >5 TiB falls back).
+
 Benchmarks live in `internal/ops/fork_bench_test.go`. Run them with
 `make bench` (local store) or `make bench-s3` (real MinIO in Docker). The
 benchmark code itself is unchanged by Task 6a — same subtest names, same
@@ -132,11 +149,13 @@ unconditionally. `ops.Fork`'s fast path (Task 6a, unchanged by this slice)
 now actually fires against an S3 backend for any single-snapshot-chain
 checkpoint, the same way it already did against the local backend.
 
-**The 5GB guard:** S3's `CopyObject` supports source objects up to 5 GiB in
-a single request; anything larger needs the multipart `UploadPartCopy` API,
-which this backend does not implement (out of scope for this slice, same as
-it was for Task 6a's local reflink path — see `copyObjectMaxBytes` in
-`s3.go`). `CopyObject` HEADs the source first — one request, not a
+**The 5GB guard** *(as measured then; superseded in v0.2.4 — see the
+version note at the top: `CopyObject` now multipart-copies sources up to
+S3's 5 TiB per-object ceiling, and only >5 TiB falls back)*: S3's
+`CopyObject` supports source objects up to 5 GiB in a single request;
+anything larger needed the multipart `UploadPartCopy` API, which this
+backend did not implement at measurement time (out of scope for that
+slice — see `copyObjectMaxBytes` in `s3.go`). `CopyObject` HEADs the source first — one request, not a
 download — reads `ContentLength`, and returns the `ErrCopyUnsupported`
 sentinel for anything over 5 GiB *before* ever attempting the copy. That
 sentinel is the exact signal `ops.Fork`'s fast path (Task 6a) was already
@@ -393,13 +412,15 @@ the object copy itself.
 - **`session.Open`**: dominated by the same `Checkout` clean-skip cost,
   since `Open` calls `Checkout` internally. Unchanged by Task 6a.
 - **`Fork` itself, when the fast-path precondition doesn't hold**: a
-  multi-member chain (post-segment-flush branch), or — since Task 6b — a
-  single-snapshot checkpoint whose object is over S3's 5GB single-request
-  `CopyObject` limit, still takes the full materialize-and-re-encode path,
-  unchanged from before Task 6a. Before Task 6b, EVERY S3 fork took this
+  multi-member chain (post-segment-flush branch) still takes the full
+  materialize-and-re-encode path, unchanged from before Task 6a. At
+  measurement time a single-snapshot checkpoint whose object was over S3's
+  5GB single-request `CopyObject` limit also fell back this way; since
+  v0.2.4 that case is instead a multipart server-side copy (see the
+  version note at the top). Before Task 6b, EVERY S3 fork took the slow
   path regardless of chain shape or size (`store.S3.CopyObject` returned
-  `ErrCopyUnsupported` unconditionally) — see `TestForkFastPathSkipsMultiMemberChains`
-  and, for the size gate specifically, `TestS3CopyObjectOverSizeLimitFallsBack`.
+  `ErrCopyUnsupported` unconditionally) — see
+  `TestForkFastPathSkipsMultiMemberChains`.
 
 **Task 6a's fast path applies only when the checkpoint being forked
 resolves to a chain of exactly one member, and that member is itself a
