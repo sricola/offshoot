@@ -8,7 +8,7 @@ require (
 	github.com/aws/aws-sdk-go-v2/service/s3 v1.106.2
 	github.com/aws/smithy-go v1.27.5
 	github.com/mattn/go-sqlite3 v1.14.49
-	github.com/superfly/ltx v0.5.1
+	github.com/superfly/ltx v0.5.2
 	golang.org/x/sys v0.44.0
 )
 
@@ -27,5 +27,5 @@ require (
 	github.com/aws/aws-sdk-go-v2/service/sso v1.33.2 // indirect
 	github.com/aws/aws-sdk-go-v2/service/ssooidc v1.38.2 // indirect
 	github.com/aws/aws-sdk-go-v2/service/sts v1.45.2 // indirect
-	github.com/pierrec/lz4/v4 v4.1.22 // indirect
+	github.com/pierrec/lz4/v4 v4.1.23 // indirect
 )
