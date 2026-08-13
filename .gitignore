@@ -13,3 +13,20 @@ sdk/python/.dry-run-venv/
 __pycache__/
 
 .superpowers/
+
+# Defensive: local credentials/config must never be committable.
+.env
+.env.*
+!.env.example
+*.pem
+*.key
+*.p12
+*.pfx
+credentials.*
+secrets.*
+
+# OS/editor noise.
+.DS_Store
+*.log
+.idea/
+.vscode/
