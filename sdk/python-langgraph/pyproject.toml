@@ -1,0 +1,53 @@
+[build-system]
+requires = ["setuptools>=77"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "langgraph-checkpoint-offshoot"
+version = "0.1.0"
+description = "LangGraph checkpointer backed by offshoot: forkable, rollbackable, TTL-reaped SQLite threads"
+readme = "README.md"
+requires-python = ">=3.10"
+license = "Apache-2.0"
+authors = [
+  { name = "offshoot contributors" },
+]
+keywords = ["langgraph", "checkpoint", "sqlite", "branching", "agents", "eval"]
+classifiers = [
+  "Development Status :: 3 - Alpha",
+  "Intended Audience :: Developers",
+  "Programming Language :: Python :: 3",
+  "Programming Language :: Python :: 3.10",
+  "Programming Language :: Python :: 3.11",
+  "Programming Language :: Python :: 3.12",
+  "Programming Language :: Python :: 3.13",
+  "Topic :: Database",
+  "Topic :: Software Development :: Testing",
+  "Operating System :: POSIX :: Linux",
+  "Operating System :: MacOS",
+]
+# License classifiers are deliberately omitted — same PEP 639 stance as
+# sdk/python/pyproject.toml.
+dependencies = [
+  # Contract pinned against langgraph-checkpoint 4.2.0 /
+  # langgraph-checkpoint-sqlite 3.1.1 (see README "Compatibility").
+  "langgraph-checkpoint-sqlite>=3.1,<4",
+  # The offshoot daemon client (sdk/python). Not yet on PyPI: until launch,
+  # install it from the repo first — `pip install -e sdk/python` — and this
+  # requirement resolves against that local install. At launch this becomes
+  # an ordinary PyPI dependency pin.
+  "offshoot-db>=0.1.0",
+]
+
+[project.urls]
+Homepage = "https://github.com/sricola/offshoot"
+Repository = "https://github.com/sricola/offshoot"
+Issues = "https://github.com/sricola/offshoot/issues"
+Changelog = "https://github.com/sricola/offshoot/blob/main/CHANGELOG.md"
+
+[tool.setuptools.packages.find]
+include = ["langgraph_checkpoint_offshoot*"]
+
+# PEP 561 marker — same stance as sdk/python.
+[tool.setuptools.package-data]
+langgraph_checkpoint_offshoot = ["py.typed"]
