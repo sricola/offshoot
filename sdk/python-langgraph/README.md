@@ -25,7 +25,13 @@ offshoot daemon op:
 | `fork_thread(new, ttl=..)` | `Client.fork`        | fork the branch; returns a **new saver** on the fork's own checkout |
 | `rollback(to)`             | `Client.rollback`    | repoint the branch at a named checkpoint; saver reopens in place    |
 | `promote(onto)`            | `Client.promote`     | repoint `onto` (e.g. `main`) at this branch's head                  |
-| `destroy()`                | `Client.destroy`     | close the saver and delete its branch                               |
+| `destroy()`                | `Client.destroy`     | close the saver and delete its branch (protected branches — `main` by default — require `force=True`) |
+
+Looking for the inverse — keep your existing LangGraph checkpointer and
+fork only the *application* database your agent's tools write to? That's
+`offshoot.langgraph.ThreadForks` in the core SDK
+([`sdk/python`](../python/README.md)); this package is for putting
+LangGraph's **own thread state** under offshoot.
 
 ## Modes
 
@@ -138,6 +144,10 @@ if it_went_badly:
 - **`promote` onto a branch with an open session**: close that session
   first (the session owns the checkout promote repoints), same rule as
   offshoot's own CLI.
+- **`destroy()` respects branch protection** (same default as the SDK's
+  `Client.destroy`): a bare `destroy()` on protected `main` raises; pass
+  `force=True` deliberately. Fork branches are unprotected. On an
+  already-closed saver, `destroy()` is a silent no-op.
 - **Async**: not yet supported. The async `BaseCheckpointSaver` methods
   delegate to `SqliteSaver`'s, which raise `NotImplementedError` pointing
   at `AsyncSqliteSaver`. An async saver (wrapping `AsyncSqliteSaver`) is

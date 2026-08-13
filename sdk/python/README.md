@@ -159,6 +159,16 @@ out-of-band and `create --from` it into each worker's store. Full detail —
 including why wrapping a multi-statement seed in one transaction matters
 (measured ~100x) — is in `offshoot/pytest_plugin.py`'s module docstring.
 
+## LangGraph
+
+Two integrations, two jobs: `offshoot.langgraph.ThreadForks` (in this
+package) keeps your existing LangGraph checkpointer and forks only the
+*application* database your agent's tools write to, one branch per thread;
+[`langgraph-checkpoint-offshoot`](../python-langgraph/README.md) is the
+inverse — a `BaseCheckpointSaver` that puts LangGraph's **own thread
+state** in an offshoot-managed SQLite database, so threads themselves can
+be forked, rolled back, promoted, and TTL-reaped.
+
 ## Links
 
 - [Full docs, CLI reference, architecture](https://github.com/sricola/offshoot)
