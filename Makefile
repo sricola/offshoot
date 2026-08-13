@@ -1,4 +1,4 @@
-.PHONY: test test-torture build test-s3 bench bench-s3 test-python-sdk test-ts-sdk test-sdks \
+.PHONY: test test-torture build test-s3 bench bench-cow bench-s3 test-python-sdk test-ts-sdk test-sdks \
 	check-sdk-versions dry-run-python-sdk dry-run-ts-sdk dry-run-sdks test-pytest-plugin \
 	ci-local ci-local-host ci-local-linux ci-local-minio ci-local-sdks lint
 test:
@@ -29,6 +29,23 @@ test-s3:
 #   go test ./internal/ops -bench 'ForkAtHead/size=4GB' -benchmem -run '^$$' -benchtime=1x -timeout 20m
 bench:
 	go test ./internal/ops -bench . -benchmem -run '^$$' -count=3 -short
+
+# bench-cow runs the copy-on-write fork benchmarks (internal/ops/
+# cow_bench_test.go) exactly as docs/benchmarks.md's "Copy-on-write fork
+# cost" section was produced: a fixed-iteration latency sweep repeated
+# -count=5 (report the median), then the added-bytes accounting at
+# N=1/10/100 shared forks and N=1/10 materialized forks (each N is a
+# separate -benchtime=Nx invocation because the per-fork byte metric is
+# diffed across exactly b.N forks), then the divergence-cost measurement.
+# Not -short: the 1GB latency case is deliberately included here and only
+# here. Local store only — see docs/benchmarks.md for why the S3 object
+# COUNTS are identical by construction.
+bench-cow:
+	go test ./internal/ops -bench 'CoWSharedFork$$|CoWCheckoutAfterFork|CoWCpBaseline' -benchmem -run '^$$' -count=5 -benchtime=3x -timeout 30m
+	go test ./internal/ops -bench 'CoWSharedForkAddedBytes|CoWMaterializedForkAddedBytes' -run '^$$' -benchtime=1x
+	go test ./internal/ops -bench 'CoWSharedForkAddedBytes|CoWMaterializedForkAddedBytes' -run '^$$' -benchtime=10x
+	go test ./internal/ops -bench 'CoWSharedForkAddedBytes' -run '^$$' -benchtime=100x
+	go test ./internal/ops -bench 'CoWDivergenceAddedBytes' -run '^$$' -benchtime=1x -count=3 -timeout 30m
 
 # bench-s3 runs the same benchmarks against a real S3-compatible backend
 # (MinIO in Docker) instead of the local store, so docs/benchmarks.md's
