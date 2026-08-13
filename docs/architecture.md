@@ -63,18 +63,25 @@ existing user file.
   synchronously flushes (WAL → LTX → upload) and records `name → txid` in
   the ref. This is the only operation actually called "checkpoint"; the
   background shipping is "commit/sync." Checkpoints are per-branch.
-  **Children do not inherit parent checkpoints** — a child's storage begins
-  at its fork point, so pre-fork states are not materializable from the
-  child; resolve them on the parent.
-- **Fork** — creates a child branch with a **materialized fork point**: the
-  child gets its own lineage in its own storage prefix and never references
-  parent segments afterward. Contract: a fork contains everything committed
-  to SQLite before the fork call returned. See Fork mechanics below.
+  **Children do not inherit parent checkpoints** — a child's checkpoint
+  map starts fresh at its fork point (just the auto-created `fork`
+  checkpoint), so pre-fork states are not addressable from the child;
+  resolve them on the parent.
+- **Fork** — creates a child branch that **shares** its parent's
+  already-durable storage (copy-on-write, since v0.2.0): the child gets its
+  own lineage for everything it writes after the fork, plus a durable **base
+  pointer** (`data/{lineage}/base.json`) naming the parent lineage and the
+  fork-point txid. Reads on the child resolve through the parent's objects
+  below the fork point and the child's own objects above it. Contract
+  unchanged: a fork contains everything committed to SQLite before the fork
+  call returned. See Fork mechanics below for the two snapshot floors that
+  keep this bounded, and `compact` for cutting the cord manually.
 - **Checkout** — a materialized local SQLite file. The agent opens it with
   any stock SQLite client at native speed; the daemon never proxies SQL.
   Checkout paths are immutable-per-materialization. **One writable checkout
-  per branch per daemon**; the design allows read-only checkouts alongside
-  it (not yet implemented — see [status.md](status.md)).
+  per branch per daemon**; read-only checkpoint checkouts alongside it are
+  shipped as `offshoot checkout --at <checkpoint> --read-only` (a separate
+  `checkouts-ro` cache tree, never the writable path).
 - **Rollback** — `rollback <db>@<branch> --to <checkpoint>` repoints the
   branch at a new lineage seeded from the checkpoint state (internally, the
   fork machinery). The branch's old lineage is orphaned, retained for the GC
@@ -89,45 +96,67 @@ existing user file.
   target's old lineage is orphaned → grace period → GC. The source branch
   survives unchanged (typically TTL-reaped later, or destroyed explicitly).
   Protected targets require `--force`.
+- **Compact** — `compact <db>@<branch>` turns a shared (copy-on-write) fork
+  into a self-contained branch: its full base-following chain at head is
+  re-encoded as one snapshot in a fresh lineage and the base pointer is
+  dropped, so the branch stops reading through — and stops pinning — its
+  ancestors' storage. A no-op on an already self-contained branch. Like
+  promote, it resets the checkpoint map (to `{"compact": head}`).
 - **Destroy / GC** — explicit destroy, TTL expiry, and a background
-  collector. Destroying a parent is always safe and allowed regardless of
-  live children (children are storage-independent once forked). Destroying
-  a branch with an active leased checkout requires `--force`. Fork-spam is
+  collector. Destroying a parent is always safe, instant, and allowed
+  regardless of live children — a parent's destruction can never corrupt a
+  child. Under copy-on-write, though, "destroyed" and "reclaimed" are
+  different events: a destroyed parent's *bytes* linger for as long as any
+  surviving child's chain still resolves through them, and are swept only
+  once the last sharing child is destroyed or compacted. Destroying a
+  branch with an active leased checkout requires `--force`. Fork-spam is
   the *expected* workload — leaking orphan branches into a bucket forever is
   the bug class this whole GC design exists to prevent.
 
 ### Fork mechanics and cost
 
-| Case | Mechanism | Cost class (design intent) |
-|---|---|---|
-| fork at head, warm parent checkout | flush parent → clone the checkout file | ~ms (reflink) / ~s per 10GB (copy fallback) |
-| fork at head, cold parent (store only) | restore parent to local cache, then as above | restore cost + above |
-| `fork --at <checkpoint>` | materialize checkpoint state from parent snapshot + segments, then seed child | restore cost |
+Fork is copy-on-write (since v0.2.0). The common-case fork **shares**: it
+writes a durable base pointer (`data/{lineage}/base.json`, create-only)
+into the parent's already-durable chain — zero data objects of its own —
+plus the child ref. The child ref also carries a `Base` reporting mirror,
+but the base *object* is the resolution source of truth: a shared parent's
+ref can be destroyed while descendants still resolve through its lineage.
 
-**Implementation note:** the design targets reflink/clonefile (APFS
-`clonefile`, XFS/btrfs `FICLONE`) with a byte-copy fallback, plus an
-asynchronous fork-point upload. Today's implementation is the simple case
-only — a synchronous local byte copy and a synchronous fork-point upload,
-O(size) in both directions and unbenchmarked at scale. See
-[status.md](status.md#daemon-and-durability) for exactly what's shipped.
+**Resolution never merges across lineages.** `store.Chain` follows base
+pointers transitively under one hard rule: each lineage's half of a chain
+is resolved wholly within its own prefix and concatenated at a seam
+verified contiguous, so epoch-dedup within one lineage can never let a
+parent object win a child's txid range.
 
-Concurrent forks of the same parent are meant to be serialized by the
-daemon (one flush, then N clones) once the reflink path lands.
+**Two automatic snapshot floors keep reads bounded** on any fork spine,
+both keyed on the snapshot cadence (`SnapshotEvery`, default 16):
 
-**Durability window (design intent):** fork should return once the local
-child checkout exists and the child ref is written, with the child's
-fork-point snapshot uploading to the store *asynchronously* — until it
-completes, the child ref would carry a `pending` marker and a fork pin that
-GC honors on the parent's segments. Today the upload is synchronous, inside
-the fork call, so there is no `pending` window to reason about yet.
+- **Fork-time floor** — a fork whose fully-resolved chain is already at the
+  depth bound (`ops.ForkShareMaxDepth`, 16 by default; a daemon substitutes
+  its own `-snapshot-every N`) materializes one fresh snapshot in the
+  child's own lineage instead of sharing — the pre-copy-on-write fork path,
+  now the fallback rather than the default.
+- **Divergence floor** — a session's snapshot counter seeds from the
+  branch's durable divergence, so the `SnapshotEvery` bound is a property
+  of the branch, not the process; a shared child stops touching its parent
+  once it has written its own snapshot.
 
-**Storage amplification, stated honestly:** N materialized forks of a
-G-byte database cost up to N×G in the store (less where snapshot boundaries
-allow server-side `CopyObject` to avoid a re-upload). This is the price of
-GC simplicity and parent-independence; TTLs on attempt branches are the
-mitigation today. Content-addressed page-level dedupe is a possible future
-direction, revisited only if TTLs and `CopyObject` dedupe prove
-insufficient in practice — see [docs/faq.md](faq.md#storage-cost-honestly).
+The materialize fallback (and `promote`/`rollback`/`compact`, which always
+materialize) uses a snapshot-copy fast path when the source resolves to a
+single snapshot: a filesystem clone locally (APFS `clonefile`, Linux
+`FICLONE`, plain-copy fallback), a server-side `CopyObject` on S3 —
+single-request under 5 GiB, multipart `UploadPartCopy` up to S3's 5 TiB
+per-object ceiling above it (since v0.2.4). Multi-member chains
+materialize-and-re-encode. Measured numbers: [docs/benchmarks.md](benchmarks.md).
+
+**The two cost models, stated honestly:** fork shares (near-free — N forks
+of a G-byte database cost near-zero added store bytes, not N×G);
+`promote`, `rollback`, and `compact` each still materialize a full
+independent copy. The asymmetry is deliberate, not an oversight —
+rollback/promote abandon their old lineage, and base-pointing into a
+lineage that is meant to die would pin it forever. Page-level /
+content-addressed dedupe remains a non-goal — see
+[docs/faq.md](faq.md#storage-cost-honestly).
 
 ## Storage layout (epoch-fenced, versioned)
 
@@ -137,7 +166,8 @@ bucket/
   refs/{db}/{branch}                         ← ref object (schema-versioned, CAS'd)
   data/{lineage}/{epoch}/{txid}.ltx          ← segments
   data/{lineage}/{epoch}/snapshot-{txid}.ltx ← compacted snapshots / fork points
-  gc/tombstones                              ← two-phase GC marker list
+  data/{lineage}/base.json                   ← copy-on-write base pointer (create-only, immutable)
+  gc/tombstones                              ← two-phase GC marker list (object-granular)
 ```
 
 **Single-writer per branch** is enforced by compare-and-swap on the ref
@@ -151,7 +181,13 @@ last landed, but the API never offers a silent retry into a dead epoch.
 
 **Layout versioning:** `offshoot.json` carries the layout version; ref
 objects carry a schema version. Policy: newer binaries read older layouts;
-a binary refuses to write a layout newer than it understands.
+a binary refuses a layout newer than it understands. This mechanism has
+been exercised for real: the first shared fork CAS-bumps a store from
+LayoutVersion 1 to 2, and every pre-v0.2.0 binary then refuses the entire
+store up front — deliberately, because a 0.1.x binary's lineage-granular
+GC cannot see base pointers and would sweep a shared ancestor out from
+under live children. There is no downgrade path once a base pointer
+exists; a v0.2.x binary reads and writes a v1 (no-base) store unchanged.
 
 **Supported stores:** AWS S3, Cloudflare R2, Tigris, MinIO — gated by a CAS
 capability probe at bucket attach. Not "any S3-compatible" endpoint — GCS's
@@ -217,10 +253,20 @@ Components: lifecycle API (`internal/daemon`) · checkout materialization
 (`internal/ops`) · sync engine (`internal/capture`, `internal/session` —
 vendored Litestream-style capture, WAL→LTX→store, restore) · lease manager
 (ref CAS, epochs — `internal/ops`, `internal/store`) · GC (TTL expiry,
-two-phase collect: tombstone → grace period → re-list refs → delete; a fork
-that finds its fork point tombstoned after writing its ref fails with a
-retryable error and deletes its own child ref; partial child prefixes are
-collected as unreachable).
+plus an **object-granular reachability collector**: the mark phase computes
+the live set as the union, over every live branch, of its resolved chain at
+head and at every checkpoint — using the same `store.Chain` resolution the
+read path uses, never a reimplementation — plus every `base.json` along
+each branch's base spine; the sweep is two-phase per object, tombstone →
+grace period → re-mark → delete, batched via `DeleteObjects` on S3. Two
+hardenings worth naming: the sweep never deletes above a live branch's
+head in its own lineage *at or above the ref's current epoch* — a retrying
+flush can legitimately re-create exactly that key, while an orphan at a
+strictly older epoch is provably fenced and is swept once its tombstone
+clears grace — and a fork that finds its fork point tombstoned after
+writing its ref fails with a retryable error and deletes its own child
+ref. GC fails closed: an incomplete mark deletes nothing, and
+`offshoot_gc_errors_total` is the alertable signal for a stalled pass).
 
 **TTL semantics:** TTL is measured from the last durable write (last
 shipped segment) or lease renewal, whichever is later; `offshoot touch`
@@ -255,10 +301,16 @@ or capture path must preserve:
    later writes into a dead epoch prefix that no ref will ever point at —
    garbage, collected with the rest of an orphaned lineage, never
    corruption of a live one.
-4. **A fork is materialized, not referential.** Once created, a child
-   branch's storage never depends on its parent's continued existence.
-   Destroying, rolling back, or otherwise mutating a parent can never
-   corrupt or orphan a child's data.
+4. **Mutating a parent can never corrupt or orphan a child.** Since
+   v0.2.0 a fork *is* referential (a shared child reads through its
+   parent's durable objects below the fork point), but the safety property
+   survives unchanged: a lineage's objects and its base pointer are
+   immutable once written, resolution never merges members across
+   lineages, and GC's reachability mark keeps every object a live child's
+   chain resolves through — so destroying, rolling back, or otherwise
+   mutating a parent changes only the parent's *ref*, never any bytes a
+   child depends on. A destroyed parent's shared bytes linger until the
+   last sharing child is destroyed or compacted.
 5. **Checkout paths are immutable-per-materialization.** A live connection
    is never rewritten out from under itself; any repoint (rollback,
    promote, a foreign checkout) that would change what a path means
@@ -315,22 +367,27 @@ or capture path must preserve:
   `destroy` and `promote --onto` require `--force`. Directly relevant to
   handing the MCP server to an LLM agent — the agent can fork and
   experiment freely but cannot vaporize `main` with a single unforced call.
-- An HTTP binding with loopback-by-default access and single-token auth is
-  designed but not built — see [status.md](status.md#observability-and-security).
-  There is no network listener in the daemon today; it speaks only the
-  local unix socket.
+- An HTTP listener is opt-in (`serve -http ADDR`): loopback-by-default,
+  single-token Bearer auth, and a non-loopback bind requires both an
+  explicit acknowledgment flag and an explicit token. `export` — the one
+  op that writes to a client-chosen path on the daemon host — is refused
+  over HTTP entirely; it remains unix-socket-only. See
+  [docs/operations.md](operations.md#httpauth-threat-model) for the full
+  threat model. With `-http` unset (the default) the daemon speaks only
+  the local unix socket.
 
-## Observability and resource limits (design intent)
+## Observability and resource limits
 
-The design calls for `offshoot status` reporting richer branch states,
-lease-aware durability ages, and a Prometheus `/metrics` endpoint on the
-daemon (capture lag, durable-through age per branch, GC backlog, checkout
-cache disk usage, fork/checkpoint latencies), plus configurable disk/FD
-budgets with LRU eviction of cold read-only materializations. None of the
-observability or resource-limit pieces beyond `status`/`session status` are
-implemented yet — see [status.md](status.md#observability-and-security) and
-[status.md](status.md#resource-behavior) for the current state and the
-roadmap milestones tracking each.
+Shipped: `offshoot status` reports a six-state branch taxonomy
+(`active`/`pending`/`error`/`dirty`/`detached`/`idle`) and a per-branch
+storage class (`shared`/`materialized`); the daemon exposes a Prometheus
+`/metrics` endpoint (capture lag, durable-through age per open session, GC
+counters and backlog, fork/flush/checkpoint latencies, ro-cache usage) and
+an event stream (socket `subscribe` op / SSE `GET /events`); and
+`serve -ro-cache-budget` bounds the read-only checkout cache with LRU
+eviction. See [docs/operations.md](operations.md) for the operator
+reference. Still deferred: an FD budget with eviction of cold *writable*
+checkouts — see [status.md](status.md#resource-behavior).
 
 ## Platform support
 
