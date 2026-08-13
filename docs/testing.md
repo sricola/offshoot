@@ -47,7 +47,8 @@ to dump-identical content after every one of the ~3,500 rounds. Zero
 divergence.
 
 This isn't a one-off: the **nightly workflow runs the full torture suite
-on Linux every day, and on macOS on the weekly Sunday leg**
+on Linux every day (skipping automatically when main has not moved
+since the previous run), and on macOS on the weekly Sunday leg**
 (`.github/workflows/nightly.yml`, `torture` job — macOS runners bill at
 10x, so the macOS torture leg moved from daily to weekly; manual
 dispatch runs both). This page is the canonical statement of CI cadence —
