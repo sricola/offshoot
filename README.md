@@ -519,29 +519,37 @@ notes on LlamaIndex and CrewAI
 
 ## Docs
 
-[FAQ](docs/faq.md) (why not Litestream / LiteFS / Turso / Dolt / `cp`) ·
-[CLI reference](docs/reference.md) · [architecture](docs/architecture.md) ·
-[branch diff](docs/diff.md) ·
-[implemented/deferred status](docs/status.md) · [roadmap](ROADMAP.md) ·
-[stability contract](docs/stability.md) (pre-1.0 promises, v1.0 criteria) ·
-[how offshoot is tested](docs/testing.md) (torture numbers, CI gates) ·
-[benchmarks](docs/benchmarks.md) (measured, with method) ·
-[CI recipes](docs/ci-recipes.md) (seed-once/fork-per-attempt Actions
-workflows) · [Grafana dashboard](docs/grafana-dashboard.json) ·
-[**the eval-harness tutorial**](docs/eval-harness.md) (seed-once-fork-many
-for pytest/vitest/`node:test`, from install to CI) ·
-[framework recipes](docs/recipes/) (Claude Code hooks, OpenAI Agents SDK,
-LlamaIndex/CrewAI) ·
-[**operations**](docs/operations.md) (metrics, branch states, eventing,
-budgets, HTTP/auth threat model — single node, see that page's first
-paragraph) · [Kubernetes sidecar recipe](docs/recipes/kubernetes.md)
+**Understand it**
+
+- [Architecture](docs/architecture.md) — the storage model, chains, fencing, copy-on-write
+- [FAQ](docs/faq.md) — why not Litestream / LiteFS / Turso / Dolt / `cp`
+- [Stability contract](docs/stability.md) — pre-1.0 promises, v1.0 criteria
+- [How offshoot is tested](docs/testing.md) — torture numbers, CI gates
+- [Benchmarks](docs/benchmarks.md) — measured, with method
+
+**Use it**
+
+- [Eval-harness tutorial](docs/eval-harness.md) — seed-once-fork-many for pytest/vitest/`node:test`, install to CI
+- [CLI reference](docs/reference.md) — every command and flag
+- [CI recipes](docs/ci-recipes.md) — seed-once/fork-per-attempt Actions workflows
+- [Framework recipes](docs/recipes/) — Claude Code hooks, OpenAI Agents SDK, LlamaIndex/CrewAI
+- [Branch diff](docs/diff.md) — `sqldiff` between branches and checkpoints
+
+**Operate it**
+
+- [Operations](docs/operations.md) — metrics, branch states, eventing, budgets, HTTP/auth threat model (single node)
+- [Grafana dashboard](docs/grafana-dashboard.json) — ready to import, all 18 metric families
+- [Kubernetes sidecar recipe](docs/recipes/kubernetes.md)
+
+**Track it**
+
+- [Implemented/deferred status](docs/status.md) — shipped-and-tested vs unverified, honestly labeled
+- [Roadmap](ROADMAP.md) · [CHANGELOG](CHANGELOG.md)
 
 ## Contributing and license
 
-[CONTRIBUTING.md](CONTRIBUTING.md) has dev setup and the test tiers,
-including `make ci-local` (mirrors CI's job matrix locally — fast
-pre-merge signal, not a substitute for the real CI gate);
-[SECURITY.md](SECURITY.md) covers vulnerability reporting;
-[docs/operations.md](docs/operations.md) documents the daemon's threat
-model. Release notes live in [CHANGELOG.md](CHANGELOG.md). License:
-[Apache-2.0](LICENSE).
+- [CONTRIBUTING.md](CONTRIBUTING.md) — dev setup and the test tiers, including
+  `make ci-local` (mirrors CI's job matrix locally)
+- [SECURITY.md](SECURITY.md) — how to report vulnerabilities
+- [CHANGELOG.md](CHANGELOG.md) — release notes
+- License: [Apache-2.0](LICENSE)
