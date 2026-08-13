@@ -34,7 +34,7 @@ library, if ever needed, is a call-site-only change (see
 `internal/metrics/metrics.go`'s package doc comment for the one-sentence
 rationale this page is intentionally not duplicating).
 
-**Every name below is API.** Per PM Amendment 2/12: metric names freeze at
+**Every name below is API.** Metric names freeze at
 offshoot's first public tag — renaming any of them after that point is a
 breaking change, exactly one free rename window between now and then. Do not
 build a dashboard against a name not in this table.

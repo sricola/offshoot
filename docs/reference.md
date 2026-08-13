@@ -507,7 +507,7 @@ itself. A lease acquired a moment before a forced destroy lands still wins
 the underlying compare-and-swap on the ref, and the forced destroy reports
 a retryable race loss exactly like an unforced one would.
 
-**Backend-specific mechanics** (PM Amendment 5: do not pretend S3
+**Backend-specific mechanics** (deliberately: do not pretend S3
 `DeleteObject` has preconditions it doesn't):
 
 - **Local** gets a TRUE conditional delete on top of the claim: the same
@@ -837,7 +837,7 @@ no ro-cache pass runs either, exactly like reap/GC). Each pass:
 2. If usage exceeds the budget, evicts entries **oldest-by-LRU-clock
    first** (see below) until usage is back at or under it.
 
-**The LRU clock (PM Amendment 11, pre-decided): a `.last-used`
+**The LRU clock (a deliberate design decision): a `.last-used`
 touch-on-HIT marker file, not the cache file's own mtime.** Every
 force=false `CheckoutAt` cache HIT (a repeat call for an already-cached
 `db@branch@checkpoint`) touches a `<cachefile>.last-used` sidecar file to
@@ -978,8 +978,7 @@ the SDK helpers to reach for) — this section is the wire-level reference.
 The daemon publishes one versioned JSON event per state transition it
 observes, drainable two ways — the unix socket protocol's `subscribe` op,
 and HTTP's `GET /events` (Server-Sent Events) — both carrying the exact
-same JSON, encoded by the same function daemon-side (PM Amendment 4: one
-schema, one encoder). There is no history/replay: a subscriber only ever
+same JSON, encoded by the same function daemon-side. There is no history/replay: a subscriber only ever
 sees events published *after* it subscribes.
 
 **Event shape:**
@@ -1076,8 +1075,7 @@ whether it was dropped checks the last event's `type`.
 Same Bearer auth as everything but `/healthz`. Response is
 `Content-Type: text/event-stream`; each event is `data: <event JSON>\n\n`.
 A `: ping` comment line is written every 15 seconds to keep the connection
-alive across any proxy/load balancer/kubelet that kills silent streams
-(PM Amendment 12) — ordinary SSE clients ignore comment lines
+alive across any proxy/load balancer/kubelet that kills silent streams — ordinary SSE clients ignore comment lines
 automatically. Unlike the other `-http` routes, this handler manages its
 own per-connection write deadline (re-armed before every write, see
 "Stalled (still-connected) subscriber" above) rather than being bound by
