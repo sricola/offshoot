@@ -27,7 +27,7 @@ import (
 type S3Config struct {
 	Bucket       string
 	Prefix       string // optional key prefix, no leading slash; "" allowed
-	Endpoint     string // optional custom endpoint (R2/MinIO/fake)
+	Endpoint     string // optional custom endpoint (MinIO/fake)
 	Region       string // defaults to "auto" when Endpoint is set, else SDK default chain
 	UsePathStyle bool   // required for MinIO and the fake
 }

@@ -105,11 +105,11 @@ depends on — CAS behavior, create-only puts, list/delete edge cases:
 - **Real cloud providers**: the nightly workflow has a credentialed
   real-provider job (`.github/workflows/nightly.yml`,
   `real-provider-conformance`) that runs the same suite against an actual
-  S3/R2 bucket when configured. Honest status: S3 support is
+  S3 bucket when configured. Honest status: S3 support is
   MinIO-verified in CI on every run, and `TestS3RealProvider` — probe,
   full conformance, and the multipart subtest — has passed against a
-  real AWS S3 bucket (us-east-1, 2026-08-13). R2 remains
-  same-code-path, not independently run (see
+  real AWS S3 bucket (us-east-1, 2026-08-13); other S3-compatible
+  providers are same-code-path (see
   [stability.md](stability.md#proposed-v10-criteria)).
 
 ## The gates every change passes

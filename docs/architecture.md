@@ -190,7 +190,7 @@ GC cannot see base pointers and would sweep a shared ancestor out from
 under live children. There is no downgrade path once a base pointer
 exists; a v0.2.x binary reads and writes a v1 (no-base) store unchanged.
 
-**Supported stores:** AWS S3, Cloudflare R2, MinIO — gated by a CAS
+**Supported stores:** AWS S3, MinIO — gated by a CAS
 capability probe at bucket attach. Not "any S3-compatible" endpoint — GCS's
 S3-interop API cannot CAS on writes, so it's refused outright rather than
 silently degrading. See [status.md](status.md#storage-backends) for which
@@ -357,7 +357,7 @@ or capture path must preserve:
   results.
 - Fault injection on the storage layer: torn uploads, CAS races, clock skew
   on leases, GC racing forks.
-- Integration matrix: MinIO + (as they come online) real S3/R2 probe
+- Integration matrix: MinIO + (as they come online) real S3 probe
   conformance; the local backend runs everywhere in CI.
 
 ## Security posture

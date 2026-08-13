@@ -73,7 +73,6 @@ resolves today). PyPI/npm registry names are unaffected — those stay
 | Local directory backend | shipped-and-tested | Quickstart's default; no bucket required |
 | MinIO | shipped-and-tested | `minio/minio:latest`, `make test-s3` passes the conformance suite for real (see README's provider table). Since v0.2.3 the env-gated `TestS3RealProvider` suite includes a real multipart-upload subtest, and it passes against MinIO — a real provider's `CompleteMultipartUpload` precondition/checksum handling is the one thing the in-process fake can never substitute for |
 | AWS S3 | shipped-and-tested | `TestS3RealProvider` (probe + full conformance + the multipart subtest) passes against a real AWS S3 bucket (us-east-1, 2026-08-13) — including the `CompleteMultipartUpload` precondition/checksum semantics the in-process fake cannot exercise |
-| Cloudflare R2 | shipped | Same code path; not yet run |
 | Google Cloud Storage | **not supported** | GCS's S3-interop API has no conditional writes; the attach probe refuses it outright rather than degrading |
 
 ## Daemon and durability

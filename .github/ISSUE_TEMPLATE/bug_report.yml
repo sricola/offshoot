@@ -29,7 +29,6 @@ body:
       options:
         - Local directory
         - S3-compatible - AWS S3
-        - S3-compatible - Cloudflare R2
         - S3-compatible - MinIO
         - S3-compatible - other (name it in the repro section)
         - Not sure / not applicable

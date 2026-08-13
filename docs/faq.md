@@ -52,7 +52,7 @@ for the "give me a managed serverless SQLite branch" use case — it's managed,
 proprietary infrastructure with instant branching baked in.
 
 offshoot is the self-hosted alternative to that specific feature: a single
-binary over a bucket you already control (S3, R2, MinIO, or just a
+binary over a bucket you already control (S3, MinIO, or just a
 local directory), producing stock SQLite files you can open with any SQLite
 client, no proprietary edge network required. The trade is real — you run and
 operate it yourself, and it doesn't give you Turso's global read replicas —

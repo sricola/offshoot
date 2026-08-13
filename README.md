@@ -184,7 +184,7 @@ chain (environment, shared config, IAM role):
 
 | Variable | Meaning |
 |---|---|
-| `OFFSHOOT_S3_ENDPOINT` | Custom endpoint (R2, MinIO) |
+| `OFFSHOOT_S3_ENDPOINT` | Custom endpoint (MinIO, or any S3-compatible endpoint) |
 | `OFFSHOOT_S3_REGION` | Region; defaults to `auto` when an endpoint is set |
 | `OFFSHOOT_S3_PATH_STYLE` | `1` for path-style addressing (MinIO) |
 | `OFFSHOOT_CHECKOUTS` | Where checkouts are materialized (remote stores) |
@@ -199,7 +199,6 @@ in unit tests proves nothing about a real provider.
 |---|---|
 | MinIO | verified in CI — the conformance suite runs against real MinIO on every PR and push to main |
 | AWS S3 | verified — `TestS3RealProvider` (probe + conformance + multipart) passed against a real bucket (us-east-1, 2026-08-13) |
-| Cloudflare R2 | expected to pass; not yet run |
 | Google Cloud Storage (S3 interop) | **unsupported** — no conditional writes on the S3 API; the probe refuses it ([why](docs/faq.md#why-no-google-cloud-storage)) |
 
 [1] `minio/minio:latest` digest: `sha256:14cea493d9a34af32f524e538b8346cf79f3321eff8e708c1e2960462bd8936e`

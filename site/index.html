@@ -181,7 +181,7 @@ footer .g{color:var(--accent)}
 
 <span class="c"># same binary, any store</span>
 <span class="p">$</span> offshoot -store ./.offshoot init             <span class="c"># local directory (default)</span>
-<span class="p">$</span> offshoot -store s3://my-bucket/offshoot init <span class="c"># S3, R2, MinIO</span></code></pre>
+<span class="p">$</span> offshoot -store s3://my-bucket/offshoot init <span class="c"># S3, MinIO</span></code></pre>
   <p class="note">Prebuilt binaries (linux/darwin × amd64/arm64) ship with every tagged
   release; <code>go install github.com/sricola/offshoot/cmd/offshoot@latest</code> resolves
   when the repo opens publicly. At attach time offshoot probes the store and refuses to run
