@@ -88,11 +88,16 @@ transactions with one `Flush` each at the default snapshot cadence
 
 Under the cadence, divergence is **O(changed pages)**: ~776 B per
 single-row transaction against a 100 MB database — segments, the ref
-update, nothing size-proportional. The honest second row: every
-`SnapshotEvery`-th flush (16th, by default) writes a **full self-snapshot**
-(the divergence floor that keeps read chains bounded), which is O(DB) —
-105.8 MB here, visible as the 0.48 s flush in the raw log. Steady-state
-cost is therefore ~776 B/txn plus one full snapshot per 16 flushes.
+update, nothing size-proportional. (The 6,209 B numerator also includes
+the fork's own one-time 377 B of `base.json` + ref; the pure per-segment
+cost is ~729 B/txn — 776 is the conservative all-in figure.) The honest
+second row: every `SnapshotEvery`-th flush (16th, by default) writes a
+**full self-snapshot** (the divergence floor that keeps read chains
+bounded), which is O(DB) — 105.8 MB here. Its latency also shows up in
+the loop timings below: k=20 runs ~0.70 s longer than k=8, of which the
+12 extra segment flushes (~14 ms each) explain only ~0.17 s — the
+remaining ~0.5 s is the snapshot flush. Steady-state cost is therefore
+~729 B/txn plus one full snapshot per 16 flushes.
 
 ```
 BenchmarkCoWDivergenceAddedBytes/k=8-10    1   726884166 ns/op       6209 addedBytes/child     776.1 addedBytes/txn
@@ -114,7 +119,10 @@ bounded-replay claim holds at this shape (the child's resolved chain is
 the parent's snapshot plus zero own segments, one extra `base.json` read).
 Run-to-run spread is wide (parent samples 421–689 ms; child 336–539 ms),
 so read the table as "no read penalty for a shared fork beyond noise,"
-not as "children are faster."
+not as "children are faster." The child-lower medians are likely an
+ordering artifact — the parent sub-benchmark always runs first, so the
+child materializes the same snapshot object with the page cache already
+warm; the spread, not the ordering, is the result.
 
 ### Caveats (read before quoting these numbers)
 
