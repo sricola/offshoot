@@ -13,6 +13,8 @@ version if you depend on format stability.
 
 ## [Unreleased]
 
+## [0.2.9] - 2026-08-13
+
 ### Changed
 
 - CI/release supply-chain hardening: every GitHub Action SHA-pinned (with
