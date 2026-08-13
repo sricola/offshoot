@@ -424,7 +424,7 @@ func (s *S3) putMultipart(key string, r io.Reader, size int64, ifMatch string, c
 				// WhenSupported (the SDK default); a caller running with
 				// when_required (the common workaround third-party S3-compatible
 				// stores need after the Jan-2025 default-checksum change — and
-				// this backend explicitly targets R2/Tigris/MinIO via S3Config)
+				// this backend explicitly targets R2/MinIO via S3Config)
 				// would otherwise send this UploadPart with NO checksum while
 				// CreateMultipartUpload already declared the upload CRC32,
 				// making every CompletedPart's checksum silently absent and

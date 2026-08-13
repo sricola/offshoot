@@ -101,7 +101,7 @@ diff a@x b@y [--summary]` answers "what changed between these two attempts"
 At rest (no daemon running): checkpoints are full snapshots; checkout paths
 are fixed at `<store>/checkouts/{db}/{branch}.db`; operations require the
 checkout to be quiescent (no live writers). Daemon mode (below) layers live
-capture, incremental segments, and S3/R2/Tigris backends on top of the same
+capture, incremental segments, and S3/R2 backends on top of the same
 commands.
 
 ## Storage
@@ -123,7 +123,7 @@ chain (environment, shared config, IAM role):
 
 | Variable | Meaning |
 |---|---|
-| `OFFSHOOT_S3_ENDPOINT` | Custom endpoint (R2, Tigris, MinIO) |
+| `OFFSHOOT_S3_ENDPOINT` | Custom endpoint (R2, MinIO) |
 | `OFFSHOOT_S3_REGION` | Region; defaults to `auto` when an endpoint is set |
 | `OFFSHOOT_S3_PATH_STYLE` | `1` for path-style addressing (MinIO) |
 | `OFFSHOOT_CHECKOUTS` | Where checkouts are materialized (remote stores) |
@@ -139,7 +139,6 @@ unit tests proves nothing about a real provider.
 | MinIO | verified — `minio/minio:latest` [1], run 2026-07-31; `make test-s3` PASS |
 | AWS S3 | expected to pass (conditional writes GA since Nov 2024); not yet run |
 | Cloudflare R2 | expected to pass; not yet run |
-| Tigris | expected to pass; not yet run |
 | Google Cloud Storage (S3 interop) | **unsupported** — no conditional writes on the S3 API; the probe refuses it |
 
 [1] `minio/minio:latest` digest: `sha256:14cea493d9a34af32f524e538b8346cf79f3321eff8e708c1e2960462bd8936e`

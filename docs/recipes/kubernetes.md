@@ -45,7 +45,7 @@ mounted volume for the local backend), never in the checkout cache.
 This is a real, apply-able manifest — not pseudocode. It uses a local
 directory store mounted from a `PersistentVolumeClaim` in this example (swap
 `OFFSHOOT_STORE` for an `s3://` spec plus credentials if you're on S3/R2/
-Tigris/MinIO instead; either way, `OFFSHOOT_CHECKOUTS` and the socket path
+MinIO instead; either way, `OFFSHOOT_CHECKOUTS` and the socket path
 stay on the pod-local `emptyDir`, never the store volume, per
 [docs/reference.md](../reference.md)'s `OFFSHOOT_CHECKOUTS` note that a
 remote store's checkouts always live outside the store itself).
@@ -161,7 +161,7 @@ guesswork:
   what's available in your cluster) or switch `OFFSHOOT_STORE` to an
   `s3://bucket/prefix` spec plus the usual AWS SDK credential env vars
   (`OFFSHOOT_S3_ENDPOINT`/`OFFSHOOT_S3_REGION`/`OFFSHOOT_S3_PATH_STYLE` for
-  R2/Tigris/MinIO — see [docs/reference.md](../reference.md)'s S3
+  R2/MinIO — see [docs/reference.md](../reference.md)'s S3
   environment variables table) if you don't want a local-directory store at
   all. Either way, `OFFSHOOT_CHECKOUTS` stays on the `emptyDir`.
 

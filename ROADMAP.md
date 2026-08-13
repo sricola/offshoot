@@ -41,7 +41,7 @@ without tripping over internal artifacts, and watch CI prove the claims.*
 - **Code CI.** Linux + macOS matrix (cgo needs real macOS runners): `go test
   ./... -race`, `go vet`, plus a MinIO service container running the S3
   conformance suite on every PR with no secrets. Nightly on main: real
-  AWS/R2/Tigris conformance + the full kill-9 torture suite, feeding the
+  AWS/R2 conformance + the full kill-9 torture suite, feeding the
   provider-support table. Badges in the README.
 - **Release engineering.** goreleaser with per-OS native build runners (cgo
   rules out naive cross-compilation; zig-cc is the fallback), darwin/linux ×

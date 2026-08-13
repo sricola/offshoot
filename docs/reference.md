@@ -28,7 +28,7 @@ variable, and falls back to `./.offshoot` if that's unset too.
 |---|---|
 | `path` or `./path` | Local directory (relative or absolute, no scheme) |
 | `file:///abs/path` | Local directory, explicit scheme |
-| `s3://bucket/prefix` | S3-compatible bucket (AWS S3, R2, Tigris, MinIO) |
+| `s3://bucket/prefix` | S3-compatible bucket (AWS S3, R2, MinIO) |
 
 Any other URL scheme is refused with `unsupported store scheme`.
 
@@ -43,7 +43,7 @@ serve`) pays this cost once per process instead of once per command.
 
 | Variable | Meaning |
 |---|---|
-| `OFFSHOOT_S3_ENDPOINT` | Custom endpoint (R2, Tigris, MinIO); unset means AWS's default endpoint |
+| `OFFSHOOT_S3_ENDPOINT` | Custom endpoint (R2, MinIO); unset means AWS's default endpoint |
 | `OFFSHOOT_S3_REGION` | Region; defaults to `auto` when a custom endpoint is set |
 | `OFFSHOOT_S3_PATH_STYLE` | Truthy (`1`, `true`, `yes`, `on`, case-insensitive) selects path-style addressing (needed for MinIO) |
 

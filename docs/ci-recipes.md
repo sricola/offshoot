@@ -59,7 +59,7 @@ env:
   AWS_ACCESS_KEY_ID: ${{ secrets.AWS_ACCESS_KEY_ID }}
   AWS_SECRET_ACCESS_KEY: ${{ secrets.AWS_SECRET_ACCESS_KEY }}
   AWS_REGION: us-east-1
-  # For R2 / Tigris / MinIO instead of AWS, also set:
+  # For R2 / MinIO instead of AWS, also set:
   #   OFFSHOOT_S3_ENDPOINT: https://<accountid>.r2.cloudflarestorage.com
   #   OFFSHOOT_S3_PATH_STYLE: "1"     # MinIO needs path-style
   DB: evals-${{ github.run_id }}

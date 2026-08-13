@@ -16,7 +16,7 @@ import (
 //
 //	/path or ./path     local directory
 //	file:///abs/path    local directory
-//	s3://bucket/prefix  S3-compatible bucket (AWS S3, R2, Tigris, MinIO)
+//	s3://bucket/prefix  S3-compatible bucket (AWS S3, R2, MinIO)
 //
 // S3 endpoint, region and addressing style come from OFFSHOOT_S3_ENDPOINT,
 // OFFSHOOT_S3_REGION and OFFSHOOT_S3_PATH_STYLE; credentials come from the

@@ -119,7 +119,7 @@ jobs:
         run: go test ./... -count=1
 
   real-provider-conformance:
-    # This job exercises a real cloud object store (AWS S3 / R2 / Tigris)
+    # This job exercises a real cloud object store (AWS S3 / R2)
     # using credentials from repo secrets, which most forks and even most
     # of this repo's own history won't have configured. Gate it on a repo
     # variable so it skips cleanly instead of failing the nightly run when

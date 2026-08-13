@@ -281,7 +281,7 @@ correct without it.
   implemented/deferred matrix, a CLI reference, fixing stale examples — is
   some of the highest-leverage work available and doesn't need prior
   coordination.
-- **Provider conformance runs.** `make test-s3` against AWS S3, R2, or Tigris
+- **Provider conformance runs.** `make test-s3` against AWS S3 or R2
   and a report of pass/fail (see the provider table in README.md) is
   directly useful and low-risk to contribute.
 - **CLI ergonomics.** Better error messages, `--help` text, flag consistency,
