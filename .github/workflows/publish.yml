@@ -60,7 +60,9 @@ jobs:
       # real upload. See the CRITICAL fix note on those steps.
       should_publish: ${{ steps.gate.outputs.should_publish }}
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
+        with:
+          persist-credentials: false
 
       - name: Verify tag matches sdk/VERSION
         if: startsWith(github.ref, 'refs/tags/sdk-v')
@@ -71,6 +73,10 @@ jobs:
 
       - name: Resolve publish gate
         id: gate
+        env:
+          # Via env, not ${{ }}-in-script: a repo variable is maintainer-set,
+          # but nothing in a run: block should be substituted pre-shell.
+          PUBLISH_ENABLED_VAR: ${{ vars.PUBLISH_ENABLED }}
         run: |
           is_tag=false
           if [[ "${GITHUB_REF}" == refs/tags/sdk-v* ]]; then
@@ -79,7 +85,7 @@ jobs:
           echo "is_tag=$is_tag" >> "$GITHUB_OUTPUT"
 
           enabled=false
-          if [ "${{ vars.PUBLISH_ENABLED }}" = "true" ]; then
+          if [ "$PUBLISH_ENABLED_VAR" = "true" ]; then
             enabled=true
           fi
           echo "enabled=$enabled" >> "$GITHUB_OUTPUT"
@@ -119,9 +125,11 @@ jobs:
       # real runs (a gate flip should never also be a permissions diff).
       id-token: write
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
+        with:
+          persist-credentials: false
 
-      - uses: actions/setup-python@v5
+      - uses: actions/setup-python@a26af69be951a213d495a4c3e4e4022e16d87065 # v5.6.0
         with:
           python-version: "3.12"
 
@@ -156,28 +164,36 @@ jobs:
         # PUBLISH_ENABLED is "true", the run was dispatched against a
         # matching tag, and the check job's own gating logic had a bug.
         if: needs.check.outputs.publish_enabled == 'true' && startsWith(github.ref, 'refs/tags/sdk-v') && github.event_name == 'push'
-        uses: pypa/gh-action-pypi-publish@release/v1
+        # SHA-pinned to the v1.14.2 release tag — this action previously rode
+        # the mutable release/v1 BRANCH, the weakest possible ref for the one
+        # step holding OIDC publish rights. Dependabot bumps the pin.
+        uses: pypa/gh-action-pypi-publish@dc37677b2e1c63e2034f94d8a5b11f265b73ba33 # v1.14.2
         with:
           packages-dir: sdk/python/dist
 
       - name: Dry-run notice
         if: needs.check.outputs.publish_enabled != 'true' || !startsWith(github.ref, 'refs/tags/sdk-v') || github.event_name != 'push'
+        env:
+          # GITHUB_REF is ref-derived: env, never ${{ }}-in-script
+          # (expression injection — same rule as release.yml's build steps).
+          PUBLISH_ENABLED: ${{ needs.check.outputs.publish_enabled }}
+          EVENT_NAME: ${{ github.event_name }}
         run: |
-          if [ "${{ needs.check.outputs.publish_enabled }}" != "true" ]; then
+          if [ "$PUBLISH_ENABLED" != "true" ]; then
             echo "PUBLISH_ENABLED repository variable is not 'true' — the sdist/wheel"
             echo "above were built, twine-checked, and install-tested, but nothing was"
             echo "uploaded to PyPI. Set PUBLISH_ENABLED=true (repo Settings > Actions >"
             echo "Variables) once the offshoot-db PyPI project exists and Trusted"
             echo "Publishing is configured for this repo+workflow — see CONTRIBUTING.md."
-          elif [ "${{ github.event_name }}" != "push" ]; then
-            echo "PUBLISH_ENABLED is 'true' and this run's ref (${{ github.ref }}) matches"
-            echo "sdk-v*, but the triggering event is '${{ github.event_name }}', not a real"
+          elif [ "$EVENT_NAME" != "push" ]; then
+            echo "PUBLISH_ENABLED is 'true' and this run's ref (${GITHUB_REF}) matches"
+            echo "sdk-v*, but the triggering event is '${EVENT_NAME}', not a real"
             echo "tag push — real uploads only ever happen from an actual 'push' event on an"
             echo "sdk-v* tag, never from workflow_dispatch (even a manual run dispatched"
             echo "against a tag ref). Push an sdk-v<version> tag (matching sdk/VERSION) to"
             echo "publish for real. Nothing was uploaded."
           else
-            echo "PUBLISH_ENABLED is 'true', but this run's ref (${{ github.ref }}) is not"
+            echo "PUBLISH_ENABLED is 'true', but this run's ref (${GITHUB_REF}) is not"
             echo "an sdk-v* tag — real uploads only ever happen from a tag push, never from"
             echo "workflow_dispatch, regardless of the gate. Push an sdk-v<version> tag"
             echo "(matching sdk/VERSION) to publish for real. Nothing was uploaded."
@@ -197,9 +213,11 @@ jobs:
       # below — see the NPM_TOKEN note on the publish step.
       id-token: write
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
+        with:
+          persist-credentials: false
 
-      - uses: actions/setup-node@v4
+      - uses: actions/setup-node@49933ea5288caeca8642d1e84afbd3f7d6820020 # v4.4.0
         with:
           node-version: "22"
           registry-url: "https://registry.npmjs.org"
@@ -246,22 +264,27 @@ jobs:
 
       - name: Dry-run notice
         if: needs.check.outputs.publish_enabled != 'true' || !startsWith(github.ref, 'refs/tags/sdk-v') || github.event_name != 'push'
+        env:
+          # GITHUB_REF is ref-derived: env, never ${{ }}-in-script
+          # (expression injection — same rule as the PyPI job's notice).
+          PUBLISH_ENABLED: ${{ needs.check.outputs.publish_enabled }}
+          EVENT_NAME: ${{ github.event_name }}
         run: |
-          if [ "${{ needs.check.outputs.publish_enabled }}" != "true" ]; then
+          if [ "$PUBLISH_ENABLED" != "true" ]; then
             echo "PUBLISH_ENABLED repository variable is not 'true' — the package above"
             echo "was built, packed, and install-tested, but nothing was uploaded to npm."
             echo "Set PUBLISH_ENABLED=true (repo Settings > Actions > Variables) once the"
             echo "@offshoot-db npm scope exists and registry auth (NPM_TOKEN secret, or"
             echo "Trusted Publishing once adopted) is configured — see CONTRIBUTING.md."
-          elif [ "${{ github.event_name }}" != "push" ]; then
-            echo "PUBLISH_ENABLED is 'true' and this run's ref (${{ github.ref }}) matches"
-            echo "sdk-v*, but the triggering event is '${{ github.event_name }}', not a real"
+          elif [ "$EVENT_NAME" != "push" ]; then
+            echo "PUBLISH_ENABLED is 'true' and this run's ref (${GITHUB_REF}) matches"
+            echo "sdk-v*, but the triggering event is '${EVENT_NAME}', not a real"
             echo "tag push — real uploads only ever happen from an actual 'push' event on an"
             echo "sdk-v* tag, never from workflow_dispatch (even a manual run dispatched"
             echo "against a tag ref). Push an sdk-v<version> tag (matching sdk/VERSION) to"
             echo "publish for real. Nothing was uploaded."
           else
-            echo "PUBLISH_ENABLED is 'true', but this run's ref (${{ github.ref }}) is not"
+            echo "PUBLISH_ENABLED is 'true', but this run's ref (${GITHUB_REF}) is not"
             echo "an sdk-v* tag — real uploads only ever happen from a tag push, never from"
             echo "workflow_dispatch, regardless of the gate. Push an sdk-v<version> tag"
             echo "(matching sdk/VERSION) to publish for real. Nothing was uploaded."

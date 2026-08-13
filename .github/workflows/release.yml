@@ -6,9 +6,11 @@ on:
       - "v*"
   workflow_dispatch:
 
+# Least privilege: the default token is read-only; the two jobs that
+# actually publish (collect → GitHub release, docker → GHCR) elevate
+# per-job below. The four build-matrix jobs never need write.
 permissions:
-  contents: write
-  packages: write
+  contents: read
 
 jobs:
   build:
@@ -36,16 +38,20 @@ jobs:
             goarch: arm64
     runs-on: ${{ matrix.os }}
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
+        with:
+          persist-credentials: false
 
-      - uses: actions/setup-go@v5
+      - uses: actions/setup-go@40f1582b2485089dde7abd97c1529aa768e1baff # v5.6.0
         with:
           go-version-file: go.mod
 
       - name: Resolve ref name
         id: ref
+        env:
+          EVENT_NAME: ${{ github.event_name }}
         run: |
-          if [ "${{ github.event_name }}" = "workflow_dispatch" ]; then
+          if [ "$EVENT_NAME" = "workflow_dispatch" ]; then
             echo "name=dev-$(git rev-parse --short HEAD)" >> "$GITHUB_OUTPUT"
           else
             echo "name=${GITHUB_REF_NAME}" >> "$GITHUB_OUTPUT"
@@ -57,30 +63,45 @@ jobs:
           GOOS: ${{ matrix.goos }}
           GOARCH: ${{ matrix.goarch }}
           CC: ${{ matrix.cc || 'cc' }}
+          # Ref-derived value: passed via env, NEVER ${{ }}-interpolated into
+          # the script — a hostile tag name would otherwise become shell code
+          # (expression substitution happens before the shell runs).
+          REFNAME: ${{ steps.ref.outputs.name }}
         run: |
-          go build -trimpath -ldflags "-s -w -X main.version=${{ steps.ref.outputs.name }}" \
+          go build -trimpath -ldflags "-s -w -X main.version=${REFNAME}" \
             -o offshoot ./cmd/offshoot
 
       - name: Smoke test
         # Cross-arch pairings can't execute their binary on the build host;
         # verify the architecture instead.
+        env:
+          # env, not inline ${{ }} — same expression-injection rationale as
+          # the build step above.
+          REFNAME: ${{ steps.ref.outputs.name }}
+          WANT_GOARCH: ${{ matrix.goarch }}
         run: |
-          if [ "$(uname -m | sed 's/x86_64/amd64/;s/aarch64/arm64/')" = "${{ matrix.goarch }}" ]; then
+          if [ "$(uname -m | sed 's/x86_64/amd64/;s/aarch64/arm64/')" = "$WANT_GOARCH" ]; then
             ./offshoot version
-            ./offshoot version | grep -q "${{ steps.ref.outputs.name }}"
+            ./offshoot version | grep -q "$REFNAME"
           else
             file ./offshoot | grep -qi "x86_64\|x86-64"
           fi
 
       - name: Package
         id: pkg
+        env:
+          # env, not inline ${{ }} — same expression-injection rationale as
+          # the build step above.
+          REFNAME: ${{ steps.ref.outputs.name }}
+          PKG_GOOS: ${{ matrix.goos }}
+          PKG_GOARCH: ${{ matrix.goarch }}
         run: |
-          name="offshoot_${{ steps.ref.outputs.name }}_${{ matrix.goos }}_${{ matrix.goarch }}"
+          name="offshoot_${REFNAME}_${PKG_GOOS}_${PKG_GOARCH}"
           tar czf "${name}.tar.gz" offshoot
           shasum -a 256 "${name}.tar.gz" > "${name}.tar.gz.sha256"
           echo "name=${name}" >> "$GITHUB_OUTPUT"
 
-      - uses: actions/upload-artifact@v4
+      - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
         with:
           name: ${{ steps.pkg.outputs.name }}
           path: |
@@ -91,17 +112,25 @@ jobs:
   collect:
     needs: build
     runs-on: ubuntu-latest
+    # The only job that creates the GitHub release — the write scope lives
+    # here, not at workflow level. (gh authenticates via the GH_TOKEN env on
+    # the release step, not via git credentials, so the checkout below still
+    # doesn't need to persist any.)
+    permissions:
+      contents: write
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
+        with:
+          persist-credentials: false
 
-      - uses: actions/setup-go@v5
+      - uses: actions/setup-go@40f1582b2485089dde7abd97c1529aa768e1baff # v5.6.0
         with:
           go-version-file: go.mod
 
       - name: Generate THIRD_PARTY_LICENSES.csv
         run: make third-party-licenses
 
-      - uses: actions/download-artifact@v4
+      - uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4.3.0
         with:
           path: dist
           merge-multiple: true
@@ -112,15 +141,17 @@ jobs:
       - name: Create GitHub release
         env:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          EVENT_NAME: ${{ github.event_name }}
+          REPO: ${{ github.repository }}
         run: |
-          if [ "${{ github.event_name }}" = "workflow_dispatch" ]; then
+          if [ "$EVENT_NAME" = "workflow_dispatch" ]; then
             tag="dev-$(git rev-parse --short HEAD)"
           else
             tag="${GITHUB_REF_NAME}"
           fi
           gh release create "$tag" \
             dist/*.tar.gz dist/*.tar.gz.sha256 THIRD_PARTY_LICENSES.csv \
-            --repo "${{ github.repository }}" \
+            --repo "$REPO" \
             --title "$tag" \
             --prerelease \
             --generate-notes
@@ -128,33 +159,45 @@ jobs:
   docker:
     needs: build
     runs-on: ubuntu-latest
+    # The only job that pushes to GHCR — packages: write lives here, not at
+    # workflow level.
+    permissions:
+      contents: read
+      packages: write
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
+        with:
+          persist-credentials: false
 
       - name: Resolve ref name
         id: ref
+        env:
+          EVENT_NAME: ${{ github.event_name }}
         run: |
-          if [ "${{ github.event_name }}" = "workflow_dispatch" ]; then
+          if [ "$EVENT_NAME" = "workflow_dispatch" ]; then
             echo "name=dev-$(git rev-parse --short HEAD)" >> "$GITHUB_OUTPUT"
           else
             echo "name=${GITHUB_REF_NAME}" >> "$GITHUB_OUTPUT"
           fi
 
-      - uses: docker/setup-buildx-action@v3
+      - uses: docker/setup-buildx-action@8d2750c68a42422c14e847fe6c8ac0403b4cbd6f # v3.12.0
 
       - name: Log in to GHCR
-        uses: docker/login-action@v3
+        uses: docker/login-action@c94ce9fb468520275223c153574b00df6fe4bcc9 # v3.7.0
         with:
           registry: ghcr.io
           username: ${{ github.actor }}
           password: ${{ secrets.GITHUB_TOKEN }}
 
-      - uses: docker/build-push-action@v6
+      - uses: docker/build-push-action@10e90e3645eae34f1e60eeb005ba3a3d33f178e8 # v6.19.2
         with:
           context: .
           push: true
           build-args: |
             VERSION=${{ steps.ref.outputs.name }}
-          tags: |
-            ghcr.io/${{ github.repository }}:${{ steps.ref.outputs.name }}
-            ghcr.io/${{ github.repository }}:latest
+          # `:latest` moves only on real tag pushes. A workflow_dispatch run
+          # is an unreviewed dev build of whatever ref it was dispatched on —
+          # it pushes only its dev-<sha> tag, so `docker pull` users can
+          # never silently receive one as :latest. (Comma-separated tags;
+          # this is an action input, not shell, so expression use is safe.)
+          tags: ${{ github.event_name == 'push' && format('ghcr.io/{0}:{1},ghcr.io/{0}:latest', github.repository, steps.ref.outputs.name) || format('ghcr.io/{0}:{1}', github.repository, steps.ref.outputs.name) }}
