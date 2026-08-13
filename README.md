@@ -35,7 +35,7 @@ live in [CHANGELOG.md](CHANGELOG.md).
 
 ## Versioning
 
-offshoot is in the 0.x prerelease series (tags `v0.1.0` … `v0.2.0`, the
+offshoot is in the 0.x prerelease series (tags `v0.1.0` … `v0.2.7`, the
 current line). The CLI surface and the on-disk storage format may still
 change release to release. Compatibility is never left to guesswork: the
 store's layout version detects a mismatch outright — a newer binary refuses

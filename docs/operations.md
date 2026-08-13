@@ -332,6 +332,23 @@ uploads, so it will never clean these up. S3's own bucket lifecycle rules
 operational answer to this and cost nothing to set up once per bucket;
 offshoot does not configure this for you.
 
+**A stalled S3 backend can no longer wedge the daemon** (v0.2.6/v0.2.7).
+Every S3 call waits at most 60 seconds for a response to *begin*, and every
+buffered single-shot RPC — Get, Put, List pages, deletes, copies, the
+below-threshold snapshot upload — additionally runs under a per-call
+deadline: a generous 15-minute base, plus transfer time at a pessimistic
+1 MiB/s floor for calls with a known payload size, so a legitimate
+just-under-5-GiB single-request transfer always fits ("eventually
+unwedges", never "fails fast"). Each multipart RPC gets its own 15-minute
+deadline. Streaming downloads (`GetReader`, used for large chain members)
+get no total deadline — that would kill legitimate long reads — but carry a
+progress watchdog instead: a read that blocks for 60 seconds with zero
+bytes cancels the request with a recognizable "read stalled" error, while a
+slow *consumer* (long pauses between reads) is never affected. The
+operational upshot: a backend that accepts a request and then stalls
+mid-body fails that flush (which retries normally) instead of hanging the
+flush lock, every later `Flush`, and `Session.Close` behind it.
+
 ## HTTP/auth threat model
 
 **This is single-tenant, same-host-or-trusted-network auth — not a
@@ -402,7 +419,7 @@ there's no config file).
 | `-flush-every DURATION` | `30s` (`0` disables) | How much committed-but-unflushed work is ever at risk: a daemon that dies loses at most one interval's worth of writes. Lower = tighter bound on data loss, more frequent background upload traffic. `0` returns to "durability only advances on explicit `flush`," this project's original behavior. |
 | `-snapshot-every N` | `16` (must be `>= 1`) | How many segments a read replays past the last snapshot before it's capped by a fresh full upload. Lower N = cheaper, more tightly bounded reads, at the cost of a full-database upload more often; higher N amortizes upload cost across more flushes at the cost of longer per-read replay. See [docs/benchmarks.md](benchmarks.md) for the measured trade-off at the default of 16, and the flush-cost interaction below. |
 | `-reap-every DURATION` | `1m` (`0` disables the janitor entirely) | How often the janitor sweeps for TTL-expired branches, runs GC, and (if a budget is set) evicts over-budget `checkouts-ro` entries. `0` doesn't just slow this down — it turns the whole janitor loop off; `offshoot gc` remains available on demand. Every metric this page's [Budgets](#budgets)/GC rows describe as "once per pass" is gated on this same interval. |
-| `-gc-grace DURATION` | `15m` | How long a tombstoned (unreferenced) lineage sits before it's actually deleted. `0` makes it eligible on the very next `-reap-every` tick after tombstoning, rather than disabling GC. A lineage re-referenced during the grace window (e.g. a fork racing GC) is left alone. |
+| `-gc-grace DURATION` | `15m` | How long a tombstoned (unreachable) storage object sits before it's actually deleted. `0` makes it eligible on the very next `-reap-every` tick after tombstoning, rather than disabling GC. An object re-referenced during the grace window (e.g. by a fork racing GC) is left alone. |
 | `-ro-cache-budget BYTES` | `0` (unlimited) | See [Budgets](#budgets) above in full; accepts a bare byte count or a `K`/`M`/`G`/`T` power-of-1024 suffix. |
 
 **`-snapshot-every` is a per-process tuning knob, not a persisted store
