@@ -35,6 +35,19 @@ type S3Config struct {
 // S3 is a Backend over S3-compatible object storage using conditional writes
 // for compare-and-swap. Etags are provider-issued opaque tokens: they are
 // returned and replayed verbatim, never parsed or compared to a hash.
+//
+// Timeout model — four layers, each documented in full at its own decl:
+//
+//  1. Transport: s3ResponseHeaderTimeout bounds every call's wait for
+//     response headers to begin arriving; never bounds a body transfer.
+//  2. Single-shot RPCs: singleShotRPCTimeout is the total per-call bound,
+//     scaled by payload size when known (singleShotDeadline /
+//     singleShotFloorBytesPerSecond).
+//  3. Multipart uploads: multipartRPCTimeout bounds each part/metadata
+//     RPC; multipartAbortTimeout the deferred abort (s3_multipart.go).
+//  4. Streaming reads: readProgressTimeout is GetReader's per-Read
+//     progress watchdog (watchdogReader) — kills a stalled stream, never
+//     a slow-but-progressing one.
 type S3 struct {
 	cl     *s3.Client
 	bucket string
