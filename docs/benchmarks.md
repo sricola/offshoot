@@ -129,7 +129,7 @@ the local implementation: a
 filesystem clone (`clonefile(2)` on darwin, the `FICLONE` ioctl on Linux)
 when the filesystem supports it, silently falling back to a plain byte copy
 otherwise. S3 returns `store.ErrCopyUnsupported` unconditionally in this
-slice (Task 6b adds S3 server-side `CopyObject`, gated to objects ≤5GB), so
+slice (Task 6b adds S3 server-side `CopyObject`, gated to objects ≤5GB — since v0.2.4 larger objects copy server-side too, via multipart `UploadPartCopy`), so
 `Fork` against S3 is unaffected — see "Results: S3 path" below.
 
 The precondition does NOT hold once a daemon session has flushed even one
