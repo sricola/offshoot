@@ -126,9 +126,6 @@ More "why not X" (Litestream, Dolt, Neon, plain `cp`):
   — images publish to GHCR on every tagged release; the store lives in the
   `/data` volume, so reuse `-v offshoot-data:/data` across commands
   (`... offshoot:latest create app`, `... offshoot:latest serve`, and so on)
-- **Nix** *(pending: fill `flake.nix`'s `vendorHash` on first build)*:
-  `nix run github:sricola/offshoot` — flake in-repo; see the
-  `vendorHash` note at the top of [`flake.nix`](flake.nix)
 - **Prebuilt binaries**:
   `offshoot_vX_os_arch.tar.gz` (+ `.sha256`) from the
   [releases page](https://github.com/sricola/offshoot/releases), published
