@@ -1,73 +1,18 @@
 # offshoot
 
-Branch SQLite like git: create, fork, checkpoint, rollback, and promote
-SQLite databases — stock SQLite files, your storage, one binary.
+Fork-per-attempt databases for AI agents and eval harnesses. Branch SQLite
+like git — create, fork, checkpoint, rollback, promote — as stock SQLite
+files, on your storage, with one binary.
 
-**Status: prerelease (0.2.x).** The CLI and daemon both work today: local and
-S3-compatible stores, copy-on-write forks, live WAL capture with incremental
-segments, leases and TTL reaping, an MCP server, and Python/TypeScript SDKs. See
-[docs/status.md](docs/status.md) for exactly what's shipped-and-tested,
-what's shipped-but-unverified, and what's still on the [roadmap](ROADMAP.md).
-Requires Go 1.25+, cgo, and the `sqlite3` CLI for tests. Linux and macOS only.
-
-**Install:**
-
-- **Homebrew** *(at launch — needs the repo public)*:
-  `brew tap sricola/offshoot https://github.com/sricola/offshoot && brew install offshoot`
-  (formula lives in-repo at [`Formula/offshoot.rb`](Formula/offshoot.rb))
-- **Docker:**
-  `docker run --rm -v offshoot-data:/data ghcr.io/sricola/offshoot:latest init`
-  — images publish to GHCR on every tagged release; the store lives in the
-  `/data` volume, so reuse `-v offshoot-data:/data` across commands
-  (`... offshoot:latest create app`, `... offshoot:latest serve`, and so on)
-- **Nix** *(at launch — needs the repo public and a real `vendorHash`)*:
-  `nix run github:sricola/offshoot` — flake in-repo; see the
-  `vendorHash` note at the top of [`flake.nix`](flake.nix)
-- **Prebuilt binaries** *(at launch — needs the releases page public)*:
-  `offshoot_vX_os_arch.tar.gz` (+ `.sha256`) from the
-  [releases page](https://github.com/sricola/offshoot/releases), published
-  for each tagged release
-- **From source:** see Quickstart below (Go 1.25+, cgo)
-
-**Windows:** use WSL2 — the linux binaries, Docker image, and
-build-from-source all work there as-is. Native Windows is unsupported:
-offshoot leans on POSIX file semantics (unix sockets, POSIX locks) that
-don't map cleanly to Windows.
-
-**Docs:** [FAQ](docs/faq.md) (why not Litestream / LiteFS / Turso / Dolt / `cp`) ·
-[CLI reference](docs/reference.md) · [architecture](docs/architecture.md) ·
-[branch diff](docs/diff.md) ·
-[implemented/deferred status](docs/status.md) · [roadmap](ROADMAP.md) ·
-[stability contract](docs/stability.md) (pre-1.0 promises, v1.0 criteria) ·
-[how offshoot is tested](docs/testing.md) (torture numbers, CI gates) ·
-[CI recipes](docs/ci-recipes.md) (seed-once/fork-per-attempt Actions
-workflows) · [Grafana dashboard](docs/grafana-dashboard.json) ·
-[**the eval-harness tutorial**](docs/eval-harness.md) (seed-once-fork-many
-for pytest/vitest/`node:test`, from install to CI) ·
-[framework recipes](docs/recipes/) (Claude Code hooks, OpenAI Agents SDK,
-LlamaIndex/CrewAI) ·
-[**operations**](docs/operations.md) (metrics, branch states, eventing,
-budgets, HTTP/auth threat model — single node, see that page's first
-paragraph) · [Kubernetes sidecar recipe](docs/recipes/kubernetes.md)
-
-**Contributing:** [CONTRIBUTING.md](CONTRIBUTING.md) has dev setup and the
-test tiers, including `make ci-local` (mirrors CI's job matrix locally —
-fast pre-merge signal, not a substitute for the real CI gate);
-[SECURITY.md](SECURITY.md) covers vulnerability reporting. Release notes
-live in [CHANGELOG.md](CHANGELOG.md).
-
-## Versioning
-
-offshoot is in the 0.x prerelease series (tags `v0.1.0` … `v0.2.7`, the
-current line). The CLI surface and the on-disk storage format may still
-change release to release. Compatibility is never left to guesswork: the
-store's layout version detects a mismatch outright — a newer binary refuses
-to write a layout an older one wouldn't understand, and an older binary
-refuses a store a newer one has upgraded. 0.2.0 exercised exactly that
-mechanism for real: the first copy-on-write (shared) fork bumps a store to
-layout version 2, and 0.1.x binaries then refuse the whole store — see
-[CHANGELOG.md](CHANGELOG.md). 1.0 is reserved for the point the storage
-format freezes.
+An agent attempt or eval run needs a real database it can trash: mocks
+aren't real, re-seeding is slow, and container or VM snapshots version a
+whole machine to get at one file. offshoot branches the database itself —
+copy-on-write forks of stock SQLite files over a local directory or an
+S3-compatible bucket. A shared fork of a 100 MB database adds
+[377 bytes](docs/benchmarks.md#added-object-store-bytes-per-fork-100-mb-database)
+to the store — about 280,000× less than a copy — and every checkout is a
+plain `.db` file any SQLite tool opens. Try N migrations or N agent
+attempts on N forks, `promote` the winner, and let the losers expire.
 
 ## Quickstart (60 seconds, no server, no bucket)
 
@@ -85,24 +30,141 @@ format freezes.
 Runnable demo: [`examples/parallel-attempts/`](examples/parallel-attempts/)
 forks a database three ways, races three migrations against the forks,
 promotes the one that's actually correct, and discards the other two —
-`./examples/parallel-attempts/run.sh`.
+`./examples/parallel-attempts/run.sh`. Real recording:
+[`docs/demo/parallel-attempts.cast`](docs/demo/parallel-attempts.cast)
+(play locally with `asciinema play`).
+
+<details>
+<summary>Transcript of that demo, from a real run — nothing doctored</summary>
+
+```
+==> building offshoot
+==> creating a database with some data
+    3 orders, checkpoint 'before-migration'
+==> keeping the pre-migration state on its own branch
+    forked 'pre-migration' from the 'before-migration' checkpoint — promote wipes main's own checkpoint history, so this fork is what actually survives
+==> forking three attempts (instant, no copy)
+==> running the migrations in parallel forks
+    attempt-1: FAIL
+    attempt-2: FAIL
+    attempt-3: PASS
+==> winner: attempt-3
+==> promoting the winner onto main
+    promoted
+==> discarding the losers
+==> main now has the migrated data:
+    id|total|total_cents
+    1|19.99|1999
+    2|8.70|870
+    3|4.35|435
+==> and the pre-migration state is still one command away, on its own branch:
+    offshoot checkout shop@pre-migration
+```
+
+</details>
 
 Building an eval harness or a test suite around this instead of a one-off
 script? [docs/eval-harness.md](docs/eval-harness.md) is the paved road:
 seed once, fork per test, xdist/vitest parallelism, golden-file assertions,
 TTL cleanup, and a CI recipe — for Python (`offshoot.pytest_plugin`) and
-TypeScript (`testkit`) alike. Two more commands round out the inspect/debug
-loop that tutorial builds on: `offshoot export <db>@<branch>[@checkpoint]
-out.db` copies a checkpoint out to a plain file for handoff, and `offshoot
-diff a@x b@y [--summary]` answers "what changed between these two attempts"
-— see [docs/diff.md](docs/diff.md) and
+TypeScript (`testkit`) alike. `offshoot export` copies a checkpoint out to
+a plain file for handoff, and `offshoot diff` answers "what changed between
+these two attempts" — see [docs/diff.md](docs/diff.md) and
 [docs/reference.md](docs/reference.md).
 
-At rest (no daemon running): checkpoints are full snapshots; checkout paths
-are fixed at `<store>/checkouts/{db}/{branch}.db`; operations require the
-checkout to be quiescent (no live writers). Daemon mode (below) layers live
-capture, incremental segments, and S3/R2 backends on top of the same
-commands.
+## Why it's different
+
+- **Copy-on-write forks, measured.** A shared fork writes two tiny
+  objects — 377 B for a 100 MB database, flat from 1 to 100 forks — and
+  forking a named checkpoint takes ~9–12 ms whether the database is 12 MB
+  or 1 GB. A diverging child pays only for the pages it changes (~776 B
+  per single-row transaction). Numbers, method, and the honest caveats:
+  [docs/benchmarks.md](docs/benchmarks.md#copy-on-write-fork-cost-v02x).
+- **kill&nbsp;-9 durable.** The torture harness runs a stock `sqlite3` CLI
+  writer and `SIGKILL`s it mid-write on roughly half of every round, while
+  bouncing the capture engine mid-traffic every 10th round; the replica
+  must converge to byte-identical dump output after every round. A 300 s
+  run is ~3,500 rounds — zero divergence — and it runs in CI on a nightly
+  cadence: [docs/testing.md](docs/testing.md#the-kill--9-torture-harness).
+- **Stock everything.** A checkout *is* a SQLite file — no forked engine,
+  no special VFS on the read path — and `offshoot export` materializes any
+  branch or checkpoint to a plain `.db` with zero ongoing relationship to
+  the store. The exit hatch is `cp`, and the pre-1.0
+  [stability contract](docs/stability.md) guarantees any format break ships
+  with a migration or a documented export path in the same release.
+- **Agent-native.** MCP tools so the agent forks before risky work and
+  promotes what passed ([`offshoot mcp`](#mcp)); TTL'd branches that reap
+  themselves so a forgotten attempt doesn't leak; pytest fixtures and a
+  vitest/jest testkit for fork-per-test isolation
+  ([docs/eval-harness.md](docs/eval-harness.md)); a LangGraph companion
+  and framework recipes ([docs/recipes/](docs/recipes/)).
+
+## What offshoot deliberately doesn't do
+
+- **No row-level merge.** The workload is fork-many-keep-one: `promote`
+  the winner whole, let the losers TTL away. Real merge would forfeit the
+  single-fenced-writer invariant the safety story rests on — if you need
+  it, [Dolt is built for that](docs/faq.md#can-i-merge-two-branches).
+- **No multi-writer branches.** Exactly one leased, epoch-fenced writer
+  per lineage; two agents writing "at once" get two forks and a `promote`
+  ([why](docs/faq.md#why-one-writer-per-branch)).
+- **No managed service, no multi-node.** Your bucket, your binary,
+  Apache-2.0; replication, failover, and the word "cluster" are explicitly
+  out of scope for v1 ([non-goals](ROADMAP.md#non-goals-v1),
+  [why not Turso/LiteFS](docs/faq.md)).
+
+More "why not X" (Litestream, Dolt, Neon, plain `cp`):
+[docs/faq.md](docs/faq.md).
+
+## Install
+
+- **Homebrew** *(at launch — needs the repo public)*:
+  `brew tap sricola/offshoot https://github.com/sricola/offshoot && brew install offshoot`
+  (formula lives in-repo at [`Formula/offshoot.rb`](Formula/offshoot.rb))
+- **Docker:**
+  `docker run --rm -v offshoot-data:/data ghcr.io/sricola/offshoot:latest init`
+  — images publish to GHCR on every tagged release; the store lives in the
+  `/data` volume, so reuse `-v offshoot-data:/data` across commands
+  (`... offshoot:latest create app`, `... offshoot:latest serve`, and so on)
+- **Nix** *(at launch — needs the repo public and a real `vendorHash`)*:
+  `nix run github:sricola/offshoot` — flake in-repo; see the
+  `vendorHash` note at the top of [`flake.nix`](flake.nix)
+- **Prebuilt binaries** *(at launch — needs the releases page public)*:
+  `offshoot_vX_os_arch.tar.gz` (+ `.sha256`) from the
+  [releases page](https://github.com/sricola/offshoot/releases), published
+  for each tagged release
+- **From source:** the Quickstart above (Go 1.25+, cgo)
+
+Requires Go 1.25+ and cgo to build, and the `sqlite3` CLI for tests. Linux
+and macOS only. **Windows:** use WSL2 — the linux binaries, Docker image,
+and build-from-source all work there as-is. Native Windows is unsupported:
+offshoot leans on POSIX file semantics (unix sockets, POSIX locks) that
+don't map cleanly to Windows
+([why](docs/faq.md#why-no-windows-support)).
+
+## Status
+
+**Prerelease (0.2.x).** What's shipped and exercised by tests that would
+fail if it broke: local and S3-compatible stores behind a shared
+conformance suite, copy-on-write forks, live WAL capture with incremental
+segments, leases with epoch fencing, CAS on every ref update, TTL reaping
+and GC, checkpoint/rollback/promote/export/diff, the daemon with metrics
+and events, an MCP server, and Python/TypeScript SDKs with test fixtures.
+[docs/status.md](docs/status.md) is the honest per-feature accounting —
+shipped-and-tested vs. shipped-but-unverified vs. still on the
+[roadmap](ROADMAP.md) — and [docs/testing.md](docs/testing.md) shows the
+CI gates behind the "tested" column.
+
+The caveats, stated plainly: the CLI surface and the on-disk storage
+format may still change before 1.0 — but never silently. Every store
+records a layout version, and a binary that doesn't understand a store's
+layout refuses the whole store rather than guessing (0.2.0's first
+copy-on-write fork exercised exactly that gate for real — see
+[CHANGELOG.md](CHANGELOG.md)). Any format break ships in the same release
+with a migration or a documented `export` → `create --from` path: the
+[stability contract](docs/stability.md) is the full promise, including the
+proposed v1.0 criteria. 1.0 is reserved for the point the storage format
+freezes.
 
 ## Storage
 
@@ -110,13 +172,12 @@ commands.
     offshoot -store s3://my-bucket/offshoot init     # S3-compatible bucket
 
 offshoot's safety rests on compare-and-swap: every branch ref update is a
-conditional write. At attach time it **probes the store** and refuses to run
-if conditional writes are not enforced, rather than silently degrading. That
-probe re-runs on every command (every CLI invocation attaches fresh) — a
-handful of sequential round trips against a remote store, paid every time by
-design (fail-closed beats a cached "it was fine last time"); a long-lived
-daemon (see Daemon mode below) amortizes it across a session instead of
-paying it per command.
+conditional write. At attach time it **probes the store** and refuses to
+run if conditional writes are not enforced, rather than silently
+degrading. That probe re-runs on every command (every CLI invocation
+attaches fresh) — fail-closed beats a cached "it was fine last time"; a
+long-lived daemon (below) amortizes it across a session instead of paying
+it per command.
 
 Configuration for `s3://` specs — credentials come from the AWS SDK default
 chain (environment, shared config, IAM role):
@@ -131,47 +192,33 @@ chain (environment, shared config, IAM role):
 ### Provider support
 
 A provider is listed as supported only after the conformance suite and CAS
-probe pass against it for real (`make test-s3`) — the in-process fake used in
-unit tests proves nothing about a real provider.
+probe pass against it for real (`make test-s3`) — the in-process fake used
+in unit tests proves nothing about a real provider.
 
 | Provider | Status |
 |---|---|
-| MinIO | verified — `minio/minio:latest` [1], run 2026-07-31; `make test-s3` PASS |
-| AWS S3 | expected to pass (conditional writes GA since Nov 2024); not yet run |
+| MinIO | verified in CI — the conformance suite runs against real MinIO on every PR and push to main |
+| AWS S3 | verified — `TestS3RealProvider` (probe + conformance + multipart) passed against a real bucket (us-east-1, 2026-08-13) |
 | Cloudflare R2 | expected to pass; not yet run |
-| Google Cloud Storage (S3 interop) | **unsupported** — no conditional writes on the S3 API; the probe refuses it |
+| Google Cloud Storage (S3 interop) | **unsupported** — no conditional writes on the S3 API; the probe refuses it ([why](docs/faq.md#why-no-google-cloud-storage)) |
 
 [1] `minio/minio:latest` digest: `sha256:14cea493d9a34af32f524e538b8346cf79f3321eff8e708c1e2960462bd8936e`
 
 Checkouts are always real local SQLite files; only the snapshots and refs
 live in the store.
 
-## Leases and fencing
-
-A long-running writer — offshoot's daemon (see Daemon mode below) — claims a branch with a lease:
-
-    offshoot lease list
-    offshoot lease acquire app@main --ttl 60s
-    offshoot lease release app@main
-
-Acquiring or reclaiming a branch **bumps its epoch**, and every object is
-written under the epoch current at the time. A writer that pauses, loses its
-lease, and later resumes therefore writes into a superseded prefix that no ref
-points at — it cannot corrupt the branch, and its garbage is collected with the
-lineage. Expiry is wall-clock and advisory; the guarantee against an
-uncooperative writer comes from the epoch fence and ref compare-and-swap, not
-from the clock.
-
-`offshoot lease acquire` exits immediately, so its lease expires unless a
-long-running process renews it. It exists for inspection and for breaking a
-stuck lease.
+At rest (no daemon running): checkpoints are full snapshots; checkout
+paths are fixed at `<store>/checkouts/{db}/{branch}.db`; operations
+require the checkout to be quiescent (no live writers). Daemon mode
+(below) layers live capture, incremental segments, and continuous
+durability on top of the same commands.
 
 ## Daemon mode
 
-At rest, every offshoot command opens the store, does its work, and exits — so
-a checkpoint has to quiesce the database. The daemon removes that constraint:
-it holds the branch under lease and captures every committed transaction while
-your agent keeps writing.
+At rest, every offshoot command opens the store, does its work, and exits —
+so a checkpoint has to quiesce the database. The daemon removes that
+constraint: it holds the branch under lease and captures every committed
+transaction while your agent keeps writing.
 
     offshoot serve &                       # holds leases, captures continuously
     sleep 1                                # let the listener come up
@@ -181,24 +228,45 @@ your agent keeps writing.
     offshoot session status                # durable txid per session
     offshoot session close app             # releases the lease
 
-**Durability is explicit.** Between flushes, writes are committed to SQLite but
-not yet in the store; `session status` reports the txid each session is durable
-through. A session that loses its lease is fenced and stops — it will not write
-under a dead epoch — and `session status` shows the error.
-
-By default the daemon also ships every open session's work on a timer,
-independent of any explicit `flush`:
+**Durability is explicit and reported.** Between flushes, writes are
+committed to SQLite but not yet in the store; `session status` reports the
+txid each session is durable through. By default the daemon also ships
+every open session's work on a timer:
 
     offshoot serve -flush-every 30s        # the default; 0 disables it
 
-`-flush-every` bounds how much committed-but-unflushed work is ever at risk:
-worst case, a daemon that dies loses at most one `-flush-every` interval's
-worth of writes, instead of everything since the last manual flush. `-flush-every
-0` turns the timer off and returns to durability that only advances when
-something calls `flush` explicitly — this project's original behavior, still
-available if you want it. The cadence is a daemon-wide setting applied to
-every session `offshoot serve` opens; there's no way yet to give one session
-a different cadence than the rest (see [docs/status.md](docs/status.md)).
+`-flush-every` bounds how much committed-but-unflushed work is ever at
+risk: worst case, a daemon that dies loses at most one interval's worth of
+writes. `0` returns to durability that advances only on explicit `flush`.
+The cadence is daemon-wide, not per-session
+([docs/status.md](docs/status.md)). A session that loses its lease is
+fenced and stops — it will not write under a dead epoch — and
+`session status` shows the error.
+
+The daemon serves a unix socket (mode 0600) under your cache directory,
+one per store; override with `OFFSHOOT_SOCKET` or `-socket PATH` (pass the
+same to every `offshoot session ...` command). Daemon and agent must share
+a kernel and a local filesystem: the checkout is a real SQLite file both
+processes open.
+
+### Leases and fencing
+
+A long-running writer — the daemon — claims a branch with a lease:
+
+    offshoot lease list
+    offshoot lease acquire app@main --ttl 60s
+    offshoot lease release app@main
+
+Acquiring or reclaiming a branch **bumps its epoch**, and every object is
+written under the epoch current at the time. A writer that pauses, loses
+its lease, and later resumes writes into a superseded prefix that no ref
+points at — it cannot corrupt the branch, and its garbage is collected
+with the lineage. Expiry is wall-clock and advisory; the guarantee against
+an uncooperative writer comes from the epoch fence and ref
+compare-and-swap, not from the clock
+([docs/testing.md](docs/testing.md#fencing-and-cas-in-two-paragraphs)).
+`offshoot lease acquire` exits immediately, so its lease expires unless
+renewed — it exists for inspection and for breaking a stuck lease.
 
 ### TTLs and the reaping janitor
 
@@ -209,250 +277,112 @@ A branch can carry a TTL, set at fork time or any time after:
     offshoot touch app@attempt-1                # resets the clock, TTL unchanged
     offshoot touch app@attempt-1 --ttl none     # clears the TTL
 
-Per the design spec:
+TTL is measured from the last durable write or lease renewal, whichever is
+later. A branch with an active lease is never reaped — a daemon session
+holding a branch open keeps renewing, so the janitor can never reap a
+branch it's actively writing to. Protected branches (`main`, by default)
+are never reaped regardless of TTL; branches without a TTL live until
+destroyed. TTLs read back re-rendered through Go's canonical duration form
+(`--ttl 1h` reports as `ttl=1h0m0s`).
 
-> TTL is measured from the last durable write (last shipped segment) or lease
-> renewal, whichever is later; `offshoot touch` resets it explicitly. A branch
-> with an active lease is never reaped — expiry defers until the lease is
-> released or times out (a wedged holder loses the lease first, then TTL
-> applies). Creating a child does not extend the parent. Branches without a
-> TTL live until destroyed.
-
-In practice: a daemon session holding a branch open keeps renewing its lease,
-so the janitor can never reap a branch this daemon is actively writing to,
-TTL or not; `offshoot touch` is how you defer expiry on a branch nobody has
-open. Protected branches (`main`, by default) are never reaped regardless of
-TTL. `offshoot status` and the daemon's own responses report the TTL
-re-rendered through Go's canonical `time.Duration.String()` — a fork
-requested with `--ttl 1h` reads back as `ttl=1h0m0s`, not the literal `1h` it
-was given.
-
-`offshoot serve` runs the janitor — TTL reaping plus the periodic GC sweep —
-on an interval:
+`offshoot serve` runs the janitor — TTL reaping plus the periodic GC
+sweep — on an interval:
 
     offshoot serve -reap-every 1m -gc-grace 15m   # both are the defaults
 
-`-reap-every 0` disables the janitor entirely: neither TTL reaping nor the
-periodic GC sweep runs (GC is still available on demand via `offshoot gc`).
-`-gc-grace` is how long a tombstoned (unreachable) lineage's storage must sit
-before a later cycle actually deletes it — `0` makes it eligible for deletion
-on the very next cycle after being marked, rather than disabling GC.
+`-reap-every 0` disables the janitor entirely (GC stays available on
+demand via `offshoot gc`); `-gc-grace` is how long a tombstoned lineage's
+storage sits before a later cycle actually deletes it.
 
 ### What a flush costs
 
-A daemon flush writes only the pages that changed since the previous flush —
-the capture engine already knows exactly which those are. Every sixteenth
-flush writes a full snapshot instead, so materializing a branch never replays
-an unbounded chain: a read applies one snapshot plus at most fifteen
-segments. That cadence is `Options.SnapshotEvery` in the embeddable session
-library, and `offshoot serve -snapshot-every N` (Milestone 4 Task 6a) plumbs
-the same knob to every daemon-managed session (default 16, unchanged if
-omitted; must be `>= 1`). A lower N means cheaper, more tightly bounded reads
-at the cost of shipping a full-database upload more often; a higher N
-amortizes that upload cost across more flushes at the cost of longer
-per-read replay — see `offshoot serve`'s entry in
-[docs/reference.md](docs/reference.md) for the full trade-off.
+A daemon flush writes only the pages that changed since the previous
+flush. Every sixteenth flush writes a full snapshot instead, so
+materializing a branch never replays an unbounded chain: a read applies
+one snapshot plus at most fifteen segments. `offshoot serve
+-snapshot-every N` tunes that cadence (default 16) — lower N means
+cheaper, more tightly bounded reads; higher N amortizes the full-snapshot
+upload across more flushes — see `offshoot serve`'s entry in
+[docs/reference.md](docs/reference.md) for the full trade-off. An idle
+session — nothing committed since the last successful flush — skips the
+tick entirely, so a quiet session pays nothing; cost scales with what the
+agent actually writes, not wall-clock time.
 
-A session's very first auto-flush after `session open` used to be an
-unconditional full snapshot, no matter where that landed in the
-sixteen-flush cadence — even for a session that never wrote anything —
-because closing a startup-rebase race required treating the checkout as
-though it might have changed. It no longer does, when TWO things are both
-provably true: the checkout `Open` received was already byte-identical to
-the branch's head at the moment `Open` checked (the same `.sum` sidecar
-clean-and-current fast path ["Resource behavior"](#resource-behavior) below
-describes), AND the LTX checksum recorded in that SAME sidecar — stamped
-there by `Checkout`/`Checkpoint`/`Rollback`/`Promote`, or by a session's
-own clean `Close` — exactly matches what the checkout actually contains
-once the session's real startup rebase finishes running. That second check
-is not redundant with the first: `Open` can return to its caller before
-its own startup rebase has actually finished (closing a different, older
-race — see `internal/session/session.go`'s `rebaseline` doc comment), so a
-write landing in that narrow window is folded into the checkout without
-the first check ever seeing it; the checksum comparison is what catches
-exactly that case and forces a real settle instead of silently losing the
-write. Reading that checksum out of the local sidecar rather than fetching
-it fresh from the store costs `Open` nothing extra — no store round trip
-at all, and specifically no download of the head object itself, which is
-exactly what an earlier, since-reverted version of this fix did on every
-single `Open`, undoing its own benefit for a read-only session against a
-snapshot head. Only when both hold — the common case for a read-only
-daemon session reopened against a checkout nothing has touched since —
-does this settling flush upload nothing at all. A session whose checkout
-instead had to be (re)materialized first (a branch's first-ever open, a
-dirty/stale local checkout, or one another writer moved past)
-still pays the settling flush exactly as before: one full-snapshot upload
-sized to the database, not fixed — measured at 541.9MB uploaded for a
-512MB source database. It happens at most once per session either way, not
-on every tick after that — see
+A session whose checkout had to be (re)materialized at open pays one
+settling full-snapshot flush, once per session; a session reopened against
+a clean, current checkout uploads nothing at all for it. The measurement
+and the exact suppression condition:
 [docs/benchmarks.md](docs/benchmarks.md#settling-flush-cost-task-2-controller-decision)
-for the measurement and `internal/session/session.go`'s `rebaseline` doc
-comment for the exact suppression condition and its proof obligation.
+and `internal/session/session.go`'s `rebaseline` doc comment.
 
-Under continuous writing, the daemon's default `-flush-every 30s` combined
-with the default sixteen-flush snapshot cadence means a full snapshot ships
-roughly every 8 minutes (30s × 16 ticks) for as long as the agent keeps
-writing between every tick. An idle session — nothing committed and no
-rebase since the last successful flush — skips the tick entirely (no object
-write, no ref write at all), so a quiet session pays none of this; the cost
-scales with how much the agent is actually writing, not with wall-clock time
-alone.
+The at-rest `offshoot checkpoint` still writes a full snapshot every time —
+it runs without a daemon, so it has no record of which pages changed. If
+you checkpoint large databases in a loop, run a daemon.
 
-The at-rest `offshoot checkpoint` still writes a full snapshot every time. It
-runs without a daemon, so it has no record of which pages changed and would
-have to diff the whole database to find out. If you checkpoint large databases
-in a loop, run a daemon.
-
-Forking is a different cost from flushing — and since the copy-on-write
-release, usually no storage cost at all. `offshoot fork` shares the
-parent's already-durable store objects through a base pointer: the child
-records where it forked from and writes new objects only as it diverges,
-so N forks of a G-byte database cost near-zero added store bytes rather
-than N×G. Reads stay bounded by construction (a fork whose resolved chain
-is already at the depth bound materializes one snapshot floor instead, and
-a diverging child self-snapshots on the ordinary cadence). The asymmetry
-to know: **fork shares; `promote`, `rollback`, and `compact` each
-materialize a full independent copy** — those paths still use the
-snapshot-copy machinery (filesystem clone / backend-side `CopyObject` when
-the source resolves to a single snapshot, materialize-and-re-encode
-otherwise; measured numbers in [docs/benchmarks.md](docs/benchmarks.md)).
-Destroying a parent stays instant and always allowed, but its bytes are
-reclaimed only once no surviving shared child still reads through them —
-`offshoot compact` cuts that cord on demand. The first shared fork bumps
-the store to layout version 2, which locks pre-copy-on-write binaries out
-of the whole store (their lineage-granular GC would sweep shared objects —
-the refusal is the protection). Full model:
+Forking is a different cost from flushing — usually no storage cost at
+all. `offshoot fork` shares the parent's already-durable objects through a
+base pointer: the child records where it forked from and writes new
+objects only as it diverges, so N forks of a G-byte database cost
+near-zero added store bytes rather than N×G, and reads stay bounded by
+construction. The asymmetry to know: **fork shares; `promote`,
+`rollback`, and `compact` each materialize a full independent copy**
+(measured numbers in [docs/benchmarks.md](docs/benchmarks.md)). Destroying
+a parent stays instant, but its bytes are reclaimed only once no surviving
+shared child still reads through them — `offshoot compact` cuts that cord
+on demand. The first shared fork bumps the store to layout version 2,
+which locks pre-copy-on-write binaries out of the whole store — the
+refusal is the protection. Full model:
 [docs/reference.md](docs/reference.md)'s `fork`/`compact`/`destroy`
-sections and [docs/operations.md](docs/operations.md#storage-sharing-copy-on-write-forks).
-
-The daemon serves a unix socket (mode 0600) under your cache directory, one per
-store; override with `OFFSHOOT_SOCKET`, or pass `-socket PATH` to `offshoot
-serve`. If you use `-socket PATH` on `serve`, pass the same `-socket PATH` to
-every `offshoot session ...` command too (or export `OFFSHOOT_SOCKET`
-instead) — the CLI has no other way to find a non-default socket. Daemon and
-agent must share a kernel and a local filesystem: the checkout is a real
-SQLite file both processes open.
+sections and
+[docs/operations.md](docs/operations.md#storage-sharing-copy-on-write-forks);
+the storage-cost ledger, stated plainly:
+[docs/faq.md](docs/faq.md#storage-cost-honestly).
 
 ### Metrics, HTTP, and events
 
-`offshoot serve` is opt-in observable and automatable: `-http ADDR` starts a
-loopback-by-default, token-authenticated HTTP listener alongside the unix
-socket — `GET /metrics` (Prometheus text exposition of every
-`offshoot_*` metric, zero new dependencies), `GET /healthz` (unauthenticated
-liveness), `POST /rpc` (the same protocol the socket speaks, over HTTP),
-`GET /events` (Server-Sent Events), and token-gated `GET /debug/pprof/*`.
-The unix socket also gains a `subscribe` op streaming the same versioned
-event JSON — flush/fork/reap/eviction/fencing, as they happen, instead of
-polling `status` in a loop. Six computed branch states
-(`active`/`pending`/`error`/`dirty`/`detached`/`idle`) answer "what's this
-branch doing right now" without a separate audit pass. A `-ro-cache-budget`
-bounds the read-only checkout cache with LRU eviction, never touching a
-writable, leased checkout. All of it is single-node: see
-[docs/operations.md](docs/operations.md) for the full metrics reference,
-states table, event schema, budget mechanics, and the HTTP threat model in
-one place, and [docs/recipes/kubernetes.md](docs/recipes/kubernetes.md) for
-a real sidecar manifest.
+`offshoot serve -http ADDR` starts a loopback-by-default,
+token-authenticated HTTP listener alongside the unix socket:
+`GET /metrics` (Prometheus text exposition, zero new dependencies),
+`GET /healthz`, `POST /rpc` (the same protocol the socket speaks),
+`GET /events` (Server-Sent Events for flush/fork/reap/eviction/fencing),
+and token-gated `GET /debug/pprof/*`. Six computed branch states answer
+"what's this branch doing right now", and `-ro-cache-budget` bounds the
+read-only checkout cache with LRU eviction. All of it is single-node:
+[docs/operations.md](docs/operations.md) has the metrics reference, states
+table, event schema, budget mechanics, and the HTTP threat model in one
+place; [docs/recipes/kubernetes.md](docs/recipes/kubernetes.md) has a real
+sidecar manifest.
 
 ### Resource behavior
 
-`checkouts-ro` (the read-only historical-checkpoint cache) has a real disk
-budget as of [Milestone 4](ROADMAP.md#milestone-4--operable-at-scale):
-`serve -ro-cache-budget <bytes|0>` (default `0`, unlimited) LRU-evicts it
-under the janitor, on the same cadence as reap/GC — see
-[docs/operations.md](docs/operations.md#budgets) for the mechanics
-(the `.last-used` touch-on-hit clock, the writable-`checkouts/`-is-never-
-evicted guarantee, and the TOCTOU-vs-`CheckoutAt` note). There is still no
-FD budget or eviction of cold *writable* sessions — see
-[docs/operations.md](docs/operations.md#deliberately-out-of-scope-in-m4)
-for exactly what M4 narrowed and why (`internal/dbfile`'s descriptors are
-deliberately unclosable by design, documented there rather than budgeted
-around this milestone).
-
-In today's code, an open session's own FD footprint is small and fixed
-(capture engine reader, WAL reader, lease-renewal timer — none of it scales
-with how long the session stays open or how much it writes). Disk is the
-sharper cost: `Checkout` no longer re-materializes a checkout that's already
-clean and current at the branch's head, which removes the common case of
-stranding a leftover file descriptor — and the full copy of the database
-behind it — on every session open. But a checkout that *does* get
-re-materialized (dirty, stale, or destroyed/reaped while an earlier open's
-descriptor still points at its now-unlinked inode) still strands one
-descriptor, and the disk behind it, for the life of the daemon process —
-there is no reclamation path for that yet.
-
-That skip fires whenever the checkout's `.sum` sidecar matches the branch
-ref's current head — and that now stays true across the daemon's default
-config too: a session's clean `Close` refreshes the sidecar to whatever it
-last durably flushed (not just `Checkout`, `Checkpoint`, `Rollback`, and
-`Promote` anymore), and the paired settling-flush suppression above means a
-reopened, unmodified session doesn't even need that flush to happen for the
-sidecar to already be current — a session that only ever read never needs a
-refresh at all, since nothing about the checkout changed since `Open`.
-
-"Clean" has real limits, though. A `Close` after a flush that failed, or on
-a session whose lease was fenced, does not stamp the sidecar — the
-checkout's true durable state is ambiguous at that point, and guessing
-"clean" would risk a later reopen silently skipping content that was never
-actually saved — so that session's checkout re-materializes on the next
-open, once. So does a session that ever took a mid-session
-rebase-on-divergence (a real WAL discontinuity, not the ordinary startup
-rebase): the replica's provenance is no longer a straight, unbroken line
-back to the checkout `Open` originally seeded it from, so `Close`
-conservatively leaves the sidecar alone rather than risk stamping content
-the checkout's own bytes never physically received. And the stamp itself
-is only ever taken from the capture engine's OWN post-shutdown fingerprint
-(computed only once its shutdown fully verifies the checkout's WAL was
-cleanly and completely folded in) rather than re-derived independently — a
-foreign write landing in the narrow window around the engine's final
-checkpoint leaves that verification unmet, and `Close` correctly leaves the
-sidecar unstamped rather than risk fingerprinting content the engine itself
-refused to vouch for. Outside those cases — the overwhelming majority of
-sessions in practice — a daemon that keeps reopening the same branch stays
-flat: no re-materialize, no stranded descriptor, on any reopen of a
-checkout nothing else touched since the prior session's clean close.
-Restarting the daemon reclaims everything a fresh process never opened.
-
-One more property worth naming explicitly, not a limit but a tradeoff: once
-a checkout's sidecar is clean-and-current (however it got that way), the
-next `Checkout` is served straight from disk without ever consulting the
-object store's chain — including if that chain has since been corrupted.
-This was already true for a sidecar stamped by `Checkout`/`Checkpoint`/
-`Rollback`/`Promote` (Milestone 2 Task 1); it now also applies after an
-ordinary session's clean close. See
-[docs/status.md](docs/status.md)'s "Clean-and-current checkout served
-without chain validation" row.
+An open session's FD footprint is small and fixed. Disk is the sharper
+cost: `Checkout` reuses a checkout that's already clean and current at the
+branch's head instead of re-materializing it, so a daemon that keeps
+reopening the same untouched branch stays flat. A checkout that *does* get
+re-materialized (dirty, stale, or destroyed while an earlier descriptor
+still points at it) strands one descriptor — and the disk behind it — for
+the life of the daemon process; restarting the daemon reclaims everything.
+The tradeoff to know: a clean-and-current checkout is served straight from
+disk without consulting the store's chain. Full mechanics and caveats:
+[docs/operations.md](docs/operations.md#budgets) and
+[docs/status.md](docs/status.md)'s resource-behavior rows.
 
 **Read-only historical checkouts** (`offshoot checkout --at <checkpoint>
---read-only`, `Client.checkout_at`/`checkoutAt`) live in a completely
-separate tree from the writable-checkout cache described above:
-`<store-root>/checkouts-ro/<db>/<branch>@<checkpoint>.db`, one file per
-`(db, branch, checkpoint)` ever materialized this way, `chmod 0444`. This
-cache has none of the above's costs or caveats: no `.sum` sidecar, no lease,
-no stranded `dbfile` descriptor (nothing in this codebase ever opens a
-`checkouts-ro` file through a live capture engine, so the stray-close lock
-hazard that motivates `internal/dbfile` in the first place doesn't apply to
-it), and no reclamation problem to solve later — **it is safe to `rm -rf`
-the entire `checkouts-ro` directory at any time**; the next call for
-anything under it just rebuilds what it needs from the store. A repeat call
-for the same checkpoint is a cheap cache hit (the file already exists, a
-checkpoint's content never changes, so it's returned as-is with no store
-access at all) unless `--force`/`force=True` is given. `offshoot export`'s
-output has the identical zero-ongoing-relationship property, just written
-wherever the caller pointed it rather than under a fixed cache path.
-
+--read-only`) live in a separate `checkouts-ro/` tree — one `chmod 0444`
+file per `(db, branch, checkpoint)`, no sidecar, no lease, no stranded
+descriptor — and **it is safe to `rm -rf` the entire `checkouts-ro`
+directory at any time**; the next call rebuilds what it needs from the
+store. `offshoot export`'s output has the same
+zero-ongoing-relationship property, written wherever you pointed it.
 
 ## Integration surface
 
-Four ways to talk to offshoot (the design spec's "integration surface"): the
-CLI above needs no daemon and no SDK; everything else below is a client of
-the daemon's lifecycle API and requires `offshoot serve` already running.
-A fifth, operator-facing surface rides alongside all four without changing
-any of them: `serve -http ADDR` exposes the identical `Request`/`Response`
-protocol the unix socket speaks as `POST /rpc` over HTTP, plus `/metrics`,
-`/healthz`, `/events`, and token-gated `/debug/pprof/*` — the same
-lifecycle API, reachable from a sidecar or a remote-dev setup instead of
-only a local unix socket. See [docs/operations.md](docs/operations.md) for
-the full surface and its threat model.
+Four ways to talk to offshoot: the CLI above needs no daemon and no SDK;
+everything below is a client of the daemon's lifecycle API and requires
+`offshoot serve` already running. A fifth, operator-facing surface rides
+alongside without changing any of them: `serve -http ADDR` exposes the
+same lifecycle API over HTTP (see
+[Metrics, HTTP, and events](#metrics-http-and-events)).
 
 ### MCP
 
@@ -464,75 +394,50 @@ branch on its own initiative instead of asking you to run commands:
 The agent gets seven tools — list, checkout, checkpoint, fork, rollback,
 promote, destroy — described so it knows *when* to use them: fork before a
 risky migration, checkpoint when tests pass, roll back when they don't,
-promote the attempt that worked.
+promote the attempt that worked. See it work end to end:
+[docs/demo/mcp-walkthrough.md](docs/demo/mcp-walkthrough.md), a real
+captured session.
 
-Destructive tools respect the same protected-branch rules as the CLI: an agent
-can fork and experiment freely, but promoting onto or destroying `main`
-requires an explicit force, and the refusal tells the agent so.
+Destructive tools respect the same protected-branch rules as the CLI: an
+agent can fork and experiment freely, but promoting onto or destroying
+`main` requires an explicit force, and the refusal tells the agent so.
 
 Agent-created forks expire by default, so an agent that forks and forgets
 doesn't leak branches forever: `offshoot_fork` applies `offshoot mcp
 -default-ttl` (default `24h`) to any call that omits its own `ttl`; pass
-`ttl:"<duration>"` on the call to override it, or `ttl:"none"` to fork a
-branch that never expires even under a configured default:
-
-    offshoot mcp -default-ttl 12h        # forks default to 12h unless overridden
-    offshoot mcp -default-ttl none       # forks are immortal unless a call sets ttl
-
-The tool's response echoes the TTL it applied and, when there is one, the
-computed expiry timestamp, so both are visible in the agent's own
-transcript. **A TTL alone does not reap anything** — reaping is the
-janitor's job (`offshoot serve`), and `offshoot mcp` runs no daemon of its
-own, so a daemonless MCP setup only sweeps expired branches when
-`offshoot gc` is run by hand.
+`ttl:"<duration>"` to override, or `ttl:"none"` for a branch that never
+expires. The response echoes the TTL applied and the computed expiry, so
+both are visible in the agent's transcript. **A TTL alone does not reap
+anything** — reaping is the janitor's job (`offshoot serve`), and
+`offshoot mcp` runs no daemon of its own; a daemonless MCP setup only
+sweeps expired branches when `offshoot gc` is run by hand.
 
 **MCP rides a running daemon when one is up, but only for a branch a
 session is already open on.** `offshoot mcp` never opens a session itself —
-that's still a harness's job (the SDKs, `offshoot session open`, or your own
-loop) — but on every call, `offshoot_checkpoint`, `offshoot_fork`, and
-`offshoot_checkout` each check fresh whether the daemon has one open for the
-branch in question. If so: `offshoot_checkpoint` flushes it live through the
-daemon (no quiesce, no full-snapshot re-encode, no lease collision);
-`offshoot_fork` forks through the daemon, which flushes an open source
-session first so an unflushed write always lands in the child; and
-`offshoot_checkout` returns that session's own live checkout path instead of
-materializing a separate at-rest copy. **Without an already-open session,
-every one of those tools runs exactly as it does with no daemon at all** —
-a daemon merely running in the background changes nothing on its own.
-`offshoot mcp -socket PATH` names the daemon to ride; omit it and MCP derives
-the same default socket `offshoot serve` does for the store, so the two
-agree without either side hardcoding a path.
-
-`offshoot_rollback`, `offshoot_promote` (checked against its `target`), and
-`offshoot_destroy` take the opposite stance from checkpoint/fork/checkout:
-each **refuses outright — even with `force`** — whenever the daemon has any
-session, healthy or fenced, open on the affected branch, rather than
-proceeding at rest. All three repoint or delete a branch's ref directly,
-bypassing the daemon entirely; without the refusal, one of these calls could
-clear a lease or delete/repoint storage out from under a session the daemon
-still believes it owns. `force` has no effect on *this* refusal, whatever
-else it does at the ops layer underneath (it overrides a live lease on
-destroy; promote never gates on the target's lease at all, force or not,
-and clears it unconditionally as a repoint side effect — see the
-`offshoot promote` entry in [docs/reference.md](docs/reference.md)). The
-remedy here is the same regardless: close the session first (`offshoot
-session close`, or the SDK/harness equivalent) and retry.
-`offshoot_promote`'s `source` is the one exception:
-an open session there does not block the promote, but the promoted state is
-the source's last-flushed/checkpointed head, not any write still unflushed
-in that live session.
-
-**In short: the good path for `offshoot mcp` requires a harness-opened
-session** — the SDKs, `offshoot session open`, or your own loop, opened
-*before* the agent's tool calls. Without one, every tool still works, just
-entirely at rest, exactly as if no daemon were running.
+that's a harness's job (the SDKs, `offshoot session open`, or your own
+loop). With an open session on the branch: `offshoot_checkpoint` flushes
+live through the daemon (no quiesce), `offshoot_fork` forks through the
+daemon (flushing first, so an unflushed write always lands in the child),
+and `offshoot_checkout` returns the session's live checkout path. Without
+one, every tool runs exactly as it does with no daemon at all.
+`offshoot_rollback`, `offshoot_promote` (checked against its `target`),
+and `offshoot_destroy` take the opposite stance: each **refuses outright —
+even with `force`** — whenever the daemon has any session open on the
+affected branch, because all three repoint or delete a ref out from under
+a session the daemon still owns; close the session first and retry
+(`offshoot_promote`'s `source` is the one exception — an open session
+there doesn't block, but the promoted state is the last-flushed head, not
+unflushed writes). Details:
+[docs/reference.md](docs/reference.md). **In short: the good path for
+`offshoot mcp` is a harness-opened session, opened before the agent's
+tool calls.**
 
 ### Python SDK
 
-`sdk/python` is a stdlib-only, thin client over the daemon's lifecycle API —
-it never opens SQLite itself and can't do anything the CLI can't; it just
-lets your process drive a running daemon instead of shelling out. Not yet
-published to PyPI — import it from a checkout of this repo:
+`sdk/python` is a stdlib-only, thin client over the daemon's lifecycle
+API — it never opens SQLite itself and can't do anything the CLI can't; it
+just lets your process drive a running daemon instead of shelling out. Not
+yet published to PyPI — import it from a checkout of this repo:
 
     offshoot -store ./.offshoot init
     offshoot serve -socket /tmp/o.sock &
@@ -549,21 +454,23 @@ with offshoot.connect("/tmp/o.sock") as c:
     s.close()
 ```
 
-`Client` also exposes `branches()`, `dbs()`, `export()` (materialize a
-checkpoint or head to a plain file), and `checkout_at()` (a read-only
-historical checkout).
+`Client` also exposes `branches()`, `dbs()`, `export()`, and
+`checkout_at()` (a read-only historical checkout).
 
-**Testing with pytest?** `pip install "offshoot-db[pytest]"` registers
+**Testing with pytest?** `pip install "offshoot-db[pytest]"` *(at launch —
+until PyPI publication, install from a checkout:
+`pip install "./sdk/python[pytest]"`)* registers
 `offshoot_daemon`/`offshoot_db`/`offshoot_fork` fixtures automatically —
 seed once, fork a fresh isolated branch per test, TTL-backstopped cleanup,
 `pytest-xdist` parallelism (one daemon per worker). Full tutorial:
 [docs/eval-harness.md](docs/eval-harness.md); condensed reference:
-`sdk/python/README.md`'s pytest-fixture-plugin section.
+`sdk/python/README.md`.
 
 ### TypeScript SDK
 
-`sdk/typescript` is the same thin client, zero runtime dependencies. Also not
-yet published to npm — build and import it from a checkout of this repo:
+`sdk/typescript` is the same thin client, zero runtime dependencies. Also
+not yet published to npm — build and import it from a checkout of this
+repo:
 
     offshoot -store ./.offshoot init
     offshoot serve -socket /tmp/o.sock &
@@ -586,10 +493,9 @@ await c.close();
 
 **Testing with vitest/jest/`node:test`?** `@offshoot-db/client/testkit`
 (`startDaemon`/`seedOnce`/`forkPerTest`/`dump`) is the framework-agnostic
-counterpart of the pytest fixtures above — same seed-once-fork-many
-semantics, wired into whatever `beforeAll`/`afterEach` hooks your test
-runner calls. See [docs/eval-harness.md](docs/eval-harness.md)'s
-TypeScript section and `sdk/typescript/README.md`'s testkit section.
+counterpart of the pytest fixtures above. See
+[docs/eval-harness.md](docs/eval-harness.md)'s TypeScript section and
+`sdk/typescript/README.md`.
 
 Both SDKs are exercised against a real daemon by `make test-sdks` (needs
 `python3` and `node`/`npm` on PATH — not part of the default `make test`,
@@ -613,6 +519,35 @@ else gets a short recipe instead of an adapter — see
 [docs/recipes/](docs/recipes/): Claude Code's MCP config and hooks pattern
 ([claude-agent-sdk.md](docs/recipes/claude-agent-sdk.md)), the OpenAI
 Agents SDK's `SQLiteSession` pointed at an offshoot checkout path
-([openai-agents.md](docs/recipes/openai-agents.md)), and short honest notes
-on LlamaIndex and CrewAI
+([openai-agents.md](docs/recipes/openai-agents.md)), and short honest
+notes on LlamaIndex and CrewAI
 ([frameworks.md](docs/recipes/frameworks.md)).
+
+## Docs
+
+[FAQ](docs/faq.md) (why not Litestream / LiteFS / Turso / Dolt / `cp`) ·
+[CLI reference](docs/reference.md) · [architecture](docs/architecture.md) ·
+[branch diff](docs/diff.md) ·
+[implemented/deferred status](docs/status.md) · [roadmap](ROADMAP.md) ·
+[stability contract](docs/stability.md) (pre-1.0 promises, v1.0 criteria) ·
+[how offshoot is tested](docs/testing.md) (torture numbers, CI gates) ·
+[benchmarks](docs/benchmarks.md) (measured, with method) ·
+[CI recipes](docs/ci-recipes.md) (seed-once/fork-per-attempt Actions
+workflows) · [Grafana dashboard](docs/grafana-dashboard.json) ·
+[**the eval-harness tutorial**](docs/eval-harness.md) (seed-once-fork-many
+for pytest/vitest/`node:test`, from install to CI) ·
+[framework recipes](docs/recipes/) (Claude Code hooks, OpenAI Agents SDK,
+LlamaIndex/CrewAI) ·
+[**operations**](docs/operations.md) (metrics, branch states, eventing,
+budgets, HTTP/auth threat model — single node, see that page's first
+paragraph) · [Kubernetes sidecar recipe](docs/recipes/kubernetes.md)
+
+## Contributing and license
+
+[CONTRIBUTING.md](CONTRIBUTING.md) has dev setup and the test tiers,
+including `make ci-local` (mirrors CI's job matrix locally — fast
+pre-merge signal, not a substitute for the real CI gate);
+[SECURITY.md](SECURITY.md) covers vulnerability reporting;
+[docs/operations.md](docs/operations.md) documents the daemon's threat
+model. Release notes live in [CHANGELOG.md](CHANGELOG.md). License:
+[Apache-2.0](LICENSE).
