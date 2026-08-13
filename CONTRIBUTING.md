@@ -164,8 +164,7 @@ image. `workflow_dispatch` builds the same artifacts under a
 
 On each release, also bump the packaging surfaces: `Formula/offshoot.rb`'s
 `url` + `sha256`, and the version chip in
-`site/index.html`'s header (the one place the site states the number).mod` changes (the first real fill, replacing
-`lib.fakeHash`, is a launch-checklist item).
+`site/index.html`'s header (the one place the site states the number).
 
 ### SDK releases
 
