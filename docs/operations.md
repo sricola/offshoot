@@ -109,6 +109,15 @@ Eighteen `# TYPE` lines, matching the eighteen rows in the table above exactly
 — that grep is the whole verification: run it yourself against a running
 daemon any time this table is in doubt.
 
+### Grafana dashboard
+
+A ready-to-import dashboard covering all eighteen families above ships as
+[docs/grafana-dashboard.json](grafana-dashboard.json) — flush rate/latency,
+the shared-vs-materialized fork split, GC (with `offshoot_gc_errors_total`
+front and center as the fail-closed alarm), sessions/capture lag, and the
+janitor/ro-cache panels. Import it via Dashboards → Import and pick your
+Prometheus datasource when prompted.
+
 ## Branch states
 
 Every branch is in exactly one of six computed states — nothing about state
@@ -473,3 +482,12 @@ started:
 
 See [docs/status.md](status.md) for the authoritative shipped/deferred
 matrix these bullets summarize.
+
+## See also
+
+- [docs/testing.md](testing.md) — how the durability machinery this page
+  operates is actually tested (torture harness, conformance, CI gates).
+- [docs/stability.md](stability.md) — the pre-1.0 format contract and the
+  layout-version gate's place in it.
+- [docs/ci-recipes.md](ci-recipes.md) — seed-once/fork-per-attempt GitHub
+  Actions recipes, including the `offshoot gc` cron job.
