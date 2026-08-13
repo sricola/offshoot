@@ -22,8 +22,9 @@ hard to get right, and there was no reason to reinvent it. Credit where due:
 without Litestream's format and capture design, offshoot wouldn't exist in
 this shape.
 
-What offshoot adds on top: many independent, materialized lineages (branches)
-per database, with fork/rollback/promote as first-class operations, TTL-based
+What offshoot adds on top: many independent lineages (branches) per
+database — forked copy-on-write, so N forks cost near-zero added storage —
+with fork/rollback/promote/compact as first-class operations, TTL-based
 cleanup, and leases with epoch fencing so concurrent writers can't corrupt
 each other. If you need durable backup and PITR for a single database, run
 Litestream. If you need N disposable forks of a database for parallel agent
@@ -170,19 +171,19 @@ pretend to resolve the conflict for you.
 
 ## Why is durability explicit instead of automatic?
 
-Today, a daemon session's writes are captured continuously into SQLite's WAL,
-but nothing ships to the store until an explicit `flush` (or CLI
-`checkpoint`). `session status` reports exactly which transaction each
-session is durable through, so "durable" is a number you can check, not a
-guess. The trade-off, stated plainly: a daemon that dies between flushes
-loses the writes after the last flush — acknowledged to SQLite, never
-mirrored to the bucket.
+It's both, and both are reported rather than assumed. A daemon session's
+writes are captured continuously into SQLite's WAL; they become durable in
+the store on an explicit `flush` (or CLI `checkpoint`), **and** — by
+default — on the daemon's background flush timer (`serve -flush-every`,
+default `30s`; `0` disables it). `session status` reports exactly which
+transaction each session is durable through, so "durable" is a number you
+can check, not a guess.
 
-A background flush interval (`serve -flush-every`, defaulting on) is planned
-for [Milestone 2](../ROADMAP.md#milestone-2--safe-by-default-for-agents) —
-it's the single highest-priority item there, precisely because "explicit
-only" is the sharpest edge in today's default. Until it ships, call `flush`
-as often as your durability requirements demand.
+The trade-off, stated plainly: a daemon that dies between flushes loses
+the writes after the last one — acknowledged to SQLite, never mirrored to
+the bucket. The default timer bounds that exposure to at most one
+`-flush-every` interval; call `flush` explicitly whenever your durability
+requirements are tighter than the cadence.
 
 ## Why no Windows support?
 
@@ -207,19 +208,32 @@ runtime failure.
 
 ## Storage cost, honestly
 
-Materialized forks cost real bytes: N forks of a G-byte database cost up to
-**N×G** in your bucket (less where snapshot boundaries line up and a
-server-side `CopyObject` avoids a re-upload). This is a direct consequence of
-the design choice that makes forks storage-independent and GC simple — a
-child never references its parent's storage, so destroying the parent (or
-the parent going away) never endangers a child, and garbage collection never
-has to reason about cross-branch object sharing.
+Since v0.2.0, forks are **copy-on-write**: a fork writes a base pointer
+into its parent's already-durable chain and adds objects only as it
+diverges, so N forks of a G-byte database cost near-zero added bytes in
+your bucket — not the N×G the original design paid. The fork-heavy attempt
+workload is the one this was built for, and it's now near-free at the
+storage layer.
 
-The mitigation today is TTLs: give attempt branches a TTL
-(`offshoot fork app attempt-1 --ttl 2h`) and the janitor reclaims them
-automatically once they go cold. Page-level content-addressed dedupe is a
-possible v2 direction if real workloads show TTLs and `CopyObject` dedupe
-aren't enough — see the roadmap's
-[non-goals](../ROADMAP.md#non-goals-v1) — but it isn't built, and the
-N×G cost is real today. If your workload forks large databases at a high
-rate, budget for it.
+What still costs real bytes, stated plainly:
+
+- **`promote`, `rollback`, and `compact` each materialize a full
+  independent copy** (~G for a G-byte database). Fork is free; picking a
+  winner isn't. This asymmetry is deliberate — those operations abandon or
+  replace a lineage, and base-pointing into a lineage that is meant to die
+  would pin it forever.
+- **A destroyed parent's bytes linger while shared children survive.**
+  Destroy is instant, but GC reclaims a shared ancestor's storage only
+  once no surviving child's chain still reads through it — destroy or
+  `compact` the children to get the refund.
+- **Deep fork spines occasionally pay a snapshot floor**: a fork whose
+  resolved chain is already at the depth bound materializes one fresh
+  snapshot instead of sharing, keeping reads bounded.
+
+TTLs remain the cleanup mechanism for attempt branches
+(`offshoot fork app attempt-1 --ttl 2h`); `offshoot status` reports every
+branch's cost class (`storage=shared` vs `storage=materialized`) so the
+bill is visible per branch. Page-level content-addressed dedupe — sharing
+across *unrelated* databases, or sub-object pages — remains a non-goal
+(see the roadmap's [non-goals](../ROADMAP.md#non-goals-v1)): copy-on-write
+shares whole objects between a fork and its own ancestors only.
