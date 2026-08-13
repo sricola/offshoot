@@ -1,7 +1,7 @@
 # Branch diff
 
 offshoot doesn't merge branches — see the FAQ's [Why no
-merge?](faq.md#why-no-merge) for the stance and why. What it does give you is
+merge?](faq.md#can-i-merge-two-branches) for the stance and why. What it does give you is
 a fast way to see WHAT changed between two branches (or two checkpoints, or a
 branch and itself over time), so you can decide by hand which fork "won."
 
@@ -174,6 +174,6 @@ offshoot exists at all.
 
 `offshoot diff` is a *read* tool: it tells you what's different, it never
 resolves anything. There is no `offshoot merge`, and there won't be one —
-see the FAQ's [Why no merge?](faq.md#why-no-merge) for the full reasoning.
+see the FAQ's [Why no merge?](faq.md#can-i-merge-two-branches) for the full reasoning.
 Forks are for pick-a-winner: diff to decide, then `offshoot promote` the one
 that's actually correct.

@@ -176,5 +176,5 @@ Destroy the losing attempt(s) once you've picked a winner (`offshoot
 destroy convo@attempt-b`), or `offshoot promote convo@attempt-a --onto
 main` to make the winning conversation's history the new `main` — the same
 pick-a-winner shape as every other offshoot workflow; see the FAQ's [why no
-merge](../faq.md#why-no-merge) for why there's no attempt to reconcile two
+merge](../faq.md#can-i-merge-two-branches) for why there's no attempt to reconcile two
 divergent conversation histories automatically.
