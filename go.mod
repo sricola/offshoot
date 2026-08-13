@@ -3,10 +3,10 @@ module github.com/sricola/offshoot
 go 1.25.0
 
 require (
-	github.com/aws/aws-sdk-go-v2 v1.43.2
+	github.com/aws/aws-sdk-go-v2 v1.43.4
 	github.com/aws/aws-sdk-go-v2/config v1.32.33
 	github.com/aws/aws-sdk-go-v2/service/s3 v1.106.2
-	github.com/aws/smithy-go v1.27.5
+	github.com/aws/smithy-go v1.27.6
 	github.com/mattn/go-sqlite3 v1.14.49
 	github.com/superfly/ltx v0.5.1
 	golang.org/x/sys v0.44.0
