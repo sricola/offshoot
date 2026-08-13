@@ -26,10 +26,10 @@ here for the walkthrough.
 ## Install
 
 offshoot ships as one static-ish Go binary (cgo for the SQLite driver) plus
-thin SDKs. Today, that means building from source; tagged binaries land on
-the project's [GitHub releases](https://github.com/sricola/offshoot/releases)
-page starting with the first 0.1.x tag — check there first if you'd rather
-not build.
+thin SDKs. Prebuilt binaries are published on the project's
+[GitHub releases](https://github.com/sricola/offshoot/releases) page for
+each tagged release — check there first if you'd rather not build from
+source.
 
 ```
 git clone https://github.com/sricola/offshoot
@@ -580,12 +580,14 @@ The fixture's per-test cost is dominated by two things offshoot already
 measures and documents elsewhere, not by anything specific to the plugin
 itself:
 
-- **Fork cost** (once per test, via `offshoot_fork()`): the reflink/
-  `CopyObject` fast path applies whenever the seed checkpoint is a single
-  unsegmented snapshot (true for every seed created via `offshoot_db`,
-  since it's a single `checkpoint` call with no intervening daemon flush) —
-  see [docs/benchmarks.md](benchmarks.md) for measured fork numbers (local
-  and S3-backed) across database sizes.
+- **Fork cost** (once per test, via `offshoot_fork()`): since v0.2.0,
+  forks are copy-on-write — the common-case fork writes a base pointer
+  into the seed's already-durable chain and **zero data objects**, so its
+  storage cost is near-zero regardless of database size. (The
+  reflink/`CopyObject` numbers in [docs/benchmarks.md](benchmarks.md)
+  describe the materialize path — the fork-floor fallback and
+  promote/rollback/compact — measured on pre-copy-on-write builds; see
+  that page's version note.)
 - **Session-open / settling-flush cost** (once per test, when
   `offshoot_fork()` opens its session): see the README's [What a flush
   costs](../README.md#what-a-flush-costs) section, and specifically the
@@ -688,5 +690,5 @@ globals jest injects) — `startDaemon`/`seedOnce`/`forkPerTest`/`dump`
 themselves don't know or care which framework is calling them. See
 `sdk/typescript/README.md`'s testkit section for the vitest-flavored version
 of the same wiring, and `sdk/typescript/test/testkit.test.ts` for the SDK's
-own `node:test`-based suite (33 tests, including an integration test wiring
+own `node:test`-based suite (22 tests, including an integration test wiring
 all four functions into `node:test`'s hooks exactly as above).
