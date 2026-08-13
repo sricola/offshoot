@@ -118,7 +118,7 @@ More "why not X" (Litestream, Dolt, Neon, plain `cp`):
 
 ## Install
 
-- **Homebrew** *(at launch — needs the repo public)*:
+- **Homebrew**:
   `brew tap sricola/offshoot https://github.com/sricola/offshoot && brew install offshoot`
   (formula lives in-repo at [`Formula/offshoot.rb`](Formula/offshoot.rb))
 - **Docker:**
@@ -126,10 +126,10 @@ More "why not X" (Litestream, Dolt, Neon, plain `cp`):
   — images publish to GHCR on every tagged release; the store lives in the
   `/data` volume, so reuse `-v offshoot-data:/data` across commands
   (`... offshoot:latest create app`, `... offshoot:latest serve`, and so on)
-- **Nix** *(at launch — needs the repo public and a real `vendorHash`)*:
+- **Nix** *(pending: fill `flake.nix`'s `vendorHash` on first build)*:
   `nix run github:sricola/offshoot` — flake in-repo; see the
   `vendorHash` note at the top of [`flake.nix`](flake.nix)
-- **Prebuilt binaries** *(at launch — needs the releases page public)*:
+- **Prebuilt binaries**:
   `offshoot_vX_os_arch.tar.gz` (+ `.sha256`) from the
   [releases page](https://github.com/sricola/offshoot/releases), published
   for each tagged release
@@ -457,9 +457,7 @@ with offshoot.connect("/tmp/o.sock") as c:
 `Client` also exposes `branches()`, `dbs()`, `export()`, and
 `checkout_at()` (a read-only historical checkout).
 
-**Testing with pytest?** `pip install "offshoot-db[pytest]"` *(at launch —
-until PyPI publication, install from a checkout:
-`pip install "./sdk/python[pytest]"`)* registers
+**Testing with pytest?** `pip install "offshoot-db[pytest]"` registers
 `offshoot_daemon`/`offshoot_db`/`offshoot_fork` fixtures automatically —
 seed once, fork a fresh isolated branch per test, TTL-backstopped cleanup,
 `pytest-xdist` parallelism (one daemon per worker). Full tutorial:
