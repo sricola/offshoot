@@ -24,6 +24,15 @@ version if you depend on format stability.
   shared-fork latency, added bytes per fork, divergence cost, and the
   read path — the new "Copy-on-write fork cost (v0.2.x)" section at the
   top of docs/benchmarks.md.
+- Trust-and-adoption docs batch: `docs/stability.md` (the pre-1.0 stability
+  contract: same-release migration-or-`export`/`create --from` promise, the
+  LayoutVersion gate, proposed v1.0 criteria), `docs/testing.md` (how
+  offshoot is tested — real torture-run numbers, fencing/CAS model,
+  conformance suite, CI gates), `docs/ci-recipes.md` (copy-pasteable GitHub
+  Actions seed-once/fork-per-attempt workflows + pytest-fixture variant),
+  `docs/grafana-dashboard.json` (ready-to-import dashboard over all 18
+  metric families), a CLI/daemon/SDK parity table in `docs/reference.md`,
+  and a rewritten merge FAQ entry ("Can I merge two branches?").
 
 ## [0.2.7] - 2026-08-11
 

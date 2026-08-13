@@ -1280,9 +1280,44 @@ store's own `checkouts-ro` tree.
 
 ---
 
+## Surface parity: CLI vs daemon vs SDKs
+
+Which operations exist on which surface today — verified against
+`cmd/offshoot/main.go`'s dispatch, the daemon protocol's op list
+(`internal/daemon/protocol.go`: `open`, `flush`, `status`, `close`,
+`shutdown`, `create`, `checkout`, `fork`, `destroy`, `rollback`,
+`promote`, `compact`, `touch`, `branches`, `dbs`, `export`, `checkout-at`,
+`subscribe`), and both SDK clients (`sdk/python/offshoot/client.py`,
+`sdk/typescript/src/client.ts`).
+
+| Operation | CLI | Daemon op | Python/TS SDK | Notes |
+|---|---|---|---|---|
+| create / checkout / fork / destroy / rollback / promote / compact / touch / branches / dbs | yes | yes | yes | Full parity. `compact` through the daemon refuses while a session is open on the branch (see above). |
+| open / flush / status / close (sessions) | `session ...` | yes | yes | SDK `flush(name, meta=...)` can attach checkpoint metadata; the CLI `session flush` subcommand has no `--meta` flag. |
+| export / historical read-only checkout | yes | yes (`export`, `checkout-at`) | yes | No CLI `session` subcommand — the CLI's `export`/`checkout --at --read-only` are the at-rest equivalents (see the section above); `export` is unix-socket-only over the daemon. |
+| events | — | yes (`subscribe` / `GET /events`) | yes (`events()`) | No CLI subscriber today. |
+| shutdown | `session shutdown` | yes | **no** | Neither SDK exposes shutdown. |
+| `create --from` (import) | **CLI-only** | no | no | Deliberately deferred, not an oversight — accepting a source file over the daemon boundary needs an upload-channel or path-trust design of its own; see [docs/status.md](status.md)'s `create --from` row. |
+| `gc` (on-demand reap + collect) | **CLI-only** | no | no | A running daemon's janitor performs the same reap/GC on its `-reap-every` timer, so daemon deployments don't lack GC — they lack an RPC to *trigger* it on demand. |
+| `lease list` / `acquire` / `release` | **CLI-only** | no | no | Daemon sessions manage their own lease lifecycle (`open` acquires, `close` releases); the CLI commands are the manual inspect/break-glass surface. |
+| `diff` | **CLI-only** | no | no | Scoped CLI-only by design; see [docs/status.md](status.md)'s diff row. |
+| at-rest `checkpoint` | **CLI-only** | n/a | n/a | Not a gap: a live session's *named flush* is how daemon/SDK checkpoints are created (see `session flush` above). |
+| whole-store `status` | **CLI-only** | no | no | The daemon's per-db `branches` op reports the same branch states/storage classes; only the all-dbs-plus-ro-cache-summary view is CLI-only. |
+| `init` / `serve` / `mcp` | CLI | n/a | n/a | Process-level commands; nothing to proxy. |
+
+Summary: the SDKs cover the entire daemon protocol except `shutdown`;
+what's genuinely CLI-only today is `init`, `create --from`, on-demand
+`gc`, the `lease` commands, `diff`, at-rest `checkpoint`, and the
+whole-store `status` view. For CI patterns that mix the two surfaces
+(CLI seeding + SDK sessions), see [docs/ci-recipes.md](ci-recipes.md).
+
 ## What's not here
 
 See [docs/status.md](status.md) for the full implemented/deferred matrix
 and links to the roadmap milestones tracking each — e.g. the FD budget
 with idle-checkout eviction, still not yet implemented as of this page's
-last update.
+last update. See also [docs/stability.md](stability.md) for what pre-1.0
+means for the commands above (and the `export` → `create --from` format
+escape hatch), [docs/testing.md](testing.md) for how this surface is
+tested, and [docs/ci-recipes.md](ci-recipes.md) for ready-made GitHub
+Actions workflows built from these commands.
