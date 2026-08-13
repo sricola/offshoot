@@ -94,9 +94,10 @@ depends on — CAS behavior, create-only puts, list/delete edge cases:
   on every `go test` run.
 - **S3 backend against a fake**: `internal/store/s3_test.go`, on every run.
 - **S3 backend against real MinIO**: CI runs the full conformance suite
-  plus the CAS probe against a real MinIO server in Docker on every push
-  and PR (`.github/workflows/ci.yml`, `s3-conformance` job → `make
-  test-s3` → `TestS3RealProvider`, `internal/store/s3_integration_test.go`).
+  plus the CAS probe against a real MinIO server in Docker on every PR and
+  every push to main (`.github/workflows/ci.yml`, `s3-conformance` job →
+  `make test-s3` → `TestS3RealProvider`,
+  `internal/store/s3_integration_test.go`).
 - **Real cloud providers**: the nightly workflow has a credentialed
   real-provider job (`.github/workflows/nightly.yml`,
   `real-provider-conformance`) that runs the same suite against an actual
