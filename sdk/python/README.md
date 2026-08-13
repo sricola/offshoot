@@ -6,12 +6,13 @@ DB per attempt, checkpoint on success, roll back on failure).
 
 Stdlib-only, thin wrapper over the `offshoot` daemon's unix-socket lifecycle
 API — it never opens SQLite itself, so it can't do anything the `offshoot`
-CLI can't. `pip install offshoot-db` pulls in no third-party dependencies.
+CLI can't. the package pulls in no third-party dependencies.
 
 ## Install
 
 ```
-pip install offshoot-db
+# not yet on PyPI — install from the repo:
+pip install "offshoot-db @ git+https://github.com/sricola/offshoot#subdirectory=sdk/python"
 ```
 
 ## Quickstart
@@ -85,7 +86,7 @@ and a CI recipe — see
 in the main repo.
 
 ```
-pip install "offshoot-db[pytest]"
+pip install "offshoot-db[pytest] @ git+https://github.com/sricola/offshoot#subdirectory=sdk/python"
 ```
 
 registers `offshoot_daemon`, `offshoot_db`, and `offshoot_fork` with pytest

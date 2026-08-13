@@ -45,7 +45,7 @@ first, then fall back to `PATH`.
 For the Python pieces in this tutorial:
 
 ```
-pip install "offshoot-db[pytest]"
+pip install "offshoot-db[pytest] @ git+https://github.com/sricola/offshoot#subdirectory=sdk/python"
 ```
 
 The base `offshoot-db` package is stdlib-only; the `[pytest]` extra pulls in

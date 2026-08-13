@@ -11,7 +11,8 @@ anything the `offshoot` CLI can't.
 ## Install
 
 ```
-npm install @offshoot-db/client
+# not yet on npm — install from a checkout:
+git clone https://github.com/sricola/offshoot && npm install ./offshoot/sdk/typescript
 ```
 
 ## Quickstart

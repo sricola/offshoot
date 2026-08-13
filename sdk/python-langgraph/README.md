@@ -51,7 +51,8 @@ LangGraph's **own thread state** under offshoot.
 ## Install
 
 ```sh
-pip install langgraph-checkpoint-offshoot
+# not yet on PyPI — install from the repo:
+pip install "langgraph-checkpoint-offshoot @ git+https://github.com/sricola/offshoot#subdirectory=sdk/python-langgraph"
 # Until offshoot-db is on PyPI, install the local SDK first from a repo
 # checkout:  pip install -e sdk/python
 ```

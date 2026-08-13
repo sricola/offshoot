@@ -336,7 +336,8 @@ jobs:
       - uses: actions/setup-go@v5
       - run: sudo apt-get update && sudo apt-get install -y sqlite3
       - run: go install github.com/sricola/offshoot/cmd/offshoot@latest
-      - run: pip install "offshoot-db[pytest]" pytest-xdist
+      # offshoot-db is not yet on PyPI; install from the repo
+      - run: pip install "offshoot-db[pytest] @ git+https://github.com/sricola/offshoot#subdirectory=sdk/python" pytest-xdist
       - name: Run evals (fork per test, 4 workers)
         run: pytest tests/ -n4
         env:

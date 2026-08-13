@@ -453,7 +453,7 @@ with offshoot.connect("/tmp/o.sock") as c:
 `Client` also exposes `branches()`, `dbs()`, `export()`, and
 `checkout_at()` (a read-only historical checkout).
 
-**Testing with pytest?** `pip install "offshoot-db[pytest]"` registers
+**Testing with pytest?** `pip install "offshoot-db[pytest] @ git+https://github.com/sricola/offshoot#subdirectory=sdk/python"` *(from the repo — not yet on PyPI)* registers
 `offshoot_daemon`/`offshoot_db`/`offshoot_fork` fixtures automatically —
 seed once, fork a fresh isolated branch per test, TTL-backstopped cleanup,
 `pytest-xdist` parallelism (one daemon per worker). Full tutorial:
