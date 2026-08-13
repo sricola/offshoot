@@ -2,20 +2,51 @@ name: nightly
 
 on:
   schedule:
-    # 09:00 UTC daily.
+    # 09:00 UTC daily — the cheap leg (ubuntu torture + conformance), and it
+    # skips itself when main hasn't moved since the last run.
     - cron: "0 9 * * *"
+    # 09:00 UTC Sunday — the expensive weekly leg (macOS at 10x billing:
+    # full `go test ./...` + torture). This is where the macOS coverage
+    # removed from ci.yml's per-push matrix now lives.
+    - cron: "0 9 * * 0"
   workflow_dispatch:
 
 permissions:
   contents: read
 
 jobs:
-  torture:
+  # Skip the whole nightly when main hasn't moved since the last scheduled
+  # window: a quiet repo shouldn't bill daily torture runs for a tree that
+  # already passed yesterday. One tiny ubuntu job (seconds) makes that call.
+  # workflow_dispatch and the weekly leg always run regardless.
+  activity:
     if: github.ref == 'refs/heads/main'
+    runs-on: ubuntu-latest
+    outputs:
+      fresh: ${{ steps.check.outputs.fresh }}
+    steps:
+      - uses: actions/checkout@v4
+      - id: check
+        run: |
+          if [ "${{ github.event_name }}" != "schedule" ] || [ "${{ github.event.schedule }}" = "0 9 * * 0" ]; then
+            echo "fresh=true" >> "$GITHUB_OUTPUT"   # manual runs and the weekly leg never skip
+          elif [ -n "$(git log -1 --since='25 hours ago' --format=%H)" ]; then
+            echo "fresh=true" >> "$GITHUB_OUTPUT"
+          else
+            echo "fresh=false" >> "$GITHUB_OUTPUT"
+            echo "No commits on main in the last 25h; skipping the nightly torture run."
+          fi
+
+  torture:
+    needs: activity
+    # Daily cron: ubuntu only (1x billing). Weekly Sunday cron + manual
+    # dispatch: both OSes — the macOS torture leg (10x billing) that used to
+    # run daily now runs weekly, alongside the full macOS `go test` below.
+    if: github.ref == 'refs/heads/main' && needs.activity.outputs.fresh == 'true'
     strategy:
       fail-fast: false
       matrix:
-        os: [ubuntu-latest, macos-latest]
+        os: ${{ (github.event_name != 'schedule' || github.event.schedule == '0 9 * * 0') && fromJSON('["ubuntu-latest", "macos-latest"]') || fromJSON('["ubuntu-latest"]') }}
     runs-on: ${{ matrix.os }}
     steps:
       - uses: actions/checkout@v4
@@ -48,13 +79,35 @@ jobs:
       - name: make test-torture
         run: make test-torture
 
+  # The full macOS test suite (the coverage removed from ci.yml's per-push
+  # matrix, where its 10x billing dominated the Actions bill): weekly
+  # Sunday leg and manual dispatch only.
+  macos-test:
+    needs: activity
+    if: github.ref == 'refs/heads/main' && needs.activity.outputs.fresh == 'true' && (github.event_name != 'schedule' || github.event.schedule == '0 9 * * 0')
+    runs-on: macos-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-go@v5
+        with:
+          go-version-file: go.mod
+      - name: Install sqlite3 + sqldiff (macos)
+        run: |
+          brew install sqlite sqldiff || true
+          echo "$(brew --prefix sqlite)/bin" >> "$GITHUB_PATH"
+      - name: Verify CLIs present
+        run: sqlite3 --version && sqldiff --help >/dev/null
+      - name: go test
+        run: go test ./... -count=1
+
   real-provider-conformance:
     # This job exercises a real cloud object store (AWS S3 / R2 / Tigris)
     # using credentials from repo secrets, which most forks and even most
     # of this repo's own history won't have configured. Gate it on a repo
     # variable so it skips cleanly instead of failing the nightly run when
     # unconfigured.
-    if: github.ref == 'refs/heads/main' && vars.NIGHTLY_S3 == 'true'
+    needs: activity
+    if: github.ref == 'refs/heads/main' && vars.NIGHTLY_S3 == 'true' && needs.activity.outputs.fresh == 'true'
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4

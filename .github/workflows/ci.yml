@@ -3,17 +3,47 @@ name: ci
 on:
   push:
     branches: [main]
+    # Prose-only pushes (docs, site, packaging metadata) don't need the Go
+    # matrix — a large share of pushes are exactly these, and each full run
+    # was billing real minutes for zero signal.
+    paths-ignore:
+      - "docs/**"
+      - "site/**"
+      - "**.md"
+      - "Formula/**"
+      - "flake.nix"
+      - "LICENSE"
   pull_request:
+    paths-ignore:
+      - "docs/**"
+      - "site/**"
+      - "**.md"
+      - "Formula/**"
+      - "flake.nix"
+      - "LICENSE"
+
+# Rapid successive pushes to the same ref supersede each other — cancel the
+# stale run instead of paying for both.
+concurrency:
+  group: ci-${{ github.ref }}
+  cancel-in-progress: true
 
 permissions:
   contents: read
 
 jobs:
+  # macOS is deliberately absent here: GitHub bills macOS runners at 10x,
+  # and the per-push macOS leg was the single largest line in the Actions
+  # bill. macOS coverage now lives in nightly.yml's weekly leg (full
+  # `go test ./...` + torture on macos-latest) and in every release build.
+  # Linux catches everything platform-independent; the known macOS-specific
+  # breakages (sqlite3 CLI missing from the image, reflink/clonefile paths)
+  # are exercised weekly and at every tag.
   test:
     strategy:
       fail-fast: false
       matrix:
-        os: [ubuntu-latest, macos-latest]
+        os: [ubuntu-latest]
     runs-on: ${{ matrix.os }}
     steps:
       - uses: actions/checkout@v4
