@@ -153,21 +153,36 @@ writing "at once," give them two branches (fork), let them write
 independently, and `promote` the one that wins. See
 [docs/architecture.md](architecture.md) for the fencing scheme in full.
 
-## Why no merge?
+## Can I merge two branches?
 
-offshoot doesn't do three-way merge, and it's not on the roadmap (see
-[non-goals](../ROADMAP.md#non-goals-v1)). Forks are for **pick-a-winner**:
-try N approaches on N branches, evaluate them, `promote` the one that's
-actually correct, discard the rest. That's a materially simpler and more
-honest contract than trying to reconcile two SQL databases that diverged
-under independent writes — real merge would mean solving schema conflicts,
-constraint violations, and semantic conflicts (two branches both "correctly"
-updating the same row differently) with no general solution.
+No — offshoot has no row-level merge, deliberately, and it's not on the
+roadmap (see [non-goals](../ROADMAP.md#non-goals-v1)). The workload
+offshoot is built for — eval harnesses and agent attempts — is
+**fork-many-keep-one**: try N approaches on N branches, evaluate them,
+`promote` the winner whole, and let the losing attempts TTL away. Attempts
+are disposable by design; there is nothing to merge back because the whole
+point of an attempt branch is that it either becomes the branch of record
+or it dies.
 
-The escape hatch is application-level: materialize both branches
-(`offshoot checkout`) and reconcile with `sqldiff` or your own logic outside
-offshoot. offshoot gives you the two checkouts to work from; it doesn't
-pretend to resolve the conflict for you.
+The reason merge is out isn't that it's hard to build (it is), it's that
+it would forfeit the guarantees everything else here rests on: offshoot's
+safety story comes from immutable, append-only lineages with a single
+fenced writer each — three-way row merge means synthesizing new state from
+two lineages that diverged under independent writers, exactly the
+situation the single-writer model exists to make impossible to get wrong.
+Real merge would also mean solving schema conflicts, constraint
+violations, and semantic conflicts (two branches both "correctly" updating
+the same row differently) with no general solution.
+
+If you actually need row-level merge across concurrent writers — long-lived
+branches, human collaborators, reconciliation as a first-class operation —
+you want [Dolt](#why-not-dolt): that's the problem it's genuinely built
+for, at the cost of adopting a whole versioned database engine instead of
+stock SQLite files. The escape hatch inside offshoot is application-level:
+materialize both branches (`offshoot checkout`) and reconcile with
+`sqldiff` or your own logic outside offshoot. offshoot gives you the two
+checkouts to work from; it doesn't pretend to resolve the conflict for
+you.
 
 ## Why is durability explicit instead of automatic?
 
