@@ -760,7 +760,19 @@ func TestHTTPShutdownResponseIsNotChunkedAndReadAllUnmarshalsCleanly(t *testing.
 	}
 	req.Header.Set("Content-Type", "application/json")
 	req.Header.Set("Authorization", "Bearer "+token)
-	resp, err := http.DefaultClient.Do(req)
+	// Deliberately NOT http.DefaultClient: its shared keep-alive pool is a
+	// flake source here. Every earlier test in this package leaves an idle
+	// pooled conn to its own server's ephemeral port, and daemon Shutdown
+	// tears servers down with http.Server.Close() — so when the kernel
+	// hands THIS test's listener a recently-recycled port (random
+	// ephemeral allocation on Linux CI makes that routine), the shutdown
+	// POST can grab the stale conn to the DEAD previous server before the
+	// transport's readLoop evicts it, and net/http surfaces `Post ...: EOF`
+	// without retrying (POST is not idempotent, hence not replayable).
+	// A fresh Transport has an empty pool, so its first request can never
+	// ride a stale conn; DisableKeepAlives means it leaves none behind.
+	client := &http.Client{Transport: &http.Transport{DisableKeepAlives: true}}
+	resp, err := client.Do(req)
 	if err != nil {
 		t.Fatal(err)
 	}
