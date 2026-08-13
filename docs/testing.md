@@ -106,8 +106,10 @@ depends on — CAS behavior, create-only puts, list/delete edge cases:
   real-provider job (`.github/workflows/nightly.yml`,
   `real-provider-conformance`) that runs the same suite against an actual
   S3/R2/Tigris bucket when configured. Honest status: S3 support is
-  MinIO-verified in CI today; AWS-proper verification is a stated
-  pre-launch item, not something this page claims early (see
+  MinIO-verified in CI on every run, and `TestS3RealProvider` — probe,
+  full conformance, and the multipart subtest — has passed against a
+  real AWS S3 bucket (us-east-1, 2026-08-13). R2/Tigris remain
+  same-code-path, not independently run (see
   [stability.md](stability.md#proposed-v10-criteria)).
 
 ## The gates every change passes
