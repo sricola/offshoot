@@ -1,6 +1,6 @@
 module github.com/sricola/offshoot
 
-go 1.24.0
+go 1.25.0
 
 require (
 	github.com/aws/aws-sdk-go-v2 v1.43.2
@@ -9,7 +9,7 @@ require (
 	github.com/aws/smithy-go v1.27.5
 	github.com/mattn/go-sqlite3 v1.14.49
 	github.com/superfly/ltx v0.5.1
-	golang.org/x/sys v0.40.0
+	golang.org/x/sys v0.44.0
 )
 
 require (

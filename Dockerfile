@@ -7,7 +7,7 @@
 # a slim Debian image with just the sqlite3 CLI and CA certs (needed for the
 # S3 backend's TLS calls) added on top.
 
-FROM golang:1.24-bookworm AS build
+FROM golang:1.25-bookworm AS build
 WORKDIR /src
 
 # Populate the module cache first so dependency downloads are cached
