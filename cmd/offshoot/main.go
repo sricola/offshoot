@@ -69,7 +69,7 @@ Usage:
                                      ancestor's storage becomes reclaimable
                                      by gc); no-op if already self-contained
   offshoot destroy <db>[@branch] [--force]   delete a branch (requires --force for protected)
-  offshoot gc [--grace duration]     garbage collect unreachable lineages (default grace: 1h)
+  offshoot gc [--grace duration]     garbage collect unreachable objects (default grace: 1h)
   offshoot path <db>[@branch]        print the checkout path
   offshoot status [-ro-cache-budget BYTES]
                                      print all branches, each with its state and
