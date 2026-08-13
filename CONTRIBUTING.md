@@ -75,7 +75,7 @@ minutes instead of waiting on a runner:
 
 | Target | Mirrors | What it needs |
 |---|---|---|
-| `make ci-local-host` | the `test` job's matrix, run on this host | `sqlite3`/`sqldiff` on PATH (dev-setup prerequisite above) |
+| `make ci-local-host` | the `test` job (ubuntu-only matrix), run on this host | `sqlite3`/`sqldiff` on PATH (dev-setup prerequisite above) |
 | `make ci-local-linux` | the `test` job's ubuntu leg, in Docker | Docker; module/build caches live in named volumes so repeat runs are fast |
 | `make ci-local-minio` | the `s3-conformance` job | Docker (spins up MinIO, runs `make test-s3`, always tears down) |
 | `make ci-local-sdks` | the `sdks` job | `python3`, Node 20+, and optionally `pip install build twine` for the `dry-run-sdks` step (skipped loudly, not silently, if absent) |
@@ -163,7 +163,8 @@ image. `workflow_dispatch` builds the same artifacts under a
 `dev-<short-sha>` name without tagging, for a pre-release smoke check.
 
 On each release, also bump the packaging surfaces: `Formula/offshoot.rb`'s
-`url` + `sha256` and `flake.nix`'s `version`. Refresh `flake.nix`'s
+`url` + `sha256`, `flake.nix`'s `version`, and the version chip in
+`site/index.html`'s header (the one place the site states the number). Refresh `flake.nix`'s
 `vendorHash` whenever `go.mod` changes (the first real fill, replacing
 `lib.fakeHash`, is a launch-checklist item).
 

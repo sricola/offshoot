@@ -47,8 +47,11 @@ to dump-identical content after every one of the ~3,500 rounds. Zero
 divergence.
 
 This isn't a one-off: the **nightly workflow runs the full torture suite
-on both Linux and macOS every day**
-(`.github/workflows/nightly.yml`, `torture` job), and
+on Linux every day, and on macOS on the weekly Sunday leg**
+(`.github/workflows/nightly.yml`, `torture` job — macOS runners bill at
+10x, so the macOS torture leg moved from daily to weekly; manual
+dispatch runs both). This page is the canonical statement of CI cadence —
+other docs link here rather than restating it. Beyond CI,
 [CONTRIBUTING.md](../CONTRIBUTING.md) requires a torture run — named in
 the PR description — for any change touching the capture or flush paths.
 
@@ -110,9 +113,12 @@ depends on — CAS behavior, create-only puts, list/delete edge cases:
 
 From `.github/workflows/ci.yml` and the `Makefile`:
 
-- **`go test ./... -count=1 -race`** on both ubuntu-latest and
-  macos-latest, every push and PR. The race detector is always on in CI,
-  not an occasional extra.
+- **`go test ./... -count=1 -race`** on ubuntu-latest, every push and PR.
+  The race detector is always on in CI, not an occasional extra. macOS
+  coverage lives in the nightly workflow instead (`macos-test` job:
+  the full `go test ./... -count=1` — note, without `-race` — on
+  macos-latest, weekly Sunday leg and manual dispatch; same 10x-billing
+  tradeoff as the torture matrix above).
 - **`gofmt` and `go vet`** as hard CI steps; `staticcheck` via `make lint`
   (best-effort there only so offline runs don't fail the two gates that
   already passed).

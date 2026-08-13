@@ -133,8 +133,9 @@ following hold:
    against an AWS bucket on a sustained basis, since multipart
    checksum/precondition behavior is exactly where providers differ.
 3. **A soak period of nightly torture runs with zero divergence.** The
-   kill-9 torture harness (see [testing.md](testing.md)) runs nightly on
-   Linux and macOS (`.github/workflows/nightly.yml`, `torture` job). The
+   kill-9 torture harness runs on the CI cadence stated in
+   [testing.md](testing.md#the-kill--9-torture-harness) — that page is
+   canonical (`.github/workflows/nightly.yml`, `torture` job). The
    1.0 bar: a defined consecutive window — proposed: 3 months — of nightly
    runs with no divergence and no corruption, restarting the clock on any
    failure whose fix touches the capture or flush path.
