@@ -20,6 +20,21 @@ version if you depend on format stability.
   permissions, checksum-verified promtool download, digest-pinned MinIO
   images, no `${{ }}` interpolation in workflow shell, `:latest` Docker tag
   only on real tag pushes, and one shared sqlite setup action.
+- Hygiene batch (audit pass 3): corrected the three stale CI-cadence
+  claims (docs/testing.md is now the canonical cadence statement;
+  stability.md links to it), bumped the site version chip to v0.2.8 and
+  dropped the duplicate footer copy (chip bump added to the release
+  checklist), added the S3 timeout-model index comment, listed the trust
+  docs + Grafana dashboard on README's front door, exported a public
+  `offshoot.client.TTL` alias (`_TTL` still works), added a delegation
+  tripwire test + direct `langgraph-checkpoint>=4.2,<5` pin to
+  sdk/python-langgraph, and single-sourced that package's version in
+  pyproject.toml.
+- Bumped `golang.org/x/sys` v0.40.0 → v0.44.0 (clears GO-2026-5024 from
+  module-level govulncheck output; the affected code is Windows-only and
+  never called here). x/sys v0.44.0 requires Go 1.25, so the module's `go`
+  directive, the Dockerfile build stage, and the documented
+  build-from-source floor moved from Go 1.24 to Go 1.25 with it.
 
 ## [0.2.8] - 2026-08-12
 
@@ -43,7 +58,12 @@ version if you depend on format stability.
   `docs/grafana-dashboard.json` (ready-to-import dashboard over all 18
   metric families), a CLI/daemon/SDK parity table in `docs/reference.md`,
   and a rewritten merge FAQ entry ("Can I merge two branches?").
-- **`langgraph-checkpoint-offshoot` (sdk/python-langgraph) 0.1.0:** a LangGraph `BaseCheckpointSaver` that wraps the stock `SqliteSaver` on an offshoot-managed checkout, adding `fork_thread`/`checkpoint`/`rollback`/`promote`/`destroy` (each 1:1 with an offshoot op) so LangGraph threads can be forked per attempt, rolled back, promoted, and TTL-reaped.
+- **`langgraph-checkpoint-offshoot` (sdk/python-langgraph) 0.1.0:** a
+  LangGraph `BaseCheckpointSaver` that wraps the stock `SqliteSaver` on an
+  offshoot-managed checkout, adding
+  `fork_thread`/`checkpoint`/`rollback`/`promote`/`destroy` (each 1:1 with
+  an offshoot op) so LangGraph threads can be forked per attempt, rolled
+  back, promoted, and TTL-reaped.
 
 ## [0.2.7] - 2026-08-11
 
