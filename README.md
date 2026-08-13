@@ -440,8 +440,6 @@ access at all) unless `--force`/`force=True` is given. `offshoot export`'s
 output has the identical zero-ongoing-relationship property, just written
 wherever the caller pointed it rather than under a fixed cache path.
 
-Design: docs/superpowers/specs/2026-07-29-offshoot-design.md
-Capture-spike evidence: docs/superpowers/specs/2026-07-29-offshoot-spike-report.md
 
 ## Integration surface
 

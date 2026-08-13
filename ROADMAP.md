@@ -274,8 +274,7 @@ what's left that no further engineering resolves.
 giving up bounded reads, GC safety, or destroy-anytime.*
 
 **Status: shipped**, as the [0.2.0] release (see
-[CHANGELOG.md](CHANGELOG.md) and the design spec,
-`docs/superpowers/specs/2026-08-07-offshoot-copy-on-write-design.md`).
+[CHANGELOG.md](CHANGELOG.md)).
 This closes the "storage amplification" risk the v1 design carried as its
 open wart (its own spec said "N materialized forks cost up to N×G").
 

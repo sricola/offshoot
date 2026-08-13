@@ -1,6 +1,6 @@
 # Implementation status
 
-offshoot's [design spec](superpowers/specs/2026-07-29-offshoot-design.md)
+offshoot's original design
 describes a v1 scope larger than what's shipped so far. This page is the
 honest accounting: what's tested in anger, what's built but unverified in
 some dimension, and what's still just a plan. If a guarantee you're relying
