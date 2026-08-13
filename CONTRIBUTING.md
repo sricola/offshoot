@@ -9,7 +9,7 @@ quickly.
 
 You need:
 
-- Go 1.24+
+- Go 1.25+
 - cgo (offshoot uses `github.com/mattn/go-sqlite3`, which is cgo-backed —
   there's no pure-Go build)
 - the `sqlite3` CLI on `PATH` (the test suite shells out to it as a stock

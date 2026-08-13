@@ -48,7 +48,7 @@ REPO_ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 cd "$REPO_ROOT" || exit 1
 
 # Derived from go.mod so this never drifts from the version the repo's own
-# Dockerfile builds against (golang:1.24-bookworm as of this writing) —
+# Dockerfile builds against (golang:1.25-bookworm as of this writing) —
 # same major.minor, same -bookworm base ci.yml's setup-go step effectively
 # gets from go.mod's go directive.
 GO_MINOR="$(awk '/^go [0-9]+\.[0-9]+/ {print $2; exit}' go.mod | cut -d. -f1,2)"

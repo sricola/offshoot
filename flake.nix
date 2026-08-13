@@ -3,7 +3,12 @@
   # on, so it has never been evaluated or built. Before first use, fill in
   # vendorHash: run `nix build`, let it fail on the fixed-output derivation
   # mismatch, and copy the hash from the "got: sha256-..." line over
-  # lib.fakeHash below. Everything else follows the stock buildGoModule
+  # lib.fakeHash below. Everything else follows the stock # NOTE (launch item, alongside the vendorHash fill): go.mod's
+          # directive is go 1.25, but nixos-25.05's default buildGoModule Go
+          # is 1.24 — the build will refuse. When filling vendorHash, either
+          # bump the nixpkgs input past Go 1.25 or override:
+          #   buildGoModule.override { go = pkgs.go_1_25; }
+          buildGoModule
   # pattern for a cgo binary (mattn/go-sqlite3 compiles its bundled SQLite
   # amalgamation, so no sqlite input is needed; buildGoModule leaves
   # CGO_ENABLED=1 and stdenv's cc in place by default).
