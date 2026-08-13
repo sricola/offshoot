@@ -8,7 +8,7 @@ S3-compatible stores, copy-on-write forks, live WAL capture with incremental
 segments, leases and TTL reaping, an MCP server, and Python/TypeScript SDKs. See
 [docs/status.md](docs/status.md) for exactly what's shipped-and-tested,
 what's shipped-but-unverified, and what's still on the [roadmap](ROADMAP.md).
-Requires Go 1.24+, cgo, and the `sqlite3` CLI for tests. Linux and macOS only.
+Requires Go 1.25+, cgo, and the `sqlite3` CLI for tests. Linux and macOS only.
 
 **Install:**
 
@@ -27,7 +27,7 @@ Requires Go 1.24+, cgo, and the `sqlite3` CLI for tests. Linux and macOS only.
   `offshoot_vX_os_arch.tar.gz` (+ `.sha256`) from the
   [releases page](https://github.com/sricola/offshoot/releases), published
   for each tagged release
-- **From source:** see Quickstart below (Go 1.24+, cgo)
+- **From source:** see Quickstart below (Go 1.25+, cgo)
 
 **Windows:** use WSL2 — the linux binaries, Docker image, and
 build-from-source all work there as-is. Native Windows is unsupported:
@@ -38,6 +38,10 @@ don't map cleanly to Windows.
 [CLI reference](docs/reference.md) · [architecture](docs/architecture.md) ·
 [branch diff](docs/diff.md) ·
 [implemented/deferred status](docs/status.md) · [roadmap](ROADMAP.md) ·
+[stability contract](docs/stability.md) (pre-1.0 promises, v1.0 criteria) ·
+[how offshoot is tested](docs/testing.md) (torture numbers, CI gates) ·
+[CI recipes](docs/ci-recipes.md) (seed-once/fork-per-attempt Actions
+workflows) · [Grafana dashboard](docs/grafana-dashboard.json) ·
 [**the eval-harness tutorial**](docs/eval-harness.md) (seed-once-fork-many
 for pytest/vitest/`node:test`, from install to CI) ·
 [framework recipes](docs/recipes/) (Claude Code hooks, OpenAI Agents SDK,

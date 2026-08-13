@@ -37,7 +37,7 @@ cd offshoot
 go build -o offshoot ./cmd/offshoot
 ```
 
-Requires Go 1.24+, cgo, and a C toolchain (already on most macOS/Linux dev
+Requires Go 1.25+, cgo, and a C toolchain (already on most macOS/Linux dev
 machines). Put the resulting `offshoot` binary on `PATH`, or point
 `OFFSHOOT_BIN` at it — both the pytest plugin and the TS testkit look there
 first, then fall back to `PATH`.
