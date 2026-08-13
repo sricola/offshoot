@@ -1,0 +1,54 @@
+<!doctype html>
+<!-- Source for site/og.png (the og:image / twitter:image social card).
+     Regenerate after editing:
+       "/Applications/Google Chrome.app/Contents/MacOS/Google Chrome" --headless \
+         --screenshot=site/og.png --window-size=1200,630 --hide-scrollbars \
+         --force-device-scale-factor=1 file://$PWD/site/og-card.html
+     Palette/typography mirror site/index.html's dark theme vars. -->
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<style>
+:root{
+  --bg:#131211; --ink:#e6e3da; --dim:#97927f; --faint:#6b665a;
+  --accent:#a9cd7c; --code-bg:#1b1a17; --border:#2b2925;
+  --mono:ui-monospace,"SF Mono","Cascadia Code",Menlo,Consolas,"Liberation Mono",monospace;
+}
+*{box-sizing:border-box;margin:0;padding:0}
+html,body{width:1200px;height:630px;overflow:hidden}
+body{
+  background:var(--bg); color:var(--ink); font-family:var(--mono);
+  -webkit-font-smoothing:antialiased;
+  display:flex; flex-direction:column; justify-content:center;
+  padding:0 96px; position:relative;
+}
+.brand{display:flex; align-items:baseline; gap:26px}
+.brand .name{font-size:88px; font-weight:700; letter-spacing:-.015em}
+.brand .g{color:var(--accent); font-weight:400; font-size:88px}
+.tagline{margin-top:36px; font-size:33px; line-height:1.55; color:var(--ink); max-width:29.5em}
+.tagline b{font-weight:700}
+.tagline .rest{color:var(--dim)}
+.chips{margin-top:52px; display:flex; gap:18px}
+.chip{
+  background:var(--code-bg); border:1px solid var(--border); border-radius:8px;
+  padding:14px 26px; font-size:23px; color:var(--dim); white-space:nowrap;
+}
+.chip b{color:var(--accent); font-weight:600}
+.rule{position:absolute; left:96px; right:96px; bottom:74px; border-top:1px solid var(--border)}
+.foot{position:absolute; left:96px; bottom:34px; font-size:20px; color:var(--faint); letter-spacing:.02em}
+.foot .g{color:var(--accent)}
+</style>
+</head>
+<body>
+  <div class="brand"><span class="g">⑂</span><span class="name">offshoot</span></div>
+  <p class="tagline"><b>Branch SQLite like git</b> <span class="rest">— copy-on-write forks,
+  checkpoint / rollback / promote, built for AI agents and eval harnesses.</span></p>
+  <div class="chips">
+    <span class="chip"><b>377 B</b> per fork</span>
+    <span class="chip"><b>kill -9</b> durable</span>
+    <span class="chip"><b>stock SQLite</b> files</span>
+  </div>
+  <div class="rule"></div>
+  <div class="foot"><span class="g">⑂</span> sricola.github.io/offshoot · local disk or S3 · one binary</div>
+</body>
+</html>
