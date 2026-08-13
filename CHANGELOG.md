@@ -13,6 +13,13 @@ version if you depend on format stability.
 
 ## [Unreleased]
 
+### Added
+
+- **Packaging surfaces: in-repo Homebrew formula (`Formula/offshoot.rb`),
+  Nix flake (`flake.nix`, vendorHash pending first `nix build`), a README
+  install matrix (brew/docker/nix/prebuilt/WSL2), and `sqldiff` in the
+  Docker image so `offshoot diff` works in-container.**
+
 ## [0.2.7] - 2026-08-11
 
 ### Fixed

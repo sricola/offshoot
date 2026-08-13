@@ -10,10 +10,27 @@ segments, leases and TTL reaping, an MCP server, and Python/TypeScript SDKs. See
 what's shipped-but-unverified, and what's still on the [roadmap](ROADMAP.md).
 Requires Go 1.24+, cgo, and the `sqlite3` CLI for tests. Linux and macOS only.
 
-**Install:** build from source (see Quickstart below), or grab a prebuilt
-binary from the [releases page](https://github.com/sricola/offshoot/releases)
-— binaries are published for each tagged release. No package-manager install
-yet.
+**Install:**
+
+- **Homebrew** *(at launch — needs the repo public)*:
+  `brew tap sricola/offshoot https://github.com/sricola/offshoot && brew install offshoot`
+  (formula lives in-repo at [`Formula/offshoot.rb`](Formula/offshoot.rb))
+- **Docker:**
+  `docker run --rm -v offshoot-data:/data ghcr.io/sricola/offshoot:latest init`
+  — images publish to GHCR on every tagged release; the store lives in the
+  `/data` volume, so reuse `-v offshoot-data:/data` across commands
+  (`... offshoot:latest create app`, `... offshoot:latest serve`, and so on)
+- **Nix:** `nix run github:sricola/offshoot` — flake in-repo; see the
+  `vendorHash` note at the top of [`flake.nix`](flake.nix)
+- **Prebuilt binaries:** `offshoot_vX_os_arch.tar.gz` (+ `.sha256`) from the
+  [releases page](https://github.com/sricola/offshoot/releases), published
+  for each tagged release
+- **From source:** see Quickstart below (Go 1.24+, cgo)
+
+**Windows:** use WSL2 — the linux binaries, Docker image, and
+build-from-source all work there as-is. Native Windows is unsupported:
+offshoot leans on POSIX file semantics (unix sockets, POSIX locks) that
+don't map cleanly to Windows.
 
 **Docs:** [FAQ](docs/faq.md) (why not Litestream / LiteFS / Turso / Dolt / `cp`) ·
 [CLI reference](docs/reference.md) · [architecture](docs/architecture.md) ·

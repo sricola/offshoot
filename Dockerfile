@@ -24,8 +24,11 @@ RUN go build -trimpath -ldflags "-s -w -X main.version=${VERSION}" \
 
 FROM debian:bookworm-slim AS runtime
 
+# sqlite3-tools carries sqldiff, which `offshoot diff` shells out to —
+# Debian packages it separately from the sqlite3 CLI (see
+# cmd/offshoot/diff.go for the per-distro breakdown).
 RUN apt-get update \
-    && apt-get install -y --no-install-recommends sqlite3 ca-certificates \
+    && apt-get install -y --no-install-recommends sqlite3 sqlite3-tools ca-certificates \
     && rm -rf /var/lib/apt/lists/*
 
 RUN useradd --create-home --home-dir /home/offshoot --shell /usr/sbin/nologin offshoot
