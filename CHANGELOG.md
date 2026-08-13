@@ -1665,7 +1665,7 @@ what's a stated, pre-written deferral.
     `sqlite3` itself, so a machine without it still skips cleanly.
   - `docs/diff.md`: the command, the raw by-hand `export`-twice-then-
     `sqldiff` recipe, the staleness rule, and a link to the FAQ's
-    [no-merge stance](docs/faq.md#why-no-merge) — `offshoot diff` is a read
+    [no-merge stance](docs/faq.md#can-i-merge-two-branches) — `offshoot diff` is a read
     tool; it never resolves anything.
 
 ### Fixed

@@ -81,12 +81,15 @@ jobs:
       # First run against a fresh bucket/prefix only. `offshoot init`
       # deliberately fails on an already-initialized store (don't script it
       # unconditionally — see reference.md); this step tolerates exactly
-      # that one case and still fails on real errors.
+      # that one case and still fails on real errors. The already-there
+      # message differs by backend: local says "key exists", S3 reports
+      # the manifest write's lost CAS ("compare-and-swap conflict") — the
+      # grep accepts both.
       - name: Init store (first run only)
         run: |
           out=$(offshoot init 2>&1) || {
             echo "$out"
-            echo "$out" | grep -qi "exist" || exit 1
+            echo "$out" | grep -Eqi "exist|compare-and-swap conflict" || exit 1
           }
 
       # Build the seed as a plain SQLite file, then import it. The source
