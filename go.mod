@@ -9,7 +9,7 @@ require (
 	github.com/aws/smithy-go v1.27.5
 	github.com/mattn/go-sqlite3 v1.14.49
 	github.com/superfly/ltx v0.5.1
-	golang.org/x/sys v0.44.0
+	golang.org/x/sys v0.47.0
 )
 
 require (
