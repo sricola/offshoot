@@ -12,3 +12,4 @@ sdk/python/*.egg-info/
 sdk/python/.dry-run-venv/
 __pycache__/
 
+.superpowers/

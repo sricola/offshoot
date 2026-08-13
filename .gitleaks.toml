@@ -1,0 +1,8 @@
+# Gitleaks config: extends the default rules; allowlists documentation
+# examples that scanners flag as credentials.
+[extend]
+useDefault = true
+
+[allowlist]
+description = "Documentation placeholder tokens (not credentials)"
+regexes = ['''verify-token-123''']
