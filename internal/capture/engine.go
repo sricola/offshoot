@@ -1758,7 +1758,7 @@ func (e *Engine) srcReader() (*io.SectionReader, error) {
 // process-lifetime boundaries, not a hot-path cost. For the target session
 // sizes (MBs to low-single-digit GBs) that's acceptable, but it does not
 // scale indefinitely: a much larger DB would make this a noticeable
-// startup/shutdown stall. TODO(now doable): session.Session carries a
+// startup/shutdown stall. Follow-up (now doable): session.Session carries a
 // cumulative LTX checksum (Session.checksum) that already covers the full
 // committed history incrementally as writes happen; this whole-file re-hash
 // could be replaced by comparing against that running checksum instead of

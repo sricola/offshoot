@@ -195,11 +195,11 @@ PyPI/npm/registry button-presses — see their own ⏸ bullets below.
   page, not a package.
 - ⏸ **Listings — prepared, submission deliberately deferred (user-gated).**
   MCP registry `server.json` manifest authored in-repo
-  ([docs/launch/mcp-registry.md](docs/launch/mcp-registry.md)) but **not
+  but **not
   submitted** — the exact registry schema needs to be fetched and validated
   against at submission time, not assumed from this repo's own docs.
   LangGraph community-integration PR text drafted
-  ([docs/launch/langgraph-listing.md](docs/launch/langgraph-listing.md))
+  
   but **not submitted** — its install command needs real PyPI publication
   to be true. Both are blocked on the same user action as actual SDK
   publication: claiming the `offshoot-db` PyPI name and `@offshoot-db` npm

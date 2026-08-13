@@ -465,7 +465,7 @@ started:
 
 - **Multi-node anything** — placement, failover, cross-node routing. See
   the top of this page and [ROADMAP.md](../ROADMAP.md#non-goals-v1).
-- **TLS** — loopback/token-only for now; revisit with real non-loopback
+- **TLS** — deliberately loopback/token-only; revisit with real non-loopback
   demand.
 - **Per-branch at-rest metrics by default** — a gauge per branch that has
   never been opened this process would make label cardinality scale with
