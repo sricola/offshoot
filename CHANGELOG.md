@@ -33,6 +33,7 @@ version if you depend on format stability.
   `docs/grafana-dashboard.json` (ready-to-import dashboard over all 18
   metric families), a CLI/daemon/SDK parity table in `docs/reference.md`,
   and a rewritten merge FAQ entry ("Can I merge two branches?").
+- **`langgraph-checkpoint-offshoot` (sdk/python-langgraph) 0.1.0:** a LangGraph `BaseCheckpointSaver` that wraps the stock `SqliteSaver` on an offshoot-managed checkout, adding `fork_thread`/`checkpoint`/`rollback`/`promote`/`destroy` (each 1:1 with an offshoot op) so LangGraph threads can be forked per attempt, rolled back, promoted, and TTL-reaped.
 
 ## [0.2.7] - 2026-08-11
 
