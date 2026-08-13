@@ -12,10 +12,12 @@ Ground rules carried over from the design spec: correctness stays paranoid
 (limits documented as plainly as features), and the storage format carries a
 layout version so incompatibility is always detected, never guessed.
 
-Releases use the 0.x prerelease series (tags `v0.1.0` … `v0.2.0`); 1.0 is
+Releases use the 0.x prerelease series (tags `v0.1.0` … `v0.2.7`); 1.0 is
 reserved for the storage-format freeze. 0.2.0 is the copy-on-write release —
 a minor (not patch) bump because it changes the storage format
-(LayoutVersion 1 → 2; see the copy-on-write milestone below).
+(LayoutVersion 1 → 2; see the copy-on-write milestone below). The 0.2.x
+patch line since then is hardening on top of that arc — see the follow-ups
+bullet in that milestone and [CHANGELOG.md](CHANGELOG.md).
 
 ---
 
@@ -291,6 +293,20 @@ open wart (its own spec said "N materialized forks cost up to N×G").
   promote/rollback/compact-materialize asymmetry and the
   destroy-lingers-until-last-child reclaim semantics are documented
   rather than hidden.
+- ✅ **Post-0.2.0 follow-ups shipped across the 0.2.x patch line** (see
+  [CHANGELOG.md](CHANGELOG.md) for each): the fork-time snapshot floor
+  tracks the daemon's configured `-snapshot-every` cadence, plus
+  `offshoot_fork_mode_total`/`offshoot_gc_errors_total` observability
+  (0.2.1); a store-RPC/memory perf pass — streaming chain materialization
+  and snapshot-flush upload, batched `DeleteObjects` GC sweeps, one less
+  List/resolution per fork and GC pass (0.2.2); S3 multipart uploads, so
+  >5 GiB snapshot flushes work (0.2.3); concurrent part uploads, multipart
+  server-side copy up to S3's 5 TiB ceiling, and an epoch-aware GC
+  compensating rule closing a bounded space leak (0.2.4); a
+  fencing-vs-resolution dedup fix for a silent-data-loss race (0.2.5); and
+  bounded waits on every S3 call — per-RPC deadlines plus a `GetReader`
+  progress watchdog — so a stalled backend can't wedge flush or close
+  (0.2.6/0.2.7).
 - ⏸ **Page-level / content-addressed cross-database dedupe — still
   deferred, explicitly out of scope for this arc.** Copy-on-write shares
   whole objects between a fork and its ancestors only; deduping unrelated
