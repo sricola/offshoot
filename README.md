@@ -20,9 +20,11 @@ Requires Go 1.24+, cgo, and the `sqlite3` CLI for tests. Linux and macOS only.
   — images publish to GHCR on every tagged release; the store lives in the
   `/data` volume, so reuse `-v offshoot-data:/data` across commands
   (`... offshoot:latest create app`, `... offshoot:latest serve`, and so on)
-- **Nix:** `nix run github:sricola/offshoot` — flake in-repo; see the
+- **Nix** *(at launch — needs the repo public and a real `vendorHash`)*:
+  `nix run github:sricola/offshoot` — flake in-repo; see the
   `vendorHash` note at the top of [`flake.nix`](flake.nix)
-- **Prebuilt binaries:** `offshoot_vX_os_arch.tar.gz` (+ `.sha256`) from the
+- **Prebuilt binaries** *(at launch — needs the releases page public)*:
+  `offshoot_vX_os_arch.tar.gz` (+ `.sha256`) from the
   [releases page](https://github.com/sricola/offshoot/releases), published
   for each tagged release
 - **From source:** see Quickstart below (Go 1.24+, cgo)

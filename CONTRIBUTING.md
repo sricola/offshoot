@@ -156,11 +156,16 @@ at their first pre-release; that's a coincidence, not a coupling.
 
 ### Binary releases
 
-Tag `v0.1.<n>` and push it. `.github/workflows/release.yml` builds
-Linux/macOS binaries for both architectures, creates a GitHub release, and
-publishes a `ghcr.io` Docker image. `workflow_dispatch` builds the same
-artifacts under a `dev-<short-sha>` name without tagging, for a
-pre-release smoke check.
+Tag `v0.2.<n>` (`vX.Y.Z` generally) and push it.
+`.github/workflows/release.yml` builds Linux/macOS binaries for both
+architectures, creates a GitHub release, and publishes a `ghcr.io` Docker
+image. `workflow_dispatch` builds the same artifacts under a
+`dev-<short-sha>` name without tagging, for a pre-release smoke check.
+
+On each release, also bump the packaging surfaces: `Formula/offshoot.rb`'s
+`url` + `sha256` and `flake.nix`'s `version`. Refresh `flake.nix`'s
+`vendorHash` whenever `go.mod` changes (the first real fill, replacing
+`lib.fakeHash`, is a launch-checklist item).
 
 ### SDK releases
 

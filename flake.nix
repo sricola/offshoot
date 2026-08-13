@@ -15,6 +15,9 @@
     let
       systems = [ "x86_64-linux" "aarch64-linux" "x86_64-darwin" "aarch64-darwin" ];
       forAllSystems = f: nixpkgs.lib.genAttrs systems (system: f nixpkgs.legacyPackages.${system});
+      # src = self + this hardcoded version means a build from main HEAD
+      # still stamps v0.2.7 until bumped — the standard in-repo-flake
+      # compromise.
       version = "0.2.7";
     in
     {
