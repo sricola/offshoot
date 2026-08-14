@@ -101,7 +101,7 @@ ul.why{list-style:none}
 ul.why li{padding:16px 0; border-bottom:1px solid var(--rule); color:var(--dim); max-width:74ch}
 ul.why li:last-child{border-bottom:none}
 ul.why b{color:var(--ink); font-weight:600}
-ul.why b::after{content:" — "}
+
 
 .tablewrap{overflow-x:auto; border:1px solid var(--border); border-radius:6px}
 table{width:100%; border-collapse:collapse; font-size:13px}
@@ -218,16 +218,16 @@ footer .g{color:var(--accent)}
 <section class="wrap" id="why">
   <h2>why branch a database?</h2>
   <ul class="why">
-    <li><b>AI agents</b>fork the database per attempt — the agent writes to a real
+    <li><b>AI agents</b> — fork the database per attempt — the agent writes to a real
     SQLite file through plain <code>sqlite3</code> or MCP tools, you promote the
     attempt that worked, and TTL'd branches expire instead of leaking.</li>
-    <li><b>Eval harnesses</b>seed once, fork per run — a shared fork of a 100&nbsp;MB
+    <li><b>Eval harnesses</b> — seed once, fork per run — a shared fork of a 100&nbsp;MB
     database adds 377 bytes to the store, flat from 1 to 100 forks, so isolated
     attempts cost near-nothing.</li>
-    <li><b>Tests</b>real isolation without fixture rebuilds: fork a fresh branch per
+    <li><b>Tests</b> — real isolation without fixture rebuilds: fork a fresh branch per
     test via the pytest fixtures or the vitest/jest testkit, with TTL-backstopped
     cleanup.</li>
-    <li><b>Experiments</b>run the destructive migration on a fork —
+    <li><b>Experiments</b> — run the destructive migration on a fork —
     <code>rollback --to fork</code> if it goes badly, <code>promote --onto main</code>
     if it doesn't.</li>
   </ul>
@@ -286,19 +286,19 @@ footer .g{color:var(--accent)}
   </svg>
   </figure>
   <ul class="why">
-    <li><b>O(1) forks</b>a fork shares the parent's durable objects through a base
+    <li><b>O(1) forks</b> — a fork shares the parent's durable objects through a base
     pointer and writes new ones only as it diverges — N forks of a G-byte database
     cost near-zero added bytes. Branches carry TTLs and reap themselves;
     <code>compact</code> makes a fork self-contained on demand.</li>
-    <li><b>Bounded replay</b>a branch is a lineage of immutable snapshots plus
+    <li><b>Bounded replay</b> — a branch is a lineage of immutable snapshots plus
     incremental segments. A read applies one snapshot and at most fifteen segments
     (default cadence), checksum-verified member by member — a torn chain is a loud
     error, never a short read.</li>
-    <li><b>kill&nbsp;-9 durable</b>one writer per branch, enforced by leases and epoch
+    <li><b>kill&nbsp;-9 durable</b> — one writer per branch, enforced by leases and epoch
     fencing; every ref update is a compare-and-swap. Validated by a torture harness
     that kill&nbsp;-9's a stock sqlite3 writer mid-write on roughly half of every
     round and requires the replica to converge byte-identical, every round.</li>
-    <li><b>Stock everything</b>a checkout is a real SQLite file — open it with plain
+    <li><b>Stock everything</b> — a checkout is a real SQLite file — open it with plain
     <code>sqlite3</code>, no forked engine, no special VFS on the read path.
     Snapshots and refs live in a local directory or any S3-compatible bucket with
     conditional writes.</li>

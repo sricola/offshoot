@@ -377,7 +377,8 @@ further acknowledgment needed. Any other address requires BOTH
 `-token`/`OFFSHOOT_TOKEN` — the auto-generated, printed-once token is a
 loopback-only convenience, refused outright for a non-loopback bind. Missing
 either is a distinct startup error; the daemon never starts under-
-acknowledged.
+acknowledged. An explicit token shorter than 16 characters is also a
+startup error — a short bearer token is guessable.
 
 **The token is a shared secret, checked in constant time**
 (`crypto/subtle.ConstantTimeCompare`), and **never logged in full again**

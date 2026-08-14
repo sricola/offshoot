@@ -58,7 +58,7 @@ Both need Go 1.25+ with cgo enabled (offshoot embeds SQLite via
 
 ## Platform support
 
-Linux and macOS only. **Windows:** use WSL2 — the linux binaries, Docker
+Linux and macOS only. **Windows:** use WSL2 — the Linux binaries, Docker
 image, and build-from-source all work there as-is. Native Windows is
 unsupported: offshoot leans on POSIX file semantics (unix sockets, POSIX
 locks) that don't map cleanly to Windows

@@ -310,7 +310,20 @@ func firstParagraph(doc ast.Node, src []byte) string {
 		if i := strings.LastIndexByte(cut, ' '); i > 100 {
 			cut = cut[:i]
 		}
-		out = strings.TrimRight(cut, " ,;:.") + "…"
+		// Don't end a SERP snippet on a dangling article/conjunction.
+		for {
+			i := strings.LastIndexByte(cut, ' ')
+			if i <= 100 {
+				break
+			}
+			switch strings.ToLower(strings.TrimRight(cut[i+1:], ",;:.")) {
+			case "a", "an", "the", "or", "and", "of", "to", "its", "it's", "their":
+				cut = cut[:i]
+				continue
+			}
+			break
+		}
+		out = strings.TrimRight(cut, " ,;:.'’s") + "…"
 	}
 	return out
 }
@@ -328,8 +341,10 @@ func docsIndexHTML(bySrc map[string]Page) string {
 	b.WriteString("<h1>Documentation</h1>\n")
 	b.WriteString("<p>Everything here is generated from the repo's canonical markdown — " +
 		"the same files you can read on GitHub. New here? Start with the " +
-		"introduction and the quickstart; building a test suite, start with the " +
-		"eval-harness tutorial; or jump straight to the CLI &amp; API reference.</p>\n")
+		`<a href="` + basePath + `/docs/introduction/">introduction</a> and the ` +
+		`<a href="` + basePath + `/docs/quickstart/">quickstart</a>; building a test suite, start with the ` +
+		`<a href="` + basePath + `/docs/eval-harness/">eval-harness tutorial</a>; or jump straight to the ` +
+		`<a href="` + basePath + `/docs/reference/">CLI &amp; API reference</a>.</p>` + "\n")
 	for _, g := range Nav {
 		fmt.Fprintf(&b, "<h2 id=%q>%s</h2>\n<ul>\n", ghSlug([]byte(g.Name)), template.HTMLEscapeString(g.Name))
 		for _, p := range g.Pages {

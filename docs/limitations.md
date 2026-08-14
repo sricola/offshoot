@@ -70,7 +70,7 @@ POSIX-specific — a real engineering gap, stated as a
 [non-goal](../ROADMAP.md#non-goals-v1) rather than glossed over
 ([details](faq.md#why-no-windows-support)).
 
-**Instead:** WSL2 works as-is (linux binaries, Docker image, or build
+**Instead:** WSL2 works as-is (Linux binaries, Docker image, or build
 from source).
 
 ## SQLite and filesystem requirements

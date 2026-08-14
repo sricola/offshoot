@@ -120,10 +120,10 @@ Usage:
                                              offshoot serve, or a manual offshoot gc);
                                              -socket names the daemon to ride when one is up
                                              (default: same derivation offshoot serve uses) —
-                                             checkpoint/fork/checkout on a branch with a
-                                             session already open there use it for live
-                                             capture; everything else, and any branch with no
-                                             open session, still runs entirely at rest
+                                             checkpoint/checkout on a branch with a session
+                                             already open there use it for live capture, and
+                                             fork rides a reachable daemon session or not;
+                                             everything else still runs entirely at rest
   offshoot session open <db>[@branch] [-socket PATH]      open a session; prints the checkout path
   offshoot session flush <db>[@branch] [name] [-socket PATH]   flush to a durable snapshot; prints the txid
   offshoot session status [-socket PATH]                  list open sessions and their durable txid

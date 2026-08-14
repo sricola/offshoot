@@ -132,7 +132,8 @@ keep chains bounded on deep fork-of-fork spines
 `offshoot status` labels every branch `storage=shared` (a base-pointer
 fork: near-free to hold, but it pins whatever ancestor storage its chain
 still reads through) or `storage=materialized` (a fully self-contained
-lineage: created roots, and the results of promote/rollback/compact). The
+lineage: branches made by `create`, and the results of
+promote/rollback/compact). The
 asymmetry to internalize: **fork shares (near-free); promote, rollback,
 and compact each materialize a full copy** — deliberate, because those
 operations abandon their old lineage, and base-pointing into a lineage

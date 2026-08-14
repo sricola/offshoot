@@ -81,8 +81,8 @@ a daemon session under it and the same tools ride live capture instead
 offshoot -store ./.offshoot init                 # once
 offshoot serve -socket /tmp/o.sock &             # holds leases, captures continuously
 sleep 1
-offshoot session open app -socket /tmp/o.sock    # THE harness-opened session
-claude mcp add offshoot -- offshoot -store ./.offshoot -socket /tmp/o.sock mcp
+offshoot session open app -socket /tmp/o.sock    # the harness-opened session
+claude mcp add offshoot -- offshoot -store ./.offshoot mcp -socket /tmp/o.sock
 # ... agent works ...
 offshoot session close app -socket /tmp/o.sock
 ```
@@ -95,11 +95,14 @@ The rules, exactly as shipped:
   lease exactly the way TTLs exist to prevent
   ([the design reasoning](status.md#integration-surface)).
 - **With a session open on the branch:** `offshoot_checkpoint` flushes
-  live through the daemon, `offshoot_fork` forks through it (flushing the
-  source first, so unflushed writes land in the child), and
-  `offshoot_checkout` returns the session's live checkout path.
-- **Without one, every tool works exactly as if no daemon existed** — at
-  rest.
+  live through the daemon and `offshoot_checkout` returns the session's
+  live checkout path.
+- **`offshoot_fork` rides the daemon whenever one is reachable** —
+  session or not (an open source session is flushed first, so unflushed
+  writes land in the child; the fork uses the daemon's `-snapshot-every`
+  share floor and counts in its metrics).
+- **With no reachable daemon, every tool works at rest** — exactly as if
+  the daemon didn't exist.
 - **`offshoot_rollback`, `offshoot_promote` (its `target`), and
   `offshoot_destroy` refuse** — even with `force`, which has no effect on
   this particular refusal — whenever the daemon has any session open on

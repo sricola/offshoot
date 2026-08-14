@@ -138,7 +138,7 @@ The full guide — store setup, S3 configuration, the fail-closed probe:
 [installation](https://sricola.github.io/offshoot/docs/installation/).
 
 Requires Go 1.25+ and cgo to build, and the `sqlite3` CLI for tests. Linux
-and macOS only. **Windows:** use WSL2 — the linux binaries, Docker image,
+and macOS only. **Windows:** use WSL2 — the Linux binaries, Docker image,
 and build-from-source all work there as-is. Native Windows is unsupported:
 offshoot leans on POSIX file semantics (unix sockets, POSIX locks) that
 don't map cleanly to Windows
@@ -199,7 +199,7 @@ in unit tests proves nothing about a real provider.
 
 | Provider | Status |
 |---|---|
-| MinIO | verified in CI — the conformance suite runs against real MinIO on every PR and push to main |
+| MinIO | verified in CI — the conformance suite runs against real MinIO[1] on every PR and push to main |
 | AWS S3 | verified — `TestS3RealProvider` (probe + conformance + multipart) passed against a real bucket (us-east-1, 2026-08-13) |
 | Google Cloud Storage (S3 interop) | **unsupported** — no conditional writes on the S3 API; the probe refuses it ([why](docs/faq.md#why-no-google-cloud-storage)) |
 
@@ -413,14 +413,15 @@ anything** — reaping is the janitor's job (`offshoot serve`), and
 `offshoot mcp` runs no daemon of its own; a daemonless MCP setup only
 sweeps expired branches when `offshoot gc` is run by hand.
 
-**MCP rides a running daemon when one is up, but only for a branch a
-session is already open on.** `offshoot mcp` never opens a session itself —
-that's a harness's job (the SDKs, `offshoot session open`, or your own
-loop). With an open session on the branch: `offshoot_checkpoint` flushes
-live through the daemon (no quiesce), `offshoot_fork` forks through the
-daemon (flushing first, so an unflushed write always lands in the child),
-and `offshoot_checkout` returns the session's live checkout path. Without
-one, every tool runs exactly as it does with no daemon at all.
+**MCP rides a running daemon when one is up.** `offshoot mcp` never opens
+a session itself — that's a harness's job (the SDKs, `offshoot session
+open`, or your own loop). With an open session on the branch:
+`offshoot_checkpoint` flushes live through the daemon (no quiesce) and
+`offshoot_checkout` returns the session's live checkout path.
+`offshoot_fork` routes through the daemon whenever one is reachable,
+session or not (an open source session is flushed first, so an unflushed
+write always lands in the child). With no reachable daemon, every tool
+runs exactly as it does with no daemon at all.
 `offshoot_rollback`, `offshoot_promote` (checked against its `target`),
 and `offshoot_destroy` take the opposite stance: each **refuses outright —
 even with `force`** — whenever the daemon has any session open on the

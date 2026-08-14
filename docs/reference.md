@@ -32,7 +32,9 @@ variable, and falls back to `./.offshoot` if that's unset too.
 
 Any other URL scheme is refused with `unsupported store scheme`.
 
-Every command except `init` first attaches to the store: it opens the
+Every store-touching command except `init` first attaches to the store
+(`offshoot version` and a bare `offshoot` usage print return before
+attaching): it opens the
 backend and runs a **CAS (compare-and-swap) capability probe**. This runs on
 every invocation — a fresh CLI process re-pays it every time — and refuses
 to proceed if the store doesn't enforce conditional writes, rather than
@@ -916,13 +918,15 @@ reference.
 
 | Method | Path | Auth | Body |
 |---|---|---|---|
-| `POST` | `/rpc` | Bearer | The same `Request`/`Response` JSON the unix socket speaks, one op per POST (`Content-Type: application/json` required; body capped at 1MiB, oversized -> `413`). Two ops are refused over HTTP: `subscribe` (use `GET /events`) and `export` — the one op that writes to an unconfined, client-chosen path on the daemon host, safe under the unix socket's same-host trust model but an arbitrary-file-write primitive for a network client, so it answers `400` here and stays socket-only |
+| `POST` | `/rpc` | Bearer | The same `Request`/`Response` JSON the unix socket speaks, one op per POST (`Content-Type: application/json` required; body capped at 1MiB, oversized -> `413`). Two ops are refused over HTTP: `subscribe` (use `GET /events`; refused in-band as a normal `{"ok":false,...}` JSON response) and `export` — the one op that writes to an unconfined, client-chosen path on the daemon host, safe under the unix socket's same-host trust model but an arbitrary-file-write primitive for a network client, so `export` alone answers `400` pre-dispatch and stays socket-only |
 | `GET` | `/metrics` | Bearer | Prometheus text exposition of the locked `offshoot_*` metric set — see [docs/operations.md](operations.md#metrics) for the full name/type/label reference table |
 | `GET` | `/healthz` | **none** | `{"ok":true,"sessions":N}` — the one endpoint that needs no token, for liveness probes |
 | `GET` | `/events` | Bearer | Server-Sent Events: the daemon's event stream (Milestone 4 Task 4a — see [Eventing](#eventing-subscribe-op--get-events) below) |
 | `GET` | `/debug/pprof/*` | Bearer | `net/http/pprof`'s standard handlers (index, cmdline, profile, symbol, trace) |
 
-**Token:** `-token TOKEN` or `OFFSHOOT_TOKEN` sets it explicitly; if
+**Token:** `-token TOKEN` or `OFFSHOOT_TOKEN` sets it explicitly — an
+explicit token shorter than **16 characters is a startup error** (a
+too-short bearer token is guessable; generate a real one). If
 neither is given, one is generated and printed to stderr **exactly once**
 at startup — treat that line, and your terminal scrollback/shell history,
 as sensitive. Every request but `/healthz` requires `Authorization: Bearer
@@ -967,7 +971,10 @@ defaults: `ReadHeaderTimeout` 5s (slow-header protection), `ReadTimeout`
 shorter window or profile out-of-band), `IdleTimeout` 2 minutes.
 
 **Errors:** everything `offshoot serve` can already error on, plus: HTTP
-address already in use; the two non-loopback-bind errors above.
+address already in use; the two non-loopback-bind errors above; an explicit
+token shorter than 16 characters; and `-token` or
+`-http-allow-non-loopback` given without `-http ADDR` (they have no effect
+alone, so serve refuses to start rather than silently ignore them).
 
 ## Eventing (subscribe op / GET /events)
 
@@ -1122,12 +1129,16 @@ the SDKs, `offshoot session open`, or a custom loop); each call to
 checks whether the daemon named by `-socket` (default: the same socket
 `offshoot serve` derives for this store) has one open for the branch in
 question. If so, `offshoot_checkpoint` flushes it live through the daemon
-instead of writing a full at-rest snapshot; `offshoot_fork` forks through
-the daemon, which flushes an open source session first; `offshoot_checkout`
-returns that session's own live checkout path. Without an already-open
-session — the common case for a bare `offshoot mcp` — every one of those
-tools behaves exactly as it does with no daemon running at all; see
-[docs/status.md](status.md) for what's tested.
+instead of writing a full at-rest snapshot; `offshoot_checkout`
+returns that session's own live checkout path. `offshoot_fork` goes
+further: it routes through the daemon whenever one is merely *reachable*,
+session or no session — so the fork uses the daemon's configured
+`-snapshot-every` share floor and lands in the daemon's fork metrics; when
+the source does have an open session, the daemon flushes it first so
+unflushed writes land in the child. Without a reachable daemon — the
+common case for a bare `offshoot mcp` — every tool behaves exactly as it
+does with no daemon running at all; see [docs/status.md](status.md) for
+what's tested.
 
 Three tools take the opposite stance: `offshoot_rollback`,
 `offshoot_promote` (checked against its `target` only), and
@@ -1301,7 +1312,7 @@ Which operations exist on which surface today — verified against
 | `diff` | **CLI-only** | no | no | Scoped CLI-only by design; see [docs/status.md](status.md)'s diff row. |
 | at-rest `checkpoint` | **CLI-only** | n/a | n/a | Not a gap: a live session's *named flush* is how daemon/SDK checkpoints are created (see `session flush` above). |
 | whole-store `status` | **CLI-only** | no | no | The daemon's per-db `branches` op reports the same branch states/storage classes; only the all-dbs-plus-ro-cache-summary view is CLI-only. |
-| `init` / `serve` / `mcp` | CLI | n/a | n/a | Process-level commands; nothing to proxy. |
+| `init` / `serve` / `mcp` / `version` / `path` | CLI | n/a | n/a | Process-level or purely local commands; nothing to proxy (`path` is `checkout`'s no-materialize sibling — see its section above). |
 
 Summary: the SDKs cover the entire daemon protocol except `shutdown`;
 what's genuinely CLI-only today is `init`, `create --from`, on-demand

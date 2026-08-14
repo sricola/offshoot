@@ -1,6 +1,6 @@
 # Contributing to offshoot
 
-offshoot is pre-alpha, single-maintainer, and moving fast. That means: ask
+offshoot is pre-release, single-maintainer, and moving fast. That means: ask
 before investing a lot of time in something structural (see "what needs an
 issue first" below), but small, well-scoped PRs are welcome and get reviewed
 quickly.
@@ -150,9 +150,9 @@ GitHub Actions run — push and let CI have the final word.
 There are two independent release tracks — the `offshoot` binary and the
 two SDKs — with two independent versioning schemes, on purpose: the SDKs
 are thin wrappers over a stable daemon wire protocol and can move on their
-own cadence, while the binary's `v0.1.x` tags govern the on-disk storage
-format. They currently both happen to read `0.1.0` because both are still
-at their first pre-release; that's a coincidence, not a coupling.
+own cadence, while the binary's `v0.2.x` tags govern the on-disk storage
+format. The two schemes already read differently (binary at `v0.2.x`, SDKs
+at `0.1.0`) — that divergence is the design, not drift.
 
 ### Binary releases
 
@@ -275,7 +275,7 @@ correct without it.
 ## What's most welcome right now
 
 - **Docs.** The gap between what's implemented and what the design spec
-  promises is real (pre-alpha), and closing that gap in writing — an honest
+  promises is real (pre-release), and closing that gap in writing — an honest
   implemented/deferred matrix, a CLI reference, fixing stale examples — is
   some of the highest-leverage work available and doesn't need prior
   coordination.
