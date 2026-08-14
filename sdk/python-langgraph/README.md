@@ -21,7 +21,7 @@ offshoot daemon op:
 
 | saver method               | offshoot op          | what it does                                                        |
 |----------------------------|----------------------|---------------------------------------------------------------------|
-| `checkpoint(name)`         | `Session.flush`      | flush the live checkout to a durable (optionally named) checkpoint  |
+| `checkpoint(name, meta=..)`| `Session.flush`      | flush the live checkout to a durable (optionally named, optionally metadata-tagged) checkpoint |
 | `fork_thread(new, ttl=..)` | `Client.fork`        | fork the branch; returns a **new saver** on the fork's own checkout |
 | `rollback(to)`             | `Client.rollback`    | repoint the branch at a named checkpoint; saver reopens in place    |
 | `promote(onto)`            | `Client.promote`     | repoint `onto` (e.g. `main`) at this branch's head                  |
@@ -35,11 +35,13 @@ LangGraph's **own thread state** under offshoot.
 
 ## Modes
 
-- **`OffshootSaver.session(socket_path, db, branch="main")` — shipped.**
-  A live daemon session: the daemon leases the branch and keeps the checkout
-  under continuous capture; `checkpoint()` (and `fork_thread`/`promote`,
-  which flush internally) make state durable. Requires `offshoot serve`
-  running on `socket_path`.
+- **`OffshootSaver.session(socket_path, db, branch="main", *, create=True)`
+  — shipped.** A live daemon session: the daemon leases the branch and keeps
+  the checkout under continuous capture; `checkpoint()` (and
+  `fork_thread`/`promote`, which flush internally) make state durable.
+  `create=True` (the default) creates `db` in the store first if it doesn't
+  exist yet; pass `create=False` to skip that auto-create. Requires
+  `offshoot serve` running on `socket_path`.
 
 - **`OffshootSaver.at_rest(store, db, branch)` — stubbed
   (`NotImplementedError`).** CLI-mode (at-rest checkout + explicit
@@ -50,11 +52,13 @@ LangGraph's **own thread state** under offshoot.
 
 ## Install
 
+Neither this package nor its `offshoot-db` dependency is on PyPI yet, so
+pip can't resolve `offshoot-db` on its own — install it from the repo
+first, then this package (no checkout needed for either):
+
 ```sh
-# not yet on PyPI — install from the repo:
+pip install "offshoot-db @ git+https://github.com/sricola/offshoot#subdirectory=sdk/python"
 pip install "langgraph-checkpoint-offshoot @ git+https://github.com/sricola/offshoot#subdirectory=sdk/python-langgraph"
-# Until offshoot-db is on PyPI, install the local SDK first from a repo
-# checkout:  pip install -e sdk/python
 ```
 
 You also need the `offshoot` binary with a running daemon:

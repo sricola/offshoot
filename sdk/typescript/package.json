@@ -43,6 +43,7 @@
   },
   "scripts": {
     "build": "tsc -p tsconfig.build.json",
+    "prepare": "npm install --ignore-scripts --no-audit --no-fund --loglevel=error && npm run build",
     "prepublishOnly": "rm -rf dist && npm run build",
     "test": "tsc && node --test test-dist/test/*.test.js"
   },

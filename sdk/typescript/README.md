@@ -15,6 +15,12 @@ anything the `offshoot` CLI can't.
 git clone https://github.com/sricola/offshoot && npm install ./offshoot/sdk/typescript
 ```
 
+The package's `prepare` script installs its own dev toolchain and builds
+`dist/` during that directory install — no separate build step is needed.
+(`dist/` is not checked into git, so if you skip scripts with
+`--ignore-scripts`, run `npm install && npm run build` inside
+`offshoot/sdk/typescript` yourself first.)
+
 ## Quickstart
 
 Start a store and a daemon (the `offshoot` binary — see the main repo's
@@ -131,7 +137,9 @@ test("agent run against a private copy", async () => {
   forks a fresh, worker-safe-named branch (uses `VITEST_POOL_ID` or
   `JEST_WORKER_ID` when present) from the seed's checkpoint with a TTL
   (default `"1h"`, `opts.ttl` overrides), opens a session, and returns
-  `{ path, db, branch, client, flush(name?), close() }`.
+  `{ path, db, branch, client, flush(name?, opts?), close() }` —
+  `flush`'s optional second argument takes `{ meta }` to attach string
+  metadata to the named checkpoint, same as `Session.flush`.
   `seedHandleOrName` may be the handle `seedOnce` returned, or a plain
   string naming an already-`seedOnce`d name. `close()` closes the session
   and destroys the branch — call it from `afterEach`; a failure in either

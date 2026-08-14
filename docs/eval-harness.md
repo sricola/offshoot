@@ -55,7 +55,10 @@ The base `offshoot-db` package is stdlib-only; the `[pytest]` extra pulls in
 prerelease — see [docs/status.md](status.md)'s publish-pipeline row; in the
 meantime `pip install -e "sdk/python[pytest]"` / `npm install
 /path/to/sdk/typescript` from a checkout works identically, and is what this
-tutorial itself uses.
+tutorial itself uses. (The TS package's `prepare` script builds its `dist/`
+during that directory install — `dist/` isn't checked into git, so if you
+install with `--ignore-scripts`, run `npm install && npm run build` inside
+`sdk/typescript` yourself first.)
 
 ## The shape of it
 
@@ -254,7 +257,7 @@ forking from the same seed checkpoint from ever colliding on a branch name.
 
 ## Mid-test flush checkpoints
 
-A `ForkedSession` (what `offshoot_fork()` returns) has a `.flush(name=None,
+A `ForkedSession` (what `offshoot_fork()` returns) has a `.flush(name="",
 meta=None)` passthrough to the underlying session — call it whenever you
 want the test's writes so far to be durable and independently inspectable
 (via `offshoot checkout --at`, `offshoot export`, `offshoot diff`) without
@@ -444,9 +447,10 @@ target: [docs/diff.md](diff.md).
 
 Every `offshoot_fork()` call sets a TTL on the branch it creates — **1
 hour by default**, overridable per-project via the `offshoot_ttl` ini
-option, or per-call via `offshoot_fork(ttl="...")` on the plugin's
-lower-level `_ForkFactory` (the fixture itself doesn't expose a per-call TTL
-argument today — see the plugin's docstring). The TTL is the crashed-run
+option. That ini option is the only TTL knob: neither the `offshoot_fork`
+fixture nor its underlying factory takes a per-call TTL argument — the
+factory's only parameter is the seed handle (see the plugin's docstring),
+and the ini value is baked in at factory construction. The TTL is the crashed-run
 backstop, not the primary cleanup mechanism: `offshoot_fork`'s teardown
 closes the session and destroys the branch on every normal test run,
 whether the test passed or failed — the TTL only matters when teardown
@@ -484,23 +488,23 @@ live, running example — `.github/workflows/ci.yml`'s `sdks` job:
   sdks:
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
+        with:
+          persist-credentials: false
 
-      - uses: actions/setup-go@v5
+      - uses: actions/setup-go@40f1582b2485089dde7abd97c1529aa768e1baff # v5.6.0
         with:
           go-version-file: go.mod
 
-      - uses: actions/setup-node@v4
+      - uses: actions/setup-node@49933ea5288caeca8642d1e84afbd3f7d6820020 # v4.4.0
         with:
           node-version: "22"
 
       - name: Verify system python3 is present
         run: python3 --version
 
-      - name: Install sqlite3 CLI
-        run: |
-          sudo apt-get update
-          sudo apt-get install -y sqlite3
+      # No sqldiff: the SDK suites drive the daemon, never offshoot diff.
+      - uses: ./.github/actions/setup-sqlite
 
       - name: make test-sdks
         run: make test-sdks
@@ -514,11 +518,34 @@ live, running example — `.github/workflows/ci.yml`'s `sdks` job:
       # stdlib-only). Installed editable so its `pytest11` entry point
       # registration is exercised for real, exactly as an installed
       # `offshoot-db[pytest]` would be.
+      #
+      # A venv, NOT `pip install --break-system-packages` straight onto
+      # system python: this runner is non-root/no-sudo, so PEP 668's
+      # externally-managed guard plus --break-system-packages makes pip
+      # silently fall back to a *user*-site install
+      # (~/.local/lib/pythonX.Y/site-packages) — which is only importable
+      # via $HOME. That's fine for the outer `make test-pytest-plugin`
+      # process itself, but three of its tests use pytest's own `pytester`
+      # fixture in *subprocess* mode (`runpytest_subprocess`, needed for a
+      # real xdist -n2 run, a real cwd-vs-rootdir check, and a real -W
+      # error flag) — and `pytester` deliberately repoints HOME at a
+      # throwaway tmp dir for every nested run (see _pytest/pytester.py's
+      # Pytester.__init__, "Ensure no user config is used"). With pytest
+      # installed only under the REAL $HOME, that nested subprocess can no
+      # longer find it at all: it exits with "No module named pytest"
+      # before printing a terminal summary, which pytester.py:585 surfaces
+      # as "ValueError: Pytest terminal summary report not found". A venv's
+      # site-packages path is baked into the interpreter itself, independent
+      # of $HOME, so the nested subprocess (same interpreter, same venv)
+      # keeps seeing pytest regardless of what HOME it's given — the same
+      # reason this never reproduces in a local dev venv.
       - name: Install offshoot-db[pytest] + pytest-xdist
-        run: python3 -m pip install --break-system-packages --quiet -e "sdk/python[pytest]" pytest-xdist
+        run: |
+          python3 -m venv .venv-pytest-plugin
+          .venv-pytest-plugin/bin/pip install --quiet -e "sdk/python[pytest]" pytest-xdist
 
       - name: make test-pytest-plugin
-        run: make test-pytest-plugin
+        run: PATH="$PWD/.venv-pytest-plugin/bin:$PATH" make test-pytest-plugin
 
       # dry-run-sdks builds the real sdist/wheel and npm tarball, runs twine
       # check, and install-tests both — the same build-verification tier
@@ -541,10 +568,20 @@ live, running example — `.github/workflows/ci.yml`'s `sdks` job:
 ```
 
 That's `.github/workflows/ci.yml`'s `sdks` job pasted verbatim, comments
-included — not an adapted excerpt. `actions/setup-node@v4` is there because
-`make test-sdks` and `make dry-run-sdks` both also exercise the TypeScript
-SDK (`test-ts-sdk`, `dry-run-ts-sdk`) in the same job; a pytest-only CI
-setup that skips the TS pieces can drop that step and the two `make
+included — not an adapted excerpt. A few of its choices are this repo's
+policies rather than requirements of the plugin, and your own job can
+simplify them: the actions are SHA-pinned with the tag in a trailing
+comment (`@v4`/`@v5`-style tags work the same), `persist-credentials:
+false` is a hardening default, and `./.github/actions/setup-sqlite` is this
+repo's composite action whose ubuntu path boils down to `sudo apt-get
+update && sudo apt-get install -y sqlite3` (its long comment in the job
+explains why the pytest install uses a venv rather than `pip install
+--break-system-packages`: on a non-root runner the latter silently becomes
+a user-site install under `$HOME`, which pytest's `pytester`-subprocess
+tests then can't see). The `setup-node` step is there because `make
+test-sdks` and `make dry-run-sdks` both also exercise the TypeScript SDK
+(`test-ts-sdk`, `dry-run-ts-sdk`) in the same job; a pytest-only CI setup
+that skips the TS pieces can drop that step and the two `make
 dry-run-sdks`-related steps at the end, keeping just checkout, setup-go,
 the `sqlite3` install, `make test-sdks`, and the two `pytest-plugin` steps.
 
