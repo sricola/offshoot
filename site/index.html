@@ -40,18 +40,34 @@ body{
 .wrap{max-width:800px; margin:0 auto; padding:0 24px}
 a{color:var(--accent); text-decoration:none; border-bottom:1px solid transparent}
 a:hover{border-bottom-color:var(--accent)}
+:focus-visible{outline:2px solid var(--accent); outline-offset:2px; border-radius:2px}
 code{background:var(--code-bg); border:1px solid var(--border); border-radius:3px;
   padding:.08em .35em; font-size:13px; overflow-wrap:anywhere}
 strong{font-weight:600}
 
-header{padding:88px 0 0}
-.brand{display:flex; align-items:baseline; gap:14px; flex-wrap:wrap}
-.brand h1{font-size:21px; font-weight:700; letter-spacing:-.01em}
-.brand h1 .g{color:var(--accent); font-weight:400}
-.meta{font-size:12px; color:var(--faint); letter-spacing:.02em}
-.pitch{margin-top:28px; font-size:16px; line-height:1.7; max-width:60ch}
-.pitch b{font-weight:600}
-.sub{margin-top:14px; color:var(--dim); max-width:64ch}
+.top{position:sticky; top:0; z-index:10; background:var(--bg);
+  border-bottom:1px solid var(--border)}
+.top .wrap{height:56px; display:flex; align-items:center; gap:8px}
+.top .wordmark{font-size:16px; font-weight:700; color:var(--ink);
+  letter-spacing:-.01em; padding:10px 4px; border-bottom:none}
+.top .wordmark .g{color:var(--accent); font-weight:400}
+.top nav{margin-left:auto; display:flex; align-items:center; gap:4px; font-size:13px}
+.top nav a{color:var(--dim); padding:12px 10px; min-height:44px;
+  display:inline-flex; align-items:center; border-bottom:none}
+.top nav a:hover{color:var(--accent)}
+
+header.hero{padding:52px 0 0}
+h1{font-size:clamp(27px,5.5vw,36px); font-weight:700; letter-spacing:-.02em; line-height:1.2}
+h1 .g{color:var(--accent); font-weight:400}
+.pitch{margin-top:16px; font-size:16px; line-height:1.7; max-width:62ch}
+.meta{margin-top:12px; font-size:12px; color:var(--faint); letter-spacing:.02em}
+.cta{margin-top:22px; display:flex; gap:12px; flex-wrap:wrap}
+.btn{display:inline-flex; align-items:center; min-height:44px; padding:0 18px;
+  border-radius:6px; font-size:13.5px; font-weight:600; border-bottom:none}
+.btn.primary{background:var(--accent); color:var(--bg); border:1px solid var(--accent)}
+.btn.primary:hover{border-color:var(--ink)}
+.btn.ghost{color:var(--accent); border:1px solid var(--border)}
+.btn.ghost:hover{border-color:var(--accent)}
 
 section{padding:56px 0 0}
 section:last-of-type{padding-bottom:24px}
@@ -64,10 +80,11 @@ pre{background:var(--code-bg); border:1px solid var(--border); border-radius:6px
 pre code{background:none; border:none; padding:0; font-size:inherit}
 pre .p{color:var(--accent); user-select:none}
 pre .c{color:var(--faint)}
-.demo{margin-top:32px}
+.demo{margin-top:30px}
 pre+pre, pre+p, p+pre{margin-top:14px}
 .note{margin-top:14px; color:var(--dim); font-size:13px; max-width:70ch}
 .note code{font-size:12px}
+.more{margin-top:18px; font-size:13px}
 
 ul.why{list-style:none}
 ul.why li{padding:16px 0; border-bottom:1px solid var(--rule); color:var(--dim); max-width:74ch}
@@ -90,10 +107,9 @@ tbody tr:hover td{background:var(--code-bg)}
 .label{font-size:11px; letter-spacing:.08em; text-transform:uppercase; color:var(--faint); margin:0 0 6px}
 .cols>div+div{margin-top:0}
 
-
 .diagram{margin:34px 0 0; overflow-x:auto}
 .diagram svg{display:block; width:100%; min-width:600px; height:auto}
-#why .diagram{margin:0 0 30px}
+#how .diagram{margin:0 0 30px}
 .dg text{font-family:var(--mono); font-size:12.5px; fill:var(--dim)}
 .dg .tk{fill:var(--ink); font-weight:600}
 .dg .ta{fill:var(--accent)}
@@ -119,15 +135,35 @@ footer .g{color:var(--accent)}
 </head>
 <body>
 
-<header class="wrap">
-  <div class="brand">
-    <h1><span class="g">⑂</span> offshoot</h1>
-    <span class="meta">v0.2.9 · pre-release · apache-2.0 · linux/macos · go 1.25+</span>
+<div class="top">
+  <div class="wrap">
+    <a class="wordmark" href="/offshoot/"><span class="g">⑂</span> offshoot</a>
+    <nav aria-label="Site">
+      <a href="/offshoot/docs/">docs</a>
+      <a href="https://github.com/sricola/offshoot">github</a>
+    </nav>
   </div>
-  <p class="pitch"><b>Branch SQLite like git</b> — create, fork, checkpoint, rollback,
-  promote. Stock SQLite files, your local disk or S3 bucket, one binary.</p>
-  <p class="sub">For AI agents and eval harnesses: fork the database per attempt,
-  let the agent write to a real SQLite file, keep the winner, reap the rest.</p>
+</div>
+
+<header class="hero wrap">
+  <h1><span class="g">⑂</span> Branch SQLite like git.</h1>
+  <p class="pitch">Copy-on-write forks of stock SQLite files, on your local disk or
+  S3 bucket — a real database per agent attempt, eval run, or test; promote the
+  winner, let the rest expire.</p>
+  <p class="meta">v0.2.9 · pre-release · apache-2.0 · linux/macos · go 1.25+</p>
+  <div class="cta">
+    <a class="btn primary" href="/offshoot/docs/quickstart/">Get started →</a>
+    <a class="btn ghost" href="https://github.com/sricola/offshoot">GitHub ↗</a>
+  </div>
+
+  <pre class="demo"><code><span class="p">$</span> offshoot init
+<span class="p">$</span> offshoot create app
+<span class="p">$</span> sqlite3 "$(offshoot checkout app)" "CREATE TABLE users (name); INSERT INTO users VALUES ('ada');"
+<span class="p">$</span> offshoot checkpoint app v1
+<span class="p">$</span> offshoot fork app attempt-1 --ttl 2h   <span class="c"># copy-on-write branch, near-zero added storage</span>
+<span class="p">$</span> sqlite3 "$(offshoot checkout app@attempt-1)" "DELETE FROM users;"   <span class="c"># destructive experiment</span>
+<span class="p">$</span> offshoot rollback app@attempt-1 --to fork    <span class="c"># it went badly — undo the world</span>
+<span class="p">$</span> offshoot promote app@attempt-1 --onto main --force   <span class="c"># …or it went well — ship it</span></code></pre>
 
   <figure class="diagram">
   <svg class="dg" viewBox="0 0 640 210" role="img"
@@ -163,33 +199,29 @@ footer .g{color:var(--accent)}
     <circle class="dot" cx="515" cy="110" r="4"/>
   </svg>
   </figure>
-
-  <pre class="demo"><code><span class="p">$</span> offshoot init
-<span class="p">$</span> offshoot create app
-<span class="p">$</span> sqlite3 "$(offshoot checkout app)" "CREATE TABLE users (name); INSERT INTO users VALUES ('ada');"
-<span class="p">$</span> offshoot checkpoint app v1
-<span class="p">$</span> offshoot fork app attempt-1 --ttl 2h   <span class="c"># copy-on-write branch, near-zero added storage</span>
-<span class="p">$</span> sqlite3 "$(offshoot checkout app@attempt-1)" "DELETE FROM users;"   <span class="c"># destructive experiment</span>
-<span class="p">$</span> offshoot rollback app@attempt-1 --to fork    <span class="c"># it went badly — undo the world</span>
-<span class="p">$</span> offshoot promote app@attempt-1 --onto main --force   <span class="c"># …or it went well — ship it</span></code></pre>
 </header>
 
-<section class="wrap" id="install">
-  <h2>install</h2>
-  <pre><code><span class="c"># build from source (go 1.25+, cgo)</span>
-<span class="p">$</span> go build -o offshoot ./cmd/offshoot
-
-<span class="c"># same binary, any store</span>
-<span class="p">$</span> offshoot -store ./.offshoot init             <span class="c"># local directory (default)</span>
-<span class="p">$</span> offshoot -store s3://my-bucket/offshoot init <span class="c"># S3, MinIO</span></code></pre>
-  <p class="note">Prebuilt binaries (linux/darwin × amd64/arm64) ship with every tagged
-  release; <code>go install github.com/sricola/offshoot/cmd/offshoot@latest</code> resolves
-  when the repo opens publicly. At attach time offshoot probes the store and refuses to run
-  if conditional writes aren't enforced — fail-closed, never silently degraded.</p>
+<section class="wrap" id="why">
+  <h2>why branch a database?</h2>
+  <ul class="why">
+    <li><b>AI agents</b>fork the database per attempt — the agent writes to a real
+    SQLite file through plain <code>sqlite3</code> or MCP tools, you promote the
+    attempt that worked, and TTL'd branches expire instead of leaking.</li>
+    <li><b>Eval harnesses</b>seed once, fork per run — a shared fork of a 100&nbsp;MB
+    database adds 377 bytes to the store, flat from 1 to 100 forks, so isolated
+    attempts cost near-nothing.</li>
+    <li><b>Tests</b>real isolation without fixture rebuilds: fork a fresh branch per
+    test via the pytest fixtures or the vitest/jest testkit, with TTL-backstopped
+    cleanup.</li>
+    <li><b>Experiments</b>run the destructive migration on a fork —
+    <code>rollback --to fork</code> if it goes badly, <code>promote --onto main</code>
+    if it doesn't.</li>
+  </ul>
+  <p class="more">New here? <a href="/offshoot/docs/introduction/">Read the introduction →</a></p>
 </section>
 
-<section class="wrap" id="why">
-  <h2>why</h2>
+<section class="wrap" id="how">
+  <h2>how it works</h2>
   <figure class="diagram">
   <svg class="dg" viewBox="0 0 640 264" role="img"
     aria-label="Architecture diagram. Your app and plain sqlite3 write to a checkout, a real database file with a WAL. The offshoot serve daemon captures WAL frames into LTX segments. Segments land in your storage, a local directory or S3-compatible bucket, as an immutable chain: a snapshot plus segments per branch. A fork's chain starts with a base pointer sharing the parent's snapshot, copy-on-write.">
@@ -241,21 +273,23 @@ footer .g{color:var(--accent)}
   </figure>
   <ul class="why">
     <li><b>O(1) forks</b>a fork shares the parent's durable objects through a base
-    pointer and writes new ones only as it diverges — N forks of a G-byte database cost
-    near-zero added bytes. Fork per attempt; branches carry TTLs and reap themselves;
+    pointer and writes new ones only as it diverges — N forks of a G-byte database
+    cost near-zero added bytes. Branches carry TTLs and reap themselves;
     <code>compact</code> makes a fork self-contained on demand.</li>
     <li><b>Bounded replay</b>a branch is a lineage of immutable snapshots plus
     incremental segments. A read applies one snapshot and at most fifteen segments
-    (default cadence), checksum-verified member by member — a torn chain is a loud error,
-    never a short read.</li>
+    (default cadence), checksum-verified member by member — a torn chain is a loud
+    error, never a short read.</li>
     <li><b>kill&nbsp;-9 durable</b>one writer per branch, enforced by leases and epoch
-    fencing; every ref update is a compare-and-swap. Validated by a torture harness that
-    kill&nbsp;-9's a stock sqlite3 writer mid-write on roughly half of every round and requires the
-    replica to converge byte-identical, every round.</li>
+    fencing; every ref update is a compare-and-swap. Validated by a torture harness
+    that kill&nbsp;-9's a stock sqlite3 writer mid-write on roughly half of every
+    round and requires the replica to converge byte-identical, every round.</li>
     <li><b>Stock everything</b>a checkout is a real SQLite file — open it with plain
-    <code>sqlite3</code>, no forked engine, no special VFS on the read path. Snapshots and
-    refs live in a local directory or any S3-compatible bucket with conditional writes.</li>
+    <code>sqlite3</code>, no forked engine, no special VFS on the read path.
+    Snapshots and refs live in a local directory or any S3-compatible bucket with
+    conditional writes.</li>
   </ul>
+  <p class="more"><a href="/offshoot/docs/architecture/">Read the architecture →</a></p>
 </section>
 
 <section class="wrap" id="agents">
@@ -283,46 +317,51 @@ footer .g{color:var(--accent)}
   <code>/healthz</code>, <code>/rpc</code>, and an SSE <code>/events</code> stream.
   Python and TypeScript SDKs drive the same API: pytest fixtures and a
   vitest/jest testkit for seed-once, fork-per-test isolation.</p>
+  <p class="more"><a href="/offshoot/docs/agents/">Agents &amp; MCP guide →</a></p>
+</section>
+
+<section class="wrap" id="install">
+  <h2>install</h2>
+  <pre><code><span class="c"># homebrew</span>
+<span class="p">$</span> brew tap sricola/offshoot https://github.com/sricola/offshoot
+<span class="p">$</span> brew install offshoot
+
+<span class="c"># docker — images publish to ghcr on every tagged release; the store lives in /data</span>
+<span class="p">$</span> docker run --rm -v offshoot-data:/data ghcr.io/sricola/offshoot:latest init
+
+<span class="c"># from source (go 1.25+, cgo)</span>
+<span class="p">$</span> go build -o offshoot ./cmd/offshoot
+
+<span class="c"># same binary, any store</span>
+<span class="p">$</span> offshoot -store ./.offshoot init             <span class="c"># local directory (default)</span>
+<span class="p">$</span> offshoot -store s3://my-bucket/offshoot init <span class="c"># S3, MinIO</span></code></pre>
+  <p class="note">Prebuilt binaries (<code>offshoot_vX_os_arch.tar.gz</code> +
+  <code>.sha256</code>) ship with every tagged
+  <a href="https://github.com/sricola/offshoot/releases">release</a>. Linux and macOS;
+  on Windows, use WSL2. At attach time offshoot probes the store and refuses to run
+  if conditional writes aren't enforced — fail-closed, never silently degraded.</p>
+  <p class="more"><a href="/offshoot/docs/installation/">Full install guide →</a></p>
 </section>
 
 <section class="wrap" id="commands">
-  <h2>commands</h2>
+  <h2>essential commands</h2>
   <div class="tablewrap"><table><tbody>
-    <tr><td class="cmd"><span class="a">init</span></td><td class="d">create a store in ./.offshoot</td></tr>
     <tr><td class="cmd"><span class="a">create</span> &lt;db&gt; [--from f]</td><td class="d">new database (branch main), or import a file</td></tr>
-    <tr><td class="cmd"><span class="a">checkout</span> &lt;db&gt;[@branch]</td><td class="d">materialize a working copy; prints its path (<code>--at cp --read-only</code> for history)</td></tr>
+    <tr><td class="cmd"><span class="a">checkout</span> &lt;db&gt;[@branch]</td><td class="d">materialize a working copy; prints its path</td></tr>
     <tr><td class="cmd"><span class="a">checkpoint</span> &lt;db&gt;[@br] &lt;name&gt;</td><td class="d">snapshot the checkout as a named checkpoint</td></tr>
     <tr><td class="cmd"><span class="a">fork</span> &lt;db&gt;[@br] &lt;new&gt; [--at cp] [--ttl d]</td><td class="d">branch from head or a checkpoint; copy-on-write</td></tr>
     <tr><td class="cmd"><span class="a">rollback</span> &lt;db&gt;[@br] --to &lt;cp&gt;</td><td class="d">repoint a branch at a checkpoint</td></tr>
     <tr><td class="cmd"><span class="a">promote</span> &lt;db&gt;@&lt;src&gt; --onto &lt;target&gt;</td><td class="d">repoint target at src's head (<code>--force</code> for protected)</td></tr>
-    <tr><td class="cmd"><span class="a">compact</span> &lt;db&gt;[@br]</td><td class="d">make a shared fork self-contained</td></tr>
     <tr><td class="cmd"><span class="a">destroy</span> &lt;db&gt;[@br] [--force]</td><td class="d">delete a branch; children survive their parent</td></tr>
-    <tr><td class="cmd"><span class="a">touch</span> &lt;db&gt;[@br] [--ttl d|none]</td><td class="d">reset a branch's activity clock; set or clear its TTL</td></tr>
-    <tr><td class="cmd"><span class="a">diff</span> a b [--summary]</td><td class="d">sqldiff two branches or checkpoints</td></tr>
-    <tr><td class="cmd"><span class="a">export</span> &lt;db&gt;[@br[@cp]] out.db</td><td class="d">copy a checkpoint (or head) out to a plain file</td></tr>
     <tr><td class="cmd"><span class="a">status</span></td><td class="d">all branches: state, storage class, TTL</td></tr>
-    <tr><td class="cmd"><span class="a">gc</span> [--grace d]</td><td class="d">collect unreachable lineages</td></tr>
-    <tr><td class="cmd"><span class="a">lease</span> list|acquire|release</td><td class="d">inspect or break branch leases</td></tr>
-    <tr><td class="cmd"><span class="a">serve</span></td><td class="d">daemon: live capture, TTL reaping, GC, optional HTTP/SSE</td></tr>
-    <tr><td class="cmd"><span class="a">session</span> open|flush|status|close|shutdown|dbs</td><td class="d">drive a running daemon from the CLI</td></tr>
-    <tr><td class="cmd"><span class="a">mcp</span> [-default-ttl d]</td><td class="d">serve the MCP tool set on stdio for an agent</td></tr>
   </tbody></table></div>
-  <p class="note">Full semantics — flags, protected-branch rules, storage classes, branch
-  states — in <code>docs/reference.md</code>.</p>
-</section>
-
-<section class="wrap" id="links">
-  <h2>links</h2>
-  <p class="note">
-    <a href="https://github.com/sricola/offshoot">github.com/sricola/offshoot ↗</a> ·
-    docs: <code>reference</code> <code>architecture</code> <code>faq</code>
-    <code>eval-harness</code> <code>operations</code> · <code>CHANGELOG</code> —
-    all <a href="https://github.com/sricola/offshoot/tree/main/docs">in-repo</a>.
-  </p>
+  <p class="more"><a href="/offshoot/docs/reference/">Full CLI reference →</a></p>
 </section>
 
 <footer><div class="wrap">
   <span><span class="g">⑂</span> offshoot</span>
+  <a href="/offshoot/docs/">docs</a>
+  <a href="https://github.com/sricola/offshoot">github</a>
   <span>apache-2.0</span>
   <span>stock sqlite · your storage · one binary</span>
 </div></footer>
