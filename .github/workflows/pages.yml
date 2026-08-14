@@ -40,6 +40,11 @@ jobs:
           go-version-file: site/gen/go.mod
       - name: Build docs site
         run: go -C site/gen run .
+      - name: Trim non-site files from the artifact
+        # The generator sources and the og-card scratch page aren't part of
+        # the published site; keep the deployed artifact to exactly what a
+        # visitor can be served.
+        run: rm -rf site/gen site/og-card.html
       - uses: actions/configure-pages@983d7736d9b0ae728b81ab479565c72886d7745b # v5.0.0
       - uses: actions/upload-pages-artifact@56afc609e74202658d3ffba0e8f6dda462b719fa # v3.0.1
         with:

@@ -34,3 +34,4 @@ secrets.*
 *.log
 .idea/
 .vscode/
+.claude/

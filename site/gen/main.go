@@ -129,6 +129,13 @@ func main() {
 		order[p.MD] = i
 	}
 
+	// Build-time link check: every intra-site link (cross-page and
+	// same-page #fragment) is recorded here and verified against the
+	// target page's actual heading IDs after the build loop — a broken
+	// internal link fails the build instead of deploying 404s/dead anchors.
+	pageIDs := map[string]map[string]bool{}
+	var intra []intraLink
+
 	for i := range flat {
 		p := flat[i]
 		src, err := os.ReadFile(filepath.Join(root, p.MD))
@@ -137,7 +144,8 @@ func main() {
 		ctx := parser.NewContext(parser.WithIDs(newGHIDs()))
 		doc := md.Parser().Parse(text.NewReader(src), parser.WithContext(ctx))
 
-		rewriteLinks(doc, root, path.Dir(p.MD), bySrc)
+		rewriteLinks(doc, root, path.Dir(p.MD), bySrc, p, &intra)
+		pageIDs[p.Slug] = collectIDs(doc)
 		toc := collectTOC(doc, src)
 		desc := firstParagraph(doc, src)
 
@@ -176,8 +184,54 @@ func main() {
 		IsIndex:     true,
 	})
 
+	// Verify the recorded intra-site links. Fragment IDs include raw
+	// HTML anchors goldmark can't see only if hand-written <a id=...>
+	// existed — the corpus has none, so heading IDs are the full set.
+	broken := 0
+	for _, l := range intra {
+		ids, ok := pageIDs[l.toSlug]
+		if !ok {
+			fmt.Fprintf(os.Stderr, "gen: %s links to unknown page %q\n", l.fromMD, l.toSlug)
+			broken++
+			continue
+		}
+		if l.frag != "" && !ids[l.frag] {
+			fmt.Fprintf(os.Stderr, "gen: %s links to %s#%s — no such anchor\n", l.fromMD, l.toSlug, l.frag)
+			broken++
+		}
+	}
+	if broken > 0 {
+		fmt.Fprintf(os.Stderr, "gen: %d broken internal link(s)\n", broken)
+		os.Exit(1)
+	}
+
 	writeSitemap(root, flat)
-	fmt.Printf("gen: %d pages + index + sitemap -> site/docs/\n", len(flat))
+	fmt.Printf("gen: %d pages + index + sitemap, %d internal links verified -> site/docs/\n", len(flat), len(intra))
+}
+
+// intraLink is one recorded site-internal link occurrence for the
+// post-build verification pass.
+type intraLink struct {
+	fromMD string // source markdown path (for the error message)
+	toSlug string // target page slug
+	frag   string // fragment without '#', "" if none
+}
+
+// collectIDs returns every heading ID (h1-h6) goldmark assigned in doc.
+func collectIDs(doc ast.Node) map[string]bool {
+	ids := map[string]bool{}
+	ast.Walk(doc, func(n ast.Node, entering bool) (ast.WalkStatus, error) {
+		if !entering {
+			return ast.WalkContinue, nil
+		}
+		if h, ok := n.(*ast.Heading); ok {
+			if id, ok := h.AttributeString("id"); ok {
+				ids[string(id.([]byte))] = true
+			}
+		}
+		return ast.WalkContinue, nil
+	})
+	return ids
 }
 
 func findRoot() (string, error) {
@@ -204,24 +258,28 @@ func findRoot() (string, error) {
 //   - anything else in the repo -> github.com blob/tree URL
 //
 // Absolute URLs and pure #fragments pass through untouched.
-func rewriteLinks(doc ast.Node, root, srcDir string, bySrc map[string]Page) {
+func rewriteLinks(doc ast.Node, root, srcDir string, bySrc map[string]Page, from Page, intra *[]intraLink) {
 	ast.Walk(doc, func(n ast.Node, entering bool) (ast.WalkStatus, error) {
 		if !entering {
 			return ast.WalkContinue, nil
 		}
 		switch v := n.(type) {
 		case *ast.Link:
-			v.Destination = []byte(rewrite(string(v.Destination), root, srcDir, bySrc))
+			v.Destination = []byte(rewrite(string(v.Destination), root, srcDir, bySrc, from, intra))
 		case *ast.Image:
-			v.Destination = []byte(rewrite(string(v.Destination), root, srcDir, bySrc))
+			v.Destination = []byte(rewrite(string(v.Destination), root, srcDir, bySrc, from, intra))
 		}
 		return ast.WalkContinue, nil
 	})
 }
 
-func rewrite(dest, root, srcDir string, bySrc map[string]Page) string {
-	if dest == "" || strings.HasPrefix(dest, "#") ||
-		strings.Contains(dest, "://") || strings.HasPrefix(dest, "mailto:") {
+func rewrite(dest, root, srcDir string, bySrc map[string]Page, from Page, intra *[]intraLink) string {
+	if strings.HasPrefix(dest, "#") {
+		// Same-page anchor: record it against this page's own IDs.
+		*intra = append(*intra, intraLink{from.MD, from.Slug, dest[1:]})
+		return dest
+	}
+	if dest == "" || strings.Contains(dest, "://") || strings.HasPrefix(dest, "mailto:") {
 		return dest
 	}
 	frag := ""
@@ -231,6 +289,7 @@ func rewrite(dest, root, srcDir string, bySrc map[string]Page) string {
 	}
 	rel := path.Clean(path.Join(srcDir, dest))
 	if p, ok := bySrc[rel]; ok {
+		*intra = append(*intra, intraLink{from.MD, p.Slug, strings.TrimPrefix(frag, "#")})
 		return basePath + "/docs/" + p.Slug + "/" + frag
 	}
 	if strings.HasSuffix(dest, "/") || isDir(filepath.Join(root, filepath.FromSlash(rel))) {

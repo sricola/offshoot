@@ -4,6 +4,7 @@ import (
 	"context"
 	"encoding/json"
 	"fmt"
+	"strings"
 	"time"
 
 	"github.com/sricola/offshoot/internal/daemon"
@@ -587,13 +588,21 @@ func forkTTLDescription(defaultTTL time.Duration) string {
 
 // ttlDefaultDisplay renders defaultTTL the way the fork schema's `ttl`
 // property advertises its default: "none" when no default is configured,
-// otherwise its canonical time.Duration.String() form — the same rendering
-// a ref's own TTL round-trips as (see the README's TTLs section).
+// otherwise time.Duration.String() with trailing zero units trimmed
+// ("24h", not "24h0m0s") — the human form every doc uses. Only this
+// schema display is trimmed; a ref's stored TTL still round-trips in the
+// full canonical form (see the README's TTLs section).
 func ttlDefaultDisplay(defaultTTL time.Duration) string {
 	if defaultTTL <= 0 {
 		return "none"
 	}
-	return defaultTTL.String()
+	s := defaultTTL.String()
+	s = strings.TrimSuffix(s, "0s")
+	s = strings.TrimSuffix(s, "0m")
+	if s == "" { // defensive: a sub-second default trims to nothing
+		return defaultTTL.String()
+	}
+	return s
 }
 
 // resolveForkTTL determines the TTL to apply to a fresh fork from the call's

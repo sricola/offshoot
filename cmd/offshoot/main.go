@@ -9,6 +9,7 @@ import (
 	"os"
 	"os/signal"
 	"runtime"
+	"runtime/debug"
 	"strconv"
 	"strings"
 	"syscall"
@@ -401,7 +402,17 @@ func run(args []string) error {
 		if len(rest) != 0 {
 			return fmt.Errorf("usage: offshoot version")
 		}
-		fmt.Printf("offshoot %s %s %s/%s\n", version, runtime.Version(), runtime.GOOS, runtime.GOARCH)
+		v := version
+		// Release builds stamp `version` via -ldflags; a `go install
+		// module@vX.Y.Z` build can't, but its module version is in the
+		// build info — prefer that over reporting "dev".
+		if v == "dev" {
+			if bi, ok := debug.ReadBuildInfo(); ok &&
+				bi.Main.Version != "" && bi.Main.Version != "(devel)" {
+				v = bi.Main.Version
+			}
+		}
+		fmt.Printf("offshoot %s %s %s/%s\n", v, runtime.Version(), runtime.GOOS, runtime.GOARCH)
 		return nil
 	}
 
