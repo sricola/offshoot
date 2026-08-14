@@ -130,7 +130,12 @@ More "why not X" (Litestream, Dolt, Neon, plain `cp`):
   `offshoot_vX_os_arch.tar.gz` (+ `.sha256`) from the
   [releases page](https://github.com/sricola/offshoot/releases), published
   for each tagged release
+- **`go install`:**
+  `go install github.com/sricola/offshoot/cmd/offshoot@latest`
 - **From source:** the Quickstart above (Go 1.25+, cgo)
+
+The full guide — store setup, S3 configuration, the fail-closed probe:
+[installation](https://sricola.github.io/offshoot/docs/installation/).
 
 Requires Go 1.25+ and cgo to build, and the `sqlite3` CLI for tests. Linux
 and macOS only. **Windows:** use WSL2 — the linux binaries, Docker image,
@@ -518,6 +523,14 @@ notes on LlamaIndex and CrewAI
 ([frameworks.md](docs/recipes/frameworks.md)).
 
 ## Docs
+
+Rendered docs site: **<https://sricola.github.io/offshoot/docs/>** — the
+same canonical markdown as the in-repo links below, with a
+getting-started track:
+[introduction](https://sricola.github.io/offshoot/docs/introduction/) ·
+[installation](https://sricola.github.io/offshoot/docs/installation/) ·
+[quickstart](https://sricola.github.io/offshoot/docs/quickstart/) ·
+[core concepts](https://sricola.github.io/offshoot/docs/concepts/).
 
 **Understand it**
 

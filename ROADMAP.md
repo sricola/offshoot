@@ -12,7 +12,7 @@ Ground rules carried over from the design spec: correctness stays paranoid
 (limits documented as plainly as features), and the storage format carries a
 layout version so incompatibility is always detected, never guessed.
 
-Releases use the 0.x prerelease series (tags `v0.1.0` … `v0.2.7`); 1.0 is
+Releases use the 0.x prerelease series (tags `v0.1.0` … `v0.2.9`); 1.0 is
 reserved for the storage-format freeze. 0.2.0 is the copy-on-write release —
 a minor (not patch) bump because it changes the storage format
 (LayoutVersion 1 → 2; see the copy-on-write milestone below). The 0.2.x
