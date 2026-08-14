@@ -5,7 +5,9 @@ branches *stock SQLite files* over *your own* object storage, for the
 server-side, fork-heavy workloads agent platforms and eval harnesses
 generate. Most of the "why not X" questions below have a good answer that
 isn't "X is bad" — it's usually "X solves a different problem, or requires
-adopting something bigger than a binary."
+adopting something bigger than a binary." For offshoot's own edges stated
+in one place — single writer, no merge, pre-1.0 format, platform and
+storage requirements — see [Limitations](limitations.md).
 
 ## Why not Litestream?
 

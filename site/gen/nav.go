@@ -19,7 +19,14 @@ type Group struct {
 
 // Nav is the ordered manifest: groups -> pages.
 var Nav = []Group{
+	{"Getting started", []Page{
+		{"docs/introduction.md", "introduction", "Introduction"},
+		{"docs/installation.md", "installation", "Installation"},
+		{"docs/quickstart.md", "quickstart", "Quickstart"},
+		{"docs/concepts.md", "concepts", "Core concepts"},
+	}},
 	{"Guides", []Page{
+		{"docs/agents.md", "agents", "Agents & MCP"},
 		{"docs/eval-harness.md", "eval-harness", "Eval harness tutorial"},
 		{"docs/ci-recipes.md", "ci-recipes", "CI recipes"},
 		{"docs/recipes/frameworks.md", "frameworks", "Framework recipes"},
@@ -44,6 +51,7 @@ var Nav = []Group{
 		{"docs/reference.md", "reference", "CLI & API reference"},
 		{"docs/status.md", "status", "Status: shipped & deferred"},
 		{"docs/faq.md", "faq", "FAQ: why not X?"},
+		{"docs/limitations.md", "limitations", "Limitations"},
 	}},
 	{"Project", []Page{
 		{"CHANGELOG.md", "changelog", "Changelog"},
