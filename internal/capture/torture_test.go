@@ -153,26 +153,32 @@ func TestTortureWriterKill(t *testing.T) {
 	if totalRebases < 1 {
 		t.Fatalf("aggregate rebases = %d, want >= 1 (the initial session's startup rebase)", totalRebases)
 	}
-	// Every bounce here goes through cancel() — the engine's ctx.Done()
-	// clean-shutdown path — so at least some of them should be eligible to
-	// resume rather than rebase. If every one of the 1+bounceCount
-	// session-starts rebased at least once, totalRebases would be >=
-	// 1+bounceCount; a strictly smaller aggregate is only possible if at
-	// least one session-start contributed 0, i.e. resumed cleanly. Skip when
-	// no bounce occurred (short/slow run) — there's nothing to have resumed.
-	if bounceCount > 0 && totalRebases >= 1+bounceCount {
-		t.Errorf("aggregate rebases (%d) >= session-starts (%d): no bounce ever resumed cleanly — resume path went unexercised this run",
-			totalRebases, 1+bounceCount)
-	}
+	// There is deliberately NO assertion of the shape "totalRebases >=
+	// 1+bounceCount means no bounce ever resumed" here. One existed (the
+	// Finding-2 inference check) and was unsound in that direction:
+	// Rebased() also counts MID-SESSION rebases — takeover fold-races
+	// (logN != consumed in takeover()) and unexpected WAL restarts — which
+	// are the engine's designed, detected fallback and which legitimately
+	// proliferate on a slow/contended machine, where takeover's
+	// endRead→checkpoint(RESTART) window stretches enough for foreign
+	// writer commits to land inside it. The first nightly on the public
+	// runner pool (2026-08-14, run 31790331162: 158 rounds, 51 rebases
+	// across 16 session-starts) tripped it while 10 of 15 bounces HAD
+	// resumed cleanly — a false red, reproduced locally without any code
+	// change under a 0.06-CPU cgroup quota (367 rounds, 47 rebases across
+	// 37 starts, 31/36 bounces resumed). Only the inference's other
+	// direction is valid (a strictly smaller aggregate proves some
+	// session-start contributed 0 rebases), and everything that direction
+	// can prove is subsumed by the direct resumedCount check below: if
+	// resume truly never works, every session-start rebases at startup, so
+	// resumedCount is 0 and that check fails loudly at any machine speed.
 
-	// Direct resume proof (task-7 hardening pass, Finding 3), independent of
-	// the inference above: the inequality check on totalRebases only infers
-	// that *some* bounce resumed, and conflates a mid-session takeover
-	// rebase with a startup resume/rebase decision. resumedCount is read
-	// straight off Engine.Resumed() in each session's success branch, so
-	// this assertion has no such ambiguity. Skip when no bounce occurred,
-	// same rationale as the inference check above: nothing could have
-	// resumed if the capturer was never bounced.
+	// Direct resume proof (task-7 hardening pass, Finding 3): resumedCount
+	// is read straight off Engine.Resumed() in each session's success
+	// branch, so — unlike any aggregate-rebase inference — it cannot
+	// conflate a mid-session takeover rebase with the startup resume/rebase
+	// decision. Skip when no bounce occurred (short/slow run): nothing
+	// could have resumed if the capturer was never bounced.
 	if bounceCount > 0 && resumedCount < 1 {
 		t.Fatalf("resumedCount = %d, want >= 1: not one of the %d capturer bounces resumed cleanly (direct proof via Engine.Resumed())",
 			resumedCount, bounceCount)
