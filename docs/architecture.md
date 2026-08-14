@@ -24,7 +24,10 @@ between runs today usually means container teardowns and fixture reloads)
 and in agent platforms (a database per user or per attempt, ideally cheap
 enough to fork freely). offshoot's answer is to make the database itself a
 first-class branchable object, using **stock SQLite** — no forked engine, no
-custom VFS on the read path — over storage you already control.
+custom VFS on the read path — over storage you already control. (For the
+shorter, non-design-doc version of this pitch, see the
+[introduction](introduction.md); for the shared vocabulary this page
+builds on, [core concepts](concepts.md).)
 
 ## Naming model
 
