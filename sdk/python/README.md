@@ -6,7 +6,7 @@ DB per attempt, checkpoint on success, roll back on failure).
 
 Stdlib-only, thin wrapper over the `offshoot` daemon's unix-socket lifecycle
 API — it never opens SQLite itself, so it can't do anything the `offshoot`
-CLI can't. the package pulls in no third-party dependencies.
+CLI can't.
 
 ## Install
 
@@ -89,12 +89,13 @@ in the main repo.
 pip install "offshoot-db[pytest] @ git+https://github.com/sricola/offshoot#subdirectory=sdk/python"
 ```
 
-registers `offshoot_daemon`, `offshoot_db`, and `offshoot_fork` with pytest
+registers `offshoot_daemon`, `offshoot_db`, `offshoot_fork`, and
+`offshoot_dump` with pytest
 automatically (a `pytest11` entry point — nothing to import). The paved
 road for seed-once-fork-many eval and test workloads:
 
 ```python
-# conftest.py or pytest.ini: the zero-code default seed
+# pytest.ini (or pyproject.toml/setup.cfg): the zero-code default seed
 # [pytest]
 # offshoot_seed = tests/seed.sql
 

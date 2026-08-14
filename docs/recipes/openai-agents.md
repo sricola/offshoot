@@ -153,7 +153,7 @@ rather stay in-process (an eval harness, a batch-attempt runner):
 import offshoot
 
 with offshoot.connect("/tmp/oai.sock") as c:
-    c.fork("convo", "main", "attempt-c", ttl="2h", at="turn-1")
+    c.fork("convo", "main", "attempt-c", ttl="2h", from_checkpoint="turn-1")
     s = c.open("convo", "attempt-c")
     # SQLiteSession(session_id="conv-1", db_path=s.path) from here
 ```

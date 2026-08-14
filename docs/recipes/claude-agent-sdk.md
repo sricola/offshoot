@@ -92,7 +92,7 @@ offshoot session open app -socket /tmp/o.sock    # THIS is the harness-opened se
 ```
 
 ```
-claude mcp add offshoot -- offshoot -store ./.offshoot -socket /tmp/o.sock mcp
+claude mcp add offshoot -- offshoot -store ./.offshoot mcp -socket /tmp/o.sock
 claude "Fix the flaky test in tests/test_orders.py, then checkpoint when it's green"
 ```
 
@@ -129,8 +129,11 @@ finishes responding. The pattern this recipe wants:
 - **`Stop`** (task completion): checkpoint the branch through the now-open
   session.
 - **On failure** (however your setup detects it — a failing test, a
-  nonzero exit from your own verification step): roll back instead of
-  checkpointing, and close the session either way.
+  nonzero exit from your own verification step): close the session first,
+  *then* roll back — rollback repoints the branch at a new lineage, so the
+  daemon session must not still be open on it (the daemon's own rollback op
+  refuses outright in that case, and an at-rest rollback would fence the
+  still-open session out from under the daemon).
 
 A minimal `.claude/settings.json` sketch — **verify the exact hook-event
 names and the JSON your Claude Code version passes on stdin/expects on
@@ -172,24 +175,32 @@ and open it:
 #!/usr/bin/env bash
 set -euo pipefail
 BRANCH="agent-$(date +%s)"
-offshoot -store ./.offshoot -socket /tmp/o.sock fork app "$BRANCH" --ttl 2h
-offshoot -store ./.offshoot -socket /tmp/o.sock session open "app@$BRANCH"
+# fork is an at-rest command and takes no -socket flag: it reads the durable
+# ref only, so it's safe to run alongside the daemon. Only the session
+# subcommands (and mcp/serve) take -socket, and only AFTER the subcommand.
+offshoot -store ./.offshoot fork app "$BRANCH" --ttl 2h
+offshoot -store ./.offshoot session open "app@$BRANCH" -socket /tmp/o.sock
 echo "$BRANCH" > .offshoot-current-branch
 ```
 
-`scripts/offshoot-session-stop.sh` — checkpoint if your own success check
-passes, roll back otherwise, then close:
+`scripts/offshoot-session-stop.sh` — checkpoint and close if your own
+success check passes; close and *then* roll back otherwise:
 
 ```bash
 #!/usr/bin/env bash
 set -euo pipefail
 BRANCH="$(cat .offshoot-current-branch)"
 if make test >/tmp/offshoot-hook-test.log 2>&1; then
-  offshoot -store ./.offshoot -socket /tmp/o.sock session flush "app@$BRANCH" done
+  offshoot -store ./.offshoot session flush "app@$BRANCH" done -socket /tmp/o.sock
+  offshoot -store ./.offshoot session close "app@$BRANCH" -socket /tmp/o.sock
 else
-  offshoot -store ./.offshoot -socket /tmp/o.sock rollback "app@$BRANCH" --to fork
+  # Close BEFORE rolling back: rollback repoints the branch, and the open
+  # daemon session owns its checkout. rollback is an at-rest command with
+  # no -socket flag; every fork branch has an auto-created "fork"
+  # checkpoint to roll back to.
+  offshoot -store ./.offshoot session close "app@$BRANCH" -socket /tmp/o.sock
+  offshoot -store ./.offshoot rollback "app@$BRANCH" --to fork
 fi
-offshoot -store ./.offshoot -socket /tmp/o.sock session close "app@$BRANCH"
 ```
 
 Note what this pattern is *not* claiming: there is no MCP-level "on tool
