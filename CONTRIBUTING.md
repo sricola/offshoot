@@ -37,7 +37,7 @@ go vet ./...
 
 ## Test tiers
 
-There are five, and they cost very different amounts of time. Run the tier
+There are six, and they cost very different amounts of time. Run the tier
 that matches what you touched — don't run torture on a docs typo, and don't
 skip it on a capture-engine change.
 

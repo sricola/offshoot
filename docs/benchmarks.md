@@ -363,7 +363,7 @@ BenchmarkSessionOpen/size=512MB-10            6   197517292 ns/op   2721.12 MB/s
 ```
 
 (Original "before" raw output is preserved in this file's git history —
-commit that added "Task 6a" to the log, or `git show 539b832:docs/benchmarks.md`.)
+commit that added "Task 6a" to the log, or `git show 2ba8fdb:docs/benchmarks.md`.)
 
 ### Isolating the fast path itself
 

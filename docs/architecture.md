@@ -91,8 +91,10 @@ existing user file.
   fork machinery). The branch's old lineage is orphaned, retained for the GC
   grace period, then collected. The old checkout (and any
   acknowledged-but-not-durable writes) is closed out; rollback reports what
-  transaction range was abandoned. A **new checkout path** is returned — a
-  file is never rewritten under a live connection.
+  transaction range was abandoned. The branch's canonical checkout path is
+  then re-materialized fresh (the path itself is stable —
+  `checkouts/<db>/<branch>.db`); the old file is closed out and replaced,
+  never rewritten under a live connection.
 - **Promote** — `promote <db>@<source> --onto <target>` repoints the target
   branch at a **new lineage seeded from the source's head** (fork machinery
   again). Because promote creates a fresh lineage, the one-writer-per-lineage
@@ -168,7 +170,7 @@ content-addressed dedupe remains a non-goal — see
 bucket/
   offshoot.json                              ← store manifest: layout version, created-at
   refs/{db}/{branch}                         ← ref object (schema-versioned, CAS'd)
-  data/{lineage}/{epoch}/{txid}.ltx          ← segments
+  data/{lineage}/{epoch}/segment-{maxTXID}-{minTXID}.ltx ← segments
   data/{lineage}/{epoch}/snapshot-{txid}.ltx ← compacted snapshots / fork points
   data/{lineage}/base.json                   ← copy-on-write base pointer (create-only, immutable)
   gc/tombstones                              ← two-phase GC marker list (object-granular)
@@ -216,18 +218,22 @@ reimplementing the lock dance — full credit for that mechanism belongs to
 Litestream; see [docs/faq.md](faq.md#why-not-litestream) for how the two
 projects relate.
 
-This works with connections offshoot doesn't own only under an **enforced
-contract**:
+This works with connections offshoot doesn't own only under a **documented
+contract** — two of its clauses are trusted assumptions today, not live
+enforcement:
 
-- Checkouts are materialized with WAL mode pre-set (`-wal`/`-shm` present).
-  The daemon polls `PRAGMA journal_mode` and watches for a rollback-journal
-  file appearing; a violation hard-fails the branch into an error state
-  (refuse sync, surface loudly) — never silent divergence.
+- Checkouts are materialized with WAL mode pre-set (`-wal`/`-shm` present),
+  and foreign connections must leave `journal_mode` alone. **This is a
+  trust assumption:** there is no live `PRAGMA journal_mode` polling and no
+  rollback-journal watcher — a connection that flips a checkout out of WAL
+  mid-session is not detected until the restart-time check below. (Live
+  contract enforcement is future work; see
+  [docs/status.md](status.md)'s connection-contract row.)
 - **Agent and daemon must share a kernel and a local POSIX filesystem**
   (containers with bind mounts: yes; virtiofs/NFS/gVisor microVM
   boundaries: no — run offshoot *inside* the guest instead, it's one
-  binary). A checkout-time probe verifies lock and SHM coherence from both
-  sides.
+  binary). This too is an assumption the deployment must honor, not
+  something a probe verifies.
 - On daemon restart, any WAL/txid mismatch (e.g. the agent's own
   autocheckpoint ran while the daemon was down) marks the checkout dirty:
   its tail becomes an orphan fork rather than pretending continuity.
@@ -273,7 +279,7 @@ ref. GC fails closed: an incomplete mark deletes nothing, and
 `offshoot_gc_errors_total` is the alertable signal for a stalled pass).
 
 **TTL semantics:** TTL is measured from the last durable write (last
-shipped segment) or lease renewal, whichever is later; `offshoot touch`
+shipped segment) or lease expiry, whichever is later; `offshoot touch`
 resets it explicitly. A branch with an active lease is never reaped —
 expiry defers until the lease is released or times out (a wedged holder
 loses the lease first, then TTL applies). Creating a child does not extend
@@ -320,9 +326,13 @@ or capture path must preserve:
    promote, a foreign checkout) that would change what a path means
    produces a *new* materialization rather than mutating the old one in
    place.
-6. **Checksums are verified on every read path.** Materialization and
-   compaction verify LTX per-file and cumulative checksums; a torn or
-   missing chain member is a loud failure, never a silently short read.
+6. **Checksums are verified on every read path that touches the store.**
+   Materialization and compaction verify LTX per-file and cumulative
+   checksums; a torn or missing chain member is a loud failure, never a
+   silently short read. One deliberate carve-out: a clean, current,
+   already-materialized checkout is served straight from local disk
+   without re-touching the chain at all — see
+   [docs/status.md](status.md)'s clean-checkout row for that tradeoff.
 7. **Protected branches require an explicit override for anything
    destructive.** `main` is protected by default; `destroy` and `promote
    --onto` a protected branch refuse without `--force`, uniformly across

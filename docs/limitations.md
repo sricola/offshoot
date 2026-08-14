@@ -75,18 +75,22 @@ from source).
 
 ## SQLite and filesystem requirements
 
-**What:** checkouts are materialized in WAL mode and must stay that way —
-the daemon polls `PRAGMA journal_mode` and watches for a rollback-journal
-file; a violation hard-fails the branch into an error state (refuse sync,
-surface loudly) rather than diverging silently. And the agent and daemon
-**must share a kernel and a local POSIX filesystem**: containers with
-bind mounts work; virtiofs, NFS, and gVisor-style microVM boundaries
-don't — a checkout-time probe verifies lock and SHM coherence from both
-sides ([the connection contract](architecture.md#wal-capture-and-the-connection-contract)).
+**What:** checkouts are materialized in WAL mode and must stay that way,
+and the agent and daemon **must share a kernel and a local POSIX
+filesystem**: containers with bind mounts work; virtiofs, NFS, and
+gVisor-style microVM boundaries don't
+([the connection contract](architecture.md#wal-capture-and-the-connection-contract)).
 
 **Why:** live capture works against connections offshoot doesn't own only
-under that enforced contract; POSIX lock semantics are what make it
-sound.
+under that contract; POSIX lock semantics are what make it sound.
+
+**Honest edge:** both clauses are trusted assumptions today, not live
+enforcement — nothing polls `PRAGMA journal_mode` or watches for a
+rollback-journal file mid-session. What IS detected, and tested: on
+daemon restart/resume, a WAL-emptiness + main-file-hash continuity check
+refuses to pretend continuity after any divergence — the checkout goes
+dirty and its tail becomes an orphan fork instead
+([how resume decides](architecture.md#wal-capture-and-the-connection-contract)).
 
 **Instead:** across a VM or network-filesystem boundary, run offshoot
 *inside* the guest — it's one binary.

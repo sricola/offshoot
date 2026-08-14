@@ -145,7 +145,7 @@ A regression test in this repo is expected to be **verified against the
 pre-fix code** — actually run against the buggy revision to confirm it
 fails there, then against the fix to confirm it passes — rather than
 merely written to look plausible. Recent examples in the log: commit
-`2682437` ("fix(store): stop a fenced writer's snapshot from shadowing the
+`9314382` ("fix(store): stop a fenced writer's snapshot from shadowing the
 live segment") states "Tests, all three mutation-verified against the
 pre-fix code" and documents what each asserted pre-fix;
 `internal/ops/compact_test.go` documents the exact mutation its no-op

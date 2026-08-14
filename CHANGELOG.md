@@ -13,6 +13,12 @@ version if you depend on format stability.
 
 ## [Unreleased]
 
+### Removed
+
+- `flake.nix` (the Nix dev shell): unmaintained and untested next to the
+  four supported install paths — Homebrew, prebuilt binaries, Docker, and
+  `go install`/source.
+
 ## [0.2.9] - 2026-08-13
 
 ### Changed
