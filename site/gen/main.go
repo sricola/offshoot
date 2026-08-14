@@ -15,6 +15,7 @@ import (
 	"path/filepath"
 	"strings"
 	"unicode"
+	"unicode/utf8"
 
 	chromahtml "github.com/alecthomas/chroma/v2/formatters/html"
 	"github.com/yuin/goldmark"
@@ -100,8 +101,10 @@ func main() {
 	for _, g := range Nav {
 		for _, p := range g.Pages {
 			if _, err := os.Stat(filepath.Join(root, p.MD)); err != nil {
-				fmt.Fprintf(os.Stderr, "gen: skipping %s (missing)\n", p.MD)
-				continue
+				// Fail loud: a renamed or deleted source must break the build,
+				// not deploy a site silently missing the page.
+				fmt.Fprintf(os.Stderr, "gen: manifest entry %s does not exist\n", p.MD)
+				os.Exit(1)
 			}
 			bySrc[p.MD] = p
 			flat = append(flat, p)
@@ -301,6 +304,9 @@ func firstParagraph(doc ast.Node, src []byte) string {
 	})
 	if len(out) > 160 {
 		cut := out[:160]
+		for len(cut) > 0 && !utf8.ValidString(cut) {
+			cut = cut[:len(cut)-1]
+		}
 		if i := strings.LastIndexByte(cut, ' '); i > 100 {
 			cut = cut[:i]
 		}

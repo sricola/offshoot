@@ -186,8 +186,9 @@ collected later, never corruption of the live chain
 
 A branch's self-destruct timer, set at fork time (`fork app attempt-1
 --ttl 2h`) or later (`touch app@attempt-1 --ttl 30m`; `--ttl none` clears
-it). Measured from the last durable write or lease renewal, whichever is
-later; `touch` resets the clock. A branch with an active lease is never
+it). Measured from the later of the branch's last-touch time and its
+lease expiry — exactly what the janitor's reap logic uses; `touch` resets
+the clock. A branch with an active lease is never
 reaped, protected branches are never reaped, and branches without a TTL
 live until destroyed. Reaping is the janitor's job — `offshoot serve`'s
 timer or an on-demand `offshoot gc`.
