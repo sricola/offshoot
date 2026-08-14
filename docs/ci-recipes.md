@@ -60,10 +60,10 @@ env:
   AWS_SECRET_ACCESS_KEY: ${{ secrets.AWS_SECRET_ACCESS_KEY }}
   AWS_REGION: us-east-1
   # For MinIO or another S3-compatible endpoint, also set:
-  #   OFFSHOOT_S3_ENDPOINT: https://<accountid>.r2.cloudflarestorage.com
+  #   OFFSHOOT_S3_ENDPOINT: https://minio.internal:9000
   #   OFFSHOOT_S3_PATH_STYLE: "1"     # MinIO needs path-style
   DB: evals-${{ github.run_id }}
-  OFFSHOOT_VERSION: v0.2.7
+  OFFSHOOT_VERSION: v0.2.9
 
 jobs:
   seed:
@@ -212,7 +212,7 @@ jobs:
       AWS_ACCESS_KEY_ID: ${{ secrets.AWS_ACCESS_KEY_ID }}
       AWS_SECRET_ACCESS_KEY: ${{ secrets.AWS_SECRET_ACCESS_KEY }}
       AWS_REGION: us-east-1
-      OFFSHOOT_VERSION: v0.2.7
+      OFFSHOOT_VERSION: v0.2.9
     steps:
       - name: Install offshoot
         run: |
