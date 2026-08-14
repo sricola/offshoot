@@ -12,6 +12,10 @@ sdk/python/*.egg-info/
 sdk/python/.dry-run-venv/
 __pycache__/
 
+# Docs site output (built in CI by site/gen, never committed).
+site/docs/
+site/sitemap.xml
+
 .superpowers/
 
 # Defensive: local credentials/config must never be committable.
