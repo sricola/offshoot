@@ -321,8 +321,9 @@ func docsIndexHTML(bySrc map[string]Page) string {
 	var b strings.Builder
 	b.WriteString("<h1>Documentation</h1>\n")
 	b.WriteString("<p>Everything here is generated from the repo's canonical markdown — " +
-		"the same files you can read on GitHub. Start with the eval-harness " +
-		"tutorial, or jump straight to the CLI &amp; API reference.</p>\n")
+		"the same files you can read on GitHub. New here? Start with the " +
+		"introduction and the quickstart; building a test suite, start with the " +
+		"eval-harness tutorial; or jump straight to the CLI &amp; API reference.</p>\n")
 	for _, g := range Nav {
 		fmt.Fprintf(&b, "<h2 id=%q>%s</h2>\n<ul>\n", ghSlug([]byte(g.Name)), template.HTMLEscapeString(g.Name))
 		for _, p := range g.Pages {

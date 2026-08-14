@@ -18,15 +18,20 @@
 <meta name="twitter:description" content="Copy-on-write forks, checkpoint/rollback/promote, kill-9-durable capture. Stock SQLite files on local disk or S3. Built for AI agents and eval harnesses.">
 <meta name="twitter:image" content="https://sricola.github.io/offshoot/og.png">
 <link rel="icon" href="data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 32 32'%3E%3Cpath d='M10 28V14M10 14v-4a4 4 0 0 1 4-4h0M10 14c0-4 3-7 8-7h4' stroke='%23a9cd7c' stroke-width='3.4' fill='none' stroke-linecap='round'/%3E%3Ccircle cx='10' cy='28' r='3' fill='%23a9cd7c'/%3E%3Ccircle cx='25' cy='7' r='3' fill='%23d9a05b'/%3E%3C/svg%3E">
+<script>(function(){var t=localStorage.getItem("theme");if(t==="dark"||t==="light")document.documentElement.dataset.theme=t})()</script>
 <style>
 :root{
-  --bg:#fcfcfa; --ink:#18150f; --dim:#6b675d; --faint:#9b968a;
+  --bg:#fcfcfa; --ink:#18150f; --dim:#6b675d; --faint:#706c63;
   --accent:#3c7a1a; --code-bg:#f4f3ee; --border:#e4e2da; --rule:#ecebe4;
   --mono:ui-monospace,"SF Mono","Cascadia Code",Menlo,Consolas,"Liberation Mono",monospace;
 }
+:root[data-theme=dark]{
+  --bg:#131211; --ink:#e6e3da; --dim:#97927f; --faint:#868278;
+  --accent:#a9cd7c; --code-bg:#1b1a17; --border:#2b2925; --rule:#232119;
+}
 @media(prefers-color-scheme:dark){
-  :root{
-    --bg:#131211; --ink:#e6e3da; --dim:#97927f; --faint:#6b665a;
+  :root:not([data-theme=light]){
+    --bg:#131211; --ink:#e6e3da; --dim:#97927f; --faint:#868278;
     --accent:#a9cd7c; --code-bg:#1b1a17; --border:#2b2925; --rule:#232119;
   }
 }
@@ -41,6 +46,9 @@ body{
 a{color:var(--accent); text-decoration:none; border-bottom:1px solid transparent}
 a:hover{border-bottom-color:var(--accent)}
 :focus-visible{outline:2px solid var(--accent); outline-offset:2px; border-radius:2px}
+.skip{position:absolute; left:-9999px; top:0; z-index:20; background:var(--bg);
+  color:var(--accent); padding:10px 16px; border:1px solid var(--border); border-radius:6px}
+.skip:focus{left:12px; top:12px}
 code{background:var(--code-bg); border:1px solid var(--border); border-radius:3px;
   padding:.08em .35em; font-size:13px; overflow-wrap:anywhere}
 strong{font-weight:600}
@@ -55,6 +63,9 @@ strong{font-weight:600}
 .top nav a{color:var(--dim); padding:12px 10px; min-height:44px;
   display:inline-flex; align-items:center; border-bottom:none}
 .top nav a:hover{color:var(--accent)}
+.top button{background:none; border:none; color:var(--dim); cursor:pointer;
+  font-family:var(--mono); font-size:16px; min-width:44px; min-height:44px; border-radius:6px}
+.top button:hover{color:var(--accent)}
 
 header.hero{padding:52px 0 0}
 h1{font-size:clamp(27px,5.5vw,36px); font-weight:700; letter-spacing:-.02em; line-height:1.2}
@@ -135,16 +146,19 @@ footer .g{color:var(--accent)}
 </head>
 <body>
 
+<a class="skip" href="#content">Skip to content</a>
 <div class="top">
   <div class="wrap">
     <a class="wordmark" href="/offshoot/"><span class="g">⑂</span> offshoot</a>
     <nav aria-label="Site">
       <a href="/offshoot/docs/">docs</a>
       <a href="https://github.com/sricola/offshoot">github</a>
+      <button class="theme" aria-label="Toggle color theme">◐</button>
     </nav>
   </div>
 </div>
 
+<main id="content">
 <header class="hero wrap">
   <h1><span class="g">⑂</span> Branch SQLite like git.</h1>
   <p class="pitch">Copy-on-write forks of stock SQLite files, on your local disk or
@@ -330,7 +344,7 @@ footer .g{color:var(--accent)}
 <span class="p">$</span> docker run --rm -v offshoot-data:/data ghcr.io/sricola/offshoot:latest init
 
 <span class="c"># from source (go 1.25+, cgo)</span>
-<span class="p">$</span> go build -o offshoot ./cmd/offshoot
+<span class="p">$</span> go install github.com/sricola/offshoot/cmd/offshoot@latest
 
 <span class="c"># same binary, any store</span>
 <span class="p">$</span> offshoot -store ./.offshoot init             <span class="c"># local directory (default)</span>
@@ -357,6 +371,7 @@ footer .g{color:var(--accent)}
   </tbody></table></div>
   <p class="more"><a href="/offshoot/docs/reference/">Full CLI reference →</a></p>
 </section>
+</main>
 
 <footer><div class="wrap">
   <span><span class="g">⑂</span> offshoot</span>
@@ -366,5 +381,17 @@ footer .g{color:var(--accent)}
   <span>stock sqlite · your storage · one binary</span>
 </div></footer>
 
+<script>
+(function(){
+  var tb=document.querySelector(".theme");
+  tb.addEventListener("click",function(){
+    var cur=document.documentElement.dataset.theme||
+      (matchMedia("(prefers-color-scheme: dark)").matches?"dark":"light");
+    var next=cur==="dark"?"light":"dark";
+    document.documentElement.dataset.theme=next;
+    localStorage.setItem("theme",next);
+  });
+})();
+</script>
 </body>
 </html>

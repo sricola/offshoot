@@ -21,20 +21,20 @@ const shellTemplate = `<!doctype html>
 <script>(function(){var t=localStorage.getItem("theme");if(t==="dark"||t==="light")document.documentElement.dataset.theme=t})()</script>
 <style>
 :root{
-  --bg:#fcfcfa; --ink:#18150f; --dim:#6b675d; --faint:#9b968a;
+  --bg:#fcfcfa; --ink:#18150f; --dim:#6b675d; --faint:#706c63;
   --accent:#3c7a1a; --code-bg:#f4f3ee; --border:#e4e2da; --rule:#ecebe4;
   --hl-s:#8a5a00; --hl-m:#145f8a;
   --mono:ui-monospace,"SF Mono","Cascadia Code",Menlo,Consolas,"Liberation Mono",monospace;
   --sans:-apple-system,BlinkMacSystemFont,"Segoe UI",Roboto,"Helvetica Neue",Arial,sans-serif;
 }
 :root[data-theme=dark]{
-  --bg:#131211; --ink:#e6e3da; --dim:#97927f; --faint:#6b665a;
+  --bg:#131211; --ink:#e6e3da; --dim:#97927f; --faint:#868278;
   --accent:#a9cd7c; --code-bg:#1b1a17; --border:#2b2925; --rule:#232119;
   --hl-s:#d9a05b; --hl-m:#7ab8d9;
 }
 @media(prefers-color-scheme:dark){
   :root:not([data-theme=light]){
-    --bg:#131211; --ink:#e6e3da; --dim:#97927f; --faint:#6b665a;
+    --bg:#131211; --ink:#e6e3da; --dim:#97927f; --faint:#868278;
     --accent:#a9cd7c; --code-bg:#1b1a17; --border:#2b2925; --rule:#232119;
     --hl-s:#d9a05b; --hl-m:#7ab8d9;
   }
