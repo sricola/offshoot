@@ -2,7 +2,7 @@
 
 ## Supported versions
 
-offshoot is pre-release (0.x). There is no long-term support branch and no
+offshoot is at 0.x. There is no long-term support branch and no
 backport policy yet — the only supported version is the latest commit on
 `main`. If you're running an older tag, upgrade before reporting; the fix is
 very likely already in `main`.

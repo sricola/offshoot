@@ -8,10 +8,12 @@ test suite. Pick whichever channel fits:
 
 ```
 brew tap sricola/offshoot https://github.com/sricola/offshoot
+brew trust sricola/offshoot
 brew install offshoot
 ```
 
-The formula lives in-repo at
+Recent Homebrew requires the explicit `brew trust` step for any
+third-party tap. The formula lives in-repo at
 [`Formula/offshoot.rb`](../Formula/offshoot.rb).
 
 ## Prebuilt binaries

@@ -119,8 +119,9 @@ More "why not X" (Litestream, Dolt, Neon, plain `cp`):
 ## Install
 
 - **Homebrew**:
-  `brew tap sricola/offshoot https://github.com/sricola/offshoot && brew install offshoot`
-  (formula lives in-repo at [`Formula/offshoot.rb`](Formula/offshoot.rb))
+  `brew tap sricola/offshoot https://github.com/sricola/offshoot && brew trust sricola/offshoot && brew install offshoot`
+  (recent Homebrew requires the explicit `trust` for third-party taps; the
+  formula lives in-repo at [`Formula/offshoot.rb`](Formula/offshoot.rb))
 - **Docker:**
   `docker run --rm -v offshoot-data:/data ghcr.io/sricola/offshoot:latest init`
   — images publish to GHCR on every tagged release; the store lives in the
@@ -146,7 +147,7 @@ don't map cleanly to Windows
 
 ## Status
 
-**Prerelease (0.2.x).** What's shipped and exercised by tests that would
+**v0.2.9.** What's shipped and exercised by tests that would
 fail if it broke: local and S3-compatible stores behind a shared
 conformance suite, copy-on-write forks, live WAL capture with incremental
 segments, leases with epoch fencing, CAS on every ref update, TTL reaping

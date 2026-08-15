@@ -51,8 +51,7 @@ pip install "offshoot-db[pytest] @ git+https://github.com/sricola/offshoot#subdi
 The base `offshoot-db` package is stdlib-only; the `[pytest]` extra pulls in
 `pytest>=7` (only that — the plugin itself adds no other dependency). For
 `pytest-xdist` parallelism (below), also `pip install pytest-xdist`.
-`offshoot-db` and `@offshoot-db/client` aren't on PyPI/npm yet in this
-prerelease — see [docs/status.md](status.md)'s publish-pipeline row; in the
+`offshoot-db` and `@offshoot-db/client` aren't on PyPI/npm yet — see [docs/status.md](status.md)'s publish-pipeline row; in the
 meantime `pip install -e "sdk/python[pytest]"` / `npm install
 /path/to/sdk/typescript` from a checkout works identically, and is what this
 tutorial itself uses. (The TS package's `prepare` script builds its `dist/`

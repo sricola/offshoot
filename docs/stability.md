@@ -157,5 +157,5 @@ politer not to need it.
   side; metrics-name freeze policy.
 - [reference.md](reference.md) — `export` and `create --from` flag-level
   reference.
-- [CHANGELOG.md](../CHANGELOG.md) — the pre-release status statement this
+- [CHANGELOG.md](../CHANGELOG.md) — the format-stability statement this
   page is the contract for.

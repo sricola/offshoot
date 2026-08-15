@@ -1,6 +1,6 @@
 # Contributing to offshoot
 
-offshoot is pre-release, single-maintainer, and moving fast. That means: ask
+offshoot is at 0.x, single-maintainer, and moving fast. That means: ask
 before investing a lot of time in something structural (see "what needs an
 issue first" below), but small, well-scoped PRs are welcome and get reviewed
 quickly.
@@ -160,7 +160,7 @@ Tag `v0.2.<n>` (`vX.Y.Z` generally) and push it.
 `.github/workflows/release.yml` builds Linux/macOS binaries for both
 architectures, creates a GitHub release, and publishes a `ghcr.io` Docker
 image. `workflow_dispatch` builds the same artifacts under a
-`dev-<short-sha>` name without tagging, for a pre-release smoke check.
+`dev-<short-sha>` name without tagging, for a smoke check before tagging.
 
 On each release, also bump the packaging surfaces: `Formula/offshoot.rb`'s
 `url` + `sha256`, and the version chip in
@@ -275,7 +275,7 @@ correct without it.
 ## What's most welcome right now
 
 - **Docs.** The gap between what's implemented and what the design spec
-  promises is real (pre-release), and closing that gap in writing — an honest
+  promises is real at 0.x, and closing that gap in writing — an honest
   implemented/deferred matrix, a CLI reference, fixing stale examples — is
   some of the highest-leverage work available and doesn't need prior
   coordination.
