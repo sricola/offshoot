@@ -8,15 +8,11 @@
 # Source build (depends_on "go" => :build) rather than per-arch bottles:
 # it version-bumps by editing url+sha256 only, and mattn/go-sqlite3 compiles
 # its bundled SQLite amalgamation via cgo, so no sqlite dependency is needed.
-#
-# UNTESTED END-TO-END until the repo is public — the url below is only
-# fetchable anonymously once it is. sha256 computed from the authenticated
-# codeload tarball for the same ref (identical bytes once public).
 class Offshoot < Formula
   desc "Branch SQLite like git: fork, checkpoint, rollback, promote"
   homepage "https://github.com/sricola/offshoot"
-  url "https://github.com/sricola/offshoot/archive/refs/tags/v0.2.7.tar.gz"
-  sha256 "851f89d24f158c87571e49e5004a822d09991935af6992a773702ce46b0bad9e"
+  url "https://github.com/sricola/offshoot/archive/refs/tags/v0.2.9.tar.gz"
+  sha256 "3d71d1e4e78071b7e582d9d83939e3b3d6b8dc260ff4a2280eea53632310da84"
   license "Apache-2.0"
   head "https://github.com/sricola/offshoot.git", branch: "main"
 
