@@ -1,8 +1,21 @@
-# offshoot
+<div align="center">
 
-Fork-per-attempt databases for AI agents and eval harnesses. Branch SQLite
-like git — create, fork, checkpoint, rollback, promote — as stock SQLite
-files, on your storage, with one binary.
+<picture>
+  <source media="(prefers-color-scheme: dark)" srcset="docs/assets/logo-dark.svg">
+  <img src="docs/assets/logo-light.svg" alt="offshoot" width="340">
+</picture>
+
+**Branch SQLite like git** — fork-per-attempt databases for AI agents and eval harnesses.<br>Create, fork, checkpoint, rollback, promote — as stock SQLite files, on your storage, with one binary.
+
+[![release](https://img.shields.io/github/v/release/sricola/offshoot?style=flat-square&labelColor=1b1a17&color=3c7a1a)](https://github.com/sricola/offshoot/releases) [![ci](https://img.shields.io/github/actions/workflow/status/sricola/offshoot/ci.yml?branch=main&style=flat-square&labelColor=1b1a17&color=3c7a1a)](https://github.com/sricola/offshoot/actions/workflows/ci.yml) [![license](https://img.shields.io/badge/license-Apache--2.0-3c7a1a?style=flat-square&labelColor=1b1a17)](LICENSE) [![docs](https://img.shields.io/badge/docs-sricola.github.io%2Foffshoot-3c7a1a?style=flat-square&labelColor=1b1a17)](https://sricola.github.io/offshoot/docs/)
+
+[Quickstart](#quickstart-60-seconds-no-server-no-bucket) · [Install](#install) · [Daemon](#daemon-mode) · [MCP](#mcp) · [SDKs](#python-sdk) · [Benchmarks](docs/benchmarks.md) · [FAQ](docs/faq.md) · [Roadmap](ROADMAP.md)
+
+`377 B` per shared fork of a 100 MB database  ·  `kill -9` durable  ·  every checkout a stock `.db` file
+
+</div>
+
+---
 
 An agent attempt or eval run needs a real database it can trash: mocks
 aren't real, re-seeding is slow, and container or VM snapshots version a
@@ -568,3 +581,13 @@ getting-started track:
 - [SECURITY.md](SECURITY.md) — how to report vulnerabilities
 - [CHANGELOG.md](CHANGELOG.md) — release notes
 - License: [Apache-2.0](LICENSE)
+
+---
+
+<div align="center">
+
+**⑂** &nbsp;fork it, trash it, promote the one that worked
+
+[Apache-2.0](LICENSE) · [sricola.github.io/offshoot](https://sricola.github.io/offshoot/) · [releases](https://github.com/sricola/offshoot/releases)
+
+</div>

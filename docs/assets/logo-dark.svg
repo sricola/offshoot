@@ -1,0 +1,11 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 300 56" role="img" aria-label="offshoot">
+  <!-- The ⑂ branch mark, drawn as strokes so it renders identically
+       everywhere; colors match site/index.html's dark palette
+       (accent #a9cd7c, ink #e8e6df). -->
+  <g fill="none" stroke="#a9cd7c" stroke-width="5" stroke-linecap="round" stroke-linejoin="round">
+    <path d="M12 8 V26 H36 V8" />
+    <path d="M24 26 V48" />
+  </g>
+  <text x="56" y="42" fill="#e8e6df" font-size="40" font-weight="700"
+        font-family="ui-monospace,'SF Mono',SFMono-Regular,Menlo,Consolas,'Liberation Mono',monospace">offshoot</text>
+</svg>
