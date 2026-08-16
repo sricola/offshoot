@@ -21,11 +21,25 @@ An agent attempt or eval run needs a real database it can trash: mocks
 aren't real, re-seeding is slow, and container or VM snapshots version a
 whole machine to get at one file. offshoot branches the database itself —
 copy-on-write forks of stock SQLite files over a local directory or an
-S3-compatible bucket. A shared fork of a 100 MB database adds
+S3-compatible bucket.
+
+A shared fork of a 100 MB database adds
 [377 bytes](docs/benchmarks.md#added-object-store-bytes-per-fork-100-mb-database)
 to the store — about 280,000× less than a copy — and every checkout is a
 plain `.db` file any SQLite tool opens. Try N migrations or N agent
-attempts on N forks, `promote` the winner, and let the losers expire.
+attempts on N forks, `promote` the winner, and let the losers expire:
+
+```text
+              fork ┌─ attempt-1 ●──✗            expires (TTL)
+                   │
+  main ●───────●───┼─ attempt-2 ●──●──✓   ──►   promote: main repoints here
+       seed    cp  │
+                   └─ attempt-3 ●──✗            expires (TTL)
+```
+
+No merge, no conflict resolution — the winner is promoted whole and the
+losers reap themselves. (That's a design position, not a gap:
+[what offshoot deliberately doesn't do](#what-offshoot-deliberately-doesnt-do).)
 
 ## Quickstart (60 seconds, no server, no bucket)
 
@@ -39,6 +53,20 @@ attempts on N forks, `promote` the winner, and let the losers expire.
     ./offshoot rollback app@attempt-1 --to fork                        # undo it
     ./offshoot promote app@attempt-1 --onto main --force               # or ship it
     ./offshoot status
+
+That's most of the surface already. The full vocabulary, one line each
+(every command and flag: [docs/reference.md](docs/reference.md)):
+
+| Command | What it does |
+|---|---|
+| `create` / `checkout` | new database / materialize a working copy — prints a plain `.db` path |
+| `checkpoint` | snapshot the checkout as a named, rollback-able point |
+| `fork` | branch from head or a checkpoint — instant, copy-on-write, optional `--ttl` |
+| `rollback` / `promote` | repoint a branch at a checkpoint / repoint a target at a branch's head |
+| `diff` / `export` | sqldiff two branches or checkpoints / copy state out to a plain file |
+| `destroy` / `gc` | delete a branch / collect unreachable objects |
+| `serve` / `session` | the daemon: leases, live capture, flush-without-pausing ([below](#daemon-mode)) |
+| `mcp` | the same verbs as MCP tools, for agents ([below](#mcp)) |
 
 Runnable demo: [`examples/parallel-attempts/`](examples/parallel-attempts/)
 forks a database three ways, races three migrations against the forks,
@@ -131,22 +159,13 @@ More "why not X" (Litestream, Dolt, Neon, plain `cp`):
 
 ## Install
 
-- **Homebrew**:
-  `brew tap sricola/offshoot https://github.com/sricola/offshoot && brew trust sricola/offshoot && brew install offshoot`
-  (recent Homebrew requires the explicit `trust` for third-party taps; the
-  formula lives in-repo at [`Formula/offshoot.rb`](Formula/offshoot.rb))
-- **Docker:**
-  `docker run --rm -v offshoot-data:/data ghcr.io/sricola/offshoot:latest init`
-  — images publish to GHCR on every tagged release; the store lives in the
-  `/data` volume, so reuse `-v offshoot-data:/data` across commands
-  (`... offshoot:latest create app`, `... offshoot:latest serve`, and so on)
-- **Prebuilt binaries**:
-  `offshoot_vX_os_arch.tar.gz` (+ `.sha256`) from the
-  [releases page](https://github.com/sricola/offshoot/releases), published
-  for each tagged release
-- **`go install`:**
-  `go install github.com/sricola/offshoot/cmd/offshoot@latest`
-- **From source:** the Quickstart above (Go 1.25+, cgo)
+| Channel | How |
+|---|---|
+| **Homebrew** | `brew tap sricola/offshoot https://github.com/sricola/offshoot && brew trust sricola/offshoot && brew install offshoot` — recent Homebrew requires the explicit `trust` for third-party taps; the formula lives in-repo at [`Formula/offshoot.rb`](Formula/offshoot.rb) |
+| **Docker** | `docker run --rm -v offshoot-data:/data ghcr.io/sricola/offshoot:latest init` — images publish to GHCR on every tagged release; the store lives in the `/data` volume, so reuse `-v offshoot-data:/data` across commands (`… create app`, `… serve`, and so on) |
+| **Prebuilt binaries** | `offshoot_vX_os_arch.tar.gz` (+ `.sha256`) from the [releases page](https://github.com/sricola/offshoot/releases), published for each tagged release |
+| **`go install`** | `go install github.com/sricola/offshoot/cmd/offshoot@latest` |
+| **From source** | the Quickstart above (Go 1.25+, cgo) |
 
 The full guide — store setup, S3 configuration, the fail-closed probe:
 [installation](https://sricola.github.io/offshoot/docs/installation/).
@@ -161,11 +180,16 @@ don't map cleanly to Windows
 ## Status
 
 **v0.2.9.** What's shipped and exercised by tests that would
-fail if it broke: local and S3-compatible stores behind a shared
-conformance suite, copy-on-write forks, live WAL capture with incremental
-segments, leases with epoch fencing, CAS on every ref update, TTL reaping
-and GC, checkpoint/rollback/promote/export/diff, the daemon with metrics
-and events, an MCP server, and Python/TypeScript SDKs with test fixtures.
+fail if it broke:
+
+- local and S3-compatible stores behind a shared conformance suite
+- copy-on-write forks; checkpoint / rollback / promote / export / diff
+- live WAL capture with incremental segments
+- leases with epoch fencing, and CAS on every ref update
+- TTL reaping and GC
+- the daemon, with metrics and events; an MCP server
+- Python and TypeScript SDKs with test fixtures
+
 [docs/status.md](docs/status.md) is the honest per-feature accounting —
 shipped-and-tested vs. shipped-but-unverified vs. still on the
 [roadmap](ROADMAP.md) — and [docs/testing.md](docs/testing.md) shows the
@@ -242,6 +266,19 @@ transaction while your agent keeps writing.
     offshoot session flush app v1          # durable in the store, writer never paused
     offshoot session status                # durable txid per session
     offshoot session close app             # releases the lease
+
+Everything ongoing the daemon does is bounded by a flag — each unpacked
+in the sections below:
+
+| `serve` flag | Default | What it bounds |
+|---|---|---|
+| `-flush-every` | `30s` | worst-case committed-but-unflushed work lost if the daemon dies (`0`: durability advances only on explicit `flush`) |
+| `-snapshot-every` | `16` | read cost — materializing replays one snapshot plus at most N−1 segments |
+| `-reap-every` | `1m` | how often the janitor reaps TTL-expired branches and runs the GC sweep (`0` disables it) |
+| `-gc-grace` | `15m` | how long a tombstoned lineage's storage sits before a later cycle deletes it |
+| `-http` | off | a loopback, token-authenticated listener: metrics, RPC, events, pprof |
+| `-ro-cache-budget` | unlimited | disk held by the read-only checkout cache (LRU eviction) |
+| `-socket` | per-store path | where the unix socket (mode 0600) lives; `OFFSHOOT_SOCKET` works too |
 
 **Durability is explicit and reported.** Between flushes, writes are
 committed to SQLite but not yet in the store; `session status` reports the
@@ -398,6 +435,15 @@ everything below is a client of the daemon's lifecycle API and requires
 alongside without changing any of them: `serve -http ADDR` exposes the
 same lifecycle API over HTTP (see
 [Metrics, HTTP, and events](#metrics-http-and-events)).
+
+| Surface | What it is | Daemon? |
+|---|---|---|
+| [CLI](#quickstart-60-seconds-no-server-no-bucket) | every verb, no dependencies | no |
+| [MCP](#mcp) — `offshoot mcp` | seven branch tools over stdio, for agents | optional — rides one when reachable |
+| [Python SDK](#python-sdk) | stdlib-only thin client, plus pytest fixtures | yes |
+| [TypeScript SDK](#typescript-sdk) | zero-dependency thin client, plus a testkit | yes |
+| [LangGraph companion](#langgraph) | thread ↔ branch mapping for checkpoint rewind | yes |
+| [HTTP](#metrics-http-and-events) — `serve -http` | the same API plus metrics and events, for operators | it *is* the daemon |
 
 ### MCP
 
