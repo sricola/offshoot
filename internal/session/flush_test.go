@@ -554,12 +554,74 @@ func TestConcurrentFlushIsSerialized(t *testing.T) {
 }
 
 // mustExec runs sql against the SQLite file at path via the sqlite3 CLI,
-// failing the test with the command's combined output on error.
+// failing the test with the command's combined output on error. The
+// busy_timeout matters: the target is typically a checkout with a live
+// session whose capture engine takes short write-side locks (startup
+// checkpoint TRUNCATE, takeover checkpoint RESTART); without it a CLI
+// writer that lands on such a moment fails instantly with SQLITE_BUSY
+// instead of riding it out (see TestMustExecWaitsOutTransientLocks).
 func mustExec(t *testing.T, path, sql string) {
 	t.Helper()
-	if out, err := exec.Command("sqlite3", path, sql).CombinedOutput(); err != nil {
+	if out, err := exec.Command("sqlite3", path, "PRAGMA busy_timeout=5000;"+sql).CombinedOutput(); err != nil {
 		t.Fatalf("%v: %s", err, out)
 	}
+}
+
+// TestMustExecWaitsOutTransientLocks pins mustExec's busy handling. Every
+// mustExec target in this package is a checkout with a live session
+// attached, whose capture engine takes short write-side locks of its own
+// (the startup rebase's checkpoint TRUNCATE, takeover's checkpoint
+// RESTART). A CLI writer with no busy_timeout fails such a moment
+// instantly with SQLITE_BUSY — "Error: stepping, database is locked (5)",
+// exactly the flake CI run 31922079955 hit in
+// TestCleanCheckoutServedWithoutChainValidationAcrossClose on a loaded
+// runner. Hold the write lock from an interactive sqlite3 while mustExec
+// runs to prove it waits a transient holder out instead, the same way the
+// torture harness's writer (PRAGMA busy_timeout=5000) always has.
+func TestMustExecWaitsOutTransientLocks(t *testing.T) {
+	testutil.RequireSQLite3(t)
+	path := filepath.Join(t.TempDir(), "t.db")
+	mustExec(t, path, "PRAGMA journal_mode=WAL; CREATE TABLE t (v);")
+
+	holder := exec.Command("sqlite3", path)
+	in, err := holder.StdinPipe()
+	if err != nil {
+		t.Fatal(err)
+	}
+	out, err := holder.StdoutPipe()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := holder.Start(); err != nil {
+		t.Fatal(err)
+	}
+	defer holder.Wait()
+	defer in.Close()
+	if _, err := io.WriteString(in, "BEGIN IMMEDIATE;\nSELECT 'lock-held';\n"); err != nil {
+		t.Fatal(err)
+	}
+	// Reading the marker back proves BEGIN IMMEDIATE has executed and the
+	// write lock is genuinely held before mustExec starts.
+	var seen []byte
+	tmp := make([]byte, 64)
+	for !bytes.Contains(seen, []byte("lock-held")) {
+		n, err := out.Read(tmp)
+		if err != nil {
+			t.Fatalf("reading lock holder's output: %v (got %q)", err, seen)
+		}
+		seen = append(seen, tmp[:n]...)
+	}
+
+	// Release the lock only after mustExec has had time to hit it: a
+	// no-busy-handling mustExec fails instantly; one that retries rides
+	// this out and lands the insert.
+	release := time.AfterFunc(300*time.Millisecond, func() {
+		io.WriteString(in, "COMMIT;\n")
+		in.Close()
+	})
+	defer release.Stop()
+
+	mustExec(t, path, "INSERT INTO t VALUES (1);")
 }
 
 // countingBackend wraps a store.Backend and counts every mutating call
