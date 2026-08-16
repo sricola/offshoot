@@ -1196,16 +1196,34 @@ func TestFlushLoopRetriesAfterRebaseDuringUpload(t *testing.T) {
 	armed.Store(false)
 	release()
 
+	// Every successful flush advances HeadTXID by exactly one (txid is
+	// always the ref's head + 1, however many SQLite transactions the
+	// attempt drained), and nothing else in this test writes the head —
+	// lease heartbeats rewrite only LeaseExpiry. So the paused flush lands
+	// at exactly ref0+1 and the retry at exactly ref0+2, and both waits
+	// below anchor on ref0. Anchoring the second wait on a freshly-polled
+	// "head after the first advance" instead — as an earlier version of
+	// this test did — raced the flushLoop it was observing: if this
+	// goroutine lost the CPU for longer than one FlushEvery tick after
+	// release() (routine on a loaded CI runner under -race), BOTH flushes
+	// landed before the first poll, the observed "first" head was already
+	// ref0+2, and the second wait then demanded ref0+3 — which never comes,
+	// because the retry it was waiting for had already happened and nothing
+	// was pending anymore. That is exactly nightly CI's "flushLoop never
+	// retried" failure, reproduced deterministically by inserting a
+	// one-tick sleep at release(); the fixed anchoring passes with that
+	// same sleep in place.
+	firstTXID := ref0.HeadTXID + 1
+
 	// The paused flush completes and succeeds — the race doesn't fail or
 	// corrupt an upload already begun — advancing the ref once.
-	var afterFirst store.Ref
 	deadline := time.Now().Add(10 * time.Second)
 	for {
-		afterFirst, _, err = w.Store.GetRef("app", "main")
+		ref, _, err := w.Store.GetRef("app", "main")
 		if err != nil {
 			t.Fatal(err)
 		}
-		if afterFirst.HeadTXID > ref0.HeadTXID {
+		if ref.HeadTXID >= firstTXID {
 			break
 		}
 		if time.Now().After(deadline) {
@@ -1217,14 +1235,14 @@ func TestFlushLoopRetriesAfterRebaseDuringUpload(t *testing.T) {
 	// Because the rebase raced this flush's upload window, flushedRebaseGen
 	// must have been left at its pre-race value: the session must not
 	// believe the raced rebase's content is durable, so the NEXT tick must
-	// retry and ship it.
+	// retry and ship it — advancing the head a second time, to firstTXID+1.
 	deadline = time.Now().Add(10 * time.Second)
 	for {
 		ref, _, err := w.Store.GetRef("app", "main")
 		if err != nil {
 			t.Fatal(err)
 		}
-		if ref.HeadTXID > afterFirst.HeadTXID {
+		if ref.HeadTXID >= firstTXID+1 {
 			break
 		}
 		if time.Now().After(deadline) {
