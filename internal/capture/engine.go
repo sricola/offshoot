@@ -78,6 +78,10 @@ type Engine struct {
 	// goroutine at any time, not just after an established happens-before.
 	rebased atomic.Int64
 
+	// takeovers counts completed checkpoint takeovers (see Takeovers());
+	// atomic for the same read-from-outside reason as rebased above.
+	takeovers atomic.Int64
+
 	// consumed mirrors e.reader's current byte offset within whatever WAL
 	// generation it is presently bound to (see wal.Reader.Offset) — i.e. how
 	// far the replica has been brought up to date. It is written by Run's own
@@ -219,6 +223,15 @@ func (e *Engine) Rebased() int { return int(e.rebased.Load()) }
 // cleanly," not "has this session ever rebased since." A later in-session
 // rebase (e.g. a takeover fold-race) does not un-set it.
 func (e *Engine) Resumed() bool { return e.resumed.Load() }
+
+// Takeovers reports how many times takeover() actually checkpointed the
+// WAL — its checkpoint(RESTART) succeeded, landing on either the
+// verified-clean path or the fold-detected rebase path. The busy path
+// (checkpoint refused; reader untouched, takeover retried on a later poll)
+// is not counted: it accomplished no takeover. Tests use this to wait for
+// a threshold-triggered takeover to complete before acting, instead of
+// guessing with a sleep.
+func (e *Engine) Takeovers() int { return int(e.takeovers.Load()) }
 
 // Lag reports WAL bytes committed by writers but not yet applied to the
 // replica: the gap between the WAL's current on-disk size and whichever is
@@ -1630,6 +1643,9 @@ func (e *Engine) takeover(ctx context.Context) error {
 		// just reacquire the read lock so foreign checkpoints stay blocked.
 		return e.beginReadRetry(ctx, 5*time.Second)
 	}
+	// The checkpoint succeeded: the WAL was folded and its RESTART armed.
+	// Both branches below are a completed takeover (see Takeovers()).
+	e.takeovers.Add(1)
 
 	if int64(logN) != consumed {
 		// Frames were folded into the main DB that we never saw: detected

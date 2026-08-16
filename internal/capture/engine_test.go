@@ -237,33 +237,37 @@ func TestEngineHoldsReadLockAcrossSnapshotCopy(t *testing.T) {
 	waitEqual(t, src, rep, 10*time.Second)
 }
 
-// TestEngineTakeoverUnderConcurrentWrites hammers the engine with a foreign
-// writer committing continuously while the engine repeatedly crosses the
-// 64-txn takeover threshold, and — critically — keeps writing *after* a
+// TestEngineTakeoverUnderConcurrentWrites drives the engine's free-running
+// poll ticker across the 64-txn takeover threshold with a foreign writer
+// committing continuously, and — critically — keeps writing *after* the
 // takeover fires. Writes must survive the deferred WAL restart that follows
 // a verified-clean takeover: SQLite's RESTART reset is lazy and only lands
 // on the next writer's commit, so any writer activity after takeover exists
 // specifically to exercise that path.
 //
-// Phase 1 approaches the 64-txn threshold and then pauses so the takeover
-// runs against a quiet WAL: this makes the checkpoint's `log`-vs-consumed
-// comparison come back clean (log == consumed) with overwhelming
-// likelihood, so the takeover should take the verified-clean path and arm
-// the expected-restart continuation rather than rebase. Phase 2 then keeps
-// writing — below the next takeover threshold, so no second takeover
-// attempt (clean or fold) is triggered — specifically to force the WAL's
-// deferred restart while the engine is mid-stream, and to prove the
-// resulting wal.ErrWALRestarted is absorbed as a continuation (fresh reader,
-// no rebase) rather than a full rebase. Under the pre-fix behavior every
-// such takeover was followed one write later by a full (counted) rebase;
-// under the fix, Rebased() must stay at 1 (the initial rebase only).
+// Phase 1 writes exactly 64 txns — the takeover threshold and not one
+// more — so the takeover fires against a quiet WAL (see the inline comment
+// for why that's structural, not timing luck): the checkpoint's
+// `log`-vs-consumed comparison comes back clean (log == consumed), taking
+// the verified-clean path and arming the expected-restart continuation
+// rather than rebasing. Phase 2 then keeps writing — below the next
+// takeover threshold, so no second takeover attempt (clean or fold) is
+// triggered — specifically to force the WAL's deferred restart while the
+// engine is mid-stream, and to prove the resulting wal.ErrWALRestarted is
+// absorbed as a continuation (fresh reader, no rebase) rather than a full
+// rebase. Under the pre-fix behavior every such takeover was followed one
+// write later by a full (counted) rebase; under the fix, Rebased() must
+// stay at 1 (the initial rebase only).
 //
-// This test's exact-rebase assertion relies on timing (the quiet pause
-// before the threshold crossing) rather than an unconditional guarantee — a
-// genuine foreign commit landing in the endRead()→checkpoint(RESTART) gap
-// is a legitimate fold race that still correctly forces a counted rebase.
-// It is verified for stability with `-count=15`; if it ever flakes, that is
-// itself informative (a fold race actually occurred) rather than a bug.
+// The exact-rebase assertion no longer relies on timing: phase 1's write
+// count means the takeover can't fire while its writes are in flight, and
+// phase 2 starts only after Takeovers() confirms the takeover completed
+// (checkpoint landed, `captured` reset), so no write from either phase can
+// land in the endRead()→checkpoint(RESTART) gap. The earlier version
+// approached the threshold with slack (68 writes) and paused a fixed 2s
+// instead, and flaked under CI-runner load when the takeover slipped past
+// the sleep — a legitimate fold race, correctly counted as a rebase, but
+// misread by this test as a failure.
 func TestEngineTakeoverUnderConcurrentWrites(t *testing.T) {
 	testutil.RequireSQLite3(t)
 	src := filepath.Join(t.TempDir(), "src.db")
@@ -292,22 +296,34 @@ func TestEngineTakeoverUnderConcurrentWrites(t *testing.T) {
 		}
 	}
 
-	// Phase 1: approach the 64-txn threshold (60, then 8 more — 68 total),
-	// then pause so the engine fully drains and the takeover it triggers
-	// runs against a quiet WAL (verified-clean path, near-certain).
-	insert(60)
-	time.Sleep(300 * time.Millisecond)
-	insert(8)
-	// Let the takeover fire and settle. Generous relative to the ~10ms poll
-	// interval: under concurrent system load (e.g. the full suite's other
-	// packages running in parallel, or this repo's continuous-write stress
-	// test churning CPU/subprocesses elsewhere), a per-transaction fsync
-	// inside drain's SaveState can push a single poll's catch-up well past a
-	// tight margin — empirically, 300ms was occasionally too little,
-	// producing a benign (safe, just non-optimal) extra rebase when phase 2's
-	// writes below landed before takeover's checkpoint got a chance to run;
-	// see drain's doc comment in engine.go for the full mechanism.
-	time.Sleep(2 * time.Second)
+	// Phase 1: exactly 64 txns — the takeover threshold, no more. With no
+	// 65th write in existence, `captured` cannot reach 64 until the last
+	// commit has landed and this loop is done, so the threshold-triggered
+	// takeover always fires against an idle writer and a quiet WAL: the
+	// verified-clean path, by construction rather than by pause. (If the
+	// startup rebase folded a few early writes into its snapshot instead of
+	// counting them, the threshold is never reached and the >5s idle
+	// trigger fires the takeover instead — also against a quiet WAL; the
+	// wait below absorbs either trigger.)
+	insert(64)
+	// Wait until the takeover has actually completed — its checkpoint ran
+	// and the WAL was folded — before writing another byte. This used to be
+	// a fixed 2s sleep, and under CI-runner load (a per-transaction fsync
+	// inside drain's SaveState can push a single poll's catch-up well past
+	// any fixed margin) the takeover occasionally slipped past it, so a
+	// phase-2 write landed in the endRead()->checkpoint(RESTART) gap and
+	// forced a benign but counted extra rebase (Rebased()==2, exactly what
+	// the assertion below then flagged — 2026-08-16, run 31919539948).
+	// Polling Takeovers() instead removes the timing bet: once it reads 1,
+	// the checkpoint has landed and `captured` is reset, so phase 2's
+	// writes cannot straddle this takeover's gap.
+	takeoverDeadline := time.Now().Add(30 * time.Second)
+	for e.Takeovers() == 0 {
+		if time.Now().After(takeoverDeadline) {
+			t.Fatalf("takeover did not complete within 30s; Takeovers() = %d", e.Takeovers())
+		}
+		time.Sleep(10 * time.Millisecond)
+	}
 
 	// Phase 2: writes CONTINUE after takeover — this is what forces the
 	// WAL's deferred (lazy) restart to actually land. Stay under the next
@@ -470,6 +486,11 @@ func TestEngineTakeoverExpectedRestartIsNotRebase(t *testing.T) {
 	t.Logf("rebased=%d", e.Rebased())
 	if got := e.Rebased(); got != 1 {
 		t.Errorf("expected-restart continuation after a clean takeover must not rebase; Rebased() = %d, want 1", got)
+	}
+	// The second drainNow crossed the 64-txn threshold with the writer
+	// provably idle, so exactly one takeover checkpointed the WAL.
+	if got := e.Takeovers(); got != 1 {
+		t.Errorf("exactly one takeover should have checkpointed the WAL; Takeovers() = %d, want 1", got)
 	}
 }
 
