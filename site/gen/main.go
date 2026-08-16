@@ -134,6 +134,7 @@ func main() {
 	// target page's actual heading IDs after the build loop — a broken
 	// internal link fails the build instead of deploying 404s/dead anchors.
 	pageIDs := map[string]map[string]bool{}
+	descBySlug := map[string]string{}
 	var intra []intraLink
 
 	for i := range flat {
@@ -148,6 +149,7 @@ func main() {
 		pageIDs[p.Slug] = collectIDs(doc)
 		toc := collectTOC(doc, src)
 		desc := firstParagraph(doc, src)
+		descBySlug[p.Slug] = desc
 
 		var buf bytes.Buffer
 		check(md.Renderer().Render(&buf, src, doc))
@@ -206,7 +208,39 @@ func main() {
 	}
 
 	writeSitemap(root, flat)
-	fmt.Printf("gen: %d pages + index + sitemap, %d internal links verified -> site/docs/\n", len(flat), len(intra))
+	writeLLMs(root, descBySlug)
+	fmt.Printf("gen: %d pages + index + sitemap + llms.txt, %d internal links verified -> site/docs/\n", len(flat), len(intra))
+}
+
+// writeLLMs emits site/llms.txt (the llms.txt convention: a markdown index
+// of the docs for LLM crawlers, linking each page's raw-markdown source)
+// and site/llms-full.txt (every page's markdown concatenated, so an agent
+// can ingest the whole corpus in one fetch).
+func writeLLMs(root string, descBySlug map[string]string) {
+	const rawBase = "https://raw.githubusercontent.com/sricola/offshoot/main/"
+	var idx, full strings.Builder
+	idx.WriteString("# offshoot\n\n" +
+		"> Branch SQLite like git: create, fork, checkpoint, rollback, promote — " +
+		"copy-on-write forks of stock SQLite files, on a local directory or an " +
+		"S3-compatible bucket, with one binary. Built for AI agents, eval " +
+		"harnesses, and test suites that need a real, disposable database per " +
+		"attempt.\n\n" +
+		"Docs site: " + siteURL + "/docs/ — every page below links its canonical " +
+		"markdown source. The full corpus in one file: " + siteURL + "/llms-full.txt\n")
+	for _, g := range Nav {
+		fmt.Fprintf(&idx, "\n## %s\n\n", g.Name)
+		for _, p := range g.Pages {
+			d := descBySlug[p.Slug]
+			fmt.Fprintf(&idx, "- [%s](%s%s): %s\n", p.Title, rawBase, p.MD, d)
+
+			src, err := os.ReadFile(filepath.Join(root, p.MD))
+			check(err)
+			fmt.Fprintf(&full, "\n\n<!-- source: %s -->\n\n", p.MD)
+			full.Write(src)
+		}
+	}
+	check(os.WriteFile(filepath.Join(root, "site", "llms.txt"), []byte(idx.String()), 0o644))
+	check(os.WriteFile(filepath.Join(root, "site", "llms-full.txt"), []byte("# offshoot — full documentation corpus\n"+full.String()), 0o644))
 }
 
 // intraLink is one recorded site-internal link occurrence for the

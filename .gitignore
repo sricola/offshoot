@@ -35,3 +35,5 @@ secrets.*
 .idea/
 .vscode/
 .claude/
+site/llms.txt
+site/llms-full.txt
