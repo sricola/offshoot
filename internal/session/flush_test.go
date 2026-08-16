@@ -36,18 +36,18 @@ func TestFlushMakesWritesDurableWithoutPausingTheWriter(t *testing.T) {
 	}
 	defer s.Close()
 
-	if out, err := exec.Command("sqlite3", s.CheckoutPath(),
+	if out, err := sqlite3CLI(s.CheckoutPath(),
 		"CREATE TABLE t (v); INSERT INTO t VALUES (1),(2),(3);").CombinedOutput(); err != nil {
 		t.Fatalf("%v: %s", err, out)
 	}
 	waitFor(t, 10*time.Second, "capture", func() bool {
-		out, err := exec.Command("sqlite3", s.ReplicaPath(), "SELECT count(*) FROM t;").Output()
+		out, err := sqlite3CLI(s.ReplicaPath(), "SELECT count(*) FROM t;").Output()
 		return err == nil && string(out) == "3\n"
 	})
 
 	// A writer holds the checkout open across the flush.
-	writer := exec.Command("sqlite3", s.CheckoutPath(),
-		"PRAGMA busy_timeout=5000; INSERT INTO t VALUES (4);")
+	writer := sqlite3CLI(s.CheckoutPath(),
+		"INSERT INTO t VALUES (4);")
 	if out, err := writer.CombinedOutput(); err != nil {
 		t.Fatalf("%v: %s", err, out)
 	}
@@ -74,7 +74,7 @@ func TestFlushMakesWritesDurableWithoutPausingTheWriter(t *testing.T) {
 	}
 
 	// The agent's checkout is still usable immediately after the flush.
-	if out, err := exec.Command("sqlite3", s.CheckoutPath(),
+	if out, err := sqlite3CLI(s.CheckoutPath(),
 		"INSERT INTO t VALUES (5);").CombinedOutput(); err != nil {
 		t.Fatalf("flush disturbed the writer: %v: %s", err, out)
 	}
@@ -90,12 +90,12 @@ func TestFlushedStateIsRecoverableByAnotherWorkspace(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if out, err := exec.Command("sqlite3", s.CheckoutPath(),
+	if out, err := sqlite3CLI(s.CheckoutPath(),
 		"CREATE TABLE t (v); INSERT INTO t VALUES ('durable');").CombinedOutput(); err != nil {
 		t.Fatalf("%v: %s", err, out)
 	}
 	waitFor(t, 10*time.Second, "capture", func() bool {
-		out, err := exec.Command("sqlite3", s.ReplicaPath(), "SELECT count(*) FROM t;").Output()
+		out, err := sqlite3CLI(s.ReplicaPath(), "SELECT count(*) FROM t;").Output()
 		return err == nil && string(out) == "1\n"
 	})
 	if _, err := s.Flush("", nil); err != nil {
@@ -114,7 +114,7 @@ func TestFlushedStateIsRecoverableByAnotherWorkspace(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	out, err := exec.Command("sqlite3", path, "SELECT v FROM t;").Output()
+	out, err := sqlite3CLI(path, "SELECT v FROM t;").Output()
 	if err != nil || string(out) != "durable\n" {
 		t.Fatalf("recovered content = %q err=%v", out, err)
 	}
@@ -184,12 +184,12 @@ func TestFlushDoesNotDeleteSnapshotOnNonCASRefFailure(t *testing.T) {
 	}
 	defer s.Close()
 
-	if out, err := exec.Command("sqlite3", s.CheckoutPath(),
+	if out, err := sqlite3CLI(s.CheckoutPath(),
 		"CREATE TABLE t (v); INSERT INTO t VALUES (1);").CombinedOutput(); err != nil {
 		t.Fatalf("%v: %s", err, out)
 	}
 	waitFor(t, 10*time.Second, "capture", func() bool {
-		out, err := exec.Command("sqlite3", s.ReplicaPath(), "SELECT count(*) FROM t;").Output()
+		out, err := sqlite3CLI(s.ReplicaPath(), "SELECT count(*) FROM t;").Output()
 		return err == nil && string(out) == "1\n"
 	})
 
@@ -234,14 +234,14 @@ func TestFlushWritesASegmentThenSnapshotsOnCadence(t *testing.T) {
 		t.Fatal(err)
 	}
 
-	if out, err := exec.Command("sqlite3", s.CheckoutPath(),
+	if out, err := sqlite3CLI(s.CheckoutPath(),
 		"CREATE TABLE t (id INTEGER PRIMARY KEY, v TEXT);").CombinedOutput(); err != nil {
 		t.Fatalf("%v: %s", err, out)
 	}
 
 	var members []store.ChainMember
 	for i := 0; i < 5; i++ {
-		if out, err := exec.Command("sqlite3", s.CheckoutPath(),
+		if out, err := sqlite3CLI(s.CheckoutPath(),
 			"INSERT INTO t (v) VALUES ('row');").CombinedOutput(); err != nil {
 			t.Fatalf("%v: %s", err, out)
 		}
@@ -292,7 +292,7 @@ func TestFlushWritesASegmentThenSnapshotsOnCadence(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	out, err := exec.Command("sqlite3", path, "SELECT count(*) FROM t;").Output()
+	out, err := sqlite3CLI(path, "SELECT count(*) FROM t;").Output()
 	if err != nil || string(out) != "5\n" {
 		t.Fatalf("rows after mixed chain = %q err=%v", out, err)
 	}
@@ -311,9 +311,9 @@ func TestSnapshotEveryOneKeepsOldBehavior(t *testing.T) {
 		t.Fatal(err)
 	}
 	defer s.Close()
-	exec.Command("sqlite3", s.CheckoutPath(), "CREATE TABLE t (v);").Run()
+	sqlite3CLI(s.CheckoutPath(), "CREATE TABLE t (v);").Run()
 	for i := 0; i < 3; i++ {
-		exec.Command("sqlite3", s.CheckoutPath(), "INSERT INTO t VALUES ('x');").Run()
+		sqlite3CLI(s.CheckoutPath(), "INSERT INTO t VALUES ('x');").Run()
 		if _, err := s.Flush("", nil); err != nil {
 			t.Fatal(err)
 		}
@@ -375,7 +375,7 @@ func TestFlushSegmentAcrossAShrinkingCommit(t *testing.T) {
 		t.Fatal(err)
 	}
 
-	if out, err := exec.Command("sqlite3", s.CheckoutPath(),
+	if out, err := sqlite3CLI(s.CheckoutPath(),
 		"CREATE TABLE t (id INTEGER PRIMARY KEY, v BLOB);").CombinedOutput(); err != nil {
 		t.Fatalf("%v: %s", err, out)
 	}
@@ -386,7 +386,7 @@ func TestFlushSegmentAcrossAShrinkingCommit(t *testing.T) {
 	// flush below continues from.
 	insertBulk := "INSERT INTO t (v) SELECT randomblob(300) FROM " +
 		"(WITH RECURSIVE c(x) AS (SELECT 1 UNION ALL SELECT x+1 FROM c WHERE x<60) SELECT x FROM c);"
-	if out, err := exec.Command("sqlite3", s.CheckoutPath(), insertBulk).CombinedOutput(); err != nil {
+	if out, err := sqlite3CLI(s.CheckoutPath(), insertBulk).CombinedOutput(); err != nil {
 		t.Fatalf("bulk insert: %v: %s", err, out)
 	}
 	if _, err := s.Flush("", nil); err != nil {
@@ -398,11 +398,11 @@ func TestFlushSegmentAcrossAShrinkingCommit(t *testing.T) {
 	// (VACUUM commits on its own), so DrainNow below catches both, and
 	// recordApply runs once per transaction — VACUUM's is what exercises
 	// the shrink branch.
-	if out, err := exec.Command("sqlite3", s.CheckoutPath(),
+	if out, err := sqlite3CLI(s.CheckoutPath(),
 		"DELETE FROM t WHERE id > 3;").CombinedOutput(); err != nil {
 		t.Fatalf("delete: %v: %s", err, out)
 	}
-	if out, err := exec.Command("sqlite3", s.CheckoutPath(),
+	if out, err := sqlite3CLI(s.CheckoutPath(),
 		"VACUUM;").CombinedOutput(); err != nil {
 		t.Fatalf("vacuum: %v: %s", err, out)
 	}
@@ -453,7 +453,7 @@ func TestFlushSegmentAcrossAShrinkingCommit(t *testing.T) {
 	if err != nil {
 		t.Fatalf("checkout after shrink: %v", err)
 	}
-	out, err := exec.Command("sqlite3", path, "SELECT count(*) FROM t;").Output()
+	out, err := sqlite3CLI(path, "SELECT count(*) FROM t;").Output()
 	if err != nil || string(out) != "3\n" {
 		t.Fatalf("rows after shrinking segment = %q err=%v", out, err)
 	}
@@ -478,12 +478,12 @@ func TestConcurrentFlushIsSerialized(t *testing.T) {
 	}
 	defer s.Close()
 
-	if out, err := exec.Command("sqlite3", s.CheckoutPath(),
+	if out, err := sqlite3CLI(s.CheckoutPath(),
 		"CREATE TABLE t (v); INSERT INTO t VALUES (1);").CombinedOutput(); err != nil {
 		t.Fatalf("%v: %s", err, out)
 	}
 	waitFor(t, 10*time.Second, "capture", func() bool {
-		out, err := exec.Command("sqlite3", s.ReplicaPath(), "SELECT count(*) FROM t;").Output()
+		out, err := sqlite3CLI(s.ReplicaPath(), "SELECT count(*) FROM t;").Output()
 		return err == nil && string(out) == "1\n"
 	})
 
@@ -553,16 +553,27 @@ func TestConcurrentFlushIsSerialized(t *testing.T) {
 	}
 }
 
-// mustExec runs sql against the SQLite file at path via the sqlite3 CLI,
-// failing the test with the command's combined output on error. The
-// busy_timeout matters: the target is typically a checkout with a live
-// session whose capture engine takes short write-side locks (startup
-// checkpoint TRUNCATE, takeover checkpoint RESTART); without it a CLI
-// writer that lands on such a moment fails instantly with SQLITE_BUSY
-// instead of riding it out (see TestMustExecWaitsOutTransientLocks).
+// sqlite3CLI builds a sqlite3 CLI invocation of sql against path with a 5s
+// busy timeout preloaded. Every CLI access in this package's tests must go
+// through it: the target is typically a checkout with a live session whose
+// capture engine takes short write-side locks of its own (the startup
+// rebase's checkpoint TRUNCATE, takeover's checkpoint RESTART), and
+// without a busy handler an access that lands on such a moment fails
+// instantly with SQLITE_BUSY instead of riding it out (see
+// TestMustExecWaitsOutTransientLocks and CI run 31922079955). The .timeout
+// dot-command is used rather than a leading PRAGMA statement because it
+// emits no output row, so callers that parse stdout see only their own
+// query's rows.
+func sqlite3CLI(path, sql string) *exec.Cmd {
+	return exec.Command("sqlite3", "-cmd", ".timeout 5000", path, sql)
+}
+
+// mustExec runs sql against the SQLite file at path via the sqlite3 CLI
+// (busy-timeout included — see sqlite3CLI), failing the test with the
+// command's combined output on error.
 func mustExec(t *testing.T, path, sql string) {
 	t.Helper()
-	if out, err := exec.Command("sqlite3", path, "PRAGMA busy_timeout=5000;"+sql).CombinedOutput(); err != nil {
+	if out, err := sqlite3CLI(path, sql).CombinedOutput(); err != nil {
 		t.Fatalf("%v: %s", err, out)
 	}
 }
@@ -622,6 +633,46 @@ func TestMustExecWaitsOutTransientLocks(t *testing.T) {
 	defer release.Stop()
 
 	mustExec(t, path, "INSERT INTO t VALUES (1);")
+}
+
+// TestFlushSurvivesOwnLeaseRenewalRace pins that a session's own lease
+// heartbeat can never fail its flushes. renewLoop stamps a fresh
+// LeaseExpiry into the ref via a CAS write every RenewEvery; Flush captures
+// the ref's etag up front and CASes its head advance at the end, seconds
+// later under load. A renewal landing in that window used to make the
+// flush's PutRef lose CAS to the session's OWN heartbeat and surface
+// "flush lost a race (retry)" to the caller — the flake
+// TestFlushIncludesEverythingCommittedBeforeIt hit intermittently
+// (renewals fire every LeaseTTL/3 = 10s there; its blocker-throttled
+// flushes run >6s). An aggressive 4ms heartbeat — orders of magnitude
+// faster than production's cadence, yet slow enough that Flush's bounded
+// benign-retry can't be exhausted even under race-detector slowdown —
+// makes that collision near-certain on every flush here (a flush's
+// GetRef→PutRef window spans tens of ms): all of them must still succeed,
+// because a CAS loss to a writer holding our own holder+epoch with the
+// head untouched is proof the premise didn't change — Flush reapplies onto
+// the fresh revision and retries instead of failing.
+func TestFlushSurvivesOwnLeaseRenewalRace(t *testing.T) {
+	testutil.RequireSQLite3(t)
+	w := newWS(t)
+	if err := w.Create("app"); err != nil {
+		t.Fatal(err)
+	}
+	s, err := Open(context.Background(), Options{
+		WS: w, DB: "app", Branch: "main",
+		RenewEvery: 4 * time.Millisecond,
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer s.Close()
+	mustExec(t, s.CheckoutPath(), "CREATE TABLE t (v);")
+	for i := 0; i < 8; i++ {
+		mustExec(t, s.CheckoutPath(), fmt.Sprintf("INSERT INTO t VALUES (%d);", i))
+		if _, err := s.Flush("", nil); err != nil {
+			t.Fatalf("flush %d must survive the session's own lease renewals: %v", i, err)
+		}
+	}
 }
 
 // countingBackend wraps a store.Backend and counts every mutating call
@@ -769,7 +820,7 @@ func TestAutoFlushShipsWritesWithoutManualFlush(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	out, err := exec.Command("sqlite3", path, "SELECT v FROM t;").Output()
+	out, err := sqlite3CLI(path, "SELECT v FROM t;").Output()
 	if err != nil || string(out) != "x\n" {
 		t.Fatalf("auto-flushed content missing from a fresh materialization: %q err=%v", out, err)
 	}
@@ -1031,7 +1082,7 @@ func TestFlushLoopFlushesRebaseFoldedContentWhenOtherwiseIdle(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	out, err := exec.Command("sqlite3", path, "SELECT v FROM rebased;").Output()
+	out, err := sqlite3CLI(path, "SELECT v FROM rebased;").Output()
 	if err != nil || string(out) != "rebase-only\n" {
 		t.Fatalf("rebase-folded content missing after flush: %q err=%v", out, err)
 	}
@@ -1195,7 +1246,7 @@ func TestFlushLoopRetriesAfterRebaseDuringUpload(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	out, err := exec.Command("sqlite3", path, "SELECT v FROM raced;").Output()
+	out, err := sqlite3CLI(path, "SELECT v FROM raced;").Output()
 	if err != nil || string(out) != "raced\n" {
 		t.Fatalf("raced rebase content missing after retry: %q err=%v", out, err)
 	}
@@ -1516,7 +1567,7 @@ func TestSettlingSuppressionCatchesRaceWindowFold(t *testing.T) {
 	if _, err := ltxio.Materialize(bytes.NewReader(data), dst); err != nil {
 		t.Fatal(err)
 	}
-	out, err := exec.Command("sqlite3", dst, "SELECT v FROM raced;").Output()
+	out, err := sqlite3CLI(dst, "SELECT v FROM raced;").Output()
 	if err != nil || string(out) != "race-window-fold\n" {
 		t.Fatalf("race-window-folded content missing from the settled snapshot: %q err=%v", out, err)
 	}
@@ -1589,7 +1640,7 @@ func TestCleanAtOpenSessionsFirstRealFlushIsASegment(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	out, err := exec.Command("sqlite3", path, "SELECT v FROM t;").Output()
+	out, err := sqlite3CLI(path, "SELECT v FROM t;").Output()
 	if err != nil || string(out) != "1\n" {
 		t.Fatalf("chain did not resolve correctly after a clean-at-open session's first real flush: %q err=%v", out, err)
 	}
@@ -1712,7 +1763,7 @@ func TestCleanCheckoutServedWithoutChainValidationAcrossClose(t *testing.T) {
 	if err != nil {
 		t.Fatalf("a clean-and-current checkout must be served without touching the (now-broken) chain: %v", err)
 	}
-	out, err := exec.Command("sqlite3", path, "SELECT v FROM t ORDER BY v;").Output()
+	out, err := sqlite3CLI(path, "SELECT v FROM t ORDER BY v;").Output()
 	if err != nil || string(out) != "1\n2\n" {
 		t.Fatalf("clean-skip must still serve correct, already-on-disk content: %q err=%v", out, err)
 	}
@@ -1818,8 +1869,8 @@ func TestCloseDoesNotStampSidecarAfterUnverifiedShutdown(t *testing.T) {
 	}
 
 	capture.ShutdownRaceHook = func() {
-		if out, err := exec.Command("sqlite3", checkoutPath,
-			"PRAGMA busy_timeout=5000; INSERT INTO t VALUES (2);").CombinedOutput(); err != nil {
+		if out, err := sqlite3CLI(checkoutPath,
+			"INSERT INTO t VALUES (2);").CombinedOutput(); err != nil {
 			t.Errorf("hook write: %v: %s", err, out)
 		}
 	}
@@ -1899,7 +1950,7 @@ func TestSidecarNotStampedAfterMidSessionRebase(t *testing.T) {
 	if os.SameFile(stBefore, stAfter) {
 		t.Fatal("a checkout that never physically received a mid-session rebase's content must not be treated as clean on the next Checkout (expected a fresh inode from re-materializing)")
 	}
-	out, err := exec.Command("sqlite3", p2, "SELECT v FROM rebased;").Output()
+	out, err := sqlite3CLI(p2, "SELECT v FROM rebased;").Output()
 	if err != nil || string(out) != "rebase-only\n" {
 		t.Fatalf("rebase-folded content missing after re-materializing: %q err=%v", out, err)
 	}
@@ -1922,7 +1973,7 @@ func TestNamedFlushStampsCheckpointMetaAndCreatedAt(t *testing.T) {
 	}
 	defer s.Close()
 
-	if out, err := exec.Command("sqlite3", s.CheckoutPath(),
+	if out, err := sqlite3CLI(s.CheckoutPath(),
 		"CREATE TABLE t (v); INSERT INTO t VALUES (1);").CombinedOutput(); err != nil {
 		t.Fatalf("%v: %s", err, out)
 	}
@@ -2021,7 +2072,7 @@ func TestSnapshotFlushEncodesOutsideReplicaMu(t *testing.T) {
 	}
 	defer s.Close()
 
-	if out, err := exec.Command("sqlite3", s.CheckoutPath(),
+	if out, err := sqlite3CLI(s.CheckoutPath(),
 		"CREATE TABLE t (v); INSERT INTO t VALUES ('x'),('y');").CombinedOutput(); err != nil {
 		t.Fatalf("%v: %s", err, out)
 	}
@@ -2208,7 +2259,7 @@ func TestSnapshotFlushStreamsUploadWithoutBuffering(t *testing.T) {
 	}
 	defer s.Close()
 
-	if out, err := exec.Command("sqlite3", s.CheckoutPath(),
+	if out, err := sqlite3CLI(s.CheckoutPath(),
 		"CREATE TABLE t (v); INSERT INTO t VALUES ('x'),('y');").CombinedOutput(); err != nil {
 		t.Fatalf("%v: %s", err, out)
 	}
@@ -2303,7 +2354,7 @@ func TestSnapshotFlushFallsBackToBufferedWithoutReaderPutter(t *testing.T) {
 	}
 	defer s.Close()
 
-	if out, err := exec.Command("sqlite3", s.CheckoutPath(),
+	if out, err := sqlite3CLI(s.CheckoutPath(),
 		"CREATE TABLE t (v); INSERT INTO t VALUES ('x'),('y');").CombinedOutput(); err != nil {
 		t.Fatalf("%v: %s", err, out)
 	}
@@ -2393,7 +2444,7 @@ func TestFencedSnapshotOrphanDoesNotShadowTheNextSessionsSegment(t *testing.T) {
 	epochA := a.Lease().Epoch
 	mustExec(t, a.CheckoutPath(), "CREATE TABLE t (v); INSERT INTO t VALUES ('session-a');")
 	waitFor(t, 10*time.Second, "session A's write to reach the replica", func() bool {
-		out, err := exec.Command("sqlite3", a.ReplicaPath(), "SELECT count(*) FROM t;").Output()
+		out, err := sqlite3CLI(a.ReplicaPath(), "SELECT count(*) FROM t;").Output()
 		return err == nil && string(out) == "1\n"
 	})
 
@@ -2492,7 +2543,7 @@ func TestFencedSnapshotOrphanDoesNotShadowTheNextSessionsSegment(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	out, err := exec.Command("sqlite3", path, "SELECT v FROM t;").Output()
+	out, err := sqlite3CLI(path, "SELECT v FROM t;").Output()
 	if err != nil || string(out) != "session-b\n" {
 		t.Fatalf("read after the takeover = %q err=%v, want \"session-b\\n\" — "+
 			"%q means the fenced writer's snapshot at txid %d shadowed B's committed segment",

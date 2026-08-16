@@ -5,7 +5,6 @@ import (
 	"context"
 	"database/sql"
 	"fmt"
-	"os/exec"
 	"strings"
 	"testing"
 	"time"
@@ -41,7 +40,7 @@ func TestFlushesUnderContinuousWritesAreConsistent(t *testing.T) {
 	}
 	defer s.Close()
 
-	if out, err := exec.Command("sqlite3", s.CheckoutPath(),
+	if out, err := sqlite3CLI(s.CheckoutPath(),
 		"CREATE TABLE t (id INTEGER PRIMARY KEY, v BLOB);").CombinedOutput(); err != nil {
 		t.Fatalf("%v: %s", err, out)
 	}
@@ -56,8 +55,8 @@ func TestFlushesUnderContinuousWritesAreConsistent(t *testing.T) {
 				return
 			default:
 			}
-			exec.Command("sqlite3", s.CheckoutPath(),
-				"PRAGMA busy_timeout=5000; INSERT INTO t (v) VALUES (randomblob(64));").Run()
+			sqlite3CLI(s.CheckoutPath(),
+				"INSERT INTO t (v) VALUES (randomblob(64));").Run()
 		}
 	}()
 
@@ -87,7 +86,7 @@ func TestFlushesUnderContinuousWritesAreConsistent(t *testing.T) {
 		if _, err := ltxio.Materialize(bytesReader(data), out); err != nil {
 			t.Fatalf("flushed snapshot %d does not decode: %v", txid, err)
 		}
-		res, err := exec.Command("sqlite3", out, "PRAGMA integrity_check; SELECT count(*) FROM t;").Output()
+		res, err := sqlite3CLI(out, "PRAGMA integrity_check; SELECT count(*) FROM t;").Output()
 		if err != nil {
 			t.Fatalf("flushed snapshot %d is not a usable database: %v", txid, err)
 		}
@@ -174,7 +173,7 @@ func TestFlushIncludesEverythingCommittedBeforeIt(t *testing.T) {
 	}
 	defer s.Close()
 
-	if out, err := exec.Command("sqlite3", s.CheckoutPath(),
+	if out, err := sqlite3CLI(s.CheckoutPath(),
 		"CREATE TABLE t (id INTEGER PRIMARY KEY, v BLOB);").CombinedOutput(); err != nil {
 		t.Fatalf("%v: %s", err, out)
 	}
@@ -247,7 +246,7 @@ func TestFlushIncludesEverythingCommittedBeforeIt(t *testing.T) {
 			t.Fatalf("round %d: flushed snapshot %d does not decode: %v", i, txid, err)
 		}
 
-		res, err := exec.Command("sqlite3", out,
+		res, err := sqlite3CLI(out,
 			fmt.Sprintf("SELECT count(*) FROM t WHERE v = '%s';", marker)).CombinedOutput()
 		if err != nil {
 			t.Fatalf("round %d: query flushed snapshot: %v: %s", i, err, res)

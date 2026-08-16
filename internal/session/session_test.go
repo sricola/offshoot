@@ -5,7 +5,6 @@ import (
 	"fmt"
 	"io"
 	"os"
-	"os/exec"
 	"path/filepath"
 	"strings"
 	"testing"
@@ -80,14 +79,14 @@ func TestOpenHoldsLeaseAndCaptures(t *testing.T) {
 	}
 
 	// An agent writes to the checkout with no coordination at all.
-	if out, err := exec.Command("sqlite3", s.CheckoutPath(),
+	if out, err := sqlite3CLI(s.CheckoutPath(),
 		"CREATE TABLE t (v); INSERT INTO t VALUES (1),(2);").CombinedOutput(); err != nil {
 		t.Fatalf("%v: %s", err, out)
 	}
 
 	// The replica converges without the writer ever being paused.
 	waitFor(t, 10*time.Second, "replica to converge", func() bool {
-		out, err := exec.Command("sqlite3", s.ReplicaPath(), "SELECT count(*) FROM t;").Output()
+		out, err := sqlite3CLI(s.ReplicaPath(), "SELECT count(*) FROM t;").Output()
 		return err == nil && string(out) == "2\n"
 	})
 	if s.Err() != nil {
@@ -191,12 +190,12 @@ func TestSessionTransitionLogsOpenedFlushedClosed(t *testing.T) {
 		if err != nil {
 			t.Fatal(err)
 		}
-		if out, err := exec.Command("sqlite3", s.CheckoutPath(),
+		if out, err := sqlite3CLI(s.CheckoutPath(),
 			"CREATE TABLE t (v); INSERT INTO t VALUES (1);").CombinedOutput(); err != nil {
 			t.Fatalf("%v: %s", err, out)
 		}
 		waitFor(t, 10*time.Second, "capture", func() bool {
-			out, err := exec.Command("sqlite3", s.ReplicaPath(), "SELECT count(*) FROM t;").Output()
+			out, err := sqlite3CLI(s.ReplicaPath(), "SELECT count(*) FROM t;").Output()
 			return err == nil && string(out) == "1\n"
 		})
 		txid, err = s.Flush("", nil)

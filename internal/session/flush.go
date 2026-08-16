@@ -551,16 +551,45 @@ func (s *Session) flush(name string, meta map[string]string, auto bool) (txid ui
 		}
 	}
 
-	ref.HeadTXID, ref.HeadEpoch = txid, lease.Epoch
-	if name != "" {
-		ref.SetCheckpoint(name, store.Checkpoint{
-			TXID: txid, Epoch: lease.Epoch,
-			CreatedAt: time.Now().UTC().Format(time.RFC3339),
-			Meta:      meta,
-		})
-	}
-	ref.Touch(time.Now())
-	if _, err := st.PutRef(s.db, s.branch, ref, etag); err != nil {
+	for attempt := 0; ; attempt++ {
+		ref.HeadTXID, ref.HeadEpoch = txid, lease.Epoch
+		if name != "" {
+			ref.SetCheckpoint(name, store.Checkpoint{
+				TXID: txid, Epoch: lease.Epoch,
+				CreatedAt: time.Now().UTC().Format(time.RFC3339),
+				Meta:      meta,
+			})
+		}
+		ref.Touch(time.Now())
+		_, err := st.PutRef(s.db, s.branch, ref, etag)
+		if err == nil {
+			break
+		}
+		// A CAS loss here is not necessarily a rival: this session's own
+		// renewLoop stamps a fresh LeaseExpiry into the ref every RenewEvery
+		// via the same CAS path, and a long flush (drain + encode + upload
+		// between the GetRef above and this PutRef) can easily span a
+		// heartbeat. Re-read the ref: if it still carries OUR holder+epoch on
+		// the same lineage with the head exactly where this flush found it,
+		// the only thing that moved was lease bookkeeping — nothing about
+		// this flush's premise changed, so reapply the head advance onto the
+		// fresh revision and try again. Every retry re-verifies that premise,
+		// so looping is safe by construction; the cap is purely a termination
+		// backstop against a pathological renewal storm and is sized so that
+		// even a heartbeat orders of magnitude faster than production's
+		// LeaseTTL/3 cadence (as the race-instrumented
+		// TestFlushSurvivesOwnLeaseRenewalRace deliberately runs) exhausts it
+		// only with negligible probability. Any other shape — foreign holder,
+		// new epoch, new lineage, moved head — falls through to the
+		// loss/cleanup handling below exactly as before.
+		if errors.Is(err, store.ErrCAS) && attempt < 8 {
+			if cur, curEtag, gerr := st.GetRef(s.db, s.branch); gerr == nil &&
+				cur.LeaseHolder == lease.Holder && cur.Epoch == lease.Epoch &&
+				cur.Lineage == ref.Lineage && cur.HeadTXID == txid-1 {
+				ref, etag = cur, curEtag
+				continue
+			}
+		}
 		// Decide whether to clean up the uploaded object after a failed ref
 		// update. This mirrors ops.Checkpoint's identical decision exactly
 		// (see its comment for the full reasoning) — flushMu serializes

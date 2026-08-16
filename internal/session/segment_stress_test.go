@@ -4,7 +4,6 @@ import (
 	"context"
 	"fmt"
 	"os"
-	"os/exec"
 	"testing"
 
 	"github.com/sricola/offshoot/internal/ltxio"
@@ -46,11 +45,11 @@ func TestCleanResumeRebaselinesBeforeFirstSegment(t *testing.T) {
 	if s1.Resumed() {
 		t.Fatal("the first Open of a fresh Dir must not report a resume")
 	}
-	if out, err := exec.Command("sqlite3", s1.CheckoutPath(), "CREATE TABLE t (v);").CombinedOutput(); err != nil {
+	if out, err := sqlite3CLI(s1.CheckoutPath(), "CREATE TABLE t (v);").CombinedOutput(); err != nil {
 		t.Fatalf("%v: %s", err, out)
 	}
 	for i := 0; i < 2; i++ {
-		if out, err := exec.Command("sqlite3", s1.CheckoutPath(), "INSERT INTO t VALUES ('a');").CombinedOutput(); err != nil {
+		if out, err := sqlite3CLI(s1.CheckoutPath(), "INSERT INTO t VALUES ('a');").CombinedOutput(); err != nil {
 			t.Fatalf("%v: %s", err, out)
 		}
 		if _, err := s1.Flush("", nil); err != nil {
@@ -75,7 +74,7 @@ func TestCleanResumeRebaselinesBeforeFirstSegment(t *testing.T) {
 		t.Fatal("reopening the same Dir after a clean shutdown must resume, not rebase — this test doesn't exercise the bug's path otherwise")
 	}
 	for i := 0; i < 2; i++ {
-		if out, err := exec.Command("sqlite3", s2.CheckoutPath(), "INSERT INTO t VALUES ('b');").CombinedOutput(); err != nil {
+		if out, err := sqlite3CLI(s2.CheckoutPath(), "INSERT INTO t VALUES ('b');").CombinedOutput(); err != nil {
 			t.Fatalf("%v: %s", err, out)
 		}
 		if _, err := s2.Flush("", nil); err != nil {
@@ -90,7 +89,7 @@ func TestCleanResumeRebaselinesBeforeFirstSegment(t *testing.T) {
 	if err != nil {
 		t.Fatalf("checkout after resume+flushes: %v", err)
 	}
-	out, err := exec.Command("sqlite3", p, "SELECT count(*) FROM t;").Output()
+	out, err := sqlite3CLI(p, "SELECT count(*) FROM t;").Output()
 	if err != nil {
 		t.Fatalf("checkout query: %v", err)
 	}
@@ -116,13 +115,13 @@ func TestEveryFlushIsExactlyMaterializable(t *testing.T) {
 		t.Fatal(err)
 	}
 	defer s.Close()
-	if out, err := exec.Command("sqlite3", s.CheckoutPath(),
+	if out, err := sqlite3CLI(s.CheckoutPath(),
 		"CREATE TABLE t (id INTEGER PRIMARY KEY, v TEXT);").CombinedOutput(); err != nil {
 		t.Fatalf("%v: %s", err, out)
 	}
 
 	for i := 0; i < 10; i++ {
-		if out, err := exec.Command("sqlite3", s.CheckoutPath(),
+		if out, err := sqlite3CLI(s.CheckoutPath(),
 			fmt.Sprintf("INSERT INTO t (v) VALUES ('row-%d');", i)).CombinedOutput(); err != nil {
 			t.Fatalf("%v: %s", err, out)
 		}
@@ -140,7 +139,7 @@ func TestEveryFlushIsExactlyMaterializable(t *testing.T) {
 			if err != nil {
 				t.Fatalf("checkout %s: %v", br, err)
 			}
-			out, err := exec.Command("sqlite3", p, "SELECT count(*) FROM t;").Output()
+			out, err := sqlite3CLI(p, "SELECT count(*) FROM t;").Output()
 			if err != nil {
 				t.Fatalf("%s: %v", br, err)
 			}
@@ -202,11 +201,11 @@ func TestChainSurvivesSessionRestart(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if out, err := exec.Command("sqlite3", s1.CheckoutPath(), "CREATE TABLE t (v);").CombinedOutput(); err != nil {
+	if out, err := sqlite3CLI(s1.CheckoutPath(), "CREATE TABLE t (v);").CombinedOutput(); err != nil {
 		t.Fatalf("%v: %s", err, out)
 	}
 	for i := 0; i < 3; i++ {
-		if out, err := exec.Command("sqlite3", s1.CheckoutPath(), "INSERT INTO t VALUES ('a');").CombinedOutput(); err != nil {
+		if out, err := sqlite3CLI(s1.CheckoutPath(), "INSERT INTO t VALUES ('a');").CombinedOutput(); err != nil {
 			t.Fatalf("%v: %s", err, out)
 		}
 		if _, err := s1.Flush("", nil); err != nil {
@@ -224,11 +223,11 @@ func TestChainSurvivesSessionRestart(t *testing.T) {
 		t.Fatal(err)
 	}
 	defer s2.Close()
-	out, err := exec.Command("sqlite3", s2.CheckoutPath(), "SELECT count(*) FROM t;").Output()
+	out, err := sqlite3CLI(s2.CheckoutPath(), "SELECT count(*) FROM t;").Output()
 	if err != nil || string(out) != "3\n" {
 		t.Fatalf("second session sees %q err=%v", out, err)
 	}
-	if out, err := exec.Command("sqlite3", s2.CheckoutPath(), "INSERT INTO t VALUES ('b');").CombinedOutput(); err != nil {
+	if out, err := sqlite3CLI(s2.CheckoutPath(), "INSERT INTO t VALUES ('b');").CombinedOutput(); err != nil {
 		t.Fatalf("%v: %s", err, out)
 	}
 	if _, err := s2.Flush("", nil); err != nil {
@@ -247,7 +246,7 @@ func TestChainSurvivesSessionRestart(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	out, err = exec.Command("sqlite3", p, "SELECT count(*) FROM t;").Output()
+	out, err = sqlite3CLI(p, "SELECT count(*) FROM t;").Output()
 	if err != nil {
 		t.Fatalf("checkout query: %v", err)
 	}
@@ -270,11 +269,11 @@ func TestMissingSegmentIsLoud(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if out, err := exec.Command("sqlite3", s.CheckoutPath(), "CREATE TABLE t (v);").CombinedOutput(); err != nil {
+	if out, err := sqlite3CLI(s.CheckoutPath(), "CREATE TABLE t (v);").CombinedOutput(); err != nil {
 		t.Fatalf("%v: %s", err, out)
 	}
 	for i := 0; i < 3; i++ {
-		if out, err := exec.Command("sqlite3", s.CheckoutPath(), "INSERT INTO t VALUES ('x');").CombinedOutput(); err != nil {
+		if out, err := sqlite3CLI(s.CheckoutPath(), "INSERT INTO t VALUES ('x');").CombinedOutput(); err != nil {
 			t.Fatalf("%v: %s", err, out)
 		}
 		if _, err := s.Flush("", nil); err != nil {
