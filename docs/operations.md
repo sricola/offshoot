@@ -5,7 +5,9 @@ metrics, HTTP, events, budgets — describes ONE daemon process on ONE host,
 watching over the branches in its own store. There is no cluster, no
 placement, no failover, and no cross-node routing anywhere in this codebase;
 running "hundreds of agent sessions" means hundreds of sessions against one
-`offshoot serve` process (or one per host, each independent), not a fleet
+`offshoot serve` process (or one per host, each with **its own store** —
+sharing one store between concurrent daemons is unsupported today, see
+[limitations](limitations.md#one-daemon-per-store)), not a fleet
 coordinating with each other. See the FAQ's [why not
 LiteFS](faq.md#why-not-litefs) for the deliberate reasoning behind that
 scope, and [ROADMAP.md](../ROADMAP.md#non-goals-v1) for the standing

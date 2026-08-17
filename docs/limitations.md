@@ -24,6 +24,27 @@ riskier problem than the one offshoot solves
 are copy-on-write and near-free, so fork-per-writer is the intended
 pattern, not a workaround.
 
+## One daemon per store
+
+**What:** the supported topology today is exactly one daemon (and its
+CLI) per store. Pointing daemons on two machines — or two daemons on one
+machine — at the same bucket or directory is not yet safe, even though
+each branch has only one leased writer.
+
+**Why:** the epoch-fencing scheme protects the live-session write path,
+but three pieces of groundwork for shared-store fleets haven't landed:
+the at-rest command paths (`checkpoint`, `rollback`, `promote`, `compact`
+run from a second machine) write without taking the branch lease; lease
+holder identity is hostname+pid, which containers can collide; and lease
+expiry is judged against the claimant's wall clock, so large clock skew
+between machines could steal a live lease. Each is fixable — the fencing
+core is designed for this — and multi-daemon safety is the named first
+step of any future fleet work ([non-goals](../ROADMAP.md#non-goals-v1)).
+
+**Instead:** shard by store, not by daemon: give each host its own store
+(the eval-harness per-worker pattern), and move state between them with
+`offshoot export` / `create --from`, or checkpoint + re-checkout.
+
 ## No merge
 
 **What:** no row-level or three-way merge between branches, and it's not
