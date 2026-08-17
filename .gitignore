@@ -8,6 +8,7 @@ sdk/typescript/test-dist/
 sdk/typescript/dry-run-pack/
 sdk/typescript/dry-run-install/
 sdk/python/dist/
+sdk/python/build/
 sdk/python/*.egg-info/
 sdk/python/.dry-run-venv/
 sdk/python-langgraph/*.egg-info/
