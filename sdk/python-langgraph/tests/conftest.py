@@ -2,10 +2,13 @@
 # binary + daemon, the same discipline as sdk/python/tests/test_client.py's
 # DaemonFixture (OFFSHOOT_BIN env override, else `go build` from this repo).
 #
-# LangGraph availability follows the RequireExec-style stance the repo uses
-# for the binary: if `langgraph` (and langgraph-checkpoint-sqlite) is not
-# importable, the whole suite SKIPS locally, but FAILS when OFFSHOOT_REQUIRE_
-# LANGGRAPH (or CI) is set — a misconfigured CI env must not silently skip.
+# Full LangGraph availability follows the RequireExec-style stance the repo
+# uses for the binary: if `langgraph.graph` (and
+# langgraph-checkpoint-sqlite) is not importable, the StateGraph tests SKIP
+# locally, but the suite FAILS when OFFSHOOT_REQUIRE_LANGGRAPH (or CI) is set
+# — a misconfigured CI env must not silently skip. Importing bare `langgraph`
+# is not enough: the checkpoint packages create that namespace even when the
+# full framework (and therefore langgraph.graph) is absent.
 from __future__ import annotations
 
 import os
@@ -26,24 +29,24 @@ sys.path.insert(0, str(_HERE.parents[1]))          # sdk/python-langgraph
 sys.path.insert(0, str(REPO / "sdk" / "python"))   # sdk/python
 
 try:
-    import langgraph  # noqa: F401
+    import langgraph.graph  # noqa: F401
     import langgraph.checkpoint.sqlite  # noqa: F401
-    HAVE_LANGGRAPH = True
+    HAVE_FULL_LANGGRAPH = True
 except ImportError:
-    HAVE_LANGGRAPH = False
+    HAVE_FULL_LANGGRAPH = False
 
 _REQUIRE = os.environ.get("OFFSHOOT_REQUIRE_LANGGRAPH") or os.environ.get("CI")
 
 
 def pytest_configure(config: pytest.Config) -> None:
-    # Fail LOUD before collection when the strict env demands langgraph but
-    # it isn't importable; locally, test modules importorskip("langgraph")
-    # and the suite skips visibly instead.
-    if not HAVE_LANGGRAPH and _REQUIRE:
+    # Fail LOUD before collection when the strict env demands full LangGraph
+    # but it isn't importable; locally, the StateGraph module skips visibly.
+    if not HAVE_FULL_LANGGRAPH and _REQUIRE:
         raise pytest.UsageError(
-            "langgraph / langgraph-checkpoint-sqlite is not importable but "
+            "full langgraph (including langgraph.graph) / "
+            "langgraph-checkpoint-sqlite is not importable but "
             "OFFSHOOT_REQUIRE_LANGGRAPH (or CI) is set — install the test "
-            "deps (`pip install langgraph langgraph-checkpoint-sqlite`) "
+            "deps (`pip install -e \"sdk/python-langgraph[test]\"`) "
             "instead of silently skipping this suite.")
 
 

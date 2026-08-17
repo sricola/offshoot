@@ -136,8 +136,10 @@ From `.github/workflows/ci.yml` and the `Makefile`:
 - **SDK gates**: the Python SDK's base suite runs with no pytest installed
   at all (proving the package has no hidden pytest dependency), the pytest
   plugin has its own suite including a real `pytest-xdist` two-worker run,
-  and both SDKs' publishable artifacts are built and install-tested on
-  every PR (`make test-sdks`, `test-pytest-plugin`, `dry-run-sdks`).
+  the LangGraph checkpoint companion compiles and runs a real `StateGraph`
+  from its isolated `[test]` extra, and both SDKs' publishable artifacts are
+  built and install-tested on every PR (`make test-sdks`,
+  `test-pytest-plugin`, `test-python-langgraph`, `dry-run-sdks`).
 
 ## Review discipline: mutation-verified regression tests
 

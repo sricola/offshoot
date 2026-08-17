@@ -207,6 +207,22 @@ jobs:
       - name: make test-pytest-plugin
         run: PATH="$PWD/.venv-pytest-plugin/bin:$PATH" make test-pytest-plugin
 
+      # The LangGraph companion intentionally keeps the full framework out of
+      # its runtime dependencies: it only imports checkpoint interfaces. Its
+      # end-to-end suite does compile a real StateGraph, so install the
+      # package's explicit [test] extra in a separate venv and arm the strict
+      # no-skip path through the Make target. Installing sdk/python alongside
+      # it satisfies offshoot-db from this checkout while that package remains
+      # intentionally unpublished.
+      - name: Install LangGraph companion test environment
+        run: |
+          python3 -m venv .venv-langgraph
+          .venv-langgraph/bin/pip install --quiet \
+            -e sdk/python -e "sdk/python-langgraph[test]"
+
+      - name: make test-python-langgraph
+        run: PATH="$PWD/.venv-langgraph/bin:$PATH" make test-python-langgraph
+
       # dry-run-sdks builds the real sdist/wheel and npm tarball, runs twine
       # check, and install-tests both — the same build-verification tier
       # .github/workflows/publish.yml runs in dry-run mode (PUBLISH_ENABLED

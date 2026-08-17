@@ -179,6 +179,15 @@ jobs:
             echo "name=${GITHUB_REF_NAME}" >> "$GITHUB_OUTPUT"
           fi
 
+      # The release runner is amd64, so register the arm64 emulator before
+      # Buildx. Pin both the action and its binfmt image: a mutable `latest`
+      # helper would undercut the workflow's otherwise SHA-pinned supply
+      # chain. Digest reviewed 2026-08-16.
+      - uses: docker/setup-qemu-action@96fe6ef7f33517b61c61be40b68a1882f3264fb8 # v4.2.0
+        with:
+          platforms: arm64
+          image: tonistiigi/binfmt@sha256:400a4873b838d1b89194d982c45e5fb3cda4593fbfd7e08a02e76b03b21166f0
+
       - uses: docker/setup-buildx-action@8d2750c68a42422c14e847fe6c8ac0403b4cbd6f # v3.12.0
 
       - name: Log in to GHCR
@@ -188,10 +197,12 @@ jobs:
           username: ${{ github.actor }}
           password: ${{ secrets.GITHUB_TOKEN }}
 
-      - uses: docker/build-push-action@10e90e3645eae34f1e60eeb005ba3a3d33f178e8 # v6.19.2
+      - id: image
+        uses: docker/build-push-action@10e90e3645eae34f1e60eeb005ba3a3d33f178e8 # v6.19.2
         with:
           context: .
           push: true
+          platforms: linux/amd64,linux/arm64
           build-args: |
             VERSION=${{ steps.ref.outputs.name }}
           # `:latest` moves only on real tag pushes. A workflow_dispatch run
@@ -200,3 +211,15 @@ jobs:
           # never silently receive one as :latest. (Comma-separated tags;
           # this is an action input, not shell, so expression use is safe.)
           tags: ${{ github.event_name == 'push' && format('ghcr.io/{0}:{1},ghcr.io/{0}:latest', github.repository, steps.ref.outputs.name) || format('ghcr.io/{0}:{1}', github.repository, steps.ref.outputs.name) }}
+
+      # Do not accept a green release whose pushed index silently lacks one
+      # of the promised architectures. Attestation manifests may also be in
+      # the index, so assert presence rather than an exact manifest count.
+      - name: Verify published image platforms
+        env:
+          IMAGE: ghcr.io/${{ github.repository }}@${{ steps.image.outputs.digest }}
+        run: |
+          docker buildx imagetools inspect "$IMAGE" --raw | jq -e '
+            any(.manifests[]; .platform.os == "linux" and .platform.architecture == "amd64") and
+            any(.manifests[]; .platform.os == "linux" and .platform.architecture == "arm64")
+          '

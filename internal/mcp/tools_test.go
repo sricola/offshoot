@@ -601,6 +601,29 @@ func TestForkSchemaAdvertisesTTL(t *testing.T) {
 	t.Fatal("offshoot_fork not found in Tools()")
 }
 
+// TestForkDescriptionStatesItsRealCost pins the storage/latency boundary an
+// agent sees before choosing the tool. A shared fork is tiny, not free, and
+// only a named-checkpoint fork avoids the default at-head checkout hash.
+func TestForkDescriptionStatesItsRealCost(t *testing.T) {
+	ts, _ := newTools(t)
+	for _, tl := range ts.Tools() {
+		if tl.Name != "offshoot_fork" {
+			continue
+		}
+		desc := strings.ToLower(tl.Description)
+		for _, fact := range []string{"two small metadata objects", "named checkpoint", "at-head", "hashes the checkout"} {
+			if !strings.Contains(desc, fact) {
+				t.Errorf("offshoot_fork description must include %q: %s", fact, tl.Description)
+			}
+		}
+		if strings.Contains(desc, "costs nothing") {
+			t.Errorf("offshoot_fork description must not claim a zero-cost fork: %s", tl.Description)
+		}
+		return
+	}
+	t.Fatal("offshoot_fork not found in Tools()")
+}
+
 // --- PM amendment: the fork response echoes the applied TTL and expiry ---
 
 // TestForkResponseEchoesTTLAndExpiry pins the PM amendment: the fork tool's

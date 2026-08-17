@@ -361,10 +361,13 @@ or capture path must preserve:
 - **Foreign-connection capture torture**, the risk spike that validated the
   whole approach before most other code was written: a stock `sqlite3`
   client the daemon doesn't control writes under load while the daemon
-  captures; `kill -9` both sides in a loop; verify LTX checksums and
-  restored-state equivalence after every bounce. This class of test lives
-  in `internal/capture/torture_test.go` and re-runs on every change to the
-  capture path.
+  captures; the foreign writer is repeatedly `kill -9`ed while the capturer
+  is gracefully stopped and restarted; verify LTX checksums and restored-state
+  equivalence after every bounce. This class of test lives in
+  `internal/capture/torture_test.go`, runs nightly, and is required by
+  `CONTRIBUTING.md` for capture/flush changes. It does not exercise a
+  `SIGKILL` of the capturer itself; [testing.md](testing.md#the-kill--9-torture-harness)
+  is the canonical boundary.
 - Property tests: random workloads applied to (a) plain SQLite and (b)
   offshoot's sync/restore/fork paths must yield byte-equivalent query
   results.
@@ -416,9 +419,10 @@ left to a confusing failure.
    risky work on its own initiative (`claude mcp add offshoot`).
 3. **Python + TypeScript SDKs** — thin clients over the daemon's lifecycle
    API.
-4. **LangGraph integration** — a checkpointer *companion*: fork the
-   database when the thread forks, rather than a `BaseCheckpointSaver`
-   replacement.
+4. **LangGraph integration** — two layers: `OffshootSaver` is a
+   `BaseCheckpointSaver` companion that wraps the stock SQLite saver on an
+   offshoot checkout; `ThreadForks` keeps an existing checkpointer and forks
+   the agent's separate application database when the thread forks.
 
 See [docs/reference.md](reference.md) for the CLI in full and
 [docs/status.md](status.md) for exactly which parts of each surface are

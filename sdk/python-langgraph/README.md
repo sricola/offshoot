@@ -165,24 +165,28 @@ Pinned against `langgraph-checkpoint` 4.2.0 / `langgraph-checkpoint-sqlite`
 `get_tuple`, `list`, `delete_thread`, `get_next_version`, the async
 variants, plus the 4.x additions `copy_thread`, `delete_for_runs`, `prune`,
 `get_delta_channel_history`, `with_allowlist` — all delegated). Tested with
-`langgraph` 1.2.x. Both packages are pinned directly in `pyproject.toml`
+`langgraph` 1.2.x. Both checkpoint packages are pinned directly in `pyproject.toml`
 (`langgraph-checkpoint>=4.2,<5`, `langgraph-checkpoint-sqlite>=3.1,<4`), and
 `tests/test_delegation_tripwire.py` re-introspects the installed surface so
 an upstream release that adds a public method fails the suite loudly instead
-of silently bypassing the inner saver.
+of silently bypassing the inner saver. The full framework is intentionally a
+`test` extra rather than a runtime dependency: applications using this adapter
+already supply LangGraph, while the adapter itself only imports its checkpoint
+interfaces.
 
 ## Tests
 
 ```sh
-cd sdk/python-langgraph
-python -m pytest tests/
+python3 -m venv .venv-langgraph
+.venv-langgraph/bin/pip install -e sdk/python -e "sdk/python-langgraph[test]"
+PATH="$PWD/.venv-langgraph/bin:$PATH" make test-python-langgraph
 ```
 
 The tests build the real `offshoot` binary (`go build`, or set
 `OFFSHOOT_BIN`), start a real daemon, and drive a real compiled
-`StateGraph`. If `langgraph` isn't installed the suite skips —
-unless `OFFSHOOT_REQUIRE_LANGGRAPH` (or `CI`) is set, in which case it
-fails loudly.
+`StateGraph`. If the full `langgraph` framework isn't installed, the
+StateGraph module skips locally; `make test-python-langgraph`,
+`OFFSHOOT_REQUIRE_LANGGRAPH`, and CI instead fail loudly.
 
 ## License
 

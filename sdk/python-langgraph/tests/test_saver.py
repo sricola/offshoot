@@ -12,10 +12,11 @@ from typing import TypedDict
 
 import pytest
 
-# Skip the whole module (locally) when langgraph isn't installed; under
-# CI / OFFSHOOT_REQUIRE_LANGGRAPH conftest.pytest_configure has already
-# turned that into a hard failure before collection got this far.
-pytest.importorskip("langgraph")
+# The adapter's checkpoint-only tests can still run without the full
+# framework. compile_graph() below skips only the four StateGraph scenarios
+# locally when langgraph.graph is absent; under CI /
+# OFFSHOOT_REQUIRE_LANGGRAPH conftest.pytest_configure turns that into a hard
+# failure before collection gets this far.
 pytest.importorskip("langgraph.checkpoint.sqlite")
 
 from langgraph_checkpoint_offshoot import OffshootSaver  # noqa: E402
@@ -26,7 +27,8 @@ class S(TypedDict):
 
 
 def compile_graph(saver: OffshootSaver):
-    from langgraph.graph import END, START, StateGraph
+    graph = pytest.importorskip("langgraph.graph")
+    END, START, StateGraph = graph.END, graph.START, graph.StateGraph
 
     def add_one(state: S) -> dict:
         return {"n": state["n"] + 1}

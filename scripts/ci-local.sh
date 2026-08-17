@@ -36,9 +36,10 @@
 #   minio  -> the `s3-conformance` job: MinIO in Docker, `make test-s3`
 #             against it, always torn down after (trap, not just the happy
 #             path).
-#   sdks   -> the `sdks` job: `make test-sdks`, the pytest-plugin suite in
-#             a venv, and `make dry-run-sdks` if its tooling (build, twine,
-#             npm) is present — skipped loudly, not silently, if not.
+#   sdks   -> the `sdks` job: `make test-sdks`, the pytest-plugin and
+#             LangGraph companion suites in separate venvs, and `make
+#             dry-run-sdks` if its tooling (build, twine, npm) is present —
+#             skipped loudly, not silently, if not.
 #
 # Usage: scripts/ci-local.sh [host|linux|minio|sdks|all]   (default: all)
 
@@ -241,6 +242,26 @@ job_sdks() {
 		return "$status"
 	fi
 
+	# The companion's runtime dependencies intentionally stop at the
+	# checkpoint interfaces; its [test] extra adds the full framework used by
+	# the StateGraph integration tests. A separate venv preserves the base
+	# SDK's no-pytest proof above and mirrors ci.yml exactly.
+	log "LangGraph companion suite (isolated [test] extra, mirrors ci.yml)"
+	venv=".venv-ci-local-langgraph"
+	rm -rf "$venv"
+	python3 -m venv "$venv" || return 1
+	"$venv/bin/pip" install --quiet \
+		-e sdk/python -e "sdk/python-langgraph[test]" || {
+		rm -rf "$venv"
+		return 1
+	}
+	PATH="${REPO_ROOT}/${venv}/bin:${PATH}" make test-python-langgraph
+	status=$?
+	rm -rf "$venv"
+	if [ "$status" -ne 0 ]; then
+		return "$status"
+	fi
+
 	log "make dry-run-sdks (needs python3 build+twine, npm — skipped loudly if absent)"
 	if python3 -c "import build, twine" >/dev/null 2>&1; then
 		make dry-run-sdks
@@ -285,7 +306,7 @@ cmd_all() {
 	run_job host  "ci-local-host  (gofmt + go vet + go test -race, this host)" job_host
 	run_job linux "ci-local-linux (gofmt + vet + go test -race, docker/linux)" job_linux
 	run_job minio "ci-local-minio (MinIO in docker + make test-s3)"           job_minio
-	run_job sdks  "ci-local-sdks  (make test-sdks + pytest-plugin + dry-run)" job_sdks
+	run_job sdks  "ci-local-sdks  (SDKs + pytest plugin + LangGraph + dry-run)" job_sdks
 
 	overall=0
 	total_secs=0

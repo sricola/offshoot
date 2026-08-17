@@ -36,8 +36,9 @@ tar xzf offshoot_v0.2.9_linux_amd64.tar.gz
 docker run --rm -v offshoot-data:/data ghcr.io/sricola/offshoot:latest init
 ```
 
-Images publish to GHCR on every tagged release. The store lives in the
-`/data` volume, so reuse `-v offshoot-data:/data` across commands
+Multi-architecture `linux/amd64` and `linux/arm64` images publish to GHCR on
+every tagged release. The store lives in the `/data` volume, so reuse
+`-v offshoot-data:/data` across commands
 (`... offshoot:latest create app`, `... offshoot:latest serve`, and so
 on).
 

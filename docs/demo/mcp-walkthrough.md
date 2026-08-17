@@ -127,7 +127,7 @@ paraphrase:
         },
         {
           "name": "offshoot_fork",
-          "description": "Create an isolated copy of a database branch before attempting risky or destructive work (schema migrations, bulk deletes, experiments). Forking is instant and costs nothing until you write. Prefer forking over backing up by hand. ... Forked branches expire 24h0m0s after their last activity by default, unless promoted or touched; pass `ttl:\"none\"` to keep one indefinitely, or `ttl` as a Go duration string (e.g. \"2h\") to override. ...",
+          "description": "Create an isolated copy of a database branch before attempting risky or destructive work (schema migrations, bulk deletes, experiments). Fork storage starts with two small metadata objects, regardless of database size. Forking a named checkpoint does not read database contents; the default at-head fork hashes the checkout to warn about uncheckpointed changes. Prefer forking over backing up by hand. ... Forked branches expire 24h0m0s after their last activity by default, unless promoted or touched; pass `ttl:\"none\"` to keep one indefinitely, or `ttl` as a Go duration string (e.g. \"2h\") to override. ...",
           "inputSchema": {
             "properties": {"at": {"type": "string"}, "branch": {"default": "main", "type": "string"}, "database": {"type": "string"}, "new_branch": {"type": "string"}, "ttl": {"default": "24h0m0s", "type": "string"}},
             "required": ["database", "new_branch"], "type": "object"

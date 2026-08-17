@@ -546,6 +546,22 @@ live, running example — `.github/workflows/ci.yml`'s `sdks` job:
       - name: make test-pytest-plugin
         run: PATH="$PWD/.venv-pytest-plugin/bin:$PATH" make test-pytest-plugin
 
+      # The LangGraph companion intentionally keeps the full framework out of
+      # its runtime dependencies: it only imports checkpoint interfaces. Its
+      # end-to-end suite does compile a real StateGraph, so install the
+      # package's explicit [test] extra in a separate venv and arm the strict
+      # no-skip path through the Make target. Installing sdk/python alongside
+      # it satisfies offshoot-db from this checkout while that package remains
+      # intentionally unpublished.
+      - name: Install LangGraph companion test environment
+        run: |
+          python3 -m venv .venv-langgraph
+          .venv-langgraph/bin/pip install --quiet \
+            -e sdk/python -e "sdk/python-langgraph[test]"
+
+      - name: make test-python-langgraph
+        run: PATH="$PWD/.venv-langgraph/bin:$PATH" make test-python-langgraph
+
       # dry-run-sdks builds the real sdist/wheel and npm tarball, runs twine
       # check, and install-tests both — the same build-verification tier
       # .github/workflows/publish.yml runs in dry-run mode (PUBLISH_ENABLED
@@ -580,18 +596,18 @@ a user-site install under `$HOME`, which pytest's `pytester`-subprocess
 tests then can't see). The `setup-node` step is there because `make
 test-sdks` and `make dry-run-sdks` both also exercise the TypeScript SDK
 (`test-ts-sdk`, `dry-run-ts-sdk`) in the same job; a pytest-only CI setup
-that skips the TS pieces can drop that step and the two `make
-dry-run-sdks`-related steps at the end, keeping just checkout, setup-go,
-the `sqlite3` install, `make test-sdks`, and the two `pytest-plugin` steps.
+can drop that step, `make test-sdks`, the LangGraph-companion steps, and the
+two `make dry-run-sdks`-related steps at the end, keeping just checkout,
+setup-go, the `sqlite3` install, and the two `pytest-plugin` steps.
 
 That `Makefile` target (`make test-pytest-plugin`) is the exact template for
 your own CI job:
 
 ```makefile
-test-pytest-plugin:
+test-pytest-plugin: check-python-version
 	go build -o bin/offshoot-pytest-plugin-test ./cmd/offshoot
 	OFFSHOOT_BIN=$(CURDIR)/bin/offshoot-pytest-plugin-test \
-	  python3 -m pytest sdk/python/tests/test_pytest_plugin.py -v
+	  $(PYTHON) -m pytest sdk/python/tests/test_pytest_plugin.py -v
 ```
 
 Build the binary once (or download a tagged release binary — see Install

@@ -162,7 +162,7 @@ More "why not X" (Litestream, Dolt, Neon, plain `cp`):
 | Channel | How |
 |---|---|
 | **Homebrew** | `brew tap sricola/offshoot https://github.com/sricola/offshoot && brew trust sricola/offshoot && brew install offshoot` — recent Homebrew requires the explicit `trust` for third-party taps; the formula lives in-repo at [`Formula/offshoot.rb`](Formula/offshoot.rb) |
-| **Docker** | `docker run --rm -v offshoot-data:/data ghcr.io/sricola/offshoot:latest init` — images publish to GHCR on every tagged release; the store lives in the `/data` volume, so reuse `-v offshoot-data:/data` across commands (`… create app`, `… serve`, and so on) |
+| **Docker** | `docker run --rm -v offshoot-data:/data ghcr.io/sricola/offshoot:latest init` — multi-architecture `linux/amd64` and `linux/arm64` images publish to GHCR on every tagged release; the store lives in the `/data` volume, so reuse `-v offshoot-data:/data` across commands (`… create app`, `… serve`, and so on) |
 | **Prebuilt binaries** | `offshoot_vX_os_arch.tar.gz` (+ `.sha256`) from the [releases page](https://github.com/sricola/offshoot/releases), published for each tagged release |
 | **`go install`** | `go install github.com/sricola/offshoot/cmd/offshoot@latest` |
 | **From source** | the Quickstart above (Go 1.25+, cgo) |
@@ -559,18 +559,25 @@ counterpart of the pytest fixtures above. See
 
 Both SDKs are exercised against a real daemon by `make test-sdks` (needs
 `python3` and `node`/`npm` on PATH — not part of the default `make test`,
-which stays hermetic to the Go suite).
+which stays hermetic to the Go suite). The separate
+`make test-python-langgraph` target exercises the checkpoint companion against
+a real compiled `StateGraph`; install `sdk/python-langgraph[test]` first as
+documented in its README.
 
 ### LangGraph
 
-`offshoot.langgraph.ThreadForks` is a checkpointer *companion*, not a
-`BaseCheckpointSaver`: it maps each LangGraph thread to its own offshoot
-branch, so rewinding a thread to an earlier checkpoint and retrying also
-forks the *database* from that same point — the retry never inherits what
-the original attempt wrote after it. See
-[`examples/langgraph-rewind/`](examples/langgraph-rewind/), runnable with
-`python3 examples/langgraph-rewind/agent.py` — no server or bucket needed
-(it builds `offshoot` and starts its own private daemon).
+There are two deliberately separate integration layers:
+
+- [`langgraph-checkpoint-offshoot`](sdk/python-langgraph/README.md) provides
+  `OffshootSaver`, a real `BaseCheckpointSaver` that wraps LangGraph's stock
+  `SqliteSaver` on an offshoot-managed checkout. Use it when LangGraph's own
+  thread state should be forkable, rollbackable, promotable, and TTL-reaped.
+- `offshoot.langgraph.ThreadForks` in the core Python SDK keeps an existing
+  LangGraph checkpointer and maps each thread to a branch of the separate
+  application database the agent's tools modify. See
+  [`examples/langgraph-rewind/`](examples/langgraph-rewind/), runnable with
+  `python3 examples/langgraph-rewind/agent.py` — no server or bucket needed
+  (it builds `offshoot` and starts its own private daemon).
 
 ### Other agent frameworks
 

@@ -291,7 +291,10 @@ func (t *OffshootTools) Tools() []Tool {
 			Name: "offshoot_fork",
 			Description: "Create an isolated copy of a database branch before attempting " +
 				"risky or destructive work (schema migrations, bulk deletes, " +
-				"experiments). Forking is instant and costs nothing until you write. " +
+				"experiments). Fork storage starts with two small metadata objects, " +
+				"regardless of database size. Forking a named checkpoint does not read " +
+				"database contents; the default at-head fork hashes the checkout to warn " +
+				"about uncheckpointed changes. " +
 				"Prefer forking over backing up by hand. Forks from the branch's " +
 				"current head by default, or from a named checkpoint via `at`. If a " +
 				"daemon session is open on the source branch, its unflushed writes are " +

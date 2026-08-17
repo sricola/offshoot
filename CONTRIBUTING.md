@@ -19,7 +19,7 @@ You need:
 
 Optional, only needed for the SDK test tier:
 
-- `python3` (Python SDK tests)
+- Python 3.10+ as `python3` (Python SDK tests and tooling)
 - Node 20+ (TypeScript SDK tests)
 
 Optional, only needed for the pytest fixture plugin's OWN test tier
@@ -30,6 +30,15 @@ the base SDK's plain-`unittest` suites above need none of this):
 pip install -e "sdk/python[pytest]" pytest-xdist
 ```
 
+Optional, only needed for the LangGraph companion's end-to-end test tier
+(`sdk/python-langgraph`; kept separate so the base SDK test still proves a
+stdlib-only install):
+
+```
+python3 -m venv .venv-langgraph
+.venv-langgraph/bin/pip install -e sdk/python -e "sdk/python-langgraph[test]"
+```
+
 ```
 go build -o offshoot ./cmd/offshoot
 go vet ./...
@@ -37,17 +46,18 @@ go vet ./...
 
 ## Test tiers
 
-There are six, and they cost very different amounts of time. Run the tier
+There are seven, and they cost very different amounts of time. Run the tier
 that matches what you touched — don't run torture on a docs typo, and don't
 skip it on a capture-engine change.
 
 | Tier | Command | Cost | When required |
 |---|---|---|---|
 | Unit/integration | `go test ./... -race` | seconds | Always, every PR |
-| Torture (kill-9) | `make test-torture` | ~5 minutes | Touching `internal/capture` or `internal/session` flush paths |
+| Torture (writer kill-9 + capturer restart) | `make test-torture` | ~5 minutes | Touching `internal/capture` or `internal/session` flush paths |
 | S3 conformance | `make test-s3` | needs a real S3-compatible provider or MinIO running | Touching `internal/store`'s S3 backend or the CAS probe |
 | SDKs | `make test-sdks` | needs `python3` + Node 20+ | Touching `sdk/python`, `sdk/typescript`, or the daemon API surface they depend on |
 | pytest fixture plugin | `make test-pytest-plugin` | needs `pip install -e "sdk/python[pytest]" pytest-xdist` | Touching `sdk/python/offshoot/pytest_plugin.py` or its test suite — kept OUT of `test-sdks` on purpose, since that tier proves the base SDK works with no pytest installed at all |
+| LangGraph companion | `make test-python-langgraph` | needs the isolated `[test]`-extra venv above | Touching `sdk/python-langgraph`, LangGraph-facing checkpoint behavior, or the daemon API surface it depends on |
 | SDK publish dry-run | `make dry-run-sdks` | needs `python3` (+ `pip install build twine`) and `npm` | Touching either SDK's manifest (`pyproject.toml`, `package.json`, `sdk/VERSION`) or `.github/workflows/publish.yml` — see "Release process" below |
 
 `go test ./... -race` is hermetic and needs only the `sqlite3` CLI — that's
@@ -58,8 +68,10 @@ push.
 
 `make test-torture` is not optional cosmetics: it's the suite that proves the
 capture engine detects every divergence instead of silently absorbing it
-(random `kill -9` of both the writer and the capturer, verified with
-`sqlite3 .dump` equivalence after every round). If your change touches
+(random `kill -9` of the writer plus graceful capturer shutdown/restart,
+verified with `sqlite3 .dump` equivalence after every round). The harness does
+not `SIGKILL` the capturer; [docs/testing.md](docs/testing.md#the-kill--9-torture-harness)
+is the canonical statement of that boundary. If your change touches
 `internal/capture` or a flush path in `internal/session`, a PR without a
 torture run attached will get sent back for one, not tests we'll take on
 faith.

@@ -10,6 +10,8 @@ sdk/typescript/dry-run-install/
 sdk/python/dist/
 sdk/python/*.egg-info/
 sdk/python/.dry-run-venv/
+sdk/python-langgraph/*.egg-info/
+.venv-langgraph/
 __pycache__/
 
 # Docs site output (built in CI by site/gen, never committed).

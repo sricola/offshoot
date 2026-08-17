@@ -44,6 +44,16 @@ dependencies = [
   "offshoot-db>=0.1.0",
 ]
 
+# The adapter itself only needs LangGraph's checkpoint interfaces. Its
+# end-to-end suite additionally compiles and runs a real StateGraph, so keep
+# that heavier framework dependency explicit and opt-in instead of making
+# every runtime install pull the full langgraph package.
+[project.optional-dependencies]
+test = [
+  "langgraph>=1.2,<2",
+  "pytest>=7",
+]
+
 [project.urls]
 Homepage = "https://github.com/sricola/offshoot"
 Repository = "https://github.com/sricola/offshoot"

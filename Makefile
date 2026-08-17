@@ -1,6 +1,14 @@
-.PHONY: test test-torture build test-s3 bench bench-cow bench-s3 test-python-sdk test-ts-sdk test-sdks \
+.PHONY: test test-torture build test-s3 bench bench-cow bench-s3 check-python-version test-python-sdk test-ts-sdk test-sdks test-python-langgraph \
 	check-sdk-versions dry-run-python-sdk dry-run-ts-sdk dry-run-sdks test-pytest-plugin \
 	ci-local ci-local-host ci-local-linux ci-local-minio ci-local-sdks lint
+
+# Override with `make PYTHON=python3.14 ...` when the platform's unversioned
+# python3 is older than the SDKs' declared Python 3.10 minimum.
+PYTHON ?= python3
+
+check-python-version:
+	@$(PYTHON) -c 'import sys; sys.exit("offshoot SDK tooling requires Python 3.10+ (got " + sys.version.split()[0] + "); pass PYTHON=python3.10 or newer") if sys.version_info < (3, 10) else None'
+
 test:
 	go test ./... -count=1
 
@@ -78,13 +86,20 @@ bench-s3:
 # own suite — imports pytest at module level and must NOT be picked up here:
 # this target proves the base SDK's plain-unittest suites pass with no
 # pytest installed at all. See `make test-pytest-plugin` for that file.
-test-python-sdk:
-	cd sdk/python && python3 -m unittest tests.test_client tests.test_langgraph -v
+test-python-sdk: check-python-version
+	cd sdk/python && $(PYTHON) -m unittest tests.test_client tests.test_langgraph -v
 test-ts-sdk:
 	cd sdk/typescript && npm install --no-audit --no-fund && npm test
 # test-sdks is deliberately not a dependency of the default `test` target:
 # it needs python3 and node/npm on PATH, which the Go suite does not.
 test-sdks: test-python-sdk test-ts-sdk
+
+# The companion's runtime install deliberately depends only on LangGraph's
+# checkpoint packages; its [test] extra supplies pytest + the full framework
+# needed by these real-StateGraph integration tests. Keep this separate from
+# test-sdks so that target continues proving the base Python SDK is stdlib-only.
+test-python-langgraph: check-python-version
+	cd sdk/python-langgraph && OFFSHOOT_REQUIRE_LANGGRAPH=1 $(PYTHON) -m pytest tests -v
 
 # test-pytest-plugin runs offshoot.pytest_plugin's own test suite
 # (sdk/python/tests/test_pytest_plugin.py). Unlike test-python-sdk (plain
@@ -97,16 +112,16 @@ test-sdks: test-python-sdk test-ts-sdk
 # the offshoot binary once and pins OFFSHOOT_BIN so both the daemon fixture
 # and its nested pytester-driven runs reuse it instead of a repeat `go
 # build`.
-test-pytest-plugin:
+test-pytest-plugin: check-python-version
 	go build -o bin/offshoot-pytest-plugin-test ./cmd/offshoot
 	OFFSHOOT_BIN=$(CURDIR)/bin/offshoot-pytest-plugin-test \
-	  python3 -m pytest sdk/python/tests/test_pytest_plugin.py -v
+	  $(PYTHON) -m pytest sdk/python/tests/test_pytest_plugin.py -v
 
 # check-sdk-versions verifies sdk/VERSION (the single source of truth — see
 # CONTRIBUTING.md's "Release process") agrees with the version literally
 # spelled out in sdk/python/pyproject.toml and sdk/typescript/package.json.
-check-sdk-versions:
-	python3 scripts/check_sdk_versions.py
+check-sdk-versions: check-python-version
+	$(PYTHON) scripts/check_sdk_versions.py
 
 # dry-run-python-sdk builds the real sdist+wheel `offshoot-db` would publish,
 # runs twine's metadata check against them, then installs the wheel into a
@@ -119,10 +134,10 @@ check-sdk-versions:
 # CONTRIBUTING.md's dev setup.
 dry-run-python-sdk: check-sdk-versions
 	rm -rf sdk/python/dist
-	cd sdk/python && python3 -m build
-	python3 -m twine check sdk/python/dist/*
+	cd sdk/python && $(PYTHON) -m build
+	$(PYTHON) -m twine check sdk/python/dist/*
 	rm -rf sdk/python/.dry-run-venv
-	python3 -m venv sdk/python/.dry-run-venv
+	$(PYTHON) -m venv sdk/python/.dry-run-venv
 	sdk/python/.dry-run-venv/bin/pip install --quiet sdk/python/dist/*.whl
 	sdk/python/.dry-run-venv/bin/python3 -c "import offshoot; print('import offshoot: ok,', offshoot.__doc__.splitlines()[0])"
 	rm -rf sdk/python/.dry-run-venv

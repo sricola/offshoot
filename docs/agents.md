@@ -124,9 +124,11 @@ reference.
   API for harnesses that open and close sessions themselves. See the
   [Python SDK](../sdk/python/README.md) and
   [TypeScript SDK](../sdk/typescript/README.md).
-- **LangGraph** — `ThreadForks` maps each thread to its own branch, so
-  rewinding a conversation also rewinds the database
-  ([LangGraph adapter](../sdk/python-langgraph/README.md)).
+- **LangGraph** — `OffshootSaver` is a real `BaseCheckpointSaver` for putting
+  LangGraph's own thread state under offshoot; the core SDK's `ThreadForks`
+  helper instead keeps an existing checkpointer and maps each thread to a
+  branch of the agent's separate application database
+  ([LangGraph integrations](../sdk/python-langgraph/README.md)).
 - **Other frameworks** — the OpenAI Agents SDK, LlamaIndex, and CrewAI
   each get a short honest recipe: [framework recipes](recipes/frameworks.md),
   [OpenAI Agents SDK](recipes/openai-agents.md).

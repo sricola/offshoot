@@ -1,11 +1,14 @@
 # Recipe: other frameworks — notes, not adapters
 
 offshoot doesn't ship a LlamaIndex or CrewAI package, and this page isn't
-one in disguise. Per the roadmap's stance: LangGraph gets a real companion
-(`offshoot.langgraph.ThreadForks`, see
-[`examples/langgraph-rewind/`](../../examples/langgraph-rewind/)) because
-its thread/checkpoint model maps onto offshoot's branch/checkpoint model
-almost exactly. Claude Code hooks and the OpenAI Agents SDK get full
+one in disguise. Per the roadmap's stance, LangGraph gets two real
+integrations because its thread/checkpoint model maps onto offshoot's
+branch/checkpoint model almost exactly: `langgraph-checkpoint-offshoot`'s
+[`OffshootSaver`](../../sdk/python-langgraph/README.md) puts LangGraph's own
+checkpoint state under offshoot, while the core SDK's
+`offshoot.langgraph.ThreadForks` maps a thread to the separate application
+database ([example](../../examples/langgraph-rewind/)). Claude Code hooks
+and the OpenAI Agents SDK get full
 recipes (see [claude-agent-sdk.md](claude-agent-sdk.md) and
 [openai-agents.md](openai-agents.md)) because both have a single,
 official, SQLite-backed persistence knob you can point at an offshoot
