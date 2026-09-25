@@ -60,7 +60,7 @@ jobs:
       # real upload. See the CRITICAL fix note on those steps.
       should_publish: ${{ steps.gate.outputs.should_publish }}
     steps:
-      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
           persist-credentials: false
 
@@ -125,7 +125,7 @@ jobs:
       # real runs (a gate flip should never also be a permissions diff).
       id-token: write
     steps:
-      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
           persist-credentials: false
 
@@ -213,7 +213,7 @@ jobs:
       # below — see the NPM_TOKEN note on the publish step.
       id-token: write
     steps:
-      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
           persist-credentials: false
 
