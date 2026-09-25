@@ -143,7 +143,7 @@ paraphrase:
         },
         {
           "name": "offshoot_promote",
-          "description": "Ship a winning attempt: repoint the target branch (often `main`) at the source branch's current head, which resets the target's checkpoint history to just the new promote checkpoint. Call this once you've validated a forked attempt and are ready to make it the branch of record. Protected branches (main is protected by default) refuse promotion unless `force` is set — treat that refusal as confirmation you need, not a bug. ...",
+          "description": "Ship a winning attempt: repoint the target branch (often `main`) at the source branch's current head, which resets the target's checkpoint history to just the new promote checkpoint. The target's previous head is kept first as a shared safety fork named `<target>-pre-promote` (TTL'd; one per target, replaced by the next promote), so a promote is undone by promoting that fork back onto the target. Call this once you've validated a forked attempt and are ready to make it the branch of record. Protected branches (main is protected by default) refuse promotion unless `force` is set — treat that refusal as confirmation you need, not a bug. If a daemon session is open on the TARGET branch, the call is refused instead of proceeding — `force` does not override this — since promoting repoints the target's storage out from under a session the daemon still believes it owns; close the session first (e.g. `offshoot session close`) and retry. An open session on the SOURCE does not block the call, but the promoted state is the source's last-flushed/checkpointed head, not any write still unflushed in that live session — flush or checkpoint the source first if you need its very latest state promoted.",
           "inputSchema": {
             "properties": {"database": {"type": "string"}, "force": {"type": "boolean"}, "source": {"type": "string"}, "target": {"type": "string"}},
             "required": ["database", "source", "target"], "type": "object"
@@ -273,7 +273,7 @@ protected-branch guardrail (not a bug in its migration), and retries with
 
 ```json
 → {"jsonrpc":"2.0","id":10,"method":"tools/call","params":{"name":"offshoot_promote","arguments":{"database":"shop","source":"migration-attempt","target":"main","force":true}}}
-← {"jsonrpc":"2.0","id":10,"result":{"content":[{"type":"text","text":"promoted shop@migration-attempt onto shop@main at txid 4"}]}}
+← {"jsonrpc":"2.0","id":10,"result":{"content":[{"type":"text","text":"promoted shop@migration-attempt onto shop@main at txid 4; the previous shop@main head is kept as shop@main-pre-promote (undo: promote it back onto main)"}]}}
 ```
 
 ### 7. Cleanup and confirmation
@@ -285,13 +285,17 @@ protected-branch guardrail (not a bug in its migration), and retries with
 
 ```json
 → {"jsonrpc":"2.0","id":12,"method":"tools/call","params":{"name":"offshoot_list","arguments":{}}}
-← {"jsonrpc":"2.0","id":12,"result":{"content":[{"type":"text","text":"shop@main head=4 checkpoints=[promote] protected=true checked_out=true\n"}]}}
+← {"jsonrpc":"2.0","id":12,"result":{"content":[{"type":"text","text":"shop@main head=4 checkpoints=[promote] protected=true checked_out=true\nshop@main-pre-promote head=2 checkpoints=[fork] protected=false checked_out=false\n"}]}}
 ```
 
 Note `checkpoints=[promote]`: promote resets the target's checkpoint history
 to just the new `promote` checkpoint (see the `parallel-attempts` README's
 "What to look at" section for why — it's a side effect of where the new
-lineage comes from, not a bug).
+lineage comes from, not a bug). And note the second line: `main`'s
+pre-promote head (txid 2, the `baseline` state) survives as
+`main-pre-promote`, the shared, TTL'd safety fork promote keeps so the
+agent can undo — `offshoot_promote` with `source: "main-pre-promote"`,
+`target: "main"` — without having forked `main` by hand first.
 
 And the real data, confirmed by SQL against `main` after the promote:
 

@@ -125,6 +125,11 @@ export interface DestroyOptions {
 export interface PromoteOptions {
   /** Override the protected-target refusal. */
   force?: boolean;
+  /** Skip the `<onto>-pre-promote` safety fork that keeps the target's
+   * previous head (one per target, replaced by the next promote, TTL'd). */
+  noBackup?: boolean;
+  /** The safety fork's TTL as a Go duration string (default 24h). */
+  backupTtl?: string;
 }
 
 /** Options for {@link Client.touch}. */
@@ -392,9 +397,16 @@ export class Client {
     return resp.checkout ?? "";
   }
 
-  /** Repoint db@onto at db@source's head; returns the promoted txid. */
+  /** Repoint db@onto at db@source's head; returns the promoted txid.
+   *
+   * By default the target's previous head is kept first as a shared safety
+   * fork named `<onto>-pre-promote`, so a promote is undone by promoting that
+   * fork back onto the target. See {@link PromoteOptions} to skip or re-TTL it. */
   async promote(db: string, source: string, onto: string, opts: PromoteOptions = {}): Promise<number> {
-    const resp = await this._call("promote", { db, branch: source, name: onto, force: opts.force ?? false });
+    const resp = await this._call("promote", {
+      db, branch: source, name: onto, force: opts.force ?? false,
+      no_backup: opts.noBackup ?? false, backup_ttl: opts.backupTtl ?? "",
+    });
     return resp.txid ?? 0;
   }
 

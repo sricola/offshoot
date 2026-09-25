@@ -120,6 +120,16 @@ of work, leak branches forever, or take the slow path by default.*
   transition with cause. (Full metrics endpoint lands in v0.4.)
 - **Resource behavior documented.** No budgets yet (v0.4), but the current
   per-session disk/FD costs and failure modes go in the docs now.
+- **Promote keeps its own undo.** *(Added after launch, from the first
+  external design question — [discussion
+  #40](https://github.com/sricola/offshoot/discussions/40).)* Promote was
+  the one verb whose inverse the user had to build by hand (the demo's
+  "fork main first" step). It now keeps the target's previous head as a
+  shared, TTL'd `<target>-pre-promote` safety fork before repointing —
+  one rolling undo point per target, marker-guarded, opt-out via
+  `--no-backup`, always on for MCP. See
+  [docs/reference.md](docs/reference.md)'s promote section for the
+  pinning trade-off it accepts (bounded by the TTL).
 
 ## Milestone 3 — The eval-harness release
 

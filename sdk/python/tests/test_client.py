@@ -350,8 +350,16 @@ class TestClient(unittest.TestCase):
             self.assertEqual(rows, 0)  # rolled back before the insert
 
             c.fork("rp", "main", "feature")
-            txid = c.promote("rp", "feature", "main", force=True)
+            txid = c.promote("rp", "feature", "main", force=True, backup_ttl="2h")
             self.assertGreater(txid, 0)
+            # promote keeps main's previous head as main-pre-promote by
+            # default (a TTL'd shared fork), and backup=False skips it.
+            names = {b.branch: b for b in c.branches("rp")}
+            self.assertIn("main-pre-promote", names)
+            self.assertEqual(names["main-pre-promote"].ttl, "2h0m0s")
+            c.destroy("rp", "main-pre-promote")
+            c.promote("rp", "feature", "main", force=True, backup=False)
+            self.assertNotIn("main-pre-promote", {b.branch for b in c.branches("rp")})
 
     def test_dbs_lists_every_database_sorted(self):
         with offshoot.connect(self.d.sock) as c:

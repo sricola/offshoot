@@ -33,7 +33,7 @@ wherever it's optional.
 | `offshoot_checkpoint` | `database`, `name`, `branch?` | Name the current state so it can be rolled back to or forked from |
 | `offshoot_fork` | `database`, `new_branch`, `branch?`, `at?`, `ttl?` | Create an isolated branch from head, or from a checkpoint via `at` |
 | `offshoot_rollback` | `database`, `to`, `branch?` | Return a branch to a named checkpoint, discarding everything since |
-| `offshoot_promote` | `database`, `source`, `target`, `force?` | Repoint `target` at `source`'s head — ship the winning attempt |
+| `offshoot_promote` | `database`, `source`, `target`, `force?` | Repoint `target` at `source`'s head — ship the winning attempt. `target`'s previous head is kept as `<target>-pre-promote` (TTL'd, one per target), the undo handle the result names |
 | `offshoot_destroy` | `database`, `branch`, `force?` | Permanently discard a branch and its checkout |
 
 ## Forks expire by default

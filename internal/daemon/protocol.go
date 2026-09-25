@@ -48,6 +48,11 @@ type Request struct {
 	// checkout-at it instead overrides their own overwrite/cache-hit
 	// refusals (ops.Workspace.Export/CheckoutAt).
 	Force bool `json:"force,omitempty"`
+	// NoBackup (promote only) skips the <target>-pre-promote safety fork
+	// ops.PromoteWith mints by default; BackupTTL (promote only) is that
+	// fork's TTL as a Go duration string ("" = ops.DefaultPromoteBackupTTL).
+	NoBackup  bool   `json:"no_backup,omitempty"`
+	BackupTTL string `json:"backup_ttl,omitempty"`
 	// Path is export's destination file path — server-side, on the daemon's
 	// own host/filesystem. Trust model: the daemon speaks only a local unix
 	// socket, reachable only by a process that can already open that socket
@@ -74,10 +79,14 @@ type Request struct {
 
 // Response is the daemon's reply to a single Request.
 type Response struct {
-	OK       bool          `json:"ok"`
-	Error    string        `json:"error,omitempty"`
-	Checkout string        `json:"checkout,omitempty"`
-	TXID     uint64        `json:"txid,omitempty"`
+	OK       bool   `json:"ok"`
+	Error    string `json:"error,omitempty"`
+	Checkout string `json:"checkout,omitempty"`
+	TXID     uint64 `json:"txid,omitempty"`
+	// Backup (promote only) names the safety fork that kept the target's
+	// pre-promote head (ops.PromoteResult.Backup); empty when none was
+	// minted (no_backup, or the source was itself that safety fork).
+	Backup   string        `json:"backup,omitempty"`
 	Sessions []SessionInfo `json:"sessions,omitempty"`
 	Branches []BranchInfo  `json:"branches,omitempty"`
 	// Databases is every database this store has at least one ref for

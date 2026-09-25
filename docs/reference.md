@@ -392,7 +392,7 @@ but the checkout needs a manual `offshoot checkout` to catch up.
 
 **Errors:** unknown checkpoint name; lost a concurrent CAS race (retry).
 
-## `offshoot promote <db>@<source> --onto <target> [--force]`
+## `offshoot promote <db>@<source> --onto <target> [--force] [--no-backup] [--backup-ttl DUR]`
 
 ```
 offshoot promote app@attempt-1 --onto main --force
@@ -404,7 +404,32 @@ collision). `source` survives unchanged (it's typically left to TTL-reap
 later, or destroyed explicitly). `target`'s old lineage is orphaned and
 later garbage-collected; its checkpoint map resets to just `{"promote":
 <txid>}`. If `target` is protected (`main` is protected by default),
-`--force` is required. Promote never checks `target`'s lease at all — with
+`--force` is required.
+
+**The safety fork.** Because that reset makes promote the one verb whose
+inverse you'd otherwise have to build by hand ("fork `main` first, then
+promote"), promote builds it: before the repoint lands, `target`'s current
+head is kept as a shared fork named **`<target>-pre-promote`** — two
+metadata objects, no data copy — with a TTL (default 24h; `--backup-ttl
+2h` to change it; a safety fork always carries one) and the marker
+metadata `offshoot.pre-promote=<target>`. It is one rolling undo point per
+target: the next promote onto the same target replaces it, and it is only
+ever replaced when the branch at that name carries the marker — a branch
+of your own that merely shares the name makes promote refuse (destroy or
+rename it, or pass `--no-backup`). Undo a promote by promoting the safety
+fork back onto the target:
+
+```
+offshoot promote app@main-pre-promote --onto main --force
+```
+
+That undo skips minting a new safety fork (it would have to replace the
+branch being promoted) and leaves `main-pre-promote` in place. The cost to
+know: the safety fork's base pointer keeps `target`'s old lineage alive
+until the fork is reaped or destroyed, so the old lineage's storage is
+reclaimed after the TTL, not at promote time — exactly the "base-pointing
+into a lineage meant to die pins it" trade-off [concepts](concepts.md)
+describes, here bounded by the TTL. `--no-backup` skips all of this. Promote never checks `target`'s lease at all — with
 or without `--force` — and any lease on `target` is cleared by the repoint
 (the same unconditional clearing rollback does; see above), so `target` is
 immediately acquirable afterward regardless of who held it. `target`'s
@@ -412,8 +437,11 @@ checkout, if any, is refreshed after a busy probe — same best-effort
 semantics as rollback.
 
 **Errors:** `source == target`; `target` is protected without `--force`;
-target checkout is busy (repoint still lands; checkout refresh is skipped
-and reported); lost a concurrent CAS race (retry).
+`<target>-pre-promote` exists but is not promote's own safety fork (nothing
+is touched); the previous safety fork has a live lease (nothing is
+touched — close that session first, or `--no-backup`); target checkout is
+busy (repoint still lands; checkout refresh is skipped and reported); lost
+a concurrent CAS race (retry).
 
 ## `offshoot compact <db>[@branch]`
 

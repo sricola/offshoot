@@ -65,7 +65,8 @@ Usage:
                                      the new branch (fork)
   offshoot touch <db>[@branch] [--ttl duration|none]   reset a branch's activity clock, optionally (re)setting its TTL
   offshoot rollback <db>[@branch] --to <cp>       repoint a branch at a checkpoint
-  offshoot promote <db>@<src> --onto <target> [--force]   repoint target at src's head
+  offshoot promote <db>@<src> --onto <target> [--force] [--no-backup] [--backup-ttl DUR]
+                                                          repoint target at src's head; keeps target's old head as <target>-pre-promote
   offshoot compact <db>[@branch]     make a shared fork self-contained (its
                                      ancestor's storage becomes reclaimable
                                      by gc); no-op if already self-contained
@@ -532,27 +533,49 @@ func run(args []string) error {
 		fmt.Println(p)
 		return nil
 	case "promote":
-		force := false
+		const usage = "usage: offshoot promote <db>@<source> --onto <target> [--force] [--no-backup] [--backup-ttl DUR]"
+		var opts ops.PromoteOptions
 		fs := rest[:0]
-		for _, a := range rest {
-			if a == "--force" {
-				force = true
-				continue
+		for i := 0; i < len(rest); i++ {
+			switch a := rest[i]; a {
+			case "--force":
+				opts.Force = true
+			case "--no-backup":
+				opts.NoBackup = true
+			case "--backup-ttl":
+				if i+1 >= len(rest) {
+					return fmt.Errorf("%s", usage)
+				}
+				i++
+				d, err := time.ParseDuration(rest[i])
+				if err != nil || d <= 0 {
+					return fmt.Errorf("--backup-ttl must be a positive Go duration (e.g. 2h), got %q", rest[i])
+				}
+				opts.BackupTTL = d
+			default:
+				fs = append(fs, a)
 			}
-			fs = append(fs, a)
 		}
 		if len(fs) != 3 || fs[1] != "--onto" {
-			return fmt.Errorf("usage: offshoot promote <db>@<source> --onto <target> [--force]")
+			return fmt.Errorf("%s", usage)
 		}
 		db, srcBranch, err := ops.ParseTarget(fs[0])
 		if err != nil {
 			return err
 		}
-		txid, err := w.Promote(db, srcBranch, fs[2], force)
+		res, err := w.PromoteWith(db, srcBranch, fs[2], opts)
 		if err != nil {
 			return err
 		}
-		fmt.Printf("promoted %s@%s -> %s@%s at txid %d\n", db, srcBranch, db, fs[2], txid)
+		fmt.Printf("promoted %s@%s -> %s@%s at txid %d\n", db, srcBranch, db, fs[2], res.TXID)
+		if res.Backup != "" {
+			ttl := opts.BackupTTL
+			if ttl <= 0 {
+				ttl = ops.DefaultPromoteBackupTTL
+			}
+			fmt.Printf("kept the previous %s@%s head as %s@%s (expires in %s; undo with: offshoot promote %s@%s --onto %s --force)\n",
+				db, fs[2], db, res.Backup, ttl, db, res.Backup, fs[2])
+		}
 		return nil
 	case "compact":
 		if len(rest) != 1 {

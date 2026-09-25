@@ -20,10 +20,6 @@ sqlite3 "$DB" "CREATE TABLE orders (id INTEGER PRIMARY KEY, total TEXT);
 "$OFFSHOOT" checkpoint shop before-migration >/dev/null
 echo "    3 orders, checkpoint 'before-migration'"
 
-echo "==> keeping the pre-migration state on its own branch"
-"$OFFSHOOT" fork shop pre-migration --at before-migration >/dev/null
-echo "    forked 'pre-migration' from the 'before-migration' checkpoint — promote wipes main's own checkpoint history, so this fork is what actually survives"
-
 echo "==> forking three attempts (instant, no copy)"
 for i in 1 2 3; do "$OFFSHOOT" fork shop "attempt-$i" >/dev/null; done
 
@@ -60,8 +56,7 @@ done
 echo "==> winner: $WINNER"
 
 echo "==> promoting the winner onto main"
-"$OFFSHOOT" promote "shop@$WINNER" --onto main --force >/dev/null
-echo "    promoted"
+"$OFFSHOOT" promote "shop@$WINNER" --onto main --force | sed 's/^/    /'
 
 echo "==> discarding the losers"
 for i in 1 2 3; do
@@ -73,5 +68,5 @@ done
 echo "==> main now has the migrated data:"
 MAIN=$("$OFFSHOOT" checkout shop)
 sqlite3 -header "$MAIN" "SELECT id, total, total_cents FROM orders;" | sed 's/^/    /'
-echo "==> and the pre-migration state is still one command away, on its own branch:"
-echo "    offshoot checkout shop@pre-migration"
+echo "==> and the pre-migration state is still one command away, on the safety fork promote kept:"
+echo "    offshoot checkout shop@main-pre-promote"

@@ -221,9 +221,18 @@ class Client:
         resp = self._call("rollback", db=db, branch=branch, name=to)
         return cast(str, resp.get("checkout", ""))
 
-    def promote(self, db: str, source: str, onto: str, force: bool = False) -> int:
-        """Repoint db@onto at db@source's head; returns the promoted txid."""
-        resp = self._call("promote", db=db, branch=source, name=onto, force=force)
+    def promote(self, db: str, source: str, onto: str, force: bool = False,
+                backup: bool = True, backup_ttl: _TTL = None) -> int:
+        """Repoint db@onto at db@source's head; returns the promoted txid.
+
+        By default the target's previous head is kept first as a shared
+        safety fork named f"{onto}-pre-promote" (one per target, replaced by
+        the next promote, TTL'd — 24h unless backup_ttl sets a timedelta or
+        Go duration string), so a promote is undone by promoting that fork
+        back onto the target. backup=False skips it.
+        """
+        resp = self._call("promote", db=db, branch=source, name=onto, force=force,
+                          no_backup=not backup, backup_ttl=_ttl_str(backup_ttl))
         return cast(int, resp.get("txid", 0))
 
     def compact(self, db: str, branch: str = "main") -> int:

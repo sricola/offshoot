@@ -147,7 +147,11 @@ All three are the fork machinery pointed at a new, self-contained lineage.
 seeded from a checkpoint, keeping checkpoints at or before the target.
 **Promote** (`promote app@attempt-1 --onto main --force`) repoints the
 target at a lineage seeded from the source's head; the source survives
-unchanged, and the target's checkpoint map resets to just `promote`.
+unchanged, and the target's checkpoint map resets to just `promote` — but
+the target's previous head is kept first as a shared, TTL'd safety fork,
+`<target>-pre-promote`, so the promote can be undone by promoting that
+fork back (`--no-backup` skips it; see the
+[reference](reference.md#offshoot-promote-dbsource---onto-target---force---no-backup---backup-ttl-dur)).
 **Compact** (`compact app@b`) turns a shared fork into a self-contained
 branch — the manual lever for releasing a destroyed ancestor's storage —
 resetting its checkpoints to `compact`. Each pays a full copy

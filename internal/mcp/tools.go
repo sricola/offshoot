@@ -322,7 +322,11 @@ func (t *OffshootTools) Tools() []Tool {
 			Name: "offshoot_promote",
 			Description: "Ship a winning attempt: repoint the target branch (often `main`) " +
 				"at the source branch's current head, which resets the target's " +
-				"checkpoint history to just the new promote checkpoint. Call this once " +
+				"checkpoint history to just the new promote checkpoint. The target's " +
+				"previous head is kept first as a shared safety fork named " +
+				"`<target>-pre-promote` (TTL'd; one per target, replaced by the next " +
+				"promote), so a promote is undone by promoting that fork back onto the " +
+				"target. Call this once " +
 				"you've validated a forked attempt and are ready to make it the branch " +
 				"of record. Protected branches (main is protected by default) refuse promotion " +
 				"unless `force` is set — treat that refusal as confirmation you need, " +
@@ -788,11 +792,19 @@ func (t *OffshootTools) promote(args json.RawMessage) (ToolResult, error) {
 	if r, refused := t.refuseIfSessionOpen(a.Database, a.Target, "promoting onto it"); refused {
 		return r, nil
 	}
-	txid, err := t.ws.Promote(a.Database, a.Source, a.Target, a.Force)
+	// The safety fork's TTL follows the configured fork default when one is
+	// set (the same "every agent-made branch expires" policy offshoot_fork
+	// applies), else ops.DefaultPromoteBackupTTL.
+	res, err := t.ws.PromoteWith(a.Database, a.Source, a.Target,
+		ops.PromoteOptions{Force: a.Force, BackupTTL: t.defaultTTL})
 	if err != nil {
 		return ErrorResult("%v", err), nil
 	}
-	return TextResult("promoted %s@%s onto %s@%s at txid %d", a.Database, a.Source, a.Database, a.Target, txid), nil
+	if res.Backup == "" {
+		return TextResult("promoted %s@%s onto %s@%s at txid %d", a.Database, a.Source, a.Database, a.Target, res.TXID), nil
+	}
+	return TextResult("promoted %s@%s onto %s@%s at txid %d; the previous %s@%s head is kept as %s@%s (undo: promote it back onto %s)",
+		a.Database, a.Source, a.Database, a.Target, res.TXID, a.Database, a.Target, a.Database, res.Backup, a.Target), nil
 }
 
 type destroyArgs struct {

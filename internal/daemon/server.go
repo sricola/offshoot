@@ -852,14 +852,31 @@ func (s *Server) opPromote(req Request) Response {
 	if err := s.refuseIfClaimed(req.DB, target); err != nil {
 		return errResp(err)
 	}
+	opts := ops.PromoteOptions{Force: req.Force, NoBackup: req.NoBackup}
+	if req.BackupTTL != "" {
+		d, err := time.ParseDuration(req.BackupTTL)
+		if err != nil || d <= 0 {
+			return errResp(fmt.Errorf("daemon: promote backup_ttl must be a positive Go duration, got %q", req.BackupTTL))
+		}
+		opts.BackupTTL = d
+	}
+	if !opts.NoBackup {
+		// The safety fork replaces any previous <target>-pre-promote; a
+		// session open on that one here is refused up front, the same way
+		// the target itself is, instead of surfacing as a lease refusal
+		// from inside ops.Destroy.
+		if err := s.refuseIfClaimed(req.DB, target+ops.PromoteBackupSuffix); err != nil {
+			return errResp(err)
+		}
+	}
 	if err := s.flushIfOpen(req.DB, source, "promote"); err != nil {
 		return errResp(err)
 	}
-	txid, err := s.ws.Promote(req.DB, source, target, req.Force)
+	res, err := s.ws.PromoteWith(req.DB, source, target, opts)
 	if err != nil {
 		return errResp(err)
 	}
-	return Response{OK: true, TXID: txid}
+	return Response{OK: true, TXID: res.TXID, Backup: res.Backup}
 }
 
 // opCompact makes db@branch self-contained (ops.Compact): its full chain is

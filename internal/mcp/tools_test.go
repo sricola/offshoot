@@ -696,3 +696,36 @@ func TestForkTTLSummaryKeepsJanitorNoteWhenReReadFails(t *testing.T) {
 		t.Errorf("degraded path must still echo the applied TTL: %s", msg)
 	}
 }
+
+// TestPromoteKeepsSafetyForkAndSaysSo: offshoot_promote always keeps the
+// target's previous head as <target>-pre-promote (agents get no opt-out —
+// this is the safe-by-default path), its TTL follows the configured fork
+// default, and the result text names the fork so the agent knows its undo
+// handle. The description states the mechanism so the model can plan on it.
+func TestPromoteKeepsSafetyForkAndSaysSo(t *testing.T) {
+	ts, w := newTools(t, 2*time.Hour)
+	if _, err := w.Fork("app", "main", "attempt-1", "", 0, nil); err != nil {
+		t.Fatal(err)
+	}
+	r := call(t, ts, "offshoot_promote", map[string]any{
+		"database": "app", "source": "attempt-1", "target": "main", "force": true})
+	if r.IsError {
+		t.Fatalf("promote: %s", text(r))
+	}
+	backup := "main" + ops.PromoteBackupSuffix
+	if !strings.Contains(text(r), "app@"+backup) {
+		t.Fatalf("result must name the safety fork %s: %s", backup, text(r))
+	}
+	ref, _, err := w.Store.GetRef("app", backup)
+	if err != nil {
+		t.Fatalf("safety fork must exist: %v", err)
+	}
+	if ref.TTL != "2h0m0s" {
+		t.Fatalf("safety fork TTL must follow the configured fork default, got %q", ref.TTL)
+	}
+	for _, tl := range ts.Tools() {
+		if tl.Name == "offshoot_promote" && !strings.Contains(tl.Description, "-pre-promote") {
+			t.Fatalf("offshoot_promote description must state the safety fork: %s", tl.Description)
+		}
+	}
+}

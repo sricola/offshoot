@@ -1086,36 +1086,136 @@ func (w *Workspace) Rollback(db, branch, to string) (string, error) {
 // between the probe and the materialize rename still holds a stale file
 // descriptor. Acceptable for the single-operator local CLI; daemon mode
 // (Plan 3) will own the data path and close this gap.
+// PromoteBackupSuffix names promote's safety fork of the target: before the
+// repoint lands, the target's current head is kept as <target>-pre-promote
+// (a shared fork — two metadata objects, no data copy) so the one verb whose
+// inverse the user otherwise had to build by hand ("fork main first, then
+// promote") builds it itself. One rolling safety fork per target: the next
+// promote onto the same target replaces it, which is what keeps both the
+// branch namespace and the old lineage's pinned storage bounded.
+const PromoteBackupSuffix = "-pre-promote"
+
+// PromoteBackupMetaKey marks a branch as promote's own safety fork; its
+// value is the target branch it was taken from. Promote only ever replaces
+// a branch at the safety-fork name when it carries this marker — a user's
+// branch that merely shares the name is never destroyed.
+const PromoteBackupMetaKey = "offshoot.pre-promote"
+
+// DefaultPromoteBackupTTL bounds how long a safety fork (and the abandoned
+// lineage its base pointer keeps alive) survives when the caller sets no
+// BackupTTL. It matches the MCP fork default: an undo window, not an
+// archive — fork explicitly to keep old state indefinitely.
+const DefaultPromoteBackupTTL = 24 * time.Hour
+
+// PromoteOptions tunes PromoteWith. The zero value is a plain promote with
+// the safety fork on at DefaultPromoteBackupTTL.
+type PromoteOptions struct {
+	// Force overrides the protected-target refusal.
+	Force bool
+	// NoBackup skips the <target>-pre-promote safety fork entirely.
+	NoBackup bool
+	// BackupTTL is the safety fork's TTL; <= 0 means DefaultPromoteBackupTTL.
+	// A safety fork always carries a TTL.
+	BackupTTL time.Duration
+}
+
+// PromoteResult reports a promote: the promoted txid and, when one was
+// minted, the safety fork's branch name (empty under NoBackup, and when the
+// source itself IS the target's safety fork — the undo path — since minting
+// one would mean replacing the very branch being promoted).
+type PromoteResult struct {
+	TXID   uint64
+	Backup string
+}
+
+// Promote is PromoteWith with only Force settable: safety fork on, default
+// TTL. Kept for the CLI/daemon/MCP call sites and tests that predate
+// PromoteOptions.
 func (w *Workspace) Promote(db, source, target string, force bool) (uint64, error) {
+	res, err := w.PromoteWith(db, source, target, PromoteOptions{Force: force})
+	return res.TXID, err
+}
+
+// promoteBackup mints (or replaces) the target's safety fork. It runs after
+// the protected check and before the repoint, and never touches the
+// target's own ref — the caller's tgtEtag stays valid across it.
+func (w *Workspace) promoteBackup(db, target string, ttl time.Duration) (string, error) {
+	name := target + PromoteBackupSuffix
+	if err := store.ValidateName(name); err != nil {
+		return "", fmt.Errorf("ops: promote: cannot name the safety fork of %s@%s (pass --no-backup to skip it): %w", db, target, err)
+	}
+	if ttl <= 0 {
+		ttl = DefaultPromoteBackupTTL
+	}
+	existing, _, err := w.Store.GetRef(db, name)
+	switch {
+	case err == nil:
+		if existing.Meta[PromoteBackupMetaKey] != target {
+			return "", fmt.Errorf("ops: promote: %s@%s already exists and is not a promote safety fork of %s@%s; destroy or rename it, or pass --no-backup", db, name, db, target)
+		}
+		// Ours from an earlier promote: replace it. An unforced Destroy is
+		// deliberate — a live lease on the old safety fork (someone is
+		// working in it) refuses the promote rather than pulling the branch
+		// out from under them.
+		if err := w.Destroy(db, name, false); err != nil {
+			return "", fmt.Errorf("ops: promote: replacing the previous safety fork %s@%s: %w", db, name, err)
+		}
+	case errors.Is(err, store.ErrNotFound):
+	default:
+		return "", err
+	}
+	if _, err := w.Fork(db, target, name, "", ttl, map[string]string{PromoteBackupMetaKey: target}); err != nil {
+		return "", fmt.Errorf("ops: promote: safety fork of %s@%s: %w", db, target, err)
+	}
+	return name, nil
+}
+
+// PromoteWith repoints target at a new lineage seeded from source's head,
+// keeping target's previous head as a safety fork first unless opted out —
+// see PromoteOptions and PromoteBackupSuffix.
+func (w *Workspace) PromoteWith(db, source, target string, opts PromoteOptions) (PromoteResult, error) {
+	force := opts.Force
 	if source == target {
-		return 0, fmt.Errorf("ops: cannot promote a branch onto itself")
+		return PromoteResult{}, fmt.Errorf("ops: cannot promote a branch onto itself")
 	}
 	if err := store.ValidateName(db); err != nil {
-		return 0, err
+		return PromoteResult{}, err
 	}
 	if err := store.ValidateName(source); err != nil {
-		return 0, err
+		return PromoteResult{}, err
 	}
 	if err := store.ValidateName(target); err != nil {
-		return 0, err
+		return PromoteResult{}, err
 	}
 	src, _, err := w.Store.GetRef(db, source)
 	if err != nil {
-		return 0, err
+		return PromoteResult{}, err
 	}
 	w.warnIfUncheckpointed(db, source, src)
 	tgt, tgtEtag, err := w.Store.GetRef(db, target)
 	if err != nil {
-		return 0, err
+		return PromoteResult{}, err
 	}
 	if tgt.Protected && !force {
-		return 0, fmt.Errorf("ops: %s@%s is protected; use --force", db, target)
+		return PromoteResult{}, fmt.Errorf("ops: %s@%s is protected; use --force", db, target)
+	}
+	// The safety fork comes after every refusal above (an unforced promote
+	// onto a protected target mints nothing) and before the repoint, so the
+	// target's current head is durably reachable from its own branch name
+	// before anything abandons it.
+	var backup string
+	if !opts.NoBackup && source != target+PromoteBackupSuffix {
+		backup, err = w.promoteBackup(db, target, opts.BackupTTL)
+		if err != nil {
+			return PromoteResult{}, err
+		}
 	}
 	cp := headCheckpoint(src)
 	txid := cp.TXID
+	result := PromoteResult{TXID: txid, Backup: backup}
 	lineage, _, err := w.copySnapshotToNewLineage(src, cp)
 	if err != nil {
-		return 0, err
+		return PromoteResult{}, err
 	}
 	next := tgt
 	next.Lineage, next.Epoch, next.HeadTXID, next.HeadEpoch = lineage, 1, txid, 1
@@ -1134,26 +1234,26 @@ func (w *Workspace) Promote(db, source, target string, force bool) (uint64, erro
 	next.Touch(time.Now())
 	if _, err := w.Store.PutRef(db, target, next, tgtEtag); err != nil {
 		w.bestEffortDelete(store.SnapshotKey(lineage, 1, txid))
-		return 0, fmt.Errorf("ops: promote lost a race (retry): %w", err)
+		return PromoteResult{}, fmt.Errorf("ops: promote lost a race (retry): %w", err)
 	}
 	// Refresh the target checkout if one exists and is quiescible.
 	path := w.CheckoutPath(db, target)
 	if _, err := os.Stat(path); err == nil {
 		if err := quiesce(path); err != nil {
-			return txid, fmt.Errorf("ops: promoted, but checkout %s is in use and was NOT refreshed: %w", path, err)
+			return result, fmt.Errorf("ops: promoted, but checkout %s is in use and was NOT refreshed: %w", path, err)
 		}
 		checksum, err := w.materializeAt(next, headCheckpoint(next), path)
 		if err != nil {
-			return txid, fmt.Errorf("ops: promoted, but checkout %s could not be refreshed: %w", path, err)
+			return result, fmt.Errorf("ops: promoted, but checkout %s could not be refreshed: %w", path, err)
 		}
 		// The checkout now equals committed state: refresh the fingerprint
 		// (identity too, since this repointed to a new lineage) so a later
 		// Fork sees it as clean rather than stale.
 		if err := writeSum(path, next.Lineage, next.HeadEpoch, txid, checksum); err != nil {
-			return txid, fmt.Errorf("ops: promoted, but checkout %s could not be refreshed: %w", path, err)
+			return result, fmt.Errorf("ops: promoted, but checkout %s could not be refreshed: %w", path, err)
 		}
 	}
-	return txid, nil
+	return result, nil
 }
 
 // compactBeforeCASForTest, when non-nil, runs between Compact's snapshot

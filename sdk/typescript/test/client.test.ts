@@ -406,8 +406,16 @@ test("rollback, promote, status", async (t: TestContext) => {
     assert.equal(rows, "0"); // rolled back before the insert
 
     await c.fork("rp", "main", "feature");
-    const txid = await c.promote("rp", "feature", "main", { force: true });
+    const txid = await c.promote("rp", "feature", "main", { force: true, backupTtl: "2h" });
     assert.ok(txid > 0);
+    // promote keeps main's previous head as main-pre-promote by default (a
+    // TTL'd shared fork); noBackup skips it.
+    let names = new Map((await c.branches("rp")).map((b) => [b.branch, b]));
+    assert.equal(names.get("main-pre-promote")?.ttl, "2h0m0s");
+    await c.destroy("rp", "main-pre-promote");
+    await c.promote("rp", "feature", "main", { force: true, noBackup: true });
+    names = new Map((await c.branches("rp")).map((b) => [b.branch, b]));
+    assert.ok(!names.has("main-pre-promote"));
   } finally {
     await c.close();
   }

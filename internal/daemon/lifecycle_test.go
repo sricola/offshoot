@@ -11,6 +11,7 @@ import (
 	"testing"
 	"time"
 
+	"github.com/sricola/offshoot/internal/ops"
 	"github.com/sricola/offshoot/internal/store"
 )
 
@@ -1140,5 +1141,58 @@ func TestStatusReportsDurableAgeFlushErrorAndCaptureLag(t *testing.T) {
 	})
 	if healed.LastFlushAt == "" {
 		t.Fatalf("LastFlushAt must still be set after recovery: %+v", healed)
+	}
+}
+
+// TestPromoteKeepsSafetyForkThroughDaemon: the "promote" op mints the
+// <target>-pre-promote safety fork by default and reports its name; the
+// no_backup/backup_ttl fields are honored; and an open session on the
+// PREVIOUS safety fork refuses the promote up front (it would have to be
+// replaced) with the same close-the-session error the target itself gets.
+func TestPromoteKeepsSafetyForkThroughDaemon(t *testing.T) {
+	srv, w := newServer(t)
+	sock := srv.SocketPath()
+	if _, err := w.Fork("app", "main", "src", "", 0, nil); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := w.Fork("app", "main", "tgt", "", 0, nil); err != nil {
+		t.Fatal(err)
+	}
+	r := call(t, sock, Request{Op: "promote", DB: "app", Branch: "src", Name: "tgt", BackupTTL: "3h"})
+	if !r.OK {
+		t.Fatalf("promote = %+v", r)
+	}
+	if r.Backup != "tgt"+ops.PromoteBackupSuffix {
+		t.Fatalf("Backup = %q, want %q", r.Backup, "tgt"+ops.PromoteBackupSuffix)
+	}
+	ref, _, err := w.Store.GetRef("app", r.Backup)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if ref.TTL != "3h0m0s" {
+		t.Fatalf("backup_ttl not honored: TTL = %q", ref.TTL)
+	}
+	if r := call(t, sock, Request{Op: "promote", DB: "app", Branch: "src", Name: "tgt", BackupTTL: "-1h"}); r.OK || !strings.Contains(r.Error, "backup_ttl") {
+		t.Fatalf("negative backup_ttl must be refused, got %+v", r)
+	}
+
+	// A session on the previous safety fork blocks its replacement.
+	open := call(t, sock, Request{Op: "open", DB: "app", Branch: r.Backup})
+	if !open.OK {
+		t.Fatalf("open = %+v", open)
+	}
+	if r := call(t, sock, Request{Op: "promote", DB: "app", Branch: "src", Name: "tgt"}); r.OK || !strings.Contains(r.Error, "close") {
+		t.Fatalf("promote must refuse while the previous safety fork has an open session, got %+v", r)
+	}
+	// ...unless the caller opts out of the safety fork entirely.
+	r2 := call(t, sock, Request{Op: "promote", DB: "app", Branch: "src", Name: "tgt", NoBackup: true})
+	if !r2.OK {
+		t.Fatalf("no_backup promote = %+v", r2)
+	}
+	if r2.Backup != "" {
+		t.Fatalf("no_backup must report no safety fork, got %q", r2.Backup)
+	}
+	if cl := call(t, sock, Request{Op: "close", DB: "app", Branch: r.Backup}); !cl.OK {
+		t.Fatalf("close = %+v", cl)
 	}
 }

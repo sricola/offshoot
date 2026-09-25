@@ -62,7 +62,7 @@ That's most of the surface already. The full vocabulary, one line each
 | `create` / `checkout` | new database / materialize a working copy — prints a plain `.db` path |
 | `checkpoint` | snapshot the checkout as a named, rollback-able point |
 | `fork` | branch from head or a checkpoint — instant, copy-on-write, optional `--ttl` |
-| `rollback` / `promote` | repoint a branch at a checkpoint / repoint a target at a branch's head |
+| `rollback` / `promote` | repoint a branch at a checkpoint / repoint a target at a branch's head (keeping its old head as `<target>-pre-promote` to undo) |
 | `diff` / `export` | sqldiff two branches or checkpoints / copy state out to a plain file |
 | `destroy` / `gc` | delete a branch / collect unreachable objects |
 | `serve` / `session` | the daemon: leases, live capture, flush-without-pausing ([below](#daemon-mode)) |
@@ -82,8 +82,6 @@ promotes the one that's actually correct, and discards the other two —
 ==> building offshoot
 ==> creating a database with some data
     3 orders, checkpoint 'before-migration'
-==> keeping the pre-migration state on its own branch
-    forked 'pre-migration' from the 'before-migration' checkpoint — promote wipes main's own checkpoint history, so this fork is what actually survives
 ==> forking three attempts (instant, no copy)
 ==> running the migrations in parallel forks
     attempt-1: FAIL
@@ -91,15 +89,16 @@ promotes the one that's actually correct, and discards the other two —
     attempt-3: PASS
 ==> winner: attempt-3
 ==> promoting the winner onto main
-    promoted
+    promoted shop@attempt-3 -> shop@main at txid 3
+    kept the previous shop@main head as shop@main-pre-promote (expires in 24h0m0s; undo with: offshoot promote shop@main-pre-promote --onto main --force)
 ==> discarding the losers
 ==> main now has the migrated data:
     id|total|total_cents
     1|19.99|1999
     2|8.70|870
     3|4.35|435
-==> and the pre-migration state is still one command away, on its own branch:
-    offshoot checkout shop@pre-migration
+==> and the pre-migration state is still one command away, on the safety fork promote kept:
+    offshoot checkout shop@main-pre-promote
 ```
 
 </details>
