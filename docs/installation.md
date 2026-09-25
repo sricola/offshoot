@@ -1,6 +1,6 @@
 # Installation
 
-One binary, no server required. Linux and macOS; requires Go 1.25+ and cgo
+One binary, no server required. Linux and macOS; requires Go 1.26+ and cgo
 only if you build from source, and the `sqlite3` CLI only for running the
 test suite. Pick whichever channel fits:
 
@@ -56,7 +56,7 @@ cd offshoot
 go build -o offshoot ./cmd/offshoot
 ```
 
-Both need Go 1.25+ with cgo enabled (offshoot embeds SQLite via
+Both need Go 1.26+ with cgo enabled (offshoot embeds SQLite via
 `mattn/go-sqlite3`).
 
 ## Platform support

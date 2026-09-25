@@ -164,12 +164,12 @@ More "why not X" (Litestream, Dolt, Neon, plain `cp`):
 | **Docker** | `docker run --rm -v offshoot-data:/data ghcr.io/sricola/offshoot:latest init` — multi-architecture `linux/amd64` and `linux/arm64` images publish to GHCR on every tagged release; the store lives in the `/data` volume, so reuse `-v offshoot-data:/data` across commands (`… create app`, `… serve`, and so on) |
 | **Prebuilt binaries** | `offshoot_vX_os_arch.tar.gz` (+ `.sha256`) from the [releases page](https://github.com/sricola/offshoot/releases), published for each tagged release |
 | **`go install`** | `go install github.com/sricola/offshoot/cmd/offshoot@latest` |
-| **From source** | the Quickstart above (Go 1.25+, cgo) |
+| **From source** | the Quickstart above (Go 1.26+, cgo) |
 
 The full guide — store setup, S3 configuration, the fail-closed probe:
 [installation](https://sricola.github.io/offshoot/docs/installation/).
 
-Requires Go 1.25+ and cgo to build, and the `sqlite3` CLI for tests. Linux
+Requires Go 1.26+ and cgo to build, and the `sqlite3` CLI for tests. Linux
 and macOS only. **Windows:** use WSL2 — the Linux binaries, Docker image,
 and build-from-source all work there as-is. Native Windows is unsupported:
 offshoot leans on POSIX file semantics (unix sockets, POSIX locks) that

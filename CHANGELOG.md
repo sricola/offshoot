@@ -13,6 +13,81 @@ version if you depend on format stability.
 
 ## [Unreleased]
 
+## [0.2.10] - 2026-09-25
+
+### Added
+
+- **Promote keeps the target's previous head as a TTL'd safety fork.**
+  Promote was the one verb whose inverse the user had to build by hand
+  (the demo forked `main` before promoting, because promote resets the
+  target's checkpoint map). Now, before the repoint lands, the target's
+  head is kept as a shared fork named `<target>-pre-promote` — two
+  metadata objects, no data copy — marked `offshoot.pre-promote=<target>`
+  and TTL'd (24h by default). One rolling safety fork per target: the next
+  promote replaces it, and only ever replaces a branch carrying the
+  marker, so a user's branch at that name makes promote refuse instead.
+  Undo a promote by promoting the safety fork back onto the target (that
+  undo skips minting a new one). The accepted cost, documented in
+  docs/reference.md: the fork's base pointer pins the target's old
+  lineage until the TTL reaps it. Surface: CLI `--no-backup` /
+  `--backup-ttl DUR` plus a "kept … undo with" line; daemon `no_backup` /
+  `backup_ttl` request fields and a `backup` response field (a session
+  open on the previous safety fork is refused up front, like the target);
+  MCP `offshoot_promote` always keeps it (TTL follows the configured fork
+  default) and names the undo handle in its result; Python
+  `promote(backup=, backup_ttl=)`; TypeScript `PromoteOptions.noBackup` /
+  `backupTtl`. Prompted by
+  [discussion #40](https://github.com/sricola/offshoot/discussions/40).
+  The parallel-attempts demo, README transcript, asciicast, and MCP
+  walkthrough were re-captured from real runs.
+- `langgraph-checkpoint-offshoot` grows an explicit `[test]` extra and
+  its own `make test-python-langgraph` tier (wired into CI in a separate
+  venv, with the no-skip `OFFSHOOT_REQUIRE_LANGGRAPH` path armed), so the
+  companion is exercised against a real compiled `StateGraph` on every
+  push instead of skipping when langgraph is absent.
+- Release images are published for linux/amd64 and linux/arm64 (pinned
+  QEMU), and the release verifies both platforms are present in the
+  pushed index.
+
+### Fixed
+
+- **Flush could lose its final ref CAS to the session's own lease
+  heartbeat**, surfacing to daemon users as a spurious "flush lost a race
+  (retry)" failure. Renewals stamp a fresh `LeaseExpiry` into the ref via
+  the same CAS path, and a long flush (drain + encode + upload between
+  GetRef and PutRef) can span a heartbeat. Flush now re-reads the ref on a
+  CAS loss and, when it still carries our holder+epoch on the same lineage
+  with the head untouched — proof the only rival write was lease
+  bookkeeping — reapplies the head advance onto the fresh revision and
+  retries (bounded). Foreign holders, new epochs, new lineages, or a moved
+  head fail exactly as before. Pinned by `TestFlushSurvivesOwnLeaseRenewalRace`.
+- `TestForceDestroyStillClaimGuards` failed ~1% of macOS runs (and the
+  2026-09-20 weekly nightly) on a legitimate interleaving — AcquireLease
+  completing before a force Destroy's first read, which force then
+  destroys by design. The test now judges that both-succeed case by the
+  order the two ref writes reached the backend, so only a lease landing
+  after the Deleting claim (the actual double-winner) fails it. No change
+  to Destroy.
+- `offshoot_fork`'s MCP description states its real cost (two metadata
+  objects; at-head forks hash the checkout) instead of "costs nothing".
+- Test-suite flakes: a busy-timeout for `mustExec` against live-session
+  targets, a structural (not timed) concurrent-takeover rebase assertion,
+  and an observation race in `TestFlushLoopRetriesAfterRebaseDuringUpload`.
+
+### Changed
+
+- **Build floor moved from Go 1.25 to Go 1.26** (`go.mod`, Dockerfile
+  build stage, documented from-source requirement): `golang.org/x/sys`
+  v0.48.0 declares `go 1.26`. Dependency bumps in one pass (superseding
+  Dependabot PRs 42–44, 51–57): x/sys 0.48.0, aws-sdk-go-v2 1.46.0 (s3
+  1.111.0, config 1.33.3), smithy-go 1.28.1; actions/checkout 7.0.1,
+  actions/setup-go 7.0.0, docker/setup-buildx 4.3.0, docker/setup-qemu
+  4.3.0, actions/deploy-pages 5.0.1 (SHA pins + version comments).
+- Docs site: `llms.txt` and `llms-full.txt` emitted for LLM crawlers; the
+  README got a centered header, badges, nav, and scannable long sections.
+- `Makefile` gains a `check-python-version` guard (`PYTHON=` override) so
+  an old system `python3` fails loudly instead of confusingly.
+
 ### Removed
 
 - `flake.nix` (the Nix dev shell): unmaintained and untested next to the
