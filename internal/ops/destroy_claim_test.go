@@ -1,7 +1,9 @@
 package ops
 
 import (
+	"encoding/json"
 	"errors"
+	"strings"
 	"sync"
 	"testing"
 	"time"
@@ -86,9 +88,22 @@ func TestConcurrentDestroyAndAcquireLeaseHaveExactlyOneWinner(t *testing.T) {
 // pre-Task-6b unconditional DeleteRef — AcquireLease could win the lease
 // and then still have its branch deleted out from under it moments later;
 // that must not happen just because --force was given.
+//
+// One outcome needs care: BOTH calls can legitimately succeed, when the
+// goroutines happen to serialize with AcquireLease landing its lease before
+// Destroy's initial GetRef — force then bypasses the live-lease pre-check by
+// design and destroys a leased branch, which is exactly what --force means.
+// That is not the bug this test guards against (macOS reorders the two
+// goroutines this way ~1% of the time). The bug would be AcquireLease
+// succeeding AFTER the Deleting claim landed. So the both-succeed case is
+// judged structurally, by the order in which the two ref writes reached the
+// backend: lease-then-claim is a sequential force destroy (fine);
+// claim-then-lease is the claim guard failing (fatal).
 func TestForceDestroyStillClaimGuards(t *testing.T) {
 	for i := 0; i < 20; i++ {
 		w := newWS(t)
+		rec := &refWriteRecorder{Backend: w.Store.B}
+		w.Store.B = rec
 		if err := w.Create("app"); err != nil {
 			t.Fatal(err)
 		}
@@ -118,7 +133,11 @@ func TestForceDestroyStillClaimGuards(t *testing.T) {
 		switch {
 		case destroyErr == nil && gone:
 			if leaseErr == nil {
-				t.Fatalf("iter %d: force destroy won but AcquireLease also claimed success", i)
+				writes := rec.refWrites(store.RefKey("app", "contested"))
+				lease, claim := indexOf(writes, "lease:holder-b"), indexOf(writes, "claim")
+				if lease < 0 || claim < 0 || lease > claim {
+					t.Fatalf("iter %d: force destroy won but AcquireLease also claimed success, and the lease write did not precede the Deleting claim (ref writes: %v)", i, writes)
+				}
 			}
 		case leaseErr == nil && !gone:
 			if destroyErr == nil {
@@ -225,4 +244,62 @@ func TestDestroySelfHealsStaleDeletingClaim(t *testing.T) {
 	if !still.Deleting {
 		t.Fatal("a fresh Deleting claim must survive a ClearStaleDeleteClaims pass")
 	}
+}
+
+// refWriteRecorder wraps a backend and records, in order, every successful
+// PutIf of a ref key as a short label: "claim" for a Deleting-claim write,
+// "lease:<holder>" for a lease write, "other" otherwise. Only the ordering
+// of writes to one key is ever asserted on.
+type refWriteRecorder struct {
+	store.Backend
+	mu     sync.Mutex
+	writes map[string][]string
+}
+
+func (r *refWriteRecorder) PutIf(key string, data []byte, ifMatch string) (string, error) {
+	etag, err := r.Backend.PutIf(key, data, ifMatch)
+	if err != nil || !strings.HasPrefix(key, "refs/") {
+		return etag, err
+	}
+	var ref store.Ref
+	label := "other"
+	if json.Unmarshal(data, &ref) == nil {
+		switch {
+		case ref.Deleting:
+			label = "claim"
+		case ref.LeaseHolder != "":
+			label = "lease:" + ref.LeaseHolder
+		}
+	}
+	r.mu.Lock()
+	if r.writes == nil {
+		r.writes = map[string][]string{}
+	}
+	r.writes[key] = append(r.writes[key], label)
+	r.mu.Unlock()
+	return etag, nil
+}
+
+// DeleteIf keeps the wrapped backend's conditional-delete capability visible
+// through the wrapper (store.DeleteRefIf type-asserts for it).
+func (r *refWriteRecorder) DeleteIf(key, ifMatch string) error {
+	if cd, ok := r.Backend.(store.ConditionalDeleter); ok {
+		return cd.DeleteIf(key, ifMatch)
+	}
+	return r.Backend.Delete(key)
+}
+
+func (r *refWriteRecorder) refWrites(key string) []string {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	return append([]string(nil), r.writes[key]...)
+}
+
+func indexOf(xs []string, want string) int {
+	for i, x := range xs {
+		if x == want {
+			return i
+		}
+	}
+	return -1
 }
