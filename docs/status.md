@@ -72,7 +72,8 @@ resolves today). PyPI/npm registry names are unaffected — those stay
 | Guarantee / feature | Status | Notes |
 |---|---|---|
 | Local directory backend | shipped-and-tested | Quickstart's default; no bucket required |
-| MinIO | shipped-and-tested | `minio/minio:latest`, `make test-s3` passes the conformance suite for real (see README's provider table). Since v0.2.3 the env-gated `TestS3RealProvider` suite includes a real multipart-upload subtest, and it passes against MinIO — a real provider's `CompleteMultipartUpload` precondition/checksum handling is the one thing the in-process fake can never substitute for |
+| RustFS | shipped-and-tested | `rustfs/rustfs:1.0.0` (digest-pinned in ci.yml), `make test-s3` passes the conformance suite for real on every PR (see README's provider table) — probe, full conformance, and the real multipart-upload subtest whose `CompleteMultipartUpload` precondition/checksum handling is the one thing the in-process fake can never substitute for. CI's local provider since v0.2.10 |
+| MinIO | shipped | Verified through v0.2.9 (`minio/minio:latest`, last green 2026-09-10); MinIO withdrew its community images (Docker Hub, quay.io) and binaries (dl.min.io) in 2026, so nothing re-verifies it. Same code path as RustFS/AWS — downgraded from shipped-and-tested for honesty, not because anything broke |
 | AWS S3 | shipped-and-tested | `TestS3RealProvider` (probe + full conformance + the multipart subtest) passes against a real AWS S3 bucket (us-east-1, 2026-08-13) — including the `CompleteMultipartUpload` precondition/checksum semantics the in-process fake cannot exercise |
 | Google Cloud Storage | **not supported** | GCS's S3-interop API has no conditional writes; the attach probe refuses it outright rather than degrading |
 

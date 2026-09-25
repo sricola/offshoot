@@ -58,12 +58,23 @@ const benchSeedChunkMB = 4
 // newBenchWorkspace returns a Workspace backed by a fresh local store,
 // unless OFFSHOOT_S3_TEST_BUCKET is set — in which case it targets that
 // bucket instead, the same env-var convention TestS3RealProvider and `make
-// bench-s3` (docker MinIO) use. Every call gets its own key prefix so
-// concurrent/-count>1 runs never collide.
+// bench-s3` (docker RustFS) use, including OFFSHOOT_S3_CREATE_BUCKET=1 to
+// create the bucket on a disposable local server first. Every call gets
+// its own key prefix so concurrent/-count>1 runs never collide.
 func newBenchWorkspace(b *testing.B) *ops.Workspace {
 	b.Helper()
 	if bucket := os.Getenv("OFFSHOOT_S3_TEST_BUCKET"); bucket != "" {
 		b.Setenv("OFFSHOOT_CHECKOUTS", b.TempDir())
+		if os.Getenv("OFFSHOOT_S3_CREATE_BUCKET") == "1" {
+			if err := store.EnsureBucket(context.Background(), store.S3Config{
+				Bucket:       bucket,
+				Endpoint:     os.Getenv("OFFSHOOT_S3_ENDPOINT"),
+				Region:       os.Getenv("OFFSHOOT_S3_REGION"),
+				UsePathStyle: os.Getenv("OFFSHOOT_S3_PATH_STYLE") == "1",
+			}); err != nil {
+				b.Fatalf("OFFSHOOT_S3_CREATE_BUCKET=1: creating bucket %q: %v", bucket, err)
+			}
+		}
 		buf := make([]byte, 6)
 		if _, err := crand.Read(buf); err != nil {
 			b.Fatal(err)

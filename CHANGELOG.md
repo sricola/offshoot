@@ -76,6 +76,19 @@ version if you depend on format stability.
 
 ### Changed
 
+- **CI's S3 conformance provider is RustFS, not MinIO.** MinIO withdrew
+  its community images from Docker Hub and quay.io and its binaries from
+  dl.min.io in 2026 (the project archived its repo), which broke the
+  `s3-conformance` job on every push. `rustfs/rustfs:1.0.0` (digest-pinned)
+  passes the identical probe + conformance + multipart suite, so it is
+  now the every-PR provider; `make ci-local-s3` (old name `ci-local-minio`
+  still works) and `make bench-s3` follow. `TestS3RealProvider` gains
+  `OFFSHOOT_S3_CREATE_BUCKET=1` (creates the bucket on a disposable local
+  server, so no client image is needed either). The provider table now
+  lists MinIO as verified through v0.2.9 and no longer re-verified, and
+  AWS S3 as verified nightly: the `NIGHTLY_S3` real-provider job is
+  configured and green as of 2026-09-25, which starts the sustained-green
+  window the 1.0 criteria ask for.
 - **Build floor moved from Go 1.25 to Go 1.26** (`go.mod`, Dockerfile
   build stage, documented from-source requirement): `golang.org/x/sys`
   v0.48.0 declares `go 1.26`. Dependency bumps in one pass (superseding

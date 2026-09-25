@@ -54,7 +54,7 @@ skip it on a capture-engine change.
 |---|---|---|---|
 | Unit/integration | `go test ./... -race` | seconds | Always, every PR |
 | Torture (writer kill-9 + capturer restart) | `make test-torture` | ~5 minutes | Touching `internal/capture` or `internal/session` flush paths |
-| S3 conformance | `make test-s3` | needs a real S3-compatible provider or MinIO running | Touching `internal/store`'s S3 backend or the CAS probe |
+| S3 conformance | `make test-s3` | needs a real S3-compatible provider running (`make ci-local-s3` spins up RustFS in Docker) | Touching `internal/store`'s S3 backend or the CAS probe |
 | SDKs | `make test-sdks` | needs `python3` + Node 20+ | Touching `sdk/python`, `sdk/typescript`, or the daemon API surface they depend on |
 | pytest fixture plugin | `make test-pytest-plugin` | needs `pip install -e "sdk/python[pytest]" pytest-xdist` | Touching `sdk/python/offshoot/pytest_plugin.py` or its test suite — kept OUT of `test-sdks` on purpose, since that tier proves the base SDK works with no pytest installed at all |
 | LangGraph companion | `make test-python-langgraph` | needs the isolated `[test]`-extra venv above | Touching `sdk/python-langgraph`, LangGraph-facing checkpoint behavior, or the daemon API surface it depends on |
@@ -76,7 +76,7 @@ is the canonical statement of that boundary. If your change touches
 torture run attached will get sent back for one, not tests we'll take on
 faith.
 
-`make test-s3` needs a real provider or a local MinIO — the in-process fake
+`make test-s3` needs a real provider or a local RustFS — the in-process fake
 used by the unit tests proves nothing about a real bucket's conditional-write
 behavior, which is what the whole compare-and-swap safety story rests on.
 
@@ -89,7 +89,7 @@ minutes instead of waiting on a runner:
 |---|---|---|
 | `make ci-local-host` | the `test` job (ubuntu-only matrix), run on this host | `sqlite3`/`sqldiff` on PATH (dev-setup prerequisite above) |
 | `make ci-local-linux` | the `test` job's ubuntu leg, in Docker | Docker; module/build caches live in named volumes so repeat runs are fast |
-| `make ci-local-minio` | the `s3-conformance` job | Docker (spins up MinIO, runs `make test-s3`, always tears down) |
+| `make ci-local-s3` | the `s3-conformance` job | Docker (spins up RustFS at the digest ci.yml pins, runs `make test-s3`, always tears down) |
 | `make ci-local-sdks` | the `sdks` job | `python3`, Node 20+, and optionally `pip install build twine` for the `dry-run-sdks` step (skipped loudly, not silently, if absent) |
 
 `make ci-local` runs all four in sequence and prints a pass/fail-per-job

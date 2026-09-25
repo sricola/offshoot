@@ -241,7 +241,9 @@ call, not two different things being measured.
   instead of decode+re-encode), it just can't clone, so it falls back to
   `reflink.CopyFile`'s plain-byte-copy path — see "Task 6a: what changed"
   below for what that's still worth.
-- **S3 path:** `minio/minio:latest` in Docker on the same host, reached over
+- **S3 path:** `minio/minio:latest` in Docker on the same host (`make
+  bench-s3` now runs RustFS instead, since MinIO's images were withdrawn;
+  the numbers below were measured against MinIO and not re-measured), reached over
   loopback (`127.0.0.1`, host-mapped port). This is a real S3-API round trip
   (HTTP, request signing, `PutIf`-style conditional writes) but **not** a
   real network path — no WAN latency, no TLS. Treat it as "S3 API overhead

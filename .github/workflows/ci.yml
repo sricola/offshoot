@@ -244,15 +244,17 @@ jobs:
 
   s3-conformance:
     runs-on: ubuntu-latest
-    # MinIO is started with a plain `docker run` (see "Start MinIO" below)
-    # rather than a `services:` container: the job-level services schema has
-    # no way to pass `server /data` as the container command without
-    # replacing the image's entrypoint, and `docker run ... minio/minio
-    # server /data` is exactly the invocation the README's supported-provider
-    # table cites as verified, so this keeps CI matching that evidence. The
-    # only CI-side deviation: both images are digest-pinned (immutable)
-    # instead of `:latest`, so a replaced upstream tag can't silently change
-    # what runs next to the checkout.
+    # RustFS (an Apache-2.0 S3-compatible server) is the local provider the
+    # conformance suite runs against on every PR. It replaced MinIO in
+    # v0.2.10: MinIO's community images were withdrawn from Docker Hub and
+    # quay.io and its binaries from dl.min.io (the project archived its
+    # repo in 2026), so there is nothing left to pin. RustFS passes the same
+    # probe + conformance + multipart suite MinIO did (verified 2026-09-25).
+    # Started with a plain `docker run` rather than a `services:` container
+    # so the invocation matches `scripts/ci-local.sh` exactly; the image is
+    # digest-pinned (immutable) so a replaced upstream tag can't silently
+    # change what runs next to the checkout. The test creates its own
+    # bucket (OFFSHOOT_S3_CREATE_BUCKET=1), so no client image is needed.
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
@@ -262,42 +264,36 @@ jobs:
         with:
           go-version-file: go.mod
 
-      - name: Start MinIO
-        # Digest = what minio/minio:latest resolved to when last reviewed
-        # (# minio:RELEASE.2025-09-07T16-13-09Z). Bump deliberately, together
-        # with the mc digest below.
+      - name: Start RustFS
+        # Digest = what rustfs/rustfs:1.0.0 (= :latest) resolved to when last
+        # reviewed (2026-09-25). Bump deliberately, and re-run make test-s3
+        # against the new digest locally first (make ci-local-s3).
         run: |
-          docker run -d --name minio \
+          docker run -d --name rustfs \
             -p 9000:9000 \
-            -e MINIO_ROOT_USER=minioadmin \
-            -e MINIO_ROOT_PASSWORD=minioadmin \
-            minio/minio@sha256:14cea493d9a34af32f524e538b8346cf79f3321eff8e708c1e2960462bd8936e server /data
+            -e RUSTFS_ACCESS_KEY=rustfsadmin \
+            -e RUSTFS_SECRET_KEY=rustfsadmin \
+            rustfs/rustfs@sha256:8cc9801755448b71a786705ce76692c77e14936cccd87cf2fc31842e58f4d1ff
           for i in $(seq 1 30); do
-            if curl -sSf http://127.0.0.1:9000/minio/health/live >/dev/null; then
-              echo "minio is up"
+            if curl -sSf http://127.0.0.1:9000/health >/dev/null; then
+              echo "rustfs is up"
               break
             fi
             sleep 1
           done
-          curl -sSf http://127.0.0.1:9000/minio/health/live
-
-      - name: Create test bucket
-        # Digest = minio/mc:latest at last review (# mc:RELEASE.2025-08-13T08-35-41Z).
-        run: |
-          docker run --rm --network host \
-            -e MC_HOST_local=http://minioadmin:minioadmin@127.0.0.1:9000 \
-            minio/mc@sha256:a7fe349ef4bd8521fb8497f55c6042871b2ae640607cf99d9bede5e9bdf11727 mb -p local/offshoot-test
+          curl -sSf http://127.0.0.1:9000/health
 
       - name: make test-s3
         env:
           OFFSHOOT_S3_TEST_BUCKET: offshoot-test
+          OFFSHOOT_S3_CREATE_BUCKET: "1"
           OFFSHOOT_S3_ENDPOINT: http://127.0.0.1:9000
           OFFSHOOT_S3_PATH_STYLE: "1"
-          AWS_ACCESS_KEY_ID: minioadmin
-          AWS_SECRET_ACCESS_KEY: minioadmin
+          AWS_ACCESS_KEY_ID: rustfsadmin
+          AWS_SECRET_ACCESS_KEY: rustfsadmin
           AWS_REGION: us-east-1
         run: make test-s3
 
-      - name: Stop MinIO
+      - name: Stop RustFS
         if: always()
-        run: docker rm -f minio || true
+        run: docker rm -f rustfs || true

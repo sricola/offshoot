@@ -125,13 +125,14 @@ following hold:
    for one. Post-1.0, a format change without a migration is a 2.0.
 2. **AWS-proper S3 verification.** The S3 backend is verified against AWS
    itself, not only S3-compatible providers. Today the full backend
-   conformance suite runs against real MinIO in CI
+   conformance suite runs against real RustFS in CI
    (`.github/workflows/ci.yml`, `s3-conformance` job) and the nightly
    workflow has a credentialed real-provider job
    (`.github/workflows/nightly.yml`, `real-provider-conformance`, gated on
-   the `NIGHTLY_S3` repo variable); the 1.0 bar is that job running green
-   against an AWS bucket on a sustained basis, since multipart
-   checksum/precondition behavior is exactly where providers differ.
+   the `NIGHTLY_S3` repo variable — set on 2026-09-25, which is when the
+   clock below started); the 1.0 bar is that job running green against an
+   AWS bucket on a sustained basis, since multipart checksum/precondition
+   behavior is exactly where providers differ.
 3. **A soak period of nightly torture runs with zero divergence.** The
    kill-9 torture harness runs on the CI cadence stated in
    [testing.md](testing.md#the-kill--9-torture-harness) — that page is

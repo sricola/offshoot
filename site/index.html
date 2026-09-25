@@ -260,7 +260,7 @@ footer .g{color:var(--accent)}
     <text class="ts" text-anchor="end" x="522" y="114">ltx segments</text>
     <!-- store -->
     <rect class="store" x="16" y="138" width="608" height="112" rx="8"/>
-    <text x="30" y="160">your storage — local dir · s3 · minio</text>
+    <text x="30" y="160">your storage — local dir · s3 · s3-compatible</text>
     <!-- main chain -->
     <text class="tk" x="30" y="192">main</text>
     <rect class="box" x="88" y="176" width="78" height="24" rx="4"/>
@@ -348,7 +348,7 @@ footer .g{color:var(--accent)}
 
 <span class="c"># same binary, any store</span>
 <span class="p">$</span> offshoot -store ./.offshoot init             <span class="c"># local directory (default)</span>
-<span class="p">$</span> offshoot -store s3://my-bucket/offshoot init <span class="c"># S3, MinIO</span></code></pre>
+<span class="p">$</span> offshoot -store s3://my-bucket/offshoot init <span class="c"># S3 or any S3-compatible server</span></code></pre>
   <p class="note">Prebuilt binaries (<code>offshoot_vX_os_arch.tar.gz</code> +
   <code>.sha256</code>) ship with every tagged
   <a href="https://github.com/sricola/offshoot/releases">release</a>. Linux and macOS;

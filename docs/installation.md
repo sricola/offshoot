@@ -99,9 +99,9 @@ variable. Three variables are consulted for `s3://` specs:
 
 | Variable | Meaning |
 |---|---|
-| `OFFSHOOT_S3_ENDPOINT` | Custom endpoint (MinIO, or any S3-compatible endpoint); unset means AWS's default endpoint |
+| `OFFSHOOT_S3_ENDPOINT` | Custom endpoint (RustFS, MinIO, or any S3-compatible endpoint); unset means AWS's default endpoint |
 | `OFFSHOOT_S3_REGION` | Region; defaults to `auto` when a custom endpoint is set |
-| `OFFSHOOT_S3_PATH_STYLE` | `1` for path-style addressing (needed for MinIO) |
+| `OFFSHOOT_S3_PATH_STYLE` | `1` for path-style addressing (needed for RustFS/MinIO-style local endpoints) |
 
 For a *remote* (`s3://`) store, `OFFSHOOT_CHECKOUTS` controls where
 checkouts are materialized locally (default: a per-store directory under
@@ -115,8 +115,9 @@ probe pass against it for real:
 
 | Provider | Status |
 |---|---|
-| MinIO | verified in CI — the conformance suite runs against real MinIO on every PR and push to main |
-| AWS S3 | verified — probe + conformance + multipart passed against a real bucket (us-east-1, 2026-08-13) |
+| AWS S3 | verified — probe + conformance + multipart passes against a real bucket (us-east-1), nightly in CI since 2026-09-25 |
+| RustFS | verified in CI — the conformance suite runs against real RustFS on every PR and push to main |
+| MinIO | verified through v0.2.9; no longer in CI since MinIO withdrew its community images and binaries in 2026 (same code path, nothing re-verifies it) |
 | Google Cloud Storage (S3 interop) | **unsupported** — no conditional writes on the S3 API; the probe refuses it ([why](faq.md#why-no-google-cloud-storage)) |
 
 See [Limitations](limitations.md#s3-compatible-means-conditional-writes)

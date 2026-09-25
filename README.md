@@ -236,11 +236,12 @@ in unit tests proves nothing about a real provider.
 
 | Provider | Status |
 |---|---|
-| MinIO | verified in CI — the conformance suite runs against real MinIO[1] on every PR and push to main |
-| AWS S3 | verified — `TestS3RealProvider` (probe + conformance + multipart) passed against a real bucket (us-east-1, 2026-08-13) |
+| AWS S3 | verified — `TestS3RealProvider` (probe + conformance + multipart) passes against a real bucket (us-east-1), nightly in CI since 2026-09-25 |
+| RustFS | verified in CI — the conformance suite runs against real RustFS[1] on every PR and push to main |
+| MinIO | verified through v0.2.9 (probe + conformance + multipart passed against `minio/minio:latest`, last 2026-09-10); no longer in CI because MinIO withdrew its community images and binaries in 2026 — the code path is unchanged, so an existing MinIO deployment is expected to keep working, but nothing re-verifies it |
 | Google Cloud Storage (S3 interop) | **unsupported** — no conditional writes on the S3 API; the probe refuses it ([why](docs/faq.md#why-no-google-cloud-storage)) |
 
-[1] `minio/minio:latest` digest: `sha256:14cea493d9a34af32f524e538b8346cf79f3321eff8e708c1e2960462bd8936e`
+[1] `rustfs/rustfs:1.0.0` digest: `sha256:8cc9801755448b71a786705ce76692c77e14936cccd87cf2fc31842e58f4d1ff`
 
 Checkouts are always real local SQLite files; only the snapshots and refs
 live in the store.

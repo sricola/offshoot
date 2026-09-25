@@ -1,6 +1,6 @@
 .PHONY: test test-torture build test-s3 bench bench-cow bench-s3 check-python-version test-python-sdk test-ts-sdk test-sdks test-python-langgraph \
 	check-sdk-versions dry-run-python-sdk dry-run-ts-sdk dry-run-sdks test-pytest-plugin \
-	ci-local ci-local-host ci-local-linux ci-local-minio ci-local-sdks lint
+	ci-local ci-local-host ci-local-linux ci-local-s3 ci-local-minio ci-local-sdks lint
 
 # Override with `make PYTHON=python3.14 ...` when the platform's unversioned
 # python3 is older than the SDKs' declared Python 3.10 minimum.
@@ -56,30 +56,32 @@ bench-cow:
 	go test ./internal/ops -bench 'CoWDivergenceAddedBytes' -run '^$$' -benchtime=1x -count=3 -timeout 30m
 
 # bench-s3 runs the same benchmarks against a real S3-compatible backend
-# (MinIO in Docker) instead of the local store, so docs/benchmarks.md's
-# local-store numbers can be compared against the network-bound path.
-# Requires Docker. Always tears the container down, even on failure.
+# (RustFS in Docker — the same digest ci.yml pins) instead of the local
+# store, so docs/benchmarks.md's local-store numbers can be compared against
+# the network-bound path. Requires Docker. Always tears the container down,
+# even on failure. The benchmark bucket is created by the ops benchmarks'
+# own setup via OFFSHOOT_S3_CREATE_BUCKET (see internal/store's
+# EnsureBucketForTest) — no client image needed.
+S3_BENCH_IMAGE = rustfs/rustfs@sha256:8cc9801755448b71a786705ce76692c77e14936cccd87cf2fc31842e58f4d1ff
 bench-s3:
-	docker rm -f offshoot-bench-minio >/dev/null 2>&1 || true
-	docker run -d --name offshoot-bench-minio -p 9100:9000 \
-		-e MINIO_ROOT_USER=minioadmin -e MINIO_ROOT_PASSWORD=minioadmin \
-		minio/minio:latest server /data
+	docker rm -f offshoot-bench-s3 >/dev/null 2>&1 || true
+	docker run -d --name offshoot-bench-s3 -p 9100:9000 \
+		-e RUSTFS_ACCESS_KEY=rustfsadmin -e RUSTFS_SECRET_KEY=rustfsadmin \
+		$(S3_BENCH_IMAGE)
 	for i in $$(seq 1 30); do \
-		curl -sSf http://127.0.0.1:9100/minio/health/live >/dev/null 2>&1 && break; \
+		curl -sSf http://127.0.0.1:9100/health >/dev/null 2>&1 && break; \
 		sleep 1; \
 	done
-	curl -sSf http://127.0.0.1:9100/minio/health/live >/dev/null
-	docker run --rm --network container:offshoot-bench-minio \
-		-e MC_HOST_local=http://minioadmin:minioadmin@127.0.0.1:9000 \
-		minio/mc:latest mb -p local/offshoot-bench
+	curl -sSf http://127.0.0.1:9100/health >/dev/null
 	OFFSHOOT_S3_TEST_BUCKET=offshoot-bench \
+	OFFSHOOT_S3_CREATE_BUCKET=1 \
 	OFFSHOOT_S3_ENDPOINT=http://127.0.0.1:9100 \
 	OFFSHOOT_S3_PATH_STYLE=1 \
-	AWS_ACCESS_KEY_ID=minioadmin \
-	AWS_SECRET_ACCESS_KEY=minioadmin \
+	AWS_ACCESS_KEY_ID=rustfsadmin \
+	AWS_SECRET_ACCESS_KEY=rustfsadmin \
 	go test ./internal/ops -bench . -benchmem -run '^$$' -count=1 -short; \
 	status=$$?; \
-	docker rm -f offshoot-bench-minio >/dev/null 2>&1; \
+	docker rm -f offshoot-bench-s3 >/dev/null 2>&1; \
 	exit $$status
 # Named explicitly (not `discover -s tests`, which globs test_*.py) because
 # tests/test_pytest_plugin.py — the offshoot.pytest_plugin fixture plugin's
@@ -189,8 +191,9 @@ ci-local-host:
 	./scripts/ci-local.sh host
 ci-local-linux:
 	./scripts/ci-local.sh linux
-ci-local-minio:
-	./scripts/ci-local.sh minio
+ci-local-s3:
+	./scripts/ci-local.sh s3
+ci-local-minio: ci-local-s3 # old name
 ci-local-sdks:
 	./scripts/ci-local.sh sdks
 

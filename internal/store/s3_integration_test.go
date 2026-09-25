@@ -16,13 +16,26 @@ import (
 // TestS3RealProvider runs the full Backend conformance suite and the CAS
 // probe against a real S3-compatible provider. Set OFFSHOOT_S3_TEST_BUCKET
 // (plus OFFSHOOT_S3_ENDPOINT / OFFSHOOT_S3_REGION / OFFSHOOT_S3_PATH_STYLE
-// and credentials as needed) to enable it. This is the only evidence that
-// justifies listing a provider as supported — the in-process fake proves
-// nothing about a real provider's precondition handling.
+// and credentials as needed) to enable it. OFFSHOOT_S3_CREATE_BUCKET=1
+// additionally creates the bucket first if it is missing — for a
+// disposable local server (CI's RustFS container) that boots empty; never
+// set it against a real account. This is the only evidence that justifies
+// listing a provider as supported — the in-process fake proves nothing
+// about a real provider's precondition handling.
 func TestS3RealProvider(t *testing.T) {
 	bucket := os.Getenv("OFFSHOOT_S3_TEST_BUCKET")
 	if bucket == "" {
 		t.Skip("set OFFSHOOT_S3_TEST_BUCKET to run real-provider tests")
+	}
+	if os.Getenv("OFFSHOOT_S3_CREATE_BUCKET") == "1" {
+		if err := store.EnsureBucket(context.Background(), store.S3Config{
+			Bucket:       bucket,
+			Endpoint:     os.Getenv("OFFSHOOT_S3_ENDPOINT"),
+			Region:       os.Getenv("OFFSHOOT_S3_REGION"),
+			UsePathStyle: os.Getenv("OFFSHOOT_S3_PATH_STYLE") == "1",
+		}); err != nil {
+			t.Fatalf("OFFSHOOT_S3_CREATE_BUCKET=1: creating bucket %q: %v", bucket, err)
+		}
 	}
 	buf := make([]byte, 8)
 	if _, err := rand.Read(buf); err != nil {

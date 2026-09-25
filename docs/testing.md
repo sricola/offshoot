@@ -97,19 +97,21 @@ depends on — CAS behavior, create-only puts, list/delete edge cases:
 - **Local filesystem backend**: `internal/store/conformance_local_test.go`,
   on every `go test` run.
 - **S3 backend against a fake**: `internal/store/s3_test.go`, on every run.
-- **S3 backend against real MinIO**: CI runs the full conformance suite
-  plus the CAS probe against a real MinIO server in Docker on every PR and
+- **S3 backend against real RustFS**: CI runs the full conformance suite
+  plus the CAS probe against a real RustFS server in Docker on every PR and
   every push to main (`.github/workflows/ci.yml`, `s3-conformance` job →
   `make test-s3` → `TestS3RealProvider`,
-  `internal/store/s3_integration_test.go`).
+  `internal/store/s3_integration_test.go`). RustFS replaced MinIO here in
+  v0.2.10 after MinIO withdrew its community images and binaries; it
+  passes the identical suite, multipart preconditions included.
 - **Real cloud providers**: the nightly workflow has a credentialed
   real-provider job (`.github/workflows/nightly.yml`,
-  `real-provider-conformance`) that runs the same suite against an actual
-  S3 bucket when configured. Honest status: S3 support is
-  MinIO-verified in CI on every run, and `TestS3RealProvider` — probe,
-  full conformance, and the multipart subtest — has passed against a
-  real AWS S3 bucket (us-east-1, 2026-08-13); other S3-compatible
-  providers are same-code-path (see
+  `real-provider-conformance`, gated on the `NIGHTLY_S3` repo variable —
+  set and running green since 2026-09-25) that runs the same suite against
+  an actual AWS S3 bucket (us-east-1). Honest status: S3 support is
+  RustFS-verified on every push and AWS-verified nightly; MinIO was
+  verified through v0.2.9 and is same-code-path but no longer
+  re-verified; other S3-compatible providers are same-code-path only (see
   [stability.md](stability.md#proposed-v10-criteria)).
 
 ## The gates every change passes

@@ -33,7 +33,7 @@
 #             container, so Linux-only bugs (this repo has real history
 #             there) surface without needing a Linux box. Module/build
 #             caches live in named Docker volumes so repeat runs are fast.
-#   minio  -> the `s3-conformance` job: MinIO in Docker, `make test-s3`
+#   s3     -> the `s3-conformance` job: RustFS in Docker, `make test-s3`
 #             against it, always torn down after (trap, not just the happy
 #             path).
 #   sdks   -> the `sdks` job: `make test-sdks`, the pytest-plugin and
@@ -41,7 +41,7 @@
 #             dry-run-sdks` if its tooling (build, twine, npm) is present —
 #             skipped loudly, not silently, if not.
 #
-# Usage: scripts/ci-local.sh [host|linux|minio|sdks|all]   (default: all)
+# Usage: scripts/ci-local.sh [host|linux|s3|sdks|all]   (default: all)
 
 set -u
 
@@ -57,7 +57,9 @@ DOCKER_IMAGE="golang:${GO_MINOR}-bookworm"
 
 GOCACHE_VOLUME="ci-local-gocache"
 GOMODCACHE_VOLUME="ci-local-gomodcache"
-MINIO_CONTAINER="ci-local-minio"
+S3_CONTAINER="ci-local-rustfs"
+# Same digest ci.yml pins (rustfs/rustfs:1.0.0 at last review, 2026-09-25).
+S3_IMAGE="rustfs/rustfs@sha256:8cc9801755448b71a786705ce76692c77e14936cccd87cf2fc31842e58f4d1ff"
 
 log() { printf '\n--- ci-local: %s ---\n' "$*"; }
 err() { printf 'ci-local: %s\n' "$*" >&2; }
@@ -152,60 +154,53 @@ job_linux() {
 }
 
 # ---------------------------------------------------------------------------
-# minio — mirrors ci.yml's `s3-conformance` job.
+# s3 — mirrors ci.yml's `s3-conformance` job (RustFS since v0.2.10; MinIO's
+# images and binaries were withdrawn upstream — see the job's comment there).
 # ---------------------------------------------------------------------------
-job_minio() {
+job_s3() {
 	need_cmd docker || return 1
 	need_cmd curl || return 1
 
-	# Runs in a subshell with its own EXIT trap so MinIO is torn down no
+	# Runs in a subshell with its own EXIT trap so RustFS is torn down no
 	# matter how this job ends (success, test failure, or us bailing out
 	# early on a health-check timeout) — same intent as ci.yml's
-	# `Stop MinIO` step, which runs under `if: always()`.
+	# `Stop RustFS` step, which runs under `if: always()`.
 	(
 		set -u
-		trap 'docker rm -f "${MINIO_CONTAINER}" >/dev/null 2>&1 || true' EXIT
+		trap 'docker rm -f "${S3_CONTAINER}" >/dev/null 2>&1 || true' EXIT
 
-		docker rm -f "${MINIO_CONTAINER}" >/dev/null 2>&1 || true
+		docker rm -f "${S3_CONTAINER}" >/dev/null 2>&1 || true
 
-		log "starting MinIO (docker run minio/minio:latest server /data)"
-		docker run -d --name "${MINIO_CONTAINER}" \
+		log "starting RustFS (docker run ${S3_IMAGE})"
+		docker run -d --name "${S3_CONTAINER}" \
 			-p 9000:9000 \
-			-e MINIO_ROOT_USER=minioadmin \
-			-e MINIO_ROOT_PASSWORD=minioadmin \
-			minio/minio:latest server /data >/dev/null || exit 1
+			-e RUSTFS_ACCESS_KEY=rustfsadmin \
+			-e RUSTFS_SECRET_KEY=rustfsadmin \
+			"${S3_IMAGE}" >/dev/null || exit 1
 
 		up=0
 		for _ in $(seq 1 30); do
-			if curl -sSf http://127.0.0.1:9000/minio/health/live >/dev/null 2>&1; then
+			if curl -sSf http://127.0.0.1:9000/health >/dev/null 2>&1; then
 				up=1
 				break
 			fi
 			sleep 1
 		done
 		if [ "$up" -ne 1 ]; then
-			err "MinIO never became healthy after 30s"
+			err "RustFS never became healthy after 30s"
 			exit 1
 		fi
-		echo "minio is up"
+		echo "rustfs is up"
 
-		log "create test bucket (offshoot-test)"
-		# --network container:<name>, not ci.yml's --network host: shares the
-		# MinIO container's network namespace directly, so `mc` can reach
-		# 127.0.0.1:9000 without relying on Docker host networking, which
-		# Docker Desktop (macOS) doesn't support the way it does on the
-		# ubuntu-latest runner ci.yml targets. Same pattern already used by
-		# this Makefile's `bench-s3` target.
-		docker run --rm --network "container:${MINIO_CONTAINER}" \
-			-e MC_HOST_local=http://minioadmin:minioadmin@127.0.0.1:9000 \
-			minio/mc:latest mb -p local/offshoot-test || exit 1
-
+		# The test creates the bucket itself (OFFSHOOT_S3_CREATE_BUCKET=1),
+		# so no client image is needed — the same knob ci.yml sets.
 		log "make test-s3"
 		OFFSHOOT_S3_TEST_BUCKET=offshoot-test \
+			OFFSHOOT_S3_CREATE_BUCKET=1 \
 			OFFSHOOT_S3_ENDPOINT=http://127.0.0.1:9000 \
 			OFFSHOOT_S3_PATH_STYLE=1 \
-			AWS_ACCESS_KEY_ID=minioadmin \
-			AWS_SECRET_ACCESS_KEY=minioadmin \
+			AWS_ACCESS_KEY_ID=rustfsadmin \
+			AWS_SECRET_ACCESS_KEY=rustfsadmin \
 			AWS_REGION=us-east-1 \
 			make test-s3
 	)
@@ -305,7 +300,7 @@ fmt_secs() {
 cmd_all() {
 	run_job host  "ci-local-host  (gofmt + go vet + go test -race, this host)" job_host
 	run_job linux "ci-local-linux (gofmt + vet + go test -race, docker/linux)" job_linux
-	run_job minio "ci-local-minio (MinIO in docker + make test-s3)"           job_minio
+	run_job s3    "ci-local-s3    (RustFS in docker + make test-s3)"           job_s3
 	run_job sdks  "ci-local-sdks  (SDKs + pytest plugin + LangGraph + dry-run)" job_sdks
 
 	overall=0
@@ -314,7 +309,7 @@ cmd_all() {
 	printf 'ci-local summary\n'
 	printf '============================================================\n'
 	printf '%-14s %-6s %10s\n' "job" "result" "time"
-	for key in host linux minio sdks; do
+	for key in host linux s3 sdks; do
 		eval "st=\${${key}_status}"
 		eval "sec=\${${key}_secs}"
 		total_secs=$((total_secs + sec))
@@ -331,11 +326,12 @@ main() {
 	case "${1:-all}" in
 	host) job_host ;;
 	linux) job_linux ;;
-	minio) job_minio ;;
+	s3) job_s3 ;;
+	minio) job_s3 ;; # old name, kept for muscle memory
 	sdks) job_sdks ;;
 	all) cmd_all ;;
 	*)
-		err "usage: $0 [host|linux|minio|sdks|all]"
+		err "usage: $0 [host|linux|s3|sdks|all]"
 		exit 2
 		;;
 	esac
