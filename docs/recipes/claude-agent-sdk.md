@@ -41,8 +41,11 @@ forks and forgets is reap-eligible a day later rather than leaking the
 branch forever. An explicit `ttl` argument on the `offshoot_fork` call
 always overrides it (including `ttl:"none"` for no TTL); `-default-ttl
 none` on `offshoot mcp` itself changes the default for every fork that
-doesn't specify one. TTL alone reaps nothing without a running janitor
-(`offshoot serve`, or a manual `offshoot gc`) — see
+doesn't specify one. Reaping an expired TTL is `offshoot mcp
+-reap-every`'s own background pass (default `60s`; it defers entirely to a
+reachable `offshoot serve` daemon's janitor rather than running alongside
+it, and either way it runs no GC — reclaiming storage still needs
+`offshoot gc` or the daemon) — see
 [docs/reference.md](../reference.md)'s `offshoot mcp` entry for the full
 detail. This applies with or without the daemon-riding upgrade and the
 hooks below; it's true of every `offshoot_fork` call in this at-rest

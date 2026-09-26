@@ -144,7 +144,10 @@ that is meant to die would pin it forever
 
 All three are the fork machinery pointed at a new, self-contained lineage.
 **Rollback** (`rollback app@b --to v1`) repoints the branch at a lineage
-seeded from a checkpoint, keeping checkpoints at or before the target.
+seeded from a checkpoint, keeping checkpoints at or before the target —
+and, like promote below, keeps the branch's previous head first as a
+shared, TTL'd safety fork, `<branch>-pre-rollback`, so the rollback can be
+undone by promoting that fork back (`--no-backup` skips it).
 **Promote** (`promote app@attempt-1 --onto main --force`) repoints the
 target at a lineage seeded from the source's head; the source survives
 unchanged, and the target's checkpoint map resets to just `promote` — but
@@ -153,9 +156,12 @@ the target's previous head is kept first as a shared, TTL'd safety fork,
 fork back (`--no-backup` skips it; see the
 [reference](reference.md#offshoot-promote-dbsource---onto-target---force---no-backup---backup-ttl-dur)).
 **Compact** (`compact app@b`) turns a shared fork into a self-contained
-branch — the manual lever for releasing a destroyed ancestor's storage —
-resetting its checkpoints to `compact`. Each pays a full copy
-(~G bytes for a G-byte database).
+branch — the manual lever for releasing a destroyed ancestor's storage.
+Unlike promote, it does not reset the checkpoint map: every existing
+checkpoint's snapshot is copied into the new self-contained lineage
+(rollback-style), with a `compact` checkpoint added at head. Each of the
+three pays a full copy (~G bytes for a G-byte database), plus, for
+compact, one extra snapshot copy per distinct checkpoint txid kept.
 
 ## The concurrency model
 
@@ -196,14 +202,25 @@ lease expiry — exactly what the janitor's reap logic uses; `touch` resets
 the clock. A branch with an active lease is never
 reaped, protected branches are never reaped, and branches without a TTL
 live until destroyed. Reaping is the janitor's job — `offshoot serve`'s
-timer or an on-demand `offshoot gc`.
+timer, `offshoot mcp -reap-every`'s own background pass when no daemon is
+reachable (default `60s`; defers to the daemon's janitor instead of
+running alongside it), or an on-demand `offshoot gc`. GC itself (reclaiming
+a reaped branch's storage) still needs the daemon's janitor or `offshoot
+gc` either way — `-reap-every` on its own only reaps.
 
 ### Protected branch
 
-A per-branch flag, on by default for `main`: `destroy` and `promote
---onto` refuse without `--force`, uniformly across the CLI, the daemon,
-and the MCP server. This is what lets an agent fork and experiment freely
-without being able to vaporize `main` in a single unforced call
+A per-branch flag, on by default for `main` and settable for any other
+branch via `offshoot protect`/`unprotect` (CLI-only — no daemon op, no MCP
+tool): `destroy` and `promote --onto` refuse without `--force`, uniformly
+across the CLI, the daemon, and the MCP server. Through `offshoot mcp`,
+though, an agent's own `force:true` is not the CLI's `--force` in
+disguise: it's honored only when the server was started with
+`-allow-force` (off by default), so touching a protected branch through
+MCP is a permission the human running the server grants at startup, not
+an argument the agent can supply its own way past. This is what lets an
+agent fork and experiment freely without being able to vaporize `main` in
+a single unforced (or, by default, even forced) call
 ([invariant 7](architecture.md#invariants)).
 
 ### GC

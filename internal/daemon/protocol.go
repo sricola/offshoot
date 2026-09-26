@@ -50,9 +50,10 @@ type Request struct {
 	// checkout-at it instead overrides their own overwrite/cache-hit
 	// refusals (ops.Workspace.Export/CheckoutAt).
 	Force bool `json:"force,omitempty"`
-	// NoBackup (promote only) skips the <target>-pre-promote safety fork
-	// ops.PromoteWith mints by default; BackupTTL (promote only) is that
-	// fork's TTL as a Go duration string ("" = ops.DefaultPromoteBackupTTL).
+	// NoBackup (promote and rollback) skips the safety fork
+	// (<target>-pre-promote / <branch>-pre-rollback) ops.PromoteWith/
+	// ops.RollbackWith mints by default; BackupTTL (promote and rollback) is
+	// that fork's TTL as a Go duration string ("" = ops.DefaultPromoteBackupTTL).
 	NoBackup  bool   `json:"no_backup,omitempty"`
 	BackupTTL string `json:"backup_ttl,omitempty"`
 	// Path is export's destination file path — server-side, on the daemon's
@@ -95,9 +96,11 @@ type Response struct {
 	Error    string `json:"error,omitempty"`
 	Checkout string `json:"checkout,omitempty"`
 	TXID     uint64 `json:"txid,omitempty"`
-	// Backup (promote only) names the safety fork that kept the target's
-	// pre-promote head (ops.PromoteResult.Backup); empty when none was
-	// minted (no_backup, or the source was itself that safety fork).
+	// Backup (promote and rollback) names the safety fork that kept the
+	// previous head — the target's for promote (ops.PromoteResult.Backup),
+	// the branch's for rollback (ops.RollbackResult.Backup); empty when
+	// none was minted (no_backup, or, for promote, the source was itself
+	// that safety fork).
 	Backup   string        `json:"backup,omitempty"`
 	Sessions []SessionInfo `json:"sessions,omitempty"`
 	Branches []BranchInfo  `json:"branches,omitempty"`

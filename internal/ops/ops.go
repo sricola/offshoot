@@ -943,15 +943,55 @@ func (w *Workspace) Fork(db, srcBranch, newBranch, at string, ttl time.Duration,
 	return txid, nil
 }
 
-// Rollback repoints db@branch at a NEW lineage seeded from checkpoint `to`
-// and re-materializes the fixed checkout path, returning the checkout path.
-// The old lineage is orphaned (collected later by GC). Checkpoints at or
-// before `to` are kept, and EVERY kept checkpoint's snapshot is copied into
-// the new lineage (not just `to`'s) so a later rollback or fork to an
-// earlier kept checkpoint still finds its snapshot object once the old
-// lineage is gone — otherwise it fails "not found" once GC reaps the old
-// lineage, since the ref itself no longer references it after this repoint.
-// Later checkpoints are dropped.
+// RollbackBackupSuffix names rollback's safety fork of the branch: before
+// the repoint lands, the branch's current head is kept as
+// <branch>-pre-rollback (a shared fork — two metadata objects, no data
+// copy), mirroring PromoteBackupSuffix. One rolling safety fork per branch:
+// the next rollback of the same branch replaces it.
+const RollbackBackupSuffix = "-pre-rollback"
+
+// RollbackBackupMetaKey marks a branch as rollback's own safety fork; its
+// value is the branch it was taken from. Rollback only ever replaces a
+// branch at the safety-fork name when it carries this marker — a user's
+// branch that merely shares the name is never destroyed.
+const RollbackBackupMetaKey = "offshoot.pre-rollback"
+
+// RollbackOptions tunes RollbackWith. The zero value is a plain rollback
+// with the safety fork on at DefaultPromoteBackupTTL (reused as rollback's
+// default too — there is no separate DefaultRollbackBackupTTL).
+type RollbackOptions struct {
+	// NoBackup skips the <branch>-pre-rollback safety fork entirely.
+	NoBackup bool
+	// BackupTTL is the safety fork's TTL; <= 0 means DefaultPromoteBackupTTL.
+	// A safety fork always carries a TTL.
+	BackupTTL time.Duration
+}
+
+// RollbackResult reports a rollback: the refreshed checkout path and, when
+// one was minted, the safety fork's branch name (empty under NoBackup).
+type RollbackResult struct {
+	Path   string
+	Backup string
+}
+
+// Rollback is RollbackWith with defaults: safety fork on, default TTL. Kept
+// for the CLI/daemon/MCP call sites and tests that predate RollbackOptions.
+func (w *Workspace) Rollback(db, branch, to string) (string, error) {
+	res, err := w.RollbackWith(db, branch, to, RollbackOptions{})
+	return res.Path, err
+}
+
+// RollbackWith repoints db@branch at a NEW lineage seeded from checkpoint
+// `to` and re-materializes the fixed checkout path, returning the checkout
+// path and, unless NoBackup, the branch's previous head kept first as a
+// TTL'd safety fork (see RollbackOptions and RollbackBackupSuffix). The old
+// lineage is orphaned (collected later by GC). Checkpoints at or before
+// `to` are kept, and EVERY kept checkpoint's snapshot is copied into the
+// new lineage (not just `to`'s) so a later rollback or fork to an earlier
+// kept checkpoint still finds its snapshot object once the old lineage is
+// gone — otherwise it fails "not found" once GC reaps the old lineage,
+// since the ref itself no longer references it after this repoint. Later
+// checkpoints are dropped.
 //
 // The ref CAS is the point of no return: once it lands, the branch has
 // repointed. The checkout refresh that follows (busy probe, materialize,
@@ -963,28 +1003,44 @@ func (w *Workspace) Fork(db, srcBranch, newBranch, at string, ttl time.Duration,
 // opened between the probe and the materialize rename still holds a stale
 // file descriptor. Acceptable for the single-operator local CLI; daemon
 // mode (Plan 3) will own the data path and close this gap.
-func (w *Workspace) Rollback(db, branch, to string) (string, error) {
+func (w *Workspace) RollbackWith(db, branch, to string, opts RollbackOptions) (RollbackResult, error) {
 	if err := store.ValidateName(db); err != nil {
-		return "", err
+		return RollbackResult{}, err
 	}
 	if err := store.ValidateName(branch); err != nil {
-		return "", err
+		return RollbackResult{}, err
 	}
 	if err := store.ValidateName(to); err != nil {
-		return "", err
+		return RollbackResult{}, err
 	}
 	ref, etag, err := w.Store.GetRef(db, branch)
 	if err != nil {
-		return "", err
+		return RollbackResult{}, err
 	}
 	cp, ok := ref.Checkpoints[to]
 	if !ok {
-		return "", fmt.Errorf("ops: no checkpoint %q on %s@%s", to, db, branch)
+		return RollbackResult{}, fmt.Errorf("ops: no checkpoint %q on %s@%s", to, db, branch)
 	}
 	txid := cp.TXID
+
+	// The safety fork comes after the checkpoint lookup (a bad `to` fails
+	// before anything is minted) and before copySnapshotToNewLineage repoints
+	// anything, so the branch's current head is durably reachable from its
+	// own safety-fork name before the repoint abandons it. safetyFork reads
+	// branch's ref itself (Fork never writes the source ref), so `ref`/`etag`
+	// captured above stay valid across it — exactly the invariant
+	// promoteBackup documents for PromoteWith's tgtEtag.
+	var backup string
+	if !opts.NoBackup {
+		backup, err = w.safetyFork(db, branch, RollbackBackupSuffix, RollbackBackupMetaKey, "rollback", opts.BackupTTL)
+		if err != nil {
+			return RollbackResult{}, err
+		}
+	}
+
 	lineage, _, err := w.copySnapshotToNewLineage(ref, cp)
 	if err != nil {
-		return "", err
+		return RollbackResult{}, err
 	}
 	copiedKeys := []string{store.SnapshotKey(lineage, 1, txid)}
 	cleanup := func() {
@@ -1016,7 +1072,7 @@ func (w *Workspace) Rollback(db, branch, to string) (string, error) {
 			key, err := w.copySnapshotIntoLineage(ref, c, lineage)
 			if err != nil {
 				cleanup()
-				return "", fmt.Errorf("ops: rollback: copying checkpoint snapshot for txid %d: %w", c.TXID, err)
+				return RollbackResult{}, fmt.Errorf("ops: rollback: copying checkpoint snapshot for txid %d: %w", c.TXID, err)
 			}
 			copiedKeys = append(copiedKeys, key)
 		}
@@ -1045,7 +1101,7 @@ func (w *Workspace) Rollback(db, branch, to string) (string, error) {
 	next.Touch(time.Now())
 	if _, err := w.Store.PutRef(db, branch, next, etag); err != nil {
 		cleanup()
-		return "", fmt.Errorf("ops: rollback lost a race (retry): %w", err)
+		return RollbackResult{}, fmt.Errorf("ops: rollback lost a race (retry): %w", err)
 	}
 
 	// The branch has repointed. Everything below is a best-effort refresh of
@@ -1071,9 +1127,9 @@ func (w *Workspace) Rollback(db, branch, to string) (string, error) {
 		return writeSum(path, next.Lineage, next.HeadEpoch, txid, checksum)
 	}
 	if err := refresh(); err != nil {
-		return "", fmt.Errorf("ops: branch repointed to checkpoint %q (txid %d), but the checkout could not be refreshed (run 'offshoot checkout' to re-materialize): %w", to, txid, err)
+		return RollbackResult{}, fmt.Errorf("ops: branch repointed to checkpoint %q (txid %d), but the checkout could not be refreshed (run 'offshoot checkout' to re-materialize): %w", to, txid, err)
 	}
-	return path, nil
+	return RollbackResult{Path: path, Backup: backup}, nil
 }
 
 // Promote repoints db@target at a NEW lineage seeded from db@source's head
@@ -1136,13 +1192,22 @@ func (w *Workspace) Promote(db, source, target string, force bool) (uint64, erro
 	return res.TXID, err
 }
 
-// promoteBackup mints (or replaces) the target's safety fork. It runs after
-// the protected check and before the repoint, and never touches the
-// target's own ref — the caller's tgtEtag stays valid across it.
-func (w *Workspace) promoteBackup(db, target string, ttl time.Duration) (string, error) {
-	name := target + PromoteBackupSuffix
+// safetyFork mints (or replaces) branch's safety fork <branch><suffix>. It
+// is the shared helper behind both Promote's <target>-pre-promote and
+// Rollback's <branch>-pre-rollback: verb names the caller in every error
+// (so "not a promote safety fork" / "not a rollback safety fork" reads
+// naturally) and metaKey is that caller's own marker key. It replaces a
+// branch at the safety-fork name only when it carries meta[metaKey]==branch
+// — a user's branch that merely shares the name is never destroyed, and the
+// replace refuses instead. An unforced Destroy of the previous safety fork
+// is deliberate: a live lease on it (someone is working in it) refuses
+// rather than pulling the branch out from under them. It never touches
+// branch's own ref — a caller's etag from an earlier GetRef(db, branch)
+// stays valid across it, since Fork only ever writes the NEW branch's ref.
+func (w *Workspace) safetyFork(db, branch, suffix, metaKey, verb string, ttl time.Duration) (string, error) {
+	name := branch + suffix
 	if err := store.ValidateName(name); err != nil {
-		return "", fmt.Errorf("ops: promote: cannot name the safety fork of %s@%s (pass --no-backup to skip it): %w", db, target, err)
+		return "", fmt.Errorf("ops: %s: cannot name the safety fork of %s@%s (pass --no-backup to skip it): %w", verb, db, branch, err)
 	}
 	if ttl <= 0 {
 		ttl = DefaultPromoteBackupTTL
@@ -1150,24 +1215,36 @@ func (w *Workspace) promoteBackup(db, target string, ttl time.Duration) (string,
 	existing, _, err := w.Store.GetRef(db, name)
 	switch {
 	case err == nil:
-		if existing.Meta[PromoteBackupMetaKey] != target {
-			return "", fmt.Errorf("ops: promote: %s@%s already exists and is not a promote safety fork of %s@%s; destroy or rename it, or pass --no-backup", db, name, db, target)
+		if existing.Meta[metaKey] != branch {
+			return "", fmt.Errorf("ops: %s: %s@%s already exists and is not a %s safety fork of %s@%s; destroy or rename it, or pass --no-backup", verb, db, name, verb, db, branch)
 		}
-		// Ours from an earlier promote: replace it. An unforced Destroy is
-		// deliberate — a live lease on the old safety fork (someone is
-		// working in it) refuses the promote rather than pulling the branch
-		// out from under them.
+		// Ours from an earlier call: replace it. The unforced Destroy above
+		// most commonly fails on a live lease (someone has a session open on
+		// the previous fork); its error text says "use --force" for a CLI
+		// caller, but neither promote nor rollback exposes a --force lever
+		// for THIS replacement (force only ever overrides the branch's OWN
+		// protected/lease check, never the safety fork's), so that phrase
+		// would misdirect a caller here — replace it before wrapping.
 		if err := w.Destroy(db, name, false); err != nil {
-			return "", fmt.Errorf("ops: promote: replacing the previous safety fork %s@%s: %w", db, name, err)
+			msg := strings.Replace(err.Error(), "use --force", "ask the human", 1)
+			return "", fmt.Errorf("ops: %s: replacing the previous safety fork %s@%s: %s (close that session, or pass --no-backup)",
+				verb, db, name, msg)
 		}
 	case errors.Is(err, store.ErrNotFound):
 	default:
 		return "", err
 	}
-	if _, err := w.Fork(db, target, name, "", ttl, map[string]string{PromoteBackupMetaKey: target}); err != nil {
-		return "", fmt.Errorf("ops: promote: safety fork of %s@%s: %w", db, target, err)
+	if _, err := w.Fork(db, branch, name, "", ttl, map[string]string{metaKey: branch}); err != nil {
+		return "", fmt.Errorf("ops: %s: safety fork of %s@%s: %w", verb, db, branch, err)
 	}
 	return name, nil
+}
+
+// promoteBackup mints (or replaces) the target's safety fork. It runs after
+// the protected check and before the repoint, and never touches the
+// target's own ref — the caller's tgtEtag stays valid across it.
+func (w *Workspace) promoteBackup(db, target string, ttl time.Duration) (string, error) {
+	return w.safetyFork(db, target, PromoteBackupSuffix, PromoteBackupMetaKey, "promote", ttl)
 }
 
 // PromoteWith repoints target at a new lineage seeded from source's head,
@@ -1279,11 +1356,16 @@ var compactBeforeCASForTest func()
 // holds, and erroring would make scripted "compact everything" loops fail
 // on exactly the branches that need nothing done.
 //
-// Checkpoints are RESET to {"compact": head txid}, like Promote (and
-// unlike Rollback's kept-checkpoint snapshot copies): old checkpoints
-// anchored on the shared ancestor would not resolve in the new
-// self-contained lineage. Preserving them Rollback-style (copy each kept
-// checkpoint's state into the new lineage) is a noted follow-up.
+// Checkpoints are PRESERVED, Rollback-style: every existing checkpoint
+// qualifies (every c.TXID <= head, by construction — compact never drops
+// history), so each one's snapshot is copied into the new self-contained
+// lineage and rewritten to epoch 1 (CreatedAt/Meta preserved) exactly as
+// Rollback does for its kept map, and a "compact" checkpoint at the head
+// txid is ADDED alongside them (not a replacement) — old checkpoints
+// anchored on the shared ancestor would not otherwise resolve once the
+// old lineage is later reclaimed by GC. Cost: one snapshot copy per
+// distinct checkpoint txid (checkpoints sharing a txid share a copy, as
+// Rollback's `done` set does for its head).
 //
 // The ref CAS is the point of no return, exactly as in Promote: a CAS
 // loss (a concurrent flush advanced the head) deletes the orphan snapshot
@@ -1302,12 +1384,13 @@ func (w *Workspace) Compact(db, branch string) (uint64, error) {
 		return 0, err
 	}
 	// The no-op decision consults the DURABLE base spine (base.json chain),
-	// not the ref's Base mirror: compact is destructive (it resets the
-	// checkpoint map), so it must be authoritative even if some code path
-	// left a stale mirror behind — a stale non-nil mirror on a genuinely
-	// self-contained branch must not trigger a needless materialize that
-	// wipes checkpoints. An empty spine means resolution never leaves this
-	// lineage: already self-contained, nothing to cut.
+	// not the ref's Base mirror: compact repoints the branch at a brand-new
+	// lineage, so it must be authoritative even if some code path left a
+	// stale mirror behind — a stale non-nil mirror on a genuinely
+	// self-contained branch must not trigger a needless materialize (and,
+	// were checkpoints ever reset instead of preserved, a needless wipe).
+	// An empty spine means resolution never leaves this lineage: already
+	// self-contained, nothing to cut.
 	spine, err := w.Store.BaseSpine(ref.Lineage)
 	if err != nil {
 		return 0, fmt.Errorf("ops: compact %s@%s: resolving base spine: %w", db, branch, err)
@@ -1322,11 +1405,44 @@ func (w *Workspace) Compact(db, branch string) (uint64, error) {
 	if err != nil {
 		return 0, err
 	}
+	copiedKeys := []string{store.SnapshotKey(lineage, 1, txid)}
+	cleanup := func() {
+		for _, k := range copiedKeys {
+			w.bestEffortDelete(k)
+		}
+	}
+
+	// Every existing checkpoint qualifies (every c.TXID <= head, by
+	// construction — compact never drops history), exactly as Rollback's
+	// kept map does for checkpoints at or before its target. Copy each
+	// one's snapshot into the new lineage (the head's copy above is reused
+	// for any checkpoint that already sits at head — the `done` set mirrors
+	// Rollback's) and rewrite it to epoch 1 (where the copy now actually
+	// lives) while preserving CreatedAt/Meta, a location update rather than
+	// a new checkpoint.
+	kept := map[string]store.Checkpoint{}
+	for name, c := range ref.Checkpoints {
+		kept[name] = c
+	}
+	done := map[uint64]bool{txid: true}
+	for name, c := range kept {
+		if !done[c.TXID] {
+			done[c.TXID] = true
+			key, err := w.copySnapshotIntoLineage(ref, c, lineage)
+			if err != nil {
+				cleanup()
+				return 0, fmt.Errorf("ops: compact: copying checkpoint snapshot for txid %d: %w", c.TXID, err)
+			}
+			copiedKeys = append(copiedKeys, key)
+		}
+		kept[name] = store.Checkpoint{TXID: c.TXID, Epoch: 1, CreatedAt: c.CreatedAt, Meta: c.Meta}
+	}
+	kept["compact"] = store.Checkpoint{TXID: txid, Epoch: 1, CreatedAt: nowStamp()}
+
 	next := ref
 	next.Lineage, next.Epoch, next.HeadTXID, next.HeadEpoch = lineage, 1, txid, 1
 	next.Base = nil
-	next.Checkpoints = nil
-	next.SetCheckpoint("compact", store.Checkpoint{TXID: txid, Epoch: 1, CreatedAt: nowStamp()})
+	next.Checkpoints = kept
 	// A repoint is itself a revocation — same reasoning as Promote: clear
 	// the lease so the branch is immediately acquirable post-repoint.
 	next.LeaseHolder, next.LeaseExpiry = "", ""
@@ -1335,7 +1451,7 @@ func (w *Workspace) Compact(db, branch string) (uint64, error) {
 		compactBeforeCASForTest()
 	}
 	if _, err := w.Store.PutRef(db, branch, next, etag); err != nil {
-		w.bestEffortDelete(store.SnapshotKey(lineage, 1, txid))
+		cleanup()
 		return 0, fmt.Errorf("ops: compact lost a race (retry): %w", err)
 	}
 	// Refresh the checkout if one exists and is quiescible.

@@ -266,9 +266,18 @@ class Client:
         """Delete db@branch. force overrides the protected-branch refusal."""
         self._call("destroy", db=db, branch=branch, force=force)
 
-    def rollback(self, db: str, branch: str, to: str) -> str:
-        """Repoint db@branch at checkpoint `to`; returns the refreshed checkout path."""
-        resp = self._call("rollback", db=db, branch=branch, name=to)
+    def rollback(self, db: str, branch: str, to: str, *,
+                 backup: bool = True, backup_ttl: _TTL = None) -> str:
+        """Repoint db@branch at checkpoint `to`; returns the refreshed checkout path.
+
+        By default the branch's previous head is kept first as a shared
+        safety fork named f"{branch}-pre-rollback" (one per branch, replaced
+        by the next rollback, TTL'd — 24h unless backup_ttl sets a timedelta
+        or Go duration string), so a rollback is undone by promoting that
+        fork back onto the branch. backup=False skips it.
+        """
+        resp = self._call("rollback", db=db, branch=branch, name=to,
+                          no_backup=not backup, backup_ttl=_ttl_str(backup_ttl))
         return cast(str, resp.get("checkout", ""))
 
     def promote(self, db: str, source: str, onto: str, force: bool = False,

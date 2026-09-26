@@ -812,10 +812,16 @@ func (s *Server) opDestroy(req Request) Response {
 	return Response{OK: true}
 }
 
-// opRollback repoints db@branch at checkpoint req.Name (ops.Rollback) and
-// returns the refreshed checkout path. Refuses if this daemon has an open
-// session on the branch, for the same reason as opDestroy: the session
-// owns the checkout that a rollback would repoint out from under it.
+// opRollback repoints db@branch at checkpoint req.Name (ops.RollbackWith)
+// and returns the refreshed checkout path. Refuses if this daemon has an
+// open session on the branch, for the same reason as opDestroy: the
+// session owns the checkout that a rollback would repoint out from under
+// it. By default the branch's previous head is kept first as a TTL'd
+// safety fork (<branch>-pre-rollback, ops.RollbackBackupSuffix) — unless
+// req.NoBackup, this refuses up front if a session is open on that
+// previous safety fork too, matching opPromote's same guard on
+// <target>-pre-promote, since replacing it would otherwise surface as a
+// lease refusal from inside ops.Destroy instead.
 func (s *Server) opRollback(req Request) Response {
 	branch := req.Branch
 	if branch == "" {
@@ -824,11 +830,24 @@ func (s *Server) opRollback(req Request) Response {
 	if err := s.refuseIfClaimed(req.DB, branch); err != nil {
 		return errResp(err)
 	}
-	path, err := s.ws.Rollback(req.DB, branch, req.Name)
+	opts := ops.RollbackOptions{NoBackup: req.NoBackup}
+	if req.BackupTTL != "" {
+		d, err := time.ParseDuration(req.BackupTTL)
+		if err != nil || d <= 0 {
+			return errResp(fmt.Errorf("daemon: rollback backup_ttl must be a positive Go duration, got %q", req.BackupTTL))
+		}
+		opts.BackupTTL = d
+	}
+	if !opts.NoBackup {
+		if err := s.refuseIfClaimed(req.DB, branch+ops.RollbackBackupSuffix); err != nil {
+			return errResp(err)
+		}
+	}
+	res, err := s.ws.RollbackWith(req.DB, branch, req.Name, opts)
 	if err != nil {
 		return errResp(err)
 	}
-	return Response{OK: true, Checkout: path}
+	return Response{OK: true, Checkout: res.Path, Backup: res.Backup}
 }
 
 // opPromote repoints db@req.Name (target) at db@req.Branch's (source) head

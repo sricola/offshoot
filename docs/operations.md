@@ -308,8 +308,11 @@ bucket isn't shrinking after a destroy, look for surviving shared
 children: destroy or `compact` them and the next GC pass reclaims the
 ancestor. `offshoot compact <db>@<branch>` is the manual release valve —
 it re-encodes the branch as one self-contained snapshot and drops its base
-pointer, at full-copy cost, and **resets the branch's checkpoints to a
-single `compact` checkpoint** (export anything you need first).
+pointer, at full-copy cost, plus one extra snapshot copy per distinct
+checkpoint txid the branch has: unlike `promote`, compact **preserves
+every checkpoint** (copied into the new lineage and rewritten to epoch 1,
+rollback-style) and adds a `compact` checkpoint at head alongside them —
+nothing to `export` first to keep.
 
 **GC counts objects, not lineages.** `gc: tombstoned N, deleted M objects`
 (and `offshoot_gc_tombstoned_total` / `offshoot_gc_deleted_total` /

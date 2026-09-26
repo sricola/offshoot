@@ -66,7 +66,7 @@ wherever it's optional.
 | `offshoot_checkout` | `database`, `branch?` | Materialize a branch to a local SQLite file and return the path to open |
 | `offshoot_checkpoint` | `database`, `name`, `branch?`, `meta?` | Name the current state so it can be rolled back to or forked from |
 | `offshoot_fork` | `database`, `new_branch`, `branch?`, `at?`, `ttl?`, `meta?` | Create an isolated branch from head, or from a checkpoint via `at` |
-| `offshoot_rollback` | `database`, `to`, `branch?` | Return a branch to a named checkpoint, discarding everything since |
+| `offshoot_rollback` | `database`, `to`, `branch?` | Return a branch to a named checkpoint, discarding everything since. The branch's previous head is kept first as a TTL'd safety fork `<branch>-pre-rollback` (one per branch, replaced by the next rollback), named in the result's `backup` field — undo by promoting it back onto the branch |
 | `offshoot_promote` | `database`, `source`, `target`, `force?` | Repoint `target` at `source`'s head — ship the winning attempt. `target`'s previous head is kept as a safety fork named `<target>-pre-promote` — the undo handle the result names — but that fork always carries a TTL (24h by default) and is one rolling slot per target, replaced by the next promote onto that target, so the undo window closes when either happens |
 | `offshoot_destroy` | `database`, `branch`, `force?` | Permanently discard a branch and its checkout |
 | `offshoot_touch` | `database`, `branch?`, `ttl?` | Reset a fork's activity clock so its TTL does not expire mid-task; `ttl` sets or (`"none"`) clears it |
@@ -95,24 +95,73 @@ instead of leaking forever. An explicit `ttl:"<duration>"` always wins,
 none` disables the default entirely. The fork tool's response echoes the
 applied TTL and computed expiry, so both land in the agent's transcript.
 
-**A TTL alone reaps nothing.** Reaping is the janitor's job (`offshoot
-serve`), and `offshoot mcp` runs no daemon of its own — a daemonless setup
-only sweeps expired branches when `offshoot gc` is run by hand.
+`offshoot mcp` itself is not a daemon in the `offshoot serve` sense — it
+never owns a live SQLite session — but it isn't daemonless for TTL
+purposes either: pass `-reap-every DURATION` (default `60s`; `0`/`none`
+disables it) and the MCP process runs its own background reap on that
+cadence for as long as it's up, expiring TTL'd forks and self-healing any
+stranded delete claim. It steps aside automatically when a real
+`offshoot serve` daemon is reachable on the same store (never a second
+writer against one store), logging once that it's deferring. Either way,
+`-reap-every` only reaps — it runs no GC, so reclaiming an expired
+branch's storage still needs `offshoot gc` (by hand) or a running
+`offshoot serve` daemon's janitor.
 
 ## The safety posture
 
-Destructive tools honor the same protected-branch rules as the CLI: an
-unforced `offshoot_promote` onto `main` or `offshoot_destroy` of `main`
-is **refused**, and the refusal comes back to the agent as the tool
-result — described to the model as "confirmation you need, not a bug" —
-rather than a transport error. The agent forks and experiments freely;
-touching the branch of record requires the explicit `force` step. Note
-what this is and isn't: `force` is an argument the agent *can* pass, so
-the protected flag is a deliberate speed bump and an auditable decision
-point, not a permission boundary — if promotion must be a human/harness
-decision, keep it in the harness (the pattern in the
-[Claude Agent SDK recipe](recipes/claude-agent-sdk.md), where the harness
-checkpoints or rolls back based on your own success signal).
+Destructive tools honor the same protected-branch rules as the CLI:
+`main` is protected by default, so an unforced `offshoot_promote` onto it
+or `offshoot_destroy` of it is **refused**, and the refusal comes back to
+the agent as the tool result rather than a transport error, naming
+`-allow-force` as the way past it. The agent forks and experiments
+freely; touching the branch of record is a human/harness decision by
+default, not an argument the agent can supply its own way past.
+
+Concretely: `force: true` in an `offshoot_promote` or `offshoot_destroy`
+call is honored only when the MCP server itself was started with
+`-allow-force` (off by default). Without it, a call against a protected
+target is refused *before any mutation*, no matter what the agent passes —
+`refuseForceOnProtected` fails closed even on a transient error reading
+the branch's own protected flag, so a storage hiccup can't accidentally
+let a force through. `offshoot_destroy`'s live-lease bypass is gated the
+same way. This makes `force` a permission boundary the human running
+`offshoot mcp` controls at startup, not a speed bump the model can step
+over by itself — an agent that hits the refusal is expected to do what
+the tool description says: ask the human to promote or destroy from the
+CLI (`offshoot promote ... --force` / `offshoot destroy ... --force`), or
+work on a fork instead. See [`mcp-walkthrough.md`](demo/mcp-walkthrough.md)
+for this refusal firing for real, followed by an `offshoot_diff` call and
+a human-run CLI promote.
+
+Any branch, not just `main`, can be put under the same protection:
+`offshoot protect <db>[@branch]` sets the flag (`offshoot unprotect`
+clears it); it's a CLI-only verb by design; there's no `offshoot_protect`
+MCP tool; flipping the flag doesn't touch the branch's TTL clock.
+
+`offshoot_rollback` keeps its own undo point: before repointing, it keeps
+the branch's previous head as a TTL'd shared safety fork,
+`<branch>-pre-rollback` (one per branch — the next rollback of the same
+branch replaces it, at least 24h TTL), and reports it back as `backup` in
+the tool result. Whether the undo itself is agent-doable depends on the
+same `-allow-force` gate above: for an **unprotected** branch, an agent can
+undo the rollback itself — `offshoot_promote` with `source:
+"<branch>-pre-rollback"`, `target: "<branch>"`. For a **protected** branch
+(`main`, typically), that promote would itself be refused unless this
+server allows force, so the undo is the human's CLI promote instead —
+`offshoot_rollback`'s result says so explicitly when it applies, naming
+the exact command (`offshoot promote <db>@<branch>-pre-rollback --onto
+<branch> --force`).
+
+That safety fork is itself guarded the same way once the branch it was
+taken from is protected: without `-allow-force`, an agent can't destroy
+`main-pre-rollback` (or `main-pre-promote`), shorten/clear its TTL via
+`offshoot_touch`, or `offshoot_promote` something onto it (that would
+repoint — i.e. destroy — the very undo point the fork exists to
+preserve). A second `offshoot_rollback main` is refused outright while the
+fork from the first one still exists too, rather than silently replacing
+an undo point the human may still need — ask the human to promote or
+destroy it first. A plain `offshoot_touch` that only extends the fork's
+life (no `ttl` argument) is never blocked this way.
 
 Also true regardless of tools: the daemon's unix socket is mode `0600`,
 and one leased, epoch-fenced writer per branch means concurrent attempts

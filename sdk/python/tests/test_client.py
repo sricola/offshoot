@@ -348,6 +348,12 @@ class TestClient(unittest.TestCase):
             rows = conn.execute("SELECT count(*) FROM t").fetchone()[0]
             conn.close()
             self.assertEqual(rows, 0)  # rolled back before the insert
+            # rollback keeps main's previous head as main-pre-rollback by
+            # default (a TTL'd shared fork), and backup=False skips it.
+            self.assertIn("main-pre-rollback", {b.branch for b in c.branches("rp")})
+            c.destroy("rp", "main-pre-rollback")
+            c.rollback("rp", "main", "cp1", backup=False)
+            self.assertNotIn("main-pre-rollback", {b.branch for b in c.branches("rp")})
 
             c.fork("rp", "main", "feature")
             txid = c.promote("rp", "feature", "main", force=True, backup_ttl="2h")

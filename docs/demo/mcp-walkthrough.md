@@ -12,11 +12,20 @@ SQL run against its real checkouts, captured by driving the server myself.
   block below is **real** — copy-pasted verbatim from an actual run of
   [`mcp-session-driver.sh`](mcp-session-driver.sh) (this directory) against a
   real, freshly initialized store. Nothing in those blocks was hand-written,
-  edited, or reordered after the fact. The script was run three times against
-  three independent fresh stores while producing this document; the JSON-RPC
-  and SQL output was byte-identical every time (modulo the random temp-store
-  path baked into a couple of response strings — see "Reproducing this"
-  below).
+  edited, or reordered after the fact. The script was run twice against two
+  independent fresh stores for this capture; the JSON-RPC and SQL output was
+  byte-identical both times (modulo the random temp-store path baked into a
+  couple of response strings — see "Reproducing this" below).
+- This transcript was re-driven in full for the guardrails branch (the force
+  gate, the rollback safety fork, and `offshoot_diff`): `main` is now
+  protected by default and an agent's `force:true` is refused unless the MCP
+  server was started with `-allow-force` (this session was not), so the
+  script no longer sends a `force:true` tool call at all. It sends
+  `offshoot_diff` instead, to show what the agent does with the refusal, and
+  the actual promote happens as a `$` CLI line run by the driver script as
+  the human's stand-in, after the diff — that shape (agent compares, human
+  forces from the CLI) is the intended shape of the guardrail, not a
+  workaround for it.
 - The prose *between* those blocks — the "the agent notices X and decides to
   Y" narration — is **illustrative**. It's how an actual coding agent (e.g.,
   Claude Code with `offshoot` wired in as below) would plausibly narrate and
@@ -69,7 +78,7 @@ wrong.
 
 ```
 $ offshoot -store $STORE init
-initialized store at /var/folders/r1/h4z43zsj7vlb62zwtkxhgc400000gn/T/tmp.9QVDPWfYzm/store
+initialized store at /var/folders/r1/h4z43zsj7vlb62zwtkxhgc400000gn/T/tmp.zJMmwgQiKG/store
 
 $ offshoot -store $STORE create shop
 
@@ -227,7 +236,7 @@ paraphrase:
         },
         {
           "name": "offshoot_rollback",
-          "description": "Return a branch to a previously named checkpoint, discarding everything written since. Call this when an attempt on a branch has gone wrong and you want to restore known-good state rather than manually undoing changes. Reports the checkout path to reopen after the rollback. `branch` defaults to \"main\" if omitted. If a daemon session is open on this branch, the call is refused instead of proceeding, since rollback repoints the branch's storage out from under a session the daemon still believes it owns — close the session first (e.g. `offshoot session close`) and retry.",
+          "description": "Return a branch to a previously named checkpoint, discarding everything written since. Call this when an attempt on a branch has gone wrong and you want to restore known-good state rather than manually undoing changes. Reports the checkout path to reopen after the rollback. `branch` defaults to \"main\" if omitted. The branch's previous head is kept first as a TTL'd safety fork `<branch>-pre-rollback` (one per branch, replaced by the next rollback; the safety fork lives at least 24h), undone by a promote of that fork back onto `branch` — through MCP only if `branch` is unprotected or this server allows force; otherwise that's the human's CLI promote. If a daemon session is open on this branch, the call is refused instead of proceeding, since rollback repoints the branch's storage out from under a session the daemon still believes it owns — close the session first (e.g. `offshoot session close`) and retry.",
           "inputSchema": {
             "properties": {
               "branch": {
@@ -257,7 +266,7 @@ paraphrase:
         },
         {
           "name": "offshoot_promote",
-          "description": "Ship a winning attempt: repoint the target branch (often `main`) at the source branch's current head, which resets the target's checkpoint history to just the new promote checkpoint. The target's previous head is kept first as a shared safety fork named `<target>-pre-promote` (TTL'd; one per target, replaced by the next promote), so a promote is undone by promoting that fork back onto the target. Call this once you've validated a forked attempt and are ready to make it the branch of record. Protected branches (main is protected by default) refuse promotion unless `force` is set — treat that refusal as confirmation you need, not a bug. If a daemon session is open on the TARGET branch, the call is refused instead of proceeding — `force` does not override this — since promoting repoints the target's storage out from under a session the daemon still believes it owns; close the session first (e.g. `offshoot session close`) and retry. An open session on the SOURCE does not block the call, but the promoted state is the source's last-flushed/checkpointed head, not any write still unflushed in that live session — flush or checkpoint the source first if you need its very latest state promoted.",
+          "description": "Ship a winning attempt: repoint the target branch (often `main`) at the source branch's current head, which resets the target's checkpoint history to just the new promote checkpoint. The target's previous head is kept first as a shared safety fork named `<target>-pre-promote` (TTL'd, at least 24h; one per target, replaced by the next promote), so a promote is undone by promoting that fork back onto the target. Call this once you've validated a forked attempt and are ready to make it the branch of record. Protected branches (main is protected by default) refuse promotion. `force` is honored only when the server was started with -allow-force; otherwise a protected target refuses and the answer is to ask the human to promote from the CLI, or work on a fork. A protected branch's own safety fork (`<branch>-pre-rollback`/`<branch>-pre-promote`) cannot be a target without -allow-force either, even though the fork itself is never protected — promoting onto it would repoint (destroy) the undo point it exists to preserve. If a daemon session is open on the TARGET branch, the call is refused instead of proceeding — `force` does not override this — since promoting repoints the target's storage out from under a session the daemon still believes it owns; close the session first (e.g. `offshoot session close`) and retry. An open session on the SOURCE does not block the call, but the promoted state is the source's last-flushed/checkpointed head, not any write still unflushed in that live session — flush or checkpoint the source first if you need its very latest state promoted.",
           "inputSchema": {
             "properties": {
               "database": {
@@ -290,7 +299,7 @@ paraphrase:
         },
         {
           "name": "offshoot_destroy",
-          "description": "Permanently discard a branch and its checkout. Call this to clean up a failed or abandoned attempt once you're done with it. Protected branches refuse destruction unless `force` is set — treat that refusal as confirmation you need, not a bug. If a daemon session is open on this branch, the call is refused instead of proceeding — `force` does not override this — since destroy deletes the branch's storage out from under a session the daemon still believes it owns; close the session first (e.g. `offshoot session close`) and retry.",
+          "description": "Permanently discard a branch and its checkout. Call this to clean up a failed or abandoned attempt once you're done with it. `force` is honored only when the server was started with -allow-force; otherwise a protected branch or a live lease refuses and the answer is to ask the human to destroy from the CLI, or work on a fork. If a daemon session is open on this branch, the call is refused instead of proceeding — `force` does not override this — since destroy deletes the branch's storage out from under a session the daemon still believes it owns; close the session first (e.g. `offshoot session close`) and retry.",
           "inputSchema": {
             "properties": {
               "branch": {
@@ -319,7 +328,7 @@ paraphrase:
         },
         {
           "name": "offshoot_touch",
-          "description": "Reset a branch's activity clock so its TTL does not expire mid-task, and optionally change the TTL. Call this when an attempt on a TTL'd fork is taking longer than expected, or before handing a fork to a long-running step. `ttl` omitted keeps the current TTL; a Go duration like \"2h\" sets it; \"none\" clears it so the branch never expires (prefer a longer duration over \"none\" — branches without a TTL are only removed by an explicit destroy). A TTL alone reaps nothing: the janitor (`offshoot serve`) or `offshoot gc` does.",
+          "description": "Reset a branch's activity clock so its TTL does not expire mid-task, and optionally change the TTL. Call this when an attempt on a TTL'd fork is taking longer than expected, or before handing a fork to a long-running step. `ttl` omitted keeps the current TTL; a Go duration like \"2h\" sets it; \"none\" clears it so the branch never expires (prefer a longer duration over \"none\" — branches without a TTL are only removed by an explicit destroy). A TTL is enforced by the daemon's janitor, by `offshoot gc`, and — when no daemon is running — by this server's own timer (`offshoot mcp -reap-every`, default 60s), so shortening a TTL takes effect within about a minute.",
           "inputSchema": {
             "properties": {
               "branch": {
@@ -393,11 +402,22 @@ paraphrase:
 *(Nothing above is truncated: every description, `inputSchema`, and
 `annotations` object is reproduced verbatim from a real `tools/list`
 response — see [`internal/mcp/tools.go`](../../internal/mcp/tools.go) for
-the source. `offshoot_diff` (read-only, comparing two branches or
-checkpoints without needing `sqldiff`) is new since this doc's last
-capture; only this `tools/list` block was re-run to pick it up — the
-`tools/call` blocks that follow are from that earlier capture and their
-responses did not change.)*
+the source. This block is from the guardrails final-review fix wave's
+second pass (a fresh, separate `tools/list` capture — `tools/list` carries
+no store-specific paths, so it can be re-captured on its own without
+disturbing the rest of this transcript, which is still the earlier run
+referenced below). Four descriptions changed from the previous capture:
+`offshoot_rollback` and `offshoot_promote` now say their safety fork "lives
+at least 24h" (the TTL floor); `offshoot_rollback` also spells out that its
+undo is agent-doable through MCP only for an unprotected branch (otherwise
+it's the human's CLI promote); `offshoot_promote` also states that a
+protected branch's own safety fork can't be a target without `-allow-force`
+either (promoting onto it would repoint — destroy — the undo point, and the
+fork itself is never protected so the plain protected-target check misses
+it); and `offshoot_touch` names the daemonless reaper (`offshoot mcp
+-reap-every`) instead of the older "a TTL alone reaps nothing" line. Every
+`tools/call` block that follows is from the run described in the honesty
+bullets above.)*
 
 ```json
 → {"jsonrpc":"2.0","id":3,"method":"tools/call","params":{"name":"offshoot_list","arguments":{}}}
@@ -419,7 +439,7 @@ completion in the same session, not a throwaway experiment to let expire.*
 
 ```json
 → {"jsonrpc":"2.0","id":5,"method":"tools/call","params":{"name":"offshoot_checkout","arguments":{"database":"shop","branch":"migration-attempt"}}}
-← {"jsonrpc":"2.0","id":5,"result":{"content":[{"type":"text","text":"checked out shop@migration-attempt at /var/folders/r1/h4z43zsj7vlb62zwtkxhgc400000gn/T/tmp.9QVDPWfYzm/store/checkouts/shop/migration-attempt.db\nthis checkout is not yet checkpointed: nothing written here can be rolled back to or forked from until you call offshoot_checkpoint"}],"structuredContent":{"branch":"migration-attempt","database":"shop","live":false,"path":"/var/folders/r1/h4z43zsj7vlb62zwtkxhgc400000gn/T/tmp.9QVDPWfYzm/store/checkouts/shop/migration-attempt.db"}}}
+← {"jsonrpc":"2.0","id":5,"result":{"content":[{"type":"text","text":"checked out shop@migration-attempt at /var/folders/r1/h4z43zsj7vlb62zwtkxhgc400000gn/T/tmp.zJMmwgQiKG/store/checkouts/shop/migration-attempt.db\nthis checkout is not yet checkpointed: nothing written here can be rolled back to or forked from until you call offshoot_checkpoint"}],"structuredContent":{"branch":"migration-attempt","database":"shop","live":false,"path":"/var/folders/r1/h4z43zsj7vlb62zwtkxhgc400000gn/T/tmp.zJMmwgQiKG/store/checkouts/shop/migration-attempt.db"}}}
 ```
 
 The response text itself is the nudge: nothing here can be rolled back to
@@ -459,8 +479,15 @@ hand-patch the bad migration:*
 
 ```json
 → {"jsonrpc":"2.0","id":7,"method":"tools/call","params":{"name":"offshoot_rollback","arguments":{"database":"shop","branch":"migration-attempt","to":"pre-migration"}}}
-← {"jsonrpc":"2.0","id":7,"result":{"content":[{"type":"text","text":"rolled back shop@migration-attempt to checkpoint \"pre-migration\"; checkout at /var/folders/r1/h4z43zsj7vlb62zwtkxhgc400000gn/T/tmp.9QVDPWfYzm/store/checkouts/shop/migration-attempt.db"}],"structuredContent":{"branch":"migration-attempt","database":"shop","path":"/var/folders/r1/h4z43zsj7vlb62zwtkxhgc400000gn/T/tmp.9QVDPWfYzm/store/checkouts/shop/migration-attempt.db","to":"pre-migration"}}}
+← {"jsonrpc":"2.0","id":7,"result":{"content":[{"type":"text","text":"rolled back shop@migration-attempt to checkpoint \"pre-migration\"; the previous head is kept as shop@migration-attempt-pre-rollback (undo: offshoot_promote it back onto migration-attempt); checkout at /var/folders/r1/h4z43zsj7vlb62zwtkxhgc400000gn/T/tmp.zJMmwgQiKG/store/checkouts/shop/migration-attempt.db"}],"structuredContent":{"backup":"migration-attempt-pre-rollback","branch":"migration-attempt","database":"shop","path":"/var/folders/r1/h4z43zsj7vlb62zwtkxhgc400000gn/T/tmp.zJMmwgQiKG/store/checkouts/shop/migration-attempt.db","to":"pre-migration"}}}
 ```
+
+The bad attempt isn't just discarded, either: rollback keeps the head it
+just abandoned (the naive-float `total_cents` write) as its own TTL'd safety
+fork, `shop@migration-attempt-pre-rollback` — reachable later by promoting
+it back onto `migration-attempt` if the "wrong" attempt turns out to be
+wanted after all. It shows up again in the final `offshoot_list` below,
+since this session never destroys it.
 
 ### 5. Checkpoint on green
 
@@ -482,7 +509,7 @@ Tests are green. The agent checkpoints the now-validated state:
 ← {"jsonrpc":"2.0","id":8,"result":{"content":[{"type":"text","text":"checkpointed shop@migration-attempt as \"migrated\" at txid 4"}],"structuredContent":{"branch":"migration-attempt","database":"shop","live":false,"name":"migrated","txid":4}}}
 ```
 
-### 6. Promote — and the protected-branch guardrail firing for real
+### 6. Promote — the guardrail holds, the agent compares, the human ships it
 
 *Narration: the agent tries to ship the migration by promoting onto `main`.*
 
@@ -493,19 +520,53 @@ Tests are green. The agent checkpoints the now-validated state:
 
 This refusal is real, not staged narration — `main` is protected by default,
 and this is `offshoot_promote`'s guardrail firing exactly as documented in
-its tool description ("treat that refusal as confirmation you need, not a
-bug") and as an `isError: true` **tool result**, not a transport-level RPC
-error — the agent sees it as a normal reply it can reason about and react to,
-same as any other tool response.
+its tool description, as an `isError: true` **tool result**, not a
+transport-level RPC error — the agent sees it as a normal reply it can
+reason about and react to, same as any other tool response.
 
-*Narration: the agent reads the refusal, recognizes it as the expected
-protected-branch guardrail (not a bug in its migration), and retries with
-`force: true` — a deliberate, informed choice, not blind retry-until-it-works.*
+That's where an agent-side retry stops, on this server. This session was
+started as plain `offshoot -store $STORE mcp` — no `-allow-force` — so even
+if the agent resent the exact same call with `force: true`, `offshoot_promote`'s
+own description says it plainly: *"`force` is honored only when the server
+was started with `-allow-force`; otherwise a protected target refuses and
+the answer is to ask the human to promote from the CLI, or work on a fork."*
+There is no argument the agent can pass here that lands a force on a
+protected branch — that decision is a server-startup flag the human running
+`offshoot mcp` controls, not a tool argument. This is a deliberate
+behavior change from earlier versions of this server: nothing in this
+transcript ever sends `force: true`.
+
+*Narration: instead of trying to force its way past the refusal, the agent
+does the thing the tool description actually points it at — it gives the
+human something to decide from. It calls `offshoot_diff` to compare `main`
+against the validated attempt:*
 
 ```json
-→ {"jsonrpc":"2.0","id":10,"method":"tools/call","params":{"name":"offshoot_promote","arguments":{"database":"shop","source":"migration-attempt","target":"main","force":true}}}
-← {"jsonrpc":"2.0","id":10,"result":{"content":[{"type":"text","text":"promoted shop@migration-attempt onto shop@main at txid 4; the previous shop@main head is kept as shop@main-pre-promote (undo: promote it back onto main)"}],"structuredContent":{"backup":"main-pre-promote","database":"shop","source":"migration-attempt","target":"main","txid":4}}}
+→ {"jsonrpc":"2.0","id":10,"method":"tools/call","params":{"name":"offshoot_diff","arguments":{"database":"shop","left":"main","right":"migration-attempt@migrated"}}}
+← {"jsonrpc":"2.0","id":10,"result":{"content":[{"type":"text","text":"left:  shop@main right: shop@migration-attempt@migrated\nTABLE   shop@main  shop@migration-attempt@migrated  ADDED  REMOVED  CHANGED  STATUS\norders  3          3                                -      -        -        changed (schema)\n1 tables: 0 same, 1 changed, 0 added, 0 removed\n"}],"structuredContent":{"database":"shop","left":"main","right":"migration-attempt@migrated","tables":[{"added":0,"changed":0,"comparable":false,"key":"","left_exists":true,"left_rows":3,"removed":0,"right_exists":true,"right_rows":3,"schema_changed":true,"status":"changed","table":"orders"}],"totals":{"added":0,"changed":1,"removed":0,"same":0}}}}
 ```
+
+Same row count on both sides, one table with a schema change — exactly the
+new `total_cents` column, and nothing else moved. `offshoot_diff` never
+opened a checkout or took a lease to produce this; it read each side's last
+durable state. This is what the agent hands the human: not "trust me, force
+it," but a concrete answer to "what does this promote actually change."
+
+*Narration: the human looks at the diff, agrees it's the intended migration
+and nothing else, and runs the promote themselves, from the CLI, where
+`--force` is the operator's own call to make — not the agent's:*
+
+```
+$ offshoot -store $STORE promote shop@migration-attempt --onto main --force
+promoted shop@migration-attempt -> shop@main at txid 4
+kept the previous shop@main head as shop@main-pre-promote (expires in 24h0m0s; undo with: offshoot promote shop@main-pre-promote --onto main --force)
+```
+
+Same safety fork the MCP tool would have made (`shop@main-pre-promote`,
+TTL'd, one per target), same undo path — `offshoot promote` prints it
+directly. The guardrail didn't block the migration from shipping; it moved
+the decision to force a protected branch to the human running the CLI,
+where it was always meant to sit.
 
 ### 7. Cleanup and confirmation
 
@@ -514,24 +575,31 @@ protected-branch guardrail (not a bug in its migration), and retries with
 ← {"jsonrpc":"2.0","id":11,"result":{"content":[{"type":"text","text":"destroyed shop@migration-attempt"}],"structuredContent":{"branch":"migration-attempt","database":"shop"}}}
 ```
 
+`migration-attempt` itself was never protected — only `main` is, by
+default — so the agent's own `offshoot_destroy` call (no `force`) cleans it
+up without needing the human at all.
+
 ```json
 → {"jsonrpc":"2.0","id":12,"method":"tools/call","params":{"name":"offshoot_list","arguments":{}}}
-← {"jsonrpc":"2.0","id":12,"result":{"content":[{"type":"text","text":"shop@main head=4 checkpoints=[promote] protected=true checked_out=true\nshop@main-pre-promote head=2 checkpoints=[fork] protected=false checked_out=false\n"}],"structuredContent":{"branches":[{"branch":"main","checked_out":true,"checkpoints":["promote"],"database":"shop","head_txid":4,"protected":true},{"branch":"main-pre-promote","checked_out":false,"checkpoints":["fork"],"database":"shop","head_txid":2,"protected":false}]}}}
+← {"jsonrpc":"2.0","id":12,"result":{"content":[{"type":"text","text":"shop@main head=4 checkpoints=[promote] protected=true checked_out=true\nshop@main-pre-promote head=2 checkpoints=[fork] protected=false checked_out=false\nshop@migration-attempt-pre-rollback head=3 checkpoints=[fork] protected=false checked_out=false\n"}],"structuredContent":{"branches":[{"branch":"main","checked_out":true,"checkpoints":["promote"],"database":"shop","head_txid":4,"protected":true},{"branch":"main-pre-promote","checked_out":false,"checkpoints":["fork"],"database":"shop","head_txid":2,"protected":false},{"branch":"migration-attempt-pre-rollback","checked_out":false,"checkpoints":["fork"],"database":"shop","head_txid":3,"protected":false}]}}}
 ```
 
-Note `checkpoints=[promote]`: promote resets the target's checkpoint history
-to just the new `promote` checkpoint (see the `parallel-attempts` README's
-"What to look at" section for why — it's a side effect of where the new
-lineage comes from, not a bug). And note the second line: `main`'s
-pre-promote head (txid 2, the `baseline` state) survives as
-`main-pre-promote`, the shared, TTL'd safety fork promote keeps so the
-agent can undo — `offshoot_promote` with `source: "main-pre-promote"`,
-`target: "main"` — without having forked `main` by hand first.
+Three branches survive, and each is a safety net from somewhere earlier in
+this session, not clutter: `main` (`checkpoints=[promote]` — promote resets
+the target's checkpoint history to just the new `promote` checkpoint, see
+the `parallel-attempts` README's "What to look at" section for why — it's a
+side effect of where the new lineage comes from, not a bug); `main-pre-promote`,
+the shared TTL'd fork §6's CLI promote kept of `main`'s pre-promote head
+(txid 2, the `baseline` state), undone by promoting it back onto `main`; and
+`migration-attempt-pre-rollback`, the fork §4's `offshoot_rollback` kept of
+the abandoned naive-float attempt (txid 3) — still sitting there because
+this session destroyed `migration-attempt` itself but never touched its
+safety fork, which only a TTL or an explicit destroy will eventually clear.
 
 And the real data, confirmed by SQL against `main` after the promote:
 
 ```
-$ sqlite3 -header $(offshoot checkout shop) "SELECT id, total, total_cents FROM orders;"
+$ sqlite3 -header $(offshoot checkout shop) 'SELECT id, total, total_cents FROM orders;'
 id|total|total_cents
 1|19.99|1999
 2|8.70|870

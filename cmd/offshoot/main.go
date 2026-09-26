@@ -64,7 +64,10 @@ Usage:
                                      stored on the checkpoint (checkpoint) or
                                      the new branch (fork)
   offshoot touch <db>[@branch] [--ttl duration|none]   reset a branch's activity clock, optionally (re)setting its TTL
-  offshoot rollback <db>[@branch] --to <cp>       repoint a branch at a checkpoint
+  offshoot protect <db>[@branch]        refuse unforced destroy/promote-onto, never reap; MCP cannot force it without -allow-force
+  offshoot unprotect <db>[@branch]      clear the protected flag
+  offshoot rollback <db>[@branch] --to <cp> [--no-backup] [--backup-ttl DUR]
+                                                          repoint a branch at a checkpoint; keeps the previous head as <branch>-pre-rollback
   offshoot promote <db>@<src> --onto <target> [--force] [--no-backup] [--backup-ttl DUR]
                                                           repoint target at src's head; keeps target's old head as <target>-pre-promote
   offshoot compact <db>[@branch]     make a shared fork self-contained (its
@@ -114,18 +117,29 @@ Usage:
                                              sensitive). -http-allow-non-loopback
                                              acknowledges binding beyond localhost, and
                                              additionally REQUIRES an explicit token
-  offshoot mcp [-default-ttl d|none] [-socket PATH]
+  offshoot mcp [-default-ttl d|none] [-socket PATH] [-allow-force] [-reap-every d|none]
                                              serve the MCP tool set on stdio for an agent;
                                              forked branches get this TTL unless the fork
-                                             call overrides it (default 24h; 0/none disables
-                                             — reaping still needs a running janitor, i.e.
-                                             offshoot serve, or a manual offshoot gc);
+                                             call overrides it (default 24h; 0/none disables);
                                              -socket names the daemon to ride when one is up
                                              (default: same derivation offshoot serve uses) —
                                              checkpoint/checkout on a branch with a session
                                              already open there use it for live capture, and
                                              fork rides a reachable daemon session or not;
-                                             everything else still runs entirely at rest
+                                             everything else still runs entirely at rest;
+                                             -allow-force lets offshoot_promote/offshoot_destroy
+                                             honor an agent's force:true against a protected
+                                             branch (main, by default); without it, such a call
+                                             is refused before any mutation — off by default;
+                                             -reap-every runs a background reap (TTL expiry,
+                                             plus self-healing any stranded delete claim) on
+                                             this cadence for as long as this process is up
+                                             (default 60s; 0/none disables it) — it defers
+                                             entirely to a running offshoot serve daemon's own
+                                             janitor when one is reachable (never a second
+                                             writer against the same store), and runs no GC
+                                             either way; a manual offshoot gc or offshoot serve
+                                             remains how disk is actually reclaimed
   offshoot session open <db>[@branch] [-socket PATH]      open a session; prints the checkout path
   offshoot session flush <db>[@branch] [name] [-socket PATH]   flush to a durable snapshot; prints the txid
   offshoot session status [-socket PATH]                  list open sessions and their durable txid
@@ -313,6 +327,29 @@ func parseDefaultTTLFlag(args []string) (time.Duration, []string, error) {
 	}
 	if d < 0 {
 		return 0, nil, fmt.Errorf("-default-ttl %q must be zero, \"none\" (both disable it), or positive", raw)
+	}
+	return d, rest, nil
+}
+
+// parseReapEveryFlag extracts mcp's -reap-every flag from args and parses
+// it, defaulting to 60s when the flag is absent. Parsed exactly like
+// parseDefaultTTLFlag (same parseTTLFlag reuse, same "none"-or-zero-both-
+// disable rule, same non-negative rule) — see StartReaper for what a
+// disabled reaper means (every <= 0 starts no goroutine at all).
+func parseReapEveryFlag(args []string) (time.Duration, []string, error) {
+	raw, rest, _, err := extractFlag(args, "-reap-every")
+	if err != nil {
+		return 0, nil, err
+	}
+	if raw == "" {
+		raw = "60s"
+	}
+	d, err := parseTTLFlag(raw)
+	if err != nil {
+		return 0, nil, fmt.Errorf("-reap-every: %w", err)
+	}
+	if d < 0 {
+		return 0, nil, fmt.Errorf("-reap-every %q must be zero, \"none\" (both disable it), or positive", raw)
 	}
 	return d, rest, nil
 }
@@ -518,19 +555,74 @@ func run(args []string) error {
 		}
 		fmt.Printf("touched %s@%s ttl=%s touched_at=%s\n", db, branch, out, ref.TouchedAt)
 		return nil
-	case "rollback":
-		if len(rest) != 3 || rest[1] != "--to" {
-			return fmt.Errorf("usage: offshoot rollback <db>[@branch] --to <checkpoint>")
+	case "protect":
+		if len(rest) != 1 {
+			return fmt.Errorf("usage: offshoot protect <db>[@branch]")
 		}
 		db, branch, err := ops.ParseTarget(rest[0])
 		if err != nil {
 			return err
 		}
-		p, err := w.Rollback(db, branch, rest[2])
+		if _, err := w.SetProtected(db, branch, true); err != nil {
+			return err
+		}
+		fmt.Printf("protected %s@%s\n", db, branch)
+		return nil
+	case "unprotect":
+		if len(rest) != 1 {
+			return fmt.Errorf("usage: offshoot unprotect <db>[@branch]")
+		}
+		db, branch, err := ops.ParseTarget(rest[0])
 		if err != nil {
 			return err
 		}
-		fmt.Println(p)
+		if _, err := w.SetProtected(db, branch, false); err != nil {
+			return err
+		}
+		fmt.Printf("unprotected %s@%s\n", db, branch)
+		return nil
+	case "rollback":
+		const usage = "usage: offshoot rollback <db>[@branch] --to <checkpoint> [--no-backup] [--backup-ttl DUR]"
+		var opts ops.RollbackOptions
+		fs := rest[:0]
+		for i := 0; i < len(rest); i++ {
+			switch a := rest[i]; a {
+			case "--no-backup":
+				opts.NoBackup = true
+			case "--backup-ttl":
+				if i+1 >= len(rest) {
+					return fmt.Errorf("%s", usage)
+				}
+				i++
+				d, err := time.ParseDuration(rest[i])
+				if err != nil || d <= 0 {
+					return fmt.Errorf("--backup-ttl must be a positive Go duration (e.g. 2h), got %q", rest[i])
+				}
+				opts.BackupTTL = d
+			default:
+				fs = append(fs, a)
+			}
+		}
+		if len(fs) != 3 || fs[1] != "--to" {
+			return fmt.Errorf("%s", usage)
+		}
+		db, branch, err := ops.ParseTarget(fs[0])
+		if err != nil {
+			return err
+		}
+		res, err := w.RollbackWith(db, branch, fs[2], opts)
+		if err != nil {
+			return err
+		}
+		fmt.Println(res.Path)
+		if res.Backup != "" {
+			ttl := opts.BackupTTL
+			if ttl <= 0 {
+				ttl = ops.DefaultPromoteBackupTTL
+			}
+			fmt.Printf("kept the previous %s@%s head as %s@%s (expires in %s; undo with: offshoot promote %s@%s --onto %s --force)\n",
+				db, branch, db, res.Backup, ttl, db, res.Backup, branch)
+		}
 		return nil
 	case "promote":
 		const usage = "usage: offshoot promote <db>@<source> --onto <target> [--force] [--no-backup] [--backup-ttl DUR]"
@@ -852,16 +944,22 @@ func run(args []string) error {
 			return fmt.Errorf("unknown lease subcommand %q", rest[0])
 		}
 	case "mcp":
+		const mcpUsage = "usage: offshoot mcp [-default-ttl DURATION|none] [-socket PATH] [-allow-force] [-reap-every DURATION|none]"
 		sock, rest, err := socketOverride(rest)
 		if err != nil {
-			return fmt.Errorf("usage: offshoot mcp [-default-ttl DURATION|none] [-socket PATH]: %w", err)
+			return fmt.Errorf("%s: %w", mcpUsage, err)
 		}
 		defaultTTL, rest, err := parseDefaultTTLFlag(rest)
 		if err != nil {
-			return fmt.Errorf("usage: offshoot mcp [-default-ttl DURATION|none] [-socket PATH]: %w", err)
+			return fmt.Errorf("%s: %w", mcpUsage, err)
+		}
+		allowForce, rest := extractBoolFlag(rest, "-allow-force")
+		reapEvery, rest, err := parseReapEveryFlag(rest)
+		if err != nil {
+			return fmt.Errorf("%s: %w", mcpUsage, err)
 		}
 		if len(rest) != 0 {
-			return fmt.Errorf("usage: offshoot mcp [-default-ttl DURATION|none] [-socket PATH]")
+			return fmt.Errorf("%s", mcpUsage)
 		}
 		// sock == "" here (the common case: no -socket given) is resolved by
 		// NewOffshootTools itself via daemon.DefaultSocketPath(spec) — the
@@ -869,8 +967,28 @@ func run(args []string) error {
 		// `offshoot mcp` and a bare `offshoot serve` against the same store
 		// agree on where to look without either side hardcoding the path.
 		ts := mcp.NewOffshootTools(w, spec, defaultTTL, sock)
+		// -allow-force is off by default: without it, an agent's force:true
+		// against a PROTECTED branch (main, by default) is refused by
+		// offshoot_promote/offshoot_destroy before any mutation — see
+		// OffshootTools.SetAllowForce. Force against an unprotected branch
+		// never needed this flag.
+		ts.SetAllowForce(allowForce)
+		// The reaper's context is cancelled the moment the server loop
+		// below returns (this function's own srv.Serve(ctx), whether it
+		// exits via stdin EOF or an error) — the reaper must never keep
+		// running past the process's own MCP-serving lifetime, since
+		// nothing would ever stop it otherwise. reapEvery <= 0 (0 or
+		// "none") starts no goroutine at all (see StartReaper).
+		ctx, cancel := context.WithCancel(context.Background())
+		defer cancel()
+		// StartReaper's returned channel is a test hook (see its own doc
+		// comment) for proving the reaper's goroutine actually stopped
+		// after cancellation — this process's own teardown once srv.Serve
+		// returns already ensures that, so there's nothing more to wait on
+		// here.
+		_ = ts.StartReaper(ctx, reapEvery)
 		srv := mcp.NewServer(os.Stdin, os.Stdout, ts)
-		return srv.Serve(context.Background())
+		return srv.Serve(ctx)
 	case "serve":
 		const serveUsage = "usage: offshoot serve [-socket PATH] [-reap-every DURATION] [-gc-grace DURATION] " +
 			"[-flush-every DURATION] [-snapshot-every N] [-ro-cache-budget BYTES] [-http ADDR] [-token TOKEN] [-http-allow-non-loopback]"

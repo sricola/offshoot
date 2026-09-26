@@ -526,3 +526,30 @@ func TestPromoteFromOpenSourceProceedsAtRest(t *testing.T) {
 			"last-flushed head, not the unflushed write sitting in its open session", n)
 	}
 }
+
+// TestReapOnceSkipsWhenDaemonIsUp proves reapOnce never touches the store
+// when a daemon is reachable: the daemon's own janitor owns reaping (see
+// internal/daemon/janitor.go), so a second reaper racing it here would be a
+// second writer against the same store. skipped must be true and the
+// expired ref must survive untouched.
+func TestReapOnceSkipsWhenDaemonIsUp(t *testing.T) {
+	ts, w, _ := newDaemonTools(t)
+	if _, err := w.Fork("app", "main", "attempt-1", "", time.Millisecond, nil); err != nil {
+		t.Fatal(err)
+	}
+	time.Sleep(5 * time.Millisecond)
+
+	reaped, skipped, err := ts.reapOnce(time.Now())
+	if err != nil {
+		t.Fatalf("reapOnce: %v", err)
+	}
+	if !skipped {
+		t.Fatalf("reapOnce must skip when a daemon is running, reaped = %v", reaped)
+	}
+	if reaped != nil {
+		t.Fatalf("reapOnce must not report anything reaped when skipping, got %v", reaped)
+	}
+	if _, _, err := w.Store.GetRef("app", "attempt-1"); err != nil {
+		t.Fatalf("app@attempt-1 must survive a skipped reapOnce, GetRef err = %v", err)
+	}
+}

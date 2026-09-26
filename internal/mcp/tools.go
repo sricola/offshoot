@@ -5,6 +5,7 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"os"
 	"strings"
 	"time"
 
@@ -29,6 +30,22 @@ type OffshootTools struct {
 	// explicit `ttl:"<duration>"` always wins over it too — see
 	// resolveForkTTL.
 	defaultTTL time.Duration
+	// allowForce gates an agent-supplied `force` against a PROTECTED branch
+	// in promote/destroy: false (the default) refuses it outright, before
+	// any mutation, regardless of ops' own force handling; true lets it
+	// through to ops as before. See SetAllowForce.
+	allowForce bool
+}
+
+// SetAllowForce sets whether this tool set honors an agent-supplied `force`
+// against a protected branch in offshoot_promote/offshoot_destroy. The
+// zero-value OffshootTools has this false: an MCP agent cannot force onto
+// or destroy a protected branch (main, by default) unless the operator
+// running this server opted in, e.g. via `offshoot mcp -allow-force` (see
+// cmd/offshoot/main.go). Force against an UNPROTECTED branch never needed
+// this flag and is unaffected either way.
+func (t *OffshootTools) SetAllowForce(v bool) {
+	t.allowForce = v
 }
 
 // NewOffshootTools binds a tool set to a workspace, store spec, and daemon
@@ -195,6 +212,126 @@ func (t *OffshootTools) refuseIfSessionOpen(db, branch, opName string) (ToolResu
 		"e.g. `offshoot session close %s@%s`", info.Holder, db, branch, opName, db, branch), true
 }
 
+// refuseForceOnProtected implements the -allow-force gate for promote
+// (branch is the TARGET) and destroy (branch is the branch being
+// destroyed): an agent-supplied force is honored as-is once this server was
+// started with -allow-force (SetAllowForce(true)), same as before this gate
+// existed. Without that flag, MCP never honors force at all: force against
+// a PROTECTED branch is refused here — before either handler calls into
+// ops, i.e. before any mutation — rather than left to ops' own protected
+// check; force against an UNPROTECTED branch is still downgraded to false
+// in effectiveForce, so ops runs exactly as an unforced call would. This
+// matters beyond the protected check: ops.Destroy also consults force to
+// bypass a live lease (see gc.go's Destroy), and downgrading here means
+// that bypass is unavailable too, same as the protected one — the caller
+// (destroy, and promote for symmetry) is expected to notice a resulting
+// ops error asking for --force and rewrap it pointing at -allow-force; see
+// wrapForceRefusal.
+//
+// If refused is true, res is the ToolResult the caller should return
+// immediately. Otherwise effectiveForce is what the caller should pass to
+// ops in place of the raw argument.
+//
+// A GetRef failure (e.g. a transient backend error, or no such branch)
+// fails CLOSED: effectiveForce is false, never the caller's raw force. This
+// gate cannot confirm the branch is safe to force, so it must not let force
+// through on an error just because ops's own GetRef, a moment later, might
+// have succeeded (e.g. a transient blip that clears) — the real error
+// (including "no such branch") still surfaces from the downstream ops call,
+// same as before this gate existed, just never with force intact.
+func (t *OffshootTools) refuseForceOnProtected(db, branch string, force bool) (res ToolResult, refused bool, effectiveForce bool) {
+	if !force || t.allowForce {
+		return ToolResult{}, false, force
+	}
+	ref, _, err := t.ws.Store.GetRef(db, branch)
+	if err != nil {
+		return ToolResult{}, false, false
+	}
+	if ref.Protected {
+		return ErrorResult("%s@%s is protected and this MCP server does not allow force "+
+			"(start it with `offshoot mcp -allow-force` to permit it). Ask the human to "+
+			"promote/destroy from the CLI, or work on a fork.", db, branch), true, false
+	}
+	return ToolResult{}, false, false
+}
+
+// wrapForceRefusal rewraps an ops error that asked for "--force" (the
+// protected-branch and, for destroy, live-lease checks in internal/ops both
+// phrase their refusal that way — see gc.go's Destroy and ops.go's
+// PromoteWith) into one that points at the actual lever an MCP agent has:
+// -allow-force on this server, not `force` on the call (refuseForceOnProtected
+// already downgrades `force` to false whenever this server wasn't started
+// with -allow-force, so a raw "use --force" from ops would otherwise read as
+// a lie — the agent DID pass force:true). Called only when the caller asked
+// for force but this server isn't honoring it; every other ops error passes
+// through untouched.
+func wrapForceRefusal(err error, force, allowForce bool) error {
+	if err == nil || !force || allowForce || !strings.Contains(err.Error(), "use --force") {
+		return err
+	}
+	return fmt.Errorf("%v — force through this MCP server needs `offshoot mcp -allow-force`; ask the human", err)
+}
+
+// guardProtectedSafetyFork refuses destroying db@branch, changing its TTL,
+// or promoting onto it, through MCP without -allow-force when branch is
+// ITSELF the safety fork (<target>-pre-rollback or <target>-pre-promote) of
+// some OTHER branch that is protected — e.g. a plain `offshoot_destroy
+// main-pre-rollback` when `main` is protected, or `offshoot_promote` with
+// `target: "main-pre-rollback"` (which would repoint, i.e. destroy, the
+// undo point just as surely as an actual destroy). Without this guard,
+// neither refuseForceOnProtected nor ops' own protected check catches this:
+// both check whether the branch NAMED in the call is protected, and a
+// safety fork itself is never protected, only the branch it was taken from
+// is. Callers pass the branch actually being destroyed/touched/promoted
+// onto, not the protected target.
+//
+// It reads branch's own ref for its Meta marker (RollbackBackupMetaKey or
+// PromoteBackupMetaKey names the branch the fork was taken from). branch not
+// existing at all (store.ErrNotFound) means ok=false (not refused): branch
+// genuinely isn't anyone's safety fork, and the caller's own subsequent ops
+// call surfaces its own "no such branch" error — there is nothing here to
+// fail closed ABOUT. Any OTHER error reading branch's own ref, though, fails
+// CLOSED the same way the target read below does: this guard cannot tell
+// whether branch carries a marker or not, and a false "not a safety fork"
+// from a transient blip is exactly the failure mode the target-read fix
+// closed — refusing here for the same reason keeps the two reads consistent
+// rather than only protecting one of the two lookups this function makes.
+//
+// Once a marker names a target, this also fails CLOSED on that target ref's
+// own read: unlike refuseForceOnProtected (which downgrades force to false
+// and lets ops' own unforced protected check backstop a failed read), there
+// is no downstream backstop here — the safety fork itself is never
+// protected, so an ops call against it sails through regardless. A
+// transient error reading the target's ref must not silently let a
+// protected branch's undo point be destroyed/repointed/TTL-changed just
+// because this one read blipped.
+func (t *OffshootTools) guardProtectedSafetyFork(db, branch string) (ToolResult, bool) {
+	ref, _, err := t.ws.Store.GetRef(db, branch)
+	if err != nil {
+		if errors.Is(err, store.ErrNotFound) {
+			return ToolResult{}, false
+		}
+		return ErrorResult("cannot read %s@%s (%v); refusing without -allow-force", db, branch, err), true
+	}
+	target := ref.Meta[ops.RollbackBackupMetaKey]
+	if target == "" {
+		target = ref.Meta[ops.PromoteBackupMetaKey]
+	}
+	if target == "" {
+		return ToolResult{}, false
+	}
+	tref, _, err := t.ws.Store.GetRef(db, target)
+	if err != nil {
+		return ErrorResult("cannot verify whether %s@%s is protected (%v); refusing to touch "+
+			"its safety fork without -allow-force", db, target, err), true
+	}
+	if !tref.Protected {
+		return ToolResult{}, false
+	}
+	return ErrorResult("%s@%s is the safety fork of protected %s@%s; without -allow-force it cannot "+
+		"be destroyed, promoted onto, or have its TTL changed through MCP — ask the human", db, branch, db, target), true
+}
+
 // prop describes one property of a tool's JSON Schema input: its argument
 // name, its real JSON Schema type (so a bool-typed Go field like `force`
 // is advertised as "boolean", not "string" — a model that follows the
@@ -355,7 +492,12 @@ func (t *OffshootTools) Tools() []Tool {
 				"everything written since. Call this when an attempt on a branch has " +
 				"gone wrong and you want to restore known-good state rather than " +
 				"manually undoing changes. Reports the checkout path to reopen after " +
-				"the rollback. `branch` defaults to \"main\" if omitted. If a daemon " +
+				"the rollback. `branch` defaults to \"main\" if omitted. The branch's " +
+				"previous head is kept first as a TTL'd safety fork `<branch>-pre-rollback` " +
+				"(one per branch, replaced by the next rollback; the safety fork lives at " +
+				"least 24h), undone by a promote of that fork back onto `branch` — through " +
+				"MCP only if `branch` is unprotected or this server allows force; otherwise " +
+				"that's the human's CLI promote. If a daemon " +
 				"session is open on this branch, the call is refused instead of " +
 				"proceeding, since rollback repoints the branch's storage out from " +
 				"under a session the daemon still believes it owns — close the " +
@@ -369,13 +511,18 @@ func (t *OffshootTools) Tools() []Tool {
 				"at the source branch's current head, which resets the target's " +
 				"checkpoint history to just the new promote checkpoint. The target's " +
 				"previous head is kept first as a shared safety fork named " +
-				"`<target>-pre-promote` (TTL'd; one per target, replaced by the next " +
-				"promote), so a promote is undone by promoting that fork back onto the " +
-				"target. Call this once " +
+				"`<target>-pre-promote` (TTL'd, at least 24h; one per target, replaced by " +
+				"the next promote), so a promote is undone by promoting that fork back onto " +
+				"the target. Call this once " +
 				"you've validated a forked attempt and are ready to make it the branch " +
-				"of record. Protected branches (main is protected by default) refuse promotion " +
-				"unless `force` is set — treat that refusal as confirmation you need, " +
-				"not a bug. If a daemon session is open on the TARGET branch, the call " +
+				"of record. Protected branches (main is protected by default) refuse promotion. " +
+				"`force` is honored only when the server was started with -allow-force; " +
+				"otherwise a protected target refuses and the answer is to ask the human to " +
+				"promote from the CLI, or work on a fork. A protected branch's own safety fork " +
+				"(`<branch>-pre-rollback`/`<branch>-pre-promote`) cannot be a target without " +
+				"-allow-force either, even though the fork itself is never protected — " +
+				"promoting onto it would repoint (destroy) the undo point it exists to " +
+				"preserve. If a daemon session is open on the TARGET branch, the call " +
 				"is refused instead of proceeding — `force` does not override this — " +
 				"since promoting repoints the target's storage out from under a session " +
 				"the daemon still believes it owns; close the session first (e.g. " +
@@ -391,8 +538,9 @@ func (t *OffshootTools) Tools() []Tool {
 			Name: "offshoot_destroy",
 			Description: "Permanently discard a branch and its checkout. Call this to " +
 				"clean up a failed or abandoned attempt once you're done with it. " +
-				"Protected branches refuse destruction unless `force` is set — treat " +
-				"that refusal as confirmation you need, not a bug. If a daemon session " +
+				"`force` is honored only when the server was started with -allow-force; " +
+				"otherwise a protected branch or a live lease refuses and the answer is to " +
+				"ask the human to destroy from the CLI, or work on a fork. If a daemon session " +
 				"is open on this branch, the call is refused instead of proceeding — " +
 				"`force` does not override this — since destroy deletes the branch's " +
 				"storage out from under a session the daemon still believes it owns; " +
@@ -407,8 +555,10 @@ func (t *OffshootTools) Tools() []Tool {
 				"longer than expected, or before handing a fork to a long-running step. `ttl` " +
 				"omitted keeps the current TTL; a Go duration like \"2h\" sets it; \"none\" clears " +
 				"it so the branch never expires (prefer a longer duration over \"none\" — " +
-				"branches without a TTL are only removed by an explicit destroy). A TTL alone " +
-				"reaps nothing: the janitor (`offshoot serve`) or `offshoot gc` does.",
+				"branches without a TTL are only removed by an explicit destroy). A TTL is " +
+				"enforced by the daemon's janitor, by `offshoot gc`, and — when no daemon is " +
+				"running — by this server's own timer (`offshoot mcp -reap-every`, default " +
+				"60s), so shortening a TTL takes effect within about a minute.",
 			InputSchema: schema(reqStr("database"), optStrDefault("branch", "main"), optStr("ttl")),
 			Annotations: annotate("Extend a branch's life", false, false, true),
 		},
@@ -847,6 +997,22 @@ type rollbackArgs struct {
 // (healthy or fenced) open on branch, this refuses rather than proceeding
 // (see refuseIfSessionOpen) — an at-rest rollback would repoint the branch
 // out from under a session the daemon still believes owns its checkout.
+// The branch's previous head is always kept first as a safety fork (see
+// promote's identical always-on backup and t.defaultTTL comment there), at
+// a TTL floored to ops.DefaultPromoteBackupTTL (24h) regardless of a shorter
+// -default-ttl — see the same floor in promote.
+//
+// Two guards sit in front of that safety fork specifically when branch is
+// protected and this server does not allow force: (1) if branch already has
+// a `<branch>-pre-rollback` from an earlier rollback, this refuses outright
+// rather than silently replacing an undo point the human may still need
+// (only a protected branch gets this treatment — an unprotected branch's
+// own safety fork is the agent's to manage); (2) if the daemon has a
+// session open on that safety-fork name, this refuses the same way
+// opRollback's daemon-side guard does (refuseIfSessionOpen), since
+// replacing it would otherwise surface as an ops lease error instead of a
+// clear MCP refusal. Whether branch is protected also decides how the
+// result phrases its own undo instructions: see the res.Backup clause below.
 func (t *OffshootTools) rollback(args json.RawMessage) (ToolResult, error) {
 	var a rollbackArgs
 	if err := json.Unmarshal(args, &a); err != nil {
@@ -863,13 +1029,69 @@ func (t *OffshootTools) rollback(args json.RawMessage) (ToolResult, error) {
 	if r, refused := t.refuseIfSessionOpen(a.Database, branch, "rolling it back"); refused {
 		return r, nil
 	}
-	path, err := t.ws.Rollback(a.Database, branch, a.To)
+
+	// protected reflects branch's OWN ref, read once and reused both for the
+	// already-has-a-safety-fork guard below and for the undo wording after a
+	// successful rollback — a GetRef failure here (e.g. no such branch) just
+	// leaves protected false; RollbackWith's own GetRef reports the real
+	// error a moment later.
+	ref, _, refErr := t.ws.Store.GetRef(a.Database, branch)
+	protected := refErr == nil && ref.Protected
+
+	backupName := branch + ops.RollbackBackupSuffix
+	if !t.allowForce && protected {
+		bref, _, err := t.ws.Store.GetRef(a.Database, backupName)
+		switch {
+		case err == nil:
+			if bref.Meta[ops.RollbackBackupMetaKey] == branch {
+				return ErrorResult("%s@%s already has a safety fork %s@%s from an earlier rollback; "+
+					"rolling back again would replace it — ask the human to promote or destroy it first",
+					a.Database, branch, a.Database, backupName), nil
+			}
+		case errors.Is(err, store.ErrNotFound):
+			// No existing safety fork at that name: nothing to protect yet.
+		default:
+			// Fail closed, same reasoning as guardProtectedSafetyFork: a
+			// transient error here must not silently let this rollback
+			// replace a safety fork that, for all we know, actually exists.
+			return ErrorResult("cannot verify whether %s@%s already has a safety fork (%v); "+
+				"refusing to roll back without -allow-force", a.Database, backupName, err), nil
+		}
+	}
+	if r, refused := t.refuseIfSessionOpen(a.Database, backupName, "replacing its safety fork"); refused {
+		return r, nil
+	}
+
+	// The safety fork's TTL follows the configured fork default, floored at
+	// ops.DefaultPromoteBackupTTL (24h) so a short -default-ttl can't shrink
+	// the undo window — see promote's identical floor.
+	backupTTL := max(t.defaultTTL, ops.DefaultPromoteBackupTTL)
+	res, err := t.ws.RollbackWith(a.Database, branch, a.To, ops.RollbackOptions{BackupTTL: backupTTL})
 	if err != nil {
 		return ErrorResult("%v", err), nil
 	}
-	return StructuredResult(map[string]any{
-		"database": a.Database, "branch": branch, "to": a.To, "path": path,
-	}, "rolled back %s@%s to checkpoint %q; checkout at %s", a.Database, branch, a.To, path), nil
+	sc := map[string]any{
+		"database": a.Database, "branch": branch, "to": a.To, "path": res.Path, "backup": res.Backup,
+	}
+	if res.Backup == "" {
+		return StructuredResult(sc, "rolled back %s@%s to checkpoint %q; checkout at %s", a.Database, branch, a.To, res.Path), nil
+	}
+	// A protected branch (main, typically) can't actually be undone through
+	// MCP unless this server allows force — offshoot_promote onto it would
+	// itself be refused (refuseForceOnProtected) — so the undo clause must
+	// not claim an agent can do it; it names the human's CLI promote
+	// instead. See item 1 of the guardrails final-review fix wave.
+	undo := fmt.Sprintf("undo: offshoot_promote it back onto %s", branch)
+	if protected && !t.allowForce {
+		undo = fmt.Sprintf("undo: ask the human to run `offshoot promote %s@%s --onto %s --force`",
+			a.Database, res.Backup, branch)
+	}
+	// The backup clause is inserted BEFORE "checkout at %s" (rather than
+	// appended after it) so the checkout path stays the message's trailing
+	// token — callers/tests that pull "the last path-shaped word" out of the
+	// prose (see lastPath in tools_test.go) still find it.
+	return StructuredResult(sc, "rolled back %s@%s to checkpoint %q; the previous head is kept as %s@%s (%s); checkout at %s",
+		a.Database, branch, a.To, a.Database, res.Backup, undo, res.Path), nil
 }
 
 type promoteArgs struct {
@@ -893,6 +1115,14 @@ type promoteArgs struct {
 // TestPromoteFromOpenSourceProceedsAtRest pins exactly this: an open
 // source session doesn't refuse, and the promoted state is the source's
 // last-flushed head, not the unflushed write.
+//
+// Before any of that, if TARGET is itself the safety fork of some OTHER
+// protected branch (e.g. `target: "main-pre-rollback"` while `main` is
+// protected), guardProtectedSafetyFork refuses without -allow-force:
+// promoting onto a safety fork repoints — i.e. destroys — the very undo
+// point the fork exists to preserve, just as surely as an actual destroy,
+// and refuseForceOnProtected below only checks whether TARGET ITSELF is
+// protected, which a safety fork never is.
 func (t *OffshootTools) promote(args json.RawMessage) (ToolResult, error) {
 	var a promoteArgs
 	if err := json.Unmarshal(args, &a); err != nil {
@@ -905,16 +1135,29 @@ func (t *OffshootTools) promote(args json.RawMessage) (ToolResult, error) {
 		namedArg("target", a.Target)); bad {
 		return r, nil
 	}
+	if !t.allowForce {
+		if r, refused := t.guardProtectedSafetyFork(a.Database, a.Target); refused {
+			return r, nil
+		}
+	}
 	if r, refused := t.refuseIfSessionOpen(a.Database, a.Target, "promoting onto it"); refused {
 		return r, nil
 	}
+	r, refused, eff := t.refuseForceOnProtected(a.Database, a.Target, a.Force)
+	if refused {
+		return r, nil
+	}
+	origForce := a.Force
+	a.Force = eff
 	// The safety fork's TTL follows the configured fork default when one is
-	// set (the same "every agent-made branch expires" policy offshoot_fork
-	// applies), else ops.DefaultPromoteBackupTTL.
+	// set and it's at least ops.DefaultPromoteBackupTTL (24h); a shorter
+	// -default-ttl (or none) still floors at 24h — an operator tuning fork
+	// TTLs down for throwaway attempts must not, as a side effect, shrink
+	// this safety fork's own undo window below a day.
 	res, err := t.ws.PromoteWith(a.Database, a.Source, a.Target,
-		ops.PromoteOptions{Force: a.Force, BackupTTL: t.defaultTTL})
+		ops.PromoteOptions{Force: a.Force, BackupTTL: max(t.defaultTTL, ops.DefaultPromoteBackupTTL)})
 	if err != nil {
-		return ErrorResult("%v", err), nil
+		return ErrorResult("%v", wrapForceRefusal(err, origForce, t.allowForce)), nil
 	}
 	sc := map[string]any{
 		"database": a.Database, "source": a.Source, "target": a.Target, "txid": res.TXID, "backup": res.Backup,
@@ -936,7 +1179,11 @@ type destroyArgs struct {
 // session (healthy or fenced) open on branch, this refuses rather than
 // proceeding (see refuseIfSessionOpen) — an at-rest destroy would delete
 // the branch (and, per ops.Destroy, clear its lease) out from under a
-// session the daemon still believes owns it.
+// session the daemon still believes owns it. Before any of that, if branch
+// is itself the safety fork of some OTHER protected branch (e.g.
+// `main-pre-rollback` while `main` is protected), guardProtectedSafetyFork
+// refuses without -allow-force — refuseForceOnProtected below only checks
+// whether BRANCH ITSELF is protected, which a safety fork never is.
 func (t *OffshootTools) destroy(args json.RawMessage) (ToolResult, error) {
 	var a destroyArgs
 	if err := json.Unmarshal(args, &a); err != nil {
@@ -948,11 +1195,22 @@ func (t *OffshootTools) destroy(args json.RawMessage) (ToolResult, error) {
 	if r, bad := validateNames(namedArg("database", a.Database), namedArg("branch", a.Branch)); bad {
 		return r, nil
 	}
+	if !t.allowForce {
+		if r, refused := t.guardProtectedSafetyFork(a.Database, a.Branch); refused {
+			return r, nil
+		}
+	}
 	if r, refused := t.refuseIfSessionOpen(a.Database, a.Branch, "destroying it"); refused {
 		return r, nil
 	}
+	r, refused, eff := t.refuseForceOnProtected(a.Database, a.Branch, a.Force)
+	if refused {
+		return r, nil
+	}
+	origForce := a.Force
+	a.Force = eff
 	if err := t.ws.Destroy(a.Database, a.Branch, a.Force); err != nil {
-		return ErrorResult("%v", err), nil
+		return ErrorResult("%v", wrapForceRefusal(err, origForce, t.allowForce)), nil
 	}
 	return StructuredResult(map[string]any{
 		"database": a.Database, "branch": a.Branch,
@@ -969,7 +1227,12 @@ type touchArgs struct {
 // touch resets db@branch's activity clock (ops.Touch: CAS-retried, refuses
 // a branch a reaper has already claimed) and optionally sets/clears its TTL.
 // Safe alongside an open daemon session: the ref CAS races only lease
-// renewals, and ops.Touch retries.
+// renewals, and ops.Touch retries. Changing the TTL (a.TTL != "") of a
+// branch that is itself the safety fork of some OTHER protected branch is
+// guarded the same way destroy() is (guardProtectedSafetyFork): a human who
+// protected `main` gets to decide how long `main-pre-rollback` lives, too. A
+// plain touch (a.TTL == "", extending life only) is never guarded — it can
+// only push the deadline further out, never pull it in or clear it.
 func (t *OffshootTools) touch(args json.RawMessage) (ToolResult, error) {
 	var a touchArgs
 	if err := json.Unmarshal(args, &a); err != nil {
@@ -981,6 +1244,11 @@ func (t *OffshootTools) touch(args json.RawMessage) (ToolResult, error) {
 	branch := branchOr(a.Branch)
 	if r, bad := validateNames(namedArg("database", a.Database), namedArg("branch", branch)); bad {
 		return r, nil
+	}
+	if a.TTL != "" && !t.allowForce {
+		if r, refused := t.guardProtectedSafetyFork(a.Database, branch); refused {
+			return r, nil
+		}
 	}
 	var ttl *time.Duration
 	switch a.TTL {
@@ -1151,4 +1419,128 @@ func (t *OffshootTools) diff(args json.RawMessage) (ToolResult, error) {
 		sc["full"], sc["truncated"] = text, truncated
 	}
 	return StructuredResult(sc, "%s", b.String()), nil
+}
+
+// reapOnce runs a single at-rest reap pass, or reports that it deferred to
+// a running daemon instead. skipped is true whenever t.daemonStatus()
+// reports a daemon reachable at all (any answer, not just a healthy
+// session — see daemonStatus's own ok contract): that daemon's own janitor
+// (see internal/daemon/janitor.go's StartJanitor/janitorTick) already reaps
+// this exact store on its own cadence, and a second reaper racing it here
+// would be a second writer against the same store with no coordination
+// between them — the CAS in ops.Workspace.Reap/reapOne makes a race between
+// the two safe from corruption, but not from surprising log lines and
+// duplicate "reaped" work attributed to the wrong process. skipped=true
+// leaves the store completely untouched: neither Reap nor
+// ClearStaleDeleteClaims is called at all.
+//
+// When no daemon is reachable, this mirrors janitorTick's own order and
+// error handling for the two calls it shares with the janitor (Reap, then
+// ClearStaleDeleteClaims — no GC; see StartReaper's doc comment for why):
+// both calls run regardless of whether the first failed (each keeps doing
+// everything it safely can and reports a partial result alongside its own
+// error, per their doc comments), and the first error either one hits wins
+// (mirroring ops.Workspace.Reap's own firstErr pattern), but reaped is
+// still whatever Reap actually destroyed even when ClearStaleDeleteClaims
+// (or Reap itself) errors afterward.
+func (t *OffshootTools) reapOnce(now time.Time) (reaped []string, skipped bool, err error) {
+	if _, up := t.daemonStatus(); up {
+		return nil, true, nil
+	}
+	var firstErr error
+	reaped, err = t.ws.Reap(now)
+	if err != nil {
+		firstErr = err
+	}
+	if _, cerr := t.ws.ClearStaleDeleteClaims(now); cerr != nil {
+		if firstErr == nil {
+			firstErr = cerr
+		} else {
+			// Both steps failed this pass: firstErr (Reap's) is what this
+			// call returns, per this function's own doc comment, but that
+			// would otherwise silently drop ClearStaleDeleteClaims' error
+			// on the floor. janitorTick logs each step's error on its own
+			// line regardless of whether an earlier step also failed (see
+			// janitor.go) — mirrored here so an operator watching stderr
+			// still learns about this failure too, not just the first one.
+			fmt.Fprintf(os.Stderr, "offshoot mcp: clear stale delete claims: %v\n", cerr)
+		}
+	}
+	return reaped, false, firstErr
+}
+
+// StartReaper runs reapOnce on a ticker, every `every`, until ctx is done —
+// the `offshoot mcp -reap-every` fallback for a store with no `offshoot
+// serve` daemon running, so a TTL set via offshoot_fork's `ttl` argument
+// (or -default-ttl) is eventually enforced even when nothing else is
+// reaping this store. every <= 0 disables the reaper entirely (no
+// goroutine started), matching StartJanitor's own contract for the same
+// shape of flag (see cmd/offshoot/main.go's -reap-every for `offshoot mcp`
+// and `offshoot serve`).
+//
+// Deliberately does NOT run GC: unlike the daemon's janitor, this reaper
+// has no operator-supplied grace period to run GC safely against (GC needs
+// a grace long enough to exceed the longest plausible in-flight fork, and
+// -reap-every here is about reap cadence, not that), and reclaiming
+// tombstoned storage is not time-sensitive the way an expired TTL is —
+// `offshoot gc` (manual) or a running `offshoot serve` daemon remains the
+// only way to reclaim disk from this store.
+//
+// Every tick's outcome is logged to stderr: one "offshoot mcp: reaped
+// <db@branch>" line per branch actually destroyed, any error from
+// reapOnce, and — the first time (and only the first time) a tick skips
+// because a daemon came up — a single "offshoot mcp: reaper skipped:
+// daemon is running" line, so an operator watching stderr learns once that
+// this reaper has backed off rather than seeing that line repeat forever
+// on every tick a daemon happens to be up.
+//
+// Never panics: reapOnce's own errors are returned values, not panics, and
+// this loop only ever logs them.
+//
+// Returns done, closed the instant the reaper's goroutine actually exits —
+// already closed before this call returns when every <= 0 disabled it
+// outright (no goroutine was ever started), or closed once the running
+// goroutine observes ctx.Done() otherwise. This is a smaller-scoped sibling
+// of StartJanitor/Shutdown's janitorWG synchronization (internal/daemon):
+// that one lets Shutdown block until every daemon goroutine has stopped;
+// this lets a caller (a test, chiefly — see
+// TestStartReaperTicksAndStopsOnCancel in internal/mcp) prove this one
+// goroutine specifically has stopped after cancelling ctx, rather than only
+// ever being able to poll side effects and infer it. cmd/offshoot/main.go's
+// `mcp` case doesn't need to wait on it (its own process teardown after
+// srv.Serve returns is enough), so it discards the return value.
+func (t *OffshootTools) StartReaper(ctx context.Context, every time.Duration) (done <-chan struct{}) {
+	doneCh := make(chan struct{})
+	if every <= 0 {
+		close(doneCh)
+		return doneCh
+	}
+	go func() {
+		defer close(doneCh)
+		ticker := time.NewTicker(every)
+		defer ticker.Stop()
+		loggedSkip := false
+		for {
+			select {
+			case <-ctx.Done():
+				return
+			case <-ticker.C:
+				reaped, skipped, err := t.reapOnce(time.Now())
+				if skipped {
+					if !loggedSkip {
+						fmt.Fprintln(os.Stderr, "offshoot mcp: reaper skipped: daemon is running")
+						loggedSkip = true
+					}
+					continue
+				}
+				if err != nil {
+					fmt.Fprintf(os.Stderr, "offshoot mcp: reap: %v\n", err)
+				}
+				for _, k := range reaped {
+					fmt.Fprintf(os.Stderr, "offshoot mcp: reaped %s\n", k)
+				}
+			}
+		}
+	}()
+	return doneCh
 }

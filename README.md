@@ -62,7 +62,8 @@ That's most of the surface already. The full vocabulary, one line each
 | `create` / `checkout` | new database / materialize a working copy — prints a plain `.db` path |
 | `checkpoint` | snapshot the checkout as a named, rollback-able point |
 | `fork` | branch from head or a checkpoint — instant, copy-on-write, optional `--ttl` |
-| `rollback` / `promote` | repoint a branch at a checkpoint / repoint a target at a branch's head (keeping its old head as `<target>-pre-promote` to undo — TTL'd, 24h by default, one rolling slot per target replaced by the next promote) |
+| `protect` / `unprotect` | refuse unforced destroy/promote-onto and never reap a branch (`main`, by default) — CLI-only; an MCP agent can't flip it, and can't force past it without the server's `-allow-force` |
+| `rollback` / `promote` | repoint a branch at a checkpoint / repoint a target at a branch's head — each keeps the branch's old head first as a TTL'd safety fork to undo (`<branch>-pre-rollback` / `<target>-pre-promote`, 24h by default, one rolling slot, `--no-backup`/`--backup-ttl` to tune or skip it) |
 | `diff` / `export` | content-aware summary, or sqldiff, between two branches or checkpoints / copy state out to a plain file |
 | `destroy` / `gc` | delete a branch / collect unreachable objects |
 | `serve` / `session` | the daemon: leases, live capture, flush-without-pausing ([below](#daemon-mode)) |
@@ -470,22 +471,33 @@ captured session.
 
 Destructive tools respect the same protected-branch rules as the CLI: an
 agent can fork and experiment freely, but promoting onto or destroying
-`main` requires an explicit force, and the refusal tells the agent so.
+`main` is refused outright by default, and the refusal tells the agent so.
+Unlike the CLI's `--force`, an agent's `force:true` is honored here only if
+the server was started with `-allow-force` — off by default — so touching
+the branch of record is a decision the human running `offshoot mcp` makes
+at startup, not one an agent can make for itself over the wire. The
+refusal points the agent at the CLI or a fork instead; see
+[docs/demo/mcp-walkthrough.md](docs/demo/mcp-walkthrough.md) for this
+firing for real, followed by an `offshoot_diff` comparison and a human-run
+CLI promote. Any branch can be protected the same way `main` is
+(`offshoot protect <db>[@branch]` — CLI-only; there's no MCP tool for it).
 Promoting also keeps the target's previous head as a safety fork
-(`<target>-pre-promote` — the result names it), but that fork always
-carries a TTL (24h by default) and is one rolling slot per target,
-replaced by the next promote onto that target, so the undo window closes
-when either happens.
+(`<target>-pre-promote` — the result names it), and rollback does the same
+for the branch it repoints (`<branch>-pre-rollback`); either fork always
+carries a TTL (24h by default) and is one rolling slot per branch/target,
+replaced by the next promote/rollback, so the undo window closes when
+either happens.
 
 Agent-created forks expire by default, so an agent that forks and forgets
 doesn't leak branches forever: `offshoot_fork` applies `offshoot mcp
 -default-ttl` (default `24h`) to any call that omits its own `ttl`; pass
 `ttl:"<duration>"` to override, or `ttl:"none"` for a branch that never
 expires. The response echoes the TTL applied and the computed expiry, so
-both are visible in the agent's transcript. **A TTL alone does not reap
-anything** — reaping is the janitor's job (`offshoot serve`), and
-`offshoot mcp` runs no daemon of its own; a daemonless MCP setup only
-sweeps expired branches when `offshoot gc` is run by hand.
+both are visible in the agent's transcript. Reaping an expired TTL is
+`offshoot mcp -reap-every`'s own background pass (default `60s`; it defers
+to a reachable `offshoot serve` daemon's janitor instead of running
+alongside it, and runs no GC either way), a running daemon's janitor, or
+`offshoot gc` by hand.
 
 **MCP rides a running daemon when one is up.** `offshoot mcp` never opens
 a session itself — that's a harness's job (the SDKs, `offshoot session

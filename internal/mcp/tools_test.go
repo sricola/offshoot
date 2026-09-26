@@ -4,6 +4,7 @@ import (
 	"bytes"
 	"context"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"os"
 	"os/exec"
@@ -151,10 +152,169 @@ func TestProtectedBranchRefusalReachesTheAgent(t *testing.T) {
 		!strings.Contains(strings.ToLower(text(r)), "force") {
 		t.Fatalf("refusal must tell the agent what to do: %s", text(r))
 	}
-	// With force it succeeds.
+	// With force it succeeds, once this server opts in to honoring it.
+	ts.SetAllowForce(true)
 	if r := call(t, ts, "offshoot_promote", map[string]any{
 		"database": "app", "source": "attempt-1", "target": "main", "force": true}); r.IsError {
 		t.Fatalf("forced promote: %s", text(r))
+	}
+}
+
+// TestMCPRefusesForceOnProtectedByDefault: with the default server (no
+// SetAllowForce), promote and destroy with force:true onto/of protected
+// main are tool errors that name -allow-force, and main is untouched.
+// After SetAllowForce(true) the same calls proceed. force on an
+// UNprotected branch never needed the flag either way.
+func TestMCPRefusesForceOnProtectedByDefault(t *testing.T) {
+	ts, w := newTools(t)
+	if r := call(t, ts, "offshoot_fork", map[string]any{
+		"database": "app", "new_branch": "attempt-1"}); r.IsError {
+		t.Fatalf("fork: %s", text(r))
+	}
+
+	before, _, err := w.Store.GetRef("app", "main")
+	if err != nil {
+		t.Fatalf("GetRef main: %v", err)
+	}
+
+	// Default server: force onto protected main is refused before any
+	// mutation, and the refusal names -allow-force.
+	r := call(t, ts, "offshoot_promote", map[string]any{
+		"database": "app", "source": "attempt-1", "target": "main", "force": true})
+	if !r.IsError {
+		t.Fatal("forced promote onto protected main must be refused without -allow-force")
+	}
+	if !strings.Contains(text(r), "-allow-force") {
+		t.Fatalf("refusal must name -allow-force: %s", text(r))
+	}
+	after, _, err := w.Store.GetRef("app", "main")
+	if err != nil {
+		t.Fatalf("GetRef main: %v", err)
+	}
+	if after.Lineage != before.Lineage || after.HeadTXID != before.HeadTXID {
+		t.Fatalf("main must be untouched by the refused promote: before=%+v after=%+v", before, after)
+	}
+
+	// Same for destroy of a protected branch.
+	if _, err := w.SetProtected("app", "attempt-1", true); err != nil {
+		t.Fatal(err)
+	}
+	dr := call(t, ts, "offshoot_destroy", map[string]any{
+		"database": "app", "branch": "attempt-1", "force": true})
+	if !dr.IsError {
+		t.Fatal("forced destroy of a protected branch must be refused without -allow-force")
+	}
+	if !strings.Contains(text(dr), "-allow-force") {
+		t.Fatalf("refusal must name -allow-force: %s", text(dr))
+	}
+	if _, _, err := w.Store.GetRef("app", "attempt-1"); err != nil {
+		t.Fatalf("attempt-1 must still exist after the refused destroy: %v", err)
+	}
+
+	// force on an UNprotected branch never needed the flag: fork a second,
+	// unprotected attempt and destroy it with force straight away.
+	if r := call(t, ts, "offshoot_fork", map[string]any{
+		"database": "app", "new_branch": "attempt-2"}); r.IsError {
+		t.Fatalf("fork: %s", text(r))
+	}
+	if r := call(t, ts, "offshoot_destroy", map[string]any{
+		"database": "app", "branch": "attempt-2", "force": true}); r.IsError {
+		t.Fatalf("forced destroy of an unprotected branch needs no -allow-force: %s", text(r))
+	}
+
+	// After SetAllowForce(true), the same protected-branch calls proceed.
+	ts.SetAllowForce(true)
+	if r := call(t, ts, "offshoot_promote", map[string]any{
+		"database": "app", "source": "attempt-1", "target": "main", "force": true}); r.IsError {
+		t.Fatalf("promote with -allow-force: %s", text(r))
+	}
+	if r := call(t, ts, "offshoot_destroy", map[string]any{
+		"database": "app", "branch": "attempt-1", "force": true}); r.IsError {
+		t.Fatalf("destroy with -allow-force: %s", text(r))
+	}
+}
+
+// errOnceGetBackend wraps a real store.Backend and fails the FIRST Get for
+// one specific key with an injected error, then behaves normally on every
+// later call (to that key or any other) — a transient backend blip, not a
+// permanently broken key. Used to prove refuseForceOnProtected's own GetRef
+// probe fails CLOSED: if its read of the target/branch ref errors, force
+// must be downgraded to false even though a later, successful read (e.g.
+// ops' own GetRef, moments later) might have found the branch unprotected.
+type errOnceGetBackend struct {
+	store.Backend
+	key     string
+	errored bool
+}
+
+func (b *errOnceGetBackend) Get(key string) ([]byte, string, error) {
+	if key == b.key && !b.errored {
+		b.errored = true
+		return nil, "", fmt.Errorf("injected transient backend error")
+	}
+	return b.Backend.Get(key)
+}
+
+// TestMCPForceFailsClosedOnTransientGetRefError: refuseForceOnProtected's
+// own GetRef probe (not ops') hitting a transient backend error must not
+// let a caller's force:true slip through to ops. Before the fix, an error
+// here left force unchanged (true), so ops' own GetRef — hitting the SAME
+// key a moment later, this time successfully — could see main protected
+// and still honor force, destroying it. The fix downgrades force to false
+// on any GetRef error at the gate, so ops' own protected check (unforced)
+// refuses instead: main survives, and the caller sees a tool error naming
+// -allow-force (via wrapForceRefusal, since ops' error text says
+// "use --force").
+func TestMCPForceFailsClosedOnTransientGetRefError(t *testing.T) {
+	ts, w := newTools(t)
+	w.Store.B = &errOnceGetBackend{Backend: w.Store.B, key: store.RefKey("app", "main")}
+
+	dr := call(t, ts, "offshoot_destroy", map[string]any{
+		"database": "app", "branch": "main", "force": true})
+	if !dr.IsError {
+		t.Fatal("forced destroy of protected main must be refused even when the gate's own GetRef errors transiently")
+	}
+	if !strings.Contains(text(dr), "-allow-force") {
+		t.Fatalf("refusal must name -allow-force: %s", text(dr))
+	}
+	if _, _, err := w.Store.GetRef("app", "main"); err != nil {
+		t.Fatalf("main must still exist: %v", err)
+	}
+}
+
+// TestMCPDestroyNeedsAllowForceForLiveLeaseToo: -allow-force gates every use
+// ops makes of force in destroy, not just the protected check — including
+// bypassing a live lease on an otherwise UNprotected branch (ops.Destroy
+// consults force for both; see gc.go). Without -allow-force, force:true is
+// downgraded to false before it ever reaches ops (refuseForceOnProtected),
+// so ops' own live-lease check refuses; the tool error is rewrapped to name
+// -allow-force. With -allow-force, the same call proceeds.
+func TestMCPDestroyNeedsAllowForceForLiveLeaseToo(t *testing.T) {
+	ts, w := newTools(t)
+	if r := call(t, ts, "offshoot_fork", map[string]any{
+		"database": "app", "new_branch": "leased"}); r.IsError {
+		t.Fatalf("fork: %s", text(r))
+	}
+	if _, err := w.AcquireLease("app", "leased", "holder", time.Hour); err != nil {
+		t.Fatal(err)
+	}
+
+	dr := call(t, ts, "offshoot_destroy", map[string]any{
+		"database": "app", "branch": "leased", "force": true})
+	if !dr.IsError {
+		t.Fatal("forced destroy under a live lease must be refused without -allow-force")
+	}
+	if !strings.Contains(text(dr), "-allow-force") {
+		t.Fatalf("refusal must name -allow-force: %s", text(dr))
+	}
+	if _, _, err := w.Store.GetRef("app", "leased"); err != nil {
+		t.Fatalf("leased branch must still exist after the refused destroy: %v", err)
+	}
+
+	ts.SetAllowForce(true)
+	if r := call(t, ts, "offshoot_destroy", map[string]any{
+		"database": "app", "branch": "leased", "force": true}); r.IsError {
+		t.Fatalf("destroy with -allow-force under a live lease: %s", text(r))
 	}
 }
 
@@ -713,34 +873,332 @@ func TestForkTTLSummaryKeepsJanitorNoteWhenReReadFails(t *testing.T) {
 // TestPromoteKeepsSafetyForkAndSaysSo: offshoot_promote always keeps the
 // target's previous head as <target>-pre-promote (agents get no opt-out —
 // this is the safe-by-default path), its TTL follows the configured fork
-// default, and the result text names the fork so the agent knows its undo
-// handle. The description states the mechanism so the model can plan on it.
+// default floored at ops.DefaultPromoteBackupTTL (24h) — a shorter
+// -default-ttl can't shrink the undo window, but a longer one still wins —
+// and the result text names the fork so the agent knows its undo handle.
+// The description states the mechanism so the model can plan on it.
 func TestPromoteKeepsSafetyForkAndSaysSo(t *testing.T) {
-	ts, w := newTools(t, 2*time.Hour)
-	if _, err := w.Fork("app", "main", "attempt-1", "", 0, nil); err != nil {
-		t.Fatal(err)
+	cases := []struct {
+		name       string
+		defaultTTL time.Duration
+		wantTTL    string
+	}{
+		{"belowFloorUsesFloor", 2 * time.Hour, "24h0m0s"},
+		{"aboveFloorWins", 48 * time.Hour, "48h0m0s"},
 	}
-	r := call(t, ts, "offshoot_promote", map[string]any{
-		"database": "app", "source": "attempt-1", "target": "main", "force": true})
-	if r.IsError {
-		t.Fatalf("promote: %s", text(r))
+	for _, c := range cases {
+		t.Run(c.name, func(t *testing.T) {
+			ts, w := newTools(t, c.defaultTTL)
+			ts.SetAllowForce(true)
+			if _, err := w.Fork("app", "main", "attempt-1", "", 0, nil); err != nil {
+				t.Fatal(err)
+			}
+			r := call(t, ts, "offshoot_promote", map[string]any{
+				"database": "app", "source": "attempt-1", "target": "main", "force": true})
+			if r.IsError {
+				t.Fatalf("promote: %s", text(r))
+			}
+			backup := "main" + ops.PromoteBackupSuffix
+			if !strings.Contains(text(r), "app@"+backup) {
+				t.Fatalf("result must name the safety fork %s: %s", backup, text(r))
+			}
+			ref, _, err := w.Store.GetRef("app", backup)
+			if err != nil {
+				t.Fatalf("safety fork must exist: %v", err)
+			}
+			if ref.TTL != c.wantTTL {
+				t.Fatalf("safety fork TTL = %q, want %q", ref.TTL, c.wantTTL)
+			}
+		})
 	}
-	backup := "main" + ops.PromoteBackupSuffix
-	if !strings.Contains(text(r), "app@"+backup) {
-		t.Fatalf("result must name the safety fork %s: %s", backup, text(r))
-	}
-	ref, _, err := w.Store.GetRef("app", backup)
-	if err != nil {
-		t.Fatalf("safety fork must exist: %v", err)
-	}
-	if ref.TTL != "2h0m0s" {
-		t.Fatalf("safety fork TTL must follow the configured fork default, got %q", ref.TTL)
-	}
+	ts, _ := newTools(t, 2*time.Hour)
 	for _, tl := range ts.Tools() {
 		if tl.Name == "offshoot_promote" && !strings.Contains(tl.Description, "-pre-promote") {
 			t.Fatalf("offshoot_promote description must state the safety fork: %s", tl.Description)
 		}
 	}
+}
+
+// TestRollbackKeepsSafetyForkAndSaysSo: offshoot_rollback always keeps the
+// branch's previous head as <branch>-pre-rollback, its TTL follows the
+// configured fork default floored at ops.DefaultPromoteBackupTTL (24h —
+// same floor promote applies, and for the same reason), and the result text
+// names the fork so the agent knows its undo handle. Mirrors
+// TestPromoteKeepsSafetyForkAndSaysSo.
+func TestRollbackKeepsSafetyForkAndSaysSo(t *testing.T) {
+	cases := []struct {
+		name       string
+		defaultTTL time.Duration
+		wantTTL    string
+	}{
+		{"belowFloorUsesFloor", 2 * time.Hour, "24h0m0s"},
+		{"aboveFloorWins", 48 * time.Hour, "48h0m0s"},
+	}
+	for _, c := range cases {
+		t.Run(c.name, func(t *testing.T) {
+			ts, w := newTools(t, c.defaultTTL)
+			if _, err := w.Fork("app", "main", "attempt-1", "", 0, nil); err != nil {
+				t.Fatal(err)
+			}
+			p, err := w.Checkout("app", "attempt-1")
+			if err != nil {
+				t.Fatal(err)
+			}
+			if out, err := exec.Command("sqlite3", p, "CREATE TABLE t (v); INSERT INTO t VALUES (1);").CombinedOutput(); err != nil {
+				t.Fatalf("%v: %s", err, out)
+			}
+			if _, err := w.Checkpoint("app", "attempt-1", "v1", nil); err != nil {
+				t.Fatal(err)
+			}
+			if out, err := exec.Command("sqlite3", p, "INSERT INTO t VALUES (2);").CombinedOutput(); err != nil {
+				t.Fatalf("%v: %s", err, out)
+			}
+			if _, err := w.Checkpoint("app", "attempt-1", "v2", nil); err != nil {
+				t.Fatal(err)
+			}
+
+			r := call(t, ts, "offshoot_rollback", map[string]any{
+				"database": "app", "branch": "attempt-1", "to": "v1"})
+			if r.IsError {
+				t.Fatalf("rollback: %s", text(r))
+			}
+			backup := "attempt-1" + ops.RollbackBackupSuffix
+			if !strings.Contains(text(r), "app@"+backup) {
+				t.Fatalf("result must name the safety fork %s: %s", backup, text(r))
+			}
+			sc, ok := r.StructuredContent.(map[string]any)
+			if !ok {
+				t.Fatalf("structuredContent must be a map, got %T", r.StructuredContent)
+			}
+			if _, ok := sc["backup"]; !ok {
+				t.Fatalf("structuredContent must have a backup field: %+v", sc)
+			}
+			ref, _, err := w.Store.GetRef("app", backup)
+			if err != nil {
+				t.Fatalf("safety fork must exist: %v", err)
+			}
+			if ref.TTL != c.wantTTL {
+				t.Fatalf("safety fork TTL = %q, want %q", ref.TTL, c.wantTTL)
+			}
+		})
+	}
+}
+
+// TestGuardProtectedSafetyFork pins item 2 of the guardrails final-review fix
+// wave: a branch's safety fork (<branch>-pre-rollback here) is guarded
+// against destroy, TTL-shortening/clearing touch, and being promoted onto,
+// and rolling back the protected branch again while its safety fork still
+// exists is refused too — all without -allow-force — while a plain touch
+// (extend only, no `ttl`) stays allowed throughout. The "unprotected"
+// subtest pins the converse: none of this applies when the branch the fork
+// was taken from isn't protected.
+func TestGuardProtectedSafetyFork(t *testing.T) {
+	t.Run("protected", func(t *testing.T) {
+		ts, w := newTools(t)
+		// A harmless, never-protected fork to use as offshoot_promote's
+		// source below — promoting it onto the safety fork is what item 2
+		// guards against.
+		if _, err := w.Fork("app", "main", "attempt-1", "", 0, nil); err != nil {
+			t.Fatal(err)
+		}
+		// "app@main" is protected and carries an "init" checkpoint from
+		// Create — rolling it back to its own init checkpoint is enough to
+		// mint main-pre-rollback without any other setup.
+		if r := call(t, ts, "offshoot_rollback", map[string]any{
+			"database": "app", "branch": "main", "to": "init"}); r.IsError {
+			t.Fatalf("rollback: %s", text(r))
+		}
+		backup := "main" + ops.RollbackBackupSuffix
+
+		// (a) destroying the safety fork is refused, naming -allow-force and
+		// the human, and the fork survives.
+		dr := call(t, ts, "offshoot_destroy", map[string]any{"database": "app", "branch": backup})
+		if !dr.IsError {
+			t.Fatal("destroying the safety fork of protected main must be refused without -allow-force")
+		}
+		if !strings.Contains(text(dr), "-allow-force") || !strings.Contains(strings.ToLower(text(dr)), "human") {
+			t.Fatalf("refusal must name -allow-force and the human: %s", text(dr))
+		}
+		if _, _, err := w.Store.GetRef("app", backup); err != nil {
+			t.Fatalf("safety fork must still exist after the refused destroy: %v", err)
+		}
+
+		// (b) touch that changes the TTL is refused; a plain touch (extend
+		// only) is allowed.
+		if r := call(t, ts, "offshoot_touch", map[string]any{
+			"database": "app", "branch": backup, "ttl": "1s"}); !r.IsError {
+			t.Fatal("touch with ttl on the safety fork of protected main must be refused without -allow-force")
+		}
+		if r := call(t, ts, "offshoot_touch", map[string]any{
+			"database": "app", "branch": backup}); r.IsError {
+			t.Fatalf("plain touch (extend only) must stay allowed: %s", text(r))
+		}
+
+		// (c) a second rollback of main is refused while the fork exists.
+		if r := call(t, ts, "offshoot_rollback", map[string]any{
+			"database": "app", "branch": "main", "to": "init"}); !r.IsError {
+			t.Fatal("a second rollback of protected main must be refused while its safety fork exists")
+		} else if !strings.Contains(strings.ToLower(text(r)), "human") {
+			t.Fatalf("refusal must point at the human: %s", text(r))
+		}
+
+		// (d) promoting onto the safety fork is refused too — it would
+		// repoint (i.e. destroy) the undo point just as surely as an actual
+		// destroy, and the fork itself is never protected so ops' own
+		// protected check never catches this.
+		if r := call(t, ts, "offshoot_promote", map[string]any{
+			"database": "app", "source": "attempt-1", "target": backup}); !r.IsError {
+			t.Fatal("promoting onto the safety fork of protected main must be refused without -allow-force")
+		} else if !strings.Contains(text(r), "-allow-force") || !strings.Contains(strings.ToLower(text(r)), "human") {
+			t.Fatalf("refusal must name -allow-force and the human: %s", text(r))
+		}
+		if _, _, err := w.Store.GetRef("app", backup); err != nil {
+			t.Fatalf("safety fork must still exist after the refused promote: %v", err)
+		}
+
+		// After -allow-force, all four proceed.
+		ts.SetAllowForce(true)
+		if r := call(t, ts, "offshoot_touch", map[string]any{
+			"database": "app", "branch": backup, "ttl": "1s"}); r.IsError {
+			t.Fatalf("touch with ttl, -allow-force: %s", text(r))
+		}
+		if r := call(t, ts, "offshoot_rollback", map[string]any{
+			"database": "app", "branch": "main", "to": "init"}); r.IsError {
+			t.Fatalf("second rollback, -allow-force: %s", text(r))
+		}
+		if r := call(t, ts, "offshoot_promote", map[string]any{
+			"database": "app", "source": "attempt-1", "target": backup}); r.IsError {
+			t.Fatalf("promote onto safety fork, -allow-force: %s", text(r))
+		}
+		if r := call(t, ts, "offshoot_destroy", map[string]any{
+			"database": "app", "branch": backup}); r.IsError {
+			t.Fatalf("destroy, -allow-force: %s", text(r))
+		}
+	})
+
+	t.Run("unprotected", func(t *testing.T) {
+		ts, w := newTools(t)
+		if _, err := w.Fork("app", "main", "attempt-1", "", 0, nil); err != nil {
+			t.Fatal(err)
+		}
+		p, err := w.Checkout("app", "attempt-1")
+		if err != nil {
+			t.Fatal(err)
+		}
+		if out, err := exec.Command("sqlite3", p, "CREATE TABLE t (v); INSERT INTO t VALUES (1);").CombinedOutput(); err != nil {
+			t.Fatalf("%v: %s", err, out)
+		}
+		if _, err := w.Checkpoint("app", "attempt-1", "v1", nil); err != nil {
+			t.Fatal(err)
+		}
+		if r := call(t, ts, "offshoot_rollback", map[string]any{
+			"database": "app", "branch": "attempt-1", "to": "v1"}); r.IsError {
+			t.Fatalf("rollback: %s", text(r))
+		}
+		backup := "attempt-1" + ops.RollbackBackupSuffix
+
+		// None of the four needs -allow-force: attempt-1 was never protected.
+		if r := call(t, ts, "offshoot_touch", map[string]any{
+			"database": "app", "branch": backup, "ttl": "1s"}); r.IsError {
+			t.Fatalf("touch with ttl on an unprotected branch's safety fork: %s", text(r))
+		}
+		if r := call(t, ts, "offshoot_promote", map[string]any{
+			"database": "app", "source": "main", "target": backup}); r.IsError {
+			t.Fatalf("promote onto an unprotected branch's safety fork: %s", text(r))
+		}
+		if r := call(t, ts, "offshoot_rollback", map[string]any{
+			"database": "app", "branch": "attempt-1", "to": "v1"}); r.IsError {
+			t.Fatalf("second rollback of an unprotected branch: %s", text(r))
+		}
+		if r := call(t, ts, "offshoot_destroy", map[string]any{
+			"database": "app", "branch": backup}); r.IsError {
+			t.Fatalf("destroy of an unprotected branch's safety fork: %s", text(r))
+		}
+	})
+}
+
+// TestGuardProtectedSafetyForkFailsClosedOnTransientReadError: unlike
+// refuseForceOnProtected (which downgrades force to false and lets ops' own
+// unforced protected check backstop a failed read), a safety fork is never
+// protected itself, so there is no downstream backstop if
+// guardProtectedSafetyFork's own read of the protected TARGET's ref errors —
+// it must refuse, not silently let the mutation through. Same reasoning for
+// rollback's own inline check of whether its safety-fork name already
+// exists: a transient error there must not read as "no existing fork,
+// proceed and replace." Uses the errOnceGetBackend pattern from
+// TestMCPForceFailsClosedOnTransientGetRefError to inject a one-shot Get
+// error on the exact ref key each guard reads.
+func TestGuardProtectedSafetyForkFailsClosedOnTransientReadError(t *testing.T) {
+	t.Run("destroyReadingTheProtectedTarget", func(t *testing.T) {
+		ts, w := newTools(t)
+		if r := call(t, ts, "offshoot_rollback", map[string]any{
+			"database": "app", "branch": "main", "to": "init"}); r.IsError {
+			t.Fatalf("rollback: %s", text(r))
+		}
+		backup := "main" + ops.RollbackBackupSuffix
+
+		// guardProtectedSafetyFork reads backup's own ref (fine, real), then
+		// "main"'s ref to check Protected — that second read is the one
+		// injected to fail once.
+		w.Store.B = &errOnceGetBackend{Backend: w.Store.B, key: store.RefKey("app", "main")}
+
+		dr := call(t, ts, "offshoot_destroy", map[string]any{"database": "app", "branch": backup})
+		if !dr.IsError {
+			t.Fatal("destroying the safety fork must be refused when reading the protected target's ref errors transiently")
+		}
+		if !strings.Contains(text(dr), "-allow-force") {
+			t.Fatalf("refusal must name -allow-force: %s", text(dr))
+		}
+		if _, _, err := w.Store.GetRef("app", backup); err != nil {
+			t.Fatalf("safety fork must still exist: %v", err)
+		}
+	})
+
+	t.Run("secondRollbackReadingItsOwnSafetyForkName", func(t *testing.T) {
+		ts, w := newTools(t)
+		if r := call(t, ts, "offshoot_rollback", map[string]any{
+			"database": "app", "branch": "main", "to": "init"}); r.IsError {
+			t.Fatalf("rollback: %s", text(r))
+		}
+		backup := "main" + ops.RollbackBackupSuffix
+
+		w.Store.B = &errOnceGetBackend{Backend: w.Store.B, key: store.RefKey("app", backup)}
+
+		r := call(t, ts, "offshoot_rollback", map[string]any{
+			"database": "app", "branch": "main", "to": "init"})
+		if !r.IsError {
+			t.Fatal("a second rollback must be refused when reading its own safety-fork name errors transiently")
+		}
+		if !strings.Contains(strings.ToLower(text(r)), "verify") {
+			t.Fatalf("refusal must say it cannot verify: %s", text(r))
+		}
+	})
+
+	t.Run("destroyReadingTheForksOwnRef", func(t *testing.T) {
+		ts, w := newTools(t)
+		if r := call(t, ts, "offshoot_rollback", map[string]any{
+			"database": "app", "branch": "main", "to": "init"}); r.IsError {
+			t.Fatalf("rollback: %s", text(r))
+		}
+		backup := "main" + ops.RollbackBackupSuffix
+
+		// guardProtectedSafetyFork's FIRST read — backup's own ref, to find
+		// its Meta marker — is the one injected to fail here (as opposed to
+		// the "destroyReadingTheProtectedTarget" subtest above, which
+		// injects on the SECOND read, "main"'s own ref).
+		w.Store.B = &errOnceGetBackend{Backend: w.Store.B, key: store.RefKey("app", backup)}
+
+		dr := call(t, ts, "offshoot_destroy", map[string]any{"database": "app", "branch": backup})
+		if !dr.IsError {
+			t.Fatal("destroying the safety fork must be refused when reading its own ref errors transiently")
+		}
+		if !strings.Contains(text(dr), "-allow-force") {
+			t.Fatalf("refusal must name -allow-force: %s", text(dr))
+		}
+		if _, _, err := w.Store.GetRef("app", backup); err != nil {
+			t.Fatalf("safety fork must still exist: %v", err)
+		}
+	})
 }
 
 // TestToolAnnotationsClassifyEveryTool pins the host-facing behavior hints
@@ -826,6 +1284,7 @@ func TestToolAnnotationsSerializeOnTheWire(t *testing.T) {
 // Constraints — so this checks structuredContent, not a JSON text block.
 func TestStructuredContentAccompaniesProse(t *testing.T) {
 	ts, w := newTools(t)
+	ts.SetAllowForce(true)
 	if _, err := w.Fork("app", "main", "attempt-1", "", 0, nil); err != nil {
 		t.Fatal(err)
 	}
@@ -1114,5 +1573,134 @@ func TestDiffToolComparesAttemptsContentAware(t *testing.T) {
 		if _, has := r.StructuredContent.(map[string]any)["full"]; !has {
 			t.Fatal("full must be present in structuredContent when requested")
 		}
+	}
+}
+
+// TestReapOnceReapsExpiredForksWhenNoDaemon proves reapOnce mirrors the
+// janitor's own Reap -> ClearStaleDeleteClaims order when no daemon is
+// reachable (newTools' harness points at an absent socket): a TTL'd fork
+// past its deadline is destroyed and reported, skipped is false, and the
+// ref is actually gone from the store afterward.
+func TestReapOnceReapsExpiredForksWhenNoDaemon(t *testing.T) {
+	ts, w := newTools(t)
+	if _, err := w.Fork("app", "main", "attempt-1", "", time.Millisecond, nil); err != nil {
+		t.Fatal(err)
+	}
+	time.Sleep(5 * time.Millisecond)
+
+	reaped, skipped, err := ts.reapOnce(time.Now())
+	if err != nil {
+		t.Fatalf("reapOnce: %v", err)
+	}
+	if skipped {
+		t.Fatal("reapOnce must not skip when no daemon is running")
+	}
+	found := false
+	for _, k := range reaped {
+		if k == "app@attempt-1" {
+			found = true
+		}
+	}
+	if !found {
+		t.Fatalf("reaped = %v, want it to contain app@attempt-1", reaped)
+	}
+	if _, _, err := w.Store.GetRef("app", "attempt-1"); !errors.Is(err, store.ErrNotFound) {
+		t.Fatalf("app@attempt-1 must be gone after reapOnce, GetRef err = %v", err)
+	}
+}
+
+// TestReapOnceNeverReapsProtected proves the -allow-force-style guard rails
+// on reaping itself: a protected fork past its TTL survives reapOnce, same
+// as it survives the daemon's own janitor (ops.Workspace.Reap never touches
+// a protected ref regardless of caller).
+func TestReapOnceNeverReapsProtected(t *testing.T) {
+	ts, w := newTools(t)
+	if _, err := w.Fork("app", "main", "attempt-1", "", time.Millisecond, nil); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := w.SetProtected("app", "attempt-1", true); err != nil {
+		t.Fatal(err)
+	}
+	time.Sleep(5 * time.Millisecond)
+
+	reaped, skipped, err := ts.reapOnce(time.Now())
+	if err != nil {
+		t.Fatalf("reapOnce: %v", err)
+	}
+	if skipped {
+		t.Fatal("reapOnce must not skip when no daemon is running")
+	}
+	for _, k := range reaped {
+		if k == "app@attempt-1" {
+			t.Fatalf("reapOnce reaped a protected branch: %v", reaped)
+		}
+	}
+	if _, _, err := w.Store.GetRef("app", "attempt-1"); err != nil {
+		t.Fatalf("app@attempt-1 must survive reapOnce, GetRef err = %v", err)
+	}
+}
+
+// TestStartReaperZeroDisablesIt mirrors internal/daemon/lifecycle_test.go's
+// TestStartJanitorZeroDisablesIt for the MCP reaper: every <= 0 must start
+// no goroutine at all, so an expired branch is never touched no matter how
+// long the test waits.
+func TestStartReaperZeroDisablesIt(t *testing.T) {
+	ts, w := newTools(t)
+	if _, err := w.Fork("app", "main", "attempt-1", "", time.Millisecond, nil); err != nil {
+		t.Fatal(err)
+	}
+
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	done := ts.StartReaper(ctx, 0)
+	select {
+	case <-done:
+	default:
+		t.Fatal("StartReaper(ctx, 0) must report done immediately: no goroutine is ever started")
+	}
+
+	// Give a real (disabled) reaper every chance to wrongly fire.
+	time.Sleep(200 * time.Millisecond)
+
+	if _, _, err := w.Store.GetRef("app", "attempt-1"); err != nil {
+		t.Fatalf("StartReaper(ctx, 0) must disable the reaper; expired branch was reaped: %v", err)
+	}
+}
+
+// TestStartReaperTicksAndStopsOnCancel mirrors
+// TestStartJanitorZeroDisablesIt's sibling shape but for the positive case:
+// a running reaper actually reaps an expired branch on its own ticker, with
+// no test-driven manual tick (unlike janitorTick's own test harness, which
+// can call janitorTick directly — StartReaper has no exported single-tick
+// equivalent, so this drives the real ticker with a short interval and
+// polls). It then proves the goroutine itself stops once ctx is cancelled,
+// via the done channel StartReaper returns — the same proof
+// StartJanitor/Shutdown gets for free from janitorWG, scoped down to one
+// goroutine here (see StartReaper's own doc comment).
+func TestStartReaperTicksAndStopsOnCancel(t *testing.T) {
+	ts, w := newTools(t)
+	if _, err := w.Fork("app", "main", "attempt-1", "", time.Millisecond, nil); err != nil {
+		t.Fatal(err)
+	}
+
+	ctx, cancel := context.WithCancel(context.Background())
+	done := ts.StartReaper(ctx, 20*time.Millisecond)
+
+	deadline := time.Now().Add(2 * time.Second)
+	for {
+		if _, _, err := w.Store.GetRef("app", "attempt-1"); errors.Is(err, store.ErrNotFound) {
+			break
+		}
+		if time.Now().After(deadline) {
+			t.Fatal("StartReaper did not reap the expired branch within 2s")
+		}
+		time.Sleep(10 * time.Millisecond)
+	}
+
+	cancel()
+	select {
+	case <-done:
+	case <-time.After(2 * time.Second):
+		t.Fatal("StartReaper's goroutine did not exit within 2s of ctx cancellation")
 	}
 }

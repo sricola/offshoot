@@ -378,7 +378,31 @@ a branch forked with `--ttl 1h` reads back as `ttl=1h0m0s`.
 **Errors:** the branch is currently being reaped (a reaper already claimed
 it) — "too late to touch."
 
-## `offshoot rollback <db>[@branch] --to <checkpoint>`
+## `offshoot protect <db>[@branch]` / `offshoot unprotect <db>[@branch]`
+
+```
+offshoot protect app@main
+offshoot unprotect app@attempt-1
+```
+
+Sets or clears a branch's `protected` flag. A protected branch refuses
+unforced `destroy` and unforced `promote --onto` it, and is never TTL-reaped
+(`main` is protected by default; every other branch starts unprotected).
+Protecting a branch does **not** touch its activity clock — `TouchedAt` and
+the TTL deadline it anchors are left exactly as they were, so unprotecting a
+stale, TTL'd branch doesn't incidentally grant it a fresh TTL window.
+
+Through an `offshoot mcp` server, an agent-supplied `force:true` against a
+protected branch is honored only when that server was started with
+`-allow-force`; see [`offshoot mcp`](#offshoot-mcp) below. `protect` and
+`unprotect` are CLI-only by design — there is no `offshoot_protect` MCP
+tool, so an agent can observe a branch's `protected` flag (via
+`offshoot_list`) but never flip it.
+
+**Errors:** the branch is currently being reaped or destroyed ("too late to
+change its protection"); CAS races are retried internally.
+
+## `offshoot rollback <db>[@branch] --to <checkpoint> [--no-backup] [--backup-ttl DUR]`
 
 ```
 offshoot rollback app@attempt-1 --to fork
@@ -393,12 +417,41 @@ after it are dropped. Any lease on the branch is cleared by the repoint, so
 it's immediately acquirable afterward. Prints the (re-materialized) checkout
 path.
 
+**The safety fork.** Before the repoint lands, the branch's current head
+(the state rollback is about to abandon) is kept first as a shared fork
+named **`<branch>-pre-rollback`** — two metadata objects, no data copy —
+with a TTL (default 24h; `--backup-ttl 2h` to change it; a safety fork
+always carries one) and the marker metadata `offshoot.pre-rollback=<branch>`.
+It is one rolling undo point per branch: the next rollback of the same
+branch replaces it, and it is only ever replaced when the branch at that
+name carries the marker — a branch of your own that merely shares the name
+makes rollback refuse (destroy or rename it, or pass `--no-backup`). Undo a
+rollback by promoting the safety fork back onto the branch:
+
+```
+offshoot promote app@attempt-1-pre-rollback --onto attempt-1 --force
+```
+
+(`--force` is needed only if `attempt-1` is itself protected.) `--no-backup`
+skips minting the safety fork entirely.
+
 The ref repoint (a CAS write) is the point of no return; the local checkout
 refresh that follows is best-effort — if it fails (e.g. the checkout is
 busy), the command reports a partial success: the branch *did* roll back,
 but the checkout needs a manual `offshoot checkout` to catch up.
 
-**Errors:** unknown checkpoint name; lost a concurrent CAS race (retry).
+**Errors:** unknown checkpoint name; `<branch>-pre-rollback` exists but is
+not rollback's own safety fork (nothing is touched); the previous safety
+fork has a live lease (nothing is touched — close that session first, or
+`--no-backup`); lost a concurrent CAS race (retry).
+
+**Daemon/SDK parity.** The daemon's `rollback` op takes the same knobs as
+request fields — `no_backup` (bool) and `backup_ttl` (a Go duration
+string; a non-positive value is refused) — and echoes the safety fork's
+name back as `backup` in the response (empty when none was minted). Python
+`rollback(db, branch, to, *, backup=True, backup_ttl=None)` and
+TypeScript `rollback(db, branch, to, opts: RollbackOptions)` expose the
+same options.
 
 ## `offshoot promote <db>@<source> --onto <target> [--force] [--no-backup] [--backup-ttl DUR]`
 
@@ -451,6 +504,14 @@ touched — close that session first, or `--no-backup`); target checkout is
 busy (repoint still lands; checkout refresh is skipped and reported); lost
 a concurrent CAS race (retry).
 
+**Daemon/SDK parity.** The daemon's `promote` op takes the same knobs as
+request fields — `no_backup` (bool) and `backup_ttl` (a Go duration
+string; a non-positive value is refused) — and echoes the safety fork's
+name back as `backup` in the response (empty when none was minted). Python
+`promote(db, source, onto, force=False, backup=True, backup_ttl=None)` and
+TypeScript `promote(db, source, onto, opts: PromoteOptions)` expose the
+same options.
+
 ## `offshoot compact <db>[@branch]`
 
 ```
@@ -468,18 +529,23 @@ reclaim). A branch that is already self-contained is a **no-op** (prints
 the current head txid), so scripted "compact everything" loops never fail
 on branches with nothing to do.
 
-**The flagged tradeoff: compact resets the branch's checkpoints** to a
-single `compact` checkpoint at the new head, exactly like `promote` resets
-to `promote` (and unlike `rollback`, which preserves checkpoints at or
-before its target). Old checkpoints were anchored on the shared ancestor's
-storage and would not resolve in the new self-contained lineage. If you
-need a pre-compact checkpoint, `export` it first.
+**Checkpoints are preserved**, `rollback`-style (unlike `promote`, which
+still resets its target to a single `promote` checkpoint): every existing
+checkpoint's snapshot is copied into the new self-contained lineage and
+rewritten to epoch 1 — a location update, `CreatedAt`/`Meta` unchanged, not
+a new checkpoint — and a `compact` checkpoint at the (unchanged) head txid
+is *added* alongside them, since old checkpoints were anchored on the
+shared ancestor's storage and need their own copy to resolve once that
+ancestor's lineage is later reclaimed by GC. Checkpoints sharing a txid
+share one copy. Nothing is dropped or renamed; you don't need to `export`
+anything first to preserve history across a compact.
 
 Cost class: compact is a full materialize — one full copy of the branch's
-state (~G bytes for a G-byte database), the same cost class a single
-`promote` or `rollback` pays — not a cheap metadata flip. (The N×G figure
+head state (~G bytes for a G-byte database) plus one additional snapshot
+copy per *distinct* checkpoint txid kept — the same cost class a single
+`promote` or `rollback` pays, not a cheap metadata flip. (The N×G figure
 elsewhere in this page is the *aggregate* cost of N materialized forks;
-one compact pays ~G, once.) Through the daemon (the
+one compact pays ~G plus its checkpoint copies, once.) Through the daemon (the
 `compact` op, SDK `compact()`), compact refuses while this daemon has an
 open session on the branch — close it first, exactly like `rollback` and
 `promote`: the session owns the checkout compact would repoint out from
@@ -1130,7 +1196,7 @@ promptly rather than left open indefinitely.
 ## `offshoot mcp`
 
 ```
-offshoot mcp [-default-ttl DURATION|none] [-socket PATH]
+offshoot mcp [-default-ttl DURATION|none] [-socket PATH] [-allow-force] [-reap-every DURATION|none]
 claude mcp add offshoot -- offshoot -store ./.offshoot mcp
 ```
 
@@ -1147,7 +1213,48 @@ same server plus a skill that teaches the loop and advisory hooks; see
 honor the same protected-branch rules as the CLI — an unforced
 `offshoot_promote --onto main` or `offshoot_destroy` on `main` is refused,
 and the refusal is returned to the agent as the tool result, not a
-transport-level error.
+transport-level error. There is no `offshoot_protect`/`offshoot_unprotect`
+tool; flipping a branch's protected flag is CLI-only by design (see
+[`offshoot protect`](#offshoot-protect-dbbranch--offshoot-unprotect-dbbranch)
+above) — an agent can see the flag via `offshoot_list` but never change it.
+
+**`-allow-force` (off by default): the force gate.** `offshoot_promote`'s
+and `offshoot_destroy`'s `force` argument is honored exactly as before this
+flag existed *only* when the server was started with `-allow-force`.
+Without it — the default — a call carrying `force: true` against a
+protected branch is refused *before any mutation*, with a tool-result
+error naming `-allow-force` and pointing the agent at the CLI or a fork
+instead; `force` against an *unprotected* branch is silently downgraded to
+`false`, so the call proceeds exactly as an unforced one would (no
+behavior change there). This also disables `offshoot_destroy`'s live-lease
+bypass — under the old default, `force` could delete a branch out from
+under an active lease; without `-allow-force` it no longer can, exactly
+like the protected-branch check. The gate (`refuseForceOnProtected`) fails
+CLOSED on a `GetRef` error (e.g. a transient backend blip): `force` is
+downgraded to `false` rather than let through, so a storage hiccup can
+never accidentally honor a force the gate couldn't actually verify was
+safe — the real error still surfaces from the downstream call, just never
+with force intact. Turning `-allow-force` on restores the pre-gate
+behavior in full: an agent's own `force: true` is honored as-is, same as
+`--force` on the CLI. See
+[docs/demo/mcp-walkthrough.md](demo/mcp-walkthrough.md) for this refusal
+firing for real against a live server, followed by an `offshoot_diff`
+comparison and a human-run CLI promote — the intended shape of the
+guardrail, not a workaround for it.
+
+**`-reap-every DURATION|none` (default `60s`): daemonless TTL reaping.**
+`offshoot mcp` is not a daemon in the `offshoot serve` sense (it never owns
+a live SQLite session), but a bare `offshoot mcp` is no longer inert with
+respect to TTLs either: on this cadence, the process reaps expired forks
+and self-heals any stranded delete claim, for as long as it stays up —
+exactly `offshoot serve`'s janitor's reap pass, minus GC. `-reap-every 0`
+or `-reap-every none` disables it, back to the old always-daemonless
+behavior. When a real `offshoot serve` daemon is reachable at the same
+socket, the MCP process defers to it entirely and logs once that it's
+skipping its own pass — never a second writer racing the daemon's own
+janitor against the same store. Either way, `-reap-every` runs **no GC**:
+reclaiming a reaped branch's storage still needs `offshoot gc` (by hand) or
+a running `offshoot serve` daemon.
 
 **Annotations.** Every tool's `tools/list` entry carries an explicit
 `annotations` object — `readOnlyHint`, `destructiveHint`, `idempotentHint`,
@@ -1174,9 +1281,8 @@ lookup via `offshoot_list`.
 **`offshoot_touch`.** Resets a branch's activity clock so its TTL does not
 expire mid-task, and optionally changes the TTL: omitting `ttl` keeps the
 current one, a Go duration string (e.g. `"2h"`) sets it, and `"none"`
-clears it so the branch never expires. Like every other tool, a TTL change
-alone reaps nothing — that's still the janitor's (`offshoot serve`) or
-`offshoot gc`'s job.
+clears it so the branch never expires. Calling it does not itself reap
+anything — see `-reap-every` above for what actually does.
 
 Agent-initiated forks carry a TTL by default: `offshoot_fork` applies
 `-default-ttl` (default `24h`) to any call that omits its own `ttl`
@@ -1187,10 +1293,11 @@ it either way — an explicit `ttl:"<duration>"` always wins, and
 `ttl:"none"` always yields no TTL even under a configured default. The
 fork tool's response echoes the applied TTL and, when there is one, the
 computed expiry timestamp, so both land in the agent's own transcript.
-**TTL alone does not reap anything**: reaping requires a running janitor
-(`offshoot serve`); `offshoot mcp` runs no daemon of its own, so a
-daemonless setup only sweeps expired branches when `offshoot gc` is run by
-hand.
+Reaping an expired TTL is `offshoot mcp`'s own `-reap-every` background
+pass (default `60s`; see above), an `offshoot serve` daemon's janitor when
+one is reachable, or `offshoot gc` run by hand — never a side effect of the
+`offshoot_fork`/`offshoot_touch` calls that set the TTL in the first
+place.
 
 **MCP rides a running daemon, but only for a branch a session is already
 open on.** No MCP tool ever opens a session itself (that's a harness's job —
@@ -1401,7 +1508,8 @@ Which operations exist on which surface today — verified against
 
 | Operation | CLI | Daemon op | Python/TS SDK | Notes |
 |---|---|---|---|---|
-| create / checkout / fork / destroy / rollback / promote / compact / touch / branches / dbs | yes | yes | yes | Full parity. `compact` through the daemon refuses while a session is open on the branch (see above). |
+| create / checkout / fork / destroy / rollback / promote / compact / touch / branches / dbs | yes | yes | yes | Full parity. `compact` through the daemon refuses while a session is open on the branch (see above). `rollback`/`promote`'s safety-fork backup (`--no-backup`/`--backup-ttl` on the CLI, `no_backup`/`backup_ttl` request fields and a `backup` response field on the daemon op, `backup`/`backup_ttl` kwargs on both SDKs) is full parity too. |
+| `protect` / `unprotect` | yes | no | no | **CLI-only, by design.** No daemon op or MCP tool sets the `protected` flag — only `offshoot_list`/the daemon's `branches` op reads it. Keeping the write side off every remote-callable surface means an agent (MCP) or a network client (daemon/HTTP) can observe protection but never grant or revoke it. |
 | open / flush / status / close (sessions) | `session ...` | yes | yes | SDK `flush(name, meta=...)` can attach checkpoint metadata; the CLI `session flush` subcommand has no `--meta` flag. |
 | export / historical read-only checkout | yes | yes (`export`, `checkout-at`) | yes | No CLI `session` subcommand — the CLI's `export`/`checkout --at --read-only` are the at-rest equivalents (see the section above); `export` is unix-socket-only over the daemon. |
 | events | — | yes (`subscribe` / `GET /events`) | yes (`events()`) | No CLI subscriber today. |
@@ -1416,8 +1524,9 @@ Which operations exist on which surface today — verified against
 
 Summary: the SDKs cover the entire daemon protocol except `shutdown`;
 what's genuinely CLI-only today is `init`, `create --from`, on-demand
-`gc`, the `lease` commands, at-rest `checkpoint`, and the whole-store
-`status` view — `diff` now has full CLI/daemon/SDK parity, plus MCP. For
+`gc`, the `lease` commands, `protect`/`unprotect`, at-rest `checkpoint`,
+and the whole-store `status` view — `diff` now has full CLI/daemon/SDK
+parity, plus MCP. For
 CI patterns that mix the two surfaces (CLI seeding + SDK sessions), see
 [docs/ci-recipes.md](ci-recipes.md).
 

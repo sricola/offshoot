@@ -64,6 +64,70 @@ version if you depend on format stability.
   `left`, `right` as `branch[@checkpoint]`, `table?`, `full?`, `max_bytes?`
   (default 32768, at most 262144) — compares two branches or checkpoints of
   one database to decide which attempt to promote.
+- **`offshoot protect`/`offshoot unprotect <db>[@branch]`.** Any branch can
+  now be given `main`'s own protected-by-default treatment (refuse unforced
+  `destroy`/`promote --onto`, never TTL-reaped), or have it cleared.
+  CLI-only by design — no daemon op, no MCP tool sets or clears the flag
+  (an agent can still see it via `offshoot_list`/the daemon's `branches`
+  op); flipping it does not touch the branch's activity clock, so
+  unprotecting a stale branch doesn't incidentally grant it a fresh TTL
+  window.
+- **Rollback safety fork.** `offshoot rollback` now keeps the branch's
+  previous head first as a shared, TTL'd fork, `<branch>-pre-rollback`
+  (one per branch, replaced by the next rollback of the same branch,
+  marker-guarded so a user's own branch at that name is never replaced) —
+  the same shape and implementation as promote's `<target>-pre-promote`.
+  Undo a rollback by promoting the safety fork back onto the branch.
+  Surface: CLI `--no-backup`/`--backup-ttl DUR` plus a "kept … undo with"
+  line; daemon `no_backup`/`backup_ttl` request fields and a `backup`
+  response field; Python `rollback(db, branch, to, *, backup=True,
+  backup_ttl=None)`; TypeScript `rollback(db, branch, to, opts:
+  RollbackOptions)`; MCP `offshoot_rollback` always keeps it and names the
+  undo handle (`backup`) in its result.
+- **`offshoot mcp -allow-force`.** Off by default. Without it, an
+  agent-supplied `force: true` against a protected target/branch is
+  refused before any mutation, and `offshoot_destroy`'s live-lease bypass
+  is disabled too; with it, both behave exactly as before this flag
+  existed. The refusal names `-allow-force` and points the agent at the
+  CLI or a fork. The gate fails closed on a transient error reading the
+  branch's own protected flag (`force` is downgraded to `false`, never let
+  through).
+- **MCP guards a protected branch's own safety fork, not just the branch
+  itself.** `offshoot_destroy`, `offshoot_touch` (when it would change the
+  TTL), and `offshoot_promote` (when the fork is the *target*) now all
+  refuse, without `-allow-force`, on a branch that is itself
+  `<target>-pre-rollback`/`<target>-pre-promote` of some OTHER protected
+  branch (`guardProtectedSafetyFork`) — `main-pre-rollback` is not itself
+  protected, so the plain protected-branch check never caught this before,
+  and promoting onto it would repoint (destroy) the undo point just as
+  surely as an actual destroy. `offshoot_rollback` additionally refuses
+  outright, without `-allow-force`, when the protected branch it's rolling
+  back already has a safety fork from an earlier rollback, rather than
+  silently replacing an undo point the human may still need. A plain
+  `offshoot_touch` that only extends a fork's life (no `ttl` argument) is
+  never blocked. The guard fails CLOSED on a transient error reading the
+  target's own ref (there is no downstream backstop the way
+  `refuseForceOnProtected` has, since the fork itself is never protected),
+  and so does `offshoot_rollback`'s own check of whether its safety-fork
+  name already exists. See `TestGuardProtectedSafetyFork` and
+  `TestGuardProtectedSafetyForkFailsClosedOnTransientReadError` in
+  `internal/mcp/tools_test.go`.
+- **MCP's safety-fork TTL floors at 24h.** `offshoot_promote` and
+  `offshoot_rollback` now pass `max(-default-ttl, ops.DefaultPromoteBackupTTL)`
+  as the safety fork's TTL, not `-default-ttl` alone — an operator running
+  `offshoot mcp -default-ttl` shorter than 24h (to keep throwaway attempt
+  forks small) no longer shrinks the undo window on `<branch>-pre-rollback`/
+  `<target>-pre-promote` below a day as a side effect; a longer
+  `-default-ttl` still wins. `TestPromoteKeepsSafetyForkAndSaysSo` and
+  `TestRollbackKeepsSafetyForkAndSaysSo` now cover both the floor
+  (2h default → 24h fork) and a default above it (48h → 48h fork).
+- **`offshoot mcp -reap-every DURATION|none`** (default `60s`). Reaps
+  expired forks and self-heals stranded delete claims on this cadence for
+  as long as the MCP process is up — the daemonless fallback a bare
+  `offshoot mcp` didn't have before. Defers entirely to a reachable
+  `offshoot serve` daemon's own janitor (never a second writer against one
+  store), logging once that it's skipping its own pass. Runs no GC either
+  way — reclaiming storage still needs `offshoot gc` or the daemon.
 
 ### Changed
 
@@ -80,6 +144,26 @@ version if you depend on format stability.
   flagged), not a bare row-count diff — `STATUS` for a comparable table is
   `same`/`changed` based on those counts (plus a schema change), suffixed
   " (schema)" when the schema itself changed.
+- **`offshoot compact` now preserves every checkpoint** instead of
+  resetting to a single `compact` checkpoint: each existing checkpoint's
+  snapshot is copied into the new self-contained lineage and rewritten to
+  epoch 1 (rollback-style), and a `compact` checkpoint is added at head
+  alongside them. Cost: one extra snapshot copy per distinct checkpoint
+  txid kept, on top of the head copy compact already paid. Nothing needs
+  exporting first to survive a compact anymore.
+- **Behavior change: `offshoot mcp` honors an agent's `force: true` only
+  when the server was started with `-allow-force`.** Earlier versions
+  honored it unconditionally, the same as the CLI's `--force`. Harnesses
+  that relied on an agent forcing past a protected branch or a live lease
+  through MCP need to add `-allow-force` explicitly; the plugin's default
+  `.mcp.json` wiring stays on the safe (refuse) default. Docs re-driven to
+  match: `docs/demo/mcp-walkthrough.md`'s transcript is a fresh capture
+  (sections on promoting past the protected-branch refusal now show
+  `offshoot_diff` comparing the attempt against `main`, followed by a
+  human-run CLI `--force` promote — no `force: true` tool call anywhere in
+  it), plus `docs/agents.md`, `docs/reference.md`, `docs/status.md`,
+  `docs/concepts.md`, `docs/architecture.md`, `README.md`, and
+  `plugin/skills/offshoot/SKILL.md`.
 
 ## [0.2.10] - 2026-09-25
 
