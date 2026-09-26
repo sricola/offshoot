@@ -1173,6 +1173,32 @@ func TestGuardProtectedSafetyForkFailsClosedOnTransientReadError(t *testing.T) {
 			t.Fatalf("refusal must say it cannot verify: %s", text(r))
 		}
 	})
+
+	t.Run("destroyReadingTheForksOwnRef", func(t *testing.T) {
+		ts, w := newTools(t)
+		if r := call(t, ts, "offshoot_rollback", map[string]any{
+			"database": "app", "branch": "main", "to": "init"}); r.IsError {
+			t.Fatalf("rollback: %s", text(r))
+		}
+		backup := "main" + ops.RollbackBackupSuffix
+
+		// guardProtectedSafetyFork's FIRST read — backup's own ref, to find
+		// its Meta marker — is the one injected to fail here (as opposed to
+		// the "destroyReadingTheProtectedTarget" subtest above, which
+		// injects on the SECOND read, "main"'s own ref).
+		w.Store.B = &errOnceGetBackend{Backend: w.Store.B, key: store.RefKey("app", backup)}
+
+		dr := call(t, ts, "offshoot_destroy", map[string]any{"database": "app", "branch": backup})
+		if !dr.IsError {
+			t.Fatal("destroying the safety fork must be refused when reading its own ref errors transiently")
+		}
+		if !strings.Contains(text(dr), "-allow-force") {
+			t.Fatalf("refusal must name -allow-force: %s", text(dr))
+		}
+		if _, _, err := w.Store.GetRef("app", backup); err != nil {
+			t.Fatalf("safety fork must still exist: %v", err)
+		}
+	})
 }
 
 // TestToolAnnotationsClassifyEveryTool pins the host-facing behavior hints

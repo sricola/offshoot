@@ -286,17 +286,21 @@ func wrapForceRefusal(err error, force, allowForce bool) error {
 // onto, not the protected target.
 //
 // It reads branch's own ref for its Meta marker (RollbackBackupMetaKey or
-// PromoteBackupMetaKey names the branch the fork was taken from). A read
-// error here, or no marker at all, means branch isn't (verifiably) anyone's
-// safety fork: ok=false (not refused), same fail-open shape as
-// refuseIfSessionOpen, since the caller's own subsequent ops call surfaces
-// the real error (no such branch, etc.) and there is nothing here to fail
-// closed ABOUT yet.
+// PromoteBackupMetaKey names the branch the fork was taken from). branch not
+// existing at all (store.ErrNotFound) means ok=false (not refused): branch
+// genuinely isn't anyone's safety fork, and the caller's own subsequent ops
+// call surfaces its own "no such branch" error — there is nothing here to
+// fail closed ABOUT. Any OTHER error reading branch's own ref, though, fails
+// CLOSED the same way the target read below does: this guard cannot tell
+// whether branch carries a marker or not, and a false "not a safety fork"
+// from a transient blip is exactly the failure mode the target-read fix
+// closed — refusing here for the same reason keeps the two reads consistent
+// rather than only protecting one of the two lookups this function makes.
 //
-// Once a marker names a target, though, this fails CLOSED on that target
-// ref's own read: unlike refuseForceOnProtected (which downgrades force to
-// false and lets ops' own unforced protected check backstop a failed read),
-// there is no downstream backstop here — the safety fork itself is never
+// Once a marker names a target, this also fails CLOSED on that target ref's
+// own read: unlike refuseForceOnProtected (which downgrades force to false
+// and lets ops' own unforced protected check backstop a failed read), there
+// is no downstream backstop here — the safety fork itself is never
 // protected, so an ops call against it sails through regardless. A
 // transient error reading the target's ref must not silently let a
 // protected branch's undo point be destroyed/repointed/TTL-changed just
@@ -304,7 +308,10 @@ func wrapForceRefusal(err error, force, allowForce bool) error {
 func (t *OffshootTools) guardProtectedSafetyFork(db, branch string) (ToolResult, bool) {
 	ref, _, err := t.ws.Store.GetRef(db, branch)
 	if err != nil {
-		return ToolResult{}, false
+		if errors.Is(err, store.ErrNotFound) {
+			return ToolResult{}, false
+		}
+		return ErrorResult("cannot read %s@%s (%v); refusing without -allow-force", db, branch, err), true
 	}
 	target := ref.Meta[ops.RollbackBackupMetaKey]
 	if target == "" {
