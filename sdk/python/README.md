@@ -124,7 +124,10 @@ def test_agent_run(offshoot_fork):
   raises a clear error rather than silently keeping the first one.
   `seed=None` falls back to the `offshoot_seed` ini option (a path to a
   `.sql` file, resolved against pytest's rootdir) — set that once and every
-  test's default `offshoot_fork()` call needs no seed code at all.
+  test's default `offshoot_fork()` call needs no seed code at all. `seed`
+  may also be a path to an existing SQLite `.db` file (detected by its
+  header, not its extension); it's imported via `create(db,
+  from_path=...)` and the checkpoint is `init`.
 - `offshoot_fork` (function-scoped): `offshoot_fork(seed_handle=None)` —
   `seed_handle` may be a handle from `offshoot_db`, a plain `str` naming an
   already-seeded name (`offshoot_fork("special")`), or `None` for the

@@ -226,10 +226,16 @@ worker** to seed and checkpoint; a 2-worker run pays that twice
 (~170ms of total, redundant seed work) but only **~85-90ms of wall-clock
 time**, because the two workers seed concurrently on independent
 daemons/stores. If your seed is expensive and you're running many workers,
-either keep worker count modest for that suite, or seed a shared file
-out-of-band once and `create --from` it into each worker's own store (see
-[docs/status.md](status.md)'s `create --from` reach row — today that's a CLI
-step, not something the fixture wires up for you).
+either keep worker count modest for that suite, or seed a shared `.db` file
+out-of-band once and pass its path directly as the seed value: `offshoot_db`/
+`offshoot_seed`'s `seed=` (and the TypeScript testkit's `seedOnce`'s `seed`)
+detect an existing SQLite file by its header and import it via the
+daemon/SDK's `create`/`from_path`/`fromPath` reach (unix-socket only, the
+same path-trust model `export` uses), forking each worker's copy from the
+imported `init` checkpoint — no CLI step required. See
+[docs/status.md](status.md)'s `create --from` row and
+[docs/recipes/eval-harnesses.md](recipes/eval-harnesses.md#seeding-options-and-importing-an-existing-database)
+for the full set of seeding shapes.
 
 Running the quickstart project's 3 tests with `-n2`:
 

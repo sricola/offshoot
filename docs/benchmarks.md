@@ -300,7 +300,11 @@ definition) can report ready during that window. A follow-up check this
 script uses elsewhere, before it runs any real SQL against a container it
 just started (an actual `SELECT 1`, retried until it succeeds), measured
 directly above as its own line, took another **250.79 ms** median (p90
-255.32 ms) past `pg_isready`'s signal on this host. Both numbers are
+255.32 ms) past `pg_isready`'s signal on this host — note that this figure
+is measured via `_wait_pg_queryable`, which re-checks `pg_isready` (already
+satisfied at that point) before it starts polling `SELECT 1`, so the
+measured gap includes one redundant `pg_isready` docker-exec round trip and
+slightly overstates the pure readiness-to-queryable gap. Both numbers are
 still comfortably sub-second here — this container was already locally
 cached (no image pull) and mounts no volume; a colder path (a network
 pull, a mounted volume, a busier host) would cost meaningfully more.

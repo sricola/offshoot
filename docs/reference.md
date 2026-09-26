@@ -105,6 +105,18 @@ overwrites an existing user file.
 **Errors:** refuses if `db` already exists (ref CAS conflict); `--from` with
 a source file that doesn't exist or isn't a valid SQLite file.
 
+**Daemon/SDK parity.** The daemon's `create` op takes an optional `path`
+request field: a server-side, absolute path (on the daemon's own host) to
+an existing SQLite file to import via `ops.CreateFrom` instead of minting
+an empty database — a relative path is refused with an error containing
+"absolute". Like `export`, it is refused over the HTTP surface specifically
+when `path` is set (`daemon: create with path is not available over HTTP;
+use the local socket`); plain `create` (no `path`) keeps working there.
+Python `create(db, from_path=None)` and TypeScript `create(db, {
+fromPath })` resolve the path to absolute client-side before sending it as
+`path`. MCP has no tool argument for this — by design, not an oversight: an
+MCP tool must never import an arbitrary host file named by an agent.
+
 ## `offshoot checkout <db>[@branch]` / `offshoot path <db>[@branch]`
 
 ```
@@ -1514,7 +1526,7 @@ Which operations exist on which surface today — verified against
 | export / historical read-only checkout | yes | yes (`export`, `checkout-at`) | yes | No CLI `session` subcommand — the CLI's `export`/`checkout --at --read-only` are the at-rest equivalents (see the section above); `export` is unix-socket-only over the daemon. |
 | events | — | yes (`subscribe` / `GET /events`) | yes (`events()`) | No CLI subscriber today. |
 | shutdown | `session shutdown` | yes | **no** | Neither SDK exposes shutdown. |
-| `create --from` (import) | **CLI-only** | no | no | Deliberately deferred, not an oversight — accepting a source file over the daemon boundary needs an upload-channel or path-trust design of its own; see [docs/status.md](status.md)'s `create --from` row. |
+| `create --from` (import) | yes | yes (socket only) | yes | Shipped in v0.2.11: daemon `create` op's `path` field, same same-host path-trust model as `export`, refused over HTTP; Python `from_path=`, TypeScript `{fromPath}`. MCP excluded by design, not deferred — an MCP tool must never import an arbitrary host file named by an agent; see [docs/status.md](status.md)'s `create --from` row. |
 | `gc` (on-demand reap + collect) | **CLI-only** | no | no | A running daemon's janitor performs the same reap/GC on its `-reap-every` timer, so daemon deployments don't lack GC — they lack an RPC to *trigger* it on demand. |
 | `lease list` / `acquire` / `release` | **CLI-only** | no | no | Daemon sessions manage their own lease lifecycle (`open` acquires, `close` releases); the CLI commands are the manual inspect/break-glass surface. |
 | `diff` | yes | yes | yes | Full parity, plus an MCP tool (`offshoot_diff`) — the only surface here MCP reaches: one database; `left`/`right` are `branch[@checkpoint]`, not the CLI/daemon's `db@branch[@checkpoint]` (there's no cross-database diff over MCP). See [docs/status.md](status.md)'s diff row. |
@@ -1523,10 +1535,12 @@ Which operations exist on which surface today — verified against
 | `init` / `serve` / `mcp` / `version` / `path` | CLI | n/a | n/a | Process-level or purely local commands; nothing to proxy (`path` is `checkout`'s no-materialize sibling — see its section above). |
 
 Summary: the SDKs cover the entire daemon protocol except `shutdown`;
-what's genuinely CLI-only today is `init`, `create --from`, on-demand
-`gc`, the `lease` commands, `protect`/`unprotect`, at-rest `checkpoint`,
-and the whole-store `status` view — `diff` now has full CLI/daemon/SDK
-parity, plus MCP. For
+what's genuinely CLI-only today is `init`, on-demand `gc`, the `lease`
+commands, `protect`/`unprotect`, at-rest `checkpoint`, and the whole-store
+`status` view — `diff` and `create --from` now both have full CLI/daemon/
+SDK parity (`create --from` unix-socket-only over the daemon, and
+deliberately excluded from MCP by design), and `diff` additionally reaches
+MCP. For
 CI patterns that mix the two surfaces (CLI seeding + SDK sessions), see
 [docs/ci-recipes.md](ci-recipes.md).
 
