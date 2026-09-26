@@ -316,3 +316,91 @@ func TestCompactNoOpAfterRollbackPreservesCheckpoints(t *testing.T) {
 		}
 	}
 }
+
+// TestCompactPreservesCheckpoints: a shared fork with checkpoints v1 and
+// v2 compacts into a self-contained lineage that still has v1, v2 (their
+// CreatedAt/Meta intact, epoch rewritten to 1) plus "compact", and
+// rollback to v1 afterwards works from the compacted lineage.
+func TestCompactPreservesCheckpoints(t *testing.T) {
+	testutil.RequireSQLite3(t)
+	w := newWS(t)
+	if err := w.Create("app"); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := w.Fork("app", "main", "child", "", 0, nil); err != nil {
+		t.Fatal(err)
+	}
+	forkRef, _, err := w.Store.GetRef("app", "child")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if forkRef.Base == nil {
+		t.Fatal("test precondition: fork must share (Base set)")
+	}
+	path, err := w.Checkout("app", "child")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if out, err := exec.Command("sqlite3", path, "CREATE TABLE t (v); INSERT INTO t VALUES (1);").CombinedOutput(); err != nil {
+		t.Fatalf("seed: %v: %s", err, out)
+	}
+	if _, err := w.Checkpoint("app", "child", "v1", map[string]string{"k": "v"}); err != nil {
+		t.Fatal(err)
+	}
+	v1Rows := branchRows(t, w, "app", "child")
+	if out, err := exec.Command("sqlite3", path, "INSERT INTO t VALUES (2);").CombinedOutput(); err != nil {
+		t.Fatalf("insert: %v: %s", err, out)
+	}
+	if _, err := w.Checkpoint("app", "child", "v2", nil); err != nil {
+		t.Fatal(err)
+	}
+
+	preRef, _, err := w.Store.GetRef("app", "child")
+	if err != nil {
+		t.Fatal(err)
+	}
+	v1 := preRef.Checkpoints["v1"]
+
+	txid, err := w.Compact("app", "child")
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	got, _, err := w.Store.GetRef("app", "child")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got.Base != nil {
+		t.Fatalf("compact must clear Base, got %+v", got.Base)
+	}
+	for _, name := range []string{"v1", "v2", "compact"} {
+		if _, ok := got.Checkpoints[name]; !ok {
+			t.Fatalf("compact must preserve checkpoint %q, got %v", name, got.Checkpoints)
+		}
+	}
+	if cp := got.Checkpoints["compact"]; cp.TXID != txid {
+		t.Fatalf("\"compact\" checkpoint txid = %d, want %d", cp.TXID, txid)
+	}
+	gotV1 := got.Checkpoints["v1"]
+	if gotV1.Epoch != 1 {
+		t.Fatalf("preserved checkpoint v1 epoch = %d, want 1", gotV1.Epoch)
+	}
+	if gotV1.TXID != v1.TXID {
+		t.Fatalf("preserved checkpoint v1 txid = %d, want %d", gotV1.TXID, v1.TXID)
+	}
+	if gotV1.CreatedAt != v1.CreatedAt {
+		t.Fatalf("preserved checkpoint v1 CreatedAt = %q, want %q", gotV1.CreatedAt, v1.CreatedAt)
+	}
+	if gotV1.Meta["k"] != "v" {
+		t.Fatalf("preserved checkpoint v1 Meta[k] = %q, want %q", gotV1.Meta["k"], "v")
+	}
+
+	// The compacted lineage must still resolve a rollback to v1 — its
+	// snapshot was copied in, not left behind in the old lineage.
+	if _, err := w.Rollback("app", "child", "v1"); err != nil {
+		t.Fatalf("rollback to v1 after compact: %v", err)
+	}
+	if got := branchRows(t, w, "app", "child"); got != v1Rows {
+		t.Fatalf("post-compact rollback to v1 row count = %s, want %s", got, v1Rows)
+	}
+}

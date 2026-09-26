@@ -95,11 +95,17 @@ func TestCompactMakesBranchSelfContained(t *testing.T) {
 		t.Fatalf("compact ref head = (txid %d, epoch %d, headEpoch %d), want (%d, 1, 1)",
 			got.HeadTXID, got.Epoch, got.HeadEpoch, txid)
 	}
-	if len(got.Checkpoints) != 1 {
-		t.Fatalf("compact must reset checkpoints to exactly {\"compact\"}, got %v", got.Checkpoints)
+	// The fork's own "fork" checkpoint must survive compact alongside the
+	// new "compact" checkpoint — compact now preserves every checkpoint
+	// rather than resetting the map.
+	if len(got.Checkpoints) != 2 {
+		t.Fatalf("compact must preserve every checkpoint plus \"compact\" (want 2: \"fork\", \"compact\"), got %v", got.Checkpoints)
 	}
 	if cp, ok := got.Checkpoints["compact"]; !ok || cp.TXID != txid {
 		t.Fatalf("want a \"compact\" checkpoint at txid %d, got %v", txid, got.Checkpoints)
+	}
+	if _, ok := got.Checkpoints["fork"]; !ok {
+		t.Fatalf("compact must preserve the pre-existing \"fork\" checkpoint, got %v", got.Checkpoints)
 	}
 	// No base.json in the new lineage: the branch is self-contained.
 	if _, _, err := w.Store.B.Get(store.BaseKey(got.Lineage)); !errors.Is(err, store.ErrNotFound) {

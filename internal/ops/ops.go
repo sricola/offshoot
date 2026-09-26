@@ -1348,11 +1348,16 @@ var compactBeforeCASForTest func()
 // holds, and erroring would make scripted "compact everything" loops fail
 // on exactly the branches that need nothing done.
 //
-// Checkpoints are RESET to {"compact": head txid}, like Promote (and
-// unlike Rollback's kept-checkpoint snapshot copies): old checkpoints
-// anchored on the shared ancestor would not resolve in the new
-// self-contained lineage. Preserving them Rollback-style (copy each kept
-// checkpoint's state into the new lineage) is a noted follow-up.
+// Checkpoints are PRESERVED, Rollback-style: every existing checkpoint
+// qualifies (every c.TXID <= head, by construction — compact never drops
+// history), so each one's snapshot is copied into the new self-contained
+// lineage and rewritten to epoch 1 (CreatedAt/Meta preserved) exactly as
+// Rollback does for its kept map, and a "compact" checkpoint at the head
+// txid is ADDED alongside them (not a replacement) — old checkpoints
+// anchored on the shared ancestor would not otherwise resolve once the
+// old lineage is later reclaimed by GC. Cost: one snapshot copy per
+// distinct checkpoint txid (checkpoints sharing a txid share a copy, as
+// Rollback's `done` set does for its head).
 //
 // The ref CAS is the point of no return, exactly as in Promote: a CAS
 // loss (a concurrent flush advanced the head) deletes the orphan snapshot
@@ -1371,12 +1376,13 @@ func (w *Workspace) Compact(db, branch string) (uint64, error) {
 		return 0, err
 	}
 	// The no-op decision consults the DURABLE base spine (base.json chain),
-	// not the ref's Base mirror: compact is destructive (it resets the
-	// checkpoint map), so it must be authoritative even if some code path
-	// left a stale mirror behind — a stale non-nil mirror on a genuinely
-	// self-contained branch must not trigger a needless materialize that
-	// wipes checkpoints. An empty spine means resolution never leaves this
-	// lineage: already self-contained, nothing to cut.
+	// not the ref's Base mirror: compact repoints the branch at a brand-new
+	// lineage, so it must be authoritative even if some code path left a
+	// stale mirror behind — a stale non-nil mirror on a genuinely
+	// self-contained branch must not trigger a needless materialize (and,
+	// were checkpoints ever reset instead of preserved, a needless wipe).
+	// An empty spine means resolution never leaves this lineage: already
+	// self-contained, nothing to cut.
 	spine, err := w.Store.BaseSpine(ref.Lineage)
 	if err != nil {
 		return 0, fmt.Errorf("ops: compact %s@%s: resolving base spine: %w", db, branch, err)
@@ -1391,11 +1397,44 @@ func (w *Workspace) Compact(db, branch string) (uint64, error) {
 	if err != nil {
 		return 0, err
 	}
+	copiedKeys := []string{store.SnapshotKey(lineage, 1, txid)}
+	cleanup := func() {
+		for _, k := range copiedKeys {
+			w.bestEffortDelete(k)
+		}
+	}
+
+	// Every existing checkpoint qualifies (every c.TXID <= head, by
+	// construction — compact never drops history), exactly as Rollback's
+	// kept map does for checkpoints at or before its target. Copy each
+	// one's snapshot into the new lineage (the head's copy above is reused
+	// for any checkpoint that already sits at head — the `done` set mirrors
+	// Rollback's) and rewrite it to epoch 1 (where the copy now actually
+	// lives) while preserving CreatedAt/Meta, a location update rather than
+	// a new checkpoint.
+	kept := map[string]store.Checkpoint{}
+	for name, c := range ref.Checkpoints {
+		kept[name] = c
+	}
+	done := map[uint64]bool{txid: true}
+	for name, c := range kept {
+		if !done[c.TXID] {
+			done[c.TXID] = true
+			key, err := w.copySnapshotIntoLineage(ref, c, lineage)
+			if err != nil {
+				cleanup()
+				return 0, fmt.Errorf("ops: compact: copying checkpoint snapshot for txid %d: %w", c.TXID, err)
+			}
+			copiedKeys = append(copiedKeys, key)
+		}
+		kept[name] = store.Checkpoint{TXID: c.TXID, Epoch: 1, CreatedAt: c.CreatedAt, Meta: c.Meta}
+	}
+	kept["compact"] = store.Checkpoint{TXID: txid, Epoch: 1, CreatedAt: nowStamp()}
+
 	next := ref
 	next.Lineage, next.Epoch, next.HeadTXID, next.HeadEpoch = lineage, 1, txid, 1
 	next.Base = nil
-	next.Checkpoints = nil
-	next.SetCheckpoint("compact", store.Checkpoint{TXID: txid, Epoch: 1, CreatedAt: nowStamp()})
+	next.Checkpoints = kept
 	// A repoint is itself a revocation — same reasoning as Promote: clear
 	// the lease so the branch is immediately acquirable post-repoint.
 	next.LeaseHolder, next.LeaseExpiry = "", ""
@@ -1404,7 +1443,7 @@ func (w *Workspace) Compact(db, branch string) (uint64, error) {
 		compactBeforeCASForTest()
 	}
 	if _, err := w.Store.PutRef(db, branch, next, etag); err != nil {
-		w.bestEffortDelete(store.SnapshotKey(lineage, 1, txid))
+		cleanup()
 		return 0, fmt.Errorf("ops: compact lost a race (retry): %w", err)
 	}
 	// Refresh the checkout if one exists and is quiescible.
