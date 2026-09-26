@@ -112,7 +112,10 @@ func runDiff(w *ops.Workspace, out io.Writer, leftTarget, rightTarget string, su
 		if errors.Is(err, ops.ErrSqldiffMissing) {
 			return sqldiffNotFoundError()
 		}
-		return fmt.Errorf("offshoot diff: %w", err)
+		// ops.Sqldiff already prefixes its errors with "ops: diff: ..."; an
+		// extra "offshoot diff: " wrap here would double up (e.g.
+		// "offshoot diff: ops: diff: sqldiff: ..."), so return it as-is.
+		return err
 	}
 	return nil
 }

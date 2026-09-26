@@ -70,6 +70,23 @@ func seedTwoSidesForDiff(t *testing.T, store string) (leftTarget, rightTarget st
 	return "app@main@left", "app@attempt@right"
 }
 
+// tableRow finds the output line whose first whitespace-separated field is
+// table (the tabwriter-aligned TABLE column) and returns its fields split on
+// whitespace — letting a caller assert an exact row shape (column values in
+// order) rather than merely that some substrings appear somewhere in the
+// output.
+func tableRow(t *testing.T, out, table string) []string {
+	t.Helper()
+	for _, line := range strings.Split(out, "\n") {
+		fields := strings.Fields(line)
+		if len(fields) > 0 && fields[0] == table {
+			return fields
+		}
+	}
+	t.Fatalf("no output row for table %q; full output:\n%s", table, out)
+	return nil
+}
+
 // TestDiffSummaryCLIReportsExactRowCounts is the load-bearing --summary
 // test: it asserts the EXACT counts (not just presence/absence) for a
 // changed, an added, and a removed table, plus the trailing totals line.
@@ -80,16 +97,25 @@ func TestDiffSummaryCLIReportsExactRowCounts(t *testing.T) {
 
 	out := call(t, store, "diff", left, right, "--summary")
 
-	for _, want := range []string{
-		"ADDED", "REMOVED", "CHANGED",
-		"users", "3", "5",
-		"gone", "2", "removed",
-		"arrivals", "4", "added",
-		"3 tables: 0 same, 1 changed, 1 added, 1 removed",
-	} {
+	for _, want := range []string{"ADDED", "REMOVED", "CHANGED", "3 tables: 0 same, 1 changed, 1 added, 1 removed"} {
 		if !strings.Contains(out, want) {
 			t.Fatalf("--summary output missing %q; full output:\n%s", want, out)
 		}
+	}
+
+	// users: 3 left, 5 right, comparable, +2 rows added via rowid (no
+	// declared PK), 0 removed, 0 changed, status "changed".
+	if got, want := tableRow(t, out, "users"), []string{"users", "3", "5", "2", "0", "0", "changed"}; strings.Join(got, " ") != strings.Join(want, " ") {
+		t.Fatalf("users row = %v, want %v; full output:\n%s", got, want, out)
+	}
+	// gone: left-only, 2 rows, not comparable (right side doesn't exist),
+	// status "removed".
+	if got, want := tableRow(t, out, "gone"), []string{"gone", "2", "-", "-", "-", "-", "removed"}; strings.Join(got, " ") != strings.Join(want, " ") {
+		t.Fatalf("gone row = %v, want %v; full output:\n%s", got, want, out)
+	}
+	// arrivals: right-only, 4 rows, not comparable, status "added".
+	if got, want := tableRow(t, out, "arrivals"), []string{"arrivals", "-", "4", "-", "-", "-", "added"}; strings.Join(got, " ") != strings.Join(want, " ") {
+		t.Fatalf("arrivals row = %v, want %v; full output:\n%s", got, want, out)
 	}
 }
 
