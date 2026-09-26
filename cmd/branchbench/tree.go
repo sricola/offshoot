@@ -27,6 +27,12 @@ type tree struct {
 	nodes []*node
 	live  int // alive, ready or not, excluding the root
 	peak  int
+	// rootFallbacks counts the steps that had to fork from the root because
+	// no node was eligible any more — the last clause of BranchBench's own
+	// parent-selection rule, which a tuple whose T x S exceeds the capacity
+	// its fanouts and depth allow (data_cleaning: 10 + 30 + 90 = 130 nodes
+	// for 200 steps) is guaranteed to reach.
+	rootFallbacks int
 }
 
 func newTree(wf workflow) *tree {
@@ -64,6 +70,7 @@ func (t *tree) reserve(cur *node, name string) *node {
 			parent = options[t.rng.Intn(len(options))]
 		} else {
 			parent = t.root
+			t.rootFallbacks++
 		}
 	}
 	child := &node{name: name, parent: parent, depth: parent.depth + 1, alive: true}

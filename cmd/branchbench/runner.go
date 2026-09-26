@@ -6,6 +6,7 @@ import (
 	"errors"
 	"fmt"
 	"math/rand"
+	"os"
 	"strings"
 	"sync"
 	"sync/atomic"
@@ -20,6 +21,8 @@ type runner struct {
 	ws         *ops.Workspace
 	wf         workflow
 	cfg        config
+	store      string // this workflow's own store directory
+	seedBytes  int64
 	tree       *tree
 	m          *metrics
 	sem        chan struct{}
@@ -217,12 +220,49 @@ func (r *runner) crossBranch() (time.Duration, int, error) {
 	return time.Since(start), len(branches), nil
 }
 
+// storeSampleEvery is how often the store directory is walked while a
+// workflow runs, to catch the peak. Branch data only accumulates during a run
+// (destroy tombstones, it does not reclaim — that is `offshoot gc`'s job), so
+// the final walk is very nearly the peak anyway; sampling is a cheap check on
+// that assumption, and the interval is deliberately coarse so walking a
+// multi-GiB tree does not perturb the very latencies being measured.
+const storeSampleEvery = 5 * time.Second
+
 // runWorkflow executes one workflow end to end and reports it.
 func (r *runner) runWorkflow(ctx context.Context) *workflowReport {
-	before, _ := dirBytes(r.cfg.store)
 	wctx, cancel := context.WithCancel(ctx)
 	defer cancel()
 	r.cancel = cancel
+	var peak, walkSkipped atomic.Int64
+	sampleStore := func() {
+		n, skipped, err := dirBytes(r.store)
+		walkSkipped.Add(int64(skipped))
+		if err != nil {
+			fmt.Fprintf(os.Stderr, "branchbench: %s: walking the store failed: %v\n", r.wf.name, err)
+			return
+		}
+		for {
+			cur := peak.Load()
+			if n <= cur || peak.CompareAndSwap(cur, n) {
+				break
+			}
+		}
+	}
+	sampling := make(chan struct{})
+	samplerDone := make(chan struct{})
+	go func() {
+		defer close(samplerDone)
+		t := time.NewTicker(storeSampleEvery)
+		defer t.Stop()
+		for {
+			select {
+			case <-sampling:
+				return
+			case <-t.C:
+				sampleStore()
+			}
+		}
+	}()
 	start := time.Now()
 	var wg sync.WaitGroup
 	for w := 0; w < r.wf.workers; w++ {
@@ -266,14 +306,26 @@ func (r *runner) runWorkflow(ctx context.Context) *workflowReport {
 		}
 	}
 	wall := time.Since(start)
-	after, _ := dirBytes(r.cfg.store)
+	close(sampling)
+	<-samplerDone
+	sampleStore()
+	end, endSkipped, endErr := dirBytes(r.store)
+	walkSkipped.Add(int64(endSkipped))
+	if endErr != nil {
+		fmt.Fprintf(os.Stderr, "branchbench: %s: walking the store failed: %v\n", r.wf.name, endErr)
+	}
 	branchTime, retries := r.m.totals()
 	return &workflowReport{
 		wf: r.wf, stepsDone: int(r.stepsDone.Load()), stepsTotal: r.wf.workers * r.wf.steps,
 		wall: wall, branchTime: branchTime, m: r.m,
-		maxDepth: int(r.maxDepth.Load()), peakLive: r.tree.peak, storeDelta: after - before,
+		maxDepth: int(r.maxDepth.Load()), peakLive: r.tree.peak,
+		rootFallbacks: r.tree.rootFallbacks, storeWalkSkipped: int(walkSkipped.Load()),
+		storePeak: peak.Load(), storeEnd: end, seedBytes: r.seedBytes,
 		crossDur: cbDur, crossBranches: cbBranches, crossQueries: r.wf.crossBranch,
 		casRetries: retries, timedOut: ctx.Err() != nil, err: r.err(),
-		concurrency: cap(r.sem),
+		// A workflow with fewer workers than -concurrency can never use the
+		// whole semaphore, so the branching-overhead denominator below is
+		// built from what it could actually use.
+		concurrency: min(cap(r.sem), r.wf.workers), requested: cap(r.sem),
 	}
 }

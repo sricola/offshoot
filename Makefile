@@ -229,8 +229,13 @@ bench-isolation: check-python-version
 	$(PYTHON) scripts/bench-isolation.py --sizes 10,100 --iters 20
 
 # BranchBench's five agentic-workflow topologies (arXiv:2604.17180) re-run
-# against a local offshoot store, full-scale parameters: ~2,300 forks in
-# all. Prints one markdown table; docs/benchmarks.md pastes it verbatim.
+# against a local offshoot store, full-scale parameters: ~2,300 forks in all.
+# Every workflow runs against its own fresh store (built, seeded and removed
+# per workflow), so this needs about 30 GB of free space in $$TMPDIR -- the
+# largest single workflow, mcts, peaks near 26.5 GiB -- and about 5 minutes on
+# an Apple M5. `go run ./cmd/branchbench -quick` is the seconds-scale smoke
+# run of the same five topologies, and `go test ./cmd/branchbench` runs it.
+# Prints one markdown table; docs/benchmarks.md pastes it verbatim.
 bench-branchbench:
 	go run ./cmd/branchbench
 

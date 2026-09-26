@@ -18,8 +18,11 @@ import (
 	"fmt"
 	"io/fs"
 	"os"
+	"os/signal"
 	"path/filepath"
 	"strings"
+	"sync"
+	"syscall"
 	"time"
 
 	_ "github.com/mattn/go-sqlite3"
@@ -51,6 +54,8 @@ func main() {
 		store: *store, workflows: strings.Split(*list, ","), concurrency: *concurrency,
 		quick: *quick, warehouses: *warehouses, timeout: *timeout, keep: *keep,
 	}
+	stop := watchForInterrupt()
+	defer stop()
 	rep, err := run(cfg)
 	if err != nil {
 		fmt.Fprintf(os.Stderr, "branchbench: %v\n", err)
@@ -58,14 +63,78 @@ func main() {
 	}
 	fmt.Print(rep.markdown())
 	for _, w := range rep.workflows {
-		if w.err != nil {
+		if w.err != nil || w.timedOut {
 			os.Exit(1)
 		}
 	}
 }
 
-// run builds the seed store and executes every requested workflow in order.
-// It fails only on setup errors; a workflow that aborts or times out is
+// activeStores tracks the store directories this process owns, so an
+// interrupted run does not silently leave tens of GB in $TMPDIR.
+var activeStores struct {
+	mu   sync.Mutex
+	dirs map[string]bool
+	keep bool
+}
+
+func trackStore(dir string, keep bool) {
+	activeStores.mu.Lock()
+	defer activeStores.mu.Unlock()
+	if activeStores.dirs == nil {
+		activeStores.dirs = map[string]bool{}
+	}
+	activeStores.dirs[dir] = true
+	activeStores.keep = keep
+}
+
+func untrackStore(dir string) {
+	activeStores.mu.Lock()
+	defer activeStores.mu.Unlock()
+	delete(activeStores.dirs, dir)
+}
+
+// watchForInterrupt removes (or, under -keep, reports) the live store
+// directories on SIGINT/SIGTERM. A full run holds tens of GB at its peak;
+// leaving that behind on Ctrl-C would be a nasty surprise.
+func watchForInterrupt() func() {
+	sigs := make(chan os.Signal, 1)
+	signal.Notify(sigs, os.Interrupt, syscall.SIGTERM)
+	go func() {
+		sig, ok := <-sigs
+		if !ok {
+			return
+		}
+		activeStores.mu.Lock()
+		dirs := make([]string, 0, len(activeStores.dirs))
+		for d := range activeStores.dirs {
+			dirs = append(dirs, d)
+		}
+		keep := activeStores.keep
+		activeStores.mu.Unlock()
+		for _, d := range dirs {
+			if keep {
+				fmt.Fprintf(os.Stderr, "branchbench: %s: store left at %s (-keep)\n", sig, d)
+				continue
+			}
+			fmt.Fprintf(os.Stderr, "branchbench: %s: removing store %s\n", sig, d)
+			if err := os.RemoveAll(d); err != nil {
+				fmt.Fprintf(os.Stderr, "branchbench: could not remove %s: %v\n", d, err)
+			}
+		}
+		os.Exit(130)
+	}()
+	return func() { signal.Stop(sigs); close(sigs) }
+}
+
+// run executes every requested workflow in order, each one against its OWN
+// fresh store: a new directory, a new ops.Init, a new seed (the generator is
+// deterministic, so every workflow starts from a byte-identical database),
+// removed again before the next workflow starts. That is what keeps the rows
+// independent — no workflow measures latency or bytes against the branches a
+// previous one left behind — and what bounds peak disk to the largest single
+// workflow rather than the sum of all five.
+//
+// run fails only on setup errors; a workflow that aborts or times out is
 // reported in the table with the step count it reached.
 func run(cfg config) (*report, error) {
 	if cfg.concurrency < 1 {
@@ -77,29 +146,7 @@ func run(cfg config) (*report, error) {
 	if cfg.timeout <= 0 {
 		cfg.timeout = 2 * time.Hour
 	}
-	if cfg.store == "" {
-		dir, err := os.MkdirTemp("", "branchbench-*")
-		if err != nil {
-			return nil, err
-		}
-		cfg.store = dir
-		if cfg.keep {
-			fmt.Fprintf(os.Stderr, "branchbench: store kept at %s\n", dir)
-		} else {
-			defer os.RemoveAll(dir)
-		}
-	}
-	ws, err := ops.Init(cfg.store)
-	if err != nil {
-		return nil, err
-	}
-	fmt.Fprintf(os.Stderr, "branchbench: seeding %d-warehouse CH-benCHmark database...\n", cfg.warehouses)
-	seedBytes, err := buildSeed(ws, cfg.warehouses)
-	if err != nil {
-		return nil, fmt.Errorf("seed: %w", err)
-	}
-	fmt.Fprintf(os.Stderr, "branchbench: seed is %.0f MiB\n", float64(seedBytes)/(1<<20))
-	rep := &report{seedBytes: seedBytes, concurrency: cfg.concurrency, quick: cfg.quick, warehouses: cfg.warehouses}
+	rep := &report{concurrency: cfg.concurrency, quick: cfg.quick, warehouses: cfg.warehouses}
 	for _, name := range cfg.workflows {
 		name = strings.TrimSpace(name)
 		if name == "" {
@@ -112,39 +159,105 @@ func run(cfg config) (*report, error) {
 		if cfg.quick {
 			wf = wf.quick()
 		}
-		fmt.Fprintf(os.Stderr, "branchbench: %s (%s): %d workers x %d steps...\n", wf.name, wf.shape, wf.workers, wf.steps)
-		r := &runner{ws: ws, wf: wf, cfg: cfg, tree: newTree(wf), m: newMetrics(), sem: make(chan struct{}, cfg.concurrency)}
-		ctx, cancel := context.WithTimeout(context.Background(), cfg.timeout)
-		wr := r.runWorkflow(ctx)
-		cancel()
-		wr.finalize()
-		if wr.err != nil {
-			fmt.Fprintf(os.Stderr, "branchbench: %s aborted after %d/%d steps: %v\n", wf.name, wr.stepsDone, wr.stepsTotal, wr.err)
-		} else {
-			fmt.Fprintf(os.Stderr, "branchbench: %s done: %d/%d steps in %s\n", wf.name, wr.stepsDone, wr.stepsTotal, wr.wall.Round(time.Millisecond))
+		wr, err := runOne(cfg, wf, rep)
+		if err != nil {
+			return nil, err
 		}
 		rep.workflows = append(rep.workflows, wr)
 	}
 	return rep, nil
 }
 
+// runOne gives one workflow its own store, seeds it, runs it, and removes the
+// store again (unless -keep).
+func runOne(cfg config, wf workflow, rep *report) (*workflowReport, error) {
+	dir, err := workflowStore(cfg, wf.name)
+	if err != nil {
+		return nil, err
+	}
+	trackStore(dir, cfg.keep)
+	fmt.Fprintf(os.Stderr, "branchbench: %s: store at %s\n", wf.name, dir)
+	if cfg.keep {
+		defer untrackStore(dir)
+	} else {
+		defer func() {
+			if err := os.RemoveAll(dir); err != nil {
+				fmt.Fprintf(os.Stderr, "branchbench: could not remove %s: %v\n", dir, err)
+			}
+			untrackStore(dir)
+		}()
+	}
+	ws, err := ops.Init(dir)
+	if err != nil {
+		return nil, err
+	}
+	fmt.Fprintf(os.Stderr, "branchbench: %s: seeding %d-warehouse CH-benCHmark database...\n", wf.name, cfg.warehouses)
+	seedBytes, err := buildSeed(ws, cfg.warehouses)
+	if err != nil {
+		return nil, fmt.Errorf("%s: seed: %w", wf.name, err)
+	}
+	// The seed is deterministic, so every workflow's is the same size; the
+	// header reports it once. A mismatch would mean the generator is not
+	// deterministic after all, which is worth failing on.
+	if rep.seedBytes == 0 {
+		rep.seedBytes = seedBytes
+	} else if rep.seedBytes != seedBytes {
+		return nil, fmt.Errorf("%s: seed is %d bytes, but an earlier workflow's seed was %d — the seed generator is not deterministic",
+			wf.name, seedBytes, rep.seedBytes)
+	}
+	fmt.Fprintf(os.Stderr, "branchbench: %s (%s): %d workers x %d steps...\n", wf.name, wf.shape, wf.workers, wf.steps)
+	r := &runner{ws: ws, wf: wf, cfg: cfg, store: dir, seedBytes: seedBytes,
+		tree: newTree(wf), m: newMetrics(), sem: make(chan struct{}, cfg.concurrency)}
+	ctx, cancel := context.WithTimeout(context.Background(), cfg.timeout)
+	wr := r.runWorkflow(ctx)
+	cancel()
+	wr.finalize()
+	if wr.err != nil {
+		fmt.Fprintf(os.Stderr, "branchbench: %s aborted after %d/%d steps: %v\n", wf.name, wr.stepsDone, wr.stepsTotal, wr.err)
+	} else {
+		fmt.Fprintf(os.Stderr, "branchbench: %s done: %d/%d steps in %s, store peaked at %s\n",
+			wf.name, wr.stepsDone, wr.stepsTotal, wr.wall.Round(time.Millisecond), fmtBytes(wr.storePeak))
+	}
+	return wr, nil
+}
+
+// workflowStore returns a fresh, empty directory for one workflow's store:
+// under -store when one was given, else a temp dir.
+func workflowStore(cfg config, name string) (string, error) {
+	if cfg.store == "" {
+		return os.MkdirTemp("", "branchbench-"+name+"-*")
+	}
+	dir := filepath.Join(cfg.store, name)
+	if err := os.RemoveAll(dir); err != nil {
+		return "", err
+	}
+	if err := os.MkdirAll(dir, 0o755); err != nil {
+		return "", err
+	}
+	return dir, nil
+}
+
 // dirBytes sums the apparent sizes of every file under dir (the store, plus
-// the materialized checkouts that live inside it for a local store).
-func dirBytes(dir string) (int64, error) {
-	var total int64
-	err := filepath.WalkDir(dir, func(_ string, d fs.DirEntry, err error) error {
+// the materialized checkouts that live inside it for a local store). skipped
+// counts entries it could not stat — usually a file a concurrent destroy
+// removed mid-walk, but the count is reported rather than swallowed, because
+// a large one would mean the store figures are understated.
+func dirBytes(dir string) (total int64, skipped int, err error) {
+	err = filepath.WalkDir(dir, func(_ string, d fs.DirEntry, err error) error {
 		if err != nil {
-			return nil // a file destroyed mid-walk is not an error here
+			skipped++
+			return nil
 		}
 		if d.IsDir() {
 			return nil
 		}
 		info, err := d.Info()
 		if err != nil {
+			skipped++
 			return nil
 		}
 		total += info.Size()
 		return nil
 	})
-	return total, err
+	return total, skipped, err
 }

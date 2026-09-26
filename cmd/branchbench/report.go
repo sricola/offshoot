@@ -18,14 +18,18 @@ type workflowReport struct {
 	wall, branchTime      time.Duration
 	m                     *metrics
 	maxDepth, peakLive    int
-	storeDelta            int64
+	storePeak, storeEnd   int64
+	seedBytes             int64
 	crossDur              time.Duration
 	crossBranches         int
 	crossQueries          int
 	casRetries            int
 	timedOut              bool
 	err                   error
-	concurrency           int
+	concurrency           int // effective: min(-concurrency, T workers)
+	requested             int // the -concurrency flag
+	rootFallbacks         int
+	storeWalkSkipped      int
 
 	// p50/p99 per operation, keyed by depth; filled by finalize for depth 1
 	// and for the deepest depth the workflow reached.
@@ -72,8 +76,15 @@ type report struct {
 	quick       bool
 }
 
+// quantileNote goes straight under the table: with this few samples per
+// (operation, depth) cell, a p99 is simply the slowest sample.
+const quantileNote = "Latencies are milliseconds. p99 is the maximum sample wherever a cell has fewer than 100 samples " +
+	"at that depth, which is most of them — the per-workflow lines below give the counts. " +
+	"Branch overhead is fork+checkout+checkpoint+destroy time summed over workers, over wall x effective concurrency " +
+	"(min(-concurrency, T workers)). Peak live counts live forked branches, excluding the root."
+
 const tableHeader = "| Workflow | Steps | Wall | Branch overhead | Fork p50/p99 (d=1 → d=max) | " +
-	"Checkout p50/p99 (d=1 → d=max) | Checkpoint p50/p99 (d=1 → d=max) | Eval p50/p99 (d=1 → d=max) | Peak live | Store Δ |"
+	"Checkout p50/p99 (d=1 → d=max) | Checkpoint p50/p99 (d=1 → d=max) | Eval p50/p99 (d=1 → d=max) | Peak live | Store peak |"
 
 func (r *report) markdown() string {
 	var b strings.Builder
@@ -85,9 +96,10 @@ func (r *report) markdown() string {
 			w.name, w.stepsDone, w.stepsTotal, w.stepsNote(), fmtWall(w.wall), w.overhead(),
 			w.cell(w.forkP50, w.forkP99), w.cell(w.checkoutP50, w.checkoutP99),
 			w.cell(w.checkpointP50, w.checkpointP99), w.cell(w.evalP50, w.evalP99),
-			w.peakLive, fmtBytes(w.storeDelta))
+			w.peakLive, fmtBytes(w.storePeak))
 	}
 	b.WriteString("\n")
+	b.WriteString(quantileNote + "\n\n")
 	for _, w := range r.workflows {
 		b.WriteString(w.line() + "\n")
 	}
@@ -121,8 +133,15 @@ func (w *workflowReport) line() string {
 	} else {
 		fmt.Fprintf(&b, "; all %d steps landed at d=1", w.samples["fork"][1])
 	}
-	fmt.Fprintf(&b, "; branch-management time %s summed over workers (%.1fx wall at concurrency %d); %d CAS retries",
-		fmtWall(w.branchTime), float64(w.branchTime)/float64(w.wall), w.concurrency, w.casRetries)
+	fmt.Fprintf(&b, "; store ended at %s of which %s is the seed", fmtBytes(w.storeEnd), fmtBytes(w.seedBytes))
+	if w.rootFallbacks > 0 {
+		fmt.Fprintf(&b, "; %d forks fell back to the root after the tree filled", w.rootFallbacks)
+	}
+	fmt.Fprintf(&b, "; branch-management time %s summed over workers (%.1fx wall at effective concurrency %d of %d requested); %d CAS retries",
+		fmtWall(w.branchTime), float64(w.branchTime)/float64(w.wall), w.concurrency, w.requested, w.casRetries)
+	if w.storeWalkSkipped > 0 {
+		fmt.Fprintf(&b, "; store sizes approximate: %d entries vanished or were unreadable during the size walks", w.storeWalkSkipped)
+	}
 	if w.err != nil {
 		fmt.Fprintf(&b, "; ABORTED: %v", w.err)
 	}
@@ -151,7 +170,7 @@ func (w *workflowReport) overhead() string {
 	if w.wall <= 0 {
 		return "n/a"
 	}
-	den := float64(w.wall) * float64(w.concurrency)
+	den := float64(w.wall) * float64(w.concurrency) // concurrency is the effective one
 	return fmt.Sprintf("%.0f%%", 100*float64(w.branchTime)/den)
 }
 
