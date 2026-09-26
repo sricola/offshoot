@@ -168,7 +168,7 @@ More "why not X" (Litestream, Dolt, Neon, plain `cp`):
 |---|---|
 | **Homebrew** | `brew tap sricola/offshoot https://github.com/sricola/offshoot && brew trust sricola/offshoot && brew install offshoot` — recent Homebrew requires the explicit `trust` for third-party taps; the formula lives in-repo at [`Formula/offshoot.rb`](Formula/offshoot.rb) |
 | **Docker** | `docker run --rm -v offshoot-data:/data ghcr.io/sricola/offshoot:latest init` — multi-architecture `linux/amd64` and `linux/arm64` images publish to GHCR on every tagged release; the store lives in the `/data` volume, so reuse `-v offshoot-data:/data` across commands (`… create app`, `… serve`, and so on) |
-| **Prebuilt binaries** | `offshoot_vX_os_arch.tar.gz` (+ `.sha256`) from the [releases page](https://github.com/sricola/offshoot/releases), published for each tagged release |
+| **Prebuilt binaries** | `offshoot_vX_os_arch.tar.gz` (+ `.sha256`) from the [releases page](https://github.com/sricola/offshoot/releases), published for each tagged release — signed and attested since v0.2.11 ([verify](https://sricola.github.io/offshoot/docs/installation/#verify-what-you-downloaded)) |
 | **`go install`** | `go install github.com/sricola/offshoot/cmd/offshoot@latest` |
 | **From source** | the Quickstart above (Go 1.26+, cgo) |
 

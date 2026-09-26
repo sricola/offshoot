@@ -30,6 +30,31 @@ tar xzf offshoot_v0.2.9_linux_amd64.tar.gz
 ./offshoot version
 ```
 
+## Verify what you downloaded
+
+Every tagged release is signed and attested by the release workflow itself
+— no maintainer-held key. Three independent checks, pick any:
+
+```sh
+# 1. SLSA build provenance (GitHub attestation store; needs gh >= 2.49)
+gh attestation verify offshoot_v0.2.11_linux_amd64.tar.gz --repo sricola/offshoot
+
+# 2. cosign keyless signature, pinned to this repo's release workflow identity
+cosign verify-blob \
+  --bundle offshoot_v0.2.11_linux_amd64.tar.gz.sigstore.json \
+  --certificate-identity-regexp '^https://github.com/sricola/offshoot/\.github/workflows/release\.yml@refs/' \
+  --certificate-oidc-issuer https://token.actions.githubusercontent.com \
+  offshoot_v0.2.11_linux_amd64.tar.gz
+
+# 3. the plain checksum, as before
+shasum -a 256 -c offshoot_v0.2.11_linux_amd64.tar.gz.sha256
+```
+
+Each release also ships `offshoot_<tag>.spdx.json`, an SPDX SBOM of the Go
+module graph, with a matching SBOM attestation (`gh attestation verify
+--predicate-type https://spdx.dev/Document/v2.3 …`). Releases before
+v0.2.11 carry checksums only.
+
 ## Docker
 
 ```
@@ -40,7 +65,9 @@ Multi-architecture `linux/amd64` and `linux/arm64` images publish to GHCR on
 every tagged release. The store lives in the `/data` volume, so reuse
 `-v offshoot-data:/data` across commands
 (`... offshoot:latest create app`, `... offshoot:latest serve`, and so
-on).
+on). Images are signed and attested too:
+`cosign verify ghcr.io/sricola/offshoot:<tag> --certificate-identity-regexp '^https://github.com/sricola/offshoot/\.github/workflows/release\.yml@refs/' --certificate-oidc-issuer https://token.actions.githubusercontent.com`,
+or `gh attestation verify oci://ghcr.io/sricola/offshoot:<tag> --repo sricola/offshoot`.
 
 ## go install / from source
 
