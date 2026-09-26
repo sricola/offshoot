@@ -8,20 +8,54 @@ server that puts fork/checkpoint/rollback in the agent's own hands, the
 daemon workflow that captures the agent's writes live, and where the
 safety rails actually are.
 
-## One command to wire up Claude Code
+## Wire it into your agent
+
+**Claude Code plugin** (MCP server + a skill that teaches the loop + advisory hooks):
+
+```
+claude plugin marketplace add sricola/offshoot
+claude plugin install offshoot@offshoot
+```
+
+**Claude Code, MCP only:**
 
 ```
 claude mcp add offshoot -- offshoot -store ./.offshoot mcp
 ```
 
+**Cursor:** [![Install in Cursor](https://cursor.com/deeplink/mcp-install-dark.svg)](cursor://anysphere.cursor-deeplink/mcp/install?name=offshoot&config=eyJjb21tYW5kIjoib2Zmc2hvb3QiLCJhcmdzIjpbIm1jcCJdfQ==)
+(the link installs `offshoot mcp` as a stdio server; the store resolves from `OFFSHOOT_STORE` or `./.offshoot`).
+
 `offshoot mcp` speaks the Model Context Protocol on stdio — no daemon
-required for the baseline. The agent gets seven tools, each described so
-the model knows *when* to reach for it: fork before a risky migration,
-checkpoint when tests pass, roll back when they don't, promote the attempt
-that worked. See it work end to end in a real captured session:
+required for the baseline. The plugin's skill is the same text as the
+["rules-file snippet"](#rules-file-snippet) below; its hooks only add
+context (they never block a command), and they stay silent when `offshoot`
+is not installed.
+
+The agent gets eight tools, each described so the model knows *when* to
+reach for it: fork before a risky migration, checkpoint when tests pass,
+roll back when they don't, promote the attempt that worked. See it work
+end to end in a real captured session:
 [the MCP walkthrough](demo/mcp-walkthrough.md).
 
-## The seven tools
+## Rules-file snippet
+
+Drop this into the project's `AGENTS.md` or `CLAUDE.md` so any agent reads
+the loop before it touches a database, MCP tools or not:
+
+```
+Database changes: this project uses offshoot. Before any schema migration,
+bulk delete, or data experiment, fork the database (offshoot_fork) and work
+in the fork's checkout; checkpoint when tests pass; roll back when they
+fail; promote the fork that worked. Never run destructive SQL on main's
+checkout directly.
+```
+
+This is the same text the Claude Code plugin's skill teaches automatically;
+an agent that indexes docs instead of reading a rules file can pull the same
+loop from <https://sricola.github.io/offshoot/llms.txt>.
+
+## The eight tools
 
 Verified against `internal/mcp/tools.go`; `branch` defaults to `"main"`
 wherever it's optional.
@@ -30,11 +64,24 @@ wherever it's optional.
 |---|---|---|
 | `offshoot_list` | *(none)* | List every database and branch, with head txid, checkpoints, and protected flags — the orient-yourself call |
 | `offshoot_checkout` | `database`, `branch?` | Materialize a branch to a local SQLite file and return the path to open |
-| `offshoot_checkpoint` | `database`, `name`, `branch?` | Name the current state so it can be rolled back to or forked from |
-| `offshoot_fork` | `database`, `new_branch`, `branch?`, `at?`, `ttl?` | Create an isolated branch from head, or from a checkpoint via `at` |
+| `offshoot_checkpoint` | `database`, `name`, `branch?`, `meta?` | Name the current state so it can be rolled back to or forked from |
+| `offshoot_fork` | `database`, `new_branch`, `branch?`, `at?`, `ttl?`, `meta?` | Create an isolated branch from head, or from a checkpoint via `at` |
 | `offshoot_rollback` | `database`, `to`, `branch?` | Return a branch to a named checkpoint, discarding everything since |
-| `offshoot_promote` | `database`, `source`, `target`, `force?` | Repoint `target` at `source`'s head — ship the winning attempt. `target`'s previous head is kept as `<target>-pre-promote` (TTL'd, one per target), the undo handle the result names |
+| `offshoot_promote` | `database`, `source`, `target`, `force?` | Repoint `target` at `source`'s head — ship the winning attempt. `target`'s previous head is kept as a safety fork named `<target>-pre-promote` — the undo handle the result names — but that fork always carries a TTL (24h by default) and is one rolling slot per target, replaced by the next promote onto that target, so the undo window closes when either happens |
 | `offshoot_destroy` | `database`, `branch`, `force?` | Permanently discard a branch and its checkout |
+| `offshoot_touch` | `database`, `branch?`, `ttl?` | Reset a fork's activity clock so its TTL does not expire mid-task; `ttl` sets or (`"none"`) clears it |
+
+## What the host sees: annotations and structured results
+
+Every tool carries the MCP spec's behavior hints, set explicitly:
+`offshoot_list` is read-only; `checkout`, `fork`, `checkpoint`, and `touch`
+are non-destructive; `rollback`, `promote`, and `destroy` are destructive,
+so a host that honors `destructiveHint` prompts before them. Every
+successful result also returns `structuredContent` (snake_case JSON:
+`txid`, `path`, `ttl`, `expires_at`, `backup`, …) next to the prose, so a
+harness reads the fields instead of parsing sentences. `fork` and
+`checkpoint` accept `meta` (string→string, at most 32 keys) to tag a
+branch or checkpoint with a run id, git SHA, or agent name.
 
 ## Forks expire by default
 

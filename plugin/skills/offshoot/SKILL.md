@@ -26,7 +26,10 @@ SQLite client opens. You have eight tools; the loop is four calls.
    repoints `target` (often `main`) at `source`'s head. Protected targets
    refuse without `force`; that refusal is confirmation you need, not a bug.
    The target's previous head is kept as `<target>-pre-promote` — the result
-   names it — so a promote is undone by promoting that fork back.
+   names it — so a promote is undone by promoting that fork back. That
+   safety fork always carries a TTL (24h by default) and is one rolling
+   slot per target, replaced by the next promote onto that target, so the
+   undo window closes when either happens.
 6. **Clean up:** `offshoot_destroy` a failed attempt, or let its TTL expire.
    `offshoot_touch {database, branch, ttl?}` keeps a fork alive if a task
    runs long.
