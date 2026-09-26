@@ -227,16 +227,21 @@ network. Measured 2026-09-26. Raw output of `make bench-isolation`
 
 | Primitive | 10 MB | 100 MB |
 |---|---|---|
-| `offshoot fork` + `open` + `close` (SDK) | 70.78 / 73.83 | 429.24 / 438.68 |
-| `offshoot fork` alone (no session) | 9.51 / 11.62 | 8.92 / 10.73 |
-| `sqlite3.Connection.backup()` | 9.60 / 11.48 | 93.23 / 99.11 |
-| `shutil.copyfile` | 0.96 / 2.88 | 13.52 / 84.76 |
-| Postgres `CREATE DATABASE trial TEMPLATE seed` | 58.78 / 62.42 | 119.72 / 144.02 |
+| `offshoot fork` + `open` + `close` (SDK) | 68.34 / 81.67 | 420.87 / 435.87 |
+| `offshoot fork` alone (no session) | 9.63 / 11.67 | 9.41 / 10.76 |
+| `sqlite3.Connection.backup()` | 9.39 / 11.58 | 93.06 / 102.28 |
+| `shutil.copyfile` | 0.91 / 0.99 | 10.93 / 90.85 |
+| Postgres `CREATE DATABASE trial TEMPLATE seed` | 57.28 / 60.84 | 119.91 / 127.51 |
 
-Postgres cold container start (`docker run -d postgres:16` until `pg_isready`; N=3, size-independent): **363.03 / 369.38 ms** (median / p95)
+Postgres cold container start (`docker run -d postgres:16` until `pg_isready`; N=3, size-independent): **355.88 / 367.67 ms** (median / p95)
 
-Values are `median / p95` milliseconds over 20 iterations (3 for the cold-container row).
+docker exec no-op (SELECT 1) overhead (same `docker exec ... psql` round trip the template-clone row above pays; N=20, size-independent): **37.04 / 41.73 ms** (median / p90)
+
+`pg_isready` -> first successful `SELECT 1` gap (measured inside the cold-container start above; N=3, size-independent): **250.79 / 255.32 ms** (median / p90)
+
+Values are `median / p95` milliseconds over 20 iterations (3 for the cold-container row), except the docker-exec-no-op and pg_isready-gap lines above, which report `median / p90`.
 Postgres seed sizes (`pg_total_relation_size`): 10 MB target -> 10.6 MiB actual, 100 MB target -> 105.2 MiB actual.
+SQLite seed sizes (actual file size): 10 MB target -> 10.0 MiB actual, 100 MB target -> 100.1 MiB actual.
 
 **Caveats:**
 - Single host, single run, not a fleet average: all rows were measured back-to-back on the same machine (see the machine line above this table in the docs) with no other load; run-to-run variance on a laptop is real.
@@ -250,44 +255,55 @@ shared CoW fork writes two small objects — a base pointer and a branch
 ref — regardless of database size (see "Copy-on-write fork cost" above);
 nothing about the fork touches the database's bytes. `sqlite3.Connection.
 backup()` and `shutil.copyfile` scale close to linearly with size, as
-expected, because both physically copy every byte (`backup()`: 9.60 ms ->
-93.23 ms, roughly the 10x size ratio; `copyfile` is under a millisecond at
-10 MB, so page-cache noise dominates its p95 there). Postgres's `CREATE
-DATABASE ... TEMPLATE` also physically copies the template's files — this
-Docker Desktop VM's filesystem doesn't give it a cheap reflink/CoW path
-here — but the row's *absolute* numbers at these sizes are dominated by
-the fixed cost of the `docker exec ... psql` round trip itself: a no-op
-`SELECT 1` through the same path costs ~36-48 ms alone on this host. Only
-the roughly 60 ms difference between the two sizes' medians (58.78 ->
-119.72 ms) is the actual template-clone work; that delta does scale with
+expected, because both physically copy every byte (`backup()`: 9.39 ms ->
+93.06 ms, roughly the 10x size ratio; `copyfile` is under a millisecond at
+10 MB, so page-cache noise dominates its p95 there). The two rows are not
+an apples-to-apples I/O comparison, though: `backup()` opens its
+destination connection with SQLite's default `synchronous=FULL`, so every
+`.backup()` call fsyncs the destination as part of committing — it asks
+the OS for durability. `shutil.copyfile` never fsyncs, so it asks for
+none. That asymmetry accounts for part of the gap between the two rows,
+on top of the difference in what each one physically does. Postgres's
+`CREATE DATABASE ... TEMPLATE` also physically copies the template's
+files — this Docker Desktop VM's filesystem doesn't give it a cheap
+reflink/CoW path here — but the row's *absolute* numbers at these sizes
+are dominated by the fixed cost of the `docker exec ... psql` round trip
+itself: a no-op `SELECT 1` through the same path, measured directly
+above, costs **37.04 ms** median (p90 41.73 ms) alone on this host. Only
+the roughly 63 ms difference between the two sizes' medians (57.28 ->
+119.91 ms) is the actual template-clone work; that delta does scale with
 size, it's just swamped by per-command overhead at 10 MB.
 
 **The honest fork-versus-open statement:** `offshoot fork` by itself is
 the flat, near-constant row above (~9 ms). The `fork` + `open` + `close`
-row is roughly 7x slower at 10 MB and roughly 48x slower at 100 MB — not
-because forking got more expensive, but because of what `open` does that
-`fork` doesn't: a real daemon round trip, and — since a freshly forked
-branch has no checkout materialized locally yet (the fork itself only
-wrote a base pointer + ref) — `Open`'s first `CheckoutProven` call has to
-materialize the branch's actual database bytes to local disk before
-handing back a live session, on top of the settling-flush checksum
+row is roughly 7.1x slower at 10 MB and roughly 44.7x slower at 100 MB —
+not because forking got more expensive, but because of what `open` (and
+`close`) does that `fork` doesn't: a real daemon round trip, and — since a
+freshly forked branch has no checkout materialized locally yet (the fork
+itself only wrote a base pointer + ref) — `Open`'s first `CheckoutProven`
+call has to materialize the branch's actual database bytes to local disk
+before handing back a live session, on top of the settling-flush checksum
 machinery described in "Settling-flush cost" below. That materialization
 is real per-byte I/O, which is why the `fork` + `open` + `close` row,
-unlike bare `fork`, is NOT size-independent (71 ms at 10 MB vs. 429 ms at
-100 MB). A test that only forks and never opens a session pays the flat
-~9 ms row instead of this one.
+unlike bare `fork`, is NOT size-independent (68 ms at 10 MB vs. 421 ms at
+100 MB). `Session.Close` is not free either — it drains the capture
+engine and, on a provably clean close, re-stamps the checkout's sidecar
+(see `docs/status.md`'s sidecar-refresh row) — so this row's overhead is
+not solely `Open`'s materialization cost, though materialization dominates
+it at these sizes. A test that only forks and never opens a session pays
+the flat ~9 ms row instead of this one.
 
 **A note on the cold-container number:** the Postgres image's entrypoint
 briefly runs a temporary, setup-only server on the same socket before the
 real server starts, and `pg_isready` (used here, per this row's own
 definition) can report ready during that window. A follow-up check this
 script uses elsewhere, before it runs any real SQL against a container it
-just started (an actual `SELECT 1`, retried until it succeeds) took
-another roughly 85-195 ms past `pg_isready`'s signal on this host. Both
-numbers are still comfortably sub-second here — this container was
-already locally cached (no image pull) and mounts no volume; a colder
-path (a network pull, a mounted volume, a busier host) would cost
-meaningfully more.
+just started (an actual `SELECT 1`, retried until it succeeds), measured
+directly above as its own line, took another **250.79 ms** median (p90
+255.32 ms) past `pg_isready`'s signal on this host. Both numbers are
+still comfortably sub-second here — this container was already locally
+cached (no image pull) and mounts no volume; a colder path (a network
+pull, a mounted volume, a busier host) would cost meaningfully more.
 
 ## Method
 

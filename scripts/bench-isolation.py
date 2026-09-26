@@ -27,9 +27,23 @@ until pg_isready), is measured once, fixed at 3 iterations
 (--cold-container-iters), independent of --sizes — starting a container
 has nothing to do with the seed's size.
 
-Postgres rows (5 and 6) are skipped cleanly, with a note in the output,
-when the `docker` CLI or the local `postgres:16` image is unavailable —
-this script never attempts a network pull.
+Two more overhead figures are measured and printed alongside the table
+(not as per-size rows, since neither depends on seed size):
+  - `docker exec no-op (SELECT 1)`: the fixed cost of the same
+    `docker exec ... psql` round trip the template-clone row pays,
+    isolating per-command overhead from that row's absolute numbers.
+    Measured over the same --iters count, against the container already
+    running for the template-clone row.
+  - `pg_isready -> queryable` gap: within the cold-container primitive,
+    the time from `pg_isready` first succeeding to the first successful
+    `SELECT 1` (see `_wait_pg_queryable`) — pg_isready can report ready
+    during the image entrypoint's temporary setup-only server, before the
+    real server is actually queryable.
+
+Postgres rows (5, 6, and the two overhead figures above) are skipped
+cleanly, with a note in the output, when the `docker` CLI or the local
+`postgres:16` image is unavailable — this script never attempts a network
+pull.
 
 Run `--dry-run` to validate tooling (offshoot binary present, sqlite3
 stdlib module, docker + postgres:16 image) and print the plan without
@@ -81,9 +95,9 @@ def percentile(values: list[float], pct: float) -> float:
     return data[f] + (data[c] - data[f]) * (k - f)
 
 
-def stats_ms(samples_sec: list[float]) -> tuple[float, float]:
+def stats_ms(samples_sec: list[float], pct: float = 95.0) -> tuple[float, float]:
     ms = [s * 1000.0 for s in samples_sec]
-    return percentile(ms, 50), percentile(ms, 95)
+    return percentile(ms, 50), percentile(ms, pct)
 
 
 def fmt_stat(stat: tuple[float, float] | None) -> str:
@@ -114,6 +128,10 @@ def build_sqlite_seed(path: Path, size_mb: int) -> int:
 
 
 def bench_sqlite_backup(seed_path: Path, iters: int, work_dir: Path) -> list[float]:
+    # dst_conn is opened with SQLite's default `synchronous=FULL`, so
+    # `.backup()` fsyncs the destination as it commits — it asks the OS for
+    # durability; bench_copyfile below does not. Left as-is: this models
+    # what harness authors actually call, not an apples-to-apples I/O test.
     samples = []
     for i in range(iters):
         dst = work_dir / f"backup-{i}.db"
@@ -132,6 +150,9 @@ def bench_sqlite_backup(seed_path: Path, iters: int, work_dir: Path) -> list[flo
 
 
 def bench_copyfile(seed_path: Path, iters: int, work_dir: Path) -> list[float]:
+    # shutil.copyfile never fsyncs the destination — no durability is asked
+    # of the OS here, unlike bench_sqlite_backup above. Left as-is: this
+    # models what harness authors actually call.
     samples = []
     for i in range(iters):
         dst = work_dir / f"copy-{i}.db"
@@ -343,8 +364,30 @@ def bench_postgres_template(cid: str, seed_db: str, iters: int) -> list[float]:
     return samples
 
 
-def bench_cold_container(iters: int) -> list[float]:
+def bench_docker_exec_noop(cid: str, iters: int) -> list[float]:
+    """`docker exec ... psql ... SELECT 1` no-op round trip — the exact
+    exec path bench_postgres_template's CREATE/DROP DATABASE calls use,
+    isolating that row's fixed per-command overhead from its absolute
+    numbers. Measured against an already-running, already-queryable
+    container (no container start cost included)."""
     samples = []
+    for _ in range(iters):
+        t0 = time.perf_counter()
+        _docker_exec_psql(cid, "SELECT 1")
+        t1 = time.perf_counter()
+        samples.append(t1 - t0)
+    return samples
+
+
+def bench_cold_container(iters: int) -> tuple[list[float], list[float]]:
+    """Returns (cold_start_samples, ready_to_queryable_gap_samples): the
+    second list is, per iteration, the time from `pg_isready` first
+    succeeding to the first successful `SELECT 1` (via `_wait_pg_queryable`,
+    which re-checks pg_isready — already satisfied — before looping on
+    SELECT 1), isolating the setup-server/real-server handoff gap
+    `_wait_pg_ready`'s docstring describes."""
+    cold_samples = []
+    gap_samples = []
     for _ in range(iters):
         t0 = time.perf_counter()
         out = subprocess.run(
@@ -353,11 +396,14 @@ def bench_cold_container(iters: int) -> list[float]:
         cid = out.stdout.strip()
         try:
             _wait_pg_ready(cid, time.time() + PG_READY_TIMEOUT_S)
-        finally:
             t1 = time.perf_counter()
+            _wait_pg_queryable(cid, time.time() + PG_READY_TIMEOUT_S)
+            t2 = time.perf_counter()
+        finally:
             subprocess.run(["docker", "rm", "-f", cid], capture_output=True)
-        samples.append(t1 - t0)
-    return samples
+        cold_samples.append(t1 - t0)
+        gap_samples.append(t2 - t1)
+    return cold_samples, gap_samples
 
 
 # --------------------------------------------------------------------------
@@ -383,7 +429,7 @@ def dry_run(sizes: list[int], iters: int, cold_iters: int, offshoot_bin: Path) -
     print(f"docker          : {'available' if pg_ok else 'unavailable — ' + pg_reason}")
     print()
     print(f"sizes (MB)      : {', '.join(str(s) for s in sizes)}")
-    print(f"iters (1-5)     : {iters}")
+    print(f"iters (per primitive) : {iters}")
     print(f"cold-container  : {cold_iters} iterations (fixed; size-independent)")
     print()
     print("Plan:")
@@ -402,7 +448,10 @@ def run(sizes: list[int], iters: int, cold_iters: int, offshoot_bin: Path) -> di
     results: dict = {k: {} for k, _ in PRIMITIVES}
     pg_ok, pg_reason = docker_available()
     pg_actual_bytes: dict[int, int] = {}
+    sqlite_actual_bytes: dict[int, int] = {}
     pg_cold = None
+    docker_exec_noop = None
+    pg_ready_gap = None
 
     with tempfile.TemporaryDirectory(prefix="offshoot-bench-") as tmp_s:
         tmp = Path(tmp_s)
@@ -415,6 +464,7 @@ def run(sizes: list[int], iters: int, cold_iters: int, offshoot_bin: Path) -> di
 
             eprint("  building sqlite seed...")
             actual_bytes = build_sqlite_seed(seed_path, size)
+            sqlite_actual_bytes[size] = actual_bytes
             eprint(f"    seed file: {actual_bytes / (1024 * 1024):.2f} MiB")
 
             eprint("  sqlite3 backup()...")
@@ -452,11 +502,16 @@ def run(sizes: list[int], iters: int, cold_iters: int, offshoot_bin: Path) -> di
                     eprint(f"    actual: {actual / (1024 * 1024):.2f} MiB")
                     eprint("  CREATE DATABASE ... TEMPLATE...")
                     results["pg_template"][size] = stats_ms(bench_postgres_template(cid, dbname, iters))
+
+                eprint("  docker exec no-op (SELECT 1)...")
+                docker_exec_noop = stats_ms(bench_docker_exec_noop(cid, iters), pct=90)
             finally:
                 stop_postgres_container(cid)
 
             eprint("  cold container start...")
-            pg_cold = stats_ms(bench_cold_container(cold_iters))
+            cold_samples, gap_samples = bench_cold_container(cold_iters)
+            pg_cold = stats_ms(cold_samples)
+            pg_ready_gap = stats_ms(gap_samples, pct=90)
         else:
             eprint(f"== postgres: skipped ({pg_reason}) ==")
             for size in sizes:
@@ -467,7 +522,10 @@ def run(sizes: list[int], iters: int, cold_iters: int, offshoot_bin: Path) -> di
         "pg_ok": pg_ok,
         "pg_reason": pg_reason,
         "pg_actual_bytes": pg_actual_bytes,
+        "sqlite_actual_bytes": sqlite_actual_bytes,
         "pg_cold": pg_cold,
+        "docker_exec_noop": docker_exec_noop,
+        "pg_ready_gap": pg_ready_gap,
         "sizes": sizes,
         "iters": iters,
         "cold_iters": cold_iters,
@@ -499,13 +557,38 @@ def render(report: dict) -> str:
         lines.append(f"Postgres cold container start: skipped ({report['pg_reason']})")
     lines.append("")
 
-    lines.append("Values are `median / p95` milliseconds"
-                  f" over {report['iters']} iterations (3 for the cold-container row).")
+    if report["pg_ok"]:
+        median, p90 = report["docker_exec_noop"]
+        lines.append(f"docker exec no-op (SELECT 1) overhead (same `docker exec ... psql` "
+                      f"round trip the template-clone row above pays; N={report['iters']}, "
+                      f"size-independent): **{median:.2f} / {p90:.2f} ms** (median / p90)")
+    else:
+        lines.append(f"docker exec no-op (SELECT 1) overhead: skipped ({report['pg_reason']})")
+    lines.append("")
+
+    if report["pg_ok"]:
+        median, p90 = report["pg_ready_gap"]
+        lines.append(f"`pg_isready` -> first successful `SELECT 1` gap (measured inside the "
+                      f"cold-container start above; N={report['cold_iters']}, "
+                      f"size-independent): **{median:.2f} / {p90:.2f} ms** (median / p90)")
+    else:
+        lines.append(f"`pg_isready` -> queryable gap: skipped ({report['pg_reason']})")
+    lines.append("")
+
+    lines.append("Values are `median / p95` milliseconds over "
+                  f"{report['iters']} iterations (3 for the cold-container row), except the "
+                  "docker-exec-no-op and pg_isready-gap lines above, which report "
+                  "`median / p90`.")
     if report["pg_actual_bytes"]:
         actual_notes = ", ".join(
             f"{s} MB target -> {b / (1024 * 1024):.1f} MiB actual"
             for s, b in sorted(report["pg_actual_bytes"].items()))
         lines.append(f"Postgres seed sizes (`pg_total_relation_size`): {actual_notes}.")
+    if report["sqlite_actual_bytes"]:
+        actual_notes = ", ".join(
+            f"{s} MB target -> {b / (1024 * 1024):.1f} MiB actual"
+            for s, b in sorted(report["sqlite_actual_bytes"].items()))
+        lines.append(f"SQLite seed sizes (actual file size): {actual_notes}.")
     lines.append("")
 
     lines.append("**Caveats:**")

@@ -214,15 +214,16 @@ check-plugin:
 # database per test (offshoot fork+open+close, offshoot fork alone,
 # sqlite3.Connection.backup(), shutil.copyfile, and — when Docker and a
 # local postgres:16 image are available — Postgres `CREATE DATABASE ...
-# TEMPLATE` and a cold-container start), at seed sizes 10 and 100 MB. See
-# docs/benchmarks.md's "Per-test isolation primitives" section for the
-# measured numbers this produces, and the script's own docstring for what
-# each row is. Builds the offshoot binary fresh, and creates a throwaway
-# venv (.venv-bench) if one doesn't already exist -- stdlib only, since the
-# script reaches sdk/python via sys.path (like sdk/python/tests/
-# test_client.py's DaemonFixture does), never a pip install. Takes several
-# minutes: the Postgres CREATE DATABASE TEMPLATE row at 100 MB and the
-# cold-container row both do real container/database work.
+# TEMPLATE`, a cold-container start, and the docker-exec/readiness overhead
+# figures), at seed sizes 10 and 100 MB. See docs/benchmarks.md's "Per-test
+# isolation primitives" section for the measured numbers this produces, and
+# the script's own docstring for what each row is. Builds the offshoot
+# binary fresh, and creates a throwaway venv (.venv-bench) if one doesn't
+# already exist -- stdlib only, since the script reaches sdk/python via
+# sys.path (like sdk/python/tests/test_client.py's DaemonFixture does),
+# never a pip install. Measured ~26s with the postgres:16 image already
+# cached locally; without Docker, the Postgres rows and overhead figures
+# skip instantly (the script never attempts a network pull).
 bench-isolation: check-python-version
 	go build -o bin/offshoot-bench ./cmd/offshoot
 	test -d .venv-bench || $(PYTHON) -m venv .venv-bench
