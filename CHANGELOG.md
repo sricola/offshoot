@@ -93,17 +93,25 @@ version if you depend on format stability.
   branch's own protected flag (`force` is downgraded to `false`, never let
   through).
 - **MCP guards a protected branch's own safety fork, not just the branch
-  itself.** `offshoot_destroy` and `offshoot_touch` (when it would change
-  the TTL) now refuse, without `-allow-force`, on a branch that is itself
+  itself.** `offshoot_destroy`, `offshoot_touch` (when it would change the
+  TTL), and `offshoot_promote` (when the fork is the *target*) now all
+  refuse, without `-allow-force`, on a branch that is itself
   `<target>-pre-rollback`/`<target>-pre-promote` of some OTHER protected
   branch (`guardProtectedSafetyFork`) — `main-pre-rollback` is not itself
-  protected, so the plain protected-branch check never caught this before.
-  `offshoot_rollback` additionally refuses outright, without
-  `-allow-force`, when the protected branch it's rolling back already has
-  a safety fork from an earlier rollback, rather than silently replacing
-  an undo point the human may still need. A plain `offshoot_touch` that
-  only extends a fork's life (no `ttl` argument) is never blocked. See
-  `TestGuardProtectedSafetyFork` in `internal/mcp/tools_test.go`.
+  protected, so the plain protected-branch check never caught this before,
+  and promoting onto it would repoint (destroy) the undo point just as
+  surely as an actual destroy. `offshoot_rollback` additionally refuses
+  outright, without `-allow-force`, when the protected branch it's rolling
+  back already has a safety fork from an earlier rollback, rather than
+  silently replacing an undo point the human may still need. A plain
+  `offshoot_touch` that only extends a fork's life (no `ttl` argument) is
+  never blocked. The guard fails CLOSED on a transient error reading the
+  target's own ref (there is no downstream backstop the way
+  `refuseForceOnProtected` has, since the fork itself is never protected),
+  and so does `offshoot_rollback`'s own check of whether its safety-fork
+  name already exists. See `TestGuardProtectedSafetyFork` and
+  `TestGuardProtectedSafetyForkFailsClosedOnTransientReadError` in
+  `internal/mcp/tools_test.go`.
 - **MCP's safety-fork TTL floors at 24h.** `offshoot_promote` and
   `offshoot_rollback` now pass `max(-default-ttl, ops.DefaultPromoteBackupTTL)`
   as the safety fork's TTL, not `-default-ttl` alone — an operator running

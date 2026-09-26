@@ -986,14 +986,21 @@ func TestRollbackKeepsSafetyForkAndSaysSo(t *testing.T) {
 
 // TestGuardProtectedSafetyFork pins item 2 of the guardrails final-review fix
 // wave: a branch's safety fork (<branch>-pre-rollback here) is guarded
-// against destroy and TTL-shortening/clearing touch, and rolling back the
-// protected branch again while its safety fork still exists is refused too
-// — all without -allow-force — while a plain touch (extend only, no `ttl`)
-// stays allowed throughout. The "unprotected" subtest pins the converse: none
-// of this applies when the branch the fork was taken from isn't protected.
+// against destroy, TTL-shortening/clearing touch, and being promoted onto,
+// and rolling back the protected branch again while its safety fork still
+// exists is refused too — all without -allow-force — while a plain touch
+// (extend only, no `ttl`) stays allowed throughout. The "unprotected"
+// subtest pins the converse: none of this applies when the branch the fork
+// was taken from isn't protected.
 func TestGuardProtectedSafetyFork(t *testing.T) {
 	t.Run("protected", func(t *testing.T) {
 		ts, w := newTools(t)
+		// A harmless, never-protected fork to use as offshoot_promote's
+		// source below — promoting it onto the safety fork is what item 2
+		// guards against.
+		if _, err := w.Fork("app", "main", "attempt-1", "", 0, nil); err != nil {
+			t.Fatal(err)
+		}
 		// "app@main" is protected and carries an "init" checkpoint from
 		// Create — rolling it back to its own init checkpoint is enough to
 		// mint main-pre-rollback without any other setup.
@@ -1035,7 +1042,21 @@ func TestGuardProtectedSafetyFork(t *testing.T) {
 			t.Fatalf("refusal must point at the human: %s", text(r))
 		}
 
-		// After -allow-force, all three proceed.
+		// (d) promoting onto the safety fork is refused too — it would
+		// repoint (i.e. destroy) the undo point just as surely as an actual
+		// destroy, and the fork itself is never protected so ops' own
+		// protected check never catches this.
+		if r := call(t, ts, "offshoot_promote", map[string]any{
+			"database": "app", "source": "attempt-1", "target": backup}); !r.IsError {
+			t.Fatal("promoting onto the safety fork of protected main must be refused without -allow-force")
+		} else if !strings.Contains(text(r), "-allow-force") || !strings.Contains(strings.ToLower(text(r)), "human") {
+			t.Fatalf("refusal must name -allow-force and the human: %s", text(r))
+		}
+		if _, _, err := w.Store.GetRef("app", backup); err != nil {
+			t.Fatalf("safety fork must still exist after the refused promote: %v", err)
+		}
+
+		// After -allow-force, all four proceed.
 		ts.SetAllowForce(true)
 		if r := call(t, ts, "offshoot_touch", map[string]any{
 			"database": "app", "branch": backup, "ttl": "1s"}); r.IsError {
@@ -1044,6 +1065,10 @@ func TestGuardProtectedSafetyFork(t *testing.T) {
 		if r := call(t, ts, "offshoot_rollback", map[string]any{
 			"database": "app", "branch": "main", "to": "init"}); r.IsError {
 			t.Fatalf("second rollback, -allow-force: %s", text(r))
+		}
+		if r := call(t, ts, "offshoot_promote", map[string]any{
+			"database": "app", "source": "attempt-1", "target": backup}); r.IsError {
+			t.Fatalf("promote onto safety fork, -allow-force: %s", text(r))
 		}
 		if r := call(t, ts, "offshoot_destroy", map[string]any{
 			"database": "app", "branch": backup}); r.IsError {
@@ -1072,10 +1097,14 @@ func TestGuardProtectedSafetyFork(t *testing.T) {
 		}
 		backup := "attempt-1" + ops.RollbackBackupSuffix
 
-		// None of the three needs -allow-force: attempt-1 was never protected.
+		// None of the four needs -allow-force: attempt-1 was never protected.
 		if r := call(t, ts, "offshoot_touch", map[string]any{
 			"database": "app", "branch": backup, "ttl": "1s"}); r.IsError {
 			t.Fatalf("touch with ttl on an unprotected branch's safety fork: %s", text(r))
+		}
+		if r := call(t, ts, "offshoot_promote", map[string]any{
+			"database": "app", "source": "main", "target": backup}); r.IsError {
+			t.Fatalf("promote onto an unprotected branch's safety fork: %s", text(r))
 		}
 		if r := call(t, ts, "offshoot_rollback", map[string]any{
 			"database": "app", "branch": "attempt-1", "to": "v1"}); r.IsError {
@@ -1084,6 +1113,64 @@ func TestGuardProtectedSafetyFork(t *testing.T) {
 		if r := call(t, ts, "offshoot_destroy", map[string]any{
 			"database": "app", "branch": backup}); r.IsError {
 			t.Fatalf("destroy of an unprotected branch's safety fork: %s", text(r))
+		}
+	})
+}
+
+// TestGuardProtectedSafetyForkFailsClosedOnTransientReadError: unlike
+// refuseForceOnProtected (which downgrades force to false and lets ops' own
+// unforced protected check backstop a failed read), a safety fork is never
+// protected itself, so there is no downstream backstop if
+// guardProtectedSafetyFork's own read of the protected TARGET's ref errors —
+// it must refuse, not silently let the mutation through. Same reasoning for
+// rollback's own inline check of whether its safety-fork name already
+// exists: a transient error there must not read as "no existing fork,
+// proceed and replace." Uses the errOnceGetBackend pattern from
+// TestMCPForceFailsClosedOnTransientGetRefError to inject a one-shot Get
+// error on the exact ref key each guard reads.
+func TestGuardProtectedSafetyForkFailsClosedOnTransientReadError(t *testing.T) {
+	t.Run("destroyReadingTheProtectedTarget", func(t *testing.T) {
+		ts, w := newTools(t)
+		if r := call(t, ts, "offshoot_rollback", map[string]any{
+			"database": "app", "branch": "main", "to": "init"}); r.IsError {
+			t.Fatalf("rollback: %s", text(r))
+		}
+		backup := "main" + ops.RollbackBackupSuffix
+
+		// guardProtectedSafetyFork reads backup's own ref (fine, real), then
+		// "main"'s ref to check Protected — that second read is the one
+		// injected to fail once.
+		w.Store.B = &errOnceGetBackend{Backend: w.Store.B, key: store.RefKey("app", "main")}
+
+		dr := call(t, ts, "offshoot_destroy", map[string]any{"database": "app", "branch": backup})
+		if !dr.IsError {
+			t.Fatal("destroying the safety fork must be refused when reading the protected target's ref errors transiently")
+		}
+		if !strings.Contains(text(dr), "-allow-force") {
+			t.Fatalf("refusal must name -allow-force: %s", text(dr))
+		}
+		if _, _, err := w.Store.GetRef("app", backup); err != nil {
+			t.Fatalf("safety fork must still exist: %v", err)
+		}
+	})
+
+	t.Run("secondRollbackReadingItsOwnSafetyForkName", func(t *testing.T) {
+		ts, w := newTools(t)
+		if r := call(t, ts, "offshoot_rollback", map[string]any{
+			"database": "app", "branch": "main", "to": "init"}); r.IsError {
+			t.Fatalf("rollback: %s", text(r))
+		}
+		backup := "main" + ops.RollbackBackupSuffix
+
+		w.Store.B = &errOnceGetBackend{Backend: w.Store.B, key: store.RefKey("app", backup)}
+
+		r := call(t, ts, "offshoot_rollback", map[string]any{
+			"database": "app", "branch": "main", "to": "init"})
+		if !r.IsError {
+			t.Fatal("a second rollback must be refused when reading its own safety-fork name errors transiently")
+		}
+		if !strings.Contains(strings.ToLower(text(r)), "verify") {
+			t.Fatalf("refusal must say it cannot verify: %s", text(r))
 		}
 	})
 }

@@ -272,24 +272,35 @@ func wrapForceRefusal(err error, force, allowForce bool) error {
 	return fmt.Errorf("%v — force through this MCP server needs `offshoot mcp -allow-force`; ask the human", err)
 }
 
-// guardProtectedSafetyFork refuses destroying db@branch, or changing its
-// TTL, through MCP without -allow-force when branch is ITSELF the safety
-// fork (<target>-pre-rollback or <target>-pre-promote) of some OTHER branch
-// that is protected — e.g. a plain `offshoot_destroy main-pre-rollback` when
-// `main` is protected. Without this guard, refuseForceOnProtected never
-// catches this: it checks whether the branch NAMED in the call is
-// protected, and a safety fork itself is never protected, only the branch
-// it was taken from is. Callers pass the branch actually being
-// destroyed/touched, not the protected target.
+// guardProtectedSafetyFork refuses destroying db@branch, changing its TTL,
+// or promoting onto it, through MCP without -allow-force when branch is
+// ITSELF the safety fork (<target>-pre-rollback or <target>-pre-promote) of
+// some OTHER branch that is protected — e.g. a plain `offshoot_destroy
+// main-pre-rollback` when `main` is protected, or `offshoot_promote` with
+// `target: "main-pre-rollback"` (which would repoint, i.e. destroy, the
+// undo point just as surely as an actual destroy). Without this guard,
+// neither refuseForceOnProtected nor ops' own protected check catches this:
+// both check whether the branch NAMED in the call is protected, and a
+// safety fork itself is never protected, only the branch it was taken from
+// is. Callers pass the branch actually being destroyed/touched/promoted
+// onto, not the protected target.
 //
 // It reads branch's own ref for its Meta marker (RollbackBackupMetaKey or
-// PromoteBackupMetaKey names the branch the fork was taken from), then that
-// named branch's own ref for Protected. A read error on either ref, or no
-// marker at all, is not this guard's business: it returns ok=false (not
-// refused) and lets the caller's own subsequent ops call surface the real
-// error (no such branch, etc.) — same fail-open-on-read-error shape as
-// refuseIfSessionOpen, since this is a courtesy guard on top of ops' own
-// checks, not the last line of defense against an actually-forced call.
+// PromoteBackupMetaKey names the branch the fork was taken from). A read
+// error here, or no marker at all, means branch isn't (verifiably) anyone's
+// safety fork: ok=false (not refused), same fail-open shape as
+// refuseIfSessionOpen, since the caller's own subsequent ops call surfaces
+// the real error (no such branch, etc.) and there is nothing here to fail
+// closed ABOUT yet.
+//
+// Once a marker names a target, though, this fails CLOSED on that target
+// ref's own read: unlike refuseForceOnProtected (which downgrades force to
+// false and lets ops' own unforced protected check backstop a failed read),
+// there is no downstream backstop here — the safety fork itself is never
+// protected, so an ops call against it sails through regardless. A
+// transient error reading the target's ref must not silently let a
+// protected branch's undo point be destroyed/repointed/TTL-changed just
+// because this one read blipped.
 func (t *OffshootTools) guardProtectedSafetyFork(db, branch string) (ToolResult, bool) {
 	ref, _, err := t.ws.Store.GetRef(db, branch)
 	if err != nil {
@@ -303,11 +314,15 @@ func (t *OffshootTools) guardProtectedSafetyFork(db, branch string) (ToolResult,
 		return ToolResult{}, false
 	}
 	tref, _, err := t.ws.Store.GetRef(db, target)
-	if err != nil || !tref.Protected {
+	if err != nil {
+		return ErrorResult("cannot verify whether %s@%s is protected (%v); refusing to touch "+
+			"its safety fork without -allow-force", db, target, err), true
+	}
+	if !tref.Protected {
 		return ToolResult{}, false
 	}
 	return ErrorResult("%s@%s is the safety fork of protected %s@%s; without -allow-force it cannot "+
-		"be destroyed or have its TTL changed through MCP — ask the human", db, branch, db, target), true
+		"be destroyed, promoted onto, or have its TTL changed through MCP — ask the human", db, branch, db, target), true
 }
 
 // prop describes one property of a tool's JSON Schema input: its argument
@@ -496,7 +511,11 @@ func (t *OffshootTools) Tools() []Tool {
 				"of record. Protected branches (main is protected by default) refuse promotion. " +
 				"`force` is honored only when the server was started with -allow-force; " +
 				"otherwise a protected target refuses and the answer is to ask the human to " +
-				"promote from the CLI, or work on a fork. If a daemon session is open on the TARGET branch, the call " +
+				"promote from the CLI, or work on a fork. A protected branch's own safety fork " +
+				"(`<branch>-pre-rollback`/`<branch>-pre-promote`) cannot be a target without " +
+				"-allow-force either, even though the fork itself is never protected — " +
+				"promoting onto it would repoint (destroy) the undo point it exists to " +
+				"preserve. If a daemon session is open on the TARGET branch, the call " +
 				"is refused instead of proceeding — `force` does not override this — " +
 				"since promoting repoints the target's storage out from under a session " +
 				"the daemon still believes it owns; close the session first (e.g. " +
@@ -1014,11 +1033,22 @@ func (t *OffshootTools) rollback(args json.RawMessage) (ToolResult, error) {
 
 	backupName := branch + ops.RollbackBackupSuffix
 	if !t.allowForce && protected {
-		if bref, _, err := t.ws.Store.GetRef(a.Database, backupName); err == nil &&
-			bref.Meta[ops.RollbackBackupMetaKey] == branch {
-			return ErrorResult("%s@%s already has a safety fork %s@%s from an earlier rollback; "+
-				"rolling back again would replace it — ask the human to promote or destroy it first",
-				a.Database, branch, a.Database, backupName), nil
+		bref, _, err := t.ws.Store.GetRef(a.Database, backupName)
+		switch {
+		case err == nil:
+			if bref.Meta[ops.RollbackBackupMetaKey] == branch {
+				return ErrorResult("%s@%s already has a safety fork %s@%s from an earlier rollback; "+
+					"rolling back again would replace it — ask the human to promote or destroy it first",
+					a.Database, branch, a.Database, backupName), nil
+			}
+		case errors.Is(err, store.ErrNotFound):
+			// No existing safety fork at that name: nothing to protect yet.
+		default:
+			// Fail closed, same reasoning as guardProtectedSafetyFork: a
+			// transient error here must not silently let this rollback
+			// replace a safety fork that, for all we know, actually exists.
+			return ErrorResult("cannot verify whether %s@%s already has a safety fork (%v); "+
+				"refusing to roll back without -allow-force", a.Database, backupName, err), nil
 		}
 	}
 	if r, refused := t.refuseIfSessionOpen(a.Database, backupName, "replacing its safety fork"); refused {
@@ -1078,6 +1108,14 @@ type promoteArgs struct {
 // TestPromoteFromOpenSourceProceedsAtRest pins exactly this: an open
 // source session doesn't refuse, and the promoted state is the source's
 // last-flushed head, not the unflushed write.
+//
+// Before any of that, if TARGET is itself the safety fork of some OTHER
+// protected branch (e.g. `target: "main-pre-rollback"` while `main` is
+// protected), guardProtectedSafetyFork refuses without -allow-force:
+// promoting onto a safety fork repoints — i.e. destroys — the very undo
+// point the fork exists to preserve, just as surely as an actual destroy,
+// and refuseForceOnProtected below only checks whether TARGET ITSELF is
+// protected, which a safety fork never is.
 func (t *OffshootTools) promote(args json.RawMessage) (ToolResult, error) {
 	var a promoteArgs
 	if err := json.Unmarshal(args, &a); err != nil {
@@ -1089,6 +1127,11 @@ func (t *OffshootTools) promote(args json.RawMessage) (ToolResult, error) {
 	if r, bad := validateNames(namedArg("database", a.Database), namedArg("source", a.Source),
 		namedArg("target", a.Target)); bad {
 		return r, nil
+	}
+	if !t.allowForce {
+		if r, refused := t.guardProtectedSafetyFork(a.Database, a.Target); refused {
+			return r, nil
+		}
 	}
 	if r, refused := t.refuseIfSessionOpen(a.Database, a.Target, "promoting onto it"); refused {
 		return r, nil

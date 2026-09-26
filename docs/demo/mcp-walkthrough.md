@@ -266,7 +266,7 @@ paraphrase:
         },
         {
           "name": "offshoot_promote",
-          "description": "Ship a winning attempt: repoint the target branch (often `main`) at the source branch's current head, which resets the target's checkpoint history to just the new promote checkpoint. The target's previous head is kept first as a shared safety fork named `<target>-pre-promote` (TTL'd, at least 24h; one per target, replaced by the next promote), so a promote is undone by promoting that fork back onto the target. Call this once you've validated a forked attempt and are ready to make it the branch of record. Protected branches (main is protected by default) refuse promotion. `force` is honored only when the server was started with -allow-force; otherwise a protected target refuses and the answer is to ask the human to promote from the CLI, or work on a fork. If a daemon session is open on the TARGET branch, the call is refused instead of proceeding — `force` does not override this — since promoting repoints the target's storage out from under a session the daemon still believes it owns; close the session first (e.g. `offshoot session close`) and retry. An open session on the SOURCE does not block the call, but the promoted state is the source's last-flushed/checkpointed head, not any write still unflushed in that live session — flush or checkpoint the source first if you need its very latest state promoted.",
+          "description": "Ship a winning attempt: repoint the target branch (often `main`) at the source branch's current head, which resets the target's checkpoint history to just the new promote checkpoint. The target's previous head is kept first as a shared safety fork named `<target>-pre-promote` (TTL'd, at least 24h; one per target, replaced by the next promote), so a promote is undone by promoting that fork back onto the target. Call this once you've validated a forked attempt and are ready to make it the branch of record. Protected branches (main is protected by default) refuse promotion. `force` is honored only when the server was started with -allow-force; otherwise a protected target refuses and the answer is to ask the human to promote from the CLI, or work on a fork. A protected branch's own safety fork (`<branch>-pre-rollback`/`<branch>-pre-promote`) cannot be a target without -allow-force either, even though the fork itself is never protected — promoting onto it would repoint (destroy) the undo point it exists to preserve. If a daemon session is open on the TARGET branch, the call is refused instead of proceeding — `force` does not override this — since promoting repoints the target's storage out from under a session the daemon still believes it owns; close the session first (e.g. `offshoot session close`) and retry. An open session on the SOURCE does not block the call, but the promoted state is the source's last-flushed/checkpointed head, not any write still unflushed in that live session — flush or checkpoint the source first if you need its very latest state promoted.",
           "inputSchema": {
             "properties": {
               "database": {
@@ -402,14 +402,22 @@ paraphrase:
 *(Nothing above is truncated: every description, `inputSchema`, and
 `annotations` object is reproduced verbatim from a real `tools/list`
 response — see [`internal/mcp/tools.go`](../../internal/mcp/tools.go) for
-the source. This capture is from the guardrails final-review fix wave's
-re-run: `offshoot_rollback` and `offshoot_promote`'s descriptions now say
-their safety fork "lives at least 24h" (the TTL floor), `offshoot_rollback`'s
-also spells out that its undo is agent-doable through MCP only for an
-unprotected branch (otherwise it's the human's CLI promote), and
-`offshoot_touch`'s names the daemonless reaper (`offshoot mcp -reap-every`)
-instead of the older "a TTL alone reaps nothing" line. Every `tools/call`
-block that follows is from this same run.)*
+the source. This block is from the guardrails final-review fix wave's
+second pass (a fresh, separate `tools/list` capture — `tools/list` carries
+no store-specific paths, so it can be re-captured on its own without
+disturbing the rest of this transcript, which is still the earlier run
+referenced below). Four descriptions changed from the previous capture:
+`offshoot_rollback` and `offshoot_promote` now say their safety fork "lives
+at least 24h" (the TTL floor); `offshoot_rollback` also spells out that its
+undo is agent-doable through MCP only for an unprotected branch (otherwise
+it's the human's CLI promote); `offshoot_promote` also states that a
+protected branch's own safety fork can't be a target without `-allow-force`
+either (promoting onto it would repoint — destroy — the undo point, and the
+fork itself is never protected so the plain protected-target check misses
+it); and `offshoot_touch` names the daemonless reaper (`offshoot mcp
+-reap-every`) instead of the older "a TTL alone reaps nothing" line. Every
+`tools/call` block that follows is from the run described in the honesty
+bullets above.)*
 
 ```json
 → {"jsonrpc":"2.0","id":3,"method":"tools/call","params":{"name":"offshoot_list","arguments":{}}}

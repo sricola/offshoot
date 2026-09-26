@@ -154,12 +154,14 @@ the exact command (`offshoot promote <db>@<branch>-pre-rollback --onto
 
 That safety fork is itself guarded the same way once the branch it was
 taken from is protected: without `-allow-force`, an agent can't destroy
-`main-pre-rollback` (or `main-pre-promote`) or shorten/clear its TTL via
-`offshoot_touch`, and a second `offshoot_rollback main` is refused outright
-while the fork from the first one still exists, rather than silently
-replacing an undo point the human may still need — ask the human to
-promote or destroy it first. A plain `offshoot_touch` that only extends
-the fork's life (no `ttl` argument) is never blocked this way.
+`main-pre-rollback` (or `main-pre-promote`), shorten/clear its TTL via
+`offshoot_touch`, or `offshoot_promote` something onto it (that would
+repoint — i.e. destroy — the very undo point the fork exists to
+preserve). A second `offshoot_rollback main` is refused outright while the
+fork from the first one still exists too, rather than silently replacing
+an undo point the human may still need — ask the human to promote or
+destroy it first. A plain `offshoot_touch` that only extends the fork's
+life (no `ttl` argument) is never blocked this way.
 
 Also true regardless of tools: the daemon's unix socket is mode `0600`,
 and one leased, epoch-fenced writer per branch means concurrent attempts
