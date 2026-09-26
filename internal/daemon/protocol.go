@@ -10,12 +10,14 @@
 // before sending the next Request on the same connection.
 package daemon
 
+import "github.com/sricola/offshoot/internal/ops"
+
 // Request is one client request sent to the daemon.
 type Request struct {
 	// Op is one of: "open" | "flush" | "status" | "close" | "shutdown" |
 	// "create" | "checkout" | "fork" | "destroy" | "rollback" | "promote" |
 	// "compact" | "touch" | "branches" | "dbs" | "export" | "checkout-at" |
-	// "subscribe".
+	// "subscribe" | "diff".
 	//
 	// "subscribe" (Milestone 4 Task 4a) is unlike every other op: it is
 	// UNIX-SOCKET-ONLY (a POST /rpc "subscribe" is refused — HTTP clients
@@ -75,6 +77,16 @@ type Request struct {
 	// so a pre-Milestone-3 client's requests decode and behave identically
 	// to before.
 	Meta map[string]string `json:"meta,omitempty"`
+
+	// Left/Right (diff only) are db[@branch[@checkpoint]] targets, the same
+	// form export takes; Table (diff only) restricts both modes to one
+	// table; Full (diff only) also runs sqldiff and returns its SQL capped
+	// at MaxBytes (0 = ops.DefaultSqldiffMaxBytes, hard ceiling 8 MiB).
+	Left     string `json:"left,omitempty"`
+	Right    string `json:"right,omitempty"`
+	Table    string `json:"table,omitempty"`
+	Full     bool   `json:"full,omitempty"`
+	MaxBytes int    `json:"max_bytes,omitempty"`
 }
 
 // Response is the daemon's reply to a single Request.
@@ -92,6 +104,23 @@ type Response struct {
 	// Databases is every database this store has at least one ref for
 	// (store.Store.ListRefs's keys, sorted), as returned by the "dbs" op.
 	Databases []string `json:"databases,omitempty"`
+	// Diff is the "diff" op's result — always JSON, never a filesystem
+	// path (see opDiff's doc comment for why that's what makes it safe on
+	// the HTTP surface while export is not).
+	Diff *DiffResult `json:"diff,omitempty"`
+}
+
+// DiffResult is the "diff" op's wire result: a content-aware per-table
+// summary (Tables/Totals, from ops.DiffSummary/ops.DiffReportOf) plus,
+// when Request.Full was set, sqldiff's own SQL output capped at
+// Request.MaxBytes.
+type DiffResult struct {
+	Left      string          `json:"left"`
+	Right     string          `json:"right"`
+	Tables    []ops.TableDiff `json:"tables"`
+	Totals    ops.DiffTotals  `json:"totals"`
+	Full      string          `json:"full,omitempty"`
+	Truncated bool            `json:"truncated,omitempty"`
 }
 
 // BranchInfo describes one branch of one db, as returned by the "branches"

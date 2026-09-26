@@ -374,6 +374,8 @@ func (s *Server) dispatch(req Request) Response {
 		return s.opExport(req)
 	case "checkout-at":
 		return s.opCheckoutAt(req)
+	case "diff":
+		return s.opDiff(req)
 	default:
 		return errResp(fmt.Errorf("daemon: unknown op %q", req.Op))
 	}
@@ -1073,6 +1075,71 @@ func (s *Server) opCheckoutAt(req Request) Response {
 		return errResp(err)
 	}
 	return Response{OK: true, Checkout: path}
+}
+
+// opDiff is the daemon's read-only branch diff: both sides materialize
+// through ops.MaterializeForDiff (a checkpoint via the ro-cache, a head via
+// a private fresh export) and the answer is JSON — never a filesystem
+// path, which is why this op is allowed on the HTTP surface while export
+// is not. The summary is content-aware and needs no sqldiff; Full
+// additionally shells out to sqldiff on the daemon host, capped at
+// MaxBytes.
+func (s *Server) opDiff(req Request) Response {
+	const maxBytesCeiling = 8 << 20
+	if req.Left == "" || req.Right == "" {
+		return errResp(fmt.Errorf("daemon: diff needs left and right targets (db[@branch[@checkpoint]])"))
+	}
+	if req.MaxBytes < 0 || req.MaxBytes > maxBytesCeiling {
+		return errResp(fmt.Errorf("daemon: diff max_bytes must be 0..%d", maxBytesCeiling))
+	}
+	ldb, lbr, lcp, err := ops.ParseExportTarget(req.Left)
+	if err != nil {
+		return errResp(err)
+	}
+	rdb, rbr, rcp, err := ops.ParseExportTarget(req.Right)
+	if err != nil {
+		return errResp(err)
+	}
+	left, err := s.ws.MaterializeForDiff(ldb, lbr, lcp)
+	if err != nil {
+		return errResp(fmt.Errorf("daemon: diff: materializing %s: %w", req.Left, err))
+	}
+	defer left.Close()
+	right, err := s.ws.MaterializeForDiff(rdb, rbr, rcp)
+	if err != nil {
+		return errResp(fmt.Errorf("daemon: diff: materializing %s: %w", req.Right, err))
+	}
+	defer right.Close()
+
+	tables, err := ops.DiffSummary(left.Path, right.Path)
+	if err != nil {
+		return errResp(err)
+	}
+	if req.Table != "" {
+		var only []ops.TableDiff
+		for _, d := range tables {
+			if d.Table == req.Table {
+				only = append(only, d)
+			}
+		}
+		if len(only) == 0 {
+			return errResp(fmt.Errorf("daemon: diff: no table %q on either side", req.Table))
+		}
+		tables = only
+	}
+	rep := ops.DiffReportOf(tables)
+	res := &DiffResult{Left: req.Left, Right: req.Right, Tables: rep.Tables, Totals: rep.Totals}
+	if req.Full {
+		text, truncated, err := ops.SqldiffCapped(left.Path, right.Path, req.Table, req.MaxBytes)
+		if err != nil {
+			if errors.Is(err, ops.ErrSqldiffMissing) {
+				return errResp(fmt.Errorf("daemon: diff: sqldiff not found on the daemon host; omit full for the summary"))
+			}
+			return errResp(err)
+		}
+		res.Full, res.Truncated = text, truncated
+	}
+	return Response{OK: true, Diff: res}
 }
 
 // Shutdown stops the janitor, stops accepting, refuses any further opens,
