@@ -15,6 +15,33 @@ version if you depend on format stability.
 
 ### Added
 
+- **`create --from` reaches the daemon and both SDKs.** The daemon's
+  `create` op now accepts an optional `path` (an absolute, server-side path
+  to an existing SQLite file, imported via `ops.CreateFrom` instead of
+  minting an empty database); refused, like `export`, over the HTTP surface
+  when `path` is set, unix-socket-only. Python `create(db, from_path=None)`
+  and TypeScript `create(db, { fromPath })` resolve the path to absolute
+  client-side. MCP is deliberately excluded, by design — an MCP tool must
+  never import an arbitrary host file named by an agent.
+- **`.db`-file seeds in the pytest plugin and the TypeScript testkit.**
+  `offshoot_seed`/`offshoot_db`'s `seed=` and the testkit's `seedOnce`'s
+  `seed` now also accept a path to an existing SQLite database file
+  (detected by its `SQLite format 3\0` header, never by extension alone),
+  importing it via the new `create`/`from_path`/`fromPath` reach and
+  forking each caller from its `init` checkpoint with fingerprint
+  `db:<sha256 of file bytes>`.
+- **`make bench-isolation` and a measured per-test-isolation benchmark.**
+  `scripts/bench-isolation.py` times offshoot's fork+open+close against
+  SQLite's backup API, a plain file copy, and Postgres template-clone /
+  cold-container primitives on the same host; results are pasted verbatim
+  into `docs/benchmarks.md`'s new "Per-test isolation primitives (v0.2.11)"
+  section.
+- **A runnable pass^k eval example and a recipe page.**
+  `examples/eval-pass-k/` (`run.py`, `golden.sql`, README) computes
+  pass@1/pass^k end to end against a seeded database, wired into CI as
+  `make example-pass-k`; `docs/recipes/eval-harnesses.md` maps the
+  seed-once-fork-many pattern onto tau2-style environments, Inspect AI, and
+  promptfoo.
 - **Explicit MCP tool annotations.** Every `offshoot_*` tool's `tools/list`
   entry now carries a fully explicit `annotations` object
   (`readOnlyHint`/`destructiveHint`/`idempotentHint`/`openWorldHint`, the

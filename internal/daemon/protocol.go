@@ -56,17 +56,24 @@ type Request struct {
 	// that fork's TTL as a Go duration string ("" = ops.DefaultPromoteBackupTTL).
 	NoBackup  bool   `json:"no_backup,omitempty"`
 	BackupTTL string `json:"backup_ttl,omitempty"`
-	// Path is export's destination file path — server-side, on the daemon's
-	// own host/filesystem. Trust model: the daemon speaks only a local unix
-	// socket, reachable only by a process that can already open that socket
-	// file (same host, same user); Path is trusted as an ordinary
-	// filesystem path this process can write, with exactly one guard
-	// enforced at the RPC boundary (opExport): it must be ABSOLUTE. A
-	// relative path is refused rather than resolved against the daemon's
-	// own working directory, which the client cannot see or control.
-	// That same-host/same-user premise does NOT hold for the HTTP surface,
-	// so handleRPC rejects "export" — the only op consuming Path — before
-	// dispatch (see httpForbiddenOps in http.go).
+	// Path is a server-side file path — on the daemon's own host/
+	// filesystem — used by two ops: export's destination file path, and
+	// create's optional source file to import (Path == "" means an
+	// ordinary fresh create via ops.Workspace.Create; a non-empty Path
+	// instead imports that existing SQLite file via ops.Workspace.
+	// CreateFrom, which never modifies the source). Trust model: the
+	// daemon speaks only a local unix socket, reachable only by a process
+	// that can already open that socket file (same host, same user); Path
+	// is trusted as an ordinary filesystem path this process can read
+	// (create) or write (export), with exactly one guard enforced at the
+	// RPC boundary (opExport, opCreate): it must be ABSOLUTE. A relative
+	// path is refused rather than resolved against the daemon's own
+	// working directory, which the client cannot see or control. That
+	// same-host/same-user premise does NOT hold for the HTTP surface, so
+	// handleRPC rejects "export" outright (see httpForbiddenOps in
+	// http.go) and rejects "create" specifically when Path is non-empty —
+	// plain create (no Path) is an ordinary op with nothing to hide from
+	// an HTTP caller and keeps working there.
 	Path string `json:"path,omitempty"`
 	// Meta is a small string->string map (capped by ops.ValidateMeta; see
 	// its doc comment for the exact limits), used by "fork" (stored on the

@@ -1,7 +1,7 @@
 .PHONY: test test-torture build test-s3 bench bench-cow bench-s3 check-python-version test-python-sdk test-ts-sdk test-sdks test-python-langgraph \
 	check-sdk-versions dry-run-python-sdk dry-run-ts-sdk dry-run-sdks test-pytest-plugin \
 	ci-local ci-local-host ci-local-linux ci-local-s3 ci-local-minio ci-local-sdks lint \
-	check-plugin
+	check-plugin bench-isolation example-pass-k
 
 # Override with `make PYTHON=python3.14 ...` when the platform's unversioned
 # python3 is older than the SDKs' declared Python 3.10 minimum.
@@ -208,3 +208,35 @@ third-party-licenses:
 
 check-plugin:
 	./scripts/check-plugin.sh
+
+# bench-isolation runs scripts/bench-isolation.py: a stdlib-only benchmark
+# of the primitives an eval harness could use to get a fresh, isolated
+# database per test (offshoot fork+open+close, offshoot fork alone,
+# sqlite3.Connection.backup(), shutil.copyfile, and — when Docker and a
+# local postgres:16 image are available — Postgres `CREATE DATABASE ...
+# TEMPLATE`, a cold-container start, and the docker-exec/readiness overhead
+# figures), at seed sizes 10 and 100 MB. See docs/benchmarks.md's "Per-test
+# isolation primitives" section for the measured numbers this produces, and
+# the script's own docstring for what each row is. Builds the offshoot
+# binary fresh. Stdlib only -- the script reaches sdk/python via sys.path
+# (like sdk/python/tests/test_client.py's DaemonFixture does), never a pip
+# install, so it runs directly under $(PYTHON) with no venv needed. Measured
+# ~26s with the postgres:16 image already cached locally; without Docker,
+# the Postgres rows and overhead figures skip instantly (the script never
+# attempts a network pull).
+bench-isolation: check-python-version
+	go build -o bin/offshoot-bench ./cmd/offshoot
+	$(PYTHON) scripts/bench-isolation.py --sizes 10,100 --iters 20
+
+# example-pass-k runs examples/eval-pass-k/run.py: a runnable pass^k eval
+# loop over offshoot (see docs/recipes/eval-harnesses.md's "tau2-style
+# environments and pass^k" section) -- seed once, fork per trial, grade
+# each attempt with `offshoot diff` against a golden reference, throw the
+# fork away. Stdlib only -- it reaches sdk/python via sys.path, exactly
+# like scripts/bench-isolation.py does, so no pip install and no venv are
+# needed here. Defaults (--k 4 --tasks 5) keep it well under 30s (~2s
+# measured locally) so it's cheap enough to run on every PR.
+example-pass-k: check-python-version
+	go build -o bin/offshoot-bench ./cmd/offshoot
+	OFFSHOOT_BIN=$(CURDIR)/bin/offshoot-bench \
+	  $(PYTHON) examples/eval-pass-k/run.py --k 4 --tasks 5

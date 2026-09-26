@@ -23,6 +23,10 @@ the fuller tutorial that superseded it as the primary teaching surface; the
 README section stays as the PyPI-landing-page-sized summary and now points
 here for the walkthrough.
 
+Running pass^k-style evals (tau2-bench, Inspect AI, promptfoo) instead of a
+pytest/vitest suite? [docs/recipes/eval-harnesses.md](recipes/eval-harnesses.md)
+has that pattern and a runnable example.
+
 ## Install
 
 offshoot ships as one static-ish Go binary (cgo for the SQLite driver) plus
@@ -222,10 +226,16 @@ worker** to seed and checkpoint; a 2-worker run pays that twice
 (~170ms of total, redundant seed work) but only **~85-90ms of wall-clock
 time**, because the two workers seed concurrently on independent
 daemons/stores. If your seed is expensive and you're running many workers,
-either keep worker count modest for that suite, or seed a shared file
-out-of-band once and `create --from` it into each worker's own store (see
-[docs/status.md](status.md)'s `create --from` reach row — today that's a CLI
-step, not something the fixture wires up for you).
+either keep worker count modest for that suite, or seed a shared `.db` file
+out-of-band once and pass its path directly as the seed value: `offshoot_db`/
+`offshoot_seed`'s `seed=` (and the TypeScript testkit's `seedOnce`'s `seed`)
+detect an existing SQLite file by its header and import it via the
+daemon/SDK's `create`/`from_path`/`fromPath` reach (unix-socket only, the
+same path-trust model `export` uses), forking each worker's copy from the
+imported `init` checkpoint — no CLI step required. See
+[docs/status.md](status.md)'s `create --from` row and
+[docs/recipes/eval-harnesses.md](recipes/eval-harnesses.md#seeding-options-and-importing-an-existing-database)
+for the full set of seeding shapes.
 
 Running the quickstart project's 3 tests with `-n2`:
 
@@ -655,6 +665,15 @@ None of this is fixture-specific benchmarking — it's the same fork/flush
 machinery every other offshoot workflow pays, measured once in
 `docs/benchmarks.md` and reused here rather than re-measured under a
 pytest-specific harness that would just be adding noise.
+
+For how that per-test cost compares to the alternatives a harness author
+might otherwise reach for — a plain `shutil.copyfile`/`sqlite3.Connection.
+backup()` of a seed file, or a Postgres `CREATE DATABASE ... TEMPLATE`
+clone — see [docs/benchmarks.md](benchmarks.md#per-test-isolation-primitives-v0211)'s
+"Per-test isolation primitives" section: bare `offshoot fork` is
+near-constant regardless of database size, while `fork` + `open` + `close`
+together are not, because `open`'s checkout materialization and
+settling-flush check (not the fork itself) scale with size.
 
 ## TypeScript: the `testkit` module
 

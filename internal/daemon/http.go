@@ -517,6 +517,17 @@ func (s *Server) handleRPC(w http.ResponseWriter, r *http.Request) {
 		http.Error(w, fmt.Sprintf("daemon: %s is not available over HTTP; use the local socket", req.Op), http.StatusBadRequest)
 		return
 	}
+	// "create" is NOT in httpForbiddenOps: plain create (no Path) is an
+	// ordinary op with no filesystem-escaping behavior and must keep
+	// working over HTTP. Only the Path-importing form is refused, for the
+	// exact same reason "export" is: Request.Path names a file on the
+	// DAEMON host's filesystem (Request.Path's doc comment in
+	// protocol.go), which an HTTP caller cannot be trusted with the same
+	// way a unix-socket caller can.
+	if req.Op == "create" && req.Path != "" {
+		http.Error(w, "daemon: create with path is not available over HTTP; use the local socket", http.StatusBadRequest)
+		return
+	}
 
 	resp := s.dispatch(req)
 

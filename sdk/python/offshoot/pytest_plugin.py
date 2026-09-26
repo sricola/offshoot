@@ -27,16 +27,22 @@ function and as a fixture:
 - ``offshoot_db`` (session-scoped): a NAMED-SEED FACTORY,
   ``offshoot_db(name="default", seed=None)``. The first call for a given
   name creates database ``eval-{name}``, runs the seed (a callable taking a
-  writable sqlite path, or a SQL string run via ``sqlite3``), and flushes it
-  to a checkpoint named ``seed``; later calls for the same name are a pure
-  memoization hit — UNLESS a later call passes a seed that doesn't match
-  what actually seeded that name (fingerprinted: SQL by content hash,
-  callables by identity), which raises a clear error rather than silently
-  keeping the first seed. With no ``seed`` argument, the ``offshoot_seed``
-  ini option (a path to a ``.sql`` file, resolved against pytest's rootdir,
-  not the process's current directory) is the zero-code default — the
-  "singleton" case (one project, one seed) needs no code at all beyond
-  setting that one ini line. Returns a :class:`SeedHandle`.
+  writable sqlite path, a SQL string run via ``sqlite3``, or a path to an
+  existing SQLite database file — detected by content, never by extension;
+  see ``_is_sqlite_file`` — imported via ``create --from`` and forked from
+  its ``init`` checkpoint instead of running any seed script), and flushes
+  it to a checkpoint named ``seed`` (or, for the database-file form,
+  requires no flush — the imported ``init`` checkpoint IS the fork point);
+  later calls for the same name are a pure memoization hit — UNLESS a later
+  call passes a seed that doesn't match what actually seeded that name
+  (fingerprinted: SQL by content hash, callables by identity, a database
+  file by the content hash of its bytes), which raises a clear error rather
+  than silently keeping the first seed. With no ``seed`` argument, the
+  ``offshoot_seed`` ini option (a path to a ``.sql`` file OR to an existing
+  SQLite database file, resolved against pytest's rootdir, not the
+  process's current directory) is the zero-code default — the "singleton"
+  case (one project, one seed) needs no code at all beyond setting that one
+  ini line. Returns a :class:`SeedHandle`.
 - ``offshoot_fork`` (function-scoped): a fork-per-test factory,
   ``offshoot_fork(seed_handle=None)``. ``seed_handle`` may be a
   :class:`SeedHandle` (from ``offshoot_db``), a plain ``str`` naming an
@@ -89,10 +95,12 @@ by the slower of the two, not their sum). The *ratio* — total seed work
 scales linearly at roughly 1x per worker — is the number to plan around,
 not the absolute milliseconds: a seed that populates gigabytes of fixture
 data, multiplied by a wide ``-n`` fan-out, is a real cost. If your seed is
-expensive: keep worker count modest, seed a shared file out-of-band once
-and `create --from` it into every worker's store (CLI-only import path —
-see docs/status.md's `create --from` row), or split expensive seeds into a
-smaller shared subset plus cheap per-worker deltas.
+expensive: keep worker count modest, seed a shared file out-of-band once and
+pass its path as the seed (via `offshoot_seed` or the `offshoot_db` factory's
+`seed=` argument) — the plugin imports it through the daemon's `create` op
+and each worker forks from the imported `init` checkpoint instead of running
+the seed script again — or split expensive seeds into a smaller shared
+subset plus cheap per-worker deltas.
 
 A load-bearing detail behind that ~85ms number: `_run_seed` wraps a
 SQL-string seed in a single transaction before running it, UNLESS the seed
@@ -181,8 +189,12 @@ from .client import Client, OffshootError, Session, connect
 from .langgraph import _UNSAFE_RUN, _sanitize
 
 # A seed is a callable given the writable sqlite path to seed however it
-# likes, or a SQL string run via `sqlite3` — see `_run_seed`. Module-private
-# typing convenience, not part of this module's public surface.
+# likes, a SQL string run via `sqlite3` — see `_run_seed` — or a `str` path
+# to an existing SQLite database file (detected by content — see
+# `_is_sqlite_file` — never by extension), imported via `create --from` and
+# forked from its `init` checkpoint instead of running a seed script.
+# Module-private typing convenience, not part of this module's public
+# surface.
 _Seed: TypeAlias = Callable[[str], object] | str
 
 __all__ = [
@@ -438,6 +450,32 @@ class SeedHandle:
     name: str = "default"
 
 
+_SQLITE_HEADER = b"SQLite format 3\x00"
+
+
+def _is_sqlite_file(p: str | Path) -> bool:
+    """True if p is an existing regular file whose first 16 bytes are
+    SQLite's own on-disk header magic (``SQLite format 3\\x00``). Content
+    detection ONLY — never by extension/suffix — so a `seed=` string that
+    merely ends in `.db` but names no real file (ordinary SQL text) is
+    never mistaken for a database file, and conversely a real SQLite file
+    with any extension (or none) is still recognized. Used to decide
+    whether a `str` seed (or the `offshoot_seed`/ini default path) names an
+    existing SQLite database to `create --from`-import rather than a SQL
+    script to run."""
+    try:
+        path = Path(p)
+        if not path.is_file():
+            return False
+        with open(path, "rb") as f:
+            header = f.read(len(_SQLITE_HEADER))
+        return header == _SQLITE_HEADER
+    except (OSError, ValueError):
+        # ValueError: e.g. an embedded NUL byte in an arbitrary SQL-string
+        # seed, which is not a valid path on any platform.
+        return False
+
+
 def _skip_leading_noise(text: str) -> str:
     """Skip leading whitespace, `--`/`/* */` comments, and `PRAGMA ...;`
     statements, returning whatever's left. Used only to detect whether a
@@ -519,10 +557,23 @@ def _fingerprint_seed(seed: _Seed) -> str:
     a seed function once (e.g. at module level) and pass that same object
     on every call for a given name, rather than a fresh,
     behaviorally-identical lambda each time — two distinct callable objects
-    are always "different" here, even if they'd do the same thing.
+    are always "different" here, even if they'd do the same thing. A `str`
+    seed naming an existing SQLite database file (see `_is_sqlite_file`) is
+    fingerprinted by the CONTENT hash of the file's bytes, read fresh each
+    call — not the path string — so editing the file on disk between two
+    calls for the same name (same path, different content) is caught as a
+    mismatch rather than silently passing because the path text didn't
+    change. The file is read exactly once per call to compute this. This
+    fingerprint hashes only the main database file — a source database with
+    an uncheckpointed `-wal` sibling has its pending WAL frames imported by
+    `create --from` (the sibling is read as part of the copy) but NOT
+    included in this hash, so checkpoint the source database before using
+    it as a seed, or a WAL-only edit can go undetected as a "same seed".
     """
     if callable(seed):
         return f"callable:{id(seed)}"
+    if _is_sqlite_file(seed):
+        return f"db:{hashlib.sha256(Path(seed).read_bytes()).hexdigest()}"
     return f"sql:{hashlib.sha256(seed.encode()).hexdigest()}"
 
 
@@ -578,19 +629,37 @@ class _SeedFactory:
                 raise OffshootError(
                     f"offshoot_db(name={name!r}): no seed given and no "
                     "`offshoot_seed` ini option set. Either pass "
-                    "seed=<callable-or-sql-string>, or set "
-                    "`offshoot_seed = path/to/seed.sql` under "
+                    "seed=<callable-or-sql-string-or-db-file-path>, or set "
+                    "`offshoot_seed = path/to/seed.sql-or-.db` under "
                     "[tool.pytest.ini_options] (pyproject.toml) or "
                     "[pytest] (pytest.ini/setup.cfg).")
-            effective_seed = Path(self._default_seed_path).read_text()
+            # The ini default path is itself either a .sql script (read as
+            # text, as before) or an existing SQLite database file (kept as
+            # a path — detected by content, never by extension — and
+            # imported below the same way an explicit seed= path is).
+            if _is_sqlite_file(self._default_seed_path):
+                effective_seed = self._default_seed_path
+            else:
+                effective_seed = Path(self._default_seed_path).read_text()
         db = f"eval-{name}"
-        self._client.create(db)
-        session = self._client.open(db, "main")
-        try:
-            _run_seed(session, effective_seed)
-        finally:
-            session.close()
-        handle = SeedHandle(db=db, checkpoint="seed", name=name)
+        if isinstance(effective_seed, str) and _is_sqlite_file(effective_seed):
+            # An imported database's `main` is quiesced at txid 1 with an
+            # `init` checkpoint (see internal/ops/ops.go's
+            # createFromQuiesced) — fork subsequent test branches from
+            # THAT, not "seed" (nothing runs a seed script here, so there
+            # is no "seed" checkpoint to fork from), and no session is
+            # opened: the daemon reads/copies/quiesces the source file
+            # itself, server-side.
+            self._client.create(db, from_path=os.path.abspath(effective_seed))
+            handle = SeedHandle(db=db, checkpoint="init", name=name)
+        else:
+            self._client.create(db)
+            session = self._client.open(db, "main")
+            try:
+                _run_seed(session, effective_seed)
+            finally:
+                session.close()
+            handle = SeedHandle(db=db, checkpoint="seed", name=name)
         self._seeded[name] = handle
         self._fingerprints[name] = _fingerprint_seed(effective_seed)
         self._seed_refs[name] = effective_seed  # keep alive — see __init__'s comment
@@ -762,8 +831,10 @@ def pytest_addoption(parser: pytest.Parser) -> None:
     parser.addini(
         "offshoot_seed", default="",
         help="Path to a .sql file (resolved against rootdir) run (via "
-             "sqlite3) as offshoot_db's zero-code default seed when a call "
-             "omits seed=.")
+             "sqlite3), OR a path to an existing SQLite database file "
+             "(imported via `create --from` and forked from its `init` "
+             "checkpoint instead), as offshoot_db's zero-code default seed "
+             "when a call omits seed=.")
     parser.addini(
         "offshoot_ttl", default=_DEFAULT_TTL,
         help="TTL applied to every offshoot_fork branch, as a Go duration "

@@ -127,8 +127,11 @@ test("agent run against a private copy", async () => {
   `{ sock, store, proc, stderrTail(), stop() }` — the caller stops it.
 - `seedOnce(daemon, {name?, seed}) -> Promise<SeedHandle>`: a named-seed
   memoization cache keyed on `(daemon, name)`. `seed` is a SQL string, a
-  path to a `.sql` file, or an async `(dbPath) => void` callback given the
-  writable sqlite path. The first call for a name creates database
+  path to a `.sql` file, an async `(dbPath) => void` callback given the
+  writable sqlite path, or a path to an existing SQLite `.db` file
+  (detected by its header, not its extension) — imported via `create(db, {
+  fromPath })` and forked from its `init` checkpoint. The first call for a
+  name creates database
   `eval-{name}`, runs the seed, and checkpoints it `seed`; a later call for
   the same name with a *different* seed throws a clear error instead of
   silently keeping the first one. A `sqlite3 <file> .dump`'s text works

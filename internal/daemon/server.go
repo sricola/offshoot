@@ -715,10 +715,25 @@ func (s *Server) flushIfOpen(db, branch, opName string) error {
 	return nil
 }
 
-// opCreate creates a fresh db (main branch at TXID 1). Validation
-// (name shape) lives in ops.Create; this handler stays thin.
+// opCreate creates a fresh db (main branch at TXID 1), or, when req.Path is
+// set, imports an existing SQLite file at that path instead
+// (ops.Workspace.CreateFrom — the source is never modified, see its own doc
+// comment). req.Path must be ABSOLUTE (see Request.Path's doc comment for
+// the trust model this enforces, and opExport for the identical guard); a
+// relative path is refused outright rather than resolved against the
+// daemon's own (client-invisible) working directory. Validation (name
+// shape) lives in ops.Create/ops.CreateFrom; this handler stays thin.
 func (s *Server) opCreate(req Request) Response {
-	if err := s.ws.Create(req.DB); err != nil {
+	if req.Path == "" {
+		if err := s.ws.Create(req.DB); err != nil {
+			return errResp(err)
+		}
+		return Response{OK: true}
+	}
+	if !filepath.IsAbs(req.Path) {
+		return errResp(fmt.Errorf("daemon: create path %q must be absolute", req.Path))
+	}
+	if err := s.ws.CreateFrom(req.DB, req.Path); err != nil {
 		return errResp(err)
 	}
 	return Response{OK: true}

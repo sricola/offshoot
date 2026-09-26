@@ -113,6 +113,11 @@ a plain file for handoff, and `offshoot diff` answers "what changed between
 these two attempts" — see [docs/diff.md](docs/diff.md) and
 [docs/reference.md](docs/reference.md).
 
+Running pass^k-style evals instead (tau2-bench, Inspect AI, promptfoo)?
+[docs/recipes/eval-harnesses.md](docs/recipes/eval-harnesses.md) has the
+fork-per-attempt/diff-per-attempt pattern and a runnable example
+([examples/eval-pass-k/](examples/eval-pass-k/)).
+
 ## Why it's different
 
 - **Copy-on-write forks, measured.** A shared fork writes two tiny

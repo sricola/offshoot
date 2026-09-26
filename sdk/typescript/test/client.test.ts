@@ -9,7 +9,8 @@
 import { test, before, after, type TestContext } from "node:test";
 import assert from "node:assert/strict";
 import { execFileSync, spawn, type ChildProcess } from "node:child_process";
-import { existsSync, mkdtempSync, rmSync, statSync } from "node:fs";
+import { existsSync, mkdtempSync, readFileSync, rmSync, statSync } from "node:fs";
+import { createHash } from "node:crypto";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { fileURLToPath } from "node:url";
@@ -611,6 +612,29 @@ test("export: misses a session's unflushed writes", async (t: TestContext) => {
     await c.export("export-unflushed-app", "main", out2);
     assert.equal(sqlite3(out2, "SELECT count(*) FROM t;").trim(), "2");
     await s.close();
+  } finally {
+    await c.close();
+  }
+});
+
+test("create: fromPath imports an existing SQLite file without touching the source", async (t: TestContext) => {
+  if (!canRun) {
+    t.skip("go and/or sqlite3 not on PATH");
+    return;
+  }
+  const c = await connect(fixture!.sock);
+  try {
+    const src = join(fixture!.dir, "legacy.db");
+    sqlite3(src, "CREATE TABLE t (v); INSERT INTO t VALUES (1); INSERT INTO t VALUES (2); INSERT INTO t VALUES (3);");
+    const before = createHash("sha256").update(readFileSync(src)).digest("hex");
+
+    await c.create("import-app", { fromPath: src });
+
+    const after = createHash("sha256").update(readFileSync(src)).digest("hex");
+    assert.equal(before, after, "create with fromPath must never modify the source file");
+
+    const path = await c.checkout("import-app", "main");
+    assert.equal(sqlite3(path, "SELECT count(*) FROM t;").trim(), "3");
   } finally {
     await c.close();
   }

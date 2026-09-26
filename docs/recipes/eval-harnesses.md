@@ -1,0 +1,287 @@
+# Recipe: eval harnesses — tau2-style pass^k, Inspect AI, promptfoo
+
+Every eval harness that grades an agent against a stateful environment
+needs the same primitive: an identical, private copy of that environment
+per attempt, so one trial's writes never leak into the next trial's grade.
+offshoot's `fork` is that primitive — near-instant, copy-on-write, and
+disposable — for anything backed by SQLite. This page has three sections:
+a runnable example of the pattern in its purest form (no framework at all),
+then a sketch each for wiring the same fork-per-attempt loop into Inspect
+AI and promptfoo specifically.
+
+## tau2-style environments and pass^k
+
+[tau2-bench](https://github.com/sierra-research/tau2-bench) and similar
+harnesses grade an agent by running it against a simulated environment `k`
+independent times per task and reporting **pass^k**: the fraction of tasks
+where *every one* of the `k` attempts passed, not just at least one
+(`pass@1`, averaged). The distinction matters because it's the difference
+between "this usually works" and "this always works" — and an agent you'd
+actually put in front of a customer needs the second one, not the first.
+
+The loop, independent of any specific harness:
+
+```
+seed once  -> checkpoint "seed"
+for each task:
+    for trial in 1..k:
+        fork "attempt-<task>-<trial>" from "seed"   # identical starting state, every time
+        run the agent against the fork's checkout path
+        grade: diff the fork against a golden reference
+        destroy the fork
+    pass@1 = passed trials / k
+    pass^k = all trials passed
+```
+
+**Why identical initial state per trial is load-bearing, not a nicety:** if
+trial 3 forked from trial 2's leftover writes instead of the shared seed,
+a pass or fail would tell you something about fork *order*, not about the
+task — the exact confound pass^k exists to rule out by construction. This
+is precisely what `fork` guarantees: every trial branches from the same
+`seed` checkpoint, copy-on-write, so trial 40 costs the same as trial 1 and
+starts from bit-identical state regardless of what the other 39 did to
+their own (separate) forks.
+
+### The runnable example
+
+[`examples/eval-pass-k/`](../../examples/eval-pass-k/) is exactly this loop,
+runnable end to end with no LLM in it — a deterministic stub "agent"
+standing in for a real model call, so the harness plumbing (fork, diff,
+pass@1/pass^k accounting) can be verified without needing an API key or
+non-deterministic output. Swap the stub for a real agent call and the loop
+around it is unchanged.
+
+It seeds a `tasks` table (5 tasks) and an `orders` table from
+[`examples/eval-pass-k/golden.sql`](../../examples/eval-pass-k/golden.sql),
+builds a golden reference once (the correct migration, checkpointed
+`expected`), then runs `k` trials per task: fork from `seed` — tagged with
+`meta={"task": ..., "trial": ...}`, offshoot branch metadata visible via
+`offshoot branches evals` — apply the task's migration (correct, or, for
+one deliberately flaky task, missing its `ROUND()` on every 3rd trial),
+diff against the golden reference, destroy the fork.
+
+Run it (see the example's own README for the full explanation, including
+why one task is designed to fail under pass^k while passing 75% of its
+individual trials):
+
+```
+make example-pass-k
+```
+
+This is `run.py`'s own stdout from a real run, pasted verbatim; the
+preceding `go build`/`OFFSHOOT_BIN=...` lines (which embed a local checkout
+path) are omitted:
+
+```
+task  description                                                     k   pass@1   pass^k
+--------------------------------------------------------------------------------------------
+0     Fill in order 1's total, rounded to the cent.                   4     1.00     PASS
+1     Fill in order 2's total, rounded to the cent.                   4     1.00     PASS
+2     Fill in order 3's total, rounded to the cent.                   4     1.00     PASS
+3     Fill in order 4's total, rounded to the cent.                   4     1.00     PASS
+4     Fill in order 5's total, rounded to the cent.                   4     0.75     FAIL
+--------------------------------------------------------------------------------------------
+5 tasks, k=4, wall time: 1.62s
+
+Task 4's pass@1 of 0.75 reads as "mostly fine" -- pass@1 only asks
+"what fraction of trials passed?" pass^k ("would EVERY one of k independent
+attempts have passed?") calls the same task a flat failure. That gap is the
+whole reason to measure pass^k, not just pass@1: an agent that's right most
+of the time is still wrong every time you'd actually ship it.
+```
+
+Task 4's row is the point of the whole example: `pass@1 = 0.75` reads as
+"mostly fine," and `pass^k = FAIL` says what that number actually means for
+an agent you'd ship — one miss in four independent attempts is a hard
+failure, not a rounding error on a dashboard.
+
+## Inspect AI
+
+**This sketch is not exercised in CI; it targets Inspect's public `solver`
+API as of 2026-09.** Inspect represents a running evaluation as a
+`TaskState` threaded through a chain of `@solver`-decorated steps; the
+pattern below forks a private database copy at the start of each epoch (one
+epoch ≈ one independent attempt at a task, Inspect's own unit for repeated
+sampling — the `pass^k` unit above) and hands the checkout path to the task
+being solved, so each epoch runs against isolated state without the task
+definition itself knowing offshoot is involved:
+
+```python
+from inspect_ai.solver import solver, Generate, TaskState
+import offshoot
+
+@solver
+def offshoot_fork_per_epoch(socket_path: str, db: str, seed_checkpoint: str = "seed"):
+    client = offshoot.connect(socket_path)
+
+    async def solve(state: TaskState, generate: Generate) -> TaskState:
+        branch = f"epoch-{state.sample_id}-{state.epoch}"
+        client.fork(db, "main", branch, from_checkpoint=seed_checkpoint,
+                    meta={"task": str(state.sample_id), "epoch": str(state.epoch)})
+        session = client.open(db, branch)
+        try:
+            # Hand the live checkout path to whatever the task under
+            # evaluation reads/writes as its database.
+            state.metadata["db_path"] = session.path
+            state = await generate(state)
+        finally:
+            # Close the session so its writes are durable, but leave the
+            # fork itself alone — the scorer below still needs it.
+            session.close()
+        # Record the branch name for the scorer; it, not the solver, owns
+        # destroying the fork once grading has read its final state.
+        state.metadata["offshoot_branch"] = branch
+        return state
+
+    return solve
+```
+
+Grading is a separate `@scorer` that reads the branch name the solver left
+in `state.metadata["offshoot_branch"]`, diffs that branch's now-closed,
+durable state against a golden checkpoint, and destroys the fork itself —
+in its own `finally`, so the fork is cleaned up whether scoring passes or
+raises, rather than being left for the solver (which already moved on to
+the next epoch by the time grading runs) to worry about:
+
+```python
+from inspect_ai.scorer import scorer, Score, Target, accuracy, CORRECT, INCORRECT
+from inspect_ai.solver import TaskState
+import offshoot
+
+@scorer(metrics=[accuracy()])
+def offshoot_diff_scorer(socket_path: str, db: str, golden_checkpoint: str = "expected"):
+    client = offshoot.connect(socket_path)
+
+    async def score(state: TaskState, target: Target) -> Score:
+        branch = state.metadata["offshoot_branch"]
+        try:
+            diff = client.diff(f"{db}@{branch}", f"{db}@golden@{golden_checkpoint}")
+            clean = bool(diff.tables) and all(t.status == "same" for t in diff.tables)
+            return Score(value=CORRECT if clean else INCORRECT)
+        finally:
+            client.destroy(db, branch)
+
+    return score
+```
+
+## promptfoo
+
+**This sketch is not exercised in CI; it targets promptfoo's public
+`extensions` hook API as of 2026-09.**
+<!-- verified against https://www.promptfoo.dev/docs/configuration/reference/ (extensions config key, file://path:function syntax, module.exports, return-to-persist) -->
+
+promptfoo's `extensions` config entries load a JS file's exported hook
+function into its test lifecycle (`beforeAll`/`beforeEach`/`afterEach`/
+`afterAll`); `beforeEach` and `afterEach` are the natural fork/grade-and-
+destroy pair, run once per test case (promptfoo's own repeat unit —
+configure `repeat` in the test suite for multiple independent attempts at
+the same case, the `pass^k` unit again). Three details below are easy to
+get wrong from memory and are exactly what makes this wire up at all:
+the config key is **`extensions`**, not `extensionHooks`; each entry needs
+a **`:functionName` suffix** naming which exported function to call
+(`file://eval-hooks.js:extensionHook`) — matching a `module.exports =
+extensionHook` (or an ESM `export async function extensionHook(hookName,
+context)`) in that file, not a bare default export; and mutating
+`context`/`context.test.vars` in place is **not** enough — promptfoo only
+persists what the hook function returns, so every branch that mutates ends
+with `return context;`. A fourth detail matters just as much even though
+it's not in promptfoo's docs: `context.test.vars` gets interpolated into
+prompts and serialized into promptfoo's result output, so it must hold only
+plain, JSON-shaped values — never a live `Session` object. The hook below
+keeps sessions in a module-level `Map` keyed by a stable per-test id and
+puts only the checkout path (a string) in `vars`.
+
+```js
+// eval-hooks.js
+const { connect } = require("@offshoot-db/client");
+
+let client;
+const DB = "evals";
+// Live Session objects never go in context.test.vars (promptfoo
+// interpolates vars into prompts and persists them in results) — keep them
+// here, keyed by a stable per-test id built from beforeEach.
+const sessions = new Map();
+let counter = 0;
+
+async function extensionHook(hookName, context) {
+  if (hookName === "beforeAll") {
+    client = await connect(process.env.OFFSHOOT_SOCKET);
+    return context;
+  }
+
+  if (hookName === "beforeEach") {
+    const caseId = context.test.vars.caseId;
+    const branch = `case-${caseId}-${context.test.repeatIndex ?? 0}`;
+    await client.fork(DB, "main", branch, {
+      from: "seed",
+      meta: { case: String(caseId) },
+    });
+    const session = await client.open(DB, branch);
+    const key = `${branch}-${counter++}`;
+    sessions.set(key, { session, branch });
+    context.test.vars.dbPath = session.path;   // fed to the prompt/provider under test (a string)
+    context.test.vars._offshootKey = key;       // stable id string, not the live Session
+    return context;
+  }
+
+  if (hookName === "afterEach") {
+    const key = context.test.vars._offshootKey;
+    const { session, branch } = sessions.get(key);
+    sessions.delete(key);
+    await session.close();
+    const diff = await client.diff(`${DB}@${branch}`, `${DB}@golden@expected`);
+    context.result.namedScores = {
+      ...context.result.namedScores,
+      offshoot_diff_clean: diff.tables.length > 0 && diff.tables.every((t) => t.status === "same") ? 1 : 0,
+    };
+    await client.destroy(DB, branch);
+    return context;
+  }
+}
+
+module.exports = extensionHook;
+```
+
+```yaml
+# promptfooconfig.yaml
+extensions:
+  - file://eval-hooks.js:extensionHook
+```
+
+Same shape as the Inspect sketch and the runnable example above: fork from
+a shared seed before the attempt, diff against a golden reference after,
+destroy either way — `return context;` on every mutating branch is the one
+promptfoo-specific detail that has no analog in the other two.
+
+## Seeding options, and importing an existing database
+
+All three sketches above (and the runnable example) fork from a `seed`
+checkpoint; how that checkpoint gets built is independent of which harness
+you're driving it from. offshoot supports the same set of seeding shapes
+across both SDKs (see [docs/eval-harness.md](../eval-harness.md)'s "named-
+seed factory" section for the pytest-fixture-flavored version of this same
+list):
+
+- **A SQL string** — inline `CREATE TABLE`/`INSERT` statements, wrapped in
+  one transaction automatically even when the string itself doesn't open
+  one.
+- **A `.sql` file** — the shape [`golden.sql`](../../examples/eval-pass-k/golden.sql)
+  above uses; also accepted as a `.dump`-shaped string (the exact text
+  `sqlite3 <file> .dump` produces), so a real database's dump works as a
+  seed unmodified.
+- **A callable** — `(path) -> None` (Python) or `(path) -> Promise<void>`
+  (TypeScript): open the path yourself and populate it however you want,
+  including something that isn't plain SQL at all.
+- **An existing `.db` file** — via `Client.create(db, from_path=...)` /
+  `client.create(db, { fromPath })`, which imports a real SQLite file
+  directly rather than replaying SQL against an empty one. The source file
+  is never modified — it's copied, the copy is quiesced, and only the copy
+  is imported. This is the `--from` path: same underlying operation as the
+  CLI's `offshoot create <db> --from <file>`, useful when your seed is
+  already a real (or realistically-sized) database rather than something
+  you'd want to express as a `.sql` fixture.
+
+Pick whichever shape matches how your own fixture data already lives — a
+migration test suite's `golden.sql`-style fixture, a captured production
+snapshot as a `.db` file, or a generator function that's easier to write in
+code than in SQL.
