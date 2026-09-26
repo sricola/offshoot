@@ -5,6 +5,7 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"os"
 	"strings"
 	"time"
 
@@ -1255,4 +1256,100 @@ func (t *OffshootTools) diff(args json.RawMessage) (ToolResult, error) {
 		sc["full"], sc["truncated"] = text, truncated
 	}
 	return StructuredResult(sc, "%s", b.String()), nil
+}
+
+// reapOnce runs a single at-rest reap pass, or reports that it deferred to
+// a running daemon instead. skipped is true whenever t.daemonStatus()
+// reports a daemon reachable at all (any answer, not just a healthy
+// session — see daemonStatus's own ok contract): that daemon's own janitor
+// (see internal/daemon/janitor.go's StartJanitor/janitorTick) already reaps
+// this exact store on its own cadence, and a second reaper racing it here
+// would be a second writer against the same store with no coordination
+// between them — the CAS in ops.Workspace.Reap/reapOne makes a race between
+// the two safe from corruption, but not from surprising log lines and
+// duplicate "reaped" work attributed to the wrong process. skipped=true
+// leaves the store completely untouched: neither Reap nor
+// ClearStaleDeleteClaims is called at all.
+//
+// When no daemon is reachable, this mirrors janitorTick's own order and
+// error handling for the two calls it shares with the janitor (Reap, then
+// ClearStaleDeleteClaims — no GC; see StartReaper's doc comment for why):
+// both calls run regardless of whether the first failed (each keeps doing
+// everything it safely can and reports a partial result alongside its own
+// error, per their doc comments), and the first error either one hits wins
+// (mirroring ops.Workspace.Reap's own firstErr pattern), but reaped is
+// still whatever Reap actually destroyed even when ClearStaleDeleteClaims
+// (or Reap itself) errors afterward.
+func (t *OffshootTools) reapOnce(now time.Time) (reaped []string, skipped bool, err error) {
+	if _, up := t.daemonStatus(); up {
+		return nil, true, nil
+	}
+	var firstErr error
+	reaped, err = t.ws.Reap(now)
+	if err != nil {
+		firstErr = err
+	}
+	if _, cerr := t.ws.ClearStaleDeleteClaims(now); cerr != nil && firstErr == nil {
+		firstErr = cerr
+	}
+	return reaped, false, firstErr
+}
+
+// StartReaper runs reapOnce on a ticker, every `every`, until ctx is done —
+// the `offshoot mcp -reap-every` fallback for a store with no `offshoot
+// serve` daemon running, so a TTL set via offshoot_fork's `ttl` argument
+// (or -default-ttl) is eventually enforced even when nothing else is
+// reaping this store. every <= 0 disables the reaper entirely (no
+// goroutine started), matching StartJanitor's own contract for the same
+// shape of flag (see cmd/offshoot/main.go's -reap-every for `offshoot mcp`
+// and `offshoot serve`).
+//
+// Deliberately does NOT run GC: unlike the daemon's janitor, this reaper
+// has no operator-supplied grace period to run GC safely against (GC needs
+// a grace long enough to exceed the longest plausible in-flight fork, and
+// -reap-every here is about reap cadence, not that), and reclaiming
+// tombstoned storage is not time-sensitive the way an expired TTL is —
+// `offshoot gc` (manual) or a running `offshoot serve` daemon remains the
+// only way to reclaim disk from this store.
+//
+// Every tick's outcome is logged to stderr: one "offshoot mcp: reaped
+// <db@branch>" line per branch actually destroyed, any error from
+// reapOnce, and — the first time (and only the first time) a tick skips
+// because a daemon came up — a single "offshoot mcp: reaper skipped:
+// daemon is running" line, so an operator watching stderr learns once that
+// this reaper has backed off rather than seeing that line repeat forever
+// on every tick a daemon happens to be up.
+//
+// Never panics: reapOnce's own errors are returned values, not panics, and
+// this loop only ever logs them.
+func (t *OffshootTools) StartReaper(ctx context.Context, every time.Duration) {
+	if every <= 0 {
+		return
+	}
+	go func() {
+		ticker := time.NewTicker(every)
+		defer ticker.Stop()
+		loggedSkip := false
+		for {
+			select {
+			case <-ctx.Done():
+				return
+			case <-ticker.C:
+				reaped, skipped, err := t.reapOnce(time.Now())
+				if skipped {
+					if !loggedSkip {
+						fmt.Fprintln(os.Stderr, "offshoot mcp: reaper skipped: daemon is running")
+						loggedSkip = true
+					}
+					continue
+				}
+				if err != nil {
+					fmt.Fprintf(os.Stderr, "offshoot mcp: reap: %v\n", err)
+				}
+				for _, k := range reaped {
+					fmt.Fprintf(os.Stderr, "offshoot mcp: reaped %s\n", k)
+				}
+			}
+		}
+	}()
 }

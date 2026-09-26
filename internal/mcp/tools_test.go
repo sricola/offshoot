@@ -4,6 +4,7 @@ import (
 	"bytes"
 	"context"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"os"
 	"os/exec"
@@ -1326,5 +1327,69 @@ func TestDiffToolComparesAttemptsContentAware(t *testing.T) {
 		if _, has := r.StructuredContent.(map[string]any)["full"]; !has {
 			t.Fatal("full must be present in structuredContent when requested")
 		}
+	}
+}
+
+// TestReapOnceReapsExpiredForksWhenNoDaemon proves reapOnce mirrors the
+// janitor's own Reap -> ClearStaleDeleteClaims order when no daemon is
+// reachable (newTools' harness points at an absent socket): a TTL'd fork
+// past its deadline is destroyed and reported, skipped is false, and the
+// ref is actually gone from the store afterward.
+func TestReapOnceReapsExpiredForksWhenNoDaemon(t *testing.T) {
+	ts, w := newTools(t)
+	if _, err := w.Fork("app", "main", "attempt-1", "", time.Millisecond, nil); err != nil {
+		t.Fatal(err)
+	}
+	time.Sleep(5 * time.Millisecond)
+
+	reaped, skipped, err := ts.reapOnce(time.Now())
+	if err != nil {
+		t.Fatalf("reapOnce: %v", err)
+	}
+	if skipped {
+		t.Fatal("reapOnce must not skip when no daemon is running")
+	}
+	found := false
+	for _, k := range reaped {
+		if k == "app@attempt-1" {
+			found = true
+		}
+	}
+	if !found {
+		t.Fatalf("reaped = %v, want it to contain app@attempt-1", reaped)
+	}
+	if _, _, err := w.Store.GetRef("app", "attempt-1"); !errors.Is(err, store.ErrNotFound) {
+		t.Fatalf("app@attempt-1 must be gone after reapOnce, GetRef err = %v", err)
+	}
+}
+
+// TestReapOnceNeverReapsProtected proves the -allow-force-style guard rails
+// on reaping itself: a protected fork past its TTL survives reapOnce, same
+// as it survives the daemon's own janitor (ops.Workspace.Reap never touches
+// a protected ref regardless of caller).
+func TestReapOnceNeverReapsProtected(t *testing.T) {
+	ts, w := newTools(t)
+	if _, err := w.Fork("app", "main", "attempt-1", "", time.Millisecond, nil); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := w.SetProtected("app", "attempt-1", true); err != nil {
+		t.Fatal(err)
+	}
+	time.Sleep(5 * time.Millisecond)
+
+	reaped, skipped, err := ts.reapOnce(time.Now())
+	if err != nil {
+		t.Fatalf("reapOnce: %v", err)
+	}
+	if skipped {
+		t.Fatal("reapOnce must not skip when no daemon is running")
+	}
+	for _, k := range reaped {
+		if k == "app@attempt-1" {
+			t.Fatalf("reapOnce reaped a protected branch: %v", reaped)
+		}
+	}
+	if _, _, err := w.Store.GetRef("app", "attempt-1"); err != nil {
+		t.Fatalf("app@attempt-1 must survive reapOnce, GetRef err = %v", err)
 	}
 }

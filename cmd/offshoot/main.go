@@ -117,12 +117,10 @@ Usage:
                                              sensitive). -http-allow-non-loopback
                                              acknowledges binding beyond localhost, and
                                              additionally REQUIRES an explicit token
-  offshoot mcp [-default-ttl d|none] [-socket PATH] [-allow-force]
+  offshoot mcp [-default-ttl d|none] [-socket PATH] [-allow-force] [-reap-every d|none]
                                              serve the MCP tool set on stdio for an agent;
                                              forked branches get this TTL unless the fork
-                                             call overrides it (default 24h; 0/none disables
-                                             — reaping still needs a running janitor, i.e.
-                                             offshoot serve, or a manual offshoot gc);
+                                             call overrides it (default 24h; 0/none disables);
                                              -socket names the daemon to ride when one is up
                                              (default: same derivation offshoot serve uses) —
                                              checkpoint/checkout on a branch with a session
@@ -132,7 +130,16 @@ Usage:
                                              -allow-force lets offshoot_promote/offshoot_destroy
                                              honor an agent's force:true against a protected
                                              branch (main, by default); without it, such a call
-                                             is refused before any mutation — off by default
+                                             is refused before any mutation — off by default;
+                                             -reap-every runs a background reap (TTL expiry,
+                                             plus self-healing any stranded delete claim) on
+                                             this cadence for as long as this process is up
+                                             (default 60s; 0/none disables it) — it defers
+                                             entirely to a running offshoot serve daemon's own
+                                             janitor when one is reachable (never a second
+                                             writer against the same store), and runs no GC
+                                             either way; a manual offshoot gc or offshoot serve
+                                             remains how disk is actually reclaimed
   offshoot session open <db>[@branch] [-socket PATH]      open a session; prints the checkout path
   offshoot session flush <db>[@branch] [name] [-socket PATH]   flush to a durable snapshot; prints the txid
   offshoot session status [-socket PATH]                  list open sessions and their durable txid
@@ -320,6 +327,29 @@ func parseDefaultTTLFlag(args []string) (time.Duration, []string, error) {
 	}
 	if d < 0 {
 		return 0, nil, fmt.Errorf("-default-ttl %q must be zero, \"none\" (both disable it), or positive", raw)
+	}
+	return d, rest, nil
+}
+
+// parseReapEveryFlag extracts mcp's -reap-every flag from args and parses
+// it, defaulting to 60s when the flag is absent. Parsed exactly like
+// parseDefaultTTLFlag (same parseTTLFlag reuse, same "none"-or-zero-both-
+// disable rule, same non-negative rule) — see StartReaper for what a
+// disabled reaper means (every <= 0 starts no goroutine at all).
+func parseReapEveryFlag(args []string) (time.Duration, []string, error) {
+	raw, rest, _, err := extractFlag(args, "-reap-every")
+	if err != nil {
+		return 0, nil, err
+	}
+	if raw == "" {
+		raw = "60s"
+	}
+	d, err := parseTTLFlag(raw)
+	if err != nil {
+		return 0, nil, fmt.Errorf("-reap-every: %w", err)
+	}
+	if d < 0 {
+		return 0, nil, fmt.Errorf("-reap-every %q must be zero, \"none\" (both disable it), or positive", raw)
 	}
 	return d, rest, nil
 }
@@ -914,7 +944,7 @@ func run(args []string) error {
 			return fmt.Errorf("unknown lease subcommand %q", rest[0])
 		}
 	case "mcp":
-		const mcpUsage = "usage: offshoot mcp [-default-ttl DURATION|none] [-socket PATH] [-allow-force]"
+		const mcpUsage = "usage: offshoot mcp [-default-ttl DURATION|none] [-socket PATH] [-allow-force] [-reap-every DURATION|none]"
 		sock, rest, err := socketOverride(rest)
 		if err != nil {
 			return fmt.Errorf("%s: %w", mcpUsage, err)
@@ -924,6 +954,10 @@ func run(args []string) error {
 			return fmt.Errorf("%s: %w", mcpUsage, err)
 		}
 		allowForce, rest := extractBoolFlag(rest, "-allow-force")
+		reapEvery, rest, err := parseReapEveryFlag(rest)
+		if err != nil {
+			return fmt.Errorf("%s: %w", mcpUsage, err)
+		}
 		if len(rest) != 0 {
 			return fmt.Errorf("%s", mcpUsage)
 		}
@@ -939,8 +973,17 @@ func run(args []string) error {
 		// OffshootTools.SetAllowForce. Force against an unprotected branch
 		// never needed this flag.
 		ts.SetAllowForce(allowForce)
+		// The reaper's context is cancelled the moment the server loop
+		// below returns (this function's own srv.Serve(ctx), whether it
+		// exits via stdin EOF or an error) — the reaper must never keep
+		// running past the process's own MCP-serving lifetime, since
+		// nothing would ever stop it otherwise. reapEvery <= 0 (0 or
+		// "none") starts no goroutine at all (see StartReaper).
+		ctx, cancel := context.WithCancel(context.Background())
+		defer cancel()
+		ts.StartReaper(ctx, reapEvery)
 		srv := mcp.NewServer(os.Stdin, os.Stdout, ts)
-		return srv.Serve(context.Background())
+		return srv.Serve(ctx)
 	case "serve":
 		const serveUsage = "usage: offshoot serve [-socket PATH] [-reap-every DURATION] [-gc-grace DURATION] " +
 			"[-flush-every DURATION] [-snapshot-every N] [-ro-cache-budget BYTES] [-http ADDR] [-token TOKEN] [-http-allow-non-loopback]"
