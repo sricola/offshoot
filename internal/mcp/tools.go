@@ -205,6 +205,10 @@ type prop struct {
 	jsonType string
 	required bool
 	def      any
+	// extra carries additional JSON Schema keywords beyond "type"/"default"
+	// (e.g. "additionalProperties" for an object-typed property like
+	// `meta`), merged into the property's schema by schema() below.
+	extra map[string]any
 }
 
 // reqStr and optStr build required/optional string properties, the common
@@ -222,6 +226,14 @@ func optStrDefault(name string, def string) prop {
 // optBool builds an optional boolean property (e.g. `force`).
 func optBool(name string) prop { return prop{name: name, jsonType: "boolean"} }
 
+// optMeta builds the optional `meta` property: a small string->string map
+// stored on the new branch (fork) or the named checkpoint (checkpoint),
+// capped by ops.ValidateMeta. Advertised as an object of strings so a
+// model does not send a JSON-encoded string.
+func optMeta(name string) prop {
+	return prop{name: name, jsonType: "object", extra: map[string]any{"additionalProperties": map[string]any{"type": "string"}}}
+}
+
 // schema builds a JSON Schema object describing a tool's arguments from a
 // list of properties, each carrying its own type/required/default.
 func schema(props ...prop) map[string]any {
@@ -231,6 +243,9 @@ func schema(props ...prop) map[string]any {
 		def := map[string]any{"type": p.jsonType}
 		if p.def != nil {
 			def["default"] = p.def
+		}
+		for k, v := range p.extra {
+			def[k] = v
 		}
 		properties[p.name] = def
 		if p.required {
@@ -302,8 +317,11 @@ func (t *OffshootTools) Tools() []Tool {
 				"If a daemon session is open on this branch, this is a live flush " +
 				"(cheap, only the diff since the last checkpoint, no pause in writes); " +
 				"otherwise it's a full-snapshot checkpoint of the checkout file. " +
-				"`branch` defaults to \"main\" if omitted.",
-			InputSchema: schema(reqStr("database"), reqStr("name"), optStrDefault("branch", "main")),
+				"`branch` defaults to \"main\" if omitted. Optional `meta` " +
+				"(string->string, at most 32 keys) tags the result with your run id, " +
+				"git SHA, or agent name for later lookup.",
+			InputSchema: schema(reqStr("database"), reqStr("name"), optStrDefault("branch", "main"),
+				optMeta("meta")),
 			Annotations: annotate("Checkpoint a branch", false, false, false),
 		},
 		{
@@ -319,10 +337,12 @@ func (t *OffshootTools) Tools() []Tool {
 				"daemon session is open on the source branch, its unflushed writes are " +
 				"flushed first, so the fork always includes everything written so far. " +
 				"`branch` (the source) defaults to \"main\" if omitted. " +
-				forkTTLDescription(t.defaultTTL) + " " + forkTTLJanitorNote,
+				forkTTLDescription(t.defaultTTL) + " " + forkTTLJanitorNote + " " +
+				"Optional `meta` (string->string, at most 32 keys) tags the result " +
+				"with your run id, git SHA, or agent name for later lookup.",
 			InputSchema: schema(reqStr("database"), reqStr("new_branch"),
 				optStrDefault("branch", "main"), optStr("at"),
-				optStrDefault("ttl", ttlDefaultDisplay(t.defaultTTL))),
+				optStrDefault("ttl", ttlDefaultDisplay(t.defaultTTL)), optMeta("meta")),
 			Annotations: annotate("Fork a branch", false, false, false),
 		},
 		{
@@ -544,9 +564,10 @@ func (t *OffshootTools) checkout(args json.RawMessage) (ToolResult, error) {
 }
 
 type checkpointArgs struct {
-	Database string `json:"database"`
-	Branch   string `json:"branch"`
-	Name     string `json:"name"`
+	Database string            `json:"database"`
+	Branch   string            `json:"branch"`
+	Name     string            `json:"name"`
+	Meta     map[string]string `json:"meta"`
 }
 
 // checkpoint names the current state of db@branch. If a daemon session is
@@ -571,7 +592,7 @@ func (t *OffshootTools) checkpoint(args json.RawMessage) (ToolResult, error) {
 		return r, nil
 	}
 	if _, ok := t.openSession(a.Database, branch); ok {
-		resp, err := daemon.Call(t.socket, daemon.Request{Op: "flush", DB: a.Database, Branch: branch, Name: a.Name})
+		resp, err := daemon.Call(t.socket, daemon.Request{Op: "flush", DB: a.Database, Branch: branch, Name: a.Name, Meta: a.Meta})
 		if err != nil {
 			return ErrorResult("%v", err), nil
 		}
@@ -580,12 +601,7 @@ func (t *OffshootTools) checkpoint(args json.RawMessage) (ToolResult, error) {
 		}, "checkpointed %s@%s as %q at txid %d — captured live from the open daemon session, no pause in writes",
 			a.Database, branch, a.Name, resp.TXID), nil
 	}
-	// meta is nil: MCP tool exposure of checkpoint/fork metadata is
-	// deliberately out of scope for Milestone 3 Task 1 (see ROADMAP's M3
-	// metadata note) — the ops.Workspace.Checkpoint/Fork surface supports
-	// it, but no offshoot_* tool argument threads a caller-supplied map
-	// through to it yet.
-	txid, err := t.ws.Checkpoint(a.Database, branch, a.Name, nil)
+	txid, err := t.ws.Checkpoint(a.Database, branch, a.Name, a.Meta)
 	if err != nil {
 		return ErrorResult("%v", err), nil
 	}
@@ -602,7 +618,8 @@ type forkArgs struct {
 	// TTL is a Go duration string ("2h"), "none" for no TTL (overrides any
 	// configured default), or "" to fall back to OffshootTools.defaultTTL —
 	// see resolveForkTTL.
-	TTL string `json:"ttl"`
+	TTL  string            `json:"ttl"`
+	Meta map[string]string `json:"meta"`
 }
 
 // forkTTLJanitorNote is appended to offshoot_fork's Description (and, in
@@ -770,7 +787,7 @@ func (t *OffshootTools) fork(args json.RawMessage) (ToolResult, error) {
 
 	var txid uint64
 	if _, up := t.daemonStatus(); up {
-		req := daemon.Request{Op: "fork", DB: a.Database, Branch: branch, Name: a.NewBranch, From: a.At}
+		req := daemon.Request{Op: "fork", DB: a.Database, Branch: branch, Name: a.NewBranch, From: a.At, Meta: a.Meta}
 		if ttl > 0 {
 			req.TTL = ttl.String()
 		}
@@ -780,9 +797,7 @@ func (t *OffshootTools) fork(args json.RawMessage) (ToolResult, error) {
 		}
 		txid = resp.TXID
 	} else {
-		// meta is nil — see the identical note on t.ws.Checkpoint's call site
-		// above: MCP metadata exposure is out of scope for Milestone 3 Task 1.
-		txid, err = t.ws.Fork(a.Database, branch, a.NewBranch, a.At, ttl, nil)
+		txid, err = t.ws.Fork(a.Database, branch, a.NewBranch, a.At, ttl, a.Meta)
 		if err != nil {
 			return ErrorResult("%v", err), nil
 		}

@@ -15,6 +15,7 @@ import (
 	"time"
 
 	"github.com/sricola/offshoot/internal/ops"
+	"github.com/sricola/offshoot/internal/store"
 	"github.com/sricola/offshoot/internal/testutil"
 )
 
@@ -267,6 +268,8 @@ func jsonSchemaTypeForKind(k reflect.Kind) string {
 		return "integer"
 	case reflect.Float32, reflect.Float64:
 		return "number"
+	case reflect.Map:
+		return "object"
 	default:
 		return "unsupported:" + k.String()
 	}
@@ -921,5 +924,63 @@ func TestStructuredContentAccompaniesProse(t *testing.T) {
 	}
 	if bytes.Contains(raw, []byte("structuredContent")) {
 		t.Fatalf("error result must omit structuredContent on the wire: %s", raw)
+	}
+}
+
+// TestForkAndCheckpointCarryMeta closes status.md's "MCP tool metadata
+// exposure" deferral: a caller-supplied meta map lands on the new branch's
+// ref (fork) and on the named checkpoint (checkpoint), both at rest, with
+// ops.ValidateMeta's caps enforced as a tool error, not a crash.
+func TestForkAndCheckpointCarryMeta(t *testing.T) {
+	ts, w := newTools(t)
+	r := call(t, ts, "offshoot_fork", map[string]any{
+		"database": "app", "new_branch": "attempt-1",
+		"meta": map[string]any{"run_id": "eval-42", "agent": "claude"}})
+	if r.IsError {
+		t.Fatalf("fork with meta: %s", text(r))
+	}
+	ref, _, err := w.Store.GetRef("app", "attempt-1")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if ref.Meta["run_id"] != "eval-42" || ref.Meta["agent"] != "claude" {
+		t.Fatalf("fork meta not stored: %v", ref.Meta)
+	}
+	if _, err := w.Checkout("app", "attempt-1"); err != nil {
+		t.Fatal(err)
+	}
+	r = call(t, ts, "offshoot_checkpoint", map[string]any{
+		"database": "app", "branch": "attempt-1", "name": "v1",
+		"meta": map[string]any{"git_sha": "abc123"}})
+	if r.IsError {
+		t.Fatalf("checkpoint with meta: %s", text(r))
+	}
+	ref, _, err = w.Store.GetRef("app", "attempt-1")
+	if err != nil {
+		t.Fatal(err)
+	}
+	var cp store.Checkpoint = ref.Checkpoints["v1"]
+	if cp.Meta["git_sha"] != "abc123" {
+		t.Fatalf("checkpoint meta not stored: %v", cp.Meta)
+	}
+	// Over the cap is a tool error the model can act on.
+	big := map[string]any{}
+	for i := 0; i < ops.MaxMetaKeys+1; i++ {
+		big[fmt.Sprintf("k%d", i)] = "v"
+	}
+	r = call(t, ts, "offshoot_fork", map[string]any{"database": "app", "new_branch": "attempt-2", "meta": big})
+	if !r.IsError || !strings.Contains(text(r), "exceeds") {
+		t.Fatalf("oversized meta must be a tool error, got %+v", r)
+	}
+	// Schema advertises meta as an object of strings.
+	for _, tl := range ts.Tools() {
+		if tl.Name != "offshoot_fork" && tl.Name != "offshoot_checkpoint" {
+			continue
+		}
+		props := tl.InputSchema.(map[string]any)["properties"].(map[string]any)
+		meta, ok := props["meta"].(map[string]any)
+		if !ok || meta["type"] != "object" {
+			t.Fatalf("%s: meta must be advertised as an object, got %v", tl.Name, props["meta"])
+		}
 	}
 }
