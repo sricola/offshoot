@@ -23,6 +23,10 @@ the fuller tutorial that superseded it as the primary teaching surface; the
 README section stays as the PyPI-landing-page-sized summary and now points
 here for the walkthrough.
 
+Running pass^k-style evals (tau2-bench, Inspect AI, promptfoo) instead of a
+pytest/vitest suite? [docs/recipes/eval-harnesses.md](recipes/eval-harnesses.md)
+has that pattern and a runnable example.
+
 ## Install
 
 offshoot ships as one static-ish Go binary (cgo for the SQLite driver) plus

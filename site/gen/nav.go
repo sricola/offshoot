@@ -30,6 +30,7 @@ var Nav = []Group{
 		{"docs/eval-harness.md", "eval-harness", "Eval harness tutorial"},
 		{"docs/ci-recipes.md", "ci-recipes", "CI recipes"},
 		{"docs/recipes/frameworks.md", "frameworks", "Framework recipes"},
+		{"docs/recipes/eval-harnesses.md", "eval-harnesses", "Eval harnesses"},
 		{"docs/recipes/claude-agent-sdk.md", "claude-agent-sdk", "Claude Agent SDK"},
 		{"docs/recipes/openai-agents.md", "openai-agents", "OpenAI Agents SDK"},
 		{"docs/recipes/kubernetes.md", "kubernetes", "Kubernetes sidecar"},

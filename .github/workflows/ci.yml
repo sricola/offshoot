@@ -172,6 +172,18 @@ jobs:
       - name: make test-sdks
         run: make test-sdks
 
+      # example-pass-k runs examples/eval-pass-k/run.py end to end: a
+      # runnable pass^k eval loop (seed once, fork per trial, grade with
+      # `offshoot diff`, destroy) that docs/recipes/eval-harnesses.md's
+      # "tau2-style environments and pass^k" section walks through. Stdlib
+      # only (reaches sdk/python via sys.path, like scripts/bench-
+      # isolation.py) -- no extra install here, Python/Go are already set
+      # up above. Kept fast on purpose (--k 4 --tasks 5, ~2s locally) so it
+      # runs on every PR rather than just proving it once at doc-writing
+      # time.
+      - name: make example-pass-k
+        run: make example-pass-k
+
       # test-pytest-plugin exercises the offshoot.pytest_plugin fixture plugin
       # (the `offshoot-db[pytest]` extra) — its own suite, separate from
       # test-sdks above, because it genuinely needs pytest + pytest-xdist
