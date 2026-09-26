@@ -70,6 +70,23 @@ func seedTwoSidesForDiff(t *testing.T, store string) (leftTarget, rightTarget st
 	return "app@main@left", "app@attempt@right"
 }
 
+// tableRow finds the output line whose first whitespace-separated field is
+// table (the tabwriter-aligned TABLE column) and returns its fields split on
+// whitespace — letting a caller assert an exact row shape (column values in
+// order) rather than merely that some substrings appear somewhere in the
+// output.
+func tableRow(t *testing.T, out, table string) []string {
+	t.Helper()
+	for _, line := range strings.Split(out, "\n") {
+		fields := strings.Fields(line)
+		if len(fields) > 0 && fields[0] == table {
+			return fields
+		}
+	}
+	t.Fatalf("no output row for table %q; full output:\n%s", table, out)
+	return nil
+}
+
 // TestDiffSummaryCLIReportsExactRowCounts is the load-bearing --summary
 // test: it asserts the EXACT counts (not just presence/absence) for a
 // changed, an added, and a removed table, plus the trailing totals line.
@@ -80,15 +97,25 @@ func TestDiffSummaryCLIReportsExactRowCounts(t *testing.T) {
 
 	out := call(t, store, "diff", left, right, "--summary")
 
-	for _, want := range []string{
-		"users", "3", "5", "changed (+2)",
-		"gone", "2", "removed",
-		"arrivals", "4", "added",
-		"3 tables: 0 same, 1 changed, 1 added, 1 removed",
-	} {
+	for _, want := range []string{"ADDED", "REMOVED", "CHANGED", "3 tables: 0 same, 1 changed, 1 added, 1 removed"} {
 		if !strings.Contains(out, want) {
 			t.Fatalf("--summary output missing %q; full output:\n%s", want, out)
 		}
+	}
+
+	// users: 3 left, 5 right, comparable, +2 rows added via rowid (no
+	// declared PK), 0 removed, 0 changed, status "changed".
+	if got, want := tableRow(t, out, "users"), []string{"users", "3", "5", "2", "0", "0", "changed"}; strings.Join(got, " ") != strings.Join(want, " ") {
+		t.Fatalf("users row = %v, want %v; full output:\n%s", got, want, out)
+	}
+	// gone: left-only, 2 rows, not comparable (right side doesn't exist),
+	// status "removed".
+	if got, want := tableRow(t, out, "gone"), []string{"gone", "2", "-", "-", "-", "-", "removed"}; strings.Join(got, " ") != strings.Join(want, " ") {
+		t.Fatalf("gone row = %v, want %v; full output:\n%s", got, want, out)
+	}
+	// arrivals: right-only, 4 rows, not comparable, status "added".
+	if got, want := tableRow(t, out, "arrivals"), []string{"arrivals", "-", "4", "-", "-", "-", "added"}; strings.Join(got, " ") != strings.Join(want, " ") {
+		t.Fatalf("arrivals row = %v, want %v; full output:\n%s", got, want, out)
 	}
 }
 
@@ -110,7 +137,7 @@ func TestDiffSummaryCLIWorksAcrossTwoDifferentDatabases(t *testing.T) {
 	call(t, store, "checkpoint", "right-db", "v1")
 
 	out := call(t, store, "diff", "left-db@main@v1", "right-db@main@v1", "--summary")
-	if !strings.Contains(out, "changed (+1)") {
+	if !strings.Contains(out, "1 tables: 0 same, 1 changed, 0 added, 0 removed") {
 		t.Fatalf("cross-db --summary output missing the expected delta; full output:\n%s", out)
 	}
 }
@@ -146,7 +173,7 @@ func TestDiffCLIHeadSideReflectsNewWriteNotStaleCache(t *testing.T) {
 	call(t, store, "checkpoint", "app", "advanced")
 
 	second := call(t, store, "diff", "app@main@base", "app@main", "--summary")
-	if !strings.Contains(second, "changed (+1)") {
+	if !strings.Contains(second, "1 tables: 0 same, 1 changed, 0 added, 0 removed") {
 		t.Fatalf("second diff (head advanced by 1 row) must reflect the new write, not a stale cache; got:\n%s", second)
 	}
 }
@@ -221,6 +248,35 @@ func TestDiffCLIIdenticalSidesProduceNoSqldiffOutput(t *testing.T) {
 	wantHeader := "left:  app@main@v1 right: app@main@v1\n"
 	if out != wantHeader {
 		t.Fatalf("diffing a checkpoint against itself should produce only the left/right header and no sqldiff output, got:\n%q", out)
+	}
+}
+
+// TestDiffCLITableFlagRestrictsSummary: --table narrows the summary to one
+// table (and is passed to sqldiff in default mode, covered by the ops test).
+func TestDiffCLITableFlagRestrictsSummary(t *testing.T) {
+	testutil.RequireSQLite3(t)
+	store := filepath.Join(t.TempDir(), "s")
+	call(t, store, "init")
+	call(t, store, "create", "app")
+	path := strings.TrimSpace(call(t, store, "checkout", "app"))
+	if out, err := exec.Command("sqlite3", path,
+		"CREATE TABLE only (v); INSERT INTO only VALUES (1);"+
+			"CREATE TABLE other (v); INSERT INTO other VALUES (1);",
+	).CombinedOutput(); err != nil {
+		t.Fatalf("%v: %s", err, out)
+	}
+	call(t, store, "checkpoint", "app", "v1")
+
+	out := call(t, store, "diff", "app@main@v1", "app@main@v1", "--summary", "--table", "only")
+
+	if !strings.Contains(out, "only") {
+		t.Fatalf("--table only output missing %q; full output:\n%s", "only", out)
+	}
+	if strings.Contains(out, "other") {
+		t.Fatalf("--table only output must not mention %q; full output:\n%s", "other", out)
+	}
+	if !strings.HasSuffix(strings.TrimRight(out, "\n"), "1 tables: 1 same, 0 changed, 0 added, 0 removed") {
+		t.Fatalf("--table only output must end with the single-table totals line; full output:\n%s", out)
 	}
 }
 

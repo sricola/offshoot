@@ -63,7 +63,7 @@ That's most of the surface already. The full vocabulary, one line each
 | `checkpoint` | snapshot the checkout as a named, rollback-able point |
 | `fork` | branch from head or a checkpoint — instant, copy-on-write, optional `--ttl` |
 | `rollback` / `promote` | repoint a branch at a checkpoint / repoint a target at a branch's head (keeping its old head as `<target>-pre-promote` to undo — TTL'd, 24h by default, one rolling slot per target replaced by the next promote) |
-| `diff` / `export` | sqldiff two branches or checkpoints / copy state out to a plain file |
+| `diff` / `export` | content-aware summary, or sqldiff, between two branches or checkpoints / copy state out to a plain file |
 | `destroy` / `gc` | delete a branch / collect unreachable objects |
 | `serve` / `session` | the daemon: leases, live capture, flush-without-pausing ([below](#daemon-mode)) |
 | `mcp` | the same verbs as MCP tools, for agents ([below](#mcp)) |
@@ -439,7 +439,7 @@ same lifecycle API over HTTP (see
 | Surface | What it is | Daemon? |
 |---|---|---|
 | [CLI](#quickstart-60-seconds-no-server-no-bucket) | every verb, no dependencies | no |
-| [MCP](#mcp) — `offshoot mcp` | eight branch tools over stdio, for agents | optional — rides one when reachable |
+| [MCP](#mcp) — `offshoot mcp` | nine branch tools over stdio, for agents | optional — rides one when reachable |
 | [Python SDK](#python-sdk) | stdlib-only thin client, plus pytest fixtures | yes |
 | [TypeScript SDK](#typescript-sdk) | zero-dependency thin client, plus a testkit | yes |
 | [LangGraph companion](#langgraph) | thread ↔ branch mapping for checkpoint rewind | yes |
@@ -460,10 +460,11 @@ branch on its own initiative instead of asking you to run commands:
 **Cursor:** [![Install in Cursor](https://cursor.com/deeplink/mcp-install-dark.svg)](https://cursor.com/en/install-mcp?name=offshoot&config=eyJjb21tYW5kIjoib2Zmc2hvb3QiLCJhcmdzIjpbIm1jcCJdfQ==)
 (the link opens Cursor's install page, which hands off to the app to install `offshoot mcp` as a stdio server; the store resolves from `OFFSHOOT_STORE` or `./.offshoot`).
 
-The agent gets eight tools — list, checkout, checkpoint, fork, rollback,
-promote, destroy, touch — described so it knows *when* to use them: fork
-before a risky migration, checkpoint when tests pass, roll back when they
-don't, promote the attempt that worked. See it work end to end:
+The agent gets nine tools — list, checkout, checkpoint, fork, rollback,
+promote, destroy, touch, diff — described so it knows *when* to use them:
+fork before a risky migration, checkpoint when tests pass, roll back when
+they don't, diff two attempts to see what changed, promote the attempt that
+worked. See it work end to end:
 [docs/demo/mcp-walkthrough.md](docs/demo/mcp-walkthrough.md), a real
 captured session.
 
@@ -529,8 +530,9 @@ with offshoot.connect("/tmp/o.sock") as c:
     s.close()
 ```
 
-`Client` also exposes `branches()`, `dbs()`, `export()`, and
-`checkout_at()` (a read-only historical checkout).
+`Client` also exposes `branches()`, `dbs()`, `export()`, `checkout_at()`
+(a read-only historical checkout), and `diff()` (a content-aware
+per-table summary between two targets, no `sqldiff` needed).
 
 **Testing with pytest?** `pip install "offshoot-db[pytest] @ git+https://github.com/sricola/offshoot#subdirectory=sdk/python"` *(from the repo — not yet on PyPI)* registers
 `offshoot_daemon`/`offshoot_db`/`offshoot_fork` fixtures automatically —
@@ -561,8 +563,9 @@ await s.close();
 await c.close();
 ```
 
-`Client` also exposes `branches()`, `dbs()`, `export()`, and
-`checkoutAt()` — the same surface as the Python client above.
+`Client` also exposes `branches()`, `dbs()`, `export()`, `checkoutAt()`,
+and `diff()` (a content-aware per-table summary between two targets, no
+`sqldiff` needed) — the same surface as the Python client above.
 
 **Testing with vitest/jest/`node:test`?** `@offshoot-db/client/testkit`
 (`startDaemon`/`seedOnce`/`forkPerTest`/`dump`) is the framework-agnostic

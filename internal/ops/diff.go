@@ -1,12 +1,18 @@
 package ops
 
 import (
+	"bytes"
 	"database/sql"
+	"errors"
 	"fmt"
+	"io"
 	"os"
+	"os/exec"
 	"path/filepath"
+	"slices"
 	"sort"
 	"strings"
+	"text/tabwriter"
 )
 
 // DiffSide is one materialized, read-only side of a branch diff: a plain
@@ -168,12 +174,37 @@ func TableRowCounts(path string) (map[string]int, error) {
 // sqlite_master) plus each side's row count, and whether the table exists
 // there at all — a table present on only one side (Left/RightExists false
 // on the other) is "added" or "removed" wholesale, not a row-count delta.
+//
+// Comparable is true when the table exists on both sides with the same
+// column names in the same order; Added/Removed/Changed are meaningful
+// only then — a schema mismatch makes row-level identity undefined, so the
+// table is reported (with row counts) but not compared.
 type TableDiff struct {
-	Table       string
-	LeftExists  bool
-	RightExists bool
-	Left        int // meaningful only when LeftExists
-	Right       int // meaningful only when RightExists
+	Table       string `json:"table"`
+	LeftExists  bool   `json:"left_exists"`
+	RightExists bool   `json:"right_exists"`
+	Left        int    `json:"left_rows"`
+	Right       int    `json:"right_rows"`
+
+	Comparable    bool `json:"comparable"`
+	Added         int  `json:"added"`
+	Removed       int  `json:"removed"`
+	Changed       int  `json:"changed"`
+	SchemaChanged bool `json:"schema_changed"`
+
+	// Key is the row identity DiffSummary compared by: "pk" (the declared
+	// primary key, verified unique on both sides), "rowid" (the table's
+	// internal rowid, used when there is no usable PK), or "" when neither
+	// was usable (Comparable is then false even though columns matched).
+	// Rowid identity is only meaningful when both sides descend from one
+	// seed and rowids were not renumbered (VACUUM on a table without an
+	// INTEGER PRIMARY KEY, or a cross-database diff); otherwise it
+	// over-reports changes, which is the safe direction for a promote
+	// decision.
+	Key string `json:"key"`
+
+	// Status is "added" | "removed" | "same" | "changed".
+	Status string `json:"status"`
 }
 
 // Delta is Right's row count minus Left's — only meaningful when both
@@ -182,29 +213,239 @@ type TableDiff struct {
 // cmd/offshoot's --summary printer).
 func (d TableDiff) Delta() int { return d.Right - d.Left }
 
-// DiffSummary computes the --summary table-level row-count diff between two
+// DiffTotals counts tables by Status.
+type DiffTotals struct {
+	Same    int `json:"same"`
+	Changed int `json:"changed"`
+	Added   int `json:"added"`
+	Removed int `json:"removed"`
+}
+
+// DiffReport is DiffSummary's result plus its totals — the shape every
+// surface (CLI, daemon, SDKs, MCP) returns.
+type DiffReport struct {
+	Tables []TableDiff `json:"tables"`
+	Totals DiffTotals  `json:"totals"`
+}
+
+// DiffReportOf wraps a table list with its totals.
+func DiffReportOf(tables []TableDiff) DiffReport {
+	rep := DiffReport{Tables: tables}
+	for _, d := range tables {
+		switch d.Status {
+		case "same":
+			rep.Totals.Same++
+		case "changed":
+			rep.Totals.Changed++
+		case "added":
+			rep.Totals.Added++
+		case "removed":
+			rep.Totals.Removed++
+		}
+	}
+	return rep
+}
+
+// roDSN is the read-only, immutable URI both sides are opened with — see
+// TableRowCounts's doc comment for why mode=ro and immutable=1 are real
+// SQLite-enforced guarantees, not conventions.
+func roDSN(path string) (string, error) {
+	abs, err := filepath.Abs(path)
+	if err != nil {
+		return "", err
+	}
+	return "file:" + abs + "?mode=ro&immutable=1", nil
+}
+
+// tableInfo is one side's view of a table: its column names in order, the
+// declared primary-key columns in pk order (empty for a rowid table), and
+// its CREATE statement with whitespace collapsed (for SchemaChanged).
+type tableInfo struct {
+	cols   []string
+	pk     []string
+	schema string
+}
+
+func readTableInfo(db *sql.DB, schemaName, table string) (tableInfo, error) {
+	var ti tableInfo
+	rows, err := db.Query("PRAGMA " + quoteIdent(schemaName) + ".table_info(" + quoteIdent(table) + ")")
+	if err != nil {
+		return ti, err
+	}
+	defer rows.Close()
+	type pkcol struct {
+		name string
+		pos  int
+	}
+	var pks []pkcol
+	for rows.Next() {
+		var cid, notnull, pk int
+		var name, ctype string
+		var dflt sql.NullString
+		if err := rows.Scan(&cid, &name, &ctype, &notnull, &dflt, &pk); err != nil {
+			return ti, err
+		}
+		ti.cols = append(ti.cols, name)
+		if pk > 0 {
+			pks = append(pks, pkcol{name, pk})
+		}
+	}
+	if err := rows.Err(); err != nil {
+		return ti, err
+	}
+	sort.Slice(pks, func(i, j int) bool { return pks[i].pos < pks[j].pos })
+	for _, p := range pks {
+		ti.pk = append(ti.pk, p.name)
+	}
+	var sqlText sql.NullString
+	err = db.QueryRow("SELECT sql FROM "+quoteIdent(schemaName)+".sqlite_master WHERE type='table' AND name = ?", table).Scan(&sqlText)
+	if err != nil {
+		return ti, err
+	}
+	ti.schema = strings.Join(strings.Fields(sqlText.String), " ")
+	return ti, nil
+}
+
+func listTables(db *sql.DB, schemaName string) ([]string, error) {
+	rows, err := db.Query(`SELECT name FROM ` + quoteIdent(schemaName) + `.sqlite_master ` +
+		`WHERE type = 'table' AND name NOT LIKE 'sqlite\_%' ESCAPE '\' ORDER BY name`)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+	var out []string
+	for rows.Next() {
+		var n string
+		if err := rows.Scan(&n); err != nil {
+			return nil, err
+		}
+		out = append(out, n)
+	}
+	return out, rows.Err()
+}
+
+func countQ(db *sql.DB, q string) (int, error) {
+	var n int
+	err := db.QueryRow(q).Scan(&n)
+	return n, err
+}
+
+// isKeyUnique reports whether no two rows of schemaName.table share the same
+// values across key (a GROUP BY ... HAVING count(*) > 1 with zero groups).
+// Needed because SQLite allows a declared PRIMARY KEY on an ordinary rowid
+// table to contain duplicate rows when a key component is NULL (a
+// long-standing SQLite legacy quirk — see DiffSummary's doc comment), so the
+// mere presence of a PK is not enough to trust it as a row identity.
+func isKeyUnique(db *sql.DB, schemaName, table string, key []string) (bool, error) {
+	cols := make([]string, len(key))
+	for i, k := range key {
+		cols[i] = quoteIdent(k)
+	}
+	q := "SELECT count(*) FROM (SELECT 1 FROM " + quoteIdent(schemaName) + "." + quoteIdent(table) +
+		" GROUP BY " + strings.Join(cols, ", ") + " HAVING count(*) > 1)"
+	n, err := countQ(db, q)
+	return n == 0, err
+}
+
+// rowidAlias returns the first of "rowid", "oid", "_rowid_" whose name does
+// not collide (case-insensitively) with one of cols, or "" if all three are
+// shadowed by a same-named user column. A shadowed alias no longer refers to
+// the table's internal rowid in SQL, so a shadowed name can't be used as a
+// row identity even though the rowid itself still exists.
+func rowidAlias(cols []string) string {
+	for _, alias := range []string{"rowid", "oid", "_rowid_"} {
+		shadowed := false
+		for _, c := range cols {
+			if strings.EqualFold(c, alias) {
+				shadowed = true
+				break
+			}
+		}
+		if !shadowed {
+			return alias
+		}
+	}
+	return ""
+}
+
+// DiffSummary computes the --summary table-level diff between two
 // materialized SQLite files: leftPath and rightPath may be two entirely
 // different databases (cross-db diff — legitimate for eval comparisons, see
 // Milestone 3 Task 6) or two checkpoints/heads of the same one; DiffSummary
 // itself doesn't know or care which. Returns one TableDiff per table in the
 // union of both sides' schemas, sorted by table name for a stable,
 // diffable-itself output.
+//
+// Beyond row counts, DiffSummary is content-aware: for a table present on
+// both sides with matching column lists, it counts rows added/removed/
+// changed by row identity — needed because two attempts can have equal row
+// counts with different values, and that must never report "same". A table
+// whose column list differs between sides is reported (with row counts) but
+// not compared, since row identity has no defined meaning across a schema
+// change.
+//
+// Row identity is chosen per table, and recorded in TableDiff.Key:
+//
+//   - The table's declared PRIMARY KEY, but only when it is actually unique
+//     on BOTH sides ("pk"). SQLite allows a declared PK on an ordinary
+//     rowid table to contain duplicate rows when a key component is NULL —
+//     a long-standing legacy quirk, not a defect in the caller's schema —
+//     so an unverified PK would silently undercount Added/Removed/Changed.
+//   - Otherwise (no PK, or a PK that isn't unique on one or both sides),
+//     the table's own internal rowid ("rowid"), referenced through
+//     whichever of the aliases rowid/oid/_rowid_ is not itself the name of
+//     a user column on that table (a WITHOUT ROWID table always has a
+//     unique PK, so it never reaches this branch).
+//   - If the PK isn't usable AND all three rowid aliases are shadowed by
+//     user columns, there is no row identity left to compare by at all:
+//     the table is reported with row counts only (Comparable=false,
+//     Key=""), and Status is "changed" or "same" purely by row count.
+//
+// Both sides are opened through ONE connection: the left path is opened
+// read-only/immutable (see TableRowCounts's doc comment for why those URI
+// flags are real, SQLite-enforced guarantees), and the right path is
+// ATTACHed to that same connection under the read-only/immutable URI too —
+// ATTACH DATABASE is per-connection, so database/sql's pooling is pinned to
+// a single connection (SetMaxOpenConns(1)) to guarantee every query in this
+// call sees the attachment.
 func DiffSummary(leftPath, rightPath string) ([]TableDiff, error) {
-	left, err := TableRowCounts(leftPath)
+	ldsn, err := roDSN(leftPath)
 	if err != nil {
 		return nil, fmt.Errorf("ops: diff summary: left: %w", err)
 	}
-	right, err := TableRowCounts(rightPath)
+	rdsn, err := roDSN(rightPath)
 	if err != nil {
 		return nil, fmt.Errorf("ops: diff summary: right: %w", err)
 	}
-
-	names := make(map[string]struct{}, len(left)+len(right))
-	for t := range left {
-		names[t] = struct{}{}
+	db, err := sql.Open("sqlite3", ldsn)
+	if err != nil {
+		return nil, fmt.Errorf("ops: diff summary: open left: %w", err)
 	}
-	for t := range right {
+	defer db.Close()
+	// One connection: ATTACH is per-connection, and database/sql would
+	// otherwise hand later queries a connection without the attachment.
+	db.SetMaxOpenConns(1)
+	if _, err := db.Exec("ATTACH DATABASE ? AS r", rdsn); err != nil {
+		return nil, fmt.Errorf("ops: diff summary: attach right: %w", err)
+	}
+
+	lt, err := listTables(db, "main")
+	if err != nil {
+		return nil, fmt.Errorf("ops: diff summary: left tables: %w", err)
+	}
+	rt, err := listTables(db, "r")
+	if err != nil {
+		return nil, fmt.Errorf("ops: diff summary: right tables: %w", err)
+	}
+	names := map[string]struct{}{}
+	inL, inR := map[string]bool{}, map[string]bool{}
+	for _, t := range lt {
 		names[t] = struct{}{}
+		inL[t] = true
+	}
+	for _, t := range rt {
+		names[t] = struct{}{}
+		inR[t] = true
 	}
 	sorted := make([]string, 0, len(names))
 	for t := range names {
@@ -214,9 +455,232 @@ func DiffSummary(leftPath, rightPath string) ([]TableDiff, error) {
 
 	out := make([]TableDiff, 0, len(sorted))
 	for _, t := range sorted {
-		l, lok := left[t]
-		r, rok := right[t]
-		out = append(out, TableDiff{Table: t, LeftExists: lok, RightExists: rok, Left: l, Right: r})
+		d := TableDiff{Table: t, LeftExists: inL[t], RightExists: inR[t]}
+		qt := quoteIdent(t)
+		if d.LeftExists {
+			if d.Left, err = countQ(db, "SELECT count(*) FROM main."+qt); err != nil {
+				return nil, fmt.Errorf("ops: diff summary: counting left %s: %w", t, err)
+			}
+		}
+		if d.RightExists {
+			if d.Right, err = countQ(db, "SELECT count(*) FROM r."+qt); err != nil {
+				return nil, fmt.Errorf("ops: diff summary: counting right %s: %w", t, err)
+			}
+		}
+		switch {
+		case !d.LeftExists:
+			d.Status = "added"
+		case !d.RightExists:
+			d.Status = "removed"
+		default:
+			li, err := readTableInfo(db, "main", t)
+			if err != nil {
+				return nil, fmt.Errorf("ops: diff summary: schema of left %s: %w", t, err)
+			}
+			ri, err := readTableInfo(db, "r", t)
+			if err != nil {
+				return nil, fmt.Errorf("ops: diff summary: schema of right %s: %w", t, err)
+			}
+			d.SchemaChanged = li.schema != ri.schema
+			if !slices.Equal(li.cols, ri.cols) {
+				d.Status = "changed" // columns differ: rows are not comparable
+				break
+			}
+			d.Comparable = true
+
+			// Identity: the declared PK if unique on both sides, else the
+			// table's internal rowid via an unshadowed alias — see
+			// DiffSummary's doc comment. Row identity for EXCEPT includes
+			// the key so a row moving to a new key counts as
+			// removed+added, consistent with the anti-joins.
+			key := li.pk
+			keyKind := ""
+			if len(key) > 0 {
+				lUniq, err := isKeyUnique(db, "main", t, key)
+				if err != nil {
+					return nil, fmt.Errorf("ops: diff summary: pk uniqueness of left %s: %w", t, err)
+				}
+				rUniq, err := isKeyUnique(db, "r", t, key)
+				if err != nil {
+					return nil, fmt.Errorf("ops: diff summary: pk uniqueness of right %s: %w", t, err)
+				}
+				if lUniq && rUniq {
+					keyKind = "pk"
+				}
+			}
+			if keyKind == "" {
+				if alias := rowidAlias(li.cols); alias != "" {
+					key = []string{alias}
+					keyKind = "rowid"
+				}
+			}
+			if keyKind == "" {
+				// No usable identity: the PK is missing or non-unique on
+				// at least one side, and rowid/oid/_rowid_ are all
+				// shadowed by user columns. Row-level comparison is
+				// undefined; fall back to a row-count-only verdict.
+				d.Comparable = false
+				if d.Left != d.Right {
+					d.Status = "changed"
+				} else {
+					d.Status = "same"
+				}
+				break
+			}
+			d.Key = keyKind
+
+			// The EXCEPT projection is built from the explicit,
+			// double-quoted table_info column names — never "*". SQLite's
+			// PRAGMA table_info hides a GENERATED ALWAYS column, but
+			// `SELECT *` includes it; if only one side has such a column,
+			// "*" would give the two SELECTs a different number of result
+			// columns and EXCEPT itself would fail ("SELECTs to the left
+			// and right of EXCEPT do not have the same number of result
+			// columns"), killing the whole summary. li.cols/ri.cols are
+			// already confirmed equal above, so either side's list works.
+			quotedCols := make([]string, len(li.cols))
+			for i, c := range li.cols {
+				quotedCols[i] = quoteIdent(c)
+			}
+			selectList := strings.Join(quotedCols, ", ")
+			if keyKind == "rowid" {
+				selectList = quoteIdent(key[0]) + ", " + selectList
+			}
+			var conds []string
+			for _, k := range key {
+				conds = append(conds, "x."+quoteIdent(k)+" IS l."+quoteIdent(k))
+			}
+			where := strings.Join(conds, " AND ")
+			if d.Removed, err = countQ(db, "SELECT count(*) FROM main."+qt+" AS l WHERE NOT EXISTS (SELECT 1 FROM r."+qt+" AS x WHERE "+where+")"); err != nil {
+				return nil, fmt.Errorf("ops: diff summary: removed rows in %s: %w", t, err)
+			}
+			if d.Added, err = countQ(db, "SELECT count(*) FROM r."+qt+" AS l WHERE NOT EXISTS (SELECT 1 FROM main."+qt+" AS x WHERE "+where+")"); err != nil {
+				return nil, fmt.Errorf("ops: diff summary: added rows in %s: %w", t, err)
+			}
+			lNotR, err := countQ(db, "SELECT count(*) FROM (SELECT "+selectList+" FROM main."+qt+" EXCEPT SELECT "+selectList+" FROM r."+qt+")")
+			if err != nil {
+				return nil, fmt.Errorf("ops: diff summary: changed rows in %s: %w", t, err)
+			}
+			d.Changed = lNotR - d.Removed
+			if d.Changed < 0 {
+				d.Changed = 0
+			}
+			if d.Added+d.Removed+d.Changed > 0 || d.SchemaChanged {
+				d.Status = "changed"
+			} else {
+				d.Status = "same"
+			}
+		}
+		out = append(out, d)
 	}
 	return out, nil
+}
+
+// FormatDiffSummary renders a DiffReport as an aligned table plus the
+// totals line. The two count columns are headered with the caller's own
+// labels (the raw target strings) so the table is self-describing away
+// from the "left: ... right: ..." line the CLI prints above it. A table
+// with SchemaChanged set (its CREATE statement differs between sides,
+// whether or not the column lists still match) has its STATUS cell
+// suffixed with " (schema)" so that case is visible without inspecting the
+// JSON. Shared by the CLI and offshoot_diff.
+func FormatDiffSummary(w io.Writer, rep DiffReport, leftLabel, rightLabel string) error {
+	tw := tabwriter.NewWriter(w, 0, 4, 2, ' ', 0)
+	fmt.Fprintf(tw, "TABLE\t%s\t%s\tADDED\tREMOVED\tCHANGED\tSTATUS\n", leftLabel, rightLabel)
+	for _, d := range rep.Tables {
+		l, r := "-", "-"
+		if d.LeftExists {
+			l = fmt.Sprintf("%d", d.Left)
+		}
+		if d.RightExists {
+			r = fmt.Sprintf("%d", d.Right)
+		}
+		a, rm, c := "-", "-", "-"
+		if d.Comparable {
+			a, rm, c = fmt.Sprintf("%d", d.Added), fmt.Sprintf("%d", d.Removed), fmt.Sprintf("%d", d.Changed)
+		}
+		status := d.Status
+		if d.SchemaChanged {
+			status += " (schema)"
+		}
+		fmt.Fprintf(tw, "%s\t%s\t%s\t%s\t%s\t%s\t%s\n", d.Table, l, r, a, rm, c, status)
+	}
+	if err := tw.Flush(); err != nil {
+		return err
+	}
+	_, err := fmt.Fprintf(w, "%d tables: %d same, %d changed, %d added, %d removed\n",
+		len(rep.Tables), rep.Totals.Same, rep.Totals.Changed, rep.Totals.Added, rep.Totals.Removed)
+	return err
+}
+
+// ErrSqldiffMissing is returned (wrapped) by Sqldiff when the external
+// sqldiff binary is not on PATH. sqldiff ships separately from the sqlite3
+// CLI; callers turn this into a per-surface hint (the CLI names the
+// package, the daemon and MCP name --summary/the summary as the
+// sqldiff-free alternative).
+var ErrSqldiffMissing = errors.New("sqldiff not found on PATH")
+
+// DefaultSqldiffMaxBytes bounds a full SQL diff carried over the wire.
+const DefaultSqldiffMaxBytes = 1 << 20
+
+// Sqldiff runs `sqldiff [--table T] leftPath rightPath` and streams its
+// stdout to w. stderr is captured into the returned error.
+func Sqldiff(leftPath, rightPath, table string, w io.Writer) error {
+	if _, err := exec.LookPath("sqldiff"); err != nil {
+		return fmt.Errorf("ops: diff: %w", ErrSqldiffMissing)
+	}
+	args := []string{}
+	if table != "" {
+		args = append(args, "--table", table)
+	}
+	args = append(args, leftPath, rightPath)
+	cmd := exec.Command("sqldiff", args...)
+	var stderr bytes.Buffer
+	cmd.Stdout = w
+	cmd.Stderr = &stderr
+	if err := cmd.Run(); err != nil {
+		if errors.Is(err, errSqldiffCapReached) {
+			return nil
+		}
+		return fmt.Errorf("ops: diff: sqldiff: %w: %s", err, strings.TrimSpace(stderr.String()))
+	}
+	return nil
+}
+
+var errSqldiffCapReached = errors.New("sqldiff output cap reached")
+
+// cappedWriter stops accepting bytes after max, reporting truncation.
+type cappedWriter struct {
+	buf       bytes.Buffer
+	max       int
+	truncated bool
+}
+
+func (c *cappedWriter) Write(p []byte) (int, error) {
+	room := c.max - c.buf.Len()
+	if room <= 0 {
+		c.truncated = true
+		return 0, errSqldiffCapReached
+	}
+	if len(p) > room {
+		c.buf.Write(p[:room])
+		c.truncated = true
+		return len(p), errSqldiffCapReached
+	}
+	return c.buf.Write(p)
+}
+
+// SqldiffCapped is Sqldiff into a buffer of at most maxBytes (<= 0 means
+// DefaultSqldiffMaxBytes). truncated reports whether output was cut; the
+// returned text is always a prefix of the full diff.
+func SqldiffCapped(leftPath, rightPath, table string, maxBytes int) (string, bool, error) {
+	if maxBytes <= 0 {
+		maxBytes = DefaultSqldiffMaxBytes
+	}
+	cw := &cappedWriter{max: maxBytes}
+	err := Sqldiff(leftPath, rightPath, table, cw)
+	if err != nil && !cw.truncated {
+		return "", false, err
+	}
+	return cw.buf.String(), cw.truncated, nil
 }

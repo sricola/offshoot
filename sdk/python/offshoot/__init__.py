@@ -1,5 +1,25 @@
 """Python client for offshoot: branchable SQLite over object storage."""
 
-from .client import Branch, CheckpointInfo, Client, Event, OffshootError, Session, connect
+from .client import (
+    Branch,
+    CheckpointInfo,
+    Client,
+    DiffResult,
+    Event,
+    OffshootError,
+    Session,
+    TableDiff,
+    connect,
+)
 
-__all__ = ["Branch", "CheckpointInfo", "Client", "Event", "OffshootError", "Session", "connect"]
+__all__ = [
+    "Branch",
+    "CheckpointInfo",
+    "Client",
+    "DiffResult",
+    "Event",
+    "OffshootError",
+    "Session",
+    "TableDiff",
+    "connect",
+]

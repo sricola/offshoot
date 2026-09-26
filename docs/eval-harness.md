@@ -389,31 +389,31 @@ UPDATE results SET passed=0 WHERE rowid=2;
 
 That's the entire answer: case 2 flipped from passed to failed, one row.
 
-`--summary` needs no `sqldiff` at all, but **read it carefully** — it's a
-row-count diff, not a content diff. Same data, same command, `--summary`
-this time:
+`--summary` needs no `sqldiff` at all, and — unlike a plain row-count
+comparison — it's content-aware: it compares rows by identity (here,
+`results` has no declared primary key, so it falls back to each row's
+internal rowid) and catches the flip even though the row *count* on both
+sides is identical. Same data, same command, `--summary` this time:
 
 ```
 $ offshoot diff evals@attempt-passed@done evals@attempt-failed@done --summary
 left:  evals@attempt-passed@done right: evals@attempt-failed@done
-TABLE    evals@attempt-passed@done  evals@attempt-failed@done  STATUS
-results  3                          3                          same
-1 tables: 1 same, 0 changed, 0 added, 0 removed
+TABLE    evals@attempt-passed@done  evals@attempt-failed@done  ADDED  REMOVED  CHANGED  STATUS
+results  3                          3                          0      0        1        changed
+1 tables: 0 same, 1 changed, 0 added, 0 removed
 ```
 
-Both sides have 3 rows in `results`, so `--summary` reports `same` — which
-is *true at the row-count level* and *misses the actual regression* (case 2
-flipped). This is the exact failure mode `--summary`'s own docs warn about
-(row count only, not values); it's a fast triage tool for "did anything
-change at all," not a substitute for the default `sqldiff` mode when you
-need to know what. Reach for `--summary` first when comparing many
-attempts' shapes cheaply; reach for the default mode the moment you need to
-know *which* rows moved.
+`results` reports `changed` with `CHANGED 1` — `--summary` caught the
+regression on its own, without shelling out to `sqldiff`. It just can't
+tell you *which* row or *what* changed the way the default mode's
+`UPDATE results SET passed=0 WHERE rowid=2;` does; reach for `--summary`
+first when comparing many attempts' shapes cheaply, and the default
+`sqldiff` mode (optionally with `--table results` to scope it) the moment
+you need to know exactly which rows moved and how.
 
-That row-count-only comparison also means `--summary` still catches a
-*structural* difference — a whole table present on one side and missing on
-the other — even though it can't see value-level changes. One more table,
-checked into `attempt-passed` only, to show what that looks like for real:
+`--summary` also catches a *structural* difference — a whole table present
+on one side and missing on the other. One more table, checked into
+`attempt-passed` only, to show what that looks like for real:
 
 ```
 sqlite3 "$(offshoot checkout evals@attempt-passed)" "CREATE TABLE scratch (note TEXT); INSERT INTO scratch VALUES ('local notes, never checked in');"
@@ -423,10 +423,10 @@ offshoot diff evals@attempt-passed@done2 evals@attempt-failed@done --summary
 
 ```
 left:  evals@attempt-passed@done2 right: evals@attempt-failed@done
-TABLE    evals@attempt-passed@done2  evals@attempt-failed@done  STATUS
-results  3                           3                          same
-scratch  1                           -                          removed
-2 tables: 1 same, 0 changed, 0 added, 1 removed
+TABLE    evals@attempt-passed@done2  evals@attempt-failed@done  ADDED  REMOVED  CHANGED  STATUS
+results  3                           3                          0      0        1        changed
+scratch  1                           -                          -      -        -        removed
+2 tables: 0 same, 1 changed, 0 added, 1 removed
 ```
 
 `scratch` exists on the left (`attempt-passed`) and not on the right

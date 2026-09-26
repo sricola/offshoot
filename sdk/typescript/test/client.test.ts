@@ -610,6 +610,35 @@ test("export: misses a session's unflushed writes", async (t: TestContext) => {
   }
 });
 
+test("diff: content-aware summary over the wire, no sqldiff", async (t: TestContext) => {
+  if (!canRun) {
+    t.skip("go and/or sqlite3 not on PATH");
+    return;
+  }
+  const c = await connect(fixture!.sock);
+  try {
+    await c.create("diff-app");
+    const s = await c.open("diff-app");
+    sqlite3(s.path, "CREATE TABLE results (id INTEGER PRIMARY KEY, passed INT); INSERT INTO results VALUES (1,1),(2,1),(3,1);");
+    await s.flush("v1");
+    sqlite3(s.path, "UPDATE results SET passed=0 WHERE id=2;");
+    await s.flush("v2");
+    await s.close();
+
+    const res = await c.diff("diff-app@main@v1", "diff-app@main@v2");
+    assert.equal(res.left, "diff-app@main@v1");
+    assert.equal(res.tables.length, 1);
+    assert.equal(res.tables[0].table, "results");
+    assert.equal(res.tables[0].changed, 1);
+    assert.equal(res.tables[0].status, "changed");
+    assert.equal(res.totals.changed, 1);
+    assert.equal(res.full ?? "", "");
+    await assert.rejects(c.diff("diff-app@main@v1", "diff-app@main@v2", { table: "nope" }));
+  } finally {
+    await c.close();
+  }
+});
+
 test("checkoutAt: materializes a separate read-only path", async (t: TestContext) => {
   if (!canRun) {
     t.skip("go and/or sqlite3 not on PATH");

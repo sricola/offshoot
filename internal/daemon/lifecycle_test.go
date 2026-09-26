@@ -1196,3 +1196,70 @@ func TestPromoteKeepsSafetyForkThroughDaemon(t *testing.T) {
 		t.Fatalf("close = %+v", cl)
 	}
 }
+
+// TestDiffOpReturnsContentAwareSummaryOverTheWire: the daemon diff op
+// materializes both sides read-only, returns JSON (never a path), and its
+// summary is content-aware — an UPDATE with unchanged row counts shows as
+// changed=1. full=true with sqldiff present returns capped SQL; without
+// sqldiff it is a clear error, not a silent empty string.
+func TestDiffOpReturnsContentAwareSummaryOverTheWire(t *testing.T) {
+	srv, w := newServer(t)
+	sock := srv.SocketPath()
+	open := call(t, sock, Request{Op: "open", DB: "app", Branch: "main"})
+	if !open.OK {
+		t.Fatalf("open = %+v", open)
+	}
+	sqliteExec(t, open.Checkout, "CREATE TABLE results (id INTEGER PRIMARY KEY, passed INT); INSERT INTO results VALUES (1,1),(2,1),(3,1);")
+	if r := call(t, sock, Request{Op: "flush", DB: "app", Branch: "main", Name: "v1"}); !r.OK {
+		t.Fatalf("flush v1 = %+v", r)
+	}
+	sqliteExec(t, open.Checkout, "UPDATE results SET passed=0 WHERE id=2;")
+	if r := call(t, sock, Request{Op: "flush", DB: "app", Branch: "main", Name: "v2"}); !r.OK {
+		t.Fatalf("flush v2 = %+v", r)
+	}
+	if r := call(t, sock, Request{Op: "close", DB: "app", Branch: "main"}); !r.OK {
+		t.Fatalf("close = %+v", r)
+	}
+	_ = w
+
+	r := call(t, sock, Request{Op: "diff", Left: "app@main@v1", Right: "app@main@v2"})
+	if !r.OK || r.Diff == nil {
+		t.Fatalf("diff = %+v", r)
+	}
+	if r.Diff.Left != "app@main@v1" || r.Diff.Right != "app@main@v2" || len(r.Diff.Tables) != 1 {
+		t.Fatalf("diff result = %+v", r.Diff)
+	}
+	res := r.Diff.Tables[0]
+	if res.Table != "results" || res.Left != 3 || res.Right != 3 || res.Changed != 1 || res.Status != "changed" {
+		t.Fatalf("results = %+v, want 3/3 rows, changed=1", res)
+	}
+	if r.Diff.Totals.Changed != 1 || r.Diff.Full != "" {
+		t.Fatalf("totals/full = %+v", r.Diff)
+	}
+
+	// table filter
+	r = call(t, sock, Request{Op: "diff", Left: "app@main@v1", Right: "app@main@v2", Table: "nope"})
+	if r.OK {
+		t.Fatalf("unknown table must be an error, got %+v", r)
+	}
+
+	// full: depends on sqldiff availability on this host
+	r = call(t, sock, Request{Op: "diff", Left: "app@main@v1", Right: "app@main@v2", Full: true, MaxBytes: 12})
+	if _, err := exec.LookPath("sqldiff"); err != nil {
+		if r.OK || !strings.Contains(r.Error, "sqldiff") {
+			t.Fatalf("without sqldiff, full must be a clear error: %+v", r)
+		}
+	} else {
+		if !r.OK || !r.Diff.Truncated || len(r.Diff.Full) != 12 {
+			t.Fatalf("full capped at 12 bytes: %+v", r.Diff)
+		}
+	}
+
+	// bad shapes
+	if r := call(t, sock, Request{Op: "diff", Left: "a@b@c@d", Right: "app"}); r.OK {
+		t.Fatal("malformed target must be an error")
+	}
+	if r := call(t, sock, Request{Op: "diff", Left: "app", Right: "app", MaxBytes: 9 << 20}); r.OK {
+		t.Fatal("max_bytes above the ceiling must be an error")
+	}
+}

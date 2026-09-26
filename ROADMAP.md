@@ -193,9 +193,11 @@ PyPI/npm/registry button-presses — see their own ⏸ bullets below.
   (`offshoot_fork`/`offshoot_checkpoint` taking a caller-supplied `meta`)
   stayed out of scope for this task — see [docs/status.md](docs/status.md).
 - ✅ **Branch diff.** `offshoot diff a@x b@y` wrapping sqldiff over two
-  materializations; the daily "attempt-2 passed, attempt-3 failed, what
-  changed?" loop. Shipped, CLI-only per the task's own scope (no daemon op,
-  no SDK parity) — see [docs/diff.md](docs/diff.md).
+  materializations, plus a content-aware `--summary` (rows added/removed/
+  changed by primary key or rowid, schema changes flagged); the daily
+  "attempt-2 passed, attempt-3 failed, what changed?" loop. Shipped
+  everywhere: CLI, a daemon `diff` op, SDK `diff()` in both languages, and
+  the MCP tool `offshoot_diff` — see [docs/diff.md](docs/diff.md).
 - ✅ **Framework recipes, not adapters.** The ThreadForks pattern (thread →
   branch, checkpoint-id → checkpoint) documented once and applied as short
   recipes: [Claude agent SDK hooks](docs/recipes/claude-agent-sdk.md),

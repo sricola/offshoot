@@ -44,15 +44,42 @@ version if you depend on format stability.
 - **Cursor one-click install link** for `offshoot mcp`
   (`https://cursor.com/en/install-mcp?...`, which hands off to the Cursor
   app), alongside the existing `claude mcp add` command.
+- **Content-aware `offshoot diff --summary`.** Rather than a bare row-count
+  comparison, `--summary` now counts rows added/removed/changed per table
+  by row identity — the table's declared primary key when it's actually
+  unique on both sides, otherwise its internal rowid — and flags schema
+  changes; a table whose column list differs between the two sides is
+  reported, with row counts, but not compared. `offshoot diff ... --table
+  T` restricts either mode (the default `sqldiff` or `--summary`) to one
+  table.
+- **Daemon `diff` op.** `left`, `right`, `table`, `full`, `max_bytes`
+  request fields; a `diff` response object carrying the same content-aware
+  summary as JSON, plus capped `sqldiff` SQL when `full` is set (0 =
+  1 MiB default cap, 8 MiB ceiling). Allowed over the HTTP surface, unlike
+  `export`, since it never returns a filesystem path.
+- **SDK `diff()`, both languages.** Python `diff(left, right, *,
+  table=None, full=False, max_bytes=None) -> DiffResult`; TypeScript
+  `diff(left, right, opts)` with `DiffOptions{table?, full?, maxBytes?}`.
+- **`offshoot_diff` MCP tool** (the ninth tool). Read-only; `database`,
+  `left`, `right` as `branch[@checkpoint]`, `table?`, `full?`, `max_bytes?`
+  (default 32768, at most 262144) — compares two branches or checkpoints of
+  one database to decide which attempt to promote.
 
 ### Changed
 
-- Docs updated for the eight-tool MCP surface: `README.md`,
+- Docs updated for the nine-tool MCP surface: `README.md`,
   `docs/agents.md`, `docs/reference.md`, `docs/status.md`, and
   `docs/demo/mcp-walkthrough.md` (its `tools/list` transcript re-captured
-  from a real `offshoot mcp` run) now describe annotations,
-  `structuredContent`, `meta`, and `offshoot_touch`, and document all three
+  from a real `offshoot mcp` run, twice — once for `offshoot_touch`, again
+  for `offshoot_diff`) now describe annotations, `structuredContent`,
+  `meta`, and `offshoot_touch`/`offshoot_diff`, and document all three
   install paths (`claude mcp add`, the Claude Code plugin, and Cursor).
+- `offshoot diff --summary`'s output gained `ADDED`/`REMOVED`/`CHANGED`
+  columns: it's now a content-aware per-table comparison (rows added,
+  removed, and changed by primary key or rowid, with schema changes
+  flagged), not a bare row-count diff — `STATUS` for a comparable table is
+  `same`/`changed` based on those counts (plus a schema change), suffixed
+  " (schema)" when the schema itself changed.
 
 ## [0.2.10] - 2026-09-25
 

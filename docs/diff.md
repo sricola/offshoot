@@ -14,7 +14,7 @@ manual steps and adds a `sqldiff`-free `--summary` mode.
 ## `offshoot diff`
 
 ```
-offshoot diff <db>[@branch[@checkpoint]] <db>[@branch[@checkpoint]] [--summary]
+offshoot diff <db>[@branch[@checkpoint]] <db>[@branch[@checkpoint]] [--summary] [--table T]
 ```
 
 Each side is parsed the same triple-`@` target form `offshoot export` uses
@@ -46,8 +46,8 @@ side) straight to stdout.
 Before either mode's own output, `offshoot diff` always prints one header
 line naming which raw target string is which side — the only place either
 mode ever repeats what you typed, so it's the one anchor tying "left"/
-"right" (or, in `--summary`, a bare row-count column) back to an actual
-`db@branch[@checkpoint]`:
+"right" (or, in `--summary`, a bare row-count column header) back to an
+actual `db@branch[@checkpoint]`:
 
 ```
 left:  evals@attempt-1@done right: evals@attempt-2@done
@@ -65,7 +65,7 @@ sqldiff ships separately from the sqlite3 CLI. Install it:
   sudo apt-get install sqlite3-tools   # Debian/Ubuntu: sqldiff ships in this separate package
 
 Or skip sqldiff entirely with 'offshoot diff ... --summary' for a
-table-level row-count comparison instead
+content-aware per-table summary (added/removed/changed rows) instead
 ```
 
 On macOS, the hint is `brew install sqldiff` — verified against a real
@@ -84,10 +84,10 @@ offshoot diff evals@attempt-1@done evals@attempt-2@done --summary
 
 ```
 left:  evals@attempt-1@done right: evals@attempt-2@done
-TABLE     evals@attempt-1@done  evals@attempt-2@done  STATUS
-attempts  12                    12                    same
-results   40                    46                    changed (+6)
-scratch   3                     -                     removed
+TABLE     evals@attempt-1@done  evals@attempt-2@done  ADDED  REMOVED  CHANGED  STATUS
+attempts  12                    12                    0      0        0        same
+results   40                    46                    6      0        0        changed
+scratch   3                     -                     -      -        -        removed
 3 tables: 1 same, 1 changed, 0 added, 1 removed
 ```
 
@@ -96,27 +96,40 @@ scratch   3                     -                     removed
 with 6 more `results` rows and `scratch` dropped entirely.)
 
 `--summary` never shells out to `sqldiff` (or any external binary at all) —
-it lists both sides' tables from `sqlite_master` and counts rows per table
-via `database/sql` + the `mattn/go-sqlite3` driver this binary is already
-built with, opened strictly read-only (`file:<path>?mode=ro&immutable=1` —
+it lists both sides' tables from `sqlite_master` and, for a table present on
+both sides with matching columns, counts rows added/removed/changed by row
+identity (the table's declared primary key when it's actually unique on
+both sides, otherwise the table's own internal rowid — see
+[docs/reference.md](reference.md) for the exact fallback order). Rowid
+identity is meaningful when both sides descend from one seed and rowids
+were not renumbered (a `VACUUM` on a table without an `INTEGER PRIMARY
+KEY`, or a cross-database diff); otherwise it over-reports changes, which
+is the safe direction for a promote decision. Row counting itself is via
+`database/sql` + the `mattn/go-sqlite3` driver this binary is already built
+with, opened strictly read-only (`file:<path>?mode=ro&immutable=1` —
 verified against a `chmod 0444` file, the exact permission `checkout --at
 --read-only`/the internal read-only cache produce). Useful when `sqldiff`
-isn't installed, or when you just want a quick "did anything change, and
-roughly how much" answer before reaching for the full SQL diff.
+isn't installed, or when you just want a per-table breakdown of what moved
+before reaching for the full SQL diff.
 
 Each table gets one row: its name, each side's row count (`-` when the
-table doesn't exist on that side at all), and a status — `added`/`removed`
-for a table on only one side, `changed (+N)`/`changed (-N)` for a
-differing row count, `same` otherwise. A trailing totals line answers "did
+table doesn't exist on that side at all), the ADDED/REMOVED/CHANGED row
+counts (`-` when the table isn't comparable — added/removed wholesale, or a
+schema mismatch), and a status — `added`/`removed` for a table on only one
+side, `changed` when any row was added, removed, or changed (or the
+table's schema changed — the STATUS cell then gets a trailing
+" (schema)"), `same` otherwise. A trailing totals line answers "did
 anything change" without counting rows of output. The two count columns are
 headered with the raw target strings themselves (not bare `LEFT`/`RIGHT`),
 matching the `left: ... right: ...` line above — a reader scanning just the
 table never has to scroll back up to know which count is which side.
 
-**Note:** `--summary` is a row-count diff, not a content diff — a table
-with the same row count on both sides but different *values* still reports
-`same`. Reach for the default `sqldiff` mode when you need to know exactly
-which rows changed.
+**Note:** a table whose column list differs between the two sides is
+reported — with row counts — but not compared (row identity has no defined
+meaning across a schema change); its ADDED/REMOVED/CHANGED cells read `-`
+and its STATUS is `changed`. Pass `--table <name>` to restrict either mode
+to one table — useful for drilling into exactly the table `--summary`
+flagged before reaching for the default `sqldiff` mode on just that table.
 
 ### How each side is materialized (and the staleness rule)
 
