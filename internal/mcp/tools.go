@@ -29,6 +29,22 @@ type OffshootTools struct {
 	// explicit `ttl:"<duration>"` always wins over it too — see
 	// resolveForkTTL.
 	defaultTTL time.Duration
+	// allowForce gates an agent-supplied `force` against a PROTECTED branch
+	// in promote/destroy: false (the default) refuses it outright, before
+	// any mutation, regardless of ops' own force handling; true lets it
+	// through to ops as before. See SetAllowForce.
+	allowForce bool
+}
+
+// SetAllowForce sets whether this tool set honors an agent-supplied `force`
+// against a protected branch in offshoot_promote/offshoot_destroy. The
+// zero-value OffshootTools has this false: an MCP agent cannot force onto
+// or destroy a protected branch (main, by default) unless the operator
+// running this server opted in, e.g. via `offshoot mcp -allow-force` (see
+// cmd/offshoot/main.go). Force against an UNPROTECTED branch never needed
+// this flag and is unaffected either way.
+func (t *OffshootTools) SetAllowForce(v bool) {
+	t.allowForce = v
 }
 
 // NewOffshootTools binds a tool set to a workspace, store spec, and daemon
@@ -193,6 +209,41 @@ func (t *OffshootTools) refuseIfSessionOpen(db, branch, opName string) (ToolResu
 	}
 	return ErrorResult("a daemon session (holder %q) is open on %s@%s; close it before %s — "+
 		"e.g. `offshoot session close %s@%s`", info.Holder, db, branch, opName, db, branch), true
+}
+
+// refuseForceOnProtected implements the -allow-force gate for promote
+// (branch is the TARGET) and destroy (branch is the branch being
+// destroyed): an agent-supplied force is honored as-is once this server was
+// started with -allow-force (SetAllowForce(true)), same as before this
+// gate existed. Without that flag, force against a PROTECTED branch is
+// refused here — before either handler calls into ops, i.e. before any
+// mutation — rather than left to ops' own protected-only force check.
+// Force against an UNPROTECTED branch is accepted but downgraded to false
+// in effectiveForce: ops' own force gate only ever looks at it when the
+// branch is protected, so passing the caller's raw force through here would
+// be a no-op at best.
+//
+// If refused is true, res is the ToolResult the caller should return
+// immediately. Otherwise effectiveForce is what the caller should pass to
+// ops in place of the raw argument.
+//
+// A GetRef failure (e.g. no such branch) is not this gate's business — it
+// lets force through unchanged so the real error surfaces from the
+// downstream ops call, exactly as it would have without this gate.
+func (t *OffshootTools) refuseForceOnProtected(db, branch string, force bool) (res ToolResult, refused bool, effectiveForce bool) {
+	if !force || t.allowForce {
+		return ToolResult{}, false, force
+	}
+	ref, _, err := t.ws.Store.GetRef(db, branch)
+	if err != nil {
+		return ToolResult{}, false, force
+	}
+	if ref.Protected {
+		return ErrorResult("%s@%s is protected and this MCP server does not allow force "+
+			"(start it with `offshoot mcp -allow-force` to permit it). Ask the human to "+
+			"promote/destroy from the CLI, or work on a fork.", db, branch), true, false
+	}
+	return ToolResult{}, false, false
 }
 
 // prop describes one property of a tool's JSON Schema input: its argument
@@ -377,8 +428,9 @@ func (t *OffshootTools) Tools() []Tool {
 				"target. Call this once " +
 				"you've validated a forked attempt and are ready to make it the branch " +
 				"of record. Protected branches (main is protected by default) refuse promotion " +
-				"unless `force` is set — treat that refusal as confirmation you need, " +
-				"not a bug. If a daemon session is open on the TARGET branch, the call " +
+				"unless `force` is set AND the server was started with -allow-force; " +
+				"otherwise the refusal means: ask the human to promote from the CLI, or " +
+				"work on a fork. If a daemon session is open on the TARGET branch, the call " +
 				"is refused instead of proceeding — `force` does not override this — " +
 				"since promoting repoints the target's storage out from under a session " +
 				"the daemon still believes it owns; close the session first (e.g. " +
@@ -394,8 +446,9 @@ func (t *OffshootTools) Tools() []Tool {
 			Name: "offshoot_destroy",
 			Description: "Permanently discard a branch and its checkout. Call this to " +
 				"clean up a failed or abandoned attempt once you're done with it. " +
-				"Protected branches refuse destruction unless `force` is set — treat " +
-				"that refusal as confirmation you need, not a bug. If a daemon session " +
+				"Protected branches refuse destruction unless `force` is set AND the " +
+				"server was started with -allow-force; otherwise the refusal means: " +
+				"ask the human to destroy from the CLI, or work on a fork. If a daemon session " +
 				"is open on this branch, the call is refused instead of proceeding — " +
 				"`force` does not override this — since destroy deletes the branch's " +
 				"storage out from under a session the daemon still believes it owns; " +
@@ -922,6 +975,11 @@ func (t *OffshootTools) promote(args json.RawMessage) (ToolResult, error) {
 	if r, refused := t.refuseIfSessionOpen(a.Database, a.Target, "promoting onto it"); refused {
 		return r, nil
 	}
+	r, refused, eff := t.refuseForceOnProtected(a.Database, a.Target, a.Force)
+	if refused {
+		return r, nil
+	}
+	a.Force = eff
 	// The safety fork's TTL follows the configured fork default when one is
 	// set (the same "every agent-made branch expires" policy offshoot_fork
 	// applies), else ops.DefaultPromoteBackupTTL.
@@ -965,6 +1023,11 @@ func (t *OffshootTools) destroy(args json.RawMessage) (ToolResult, error) {
 	if r, refused := t.refuseIfSessionOpen(a.Database, a.Branch, "destroying it"); refused {
 		return r, nil
 	}
+	r, refused, eff := t.refuseForceOnProtected(a.Database, a.Branch, a.Force)
+	if refused {
+		return r, nil
+	}
+	a.Force = eff
 	if err := t.ws.Destroy(a.Database, a.Branch, a.Force); err != nil {
 		return ErrorResult("%v", err), nil
 	}

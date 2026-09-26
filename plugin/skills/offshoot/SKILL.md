@@ -29,7 +29,9 @@ SQLite client opens. You have nine tools; the loop is four calls.
 6. **Promote the winner:** `offshoot_promote {database, source, target, force?}`
    repoints `target` (often `main`) at `source`'s head. Protected targets
    refuse without `force`; that refusal is confirmation you need, not a bug.
-   The target's previous head is kept as `<target>-pre-promote` — the result
+   A protected branch cannot be forced through MCP unless the operator
+   started `offshoot mcp -allow-force`; ask the human, who can promote from
+   the CLI. The target's previous head is kept as `<target>-pre-promote` — the result
    names it — so a promote is undone by promoting that fork back. That
    safety fork always carries a TTL (24h by default) and is one rolling
    slot per target, replaced by the next promote onto that target, so the

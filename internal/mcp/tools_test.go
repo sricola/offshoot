@@ -151,10 +151,85 @@ func TestProtectedBranchRefusalReachesTheAgent(t *testing.T) {
 		!strings.Contains(strings.ToLower(text(r)), "force") {
 		t.Fatalf("refusal must tell the agent what to do: %s", text(r))
 	}
-	// With force it succeeds.
+	// With force it succeeds, once this server opts in to honoring it.
+	ts.SetAllowForce(true)
 	if r := call(t, ts, "offshoot_promote", map[string]any{
 		"database": "app", "source": "attempt-1", "target": "main", "force": true}); r.IsError {
 		t.Fatalf("forced promote: %s", text(r))
+	}
+}
+
+// TestMCPRefusesForceOnProtectedByDefault: with the default server (no
+// SetAllowForce), promote and destroy with force:true onto/of protected
+// main are tool errors that name -allow-force, and main is untouched.
+// After SetAllowForce(true) the same calls proceed. force on an
+// UNprotected branch never needed the flag either way.
+func TestMCPRefusesForceOnProtectedByDefault(t *testing.T) {
+	ts, w := newTools(t)
+	if r := call(t, ts, "offshoot_fork", map[string]any{
+		"database": "app", "new_branch": "attempt-1"}); r.IsError {
+		t.Fatalf("fork: %s", text(r))
+	}
+
+	before, _, err := w.Store.GetRef("app", "main")
+	if err != nil {
+		t.Fatalf("GetRef main: %v", err)
+	}
+
+	// Default server: force onto protected main is refused before any
+	// mutation, and the refusal names -allow-force.
+	r := call(t, ts, "offshoot_promote", map[string]any{
+		"database": "app", "source": "attempt-1", "target": "main", "force": true})
+	if !r.IsError {
+		t.Fatal("forced promote onto protected main must be refused without -allow-force")
+	}
+	if !strings.Contains(text(r), "-allow-force") {
+		t.Fatalf("refusal must name -allow-force: %s", text(r))
+	}
+	after, _, err := w.Store.GetRef("app", "main")
+	if err != nil {
+		t.Fatalf("GetRef main: %v", err)
+	}
+	if after.Lineage != before.Lineage || after.HeadTXID != before.HeadTXID {
+		t.Fatalf("main must be untouched by the refused promote: before=%+v after=%+v", before, after)
+	}
+
+	// Same for destroy of a protected branch.
+	if _, err := w.SetProtected("app", "attempt-1", true); err != nil {
+		t.Fatal(err)
+	}
+	dr := call(t, ts, "offshoot_destroy", map[string]any{
+		"database": "app", "branch": "attempt-1", "force": true})
+	if !dr.IsError {
+		t.Fatal("forced destroy of a protected branch must be refused without -allow-force")
+	}
+	if !strings.Contains(text(dr), "-allow-force") {
+		t.Fatalf("refusal must name -allow-force: %s", text(dr))
+	}
+	if _, _, err := w.Store.GetRef("app", "attempt-1"); err != nil {
+		t.Fatalf("attempt-1 must still exist after the refused destroy: %v", err)
+	}
+
+	// force on an UNprotected branch never needed the flag: fork a second,
+	// unprotected attempt and destroy it with force straight away.
+	if r := call(t, ts, "offshoot_fork", map[string]any{
+		"database": "app", "new_branch": "attempt-2"}); r.IsError {
+		t.Fatalf("fork: %s", text(r))
+	}
+	if r := call(t, ts, "offshoot_destroy", map[string]any{
+		"database": "app", "branch": "attempt-2", "force": true}); r.IsError {
+		t.Fatalf("forced destroy of an unprotected branch needs no -allow-force: %s", text(r))
+	}
+
+	// After SetAllowForce(true), the same protected-branch calls proceed.
+	ts.SetAllowForce(true)
+	if r := call(t, ts, "offshoot_promote", map[string]any{
+		"database": "app", "source": "attempt-1", "target": "main", "force": true}); r.IsError {
+		t.Fatalf("promote with -allow-force: %s", text(r))
+	}
+	if r := call(t, ts, "offshoot_destroy", map[string]any{
+		"database": "app", "branch": "attempt-1", "force": true}); r.IsError {
+		t.Fatalf("destroy with -allow-force: %s", text(r))
 	}
 }
 
@@ -717,6 +792,7 @@ func TestForkTTLSummaryKeepsJanitorNoteWhenReReadFails(t *testing.T) {
 // handle. The description states the mechanism so the model can plan on it.
 func TestPromoteKeepsSafetyForkAndSaysSo(t *testing.T) {
 	ts, w := newTools(t, 2*time.Hour)
+	ts.SetAllowForce(true)
 	if _, err := w.Fork("app", "main", "attempt-1", "", 0, nil); err != nil {
 		t.Fatal(err)
 	}
@@ -877,6 +953,7 @@ func TestToolAnnotationsSerializeOnTheWire(t *testing.T) {
 // Constraints — so this checks structuredContent, not a JSON text block.
 func TestStructuredContentAccompaniesProse(t *testing.T) {
 	ts, w := newTools(t)
+	ts.SetAllowForce(true)
 	if _, err := w.Fork("app", "main", "attempt-1", "", 0, nil); err != nil {
 		t.Fatal(err)
 	}

@@ -117,7 +117,7 @@ Usage:
                                              sensitive). -http-allow-non-loopback
                                              acknowledges binding beyond localhost, and
                                              additionally REQUIRES an explicit token
-  offshoot mcp [-default-ttl d|none] [-socket PATH]
+  offshoot mcp [-default-ttl d|none] [-socket PATH] [-allow-force]
                                              serve the MCP tool set on stdio for an agent;
                                              forked branches get this TTL unless the fork
                                              call overrides it (default 24h; 0/none disables
@@ -128,7 +128,11 @@ Usage:
                                              checkpoint/checkout on a branch with a session
                                              already open there use it for live capture, and
                                              fork rides a reachable daemon session or not;
-                                             everything else still runs entirely at rest
+                                             everything else still runs entirely at rest;
+                                             -allow-force lets offshoot_promote/offshoot_destroy
+                                             honor an agent's force:true against a protected
+                                             branch (main, by default); without it, such a call
+                                             is refused before any mutation — off by default
   offshoot session open <db>[@branch] [-socket PATH]      open a session; prints the checkout path
   offshoot session flush <db>[@branch] [name] [-socket PATH]   flush to a durable snapshot; prints the txid
   offshoot session status [-socket PATH]                  list open sessions and their durable txid
@@ -910,16 +914,18 @@ func run(args []string) error {
 			return fmt.Errorf("unknown lease subcommand %q", rest[0])
 		}
 	case "mcp":
+		const mcpUsage = "usage: offshoot mcp [-default-ttl DURATION|none] [-socket PATH] [-allow-force]"
 		sock, rest, err := socketOverride(rest)
 		if err != nil {
-			return fmt.Errorf("usage: offshoot mcp [-default-ttl DURATION|none] [-socket PATH]: %w", err)
+			return fmt.Errorf("%s: %w", mcpUsage, err)
 		}
 		defaultTTL, rest, err := parseDefaultTTLFlag(rest)
 		if err != nil {
-			return fmt.Errorf("usage: offshoot mcp [-default-ttl DURATION|none] [-socket PATH]: %w", err)
+			return fmt.Errorf("%s: %w", mcpUsage, err)
 		}
+		allowForce, rest := extractBoolFlag(rest, "-allow-force")
 		if len(rest) != 0 {
-			return fmt.Errorf("usage: offshoot mcp [-default-ttl DURATION|none] [-socket PATH]")
+			return fmt.Errorf("%s", mcpUsage)
 		}
 		// sock == "" here (the common case: no -socket given) is resolved by
 		// NewOffshootTools itself via daemon.DefaultSocketPath(spec) — the
@@ -927,6 +933,12 @@ func run(args []string) error {
 		// `offshoot mcp` and a bare `offshoot serve` against the same store
 		// agree on where to look without either side hardcoding the path.
 		ts := mcp.NewOffshootTools(w, spec, defaultTTL, sock)
+		// -allow-force is off by default: without it, an agent's force:true
+		// against a PROTECTED branch (main, by default) is refused by
+		// offshoot_promote/offshoot_destroy before any mutation — see
+		// OffshootTools.SetAllowForce. Force against an unprotected branch
+		// never needed this flag.
+		ts.SetAllowForce(allowForce)
 		srv := mcp.NewServer(os.Stdin, os.Stdout, ts)
 		return srv.Serve(context.Background())
 	case "serve":
