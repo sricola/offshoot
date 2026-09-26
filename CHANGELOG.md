@@ -155,6 +155,38 @@ version if you depend on format stability.
   `offshoot serve` daemon's own janitor (never a second writer against one
   store), logging once that it's skipping its own pass. Runs no GC either
   way — reclaiming storage still needs `offshoot gc` or the daemon.
+- **OpenSSF Scorecard workflow and README badge.** `.github/workflows/scorecard.yml`
+  runs `ossf/scorecard-action` on push to `main`, a weekly cron, and
+  `workflow_dispatch`, publishing results (the badge and the scorecard.dev
+  viewer page) and uploading SARIF to code scanning. The badge shows no
+  score until the workflow's first run on `main` after merge.
+- **Signed and attested releases.** `release.yml` now signs every release
+  tarball with keyless cosign (`<asset>.sigstore.json`, no maintainer-held
+  key), attaches SLSA build provenance (a GitHub attestation plus an
+  `offshoot_<tag>_provenance.intoto.jsonl` release asset), and ships an
+  SPDX SBOM of the Go module graph (`offshoot_<tag>.spdx.json`) with its
+  own attestation. The `docker` job cosign-signs the GHCR image digest and
+  pushes a provenance attestation alongside it. A "Verify what you
+  downloaded" recipe (`gh attestation verify`, `cosign verify-blob`,
+  `cosign verify`/`gh attestation verify oci://` for the image) is in
+  `docs/installation.md`, linked from `SECURITY.md` and `docs/testing.md`.
+  Releases before v0.2.11 remain checksum-only.
+- **`cmd/branchbench` and `make bench-branchbench`.** Re-runs BranchBench's
+  ([arXiv:2604.17180](https://arxiv.org/abs/2604.17180)) five macrobenchmark
+  topologies — `simulation`, `data_cleaning`, `software_dev`, `mcts`,
+  `failure_repro` — against a local offshoot store, each workflow getting
+  its own fresh store. `go test ./cmd/branchbench` runs all five at
+  `-quick` scale as part of the normal suite; `docs/benchmarks.md`'s new
+  "BranchBench topologies (v0.2.11)" section has one pasted full-scale run
+  (2,310/2,310 worker-steps, 0 CAS retries) alongside BranchBench's own
+  published hosted-Postgres-family numbers for context.
+- **README first screen and the testing page as a launch artifact.** The
+  README's first screen now leads with Install, then "see it run", then
+  the stability paragraph, then the quickstart, instead of quickstart
+  first. `docs/testing.md` gained an "At a glance" evidence table, a
+  "Signed releases" section, and a "What is not proven here" section
+  naming this project's own testing gaps rather than leaving them
+  implicit.
 
 ### Changed
 

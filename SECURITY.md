@@ -10,6 +10,16 @@ very likely already in `main`.
 Once there's a 1.0, this file will get a real support-window table. Until
 then, treat everything as "best effort, latest only."
 
+## Verifying a release
+
+Releases are built and signed in CI, not by hand: every tagged tarball and
+the GHCR image carry a keyless Sigstore signature and SLSA build
+provenance, with no maintainer-held key involved. The identity to pin when
+verifying is the release workflow itself
+(`.github/workflows/release.yml` on `sricola/offshoot`), not a person. See
+the [installation page](docs/installation.md#verify-what-you-downloaded)
+for the exact verification commands.
+
 ## Reporting a vulnerability
 
 **Do not open a public issue for a security report.** Use GitHub's private

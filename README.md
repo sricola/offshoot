@@ -7,9 +7,9 @@
 
 **Branch SQLite like git** — fork-per-attempt databases for AI agents and eval harnesses.<br>Create, fork, checkpoint, rollback, promote — as stock SQLite files, on your storage, with one binary.
 
-[![release](https://img.shields.io/github/v/release/sricola/offshoot?style=flat-square&labelColor=1b1a17&color=3c7a1a)](https://github.com/sricola/offshoot/releases) [![ci](https://img.shields.io/github/actions/workflow/status/sricola/offshoot/ci.yml?branch=main&style=flat-square&labelColor=1b1a17&color=3c7a1a)](https://github.com/sricola/offshoot/actions/workflows/ci.yml) [![license](https://img.shields.io/badge/license-Apache--2.0-3c7a1a?style=flat-square&labelColor=1b1a17)](LICENSE) [![docs](https://img.shields.io/badge/docs-sricola.github.io%2Foffshoot-3c7a1a?style=flat-square&labelColor=1b1a17)](https://sricola.github.io/offshoot/docs/)
+[![release](https://img.shields.io/github/v/release/sricola/offshoot?style=flat-square&labelColor=1b1a17&color=3c7a1a)](https://github.com/sricola/offshoot/releases) [![ci](https://img.shields.io/github/actions/workflow/status/sricola/offshoot/ci.yml?branch=main&style=flat-square&labelColor=1b1a17&color=3c7a1a)](https://github.com/sricola/offshoot/actions/workflows/ci.yml) [![license](https://img.shields.io/badge/license-Apache--2.0-3c7a1a?style=flat-square&labelColor=1b1a17)](LICENSE) [![docs](https://img.shields.io/badge/docs-sricola.github.io%2Foffshoot-3c7a1a?style=flat-square&labelColor=1b1a17)](https://sricola.github.io/offshoot/docs/) [![openssf scorecard](https://img.shields.io/ossf-scorecard/github.com/sricola/offshoot?label=openssf%20scorecard&style=flat-square&labelColor=1b1a17&color=3c7a1a)](https://scorecard.dev/viewer/?uri=github.com/sricola/offshoot)
 
-[Quickstart](#quickstart-60-seconds-no-server-no-bucket) · [Install](#install) · [Daemon](#daemon-mode) · [MCP](#mcp) · [SDKs](#python-sdk) · [Benchmarks](docs/benchmarks.md) · [FAQ](docs/faq.md) · [Roadmap](ROADMAP.md)
+[Install](#install) · [See it run](#see-it-run) · [Quickstart](#quickstart-60-seconds-no-server-no-bucket) · [Daemon](#daemon-mode) · [MCP](#mcp) · [SDKs](#python-sdk) · [Benchmarks](docs/benchmarks.md) · [FAQ](docs/faq.md) · [Roadmap](ROADMAP.md)
 
 `377 B` per shared fork of a 100 MB database  ·  `kill -9` durable  ·  every checkout a stock `.db` file
 
@@ -41,38 +41,38 @@ No merge, no conflict resolution — the winner is promoted whole and the
 losers reap themselves. (That's a design position, not a gap:
 [what offshoot deliberately doesn't do](#what-offshoot-deliberately-doesnt-do).)
 
-## Quickstart (60 seconds, no server, no bucket)
+## Install
 
-    go build -o offshoot ./cmd/offshoot
-    ./offshoot init
-    ./offshoot create app
-    sqlite3 "$(./offshoot checkout app)" "CREATE TABLE users (name); INSERT INTO users VALUES ('ada');"
-    ./offshoot checkpoint app v1
-    ./offshoot fork app attempt-1        # instant branch
-    sqlite3 "$(./offshoot checkout app@attempt-1)" "DELETE FROM users;"   # destructive experiment
-    ./offshoot rollback app@attempt-1 --to fork                        # undo it
-    ./offshoot promote app@attempt-1 --onto main --force               # or ship it
-    ./offshoot status
+```sh
+brew tap sricola/offshoot https://github.com/sricola/offshoot && brew trust sricola/offshoot && brew install offshoot
+# or: go install github.com/sricola/offshoot/cmd/offshoot@latest
+# or: docker run --rm -v offshoot-data:/data ghcr.io/sricola/offshoot:latest init
+```
 
-That's most of the surface already. The full vocabulary, one line each
-(every command and flag: [docs/reference.md](docs/reference.md)):
-
-| Command | What it does |
+| Channel | How |
 |---|---|
-| `create` / `checkout` | new database / materialize a working copy — prints a plain `.db` path |
-| `checkpoint` | snapshot the checkout as a named, rollback-able point |
-| `fork` | branch from head or a checkpoint — instant, copy-on-write, optional `--ttl` |
-| `protect` / `unprotect` | refuse unforced destroy/promote-onto and never reap a branch (`main`, by default) — CLI-only; an MCP agent can't flip it, and can't force past it without the server's `-allow-force` |
-| `rollback` / `promote` | repoint a branch at a checkpoint / repoint a target at a branch's head — each keeps the branch's old head first as a TTL'd safety fork to undo (`<branch>-pre-rollback` / `<target>-pre-promote`, 24h by default, one rolling slot, `--no-backup`/`--backup-ttl` to tune or skip it) |
-| `diff` / `export` | content-aware summary, or sqldiff, between two branches or checkpoints / copy state out to a plain file |
-| `destroy` / `gc` | delete a branch / collect unreachable objects |
-| `serve` / `session` | the daemon: leases, live capture, flush-without-pausing ([below](#daemon-mode)) |
-| `mcp` | the same verbs as MCP tools, for agents ([below](#mcp)) |
+| **Homebrew** | `brew tap sricola/offshoot https://github.com/sricola/offshoot && brew trust sricola/offshoot && brew install offshoot` — recent Homebrew requires the explicit `trust` for third-party taps; the formula lives in-repo at [`Formula/offshoot.rb`](Formula/offshoot.rb) |
+| **Docker** | `docker run --rm -v offshoot-data:/data ghcr.io/sricola/offshoot:latest init` — multi-architecture `linux/amd64` and `linux/arm64` images publish to GHCR on every tagged release; the store lives in the `/data` volume, so reuse `-v offshoot-data:/data` across commands (`… create app`, `… serve`, and so on) |
+| **Prebuilt binaries** | `offshoot_vX_os_arch.tar.gz` (+ `.sha256`) from the [releases page](https://github.com/sricola/offshoot/releases), published for each tagged release — signed and attested since v0.2.11 ([verify](https://sricola.github.io/offshoot/docs/installation/#verify-what-you-downloaded)) |
+| **`go install`** | `go install github.com/sricola/offshoot/cmd/offshoot@latest` |
+| **From source** | the Quickstart below (Go 1.26+, cgo) |
+
+The full guide — store setup, S3 configuration, the fail-closed probe:
+[installation](https://sricola.github.io/offshoot/docs/installation/).
+
+Requires Go 1.26+ and cgo to build, and the `sqlite3` CLI for tests. Linux
+and macOS only. **Windows:** use WSL2 — the Linux binaries, Docker image,
+and build-from-source all work there as-is. Native Windows is unsupported:
+offshoot leans on POSIX file semantics (unix sockets, POSIX locks) that
+don't map cleanly to Windows
+([why](docs/faq.md#why-no-windows-support)).
+
+## See it run
 
 Runnable demo: [`examples/parallel-attempts/`](examples/parallel-attempts/)
-forks a database three ways, races three migrations against the forks,
-promotes the one that's actually correct, and discards the other two —
-`./examples/parallel-attempts/run.sh`. Real recording:
+forks a database three ways, races three migrations against the forks in
+parallel, promotes the one that's actually correct, and discards the other
+two — `./examples/parallel-attempts/run.sh`. Real recording:
 [`docs/demo/parallel-attempts.cast`](docs/demo/parallel-attempts.cast)
 (play locally with `asciinema play`).
 
@@ -103,6 +103,50 @@ promotes the one that's actually correct, and discards the other two —
 ```
 
 </details>
+
+## Stability, in one paragraph
+
+The caveats, stated plainly: the CLI surface and the on-disk storage
+format may still change before 1.0 — but never silently. Every store
+records a layout version, and a binary that doesn't understand a store's
+layout refuses the whole store rather than guessing (0.2.0's first
+copy-on-write fork exercised exactly that gate for real — see
+[CHANGELOG.md](CHANGELOG.md)). Any format break ships in the same release
+with a migration or a documented `export` → `create --from` path: the
+[stability contract](docs/stability.md) is the full promise, including the
+proposed v1.0 criteria. 1.0 is reserved for the point the storage format
+freezes. Releases are signed and carry SLSA provenance
+([verify](https://sricola.github.io/offshoot/docs/installation/#verify-what-you-downloaded));
+[how offshoot is tested](docs/testing.md) shows the harnesses behind these
+claims.
+
+## Quickstart (60 seconds, no server, no bucket)
+
+    offshoot init
+    offshoot create app
+    sqlite3 "$(offshoot checkout app)" "CREATE TABLE users (name); INSERT INTO users VALUES ('ada');"
+    offshoot checkpoint app v1
+    offshoot fork app attempt-1        # instant branch
+    sqlite3 "$(offshoot checkout app@attempt-1)" "DELETE FROM users;"   # destructive experiment
+    offshoot rollback app@attempt-1 --to fork                        # undo it
+    offshoot promote app@attempt-1 --onto main --force               # or ship it
+    offshoot status
+    # from source: go build -o offshoot ./cmd/offshoot && export PATH=$PWD:$PATH
+
+That's most of the surface already. The full vocabulary, one line each
+(every command and flag: [docs/reference.md](docs/reference.md)):
+
+| Command | What it does |
+|---|---|
+| `create` / `checkout` | new database / materialize a working copy — prints a plain `.db` path |
+| `checkpoint` | snapshot the checkout as a named, rollback-able point |
+| `fork` | branch from head or a checkpoint — instant, copy-on-write, optional `--ttl` |
+| `protect` / `unprotect` | refuse unforced destroy/promote-onto and never reap a branch (`main`, by default) — CLI-only; an MCP agent can't flip it, and can't force past it without the server's `-allow-force` |
+| `rollback` / `promote` | repoint a branch at a checkpoint / repoint a target at a branch's head — each keeps the branch's old head first as a TTL'd safety fork to undo (`<branch>-pre-rollback` / `<target>-pre-promote`, 24h by default, one rolling slot, `--no-backup`/`--backup-ttl` to tune or skip it) |
+| `diff` / `export` | content-aware summary, or sqldiff, between two branches or checkpoints / copy state out to a plain file |
+| `destroy` / `gc` | delete a branch / collect unreachable objects |
+| `serve` / `session` | the daemon: leases, live capture, flush-without-pausing ([below](#daemon-mode)) |
+| `mcp` | the same verbs as MCP tools, for agents ([below](#mcp)) |
 
 Building an eval harness or a test suite around this instead of a one-off
 script? [docs/eval-harness.md](docs/eval-harness.md) is the paved road:
@@ -162,29 +206,9 @@ fork-per-attempt/diff-per-attempt pattern and a runnable example
 More "why not X" (Litestream, Dolt, Neon, plain `cp`):
 [docs/faq.md](docs/faq.md).
 
-## Install
-
-| Channel | How |
-|---|---|
-| **Homebrew** | `brew tap sricola/offshoot https://github.com/sricola/offshoot && brew trust sricola/offshoot && brew install offshoot` — recent Homebrew requires the explicit `trust` for third-party taps; the formula lives in-repo at [`Formula/offshoot.rb`](Formula/offshoot.rb) |
-| **Docker** | `docker run --rm -v offshoot-data:/data ghcr.io/sricola/offshoot:latest init` — multi-architecture `linux/amd64` and `linux/arm64` images publish to GHCR on every tagged release; the store lives in the `/data` volume, so reuse `-v offshoot-data:/data` across commands (`… create app`, `… serve`, and so on) |
-| **Prebuilt binaries** | `offshoot_vX_os_arch.tar.gz` (+ `.sha256`) from the [releases page](https://github.com/sricola/offshoot/releases), published for each tagged release |
-| **`go install`** | `go install github.com/sricola/offshoot/cmd/offshoot@latest` |
-| **From source** | the Quickstart above (Go 1.26+, cgo) |
-
-The full guide — store setup, S3 configuration, the fail-closed probe:
-[installation](https://sricola.github.io/offshoot/docs/installation/).
-
-Requires Go 1.26+ and cgo to build, and the `sqlite3` CLI for tests. Linux
-and macOS only. **Windows:** use WSL2 — the Linux binaries, Docker image,
-and build-from-source all work there as-is. Native Windows is unsupported:
-offshoot leans on POSIX file semantics (unix sockets, POSIX locks) that
-don't map cleanly to Windows
-([why](docs/faq.md#why-no-windows-support)).
-
 ## Status
 
-**v0.2.9.** What's shipped and exercised by tests that would
+**v0.2.10.** What's shipped and exercised by tests that would
 fail if it broke:
 
 - local and S3-compatible stores behind a shared conformance suite
@@ -199,17 +223,6 @@ fail if it broke:
 shipped-and-tested vs. shipped-but-unverified vs. still on the
 [roadmap](ROADMAP.md) — and [docs/testing.md](docs/testing.md) shows the
 CI gates behind the "tested" column.
-
-The caveats, stated plainly: the CLI surface and the on-disk storage
-format may still change before 1.0 — but never silently. Every store
-records a layout version, and a binary that doesn't understand a store's
-layout refuses the whole store rather than guessing (0.2.0's first
-copy-on-write fork exercised exactly that gate for real — see
-[CHANGELOG.md](CHANGELOG.md)). Any format break ships in the same release
-with a migration or a documented `export` → `create --from` path: the
-[stability contract](docs/stability.md) is the full promise, including the
-proposed v1.0 criteria. 1.0 is reserved for the point the storage format
-freezes.
 
 ## Storage
 

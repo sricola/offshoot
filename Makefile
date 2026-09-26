@@ -1,7 +1,7 @@
 .PHONY: test test-torture build test-s3 bench bench-cow bench-s3 check-python-version test-python-sdk test-ts-sdk test-sdks test-python-langgraph \
 	check-sdk-versions dry-run-python-sdk dry-run-ts-sdk dry-run-sdks test-pytest-plugin \
 	ci-local ci-local-host ci-local-linux ci-local-s3 ci-local-minio ci-local-sdks lint \
-	check-plugin bench-isolation example-pass-k
+	check-plugin bench-isolation bench-branchbench example-pass-k
 
 # Override with `make PYTHON=python3.14 ...` when the platform's unversioned
 # python3 is older than the SDKs' declared Python 3.10 minimum.
@@ -227,6 +227,18 @@ check-plugin:
 bench-isolation: check-python-version
 	go build -o bin/offshoot-bench ./cmd/offshoot
 	$(PYTHON) scripts/bench-isolation.py --sizes 10,100 --iters 20
+
+# BranchBench's five agentic-workflow topologies (arXiv:2604.17180) re-run
+# against a local offshoot store, full-scale parameters: ~2,300 forks in all.
+# Every workflow runs against its own fresh store (built, seeded and removed
+# per workflow), so this needs about 30 GB of free space in $TMPDIR -- the
+# largest single workflow, mcts, peaks near 26.5 GiB -- and under 3 minutes on
+# an Apple M5. `go run ./cmd/branchbench -quick` is the seconds-scale smoke
+# run of the same five topologies, and `go test ./cmd/branchbench` runs it.
+# Prints one markdown table; docs/benchmarks.md pastes it verbatim.
+bench-branchbench:
+	@echo "branchbench: needs ~30 GB free in TMPDIR and ~3 minutes; Ctrl-C removes the store. Smoke run: go run ./cmd/branchbench -quick"
+	go run ./cmd/branchbench
 
 # example-pass-k runs examples/eval-pass-k/run.py: a runnable pass^k eval
 # loop over offshoot (see docs/recipes/eval-harnesses.md's "tau2-style

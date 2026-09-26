@@ -347,6 +347,22 @@ open wart (its own spec said "N materialized forks cost up to N×G").
    answers for the predictable questions. *Only after phase 3's external user
    succeeded.*
 
+**Rigor artifacts (2026-09-26).** Ahead of phase 4, the trust-floor and
+quiet-public work picked up a rigor pass that now exists in the repo: every
+tagged release is signed and attested (keyless cosign, SLSA build
+provenance, an SPDX SBOM, a signed and attested GHCR image) with a
+verification recipe in `docs/installation.md`; an OpenSSF Scorecard workflow
+runs on push to `main`, weekly, and on demand, with a badge on the README;
+`cmd/branchbench` reproduces BranchBench's five agentic-branching topologies
+against a local store, pasted in `docs/benchmarks.md`; `docs/testing.md`
+gained an "At a glance" evidence table naming what's proven and what isn't;
+and the README's first screen now leads with install and a recording before
+the quickstart. None of this changes phase 4's gate: **Announce** is still
+blocked on phase 3's external user succeeding, not on further engineering —
+see [docs/status.md](docs/status.md#standing-nag-user-gated-launch-items)
+for the drafted Show HN copy and the corruption-bounty terms, both ready to
+go and waiting on that gate plus the maintainer's button-press.
+
 ## Non-goals (v1)
 
 - **Multi-node orchestration.** Shared-bucket safety is guaranteed by fencing;
