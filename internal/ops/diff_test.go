@@ -2,6 +2,7 @@ package ops
 
 import (
 	"bytes"
+	"errors"
 	"os"
 	"os/exec"
 	"path/filepath"
@@ -485,5 +486,51 @@ func TestDiffSideCloseIsSafeOnZeroValueAndTwiceInARow(t *testing.T) {
 	}
 	if err := side.Close(); err != nil {
 		t.Fatalf("a second Close must not error, got %v", err)
+	}
+}
+
+// TestSqldiffCappedTruncatesAndFlags: with sqldiff present, a cap smaller
+// than the output yields exactly maxBytes bytes and truncated=true; a
+// generous cap yields the whole output and truncated=false. Skips when
+// sqldiff is not installed (CI installs sqlite3-tools).
+func TestSqldiffCappedTruncatesAndFlags(t *testing.T) {
+	testutil.RequireSQLite3(t)
+	if _, err := exec.LookPath("sqldiff"); err != nil {
+		t.Skip("sqldiff not on PATH")
+	}
+	left := filepath.Join(t.TempDir(), "left.db")
+	right := filepath.Join(t.TempDir(), "right.db")
+	exec.Command("sqlite3", left, "CREATE TABLE t (id INTEGER PRIMARY KEY, v);").Run()
+	exec.Command("sqlite3", right, "CREATE TABLE t (id INTEGER PRIMARY KEY, v); INSERT INTO t VALUES (1,'aaaaaaaaaa'),(2,'bbbbbbbbbb'),(3,'cccccccccc');").Run()
+	full, trunc, err := SqldiffCapped(left, right, "", 0)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if trunc || !strings.Contains(full, "INSERT INTO t") {
+		t.Fatalf("full=%q truncated=%v", full, trunc)
+	}
+	part, trunc, err := SqldiffCapped(left, right, "", 20)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !trunc || len(part) != 20 || !strings.HasPrefix(full, part) {
+		t.Fatalf("part=%q (len %d) truncated=%v", part, len(part), trunc)
+	}
+	only, _, err := SqldiffCapped(left, right, "t", 0)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if only != full {
+		t.Fatalf("--table t must equal the full diff for a one-table db:\n%s\n---\n%s", only, full)
+	}
+}
+
+// TestSqldiffMissingIsASentinel: callers (CLI hint, daemon error) branch on
+// errors.Is(err, ErrSqldiffMissing).
+func TestSqldiffMissingIsASentinel(t *testing.T) {
+	t.Setenv("PATH", t.TempDir())
+	_, _, err := SqldiffCapped("/nonexistent/a.db", "/nonexistent/b.db", "", 0)
+	if !errors.Is(err, ErrSqldiffMissing) {
+		t.Fatalf("err = %v, want ErrSqldiffMissing", err)
 	}
 }

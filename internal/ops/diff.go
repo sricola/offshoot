@@ -1,10 +1,13 @@
 package ops
 
 import (
+	"bytes"
 	"database/sql"
+	"errors"
 	"fmt"
 	"io"
 	"os"
+	"os/exec"
 	"path/filepath"
 	"slices"
 	"sort"
@@ -590,4 +593,76 @@ func FormatDiffSummary(w io.Writer, rep DiffReport, leftLabel, rightLabel string
 	_, err := fmt.Fprintf(w, "%d tables: %d same, %d changed, %d added, %d removed\n",
 		len(rep.Tables), rep.Totals.Same, rep.Totals.Changed, rep.Totals.Added, rep.Totals.Removed)
 	return err
+}
+
+// ErrSqldiffMissing is returned (wrapped) by Sqldiff when the external
+// sqldiff binary is not on PATH. sqldiff ships separately from the sqlite3
+// CLI; callers turn this into a per-surface hint (the CLI names the
+// package, the daemon and MCP name --summary/the summary as the
+// sqldiff-free alternative).
+var ErrSqldiffMissing = errors.New("sqldiff not found on PATH")
+
+// DefaultSqldiffMaxBytes bounds a full SQL diff carried over the wire.
+const DefaultSqldiffMaxBytes = 1 << 20
+
+// Sqldiff runs `sqldiff [--table T] leftPath rightPath` and streams its
+// stdout to w. stderr is captured into the returned error.
+func Sqldiff(leftPath, rightPath, table string, w io.Writer) error {
+	if _, err := exec.LookPath("sqldiff"); err != nil {
+		return fmt.Errorf("ops: diff: %w", ErrSqldiffMissing)
+	}
+	args := []string{}
+	if table != "" {
+		args = append(args, "--table", table)
+	}
+	args = append(args, leftPath, rightPath)
+	cmd := exec.Command("sqldiff", args...)
+	var stderr bytes.Buffer
+	cmd.Stdout = w
+	cmd.Stderr = &stderr
+	if err := cmd.Run(); err != nil {
+		if errors.Is(err, errSqldiffCapReached) {
+			return nil
+		}
+		return fmt.Errorf("ops: diff: sqldiff: %w: %s", err, strings.TrimSpace(stderr.String()))
+	}
+	return nil
+}
+
+var errSqldiffCapReached = errors.New("sqldiff output cap reached")
+
+// cappedWriter stops accepting bytes after max, reporting truncation.
+type cappedWriter struct {
+	buf       bytes.Buffer
+	max       int
+	truncated bool
+}
+
+func (c *cappedWriter) Write(p []byte) (int, error) {
+	room := c.max - c.buf.Len()
+	if room <= 0 {
+		c.truncated = true
+		return 0, errSqldiffCapReached
+	}
+	if len(p) > room {
+		c.buf.Write(p[:room])
+		c.truncated = true
+		return len(p), errSqldiffCapReached
+	}
+	return c.buf.Write(p)
+}
+
+// SqldiffCapped is Sqldiff into a buffer of at most maxBytes (<= 0 means
+// DefaultSqldiffMaxBytes). truncated reports whether output was cut; the
+// returned text is always a prefix of the full diff.
+func SqldiffCapped(leftPath, rightPath, table string, maxBytes int) (string, bool, error) {
+	if maxBytes <= 0 {
+		maxBytes = DefaultSqldiffMaxBytes
+	}
+	cw := &cappedWriter{max: maxBytes}
+	err := Sqldiff(leftPath, rightPath, table, cw)
+	if err != nil && !cw.truncated {
+		return "", false, err
+	}
+	return cw.buf.String(), cw.truncated, nil
 }

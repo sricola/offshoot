@@ -1,12 +1,10 @@
 package main
 
 import (
+	"errors"
 	"fmt"
 	"io"
-	"os"
-	"os/exec"
 	"runtime"
-	"text/tabwriter"
 
 	"github.com/sricola/offshoot/internal/ops"
 )
@@ -43,22 +41,23 @@ sqldiff ships separately from the sqlite3 CLI. Install it:
   %s
 
 Or skip sqldiff entirely with 'offshoot diff ... --summary' for a
-table-level row-count comparison instead`, hint)
+content-aware per-table summary (added/removed/changed rows) instead`, hint)
 }
 
 // runDiff implements `offshoot diff <db>@<branch>[@checkpoint]
-// <db>@<branch>[@checkpoint] [--summary]`: materializes both sides
-// read-only (ops.Workspace.MaterializeForDiff — the read-only checkout-at
-// cache for a named checkpoint, a private fresh export for head; see that
-// function's doc comment for the staleness reasoning) and either runs
-// sqldiff over the two materialized paths (default) or prints a
-// stdlib-only table-level row-count summary (--summary, no sqldiff
-// dependency at all).
+// <db>@<branch>[@checkpoint] [--summary] [--table T]`: materializes both
+// sides read-only (ops.Workspace.MaterializeForDiff — the read-only
+// checkout-at cache for a named checkpoint, a private fresh export for
+// head; see that function's doc comment for the staleness reasoning) and
+// either runs sqldiff over the two materialized paths (default) or prints
+// the shared content-aware per-table summary (--summary, no sqldiff
+// dependency at all). table, when non-empty, restricts either mode to that
+// one table.
 //
 // The two sides may name the same db or two entirely different ones —
 // cross-db diff is a legitimate eval-comparison shape (Milestone 3 Task 6)
 // and nothing here assumes otherwise.
-func runDiff(w *ops.Workspace, out io.Writer, leftTarget, rightTarget string, summary bool) error {
+func runDiff(w *ops.Workspace, out io.Writer, leftTarget, rightTarget string, summary bool, table string) error {
 	ldb, lbranch, lcp, err := ops.ParseExportTarget(leftTarget)
 	if err != nil {
 		return err
@@ -90,74 +89,30 @@ func runDiff(w *ops.Workspace, out io.Writer, leftTarget, rightTarget string, su
 	fmt.Fprintf(out, "left:  %s right: %s\n", leftTarget, rightTarget)
 
 	if summary {
-		return printDiffSummary(out, left.Path, right.Path, leftTarget, rightTarget)
-	}
-
-	if _, err := exec.LookPath("sqldiff"); err != nil {
-		return sqldiffNotFoundError()
-	}
-	cmd := exec.Command("sqldiff", left.Path, right.Path)
-	cmd.Stdout = out
-	cmd.Stderr = os.Stderr
-	if err := cmd.Run(); err != nil {
-		return fmt.Errorf("offshoot diff: sqldiff: %w", err)
-	}
-	return nil
-}
-
-// printDiffSummary renders ops.DiffSummary's per-table row-count diff as an
-// aligned table (text/tabwriter — stdlib, no new dependency), one line per
-// table: its name, each side's row count ("-" when the table doesn't exist
-// on that side), and a STATUS column spelling out exactly what changed —
-// "added"/"removed" for a table only on one side, "changed (+N)"/
-// "changed (-N)" for a differing row count, "same" otherwise. A trailing
-// summary line gives the totals so a caller doesn't have to count rows of
-// output to answer "did anything change at all."
-//
-// The two count columns are headered with the caller's own leftTarget/
-// rightTarget strings (not bare "LEFT"/"RIGHT") — runDiff already prints a
-// "left: ... right: ..." line above this table, but repeating the target
-// names as the column headers themselves means a reader scanning just the
-// table doesn't have to scroll back up to know which count belongs to
-// which side.
-func printDiffSummary(out io.Writer, leftPath, rightPath, leftTarget, rightTarget string) error {
-	rows, err := ops.DiffSummary(leftPath, rightPath)
-	if err != nil {
-		return fmt.Errorf("offshoot diff --summary: %w", err)
-	}
-
-	tw := tabwriter.NewWriter(out, 0, 4, 2, ' ', 0)
-	fmt.Fprintf(tw, "TABLE\t%s\t%s\tSTATUS\n", leftTarget, rightTarget)
-
-	var added, removed, changed, same int
-	for _, d := range rows {
-		leftCol, rightCol, status := "-", "-", ""
-		switch {
-		case !d.LeftExists:
-			rightCol = fmt.Sprintf("%d", d.Right)
-			status = "added"
-			added++
-		case !d.RightExists:
-			leftCol = fmt.Sprintf("%d", d.Left)
-			status = "removed"
-			removed++
-		case d.Delta() != 0:
-			leftCol = fmt.Sprintf("%d", d.Left)
-			rightCol = fmt.Sprintf("%d", d.Right)
-			status = fmt.Sprintf("changed (%+d)", d.Delta())
-			changed++
-		default:
-			leftCol = fmt.Sprintf("%d", d.Left)
-			rightCol = fmt.Sprintf("%d", d.Right)
-			status = "same"
-			same++
+		rows, err := ops.DiffSummary(left.Path, right.Path)
+		if err != nil {
+			return fmt.Errorf("offshoot diff --summary: %w", err)
 		}
-		fmt.Fprintf(tw, "%s\t%s\t%s\t%s\n", d.Table, leftCol, rightCol, status)
+		if table != "" {
+			filtered := rows[:0]
+			for _, d := range rows {
+				if d.Table == table {
+					filtered = append(filtered, d)
+				}
+			}
+			if len(filtered) == 0 {
+				return fmt.Errorf("offshoot diff --summary: no table %q on either side", table)
+			}
+			rows = filtered
+		}
+		return ops.FormatDiffSummary(out, ops.DiffReportOf(rows), leftTarget, rightTarget)
 	}
-	if err := tw.Flush(); err != nil {
-		return err
+
+	if err := ops.Sqldiff(left.Path, right.Path, table, out); err != nil {
+		if errors.Is(err, ops.ErrSqldiffMissing) {
+			return sqldiffNotFoundError()
+		}
+		return fmt.Errorf("offshoot diff: %w", err)
 	}
-	fmt.Fprintf(out, "%d tables: %d same, %d changed, %d added, %d removed\n",
-		len(rows), same, changed, added, removed)
 	return nil
 }

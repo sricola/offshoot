@@ -44,17 +44,17 @@ Usage:
                                      overwrite an existing out.db unless
                                      --force; no sidecar, no lease — out.db
                                      has no ongoing relationship to the store
-  offshoot diff <db>[@branch[@checkpoint]] <db>[@branch[@checkpoint]] [--summary]
+  offshoot diff <db>[@branch[@checkpoint]] <db>[@branch[@checkpoint]] [--summary] [--table T]
                                      materialize both sides read-only and run
                                      sqldiff over them; --summary prints a
-                                     table-level row-count comparison instead
-                                     (no sqldiff needed) — row counts only;
-                                     equal counts with different values
-                                     report as same — use full sqldiff mode
-                                     for content; either target may omit the
-                                     checkpoint for the branch's current
-                                     head; the two sides may name the same
-                                     db or different ones
+                                     content-aware per-table summary instead
+                                     (no sqldiff needed) — added/removed/
+                                     changed row counts per table, not just
+                                     row-count deltas; --table restricts
+                                     either mode to one table; either target
+                                     may omit the checkpoint for the
+                                     branch's current head; the two sides
+                                     may name the same db or different ones
   offshoot checkpoint <db>[@branch] <name> [--meta k=v ...]
                                      snapshot the checkout as a named checkpoint
   offshoot fork <db>[@branch] <new> [--at cp] [--ttl duration] [--meta k=v ...]
@@ -653,10 +653,14 @@ func run(args []string) error {
 		return nil
 	case "diff":
 		summary, rest := extractBoolFlag(rest, "--summary")
-		if len(rest) != 2 {
-			return fmt.Errorf("usage: offshoot diff <db>[@branch[@checkpoint]] <db>[@branch[@checkpoint]] [--summary]")
+		table, rest, _, err := extractFlag(rest, "--table")
+		if err != nil {
+			return fmt.Errorf("usage: offshoot diff <db>[@branch[@checkpoint]] <db>[@branch[@checkpoint]] [--summary] [--table T]: %w", err)
 		}
-		return runDiff(w, os.Stdout, rest[0], rest[1], summary)
+		if len(rest) != 2 {
+			return fmt.Errorf("usage: offshoot diff <db>[@branch[@checkpoint]] <db>[@branch[@checkpoint]] [--summary] [--table T]")
+		}
+		return runDiff(w, os.Stdout, rest[0], rest[1], summary, table)
 	case "destroy":
 		force := false
 		fs := rest[:0]
