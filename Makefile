@@ -218,16 +218,15 @@ check-plugin:
 # figures), at seed sizes 10 and 100 MB. See docs/benchmarks.md's "Per-test
 # isolation primitives" section for the measured numbers this produces, and
 # the script's own docstring for what each row is. Builds the offshoot
-# binary fresh, and creates a throwaway venv (.venv-bench) if one doesn't
-# already exist -- stdlib only, since the script reaches sdk/python via
-# sys.path (like sdk/python/tests/test_client.py's DaemonFixture does),
-# never a pip install. Measured ~26s with the postgres:16 image already
-# cached locally; without Docker, the Postgres rows and overhead figures
-# skip instantly (the script never attempts a network pull).
+# binary fresh. Stdlib only -- the script reaches sdk/python via sys.path
+# (like sdk/python/tests/test_client.py's DaemonFixture does), never a pip
+# install, so it runs directly under $(PYTHON) with no venv needed. Measured
+# ~26s with the postgres:16 image already cached locally; without Docker,
+# the Postgres rows and overhead figures skip instantly (the script never
+# attempts a network pull).
 bench-isolation: check-python-version
 	go build -o bin/offshoot-bench ./cmd/offshoot
-	test -d .venv-bench || $(PYTHON) -m venv .venv-bench
-	.venv-bench/bin/python3 scripts/bench-isolation.py --sizes 10,100 --iters 20
+	$(PYTHON) scripts/bench-isolation.py --sizes 10,100 --iters 20
 
 # example-pass-k runs examples/eval-pass-k/run.py: a runnable pass^k eval
 # loop over offshoot (see docs/recipes/eval-harnesses.md's "tau2-style

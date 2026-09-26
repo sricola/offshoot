@@ -456,7 +456,7 @@ export class Client {
   async create(db: string, opts: CreateOptions = {}): Promise<void> {
     await this._call("create", {
       db,
-      path: opts.fromPath ? path.resolve(opts.fromPath) : "",
+      ...(opts.fromPath ? { path: path.resolve(opts.fromPath) } : {}),
     });
   }
 

@@ -106,13 +106,11 @@ Flags: `--k` (trials per task, default 4), `--tasks` (how many of
 
 ## Real output
 
-This is `make example-pass-k`'s actual stdout, pasted verbatim:
+This is `run.py`'s own stdout from a real `make example-pass-k` run, pasted
+verbatim; the preceding `go build`/`OFFSHOOT_BIN=...` lines (which embed a
+local checkout path) are omitted:
 
 ```
-$ make PYTHON=/opt/homebrew/bin/python3.14 example-pass-k
-go build -o bin/offshoot-bench ./cmd/offshoot
-OFFSHOOT_BIN=/Users/sray/gits/offshoot/.claude/worktrees/eval-harness-path/bin/offshoot-bench \
-	  /opt/homebrew/bin/python3.14 examples/eval-pass-k/run.py --k 4 --tasks 5
 task  description                                                     k   pass@1   pass^k
 --------------------------------------------------------------------------------------------
 0     Fill in order 1's total, rounded to the cent.                   4     1.00     PASS
@@ -121,7 +119,7 @@ task  description                                                     k   pass@1
 3     Fill in order 4's total, rounded to the cent.                   4     1.00     PASS
 4     Fill in order 5's total, rounded to the cent.                   4     0.75     FAIL
 --------------------------------------------------------------------------------------------
-5 tasks, k=4, wall time: 1.95s
+5 tasks, k=4, wall time: 1.62s
 
 Task 4's pass@1 of 0.75 reads as "mostly fine" -- pass@1 only asks
 "what fraction of trials passed?" pass^k ("would EVERY one of k independent

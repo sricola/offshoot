@@ -30,9 +30,9 @@
 //   from import IS the fork point). Later calls for the same name are a
 //   pure memoization hit UNLESS the
 //   seed doesn't match what actually seeded that name (fingerprinted: SQL/
-//   path text by content hash, callables by identity) — that raises a
-//   clear error rather than silently keeping the first seed, exactly like
-//   the pytest plugin's `offshoot_db`.
+//   path text by content hash, callables by identity, db files by content
+//   hash (`db:<sha256>`)) — that raises a clear error rather than silently
+//   keeping the first seed, exactly like the pytest plugin's `offshoot_db`.
 // - forkPerTest(daemon, seedHandleOrName, opts?): forks a fresh, worker-
 //   safe-named branch from the seed's checkpoint with a TTL (default
 //   "1h", opts.ttl overrides), opens a session, and returns a
@@ -444,8 +444,11 @@ interface ResolvedSeed {
  * by content — see {@link isSqliteFile} — never by extension, checked
  * BEFORE `.sql`-path detection since a real SQLite file is never valid SQL
  * text) is fingerprinted the same way: the content hash of its own bytes,
- * read fresh each call. Callables are fingerprinted by identity (mirrors
- * Python's `id()`-based fingerprint). */
+ * read fresh each call. This hashes only the main database file — a source
+ * database with an uncheckpointed `-wal` sibling has those pending frames
+ * imported by `create --from` but NOT included in this hash, so checkpoint
+ * the source database before using it as a seed. Callables are
+ * fingerprinted by identity (mirrors Python's `id()`-based fingerprint). */
 async function resolveSeed(seed: Seed): Promise<ResolvedSeed> {
   if (typeof seed === "function") {
     let id = callableIds.get(seed);

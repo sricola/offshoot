@@ -265,9 +265,10 @@ the OS for durability. `shutil.copyfile` never fsyncs, so it asks for
 none. That asymmetry accounts for part of the gap between the two rows,
 on top of the difference in what each one physically does. Postgres's
 `CREATE DATABASE ... TEMPLATE` also physically copies the template's
-files — this Docker Desktop VM's filesystem doesn't give it a cheap
-reflink/CoW path here — but the row's *absolute* numbers at these sizes
-are dominated by the fixed cost of the `docker exec ... psql` round trip
+files — PostgreSQL 16's default `STRATEGY = WAL_LOG` copies the template
+block by block through WAL regardless of filesystem, rather than taking a
+filesystem-level reflink/CoW shortcut — but the row's *absolute* numbers
+at these sizes are dominated by the fixed cost of the `docker exec ... psql` round trip
 itself: a no-op `SELECT 1` through the same path, measured directly
 above, costs **37.04 ms** median (p90 41.73 ms) alone on this host. Only
 the roughly 63 ms difference between the two sizes' medians (57.28 ->

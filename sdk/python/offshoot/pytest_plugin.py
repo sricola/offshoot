@@ -95,10 +95,12 @@ by the slower of the two, not their sum). The *ratio* — total seed work
 scales linearly at roughly 1x per worker — is the number to plan around,
 not the absolute milliseconds: a seed that populates gigabytes of fixture
 data, multiplied by a wide ``-n`` fan-out, is a real cost. If your seed is
-expensive: keep worker count modest, seed a shared file out-of-band once
-and `create --from` it into every worker's store (CLI-only import path —
-see docs/status.md's `create --from` row), or split expensive seeds into a
-smaller shared subset plus cheap per-worker deltas.
+expensive: keep worker count modest, seed a shared file out-of-band once and
+pass its path as the seed (via `offshoot_seed` or the `offshoot_db` factory's
+`seed=` argument) — the plugin imports it through the daemon's `create` op
+and each worker forks from the imported `init` checkpoint instead of running
+the seed script again — or split expensive seeds into a smaller shared
+subset plus cheap per-worker deltas.
 
 A load-bearing detail behind that ~85ms number: `_run_seed` wraps a
 SQL-string seed in a single transaction before running it, UNLESS the seed
@@ -561,7 +563,12 @@ def _fingerprint_seed(seed: _Seed) -> str:
     call — not the path string — so editing the file on disk between two
     calls for the same name (same path, different content) is caught as a
     mismatch rather than silently passing because the path text didn't
-    change. The file is read exactly once per call to compute this.
+    change. The file is read exactly once per call to compute this. This
+    fingerprint hashes only the main database file — a source database with
+    an uncheckpointed `-wal` sibling has its pending WAL frames imported by
+    `create --from` (the sibling is read as part of the copy) but NOT
+    included in this hash, so checkpoint the source database before using
+    it as a seed, or a WAL-only edit can go undetected as a "same seed".
     """
     if callable(seed):
         return f"callable:{id(seed)}"

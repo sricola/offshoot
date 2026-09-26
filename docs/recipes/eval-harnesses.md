@@ -68,13 +68,11 @@ individual trials):
 make example-pass-k
 ```
 
-Real output, pasted verbatim:
+This is `run.py`'s own stdout from a real run, pasted verbatim; the
+preceding `go build`/`OFFSHOOT_BIN=...` lines (which embed a local checkout
+path) are omitted:
 
 ```
-$ make PYTHON=/opt/homebrew/bin/python3.14 example-pass-k
-go build -o bin/offshoot-bench ./cmd/offshoot
-OFFSHOOT_BIN=/Users/sray/gits/offshoot/.claude/worktrees/eval-harness-path/bin/offshoot-bench \
-	  /opt/homebrew/bin/python3.14 examples/eval-pass-k/run.py --k 4 --tasks 5
 task  description                                                     k   pass@1   pass^k
 --------------------------------------------------------------------------------------------
 0     Fill in order 1's total, rounded to the cent.                   4     1.00     PASS
@@ -83,7 +81,7 @@ task  description                                                     k   pass@1
 3     Fill in order 4's total, rounded to the cent.                   4     1.00     PASS
 4     Fill in order 5's total, rounded to the cent.                   4     0.75     FAIL
 --------------------------------------------------------------------------------------------
-5 tasks, k=4, wall time: 1.95s
+5 tasks, k=4, wall time: 1.62s
 
 Task 4's pass@1 of 0.75 reads as "mostly fine" -- pass@1 only asks
 "what fraction of trials passed?" pass^k ("would EVERY one of k independent
@@ -127,18 +125,44 @@ def offshoot_fork_per_epoch(socket_path: str, db: str, seed_checkpoint: str = "s
             state.metadata["db_path"] = session.path
             state = await generate(state)
         finally:
+            # Close the session so its writes are durable, but leave the
+            # fork itself alone — the scorer below still needs it.
             session.close()
-            client.destroy(db, branch)
+        # Record the branch name for the scorer; it, not the solver, owns
+        # destroying the fork once grading has read its final state.
+        state.metadata["offshoot_branch"] = branch
         return state
 
     return solve
 ```
 
-Grading (a separate `scorer`, not shown) diffs the now-closed fork's last
-durable state against a golden checkpoint the same way the runnable example
-above does, before the branch above destroys it — a scorer needs to run
-between `session.close()` and `client.destroy(...)` if it wants
-`offshoot diff` to see the fork's final state.
+Grading is a separate `@scorer` that reads the branch name the solver left
+in `state.metadata["offshoot_branch"]`, diffs that branch's now-closed,
+durable state against a golden checkpoint, and destroys the fork itself —
+in its own `finally`, so the fork is cleaned up whether scoring passes or
+raises, rather than being left for the solver (which already moved on to
+the next epoch by the time grading runs) to worry about:
+
+```python
+from inspect_ai.scorer import scorer, Score, Target, accuracy, CORRECT, INCORRECT
+from inspect_ai.solver import TaskState
+import offshoot
+
+@scorer(metrics=[accuracy()])
+def offshoot_diff_scorer(socket_path: str, db: str, golden_checkpoint: str = "expected"):
+    client = offshoot.connect(socket_path)
+
+    async def score(state: TaskState, target: Target) -> Score:
+        branch = state.metadata["offshoot_branch"]
+        try:
+            diff = client.diff(f"{db}@{branch}", f"{db}@golden@{golden_checkpoint}")
+            clean = bool(diff.tables) and all(t.status == "same" for t in diff.tables)
+            return Score(value=CORRECT if clean else INCORRECT)
+        finally:
+            client.destroy(db, branch)
+
+    return score
+```
 
 ## promptfoo
 
@@ -160,14 +184,24 @@ extensionHook` (or an ESM `export async function extensionHook(hookName,
 context)`) in that file, not a bare default export; and mutating
 `context`/`context.test.vars` in place is **not** enough — promptfoo only
 persists what the hook function returns, so every branch that mutates ends
-with `return context;`.
+with `return context;`. A fourth detail matters just as much even though
+it's not in promptfoo's docs: `context.test.vars` gets interpolated into
+prompts and serialized into promptfoo's result output, so it must hold only
+plain, JSON-shaped values — never a live `Session` object. The hook below
+keeps sessions in a module-level `Map` keyed by a stable per-test id and
+puts only the checkout path (a string) in `vars`.
 
 ```js
 // eval-hooks.js
-import { connect } from "@offshoot-db/client";
+const { connect } = require("@offshoot-db/client");
 
 let client;
 const DB = "evals";
+// Live Session objects never go in context.test.vars (promptfoo
+// interpolates vars into prompts and persists them in results) — keep them
+// here, keyed by a stable per-test id built from beforeEach.
+const sessions = new Map();
+let counter = 0;
 
 async function extensionHook(hookName, context) {
   if (hookName === "beforeAll") {
@@ -183,20 +217,22 @@ async function extensionHook(hookName, context) {
       meta: { case: String(caseId) },
     });
     const session = await client.open(DB, branch);
-    context.test.vars.dbPath = session.path;   // fed to the prompt/provider under test
-    context.test.vars._offshootBranch = branch;
-    context.test.vars._offshootSession = session;
+    const key = `${branch}-${counter++}`;
+    sessions.set(key, { session, branch });
+    context.test.vars.dbPath = session.path;   // fed to the prompt/provider under test (a string)
+    context.test.vars._offshootKey = key;       // stable id string, not the live Session
     return context;
   }
 
   if (hookName === "afterEach") {
-    const branch = context.test.vars._offshootBranch;
-    const session = context.test.vars._offshootSession;
+    const key = context.test.vars._offshootKey;
+    const { session, branch } = sessions.get(key);
+    sessions.delete(key);
     await session.close();
     const diff = await client.diff(`${DB}@${branch}`, `${DB}@golden@expected`);
     context.result.namedScores = {
       ...context.result.namedScores,
-      offshoot_diff_clean: diff.tables.every((t) => t.status === "same") ? 1 : 0,
+      offshoot_diff_clean: diff.tables.length > 0 && diff.tables.every((t) => t.status === "same") ? 1 : 0,
     };
     await client.destroy(DB, branch);
     return context;

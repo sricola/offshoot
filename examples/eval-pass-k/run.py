@@ -218,7 +218,10 @@ def run_eval(sock: str, k: int, n_tasks: int) -> int:
                         attempt.close()
 
                     diff = client.diff(f"{DB}@{branch}", f"{DB}@golden@expected")
-                    passed = all(t.status == "same" for t in diff.tables)
+                    # bool(...) guards against the vacuous True that
+                    # all(...) would return on an empty table list -- an
+                    # empty diff must never read as "passed".
+                    passed = bool(diff.tables) and all(t.status == "same" for t in diff.tables)
                     outcomes.append(passed)
                 finally:
                     # Destroy the fork even if apply_sql/flush/diff raised
