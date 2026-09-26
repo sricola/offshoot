@@ -457,8 +457,8 @@ branch on its own initiative instead of asking you to run commands:
     claude plugin marketplace add sricola/offshoot
     claude plugin install offshoot@offshoot
 
-**Cursor:** [![Install in Cursor](https://cursor.com/deeplink/mcp-install-dark.svg)](cursor://anysphere.cursor-deeplink/mcp/install?name=offshoot&config=eyJjb21tYW5kIjoib2Zmc2hvb3QiLCJhcmdzIjpbIm1jcCJdfQ==)
-(the link installs `offshoot mcp` as a stdio server; the store resolves from `OFFSHOOT_STORE` or `./.offshoot`).
+**Cursor:** [![Install in Cursor](https://cursor.com/deeplink/mcp-install-dark.svg)](https://cursor.com/en/install-mcp?name=offshoot&config=eyJjb21tYW5kIjoib2Zmc2hvb3QiLCJhcmdzIjpbIm1jcCJdfQ==)
+(the link opens Cursor's install page, which hands off to the app to install `offshoot mcp` as a stdio server; the store resolves from `OFFSHOOT_STORE` or `./.offshoot`).
 
 The agent gets eight tools — list, checkout, checkpoint, fork, rollback,
 promote, destroy, touch — described so it knows *when* to use them: fork

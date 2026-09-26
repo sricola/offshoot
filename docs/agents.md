@@ -23,14 +23,14 @@ claude plugin install offshoot@offshoot
 claude mcp add offshoot -- offshoot -store ./.offshoot mcp
 ```
 
-**Cursor:** [![Install in Cursor](https://cursor.com/deeplink/mcp-install-dark.svg)](cursor://anysphere.cursor-deeplink/mcp/install?name=offshoot&config=eyJjb21tYW5kIjoib2Zmc2hvb3QiLCJhcmdzIjpbIm1jcCJdfQ==)
-(the link installs `offshoot mcp` as a stdio server; the store resolves from `OFFSHOOT_STORE` or `./.offshoot`).
+**Cursor:** [![Install in Cursor](https://cursor.com/deeplink/mcp-install-dark.svg)](https://cursor.com/en/install-mcp?name=offshoot&config=eyJjb21tYW5kIjoib2Zmc2hvb3QiLCJhcmdzIjpbIm1jcCJdfQ==)
+(the link opens Cursor's install page, which hands off to the app to install `offshoot mcp` as a stdio server; the store resolves from `OFFSHOOT_STORE` or `./.offshoot`).
 
 `offshoot mcp` speaks the Model Context Protocol on stdio — no daemon
-required for the baseline. The plugin's skill is the same text as the
-["rules-file snippet"](#rules-file-snippet) below; its hooks only add
-context (they never block a command), and they stay silent when `offshoot`
-is not installed.
+required for the baseline. The plugin's skill includes the
+["rules-file snippet"](#rules-file-snippet) below plus the six-step loop and
+rules it's drawn from; its hooks only add context (they never block a
+command), and they stay silent when `offshoot` is not installed.
 
 The agent gets eight tools, each described so the model knows *when* to
 reach for it: fork before a risky migration, checkpoint when tests pass,

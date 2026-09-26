@@ -69,7 +69,7 @@ wrong.
 
 ```
 $ offshoot -store $STORE init
-initialized store at /.../store
+initialized store at /var/folders/r1/h4z43zsj7vlb62zwtkxhgc400000gn/T/tmp.9QVDPWfYzm/store
 
 $ offshoot -store $STORE create shop
 
@@ -360,7 +360,7 @@ since this doc's last capture.)*
 
 ```json
 → {"jsonrpc":"2.0","id":3,"method":"tools/call","params":{"name":"offshoot_list","arguments":{}}}
-← {"jsonrpc":"2.0","id":3,"result":{"content":[{"type":"text","text":"shop@main head=2 checkpoints=[baseline init] protected=true checked_out=true\n"}]}}
+← {"jsonrpc":"2.0","id":3,"result":{"content":[{"type":"text","text":"shop@main head=2 checkpoints=[baseline init] protected=true checked_out=true\n"}],"structuredContent":{"branches":[{"branch":"main","checked_out":true,"checkpoints":["baseline","init"],"database":"shop","head_txid":2,"protected":true}]}}}
 ```
 
 ### 3. Fork before the risky migration
@@ -373,12 +373,12 @@ completion in the same session, not a throwaway experiment to let expire.*
 
 ```json
 → {"jsonrpc":"2.0","id":4,"method":"tools/call","params":{"name":"offshoot_fork","arguments":{"database":"shop","new_branch":"migration-attempt","ttl":"none"}}}
-← {"jsonrpc":"2.0","id":4,"result":{"content":[{"type":"text","text":"forked shop@main to shop@migration-attempt at txid 2; ttl=none (never expires)"}]}}
+← {"jsonrpc":"2.0","id":4,"result":{"content":[{"type":"text","text":"forked shop@main to shop@migration-attempt at txid 2; ttl=none (never expires)"}],"structuredContent":{"branch":"main","database":"shop","expires_at":"","new_branch":"migration-attempt","ttl":"","txid":2}}}
 ```
 
 ```json
 → {"jsonrpc":"2.0","id":5,"method":"tools/call","params":{"name":"offshoot_checkout","arguments":{"database":"shop","branch":"migration-attempt"}}}
-← {"jsonrpc":"2.0","id":5,"result":{"content":[{"type":"text","text":"checked out shop@migration-attempt at /.../store/checkouts/shop/migration-attempt.db\nthis checkout is not yet checkpointed: nothing written here can be rolled back to or forked from until you call offshoot_checkpoint"}]}}
+← {"jsonrpc":"2.0","id":5,"result":{"content":[{"type":"text","text":"checked out shop@migration-attempt at /var/folders/r1/h4z43zsj7vlb62zwtkxhgc400000gn/T/tmp.9QVDPWfYzm/store/checkouts/shop/migration-attempt.db\nthis checkout is not yet checkpointed: nothing written here can be rolled back to or forked from until you call offshoot_checkpoint"}],"structuredContent":{"branch":"migration-attempt","database":"shop","live":false,"path":"/var/folders/r1/h4z43zsj7vlb62zwtkxhgc400000gn/T/tmp.9QVDPWfYzm/store/checkouts/shop/migration-attempt.db"}}}
 ```
 
 The response text itself is the nudge: nothing here can be rolled back to
@@ -387,7 +387,7 @@ real rollback target if the migration goes wrong:
 
 ```json
 → {"jsonrpc":"2.0","id":6,"method":"tools/call","params":{"name":"offshoot_checkpoint","arguments":{"database":"shop","branch":"migration-attempt","name":"pre-migration"}}}
-← {"jsonrpc":"2.0","id":6,"result":{"content":[{"type":"text","text":"checkpointed shop@migration-attempt as \"pre-migration\" at txid 3"}]}}
+← {"jsonrpc":"2.0","id":6,"result":{"content":[{"type":"text","text":"checkpointed shop@migration-attempt as \"pre-migration\" at txid 3"}],"structuredContent":{"branch":"migration-attempt","database":"shop","live":false,"name":"pre-migration","txid":3}}}
 ```
 
 ### 4. Rollback on red
@@ -418,7 +418,7 @@ hand-patch the bad migration:*
 
 ```json
 → {"jsonrpc":"2.0","id":7,"method":"tools/call","params":{"name":"offshoot_rollback","arguments":{"database":"shop","branch":"migration-attempt","to":"pre-migration"}}}
-← {"jsonrpc":"2.0","id":7,"result":{"content":[{"type":"text","text":"rolled back shop@migration-attempt to checkpoint \"pre-migration\"; checkout at /.../store/checkouts/shop/migration-attempt.db"}]}}
+← {"jsonrpc":"2.0","id":7,"result":{"content":[{"type":"text","text":"rolled back shop@migration-attempt to checkpoint \"pre-migration\"; checkout at /var/folders/r1/h4z43zsj7vlb62zwtkxhgc400000gn/T/tmp.9QVDPWfYzm/store/checkouts/shop/migration-attempt.db"}],"structuredContent":{"branch":"migration-attempt","database":"shop","path":"/var/folders/r1/h4z43zsj7vlb62zwtkxhgc400000gn/T/tmp.9QVDPWfYzm/store/checkouts/shop/migration-attempt.db","to":"pre-migration"}}}
 ```
 
 ### 5. Checkpoint on green
@@ -438,7 +438,7 @@ Tests are green. The agent checkpoints the now-validated state:
 
 ```json
 → {"jsonrpc":"2.0","id":8,"method":"tools/call","params":{"name":"offshoot_checkpoint","arguments":{"database":"shop","branch":"migration-attempt","name":"migrated"}}}
-← {"jsonrpc":"2.0","id":8,"result":{"content":[{"type":"text","text":"checkpointed shop@migration-attempt as \"migrated\" at txid 4"}]}}
+← {"jsonrpc":"2.0","id":8,"result":{"content":[{"type":"text","text":"checkpointed shop@migration-attempt as \"migrated\" at txid 4"}],"structuredContent":{"branch":"migration-attempt","database":"shop","live":false,"name":"migrated","txid":4}}}
 ```
 
 ### 6. Promote — and the protected-branch guardrail firing for real
@@ -463,19 +463,19 @@ protected-branch guardrail (not a bug in its migration), and retries with
 
 ```json
 → {"jsonrpc":"2.0","id":10,"method":"tools/call","params":{"name":"offshoot_promote","arguments":{"database":"shop","source":"migration-attempt","target":"main","force":true}}}
-← {"jsonrpc":"2.0","id":10,"result":{"content":[{"type":"text","text":"promoted shop@migration-attempt onto shop@main at txid 4; the previous shop@main head is kept as shop@main-pre-promote (undo: promote it back onto main)"}]}}
+← {"jsonrpc":"2.0","id":10,"result":{"content":[{"type":"text","text":"promoted shop@migration-attempt onto shop@main at txid 4; the previous shop@main head is kept as shop@main-pre-promote (undo: promote it back onto main)"}],"structuredContent":{"backup":"main-pre-promote","database":"shop","source":"migration-attempt","target":"main","txid":4}}}
 ```
 
 ### 7. Cleanup and confirmation
 
 ```json
 → {"jsonrpc":"2.0","id":11,"method":"tools/call","params":{"name":"offshoot_destroy","arguments":{"database":"shop","branch":"migration-attempt"}}}
-← {"jsonrpc":"2.0","id":11,"result":{"content":[{"type":"text","text":"destroyed shop@migration-attempt"}]}}
+← {"jsonrpc":"2.0","id":11,"result":{"content":[{"type":"text","text":"destroyed shop@migration-attempt"}],"structuredContent":{"branch":"migration-attempt","database":"shop"}}}
 ```
 
 ```json
 → {"jsonrpc":"2.0","id":12,"method":"tools/call","params":{"name":"offshoot_list","arguments":{}}}
-← {"jsonrpc":"2.0","id":12,"result":{"content":[{"type":"text","text":"shop@main head=4 checkpoints=[promote] protected=true checked_out=true\nshop@main-pre-promote head=2 checkpoints=[fork] protected=false checked_out=false\n"}]}}
+← {"jsonrpc":"2.0","id":12,"result":{"content":[{"type":"text","text":"shop@main head=4 checkpoints=[promote] protected=true checked_out=true\nshop@main-pre-promote head=2 checkpoints=[fork] protected=false checked_out=false\n"}],"structuredContent":{"branches":[{"branch":"main","checked_out":true,"checkpoints":["promote"],"database":"shop","head_txid":4,"protected":true},{"branch":"main-pre-promote","checked_out":false,"checkpoints":["fork"],"database":"shop","head_txid":2,"protected":false}]}}}
 ```
 
 Note `checkpoints=[promote]`: promote resets the target's checkpoint history

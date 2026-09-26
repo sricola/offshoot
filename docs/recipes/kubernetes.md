@@ -263,8 +263,9 @@ strictly weaker check than either dry-run above.
 
 - No StatefulSet, no `PodDisruptionBudget` tuned for HA, no multi-replica
   story — see the top of this page.
-- Official image: `ghcr.io/sricola/offshoot:v0.2.10` (multi-arch). To build your own from this
-  repo until [docs/status.md](../status.md) says otherwise.
+- Official image: `ghcr.io/sricola/offshoot:<tag>` (multi-arch, published on
+  every tagged release; pin a tag). Building your own from `cmd/offshoot`
+  still works if you need a different base.
 - No admission-controller / NetworkPolicy guidance — write the
   `NetworkPolicy` your cluster's security posture requires around this Pod;
   that's environment-specific and out of scope for a single-binary tool's

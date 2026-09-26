@@ -17,6 +17,8 @@ pl = json.load(open("plugin/.claude-plugin/plugin.json"))
 for k in ("name", "version", "description", "author", "homepage", "repository", "license"):
     assert k in pl, f"plugin.json missing {k}"
 assert pl["name"] == "offshoot"
+assert mk["plugins"][0]["version"] == pl["version"], \
+    f"marketplace.json plugin version ({mk['plugins'][0]['version']!r}) != plugin.json version ({pl['version']!r})"
 mcp = json.load(open("plugin/.mcp.json"))
 assert mcp["offshoot"]["command"] == "offshoot" and mcp["offshoot"]["args"] == ["mcp"], ".mcp.json server"
 hooks = json.load(open("plugin/hooks/hooks.json"))["hooks"]

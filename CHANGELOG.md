@@ -42,8 +42,8 @@ version if you depend on format stability.
   MCP server plus a skill that teaches the fork/checkpoint/rollback/promote
   loop and advisory hooks that only add context, never block a command.
 - **Cursor one-click install link** for `offshoot mcp`
-  (`cursor://anysphere.cursor-deeplink/mcp/install?...`), alongside the
-  existing `claude mcp add` command.
+  (`https://cursor.com/en/install-mcp?...`, which hands off to the Cursor
+  app), alongside the existing `claude mcp add` command.
 
 ### Changed
 
