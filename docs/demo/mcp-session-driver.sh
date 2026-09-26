@@ -90,7 +90,7 @@ sqlite3 "$ATTEMPT_PATH" "ALTER TABLE orders ADD COLUMN total_cents INTEGER;
 echo "== real SQL: run tests (integer-type check) — RED =="
 section "real SQL: test assertion (all total_cents must be integer-typed)"
 TEST1=$(sqlite3 "$ATTEMPT_PATH" "SELECT count(*) FROM orders WHERE typeof(total_cents)='integer';")
-echo '$ sqlite3 $(offshoot path shop@migration-attempt) "SELECT count(*) FROM orders WHERE typeof(total_cents)=\x27integer\x27;"' >> "$LOG"
+printf '%s\n' '$ sqlite3 $(offshoot path shop@migration-attempt) "SELECT count(*) FROM orders WHERE typeof(total_cents)='\''integer'\'';"' >> "$LOG"
 echo "$TEST1  (want 3)" >> "$LOG"
 if [ "$TEST1" = "3" ]; then echo "TESTS: GREEN" >> "$LOG"; else echo "TESTS: RED" >> "$LOG"; fi
 
@@ -106,7 +106,7 @@ sqlite3 "$ATTEMPT_PATH" "ALTER TABLE orders ADD COLUMN total_cents INTEGER;
 echo "== real SQL: run tests again — GREEN =="
 section "real SQL: test assertion, re-run after correction"
 TEST2=$(sqlite3 "$ATTEMPT_PATH" "SELECT count(*) FROM orders WHERE typeof(total_cents)='integer';")
-echo '$ sqlite3 $(offshoot path shop@migration-attempt) "SELECT count(*) FROM orders WHERE typeof(total_cents)=\x27integer\x27;"' >> "$LOG"
+printf '%s\n' '$ sqlite3 $(offshoot path shop@migration-attempt) "SELECT count(*) FROM orders WHERE typeof(total_cents)='\''integer'\'';"' >> "$LOG"
 echo "$TEST2  (want 3)" >> "$LOG"
 if [ "$TEST2" = "3" ]; then echo "TESTS: GREEN" >> "$LOG"; else echo "TESTS: RED" >> "$LOG"; fi
 

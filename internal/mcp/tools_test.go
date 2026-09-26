@@ -873,30 +873,45 @@ func TestForkTTLSummaryKeepsJanitorNoteWhenReReadFails(t *testing.T) {
 // TestPromoteKeepsSafetyForkAndSaysSo: offshoot_promote always keeps the
 // target's previous head as <target>-pre-promote (agents get no opt-out —
 // this is the safe-by-default path), its TTL follows the configured fork
-// default, and the result text names the fork so the agent knows its undo
-// handle. The description states the mechanism so the model can plan on it.
+// default floored at ops.DefaultPromoteBackupTTL (24h) — a shorter
+// -default-ttl can't shrink the undo window, but a longer one still wins —
+// and the result text names the fork so the agent knows its undo handle.
+// The description states the mechanism so the model can plan on it.
 func TestPromoteKeepsSafetyForkAndSaysSo(t *testing.T) {
-	ts, w := newTools(t, 2*time.Hour)
-	ts.SetAllowForce(true)
-	if _, err := w.Fork("app", "main", "attempt-1", "", 0, nil); err != nil {
-		t.Fatal(err)
+	cases := []struct {
+		name       string
+		defaultTTL time.Duration
+		wantTTL    string
+	}{
+		{"belowFloorUsesFloor", 2 * time.Hour, "24h0m0s"},
+		{"aboveFloorWins", 48 * time.Hour, "48h0m0s"},
 	}
-	r := call(t, ts, "offshoot_promote", map[string]any{
-		"database": "app", "source": "attempt-1", "target": "main", "force": true})
-	if r.IsError {
-		t.Fatalf("promote: %s", text(r))
+	for _, c := range cases {
+		t.Run(c.name, func(t *testing.T) {
+			ts, w := newTools(t, c.defaultTTL)
+			ts.SetAllowForce(true)
+			if _, err := w.Fork("app", "main", "attempt-1", "", 0, nil); err != nil {
+				t.Fatal(err)
+			}
+			r := call(t, ts, "offshoot_promote", map[string]any{
+				"database": "app", "source": "attempt-1", "target": "main", "force": true})
+			if r.IsError {
+				t.Fatalf("promote: %s", text(r))
+			}
+			backup := "main" + ops.PromoteBackupSuffix
+			if !strings.Contains(text(r), "app@"+backup) {
+				t.Fatalf("result must name the safety fork %s: %s", backup, text(r))
+			}
+			ref, _, err := w.Store.GetRef("app", backup)
+			if err != nil {
+				t.Fatalf("safety fork must exist: %v", err)
+			}
+			if ref.TTL != c.wantTTL {
+				t.Fatalf("safety fork TTL = %q, want %q", ref.TTL, c.wantTTL)
+			}
+		})
 	}
-	backup := "main" + ops.PromoteBackupSuffix
-	if !strings.Contains(text(r), "app@"+backup) {
-		t.Fatalf("result must name the safety fork %s: %s", backup, text(r))
-	}
-	ref, _, err := w.Store.GetRef("app", backup)
-	if err != nil {
-		t.Fatalf("safety fork must exist: %v", err)
-	}
-	if ref.TTL != "2h0m0s" {
-		t.Fatalf("safety fork TTL must follow the configured fork default, got %q", ref.TTL)
-	}
+	ts, _ := newTools(t, 2*time.Hour)
 	for _, tl := range ts.Tools() {
 		if tl.Name == "offshoot_promote" && !strings.Contains(tl.Description, "-pre-promote") {
 			t.Fatalf("offshoot_promote description must state the safety fork: %s", tl.Description)
@@ -906,53 +921,171 @@ func TestPromoteKeepsSafetyForkAndSaysSo(t *testing.T) {
 
 // TestRollbackKeepsSafetyForkAndSaysSo: offshoot_rollback always keeps the
 // branch's previous head as <branch>-pre-rollback, its TTL follows the
-// configured fork default, and the result text names the fork so the agent
-// knows its undo handle. Mirrors TestPromoteKeepsSafetyForkAndSaysSo.
+// configured fork default floored at ops.DefaultPromoteBackupTTL (24h —
+// same floor promote applies, and for the same reason), and the result text
+// names the fork so the agent knows its undo handle. Mirrors
+// TestPromoteKeepsSafetyForkAndSaysSo.
 func TestRollbackKeepsSafetyForkAndSaysSo(t *testing.T) {
-	ts, w := newTools(t, 2*time.Hour)
-	if _, err := w.Fork("app", "main", "attempt-1", "", 0, nil); err != nil {
-		t.Fatal(err)
+	cases := []struct {
+		name       string
+		defaultTTL time.Duration
+		wantTTL    string
+	}{
+		{"belowFloorUsesFloor", 2 * time.Hour, "24h0m0s"},
+		{"aboveFloorWins", 48 * time.Hour, "48h0m0s"},
 	}
-	p, err := w.Checkout("app", "attempt-1")
-	if err != nil {
-		t.Fatal(err)
-	}
-	if out, err := exec.Command("sqlite3", p, "CREATE TABLE t (v); INSERT INTO t VALUES (1);").CombinedOutput(); err != nil {
-		t.Fatalf("%v: %s", err, out)
-	}
-	if _, err := w.Checkpoint("app", "attempt-1", "v1", nil); err != nil {
-		t.Fatal(err)
-	}
-	if out, err := exec.Command("sqlite3", p, "INSERT INTO t VALUES (2);").CombinedOutput(); err != nil {
-		t.Fatalf("%v: %s", err, out)
-	}
-	if _, err := w.Checkpoint("app", "attempt-1", "v2", nil); err != nil {
-		t.Fatal(err)
-	}
+	for _, c := range cases {
+		t.Run(c.name, func(t *testing.T) {
+			ts, w := newTools(t, c.defaultTTL)
+			if _, err := w.Fork("app", "main", "attempt-1", "", 0, nil); err != nil {
+				t.Fatal(err)
+			}
+			p, err := w.Checkout("app", "attempt-1")
+			if err != nil {
+				t.Fatal(err)
+			}
+			if out, err := exec.Command("sqlite3", p, "CREATE TABLE t (v); INSERT INTO t VALUES (1);").CombinedOutput(); err != nil {
+				t.Fatalf("%v: %s", err, out)
+			}
+			if _, err := w.Checkpoint("app", "attempt-1", "v1", nil); err != nil {
+				t.Fatal(err)
+			}
+			if out, err := exec.Command("sqlite3", p, "INSERT INTO t VALUES (2);").CombinedOutput(); err != nil {
+				t.Fatalf("%v: %s", err, out)
+			}
+			if _, err := w.Checkpoint("app", "attempt-1", "v2", nil); err != nil {
+				t.Fatal(err)
+			}
 
-	r := call(t, ts, "offshoot_rollback", map[string]any{
-		"database": "app", "branch": "attempt-1", "to": "v1"})
-	if r.IsError {
-		t.Fatalf("rollback: %s", text(r))
+			r := call(t, ts, "offshoot_rollback", map[string]any{
+				"database": "app", "branch": "attempt-1", "to": "v1"})
+			if r.IsError {
+				t.Fatalf("rollback: %s", text(r))
+			}
+			backup := "attempt-1" + ops.RollbackBackupSuffix
+			if !strings.Contains(text(r), "app@"+backup) {
+				t.Fatalf("result must name the safety fork %s: %s", backup, text(r))
+			}
+			sc, ok := r.StructuredContent.(map[string]any)
+			if !ok {
+				t.Fatalf("structuredContent must be a map, got %T", r.StructuredContent)
+			}
+			if _, ok := sc["backup"]; !ok {
+				t.Fatalf("structuredContent must have a backup field: %+v", sc)
+			}
+			ref, _, err := w.Store.GetRef("app", backup)
+			if err != nil {
+				t.Fatalf("safety fork must exist: %v", err)
+			}
+			if ref.TTL != c.wantTTL {
+				t.Fatalf("safety fork TTL = %q, want %q", ref.TTL, c.wantTTL)
+			}
+		})
 	}
-	backup := "attempt-1" + ops.RollbackBackupSuffix
-	if !strings.Contains(text(r), "app@"+backup) {
-		t.Fatalf("result must name the safety fork %s: %s", backup, text(r))
-	}
-	sc, ok := r.StructuredContent.(map[string]any)
-	if !ok {
-		t.Fatalf("structuredContent must be a map, got %T", r.StructuredContent)
-	}
-	if _, ok := sc["backup"]; !ok {
-		t.Fatalf("structuredContent must have a backup field: %+v", sc)
-	}
-	ref, _, err := w.Store.GetRef("app", backup)
-	if err != nil {
-		t.Fatalf("safety fork must exist: %v", err)
-	}
-	if ref.TTL != "2h0m0s" {
-		t.Fatalf("safety fork TTL must follow the configured fork default, got %q", ref.TTL)
-	}
+}
+
+// TestGuardProtectedSafetyFork pins item 2 of the guardrails final-review fix
+// wave: a branch's safety fork (<branch>-pre-rollback here) is guarded
+// against destroy and TTL-shortening/clearing touch, and rolling back the
+// protected branch again while its safety fork still exists is refused too
+// — all without -allow-force — while a plain touch (extend only, no `ttl`)
+// stays allowed throughout. The "unprotected" subtest pins the converse: none
+// of this applies when the branch the fork was taken from isn't protected.
+func TestGuardProtectedSafetyFork(t *testing.T) {
+	t.Run("protected", func(t *testing.T) {
+		ts, w := newTools(t)
+		// "app@main" is protected and carries an "init" checkpoint from
+		// Create — rolling it back to its own init checkpoint is enough to
+		// mint main-pre-rollback without any other setup.
+		if r := call(t, ts, "offshoot_rollback", map[string]any{
+			"database": "app", "branch": "main", "to": "init"}); r.IsError {
+			t.Fatalf("rollback: %s", text(r))
+		}
+		backup := "main" + ops.RollbackBackupSuffix
+
+		// (a) destroying the safety fork is refused, naming -allow-force and
+		// the human, and the fork survives.
+		dr := call(t, ts, "offshoot_destroy", map[string]any{"database": "app", "branch": backup})
+		if !dr.IsError {
+			t.Fatal("destroying the safety fork of protected main must be refused without -allow-force")
+		}
+		if !strings.Contains(text(dr), "-allow-force") || !strings.Contains(strings.ToLower(text(dr)), "human") {
+			t.Fatalf("refusal must name -allow-force and the human: %s", text(dr))
+		}
+		if _, _, err := w.Store.GetRef("app", backup); err != nil {
+			t.Fatalf("safety fork must still exist after the refused destroy: %v", err)
+		}
+
+		// (b) touch that changes the TTL is refused; a plain touch (extend
+		// only) is allowed.
+		if r := call(t, ts, "offshoot_touch", map[string]any{
+			"database": "app", "branch": backup, "ttl": "1s"}); !r.IsError {
+			t.Fatal("touch with ttl on the safety fork of protected main must be refused without -allow-force")
+		}
+		if r := call(t, ts, "offshoot_touch", map[string]any{
+			"database": "app", "branch": backup}); r.IsError {
+			t.Fatalf("plain touch (extend only) must stay allowed: %s", text(r))
+		}
+
+		// (c) a second rollback of main is refused while the fork exists.
+		if r := call(t, ts, "offshoot_rollback", map[string]any{
+			"database": "app", "branch": "main", "to": "init"}); !r.IsError {
+			t.Fatal("a second rollback of protected main must be refused while its safety fork exists")
+		} else if !strings.Contains(strings.ToLower(text(r)), "human") {
+			t.Fatalf("refusal must point at the human: %s", text(r))
+		}
+
+		// After -allow-force, all three proceed.
+		ts.SetAllowForce(true)
+		if r := call(t, ts, "offshoot_touch", map[string]any{
+			"database": "app", "branch": backup, "ttl": "1s"}); r.IsError {
+			t.Fatalf("touch with ttl, -allow-force: %s", text(r))
+		}
+		if r := call(t, ts, "offshoot_rollback", map[string]any{
+			"database": "app", "branch": "main", "to": "init"}); r.IsError {
+			t.Fatalf("second rollback, -allow-force: %s", text(r))
+		}
+		if r := call(t, ts, "offshoot_destroy", map[string]any{
+			"database": "app", "branch": backup}); r.IsError {
+			t.Fatalf("destroy, -allow-force: %s", text(r))
+		}
+	})
+
+	t.Run("unprotected", func(t *testing.T) {
+		ts, w := newTools(t)
+		if _, err := w.Fork("app", "main", "attempt-1", "", 0, nil); err != nil {
+			t.Fatal(err)
+		}
+		p, err := w.Checkout("app", "attempt-1")
+		if err != nil {
+			t.Fatal(err)
+		}
+		if out, err := exec.Command("sqlite3", p, "CREATE TABLE t (v); INSERT INTO t VALUES (1);").CombinedOutput(); err != nil {
+			t.Fatalf("%v: %s", err, out)
+		}
+		if _, err := w.Checkpoint("app", "attempt-1", "v1", nil); err != nil {
+			t.Fatal(err)
+		}
+		if r := call(t, ts, "offshoot_rollback", map[string]any{
+			"database": "app", "branch": "attempt-1", "to": "v1"}); r.IsError {
+			t.Fatalf("rollback: %s", text(r))
+		}
+		backup := "attempt-1" + ops.RollbackBackupSuffix
+
+		// None of the three needs -allow-force: attempt-1 was never protected.
+		if r := call(t, ts, "offshoot_touch", map[string]any{
+			"database": "app", "branch": backup, "ttl": "1s"}); r.IsError {
+			t.Fatalf("touch with ttl on an unprotected branch's safety fork: %s", text(r))
+		}
+		if r := call(t, ts, "offshoot_rollback", map[string]any{
+			"database": "app", "branch": "attempt-1", "to": "v1"}); r.IsError {
+			t.Fatalf("second rollback of an unprotected branch: %s", text(r))
+		}
+		if r := call(t, ts, "offshoot_destroy", map[string]any{
+			"database": "app", "branch": backup}); r.IsError {
+			t.Fatalf("destroy of an unprotected branch's safety fork: %s", text(r))
+		}
+	})
 }
 
 // TestToolAnnotationsClassifyEveryTool pins the host-facing behavior hints

@@ -1218,9 +1218,17 @@ func (w *Workspace) safetyFork(db, branch, suffix, metaKey, verb string, ttl tim
 		if existing.Meta[metaKey] != branch {
 			return "", fmt.Errorf("ops: %s: %s@%s already exists and is not a %s safety fork of %s@%s; destroy or rename it, or pass --no-backup", verb, db, name, verb, db, branch)
 		}
-		// Ours from an earlier call: replace it.
+		// Ours from an earlier call: replace it. The unforced Destroy above
+		// most commonly fails on a live lease (someone has a session open on
+		// the previous fork); its error text says "use --force" for a CLI
+		// caller, but neither promote nor rollback exposes a --force lever
+		// for THIS replacement (force only ever overrides the branch's OWN
+		// protected/lease check, never the safety fork's), so that phrase
+		// would misdirect a caller here — replace it before wrapping.
 		if err := w.Destroy(db, name, false); err != nil {
-			return "", fmt.Errorf("ops: %s: replacing the previous safety fork %s@%s: %w", verb, db, name, err)
+			msg := strings.Replace(err.Error(), "use --force", "ask the human", 1)
+			return "", fmt.Errorf("ops: %s: replacing the previous safety fork %s@%s: %s (close that session, or pass --no-backup)",
+				verb, db, name, msg)
 		}
 	case errors.Is(err, store.ErrNotFound):
 	default:

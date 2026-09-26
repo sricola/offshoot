@@ -272,6 +272,44 @@ func wrapForceRefusal(err error, force, allowForce bool) error {
 	return fmt.Errorf("%v — force through this MCP server needs `offshoot mcp -allow-force`; ask the human", err)
 }
 
+// guardProtectedSafetyFork refuses destroying db@branch, or changing its
+// TTL, through MCP without -allow-force when branch is ITSELF the safety
+// fork (<target>-pre-rollback or <target>-pre-promote) of some OTHER branch
+// that is protected — e.g. a plain `offshoot_destroy main-pre-rollback` when
+// `main` is protected. Without this guard, refuseForceOnProtected never
+// catches this: it checks whether the branch NAMED in the call is
+// protected, and a safety fork itself is never protected, only the branch
+// it was taken from is. Callers pass the branch actually being
+// destroyed/touched, not the protected target.
+//
+// It reads branch's own ref for its Meta marker (RollbackBackupMetaKey or
+// PromoteBackupMetaKey names the branch the fork was taken from), then that
+// named branch's own ref for Protected. A read error on either ref, or no
+// marker at all, is not this guard's business: it returns ok=false (not
+// refused) and lets the caller's own subsequent ops call surface the real
+// error (no such branch, etc.) — same fail-open-on-read-error shape as
+// refuseIfSessionOpen, since this is a courtesy guard on top of ops' own
+// checks, not the last line of defense against an actually-forced call.
+func (t *OffshootTools) guardProtectedSafetyFork(db, branch string) (ToolResult, bool) {
+	ref, _, err := t.ws.Store.GetRef(db, branch)
+	if err != nil {
+		return ToolResult{}, false
+	}
+	target := ref.Meta[ops.RollbackBackupMetaKey]
+	if target == "" {
+		target = ref.Meta[ops.PromoteBackupMetaKey]
+	}
+	if target == "" {
+		return ToolResult{}, false
+	}
+	tref, _, err := t.ws.Store.GetRef(db, target)
+	if err != nil || !tref.Protected {
+		return ToolResult{}, false
+	}
+	return ErrorResult("%s@%s is the safety fork of protected %s@%s; without -allow-force it cannot "+
+		"be destroyed or have its TTL changed through MCP — ask the human", db, branch, db, target), true
+}
+
 // prop describes one property of a tool's JSON Schema input: its argument
 // name, its real JSON Schema type (so a bool-typed Go field like `force`
 // is advertised as "boolean", not "string" — a model that follows the
@@ -434,8 +472,10 @@ func (t *OffshootTools) Tools() []Tool {
 				"manually undoing changes. Reports the checkout path to reopen after " +
 				"the rollback. `branch` defaults to \"main\" if omitted. The branch's " +
 				"previous head is kept first as a TTL'd safety fork `<branch>-pre-rollback` " +
-				"(one per branch, replaced by the next rollback), so a rollback is undone " +
-				"by promoting that fork back onto `branch`. If a daemon " +
+				"(one per branch, replaced by the next rollback; the safety fork lives at " +
+				"least 24h), undone by a promote of that fork back onto `branch` — through " +
+				"MCP only if `branch` is unprotected or this server allows force; otherwise " +
+				"that's the human's CLI promote. If a daemon " +
 				"session is open on this branch, the call is refused instead of " +
 				"proceeding, since rollback repoints the branch's storage out from " +
 				"under a session the daemon still believes it owns — close the " +
@@ -449,9 +489,9 @@ func (t *OffshootTools) Tools() []Tool {
 				"at the source branch's current head, which resets the target's " +
 				"checkpoint history to just the new promote checkpoint. The target's " +
 				"previous head is kept first as a shared safety fork named " +
-				"`<target>-pre-promote` (TTL'd; one per target, replaced by the next " +
-				"promote), so a promote is undone by promoting that fork back onto the " +
-				"target. Call this once " +
+				"`<target>-pre-promote` (TTL'd, at least 24h; one per target, replaced by " +
+				"the next promote), so a promote is undone by promoting that fork back onto " +
+				"the target. Call this once " +
 				"you've validated a forked attempt and are ready to make it the branch " +
 				"of record. Protected branches (main is protected by default) refuse promotion. " +
 				"`force` is honored only when the server was started with -allow-force; " +
@@ -489,8 +529,10 @@ func (t *OffshootTools) Tools() []Tool {
 				"longer than expected, or before handing a fork to a long-running step. `ttl` " +
 				"omitted keeps the current TTL; a Go duration like \"2h\" sets it; \"none\" clears " +
 				"it so the branch never expires (prefer a longer duration over \"none\" — " +
-				"branches without a TTL are only removed by an explicit destroy). A TTL alone " +
-				"reaps nothing: the janitor (`offshoot serve`) or `offshoot gc` does.",
+				"branches without a TTL are only removed by an explicit destroy). A TTL is " +
+				"enforced by the daemon's janitor, by `offshoot gc`, and — when no daemon is " +
+				"running — by this server's own timer (`offshoot mcp -reap-every`, default " +
+				"60s), so shortening a TTL takes effect within about a minute.",
 			InputSchema: schema(reqStr("database"), optStrDefault("branch", "main"), optStr("ttl")),
 			Annotations: annotate("Extend a branch's life", false, false, true),
 		},
@@ -930,7 +972,21 @@ type rollbackArgs struct {
 // (see refuseIfSessionOpen) — an at-rest rollback would repoint the branch
 // out from under a session the daemon still believes owns its checkout.
 // The branch's previous head is always kept first as a safety fork (see
-// promote's identical always-on backup and t.defaultTTL comment there).
+// promote's identical always-on backup and t.defaultTTL comment there), at
+// a TTL floored to ops.DefaultPromoteBackupTTL (24h) regardless of a shorter
+// -default-ttl — see the same floor in promote.
+//
+// Two guards sit in front of that safety fork specifically when branch is
+// protected and this server does not allow force: (1) if branch already has
+// a `<branch>-pre-rollback` from an earlier rollback, this refuses outright
+// rather than silently replacing an undo point the human may still need
+// (only a protected branch gets this treatment — an unprotected branch's
+// own safety fork is the agent's to manage); (2) if the daemon has a
+// session open on that safety-fork name, this refuses the same way
+// opRollback's daemon-side guard does (refuseIfSessionOpen), since
+// replacing it would otherwise surface as an ops lease error instead of a
+// clear MCP refusal. Whether branch is protected also decides how the
+// result phrases its own undo instructions: see the res.Backup clause below.
 func (t *OffshootTools) rollback(args json.RawMessage) (ToolResult, error) {
 	var a rollbackArgs
 	if err := json.Unmarshal(args, &a); err != nil {
@@ -947,7 +1003,33 @@ func (t *OffshootTools) rollback(args json.RawMessage) (ToolResult, error) {
 	if r, refused := t.refuseIfSessionOpen(a.Database, branch, "rolling it back"); refused {
 		return r, nil
 	}
-	res, err := t.ws.RollbackWith(a.Database, branch, a.To, ops.RollbackOptions{BackupTTL: t.defaultTTL})
+
+	// protected reflects branch's OWN ref, read once and reused both for the
+	// already-has-a-safety-fork guard below and for the undo wording after a
+	// successful rollback — a GetRef failure here (e.g. no such branch) just
+	// leaves protected false; RollbackWith's own GetRef reports the real
+	// error a moment later.
+	ref, _, refErr := t.ws.Store.GetRef(a.Database, branch)
+	protected := refErr == nil && ref.Protected
+
+	backupName := branch + ops.RollbackBackupSuffix
+	if !t.allowForce && protected {
+		if bref, _, err := t.ws.Store.GetRef(a.Database, backupName); err == nil &&
+			bref.Meta[ops.RollbackBackupMetaKey] == branch {
+			return ErrorResult("%s@%s already has a safety fork %s@%s from an earlier rollback; "+
+				"rolling back again would replace it — ask the human to promote or destroy it first",
+				a.Database, branch, a.Database, backupName), nil
+		}
+	}
+	if r, refused := t.refuseIfSessionOpen(a.Database, backupName, "replacing its safety fork"); refused {
+		return r, nil
+	}
+
+	// The safety fork's TTL follows the configured fork default, floored at
+	// ops.DefaultPromoteBackupTTL (24h) so a short -default-ttl can't shrink
+	// the undo window — see promote's identical floor.
+	backupTTL := max(t.defaultTTL, ops.DefaultPromoteBackupTTL)
+	res, err := t.ws.RollbackWith(a.Database, branch, a.To, ops.RollbackOptions{BackupTTL: backupTTL})
 	if err != nil {
 		return ErrorResult("%v", err), nil
 	}
@@ -957,12 +1039,22 @@ func (t *OffshootTools) rollback(args json.RawMessage) (ToolResult, error) {
 	if res.Backup == "" {
 		return StructuredResult(sc, "rolled back %s@%s to checkpoint %q; checkout at %s", a.Database, branch, a.To, res.Path), nil
 	}
+	// A protected branch (main, typically) can't actually be undone through
+	// MCP unless this server allows force — offshoot_promote onto it would
+	// itself be refused (refuseForceOnProtected) — so the undo clause must
+	// not claim an agent can do it; it names the human's CLI promote
+	// instead. See item 1 of the guardrails final-review fix wave.
+	undo := fmt.Sprintf("undo: offshoot_promote it back onto %s", branch)
+	if protected && !t.allowForce {
+		undo = fmt.Sprintf("undo: ask the human to run `offshoot promote %s@%s --onto %s --force`",
+			a.Database, res.Backup, branch)
+	}
 	// The backup clause is inserted BEFORE "checkout at %s" (rather than
 	// appended after it) so the checkout path stays the message's trailing
 	// token — callers/tests that pull "the last path-shaped word" out of the
 	// prose (see lastPath in tools_test.go) still find it.
-	return StructuredResult(sc, "rolled back %s@%s to checkpoint %q; the previous head is kept as %s@%s (undo: offshoot_promote it back onto %s); checkout at %s",
-		a.Database, branch, a.To, a.Database, res.Backup, branch, res.Path), nil
+	return StructuredResult(sc, "rolled back %s@%s to checkpoint %q; the previous head is kept as %s@%s (%s); checkout at %s",
+		a.Database, branch, a.To, a.Database, res.Backup, undo, res.Path), nil
 }
 
 type promoteArgs struct {
@@ -1008,10 +1100,12 @@ func (t *OffshootTools) promote(args json.RawMessage) (ToolResult, error) {
 	origForce := a.Force
 	a.Force = eff
 	// The safety fork's TTL follows the configured fork default when one is
-	// set (the same "every agent-made branch expires" policy offshoot_fork
-	// applies), else ops.DefaultPromoteBackupTTL.
+	// set and it's at least ops.DefaultPromoteBackupTTL (24h); a shorter
+	// -default-ttl (or none) still floors at 24h — an operator tuning fork
+	// TTLs down for throwaway attempts must not, as a side effect, shrink
+	// this safety fork's own undo window below a day.
 	res, err := t.ws.PromoteWith(a.Database, a.Source, a.Target,
-		ops.PromoteOptions{Force: a.Force, BackupTTL: t.defaultTTL})
+		ops.PromoteOptions{Force: a.Force, BackupTTL: max(t.defaultTTL, ops.DefaultPromoteBackupTTL)})
 	if err != nil {
 		return ErrorResult("%v", wrapForceRefusal(err, origForce, t.allowForce)), nil
 	}
@@ -1035,7 +1129,11 @@ type destroyArgs struct {
 // session (healthy or fenced) open on branch, this refuses rather than
 // proceeding (see refuseIfSessionOpen) — an at-rest destroy would delete
 // the branch (and, per ops.Destroy, clear its lease) out from under a
-// session the daemon still believes owns it.
+// session the daemon still believes owns it. Before any of that, if branch
+// is itself the safety fork of some OTHER protected branch (e.g.
+// `main-pre-rollback` while `main` is protected), guardProtectedSafetyFork
+// refuses without -allow-force — refuseForceOnProtected below only checks
+// whether BRANCH ITSELF is protected, which a safety fork never is.
 func (t *OffshootTools) destroy(args json.RawMessage) (ToolResult, error) {
 	var a destroyArgs
 	if err := json.Unmarshal(args, &a); err != nil {
@@ -1046,6 +1144,11 @@ func (t *OffshootTools) destroy(args json.RawMessage) (ToolResult, error) {
 	}
 	if r, bad := validateNames(namedArg("database", a.Database), namedArg("branch", a.Branch)); bad {
 		return r, nil
+	}
+	if !t.allowForce {
+		if r, refused := t.guardProtectedSafetyFork(a.Database, a.Branch); refused {
+			return r, nil
+		}
 	}
 	if r, refused := t.refuseIfSessionOpen(a.Database, a.Branch, "destroying it"); refused {
 		return r, nil
@@ -1074,7 +1177,12 @@ type touchArgs struct {
 // touch resets db@branch's activity clock (ops.Touch: CAS-retried, refuses
 // a branch a reaper has already claimed) and optionally sets/clears its TTL.
 // Safe alongside an open daemon session: the ref CAS races only lease
-// renewals, and ops.Touch retries.
+// renewals, and ops.Touch retries. Changing the TTL (a.TTL != "") of a
+// branch that is itself the safety fork of some OTHER protected branch is
+// guarded the same way destroy() is (guardProtectedSafetyFork): a human who
+// protected `main` gets to decide how long `main-pre-rollback` lives, too. A
+// plain touch (a.TTL == "", extending life only) is never guarded — it can
+// only push the deadline further out, never pull it in or clear it.
 func (t *OffshootTools) touch(args json.RawMessage) (ToolResult, error) {
 	var a touchArgs
 	if err := json.Unmarshal(args, &a); err != nil {
@@ -1086,6 +1194,11 @@ func (t *OffshootTools) touch(args json.RawMessage) (ToolResult, error) {
 	branch := branchOr(a.Branch)
 	if r, bad := validateNames(namedArg("database", a.Database), namedArg("branch", branch)); bad {
 		return r, nil
+	}
+	if a.TTL != "" && !t.allowForce {
+		if r, refused := t.guardProtectedSafetyFork(a.Database, branch); refused {
+			return r, nil
+		}
 	}
 	var ttl *time.Duration
 	switch a.TTL {

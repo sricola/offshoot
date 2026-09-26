@@ -138,13 +138,28 @@ Any branch, not just `main`, can be put under the same protection:
 clears it); it's a CLI-only verb by design; there's no `offshoot_protect`
 MCP tool; flipping the flag doesn't touch the branch's TTL clock.
 
-`offshoot_rollback` has its own undo, independent of `-allow-force`:
-before repointing, it keeps the branch's previous head as a TTL'd shared
-safety fork, `<branch>-pre-rollback` (one per branch — the next rollback
-of the same branch replaces it), and reports it back as `backup` in the
-tool result. Promoting that fork back onto the branch (`offshoot_promote`
-with `source: "<branch>-pre-rollback"`, `target: "<branch>"`, or the CLI
-equivalent) undoes the rollback.
+`offshoot_rollback` keeps its own undo point: before repointing, it keeps
+the branch's previous head as a TTL'd shared safety fork,
+`<branch>-pre-rollback` (one per branch — the next rollback of the same
+branch replaces it, at least 24h TTL), and reports it back as `backup` in
+the tool result. Whether the undo itself is agent-doable depends on the
+same `-allow-force` gate above: for an **unprotected** branch, an agent can
+undo the rollback itself — `offshoot_promote` with `source:
+"<branch>-pre-rollback"`, `target: "<branch>"`. For a **protected** branch
+(`main`, typically), that promote would itself be refused unless this
+server allows force, so the undo is the human's CLI promote instead —
+`offshoot_rollback`'s result says so explicitly when it applies, naming
+the exact command (`offshoot promote <db>@<branch>-pre-rollback --onto
+<branch> --force`).
+
+That safety fork is itself guarded the same way once the branch it was
+taken from is protected: without `-allow-force`, an agent can't destroy
+`main-pre-rollback` (or `main-pre-promote`) or shorten/clear its TTL via
+`offshoot_touch`, and a second `offshoot_rollback main` is refused outright
+while the fork from the first one still exists, rather than silently
+replacing an undo point the human may still need — ask the human to
+promote or destroy it first. A plain `offshoot_touch` that only extends
+the fork's life (no `ttl` argument) is never blocked this way.
 
 Also true regardless of tools: the daemon's unix socket is mode `0600`,
 and one leased, epoch-fenced writer per branch means concurrent attempts

@@ -92,6 +92,27 @@ version if you depend on format stability.
   CLI or a fork. The gate fails closed on a transient error reading the
   branch's own protected flag (`force` is downgraded to `false`, never let
   through).
+- **MCP guards a protected branch's own safety fork, not just the branch
+  itself.** `offshoot_destroy` and `offshoot_touch` (when it would change
+  the TTL) now refuse, without `-allow-force`, on a branch that is itself
+  `<target>-pre-rollback`/`<target>-pre-promote` of some OTHER protected
+  branch (`guardProtectedSafetyFork`) — `main-pre-rollback` is not itself
+  protected, so the plain protected-branch check never caught this before.
+  `offshoot_rollback` additionally refuses outright, without
+  `-allow-force`, when the protected branch it's rolling back already has
+  a safety fork from an earlier rollback, rather than silently replacing
+  an undo point the human may still need. A plain `offshoot_touch` that
+  only extends a fork's life (no `ttl` argument) is never blocked. See
+  `TestGuardProtectedSafetyFork` in `internal/mcp/tools_test.go`.
+- **MCP's safety-fork TTL floors at 24h.** `offshoot_promote` and
+  `offshoot_rollback` now pass `max(-default-ttl, ops.DefaultPromoteBackupTTL)`
+  as the safety fork's TTL, not `-default-ttl` alone — an operator running
+  `offshoot mcp -default-ttl` shorter than 24h (to keep throwaway attempt
+  forks small) no longer shrinks the undo window on `<branch>-pre-rollback`/
+  `<target>-pre-promote` below a day as a side effect; a longer
+  `-default-ttl` still wins. `TestPromoteKeepsSafetyForkAndSaysSo` and
+  `TestRollbackKeepsSafetyForkAndSaysSo` now cover both the floor
+  (2h default → 24h fork) and a default above it (48h → 48h fork).
 - **`offshoot mcp -reap-every DURATION|none`** (default `60s`). Reaps
   expired forks and self-heals stranded delete claims on this cadence for
   as long as the MCP process is up — the daemonless fallback a bare
