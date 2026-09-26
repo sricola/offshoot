@@ -233,6 +233,90 @@ func TestMCPRefusesForceOnProtectedByDefault(t *testing.T) {
 	}
 }
 
+// errOnceGetBackend wraps a real store.Backend and fails the FIRST Get for
+// one specific key with an injected error, then behaves normally on every
+// later call (to that key or any other) — a transient backend blip, not a
+// permanently broken key. Used to prove refuseForceOnProtected's own GetRef
+// probe fails CLOSED: if its read of the target/branch ref errors, force
+// must be downgraded to false even though a later, successful read (e.g.
+// ops' own GetRef, moments later) might have found the branch unprotected.
+type errOnceGetBackend struct {
+	store.Backend
+	key     string
+	errored bool
+}
+
+func (b *errOnceGetBackend) Get(key string) ([]byte, string, error) {
+	if key == b.key && !b.errored {
+		b.errored = true
+		return nil, "", fmt.Errorf("injected transient backend error")
+	}
+	return b.Backend.Get(key)
+}
+
+// TestMCPForceFailsClosedOnTransientGetRefError: refuseForceOnProtected's
+// own GetRef probe (not ops') hitting a transient backend error must not
+// let a caller's force:true slip through to ops. Before the fix, an error
+// here left force unchanged (true), so ops' own GetRef — hitting the SAME
+// key a moment later, this time successfully — could see main protected
+// and still honor force, destroying it. The fix downgrades force to false
+// on any GetRef error at the gate, so ops' own protected check (unforced)
+// refuses instead: main survives, and the caller sees a tool error naming
+// -allow-force (via wrapForceRefusal, since ops' error text says
+// "use --force").
+func TestMCPForceFailsClosedOnTransientGetRefError(t *testing.T) {
+	ts, w := newTools(t)
+	w.Store.B = &errOnceGetBackend{Backend: w.Store.B, key: store.RefKey("app", "main")}
+
+	dr := call(t, ts, "offshoot_destroy", map[string]any{
+		"database": "app", "branch": "main", "force": true})
+	if !dr.IsError {
+		t.Fatal("forced destroy of protected main must be refused even when the gate's own GetRef errors transiently")
+	}
+	if !strings.Contains(text(dr), "-allow-force") {
+		t.Fatalf("refusal must name -allow-force: %s", text(dr))
+	}
+	if _, _, err := w.Store.GetRef("app", "main"); err != nil {
+		t.Fatalf("main must still exist: %v", err)
+	}
+}
+
+// TestMCPDestroyNeedsAllowForceForLiveLeaseToo: -allow-force gates every use
+// ops makes of force in destroy, not just the protected check — including
+// bypassing a live lease on an otherwise UNprotected branch (ops.Destroy
+// consults force for both; see gc.go). Without -allow-force, force:true is
+// downgraded to false before it ever reaches ops (refuseForceOnProtected),
+// so ops' own live-lease check refuses; the tool error is rewrapped to name
+// -allow-force. With -allow-force, the same call proceeds.
+func TestMCPDestroyNeedsAllowForceForLiveLeaseToo(t *testing.T) {
+	ts, w := newTools(t)
+	if r := call(t, ts, "offshoot_fork", map[string]any{
+		"database": "app", "new_branch": "leased"}); r.IsError {
+		t.Fatalf("fork: %s", text(r))
+	}
+	if _, err := w.AcquireLease("app", "leased", "holder", time.Hour); err != nil {
+		t.Fatal(err)
+	}
+
+	dr := call(t, ts, "offshoot_destroy", map[string]any{
+		"database": "app", "branch": "leased", "force": true})
+	if !dr.IsError {
+		t.Fatal("forced destroy under a live lease must be refused without -allow-force")
+	}
+	if !strings.Contains(text(dr), "-allow-force") {
+		t.Fatalf("refusal must name -allow-force: %s", text(dr))
+	}
+	if _, _, err := w.Store.GetRef("app", "leased"); err != nil {
+		t.Fatalf("leased branch must still exist after the refused destroy: %v", err)
+	}
+
+	ts.SetAllowForce(true)
+	if r := call(t, ts, "offshoot_destroy", map[string]any{
+		"database": "app", "branch": "leased", "force": true}); r.IsError {
+		t.Fatalf("destroy with -allow-force under a live lease: %s", text(r))
+	}
+}
+
 func TestUserErrorsAreToolErrorsNotRPCErrors(t *testing.T) {
 	ts, _ := newTools(t)
 	r := call(t, ts, "offshoot_rollback", map[string]any{

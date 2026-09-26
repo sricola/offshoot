@@ -38,7 +38,9 @@ SQLite client opens. You have nine tools; the loop is four calls.
    undo window closes when either happens.
 7. **Clean up:** `offshoot_destroy` a failed attempt, or let its TTL expire.
    `offshoot_touch {database, branch, ttl?}` keeps a fork alive if a task
-   runs long.
+   runs long. A protected branch (or one under a live lease) cannot be
+   destroyed with `force` through MCP unless the operator started
+   `offshoot mcp -allow-force`; ask the human, who can destroy from the CLI.
 
 ## Rules
 
