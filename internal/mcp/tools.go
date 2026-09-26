@@ -247,6 +247,22 @@ func schema(props ...prop) map[string]any {
 	return s
 }
 
+// annotate builds a fully explicit ToolAnnotations. openWorldHint is always
+// false: every offshoot tool acts only on its own store, never on the open
+// internet. All four hints are set on purpose — the spec defaults
+// destructiveHint to TRUE, so an unannotated fork would read as destructive
+// to a host that honors the hints.
+func annotate(title string, readOnly, destructive, idempotent bool) *ToolAnnotations {
+	f := false
+	return &ToolAnnotations{
+		Title:           title,
+		ReadOnlyHint:    &readOnly,
+		DestructiveHint: &destructive,
+		IdempotentHint:  &idempotent,
+		OpenWorldHint:   &f,
+	}
+}
+
 // Tools returns the seven lifecycle tools this server exposes. Descriptions
 // are the agent's only documentation: each explains not just what the tool
 // does but when an agent should reach for it.
@@ -260,6 +276,7 @@ func (t *OffshootTools) Tools() []Tool {
 				"exist, what branches an attempt could fork from, or which checkpoints " +
 				"are available to roll back to or fork from.",
 			InputSchema: schema(),
+			Annotations: annotate("List databases and branches", true, false, true),
 		},
 		{
 			Name: "offshoot_checkout",
@@ -274,6 +291,7 @@ func (t *OffshootTools) Tools() []Tool {
 				"Call offshoot_checkpoint to name the current state so it can be rolled " +
 				"back to or forked from later. `branch` defaults to \"main\" if omitted.",
 			InputSchema: schema(reqStr("database"), optStrDefault("branch", "main")),
+			Annotations: annotate("Materialize a branch to a SQLite file", false, false, true),
 		},
 		{
 			Name: "offshoot_checkpoint",
@@ -286,6 +304,7 @@ func (t *OffshootTools) Tools() []Tool {
 				"otherwise it's a full-snapshot checkpoint of the checkout file. " +
 				"`branch` defaults to \"main\" if omitted.",
 			InputSchema: schema(reqStr("database"), reqStr("name"), optStrDefault("branch", "main")),
+			Annotations: annotate("Checkpoint a branch", false, false, false),
 		},
 		{
 			Name: "offshoot_fork",
@@ -304,6 +323,7 @@ func (t *OffshootTools) Tools() []Tool {
 			InputSchema: schema(reqStr("database"), reqStr("new_branch"),
 				optStrDefault("branch", "main"), optStr("at"),
 				optStrDefault("ttl", ttlDefaultDisplay(t.defaultTTL))),
+			Annotations: annotate("Fork a branch", false, false, false),
 		},
 		{
 			Name: "offshoot_rollback",
@@ -317,6 +337,7 @@ func (t *OffshootTools) Tools() []Tool {
 				"under a session the daemon still believes it owns — close the " +
 				"session first (e.g. `offshoot session close`) and retry.",
 			InputSchema: schema(reqStr("database"), reqStr("to"), optStrDefault("branch", "main")),
+			Annotations: annotate("Roll a branch back to a checkpoint", false, true, false),
 		},
 		{
 			Name: "offshoot_promote",
@@ -340,6 +361,7 @@ func (t *OffshootTools) Tools() []Tool {
 				"live session — flush or checkpoint the source first if you need its " +
 				"very latest state promoted.",
 			InputSchema: schema(reqStr("database"), reqStr("source"), reqStr("target"), optBool("force")),
+			Annotations: annotate("Promote a branch onto a target", false, true, false),
 		},
 		{
 			Name: "offshoot_destroy",
@@ -352,6 +374,7 @@ func (t *OffshootTools) Tools() []Tool {
 				"storage out from under a session the daemon still believes it owns; " +
 				"close the session first (e.g. `offshoot session close`) and retry.",
 			InputSchema: schema(reqStr("database"), reqStr("branch"), optBool("force")),
+			Annotations: annotate("Destroy a branch", false, true, false),
 		},
 	}
 }

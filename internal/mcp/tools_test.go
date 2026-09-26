@@ -729,3 +729,77 @@ func TestPromoteKeepsSafetyForkAndSaysSo(t *testing.T) {
 		}
 	}
 }
+
+// TestToolAnnotationsClassifyEveryTool pins the host-facing behavior hints
+// the 2026-07-28 spec lets a tool carry: hosts use readOnlyHint to skip
+// confirmation and destructiveHint to require it, and the spec's default
+// for destructiveHint is TRUE, so every tool must state all hints
+// explicitly — an unannotated fork would be treated as destructive.
+func TestToolAnnotationsClassifyEveryTool(t *testing.T) {
+	ts, _ := newTools(t)
+	want := map[string]struct{ readOnly, destructive, idempotent bool }{
+		"offshoot_list":       {true, false, true},
+		"offshoot_checkout":   {false, false, true},
+		"offshoot_checkpoint": {false, false, false},
+		"offshoot_fork":       {false, false, false},
+		"offshoot_rollback":   {false, true, false},
+		"offshoot_promote":    {false, true, false},
+		"offshoot_destroy":    {false, true, false},
+	}
+	for _, tl := range ts.Tools() {
+		w, ok := want[tl.Name]
+		if !ok {
+			continue // tools added by later tasks pin their own annotations
+		}
+		a := tl.Annotations
+		if a == nil {
+			t.Fatalf("%s: no annotations", tl.Name)
+		}
+		if a.Title == "" {
+			t.Errorf("%s: annotations.title must be set", tl.Name)
+		}
+		for name, got := range map[string]*bool{
+			"readOnlyHint": a.ReadOnlyHint, "destructiveHint": a.DestructiveHint,
+			"idempotentHint": a.IdempotentHint, "openWorldHint": a.OpenWorldHint,
+		} {
+			if got == nil {
+				t.Errorf("%s: %s must be set explicitly (spec defaults are not ours)", tl.Name, name)
+			}
+		}
+		if a.ReadOnlyHint == nil || a.DestructiveHint == nil || a.IdempotentHint == nil || a.OpenWorldHint == nil {
+			continue
+		}
+		if *a.ReadOnlyHint != w.readOnly || *a.DestructiveHint != w.destructive || *a.IdempotentHint != w.idempotent {
+			t.Errorf("%s: hints readOnly=%v destructive=%v idempotent=%v, want %v/%v/%v",
+				tl.Name, *a.ReadOnlyHint, *a.DestructiveHint, *a.IdempotentHint, w.readOnly, w.destructive, w.idempotent)
+		}
+		if *a.OpenWorldHint {
+			t.Errorf("%s: openWorldHint must be false (offshoot touches only its own store)", tl.Name)
+		}
+	}
+}
+
+// TestToolAnnotationsSerializeOnTheWire: the hints must reach tools/list
+// JSON under the spec's field names, with the omitted-when-nil shape.
+func TestToolAnnotationsSerializeOnTheWire(t *testing.T) {
+	ts, _ := newTools(t)
+	raw, err := json.Marshal(ts.Tools())
+	if err != nil {
+		t.Fatal(err)
+	}
+	var back []map[string]any
+	if err := json.Unmarshal(raw, &back); err != nil {
+		t.Fatal(err)
+	}
+	for _, tl := range back {
+		ann, ok := tl["annotations"].(map[string]any)
+		if !ok {
+			t.Fatalf("%v: annotations missing on the wire", tl["name"])
+		}
+		for _, k := range []string{"title", "readOnlyHint", "destructiveHint", "idempotentHint", "openWorldHint"} {
+			if _, ok := ann[k]; !ok {
+				t.Errorf("%v: annotations.%s missing on the wire", tl["name"], k)
+			}
+		}
+	}
+}

@@ -83,6 +83,22 @@ type Tool struct {
 	Name        string `json:"name"`
 	Description string `json:"description"`
 	InputSchema any    `json:"inputSchema"`
+	// Annotations are the spec's behavior hints
+	// (https://modelcontextprotocol.io/specification/2026-07-28/server/tools#tool):
+	// hosts use them to decide which calls need a confirmation prompt. The
+	// spec's default for destructiveHint is true, so every offshoot tool
+	// sets all four hints explicitly — see tools.go's annotate.
+	Annotations *ToolAnnotations `json:"annotations,omitempty"`
+}
+
+// ToolAnnotations mirrors the spec's ToolAnnotations object. Pointers, so a
+// nil hint is omitted rather than serialized as a misleading false.
+type ToolAnnotations struct {
+	Title           string `json:"title,omitempty"`
+	ReadOnlyHint    *bool  `json:"readOnlyHint,omitempty"`
+	DestructiveHint *bool  `json:"destructiveHint,omitempty"`
+	IdempotentHint  *bool  `json:"idempotentHint,omitempty"`
+	OpenWorldHint   *bool  `json:"openWorldHint,omitempty"`
 }
 
 // ToolSet is what the server exposes; Task 2 implements it over offshoot.
