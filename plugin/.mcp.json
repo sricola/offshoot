@@ -1,0 +1,6 @@
+{
+  "offshoot": {
+    "command": "offshoot",
+    "args": ["mcp"]
+  }
+}

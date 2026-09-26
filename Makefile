@@ -1,6 +1,7 @@
 .PHONY: test test-torture build test-s3 bench bench-cow bench-s3 check-python-version test-python-sdk test-ts-sdk test-sdks test-python-langgraph \
 	check-sdk-versions dry-run-python-sdk dry-run-ts-sdk dry-run-sdks test-pytest-plugin \
-	ci-local ci-local-host ci-local-linux ci-local-s3 ci-local-minio ci-local-sdks lint
+	ci-local ci-local-host ci-local-linux ci-local-s3 ci-local-minio ci-local-sdks lint \
+	check-plugin
 
 # Override with `make PYTHON=python3.14 ...` when the platform's unversioned
 # python3 is older than the SDKs' declared Python 3.10 minimum.
@@ -204,3 +205,6 @@ ci-local-sdks:
 # release.yml's collect job so a release always ships an up-to-date bundle.
 third-party-licenses:
 	go run github.com/google/go-licenses@latest report ./... > THIRD_PARTY_LICENSES.csv
+
+check-plugin:
+	./scripts/check-plugin.sh

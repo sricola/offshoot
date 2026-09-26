@@ -1,0 +1,12 @@
+{
+  "name": "offshoot",
+  "owner": { "name": "Srivatsa Ray", "url": "https://github.com/sricola" },
+  "plugins": [
+    {
+      "name": "offshoot",
+      "source": "./plugin",
+      "description": "offshoot MCP tools (fork, checkpoint, rollback, promote, destroy, touch, list, checkout) with a skill for the fork-before-risky-work loop and advisory hooks.",
+      "version": "0.1.0"
+    }
+  ]
+}

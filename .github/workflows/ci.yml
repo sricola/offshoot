@@ -145,6 +145,9 @@ jobs:
           OFFSHOOT_REQUIRE_PROMTOOL: "1"
         run: go test ./internal/metrics ./internal/daemon -run TestPromtoolCheck -v -count=1
 
+      - name: make check-plugin
+        run: make check-plugin
+
   sdks:
     runs-on: ubuntu-latest
     steps:

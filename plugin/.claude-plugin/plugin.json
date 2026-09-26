@@ -1,0 +1,10 @@
+{
+  "name": "offshoot",
+  "version": "0.1.0",
+  "description": "Give each attempt its own real SQLite database: fork before risky work, checkpoint when tests pass, roll back when they fail, promote the winner. Requires the offshoot binary on PATH.",
+  "author": { "name": "Srivatsa Ray", "url": "https://github.com/sricola" },
+  "homepage": "https://sricola.github.io/offshoot/",
+  "repository": "https://github.com/sricola/offshoot",
+  "license": "Apache-2.0",
+  "keywords": ["sqlite", "database", "branching", "fork", "checkpoint", "rollback", "mcp"]
+}
