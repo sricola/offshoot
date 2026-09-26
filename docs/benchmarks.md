@@ -424,6 +424,10 @@ verbatim, minus make's own echoed `go run` line:
 
 darwin/arm64, Apple M5, 10 cores, Go 1.27.1, offshoot dev-329fc05-54-g1057bd1, measured 2026-09-26, seed 17 MiB, concurrency 8
 
+(`dev-329fc05-54-g1057bd1` is `git describe`'s own dev-tag format, counting
+from the last tag reachable on this machine at measurement time — the
+`g1057bd1` suffix is commit `1057bd1`, not a released version.)
+
 | Workflow | Steps | Wall | Branch overhead | Fork p50/p99 (d=1 → d=max) | Checkout p50/p99 (d=1 → d=max) | Checkpoint p50/p99 (d=1 → d=max) | Eval p50/p99 (d=1 → d=max) | Peak live | Store peak |
 |---|---|---|---|---|---|---|---|---|---|
 | simulation | 1000/1000 | 73.9 s | 88% | 73.2/136.7 → (d=1 is max) | 316.4/381.4 → (d=1 is max) | 119.5/162.0 → (d=1 is max) | 11.4/17.5 → (d=1 is max) | 8 | 12.0 GiB |
@@ -513,8 +517,12 @@ on a local copy-on-write SQLite store.
 - **These are latencies under 8-way concurrency, not per-op costs in
   isolation.** A checkout of a 17 MiB database is 0.18-0.35 s here, while the
   isolation section's *uncontended* `fork` + `open` + `close` of a 100 MB
-  database is 421 ms. The difference is queueing: eight workers deep on one
-  laptop's disk and page cache. One hypothesis this run does not test is that
+  database is 421 ms. `failure_repro` (T=1, no other worker sharing this run's
+  disk and page cache) gives a control point from inside this same table:
+  its uncontended checkout is 49.2 ms p50 — an order of magnitude under the
+  8-way-contended 0.18-0.35 s above on a database roughly comparable in size.
+  The difference is queueing: eight workers deep on one laptop's disk and
+  page cache. One hypothesis this run does not test is that
   `Fork` at head also quiesces the *parent's* checkout, which would serialize
   concurrent forks that share a parent — plausible given the fanouts here, but
   unmeasured; 8-way I/O contention and the floor materialization above are the

@@ -1,6 +1,6 @@
 DRAFT — not posted. Copy for the maintainer to review, edit, and post by hand when the ROADMAP launch gate (one external person completes install → fork → promote without help) is met.
 
-# How offshoot is tested: kill -9, CAS everywhere, and a benchmark nobody ran on SQLite
+# How offshoot is tested: kill -9, CAS everywhere, and a benchmark nobody had run on SQLite yet
 
 ## HN text post
 
@@ -23,9 +23,10 @@ branching under agentic workloads that hosted Postgres-family systems have
 struggled with. Our deep-narrow "mcts" topology — 10 workers x 100 steps,
 depth 25 — finished all 1,000 worker-steps in 65.1s wall time, with
 eval-query p50 latency at 9.1ms at depth 1 and 10.4ms at depth 25: reads
-don't get slower as branches deepen. Per-test isolation: a bare `fork`
-stays flat around 9-11ms regardless of database size; open a session and
-materialize the checkout and it's 421ms on a 100MB database.
+don't get slower as branches deepen. Per-test isolation: a fork from a
+checkpoint (the fixture path) stays flat, ~9-12ms from 12MB to 1GB; a fork
+at head instead grows with size (17.0/50.3/418.0ms for 12MB/100MB/1GB)
+because it also hashes the checkout to warn about uncheckpointed changes.
 
 Every writer is CAS-fenced by a lease epoch, one writer per lineage,
 always. And since v0.2.11, every tagged release is signed keylessly and

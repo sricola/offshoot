@@ -69,13 +69,10 @@ don't map cleanly to Windows
 
 ## See it run
 
-Three agents race three migrations on three forks; one is right; it gets
-promoted and the others expire.
-
 Runnable demo: [`examples/parallel-attempts/`](examples/parallel-attempts/)
-forks a database three ways, races three migrations against the forks,
-promotes the one that's actually correct, and discards the other two —
-`./examples/parallel-attempts/run.sh`. Real recording:
+forks a database three ways, races three migrations against the forks in
+parallel, promotes the one that's actually correct, and discards the other
+two — `./examples/parallel-attempts/run.sh`. Real recording:
 [`docs/demo/parallel-attempts.cast`](docs/demo/parallel-attempts.cast)
 (play locally with `asciinema play`).
 
@@ -125,15 +122,16 @@ claims.
 
 ## Quickstart (60 seconds, no server, no bucket)
 
-    offshoot init                        # or go build -o offshoot ./cmd/offshoot from source
-    ./offshoot create app
-    sqlite3 "$(./offshoot checkout app)" "CREATE TABLE users (name); INSERT INTO users VALUES ('ada');"
-    ./offshoot checkpoint app v1
-    ./offshoot fork app attempt-1        # instant branch
-    sqlite3 "$(./offshoot checkout app@attempt-1)" "DELETE FROM users;"   # destructive experiment
-    ./offshoot rollback app@attempt-1 --to fork                        # undo it
-    ./offshoot promote app@attempt-1 --onto main --force               # or ship it
-    ./offshoot status
+    offshoot init
+    offshoot create app
+    sqlite3 "$(offshoot checkout app)" "CREATE TABLE users (name); INSERT INTO users VALUES ('ada');"
+    offshoot checkpoint app v1
+    offshoot fork app attempt-1        # instant branch
+    sqlite3 "$(offshoot checkout app@attempt-1)" "DELETE FROM users;"   # destructive experiment
+    offshoot rollback app@attempt-1 --to fork                        # undo it
+    offshoot promote app@attempt-1 --onto main --force               # or ship it
+    offshoot status
+    # from source: go build -o offshoot ./cmd/offshoot && export PATH=$PWD:$PATH
 
 That's most of the surface already. The full vocabulary, one line each
 (every command and flag: [docs/reference.md](docs/reference.md)):

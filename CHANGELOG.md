@@ -169,8 +169,8 @@ version if you depend on format stability.
   pushes a provenance attestation alongside it. A "Verify what you
   downloaded" recipe (`gh attestation verify`, `cosign verify-blob`,
   `cosign verify`/`gh attestation verify oci://` for the image) is in
-  `docs/installation.md` and `SECURITY.md`. Releases before v0.2.11 remain
-  checksum-only.
+  `docs/installation.md`, linked from `SECURITY.md` and `docs/testing.md`.
+  Releases before v0.2.11 remain checksum-only.
 - **`cmd/branchbench` and `make bench-branchbench`.** Re-runs BranchBench's
   ([arXiv:2604.17180](https://arxiv.org/abs/2604.17180)) five macrobenchmark
   topologies — `simulation`, `data_cleaning`, `software_dev`, `mcts`,

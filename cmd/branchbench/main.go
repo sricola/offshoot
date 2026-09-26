@@ -21,7 +21,7 @@ import (
 	"os/signal"
 	"path/filepath"
 	"strings"
-	"sync"
+	"sync/atomic"
 	"syscall"
 	"time"
 
@@ -41,7 +41,7 @@ type config struct {
 
 func main() {
 	var (
-		store       = flag.String("store", "", "store directory (default: a fresh temp dir, removed at exit unless -keep)")
+		store       = flag.String("store", "", "store directory (default: a fresh temp dir, removed at exit unless -keep); each workflow uses DIR/<workflow>, which is removed before the run and again after unless -keep")
 		list        = flag.String("workflows", strings.Join(allWorkflowNames(), ","), "comma-separated workflows to run")
 		concurrency = flag.Int("concurrency", 8, "worker goroutines in flight (1 = sequential)")
 		quick       = flag.Bool("quick", false, "scale every workflow down (seconds, not minutes)")
@@ -54,12 +54,20 @@ func main() {
 		store: *store, workflows: strings.Split(*list, ","), concurrency: *concurrency,
 		quick: *quick, warehouses: *warehouses, timeout: *timeout, keep: *keep,
 	}
-	stop := watchForInterrupt()
+	ctx, cancel := context.WithCancel(context.Background())
+	interrupted, stop := watchForInterrupt(cancel)
 	defer stop()
-	rep, err := run(cfg)
+	rep, err := run(ctx, cfg)
 	if err != nil {
 		fmt.Fprintf(os.Stderr, "branchbench: %v\n", err)
 		os.Exit(1)
+	}
+	if interrupted() {
+		// The context cancellation above already unwound the in-flight
+		// workflow: its workers stopped at the next step boundary,
+		// runWorkflow returned, and runOne's own deferred cleanup removed
+		// the store (or left it, under -keep) before run() returned here.
+		os.Exit(130)
 	}
 	fmt.Print(rep.markdown())
 	for _, w := range rep.workflows {
@@ -69,61 +77,25 @@ func main() {
 	}
 }
 
-// activeStores tracks the store directories this process owns, so an
-// interrupted run does not silently leave tens of GB in $TMPDIR.
-var activeStores struct {
-	mu   sync.Mutex
-	dirs map[string]bool
-	keep bool
-}
-
-func trackStore(dir string, keep bool) {
-	activeStores.mu.Lock()
-	defer activeStores.mu.Unlock()
-	if activeStores.dirs == nil {
-		activeStores.dirs = map[string]bool{}
-	}
-	activeStores.dirs[dir] = true
-	activeStores.keep = keep
-}
-
-func untrackStore(dir string) {
-	activeStores.mu.Lock()
-	defer activeStores.mu.Unlock()
-	delete(activeStores.dirs, dir)
-}
-
-// watchForInterrupt removes (or, under -keep, reports) the live store
-// directories on SIGINT/SIGTERM. A full run holds tens of GB at its peak;
-// leaving that behind on Ctrl-C would be a nasty surprise.
-func watchForInterrupt() func() {
+// watchForInterrupt cancels ctx on SIGINT/SIGTERM instead of reaching into
+// the store directly: canceling lets runOne's own deferred cleanup remove
+// the store after the in-flight workflow's workers actually stop, rather
+// than a signal handler's os.RemoveAll racing them while they still write
+// to it. The returned interrupted func reports whether a signal was seen.
+func watchForInterrupt(cancel context.CancelFunc) (interrupted func() bool, stop func()) {
 	sigs := make(chan os.Signal, 1)
 	signal.Notify(sigs, os.Interrupt, syscall.SIGTERM)
+	var got atomic.Bool
 	go func() {
 		sig, ok := <-sigs
 		if !ok {
 			return
 		}
-		activeStores.mu.Lock()
-		dirs := make([]string, 0, len(activeStores.dirs))
-		for d := range activeStores.dirs {
-			dirs = append(dirs, d)
-		}
-		keep := activeStores.keep
-		activeStores.mu.Unlock()
-		for _, d := range dirs {
-			if keep {
-				fmt.Fprintf(os.Stderr, "branchbench: %s: store left at %s (-keep)\n", sig, d)
-				continue
-			}
-			fmt.Fprintf(os.Stderr, "branchbench: %s: removing store %s\n", sig, d)
-			if err := os.RemoveAll(d); err != nil {
-				fmt.Fprintf(os.Stderr, "branchbench: could not remove %s: %v\n", d, err)
-			}
-		}
-		os.Exit(130)
+		got.Store(true)
+		fmt.Fprintf(os.Stderr, "branchbench: %s: stopping (finishing the in-flight step, then removing the store unless -keep)\n", sig)
+		cancel()
 	}()
-	return func() { signal.Stop(sigs); close(sigs) }
+	return got.Load, func() { signal.Stop(sigs); close(sigs) }
 }
 
 // run executes every requested workflow in order, each one against its OWN
@@ -135,8 +107,10 @@ func watchForInterrupt() func() {
 // workflow rather than the sum of all five.
 //
 // run fails only on setup errors; a workflow that aborts or times out is
-// reported in the table with the step count it reached.
-func run(cfg config) (*report, error) {
+// reported in the table with the step count it reached. If ctx is canceled
+// (SIGINT/SIGTERM — see watchForInterrupt), run finishes unwinding whichever
+// workflow is in flight and then stops rather than starting the next one.
+func run(ctx context.Context, cfg config) (*report, error) {
 	if cfg.concurrency < 1 {
 		return nil, fmt.Errorf("-concurrency must be >= 1")
 	}
@@ -159,32 +133,33 @@ func run(cfg config) (*report, error) {
 		if cfg.quick {
 			wf = wf.quick()
 		}
-		wr, err := runOne(cfg, wf, rep)
+		wr, err := runOne(ctx, cfg, wf, rep)
 		if err != nil {
 			return nil, err
 		}
 		rep.workflows = append(rep.workflows, wr)
+		if ctx.Err() != nil {
+			break
+		}
 	}
 	return rep, nil
 }
 
 // runOne gives one workflow its own store, seeds it, runs it, and removes the
-// store again (unless -keep).
-func runOne(cfg config, wf workflow, rep *report) (*workflowReport, error) {
+// store again (unless -keep). ctx is the run's top-level context: canceling
+// it (SIGINT/SIGTERM) propagates into runWorkflow's own child context, so
+// the workers stop at the next step boundary and this function's deferred
+// cleanup below still runs before returning.
+func runOne(ctx context.Context, cfg config, wf workflow, rep *report) (*workflowReport, error) {
 	dir, err := workflowStore(cfg, wf.name)
 	if err != nil {
 		return nil, err
 	}
-	trackStore(dir, cfg.keep)
-	fmt.Fprintf(os.Stderr, "branchbench: %s: store at %s\n", wf.name, dir)
-	if cfg.keep {
-		defer untrackStore(dir)
-	} else {
+	if !cfg.keep {
 		defer func() {
 			if err := os.RemoveAll(dir); err != nil {
 				fmt.Fprintf(os.Stderr, "branchbench: could not remove %s: %v\n", dir, err)
 			}
-			untrackStore(dir)
 		}()
 	}
 	ws, err := ops.Init(dir)
@@ -208,8 +183,8 @@ func runOne(cfg config, wf workflow, rep *report) (*workflowReport, error) {
 	fmt.Fprintf(os.Stderr, "branchbench: %s (%s): %d workers x %d steps...\n", wf.name, wf.shape, wf.workers, wf.steps)
 	r := &runner{ws: ws, wf: wf, cfg: cfg, store: dir, seedBytes: seedBytes,
 		tree: newTree(wf), m: newMetrics(), sem: make(chan struct{}, cfg.concurrency)}
-	ctx, cancel := context.WithTimeout(context.Background(), cfg.timeout)
-	wr := r.runWorkflow(ctx)
+	wctx, cancel := context.WithTimeout(ctx, cfg.timeout)
+	wr := r.runWorkflow(wctx)
 	cancel()
 	wr.finalize()
 	if wr.err != nil {
@@ -222,12 +197,21 @@ func runOne(cfg config, wf workflow, rep *report) (*workflowReport, error) {
 }
 
 // workflowStore returns a fresh, empty directory for one workflow's store:
-// under -store when one was given, else a temp dir.
+// under -store when one was given (as DIR/<workflow>, removed before the
+// run and again after unless -keep), else a temp dir. The path is printed
+// before anything already there is removed, so it's on the record even if
+// the removal itself fails or is interrupted.
 func workflowStore(cfg config, name string) (string, error) {
 	if cfg.store == "" {
-		return os.MkdirTemp("", "branchbench-"+name+"-*")
+		dir, err := os.MkdirTemp("", "branchbench-"+name+"-*")
+		if err != nil {
+			return "", err
+		}
+		fmt.Fprintf(os.Stderr, "branchbench: %s: store at %s\n", name, dir)
+		return dir, nil
 	}
 	dir := filepath.Join(cfg.store, name)
+	fmt.Fprintf(os.Stderr, "branchbench: %s: store at %s\n", name, dir)
 	if err := os.RemoveAll(dir); err != nil {
 		return "", err
 	}

@@ -1,6 +1,7 @@
 package main
 
 import (
+	"context"
 	"strings"
 	"testing"
 )
@@ -11,7 +12,7 @@ import (
 // report must render the table.
 func TestEveryWorkflowRunsAtQuickScale(t *testing.T) {
 	dir := t.TempDir()
-	rep, err := run(config{store: dir, workflows: allWorkflowNames(), quick: true, concurrency: 2, warehouses: 1})
+	rep, err := run(context.Background(), config{store: dir, workflows: allWorkflowNames(), quick: true, concurrency: 2, warehouses: 1})
 	if err != nil {
 		t.Fatal(err)
 	}

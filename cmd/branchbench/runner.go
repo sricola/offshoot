@@ -275,7 +275,11 @@ func (r *runner) runWorkflow(ctx context.Context) *workflowReport {
 				if wctx.Err() != nil {
 					return
 				}
-				r.sem <- struct{}{}
+				select {
+				case r.sem <- struct{}{}:
+				case <-wctx.Done():
+					return
+				}
 				next, err := r.step(wIdx, s, cur, rng)
 				<-r.sem
 				if err != nil {

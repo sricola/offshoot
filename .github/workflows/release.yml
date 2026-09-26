@@ -193,19 +193,14 @@ jobs:
       - name: Create GitHub release
         env:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
-          EVENT_NAME: ${{ github.event_name }}
+          TAG: ${{ steps.tag.outputs.name }}
           REPO: ${{ github.repository }}
         run: |
-          if [ "$EVENT_NAME" = "workflow_dispatch" ]; then
-            tag="dev-$(git rev-parse --short HEAD)"
-          else
-            tag="${GITHUB_REF_NAME}"
-          fi
-          gh release create "$tag" \
+          gh release create "$TAG" \
             dist/*.tar.gz dist/*.tar.gz.sha256 dist/*.sigstore.json dist/*.intoto.jsonl \
-            offshoot_"$tag".spdx.json THIRD_PARTY_LICENSES.csv \
+            offshoot_"$TAG".spdx.json THIRD_PARTY_LICENSES.csv \
             --repo "$REPO" \
-            --title "$tag" \
+            --title "$TAG" \
             --generate-notes
 
   docker:
