@@ -1,9 +1,11 @@
 package ops
 
 import (
+	"bytes"
 	"os"
 	"os/exec"
 	"path/filepath"
+	"strings"
 	"testing"
 
 	"github.com/sricola/offshoot/internal/testutil"
@@ -94,6 +96,9 @@ func TestDiffSummaryReportsAddedRemovedAndChangedTables(t *testing.T) {
 	if users.Left != 3 || users.Right != 5 || users.Delta() != 2 {
 		t.Fatalf("users left=%d right=%d delta=%d, want 3/5/2", users.Left, users.Right, users.Delta())
 	}
+	if !users.Comparable || users.Added != 2 || users.Removed != 0 || users.Changed != 0 || users.Status != "changed" {
+		t.Fatalf("users = %+v, want comparable added=2 removed=0 changed=0 status=changed", users)
+	}
 
 	gone, ok := byTable["gone"]
 	if !ok || !gone.LeftExists || gone.RightExists {
@@ -102,6 +107,9 @@ func TestDiffSummaryReportsAddedRemovedAndChangedTables(t *testing.T) {
 	if gone.Left != 2 {
 		t.Fatalf("gone.Left = %d, want 2", gone.Left)
 	}
+	if gone.Status != "removed" {
+		t.Fatalf("gone.Status = %q, want removed", gone.Status)
+	}
 
 	nt, ok := byTable["new_table"]
 	if !ok || nt.LeftExists || !nt.RightExists {
@@ -109,6 +117,9 @@ func TestDiffSummaryReportsAddedRemovedAndChangedTables(t *testing.T) {
 	}
 	if nt.Right != 4 {
 		t.Fatalf("new_table.Right = %d, want 4", nt.Right)
+	}
+	if nt.Status != "added" {
+		t.Fatalf("nt.Status = %q, want added", nt.Status)
 	}
 }
 
@@ -125,6 +136,141 @@ func TestDiffSummaryAcrossTwoEntirelyDifferentDatabasesIsLegit(t *testing.T) {
 	}
 	if len(got) != 2 {
 		t.Fatalf("got %d tables, want 2: %+v", len(got), got)
+	}
+}
+
+// TestDiffSummaryIsContentAware pins the reason the summary exists for
+// agents: two attempts with identical row counts but different VALUES are
+// not "same". With a declared primary key, a row whose key is on both sides
+// but whose content differs is Changed; a key only on the left is Removed;
+// only on the right is Added. Row counts stay reported alongside.
+func TestDiffSummaryIsContentAware(t *testing.T) {
+	testutil.RequireSQLite3(t)
+	left := filepath.Join(t.TempDir(), "left.db")
+	right := filepath.Join(t.TempDir(), "right.db")
+	if out, err := exec.Command("sqlite3", left,
+		"CREATE TABLE results (id INTEGER PRIMARY KEY, passed INT);"+
+			"INSERT INTO results VALUES (1,1),(2,1),(3,1);",
+	).CombinedOutput(); err != nil {
+		t.Fatalf("%v: %s", err, out)
+	}
+	if out, err := exec.Command("sqlite3", right,
+		"CREATE TABLE results (id INTEGER PRIMARY KEY, passed INT);"+
+			"INSERT INTO results VALUES (1,1),(2,0),(4,1);", // 2 changed, 3 removed, 4 added
+	).CombinedOutput(); err != nil {
+		t.Fatalf("%v: %s", err, out)
+	}
+	got, err := DiffSummary(left, right)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(got) != 1 {
+		t.Fatalf("got %d tables, want 1: %+v", len(got), got)
+	}
+	r := got[0]
+	if !r.Comparable || r.Left != 3 || r.Right != 3 {
+		t.Fatalf("results = %+v, want comparable with 3/3 rows", r)
+	}
+	if r.Added != 1 || r.Removed != 1 || r.Changed != 1 || r.Status != "changed" {
+		t.Fatalf("results = %+v, want added=1 removed=1 changed=1 status=changed", r)
+	}
+	if r.SchemaChanged {
+		t.Fatalf("results schema must not be flagged changed: %+v", r)
+	}
+}
+
+// TestDiffSummaryRowidTablesUseRowidAsKey: a table with no declared primary
+// key is keyed by rowid (both sides descend from one seed, so rowids line
+// up), and an in-place UPDATE shows as Changed, not Removed+Added.
+func TestDiffSummaryRowidTablesUseRowidAsKey(t *testing.T) {
+	testutil.RequireSQLite3(t)
+	left := filepath.Join(t.TempDir(), "left.db")
+	right := filepath.Join(t.TempDir(), "right.db")
+	exec.Command("sqlite3", left, "CREATE TABLE t (v); INSERT INTO t VALUES ('a'),('b');").Run()
+	exec.Command("sqlite3", right, "CREATE TABLE t (v); INSERT INTO t VALUES ('a'),('B');").Run()
+	got, err := DiffSummary(left, right)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got[0].Changed != 1 || got[0].Added != 0 || got[0].Removed != 0 {
+		t.Fatalf("t = %+v, want changed=1 only", got[0])
+	}
+}
+
+// TestDiffSummarySchemaMismatchIsReportedNotCompared: when the column list
+// differs, row-level counts are impossible to define, so the table is
+// reported with row counts, Comparable=false, SchemaChanged=true, and
+// Status "changed" — never a SQL error from a malformed EXCEPT.
+func TestDiffSummarySchemaMismatchIsReportedNotCompared(t *testing.T) {
+	testutil.RequireSQLite3(t)
+	left := filepath.Join(t.TempDir(), "left.db")
+	right := filepath.Join(t.TempDir(), "right.db")
+	exec.Command("sqlite3", left, "CREATE TABLE t (a); INSERT INTO t VALUES (1);").Run()
+	exec.Command("sqlite3", right, "CREATE TABLE t (a, b); INSERT INTO t VALUES (1, 2);").Run()
+	got, err := DiffSummary(left, right)
+	if err != nil {
+		t.Fatal(err)
+	}
+	d := got[0]
+	if d.Comparable || !d.SchemaChanged || d.Status != "changed" || d.Left != 1 || d.Right != 1 {
+		t.Fatalf("t = %+v, want incomparable schema-changed with 1/1 rows", d)
+	}
+}
+
+// TestDiffSummaryIdenticalSidesAreSame: same content, same schema → same.
+func TestDiffSummaryIdenticalSidesAreSame(t *testing.T) {
+	testutil.RequireSQLite3(t)
+	left := filepath.Join(t.TempDir(), "left.db")
+	right := filepath.Join(t.TempDir(), "right.db")
+	for _, p := range []string{left, right} {
+		exec.Command("sqlite3", p, "CREATE TABLE t (id INTEGER PRIMARY KEY, v); INSERT INTO t VALUES (1,'x');").Run()
+	}
+	got, err := DiffSummary(left, right)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got[0].Status != "same" || got[0].Added+got[0].Removed+got[0].Changed != 0 {
+		t.Fatalf("t = %+v, want same", got[0])
+	}
+}
+
+// TestDiffSummaryOpensBothSidesReadOnlyEvenOn0444Files: the attached right
+// side must be opened read-only too (CheckoutAt/Export produce 0444 files).
+func TestDiffSummaryOpensBothSidesReadOnlyEvenOn0444Files(t *testing.T) {
+	testutil.RequireSQLite3(t)
+	left := filepath.Join(t.TempDir(), "left.db")
+	right := filepath.Join(t.TempDir(), "right.db")
+	for _, p := range []string{left, right} {
+		exec.Command("sqlite3", p, "CREATE TABLE t (id INTEGER PRIMARY KEY, v); INSERT INTO t VALUES (1,'x');").Run()
+		if err := os.Chmod(p, 0o444); err != nil {
+			t.Fatal(err)
+		}
+	}
+	if _, err := DiffSummary(left, right); err != nil {
+		t.Fatalf("read-only sides must be diffable: %v", err)
+	}
+}
+
+// TestFormatDiffSummaryRendersCountsAndTotals pins the shared renderer the
+// CLI and MCP both use.
+func TestFormatDiffSummaryRendersCountsAndTotals(t *testing.T) {
+	rep := DiffReportOf([]TableDiff{
+		{Table: "results", LeftExists: true, RightExists: true, Left: 3, Right: 3, Comparable: true, Added: 1, Removed: 1, Changed: 1, Status: "changed"},
+		{Table: "scratch", LeftExists: true, Left: 2, Status: "removed"},
+		{Table: "t", LeftExists: true, RightExists: true, Left: 1, Right: 1, Comparable: true, Status: "same"},
+	})
+	if rep.Totals != (DiffTotals{Same: 1, Changed: 1, Added: 0, Removed: 1}) {
+		t.Fatalf("totals = %+v", rep.Totals)
+	}
+	var b bytes.Buffer
+	if err := FormatDiffSummary(&b, rep, "L", "R"); err != nil {
+		t.Fatal(err)
+	}
+	out := b.String()
+	for _, want := range []string{"TABLE", "ADDED", "REMOVED", "CHANGED", "STATUS", "results", "changed", "scratch", "removed", "3 tables: 1 same, 1 changed, 0 added, 1 removed"} {
+		if !strings.Contains(out, want) {
+			t.Fatalf("output missing %q:\n%s", want, out)
+		}
 	}
 }
 
