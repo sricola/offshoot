@@ -803,3 +803,65 @@ func TestToolAnnotationsSerializeOnTheWire(t *testing.T) {
 		}
 	}
 }
+
+// TestStructuredContentAccompaniesProse: every successful tool result also
+// carries a machine-readable structuredContent (2026-07-28 spec), so a
+// harness can read txids/paths/backup names without parsing prose. The
+// prose stays the only content block on purpose — see the plan's Global
+// Constraints — so this checks structuredContent, not a JSON text block.
+func TestStructuredContentAccompaniesProse(t *testing.T) {
+	ts, w := newTools(t)
+	if _, err := w.Fork("app", "main", "attempt-1", "", 0, nil); err != nil {
+		t.Fatal(err)
+	}
+	sc := func(r ToolResult) map[string]any {
+		t.Helper()
+		if r.IsError {
+			t.Fatalf("unexpected error: %s", text(r))
+		}
+		m, ok := r.StructuredContent.(map[string]any)
+		if !ok {
+			t.Fatalf("structuredContent is %T, want map[string]any", r.StructuredContent)
+		}
+		return m
+	}
+	fork := sc(call(t, ts, "offshoot_fork", map[string]any{"database": "app", "new_branch": "attempt-2"}))
+	if fork["new_branch"] != "attempt-2" || fork["txid"] == nil || fork["ttl"] == nil {
+		t.Fatalf("fork structuredContent = %v", fork)
+	}
+	// offshoot_checkpoint is at-rest here (no daemon session), and the ops
+	// layer's Checkpoint requires an existing checkout to snapshot from
+	// (see ops.Workspace.Checkpoint's os.Stat guard) — so checkout must run
+	// before checkpoint, matching real CLI/agent usage (checkout, then
+	// checkpoint), unlike the brief's checkpoint-then-checkout ordering.
+	co := sc(call(t, ts, "offshoot_checkout", map[string]any{"database": "app", "branch": "attempt-1"}))
+	if co["path"] == "" || co["path"] == nil {
+		t.Fatalf("checkout structuredContent = %v", co)
+	}
+	cp := sc(call(t, ts, "offshoot_checkpoint", map[string]any{"database": "app", "branch": "attempt-1", "name": "v1"}))
+	if cp["name"] != "v1" || cp["txid"] == nil || cp["live"] != false {
+		t.Fatalf("checkpoint structuredContent = %v", cp)
+	}
+	rb := sc(call(t, ts, "offshoot_rollback", map[string]any{"database": "app", "branch": "attempt-1", "to": "v1"}))
+	if rb["to"] != "v1" || rb["path"] == nil {
+		t.Fatalf("rollback structuredContent = %v", rb)
+	}
+	pr := sc(call(t, ts, "offshoot_promote", map[string]any{"database": "app", "source": "attempt-1", "target": "main", "force": true}))
+	if pr["backup"] != "main"+ops.PromoteBackupSuffix || pr["txid"] == nil {
+		t.Fatalf("promote structuredContent = %v", pr)
+	}
+	ls := sc(call(t, ts, "offshoot_list", map[string]any{}))
+	branches, _ := ls["branches"].([]any)
+	if len(branches) < 3 {
+		t.Fatalf("list structuredContent branches = %v", ls["branches"])
+	}
+	ds := sc(call(t, ts, "offshoot_destroy", map[string]any{"database": "app", "branch": "attempt-2"}))
+	if ds["branch"] != "attempt-2" {
+		t.Fatalf("destroy structuredContent = %v", ds)
+	}
+	// Errors carry no structuredContent.
+	bad := call(t, ts, "offshoot_destroy", map[string]any{"database": "app", "branch": "nope"})
+	if !bad.IsError || bad.StructuredContent != nil {
+		t.Fatalf("error results must not carry structuredContent: %+v", bad)
+	}
+}

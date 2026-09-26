@@ -455,15 +455,25 @@ func (t *OffshootTools) list(args json.RawMessage) (ToolResult, error) {
 		return ErrorResult("%v", err), nil
 	}
 	if len(statuses) == 0 {
-		return TextResult("no databases yet; create one with the offshoot CLI (`offshoot create <name>`)"), nil
+		return StructuredResult(map[string]any{"branches": []any{}},
+			"no databases yet; create one with the offshoot CLI (`offshoot create <name>`)"), nil
 	}
 	var b []byte
+	// rows is []any, not []map[string]any: structuredContent is read back as
+	// generic JSON-shaped Go values (see TestStructuredContentAccompaniesProse's
+	// []any type assertion on "branches"), matching what a real JSON
+	// round-trip over the wire would produce for an array of objects.
+	rows := make([]any, 0, len(statuses))
 	for _, s := range statuses {
 		line := fmt.Sprintf("%s@%s head=%d checkpoints=%v protected=%v checked_out=%v\n",
 			s.DB, s.Branch, s.HeadTXID, s.Checkpoints, s.Protected, s.CheckedOut)
 		b = append(b, line...)
+		rows = append(rows, map[string]any{
+			"database": s.DB, "branch": s.Branch, "head_txid": s.HeadTXID,
+			"checkpoints": s.Checkpoints, "protected": s.Protected, "checked_out": s.CheckedOut,
+		})
 	}
-	return TextResult("%s", string(b)), nil
+	return StructuredResult(map[string]any{"branches": rows}, "%s", string(b)), nil
 }
 
 type checkoutArgs struct {
@@ -508,7 +518,9 @@ func (t *OffshootTools) checkout(args json.RawMessage) (ToolResult, error) {
 				a.Database, branch, info.Checkout)
 			msg += "\nwrite there directly — the daemon captures every commit continuously; " +
 				"call offshoot_checkpoint to name a point you can roll back to or fork from"
-			return TextResult("%s", msg), nil
+			return StructuredResult(map[string]any{
+				"database": a.Database, "branch": branch, "path": info.Checkout, "live": true,
+			}, "%s", msg), nil
 		}
 	}
 
@@ -530,7 +542,9 @@ func (t *OffshootTools) checkout(args json.RawMessage) (ToolResult, error) {
 				"full snapshot, not a live flush, until something opens a session on it"
 		}
 	}
-	return TextResult("%s", msg), nil
+	return StructuredResult(map[string]any{
+		"database": a.Database, "branch": branch, "path": path, "live": false,
+	}, "%s", msg), nil
 }
 
 type checkpointArgs struct {
@@ -565,7 +579,9 @@ func (t *OffshootTools) checkpoint(args json.RawMessage) (ToolResult, error) {
 		if err != nil {
 			return ErrorResult("%v", err), nil
 		}
-		return TextResult("checkpointed %s@%s as %q at txid %d — captured live from the open daemon session, no pause in writes",
+		return StructuredResult(map[string]any{
+			"database": a.Database, "branch": branch, "name": a.Name, "txid": resp.TXID, "live": true,
+		}, "checkpointed %s@%s as %q at txid %d — captured live from the open daemon session, no pause in writes",
 			a.Database, branch, a.Name, resp.TXID), nil
 	}
 	// meta is nil: MCP tool exposure of checkpoint/fork metadata is
@@ -577,7 +593,9 @@ func (t *OffshootTools) checkpoint(args json.RawMessage) (ToolResult, error) {
 	if err != nil {
 		return ErrorResult("%v", err), nil
 	}
-	return TextResult("checkpointed %s@%s as %q at txid %d", a.Database, branch, a.Name, txid), nil
+	return StructuredResult(map[string]any{
+		"database": a.Database, "branch": branch, "name": a.Name, "txid": txid, "live": false,
+	}, "checkpointed %s@%s as %q at txid %d", a.Database, branch, a.Name, txid), nil
 }
 
 type forkArgs struct {
@@ -689,6 +707,26 @@ func forkTTLSummary(ws *ops.Workspace, db, branch string, ttl time.Duration) str
 	return fmt.Sprintf("ttl=%s expires_at=%s; %s", ref.TTL, deadline.Format(time.RFC3339), forkTTLJanitorNote)
 }
 
+// forkTTLFields computes the raw ttl and expires_at values for fork's
+// structuredContent, mirroring exactly what forkTTLSummary's prose prints:
+// both empty when there's no TTL or the post-fork re-read couldn't resolve a
+// deadline, otherwise the ref's own TTL string and, when computable, the
+// same RFC3339 deadline forkTTLSummary formats into its "expires_at=" clause.
+func forkTTLFields(ws *ops.Workspace, db, branch string, ttl time.Duration) (ttlStr, expiresAt string) {
+	if ttl <= 0 {
+		return "", ""
+	}
+	ref, _, err := ws.Store.GetRef(db, branch)
+	if err != nil {
+		return ttl.String(), ""
+	}
+	deadline, ok := ops.ReapDeadline(ref)
+	if !ok {
+		return ref.TTL, ""
+	}
+	return ref.TTL, deadline.Format(time.RFC3339)
+}
+
 // fork creates new_branch from branch's head (or checkpoint `at`). If a
 // daemon is up (whether or not it has a session open on the source — the
 // daemon's own "fork" op handles both), the fork is routed through it, so
@@ -740,7 +778,11 @@ func (t *OffshootTools) fork(args json.RawMessage) (ToolResult, error) {
 	}
 	msg := fmt.Sprintf("forked %s@%s to %s@%s at txid %d", a.Database, branch, a.Database, a.NewBranch, txid)
 	msg += "; " + forkTTLSummary(t.ws, a.Database, a.NewBranch, ttl)
-	return TextResult("%s", msg), nil
+	ttlStr, expiresAt := forkTTLFields(t.ws, a.Database, a.NewBranch, ttl)
+	return StructuredResult(map[string]any{
+		"database": a.Database, "branch": branch, "new_branch": a.NewBranch, "txid": txid,
+		"ttl": ttlStr, "expires_at": expiresAt,
+	}, "%s", msg), nil
 }
 
 type rollbackArgs struct {
@@ -776,7 +818,9 @@ func (t *OffshootTools) rollback(args json.RawMessage) (ToolResult, error) {
 	if err != nil {
 		return ErrorResult("%v", err), nil
 	}
-	return TextResult("rolled back %s@%s to checkpoint %q; checkout at %s", a.Database, branch, a.To, path), nil
+	return StructuredResult(map[string]any{
+		"database": a.Database, "branch": branch, "to": a.To, "path": path,
+	}, "rolled back %s@%s to checkpoint %q; checkout at %s", a.Database, branch, a.To, path), nil
 }
 
 type promoteArgs struct {
@@ -823,10 +867,13 @@ func (t *OffshootTools) promote(args json.RawMessage) (ToolResult, error) {
 	if err != nil {
 		return ErrorResult("%v", err), nil
 	}
-	if res.Backup == "" {
-		return TextResult("promoted %s@%s onto %s@%s at txid %d", a.Database, a.Source, a.Database, a.Target, res.TXID), nil
+	sc := map[string]any{
+		"database": a.Database, "source": a.Source, "target": a.Target, "txid": res.TXID, "backup": res.Backup,
 	}
-	return TextResult("promoted %s@%s onto %s@%s at txid %d; the previous %s@%s head is kept as %s@%s (undo: promote it back onto %s)",
+	if res.Backup == "" {
+		return StructuredResult(sc, "promoted %s@%s onto %s@%s at txid %d", a.Database, a.Source, a.Database, a.Target, res.TXID), nil
+	}
+	return StructuredResult(sc, "promoted %s@%s onto %s@%s at txid %d; the previous %s@%s head is kept as %s@%s (undo: promote it back onto %s)",
 		a.Database, a.Source, a.Database, a.Target, res.TXID, a.Database, a.Target, a.Database, res.Backup, a.Target), nil
 }
 
@@ -858,5 +905,7 @@ func (t *OffshootTools) destroy(args json.RawMessage) (ToolResult, error) {
 	if err := t.ws.Destroy(a.Database, a.Branch, a.Force); err != nil {
 		return ErrorResult("%v", err), nil
 	}
-	return TextResult("destroyed %s@%s", a.Database, a.Branch), nil
+	return StructuredResult(map[string]any{
+		"database": a.Database, "branch": a.Branch,
+	}, "destroyed %s@%s", a.Database, a.Branch), nil
 }
