@@ -3,6 +3,7 @@ package mcp
 import (
 	"context"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"strings"
 	"time"
@@ -226,6 +227,9 @@ func optStrDefault(name string, def string) prop {
 // optBool builds an optional boolean property (e.g. `force`).
 func optBool(name string) prop { return prop{name: name, jsonType: "boolean"} }
 
+// optInt builds an optional integer property (e.g. `max_bytes`).
+func optInt(name string) prop { return prop{name: name, jsonType: "integer"} }
+
 // optMeta builds the optional `meta` property: a small string->string map
 // stored on the new branch (fork) or the named checkpoint (checkpoint),
 // capped by ops.ValidateMeta. Advertised as an object of strings so a
@@ -278,7 +282,7 @@ func annotate(title string, readOnly, destructive, idempotent bool) *ToolAnnotat
 	}
 }
 
-// Tools returns the eight lifecycle tools this server exposes. Descriptions
+// Tools returns the nine lifecycle tools this server exposes. Descriptions
 // are the agent's only documentation: each explains not just what the tool
 // does but when an agent should reach for it.
 func (t *OffshootTools) Tools() []Tool {
@@ -408,6 +412,23 @@ func (t *OffshootTools) Tools() []Tool {
 			InputSchema: schema(reqStr("database"), optStrDefault("branch", "main"), optStr("ttl")),
 			Annotations: annotate("Extend a branch's life", false, false, true),
 		},
+		{
+			Name: "offshoot_diff",
+			Description: "Compare two branches (or checkpoints, `branch@checkpoint`) of one " +
+				"database and report, per table, rows added, removed, and changed plus " +
+				"schema changes — without sqldiff. Call this to decide which attempt to " +
+				"promote, to check what a migration changed against a checkpoint, or to " +
+				"compare an attempt with a golden checkpoint. `table` narrows to one table. " +
+				"`full` also returns the SQL statements that turn left into right (needs " +
+				"sqldiff on the host), capped at `max_bytes` (default 32768, at most " +
+				"262144) with `truncated` set when cut; prefer the summary first and " +
+				"`full` with `table` for a drill-down. Read-only: never touches a live " +
+				"checkout, never takes a lease; a head-side branch reads its last durable " +
+				"(flushed/checkpointed) state.",
+			InputSchema: schema(reqStr("database"), reqStr("left"), reqStr("right"),
+				optStr("table"), optBool("full"), optInt("max_bytes")),
+			Annotations: annotate("Compare two branches or checkpoints", true, false, true),
+		},
 	}
 }
 
@@ -478,6 +499,8 @@ func (t *OffshootTools) Call(ctx context.Context, name string, args json.RawMess
 		return t.destroy(args)
 	case "offshoot_touch":
 		return t.touch(args)
+	case "offshoot_diff":
+		return t.diff(args)
 	default:
 		return ToolResult{}, fmt.Errorf("mcp: unknown tool %q", name)
 	}
@@ -983,4 +1006,140 @@ func (t *OffshootTools) touch(args json.RawMessage) (ToolResult, error) {
 	return StructuredResult(
 		map[string]any{"database": a.Database, "branch": branch, "ttl": ref.TTL, "touched_at": ref.TouchedAt},
 		"touched %s@%s ttl=%s touched_at=%s", a.Database, branch, shown, ref.TouchedAt), nil
+}
+
+type diffArgs struct {
+	Database string `json:"database"`
+	Left     string `json:"left"`
+	Right    string `json:"right"`
+	Table    string `json:"table"`
+	Full     bool   `json:"full"`
+	MaxBytes int    `json:"max_bytes"`
+}
+
+const (
+	diffDefaultMaxBytes = 32 << 10
+	diffMaxBytesCeiling = 256 << 10
+)
+
+// splitSide parses "branch" or "branch@checkpoint" (never a database: MCP
+// diff is scoped to one database) and validates both names.
+func splitSide(arg, side string) (branch, checkpoint string, r ToolResult, bad bool) {
+	parts := strings.Split(arg, "@")
+	switch len(parts) {
+	case 1:
+		branch = parts[0]
+	case 2:
+		branch, checkpoint = parts[0], parts[1]
+	default:
+		return "", "", ErrorResult("%s must be branch or branch@checkpoint, got %q", side, arg), true
+	}
+	if branch == "" {
+		return "", "", ErrorResult("%s needs a branch name", side), true
+	}
+	named := []named{namedArg(side+" branch", branch)}
+	if checkpoint != "" {
+		named = append(named, namedArg(side+" checkpoint", checkpoint))
+	}
+	if r, bad := validateNames(named...); bad {
+		return "", "", r, true
+	}
+	return branch, checkpoint, ToolResult{}, false
+}
+
+// diff is read-only: both sides materialize through MaterializeForDiff (the
+// ro-cache for a checkpoint, a private fresh export for a head) and are
+// closed before returning. Summary needs no sqldiff; full shells out to it
+// with a byte cap sized for a model's context, not a file.
+func (t *OffshootTools) diff(args json.RawMessage) (ToolResult, error) {
+	var a diffArgs
+	if err := json.Unmarshal(args, &a); err != nil {
+		return ErrorResult("invalid arguments: %v", err), nil
+	}
+	if a.Database == "" || a.Left == "" || a.Right == "" {
+		return ErrorResult("database, left, and right are required"), nil
+	}
+	if r, bad := validateNames(namedArg("database", a.Database)); bad {
+		return r, nil
+	}
+	lbr, lcp, r, bad := splitSide(a.Left, "left")
+	if bad {
+		return r, nil
+	}
+	rbr, rcp, r, bad := splitSide(a.Right, "right")
+	if bad {
+		return r, nil
+	}
+	if a.MaxBytes < 0 || a.MaxBytes > diffMaxBytesCeiling {
+		return ErrorResult("max_bytes must be 0..%d", diffMaxBytesCeiling), nil
+	}
+	maxBytes := a.MaxBytes
+	if maxBytes == 0 {
+		maxBytes = diffDefaultMaxBytes
+	}
+	left, err := t.ws.MaterializeForDiff(a.Database, lbr, lcp)
+	if err != nil {
+		return ErrorResult("left: %v", err), nil
+	}
+	defer left.Close()
+	right, err := t.ws.MaterializeForDiff(a.Database, rbr, rcp)
+	if err != nil {
+		return ErrorResult("right: %v", err), nil
+	}
+	defer right.Close()
+
+	tables, err := ops.DiffSummary(left.Path, right.Path)
+	if err != nil {
+		return ErrorResult("%v", err), nil
+	}
+	if a.Table != "" {
+		var only []ops.TableDiff
+		for _, d := range tables {
+			if d.Table == a.Table {
+				only = append(only, d)
+			}
+		}
+		if len(only) == 0 {
+			return ErrorResult("no table %q on either side", a.Table), nil
+		}
+		tables = only
+	}
+	rep := ops.DiffReportOf(tables)
+	leftLabel := a.Database + "@" + a.Left
+	rightLabel := a.Database + "@" + a.Right
+	var b strings.Builder
+	fmt.Fprintf(&b, "left:  %s right: %s\n", leftLabel, rightLabel)
+	if err := ops.FormatDiffSummary(&b, rep, leftLabel, rightLabel); err != nil {
+		return ErrorResult("%v", err), nil
+	}
+	rows := make([]map[string]any, 0, len(rep.Tables))
+	for _, d := range rep.Tables {
+		rows = append(rows, map[string]any{
+			"table": d.Table, "left_exists": d.LeftExists, "right_exists": d.RightExists,
+			"left_rows": d.Left, "right_rows": d.Right, "comparable": d.Comparable,
+			"added": d.Added, "removed": d.Removed, "changed": d.Changed,
+			"schema_changed": d.SchemaChanged, "key": d.Key, "status": d.Status,
+		})
+	}
+	sc := map[string]any{
+		"database": a.Database, "left": a.Left, "right": a.Right, "tables": rows,
+		"totals": map[string]any{"same": rep.Totals.Same, "changed": rep.Totals.Changed, "added": rep.Totals.Added, "removed": rep.Totals.Removed},
+	}
+	if a.Full {
+		text, truncated, err := ops.SqldiffCapped(left.Path, right.Path, a.Table, maxBytes)
+		if err != nil {
+			if errors.Is(err, ops.ErrSqldiffMissing) {
+				return ErrorResult("full diff needs the sqldiff binary on this host (it is not installed); the summary above needs nothing — call again without full"), nil
+			}
+			return ErrorResult("%v", err), nil
+		}
+		if truncated {
+			fmt.Fprintf(&b, "\n-- sqldiff (truncated at %d bytes; narrow with table or raise max_bytes)\n", maxBytes)
+		} else {
+			b.WriteString("\n-- sqldiff\n")
+		}
+		b.WriteString(text)
+		sc["full"], sc["truncated"] = text, truncated
+	}
+	return StructuredResult(sc, "%s", b.String()), nil
 }

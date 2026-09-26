@@ -70,7 +70,7 @@ func text(r ToolResult) string {
 func TestToolsAdvertiseSchemas(t *testing.T) {
 	ts, _ := newTools(t)
 	tools := ts.Tools()
-	if len(tools) < 8 {
+	if len(tools) < 9 {
 		t.Fatalf("want the full lifecycle surface, got %d tools", len(tools))
 	}
 	seen := map[string]bool{}
@@ -254,6 +254,7 @@ var toolArgStructs = map[string]any{
 	"offshoot_promote":    promoteArgs{},
 	"offshoot_destroy":    destroyArgs{},
 	"offshoot_touch":      touchArgs{},
+	"offshoot_diff":       diffArgs{},
 }
 
 // jsonSchemaTypeForKind maps a Go reflect.Kind to the JSON Schema "type"
@@ -756,6 +757,7 @@ func TestToolAnnotationsClassifyEveryTool(t *testing.T) {
 		"offshoot_promote":    {false, true, false},
 		"offshoot_destroy":    {false, true, false},
 		"offshoot_touch":      {false, false, true},
+		"offshoot_diff":       {true, false, true},
 	}
 	for _, tl := range ts.Tools() {
 		w, ok := want[tl.Name]
@@ -1033,5 +1035,81 @@ func TestTouchExtendsALeasedAttempt(t *testing.T) {
 	}
 	if r := call(t, ts, "offshoot_touch", map[string]any{"database": "app", "branch": "nope"}); !r.IsError {
 		t.Fatal("unknown branch must be a tool error")
+	}
+}
+
+// TestDiffToolComparesAttemptsContentAware: the ninth tool answers "what
+// changed between attempt A and B" for an agent, without sqldiff, and its
+// structuredContent carries the per-table counts a harness needs.
+func TestDiffToolComparesAttemptsContentAware(t *testing.T) {
+	ts, w := newTools(t)
+	p, err := w.Checkout("app", "main")
+	if err != nil {
+		t.Fatal(err)
+	}
+	sqlite := func(path, q string) {
+		t.Helper()
+		if out, err := exec.Command("sqlite3", path, q).CombinedOutput(); err != nil {
+			t.Fatalf("%v: %s", err, out)
+		}
+	}
+	sqlite(p, "CREATE TABLE results (id INTEGER PRIMARY KEY, passed INT); INSERT INTO results VALUES (1,1),(2,1),(3,1);")
+	if _, err := w.Checkpoint("app", "main", "seed", nil); err != nil {
+		t.Fatal(err)
+	}
+	for _, b := range []string{"attempt-1", "attempt-2"} {
+		if _, err := w.Fork("app", "main", b, "seed", 0, nil); err != nil {
+			t.Fatal(err)
+		}
+	}
+	p2, _ := w.Checkout("app", "attempt-2")
+	sqlite(p2, "UPDATE results SET passed=0 WHERE id=2; INSERT INTO results VALUES (4,1);")
+	if _, err := w.Checkpoint("app", "attempt-2", "done", nil); err != nil {
+		t.Fatal(err)
+	}
+
+	r := call(t, ts, "offshoot_diff", map[string]any{"database": "app", "left": "attempt-1@fork", "right": "attempt-2@done"})
+	if r.IsError {
+		t.Fatalf("diff: %s", text(r))
+	}
+	if !strings.Contains(text(r), "left:  app@attempt-1@fork right: app@attempt-2@done") || !strings.Contains(text(r), "1 tables: 0 same, 1 changed, 0 added, 0 removed") {
+		t.Fatalf("diff text:\n%s", text(r))
+	}
+	sc := r.StructuredContent.(map[string]any)
+	tables := sc["tables"].([]map[string]any)
+	if len(tables) != 1 || tables[0]["changed"] != 1 || tables[0]["added"] != 1 || tables[0]["status"] != "changed" {
+		t.Fatalf("structured tables = %v", tables)
+	}
+	if _, has := sc["full"]; has {
+		t.Fatalf("full must be omitted when not requested: %v", sc)
+	}
+	// head-side left (no checkpoint) is allowed: attempt-1's head equals its fork point.
+	if r := call(t, ts, "offshoot_diff", map[string]any{"database": "app", "left": "attempt-1", "right": "attempt-2@done"}); r.IsError {
+		t.Fatalf("head-side diff: %s", text(r))
+	}
+	// bad shapes are tool errors
+	for _, bad := range []map[string]any{
+		{"database": "app", "left": "a@b@c", "right": "main"},
+		{"database": "app", "left": "../x", "right": "main"},
+		{"database": "app", "left": "main", "right": "main", "max_bytes": 1 << 20},
+		{"database": "app", "left": "main", "right": "main", "table": "nope"},
+	} {
+		if r := call(t, ts, "offshoot_diff", bad); !r.IsError {
+			t.Fatalf("args %v must be a tool error", bad)
+		}
+	}
+	// full: sqldiff-dependent
+	r = call(t, ts, "offshoot_diff", map[string]any{"database": "app", "left": "attempt-1@fork", "right": "attempt-2@done", "full": true, "table": "results"})
+	if _, err := exec.LookPath("sqldiff"); err != nil {
+		if !r.IsError || !strings.Contains(text(r), "sqldiff") {
+			t.Fatalf("without sqldiff, full must say so: %s", text(r))
+		}
+	} else {
+		if r.IsError || !strings.Contains(text(r), "UPDATE results") {
+			t.Fatalf("full diff: %s", text(r))
+		}
+		if _, has := r.StructuredContent.(map[string]any)["full"]; !has {
+			t.Fatal("full must be present in structuredContent when requested")
+		}
 	}
 }
