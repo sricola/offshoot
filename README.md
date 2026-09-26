@@ -62,7 +62,7 @@ That's most of the surface already. The full vocabulary, one line each
 | `create` / `checkout` | new database / materialize a working copy — prints a plain `.db` path |
 | `checkpoint` | snapshot the checkout as a named, rollback-able point |
 | `fork` | branch from head or a checkpoint — instant, copy-on-write, optional `--ttl` |
-| `rollback` / `promote` | repoint a branch at a checkpoint / repoint a target at a branch's head (keeping its old head as `<target>-pre-promote` to undo) |
+| `rollback` / `promote` | repoint a branch at a checkpoint / repoint a target at a branch's head (keeping its old head as `<target>-pre-promote` to undo — TTL'd, 24h by default, one rolling slot per target replaced by the next promote) |
 | `diff` / `export` | sqldiff two branches or checkpoints / copy state out to a plain file |
 | `destroy` / `gc` | delete a branch / collect unreachable objects |
 | `serve` / `session` | the daemon: leases, live capture, flush-without-pausing ([below](#daemon-mode)) |
@@ -470,6 +470,11 @@ captured session.
 Destructive tools respect the same protected-branch rules as the CLI: an
 agent can fork and experiment freely, but promoting onto or destroying
 `main` requires an explicit force, and the refusal tells the agent so.
+Promoting also keeps the target's previous head as a safety fork
+(`<target>-pre-promote` — the result names it), but that fork always
+carries a TTL (24h by default) and is one rolling slot per target,
+replaced by the next promote onto that target, so the undo window closes
+when either happens.
 
 Agent-created forks expire by default, so an agent that forks and forgets
 doesn't leak branches forever: `offshoot_fork` applies `offshoot mcp
