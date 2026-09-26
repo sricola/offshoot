@@ -53,9 +53,10 @@ shasum -a 256 -c offshoot_v0.2.11_linux_amd64.tar.gz.sha256
 For a numbered release, pin the check tighter with
 `--certificate-identity-regexp '^https://github.com/sricola/offshoot/\.github/workflows/release\.yml@refs/tags/v'`
 (the plain `@refs/` form above also matches a branch's `workflow_dispatch`
-dev build), or use `gh attestation verify offshoot_v0.2.11_linux_amd64.tar.gz
---signer-workflow sricola/offshoot/.github/workflows/release.yml` in place
-of `--repo` for the same tightening.
+dev build), or add `--signer-workflow
+sricola/offshoot/.github/workflows/release.yml` to the `gh attestation
+verify` command above for the same tightening (`gh` still requires
+`--repo` or `--owner` alongside it).
 
 Each release also ships `offshoot_<tag>.spdx.json`, an SPDX SBOM of the Go
 module graph, with a matching SBOM attestation (`gh attestation verify
@@ -77,9 +78,9 @@ on). Images are signed and attested too:
 or `gh attestation verify oci://ghcr.io/sricola/offshoot:<tag> --repo sricola/offshoot`.
 For a numbered release, tighten the regexp to
 `@refs/tags/v` (the plain `@refs/` form also matches a branch's
-`workflow_dispatch` dev build), or pass `gh attestation verify`
-`--signer-workflow sricola/offshoot/.github/workflows/release.yml` instead
-of `--repo`.
+`workflow_dispatch` dev build), or add
+`--signer-workflow sricola/offshoot/.github/workflows/release.yml` to the
+`gh attestation verify` command alongside `--repo`.
 
 ## go install / from source
 
