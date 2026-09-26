@@ -501,6 +501,33 @@ class TestClient(unittest.TestCase):
             db.close()
             s.close()
 
+    def test_diff_is_content_aware_and_needs_no_sqldiff(self):
+        with offshoot.connect(self.d.sock) as c:
+            c.create("diffdb")
+            s = c.open("diffdb")
+            db = sqlite3.connect(s.path)
+            db.execute("CREATE TABLE results (id INTEGER PRIMARY KEY, passed INT)")
+            db.executemany("INSERT INTO results VALUES (?, ?)", [(1, 1), (2, 1), (3, 1)])
+            db.commit()
+            s.flush("v1")
+            db.execute("UPDATE results SET passed=0 WHERE id=2")
+            db.commit()
+            s.flush("v2")
+            db.close()
+            s.close()
+
+            res = c.diff("diffdb@main@v1", "diffdb@main@v2")
+            self.assertEqual((res.left, res.right), ("diffdb@main@v1", "diffdb@main@v2"))
+            self.assertEqual(len(res.tables), 1)
+            t = res.tables[0]
+            self.assertEqual((t.table, t.left_rows, t.right_rows, t.changed, t.status),
+                             ("results", 3, 3, 1, "changed"))
+            self.assertEqual(res.totals["changed"], 1)
+            self.assertEqual(res.full, "")
+            self.assertFalse(res.truncated)
+            with self.assertRaises(offshoot.OffshootError):
+                c.diff("diffdb@main@v1", "diffdb@main@v2", table="nope")
+
     def test_checkout_at_materializes_separate_readonly_path(self):
         with offshoot.connect(self.d.sock) as c:
             c.create("checkout-at-app")

@@ -529,8 +529,9 @@ with offshoot.connect("/tmp/o.sock") as c:
     s.close()
 ```
 
-`Client` also exposes `branches()`, `dbs()`, `export()`, and
-`checkout_at()` (a read-only historical checkout).
+`Client` also exposes `branches()`, `dbs()`, `export()`, `checkout_at()`
+(a read-only historical checkout), and `diff()` (a content-aware
+per-table summary between two targets, no `sqldiff` needed).
 
 **Testing with pytest?** `pip install "offshoot-db[pytest] @ git+https://github.com/sricola/offshoot#subdirectory=sdk/python"` *(from the repo — not yet on PyPI)* registers
 `offshoot_daemon`/`offshoot_db`/`offshoot_fork` fixtures automatically —
@@ -561,8 +562,9 @@ await s.close();
 await c.close();
 ```
 
-`Client` also exposes `branches()`, `dbs()`, `export()`, and
-`checkoutAt()` — the same surface as the Python client above.
+`Client` also exposes `branches()`, `dbs()`, `export()`, `checkoutAt()`,
+and `diff()` (a content-aware per-table summary between two targets, no
+`sqldiff` needed) — the same surface as the Python client above.
 
 **Testing with vitest/jest/`node:test`?** `@offshoot-db/client/testkit`
 (`startDaemon`/`seedOnce`/`forkPerTest`/`dump`) is the framework-agnostic

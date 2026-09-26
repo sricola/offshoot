@@ -78,6 +78,56 @@ class Branch:
 
 
 @dataclass
+class TableDiff:
+    """One table's row in a :meth:`Client.diff` result.
+
+    Mirrors ``internal/ops/diff.go``'s ``TableDiff``. A table present on
+    only one side is reported wholesale (``added``/``removed`` status) via
+    ``left_exists``/``right_exists``, not a row-count delta. ``comparable``
+    is true when the table exists on both sides with the same column names
+    in the same order; ``added``/``removed``/``changed`` are meaningful
+    only then — a schema mismatch (``schema_changed``) makes row-level
+    identity undefined, so the table is reported (with row counts) but not
+    compared. ``key`` is the row identity used for the comparison: ``"pk"``
+    (a declared primary key, verified unique on both sides), ``"rowid"``
+    (no usable PK), or ``""`` when neither was usable. ``status`` is one of
+    ``"added"``, ``"removed"``, ``"same"``, ``"changed"``.
+    """
+
+    table: str
+    left_exists: bool
+    right_exists: bool
+    left_rows: int
+    right_rows: int
+    comparable: bool
+    added: int
+    removed: int
+    changed: int
+    schema_changed: bool
+    status: str
+    key: str = ""
+
+
+@dataclass
+class DiffResult:
+    """:meth:`Client.diff`'s result: a content-aware per-table summary plus,
+    when called with ``full=True``, sqldiff's own SQL output.
+
+    Mirrors ``internal/daemon/protocol.go``'s ``DiffResult``. ``totals``
+    counts tables by status (``same``/``changed``/``added``/``removed``).
+    ``full`` is ``""`` unless requested; ``truncated`` is true when the
+    daemon capped ``full`` at ``max_bytes``.
+    """
+
+    left: str
+    right: str
+    tables: list[TableDiff]
+    totals: dict[str, int]
+    full: str = ""
+    truncated: bool = False
+
+
+@dataclass
 class Event:
     """One event from the daemon's event stream — see :meth:`Client.events`.
 
@@ -297,6 +347,32 @@ class Client:
         """
         self._call("export", db=db, branch=branch, name=checkpoint or "",
                     path=out_path, force=force)
+
+    def diff(self, left: str, right: str, *, table: str | None = None,
+             full: bool = False, max_bytes: int | None = None) -> DiffResult:
+        """Compare two targets (db[@branch[@checkpoint]], same form as export)
+        read-only and return a content-aware per-table summary: rows added,
+        removed, and changed (by primary key, or rowid when none is declared)
+        plus schema changes, with no sqldiff needed. table restricts the
+        answer to one table. full=True also returns sqldiff's SQL (requires
+        sqldiff on the daemon host), capped at max_bytes (daemon default
+        1 MiB) with truncated=True when cut. Never touches a live checkout
+        or takes a lease; a head-side target reads the last durable state.
+        """
+        resp = self._call("diff", left=left, right=right, table=table or "",
+                          full=full, max_bytes=max_bytes or 0)
+        d = resp.get("diff") or {}
+        tables = [TableDiff(
+            table=t.get("table", ""), left_exists=t.get("left_exists", False),
+            right_exists=t.get("right_exists", False), left_rows=t.get("left_rows", 0),
+            right_rows=t.get("right_rows", 0), comparable=t.get("comparable", False),
+            added=t.get("added", 0), removed=t.get("removed", 0), changed=t.get("changed", 0),
+            schema_changed=t.get("schema_changed", False), status=t.get("status", ""),
+            key=t.get("key", ""),
+        ) for t in d.get("tables", [])]
+        return DiffResult(left=d.get("left", left), right=d.get("right", right), tables=tables,
+                          totals=dict(d.get("totals", {})), full=d.get("full", ""),
+                          truncated=bool(d.get("truncated", False)))
 
     def checkout_at(self, db: str, branch: str, checkpoint: str, force: bool = False) -> str:
         """Materialize db@branch's state at checkpoint into a dedicated

@@ -148,6 +148,72 @@ export interface ExportOptions {
   force?: boolean;
 }
 
+/** One table's row in a {@link Client.diff} result.
+ *
+ * Mirrors `internal/ops/diff.go`'s `TableDiff`. A table present on only one
+ * side is reported wholesale (`added`/`removed` status) via
+ * `left_exists`/`right_exists`, not a row-count delta. `comparable` is true
+ * when the table exists on both sides with the same column names in the
+ * same order; `added`/`removed`/`changed` are meaningful only then — a
+ * schema mismatch (`schema_changed`) makes row-level identity undefined, so
+ * the table is reported (with row counts) but not compared. `key` is the
+ * row identity used for the comparison: `"pk"` (a declared primary key,
+ * verified unique on both sides), `"rowid"` (no usable PK), or `""` when
+ * neither was usable. `status` is one of `"added"`, `"removed"`, `"same"`,
+ * `"changed"`.
+ */
+export interface TableDiff {
+  table: string;
+  left_exists: boolean;
+  right_exists: boolean;
+  left_rows: number;
+  right_rows: number;
+  comparable: boolean;
+  added: number;
+  removed: number;
+  changed: number;
+  schema_changed: boolean;
+  status: string;
+  key: string;
+}
+
+/** {@link DiffResult}'s table counts by status. */
+export interface DiffTotals {
+  same: number;
+  changed: number;
+  added: number;
+  removed: number;
+}
+
+/** {@link Client.diff}'s result: a content-aware per-table summary plus,
+ * when called with `opts.full`, sqldiff's own SQL output.
+ *
+ * Mirrors `internal/daemon/protocol.go`'s `DiffResult`. `full` is omitted
+ * unless requested; `truncated` is true when the daemon capped `full` at
+ * `opts.maxBytes`.
+ */
+export interface DiffResult {
+  left: string;
+  right: string;
+  tables: TableDiff[];
+  totals: DiffTotals;
+  full?: string;
+  truncated?: boolean;
+}
+
+/** Options for {@link Client.diff}. */
+export interface DiffOptions {
+  /** Restrict the comparison to one table; omitted (or "") compares every
+   * table. */
+  table?: string;
+  /** Also return sqldiff's own SQL output (requires sqldiff on the daemon
+   * host). */
+  full?: boolean;
+  /** Cap `full`'s size in bytes; omitted (or 0) means the daemon's default
+   * (1 MiB). */
+  maxBytes?: number;
+}
+
 /** Options for {@link Client.checkoutAt}. */
 export interface CheckoutAtOptions {
   /** Re-materialize an already-cached read-only checkout file. Without
@@ -233,6 +299,7 @@ interface RawResponse {
   sessions?: RawSessionInfo[];
   branches?: RawBranchInfo[];
   databases?: string[];
+  diff?: DiffResult;
 }
 
 /** @internal The subscribe op's one-line ack, read off the socket before
@@ -474,6 +541,33 @@ export class Client {
       path: outPath,
       force: opts.force ?? false,
     });
+  }
+
+  /** Compare two targets (db[@branch[@checkpoint]], same form as export)
+   * read-only and return a content-aware per-table summary: rows added,
+   * removed, and changed (by primary key, or rowid when none is declared)
+   * plus schema changes, with no sqldiff needed. opts.table restricts the
+   * answer to one table. opts.full also returns sqldiff's SQL (requires
+   * sqldiff on the daemon host), capped at opts.maxBytes (daemon default
+   * 1 MiB) with truncated=true when cut. Never touches a live checkout or
+   * takes a lease; a head-side target reads the last durable state. */
+  async diff(left: string, right: string, opts: DiffOptions = {}): Promise<DiffResult> {
+    const resp = await this._call("diff", {
+      left,
+      right,
+      table: opts.table ?? "",
+      full: opts.full ?? false,
+      max_bytes: opts.maxBytes ?? 0,
+    });
+    const d = resp.diff;
+    return {
+      left: d?.left ?? left,
+      right: d?.right ?? right,
+      tables: d?.tables ?? [],
+      totals: d?.totals ?? { same: 0, changed: 0, added: 0, removed: 0 },
+      full: d?.full ?? "",
+      truncated: d?.truncated ?? false,
+    };
   }
 
   /** Materialize db@branch's state at checkpoint into a dedicated
