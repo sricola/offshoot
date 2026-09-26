@@ -7,7 +7,7 @@ description: Use when working on a project that has an offshoot store (a .offsho
 
 offshoot gives every attempt its own real SQLite database — a copy-on-write
 fork, not a mock and not a re-seed. Every checkout is a stock `.db` file any
-SQLite client opens. You have eight tools; the loop is four calls.
+SQLite client opens. You have nine tools; the loop is four calls.
 
 ## The loop
 
@@ -22,7 +22,11 @@ SQLite client opens. You have eight tools; the loop is four calls.
    Name checkpoints for what they mean (`before-migration`, `migrated`).
 4. **Roll back when they fail:** `offshoot_rollback {database, branch, to}`
    returns the branch to a checkpoint, discarding everything since.
-5. **Promote the winner:** `offshoot_promote {database, source, target, force?}`
+5. **Compare before you promote:** `offshoot_diff {database, left:
+   "attempt-2@done", right: "main"}` (or against a golden checkpoint) — read
+   the per-table added/removed/changed counts; use `table` + `full` to see
+   the exact rows.
+6. **Promote the winner:** `offshoot_promote {database, source, target, force?}`
    repoints `target` (often `main`) at `source`'s head. Protected targets
    refuse without `force`; that refusal is confirmation you need, not a bug.
    The target's previous head is kept as `<target>-pre-promote` — the result
@@ -30,7 +34,7 @@ SQLite client opens. You have eight tools; the loop is four calls.
    safety fork always carries a TTL (24h by default) and is one rolling
    slot per target, replaced by the next promote onto that target, so the
    undo window closes when either happens.
-6. **Clean up:** `offshoot_destroy` a failed attempt, or let its TTL expire.
+7. **Clean up:** `offshoot_destroy` a failed attempt, or let its TTL expire.
    `offshoot_touch {database, branch, ttl?}` keeps a fork alive if a task
    runs long.
 

@@ -33,9 +33,9 @@ claude mcp add offshoot -- offshoot -store ./.offshoot mcp
 This is the exact command documented in [`README.md`](../../README.md) and
 [`docs/reference.md`](../reference.md#offshoot-mcp) for this repo. It
 registers `offshoot mcp` as a stdio MCP server scoped to the current
-project's `./.offshoot` store; the agent picks up the eight `offshoot_*`
+project's `./.offshoot` store; the agent picks up the nine `offshoot_*`
 tools (`list`, `checkout`, `checkpoint`, `fork`, `rollback`, `promote`,
-`destroy`, `touch`) the next time it starts a session with `offshoot`
+`destroy`, `touch`, `diff`) the next time it starts a session with `offshoot`
 available.
 
 Useful variations, also from `docs/reference.md`:
@@ -345,6 +345,45 @@ paraphrase:
             "idempotentHint": true,
             "openWorldHint": false
           }
+        },
+        {
+          "name": "offshoot_diff",
+          "description": "Compare two branches (or checkpoints, `branch@checkpoint`) of one database and report, per table, rows added, removed, and changed plus schema changes — without sqldiff. Call this to decide which attempt to promote, to check what a migration changed against a checkpoint, or to compare an attempt with a golden checkpoint. `table` narrows to one table. `full` also returns the SQL statements that turn left into right (needs sqldiff on the host), capped at `max_bytes` (default 32768, at most 262144) with `truncated` set when cut; prefer the summary first and `full` with `table` for a drill-down. Read-only: never touches a live checkout, never takes a lease; a head-side branch reads its last durable (flushed/checkpointed) state.",
+          "inputSchema": {
+            "properties": {
+              "database": {
+                "type": "string"
+              },
+              "full": {
+                "type": "boolean"
+              },
+              "left": {
+                "type": "string"
+              },
+              "max_bytes": {
+                "type": "integer"
+              },
+              "right": {
+                "type": "string"
+              },
+              "table": {
+                "type": "string"
+              }
+            },
+            "required": [
+              "database",
+              "left",
+              "right"
+            ],
+            "type": "object"
+          },
+          "annotations": {
+            "title": "Compare two branches or checkpoints",
+            "readOnlyHint": true,
+            "destructiveHint": false,
+            "idempotentHint": true,
+            "openWorldHint": false
+          }
         }
       ]
     }
@@ -354,9 +393,11 @@ paraphrase:
 *(Nothing above is truncated: every description, `inputSchema`, and
 `annotations` object is reproduced verbatim from a real `tools/list`
 response — see [`internal/mcp/tools.go`](../../internal/mcp/tools.go) for
-the source. `annotations` (behavior hints the host can act on — e.g.
-`destructiveHint` to prompt before a call) and `offshoot_touch` are new
-since this doc's last capture.)*
+the source. `offshoot_diff` (read-only, comparing two branches or
+checkpoints without needing `sqldiff`) is new since this doc's last
+capture; only this `tools/list` block was re-run to pick it up — the
+`tools/call` blocks that follow are from that earlier capture and their
+responses did not change.)*
 
 ```json
 → {"jsonrpc":"2.0","id":3,"method":"tools/call","params":{"name":"offshoot_list","arguments":{}}}

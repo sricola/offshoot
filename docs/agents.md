@@ -32,11 +32,11 @@ required for the baseline. The plugin's skill includes the
 rules it's drawn from; its hooks only add context (they never block a
 command), and they stay silent when `offshoot` is not installed.
 
-The agent gets eight tools, each described so the model knows *when* to
+The agent gets nine tools, each described so the model knows *when* to
 reach for it: fork before a risky migration, checkpoint when tests pass,
-roll back when they don't, promote the attempt that worked. See it work
-end to end in a real captured session:
-[the MCP walkthrough](demo/mcp-walkthrough.md).
+roll back when they don't, diff two attempts to see what actually changed,
+promote the attempt that worked. See it work end to end in a real captured
+session: [the MCP walkthrough](demo/mcp-walkthrough.md).
 
 ## Rules-file snippet
 
@@ -55,7 +55,7 @@ This is the same text the Claude Code plugin's skill teaches automatically;
 an agent that indexes docs instead of reading a rules file can pull the same
 loop from <https://sricola.github.io/offshoot/llms.txt>.
 
-## The eight tools
+## The nine tools
 
 Verified against `internal/mcp/tools.go`; `branch` defaults to `"main"`
 wherever it's optional.
@@ -70,14 +70,16 @@ wherever it's optional.
 | `offshoot_promote` | `database`, `source`, `target`, `force?` | Repoint `target` at `source`'s head — ship the winning attempt. `target`'s previous head is kept as a safety fork named `<target>-pre-promote` — the undo handle the result names — but that fork always carries a TTL (24h by default) and is one rolling slot per target, replaced by the next promote onto that target, so the undo window closes when either happens |
 | `offshoot_destroy` | `database`, `branch`, `force?` | Permanently discard a branch and its checkout |
 | `offshoot_touch` | `database`, `branch?`, `ttl?` | Reset a fork's activity clock so its TTL does not expire mid-task; `ttl` sets or (`"none"`) clears it |
+| `offshoot_diff` | `database`, `left`, `right`, `table?`, `full?`, `max_bytes?` | Per-table rows added/removed/changed (and schema changes) between two branches or checkpoints — decide which attempt to promote; `full` adds capped sqldiff SQL |
 
 ## What the host sees: annotations and structured results
 
 Every tool carries the MCP spec's behavior hints, set explicitly:
-`offshoot_list` is read-only; `checkout`, `fork`, `checkpoint`, and `touch`
-are non-destructive; `rollback`, `promote`, and `destroy` are destructive,
-so a host that honors `destructiveHint` prompts before them. Every
-successful result also returns `structuredContent` (snake_case JSON:
+`offshoot_list` and `offshoot_diff` are read-only; `checkout`, `fork`,
+`checkpoint`, and `touch` are non-destructive; `rollback`, `promote`, and
+`destroy` are destructive, so a host that honors `destructiveHint` prompts
+before them. Every successful result also returns `structuredContent`
+(snake_case JSON:
 `txid`, `path`, `ttl`, `expires_at`, `backup`, …) next to the prose, so a
 harness reads the fields instead of parsing sentences. `fork` and
 `checkpoint` accept `meta` (string→string, at most 32 keys) to tag a

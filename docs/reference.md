@@ -188,11 +188,12 @@ error, a checksum mismatch) never leaves a truncated or partial file at
 **Errors:** no such `db@branch`; no such checkpoint; `out.db` already exists
 and `--force` was not given.
 
-## `offshoot diff <db>[@branch[@checkpoint]] <db>[@branch[@checkpoint]] [--summary]`
+## `offshoot diff <db>[@branch[@checkpoint]] <db>[@branch[@checkpoint]] [--summary] [--table T]`
 
 ```
 offshoot diff app@attempt-1@v1 app@attempt-2@v1
 offshoot diff app@attempt-1@v1 app@attempt-2@v1 --summary
+offshoot diff app@attempt-1@v1 app@attempt-2@v1 --summary --table orders
 offshoot diff app@attempt-1 app@attempt-2                # both at head
 offshoot diff evals@golden@v1 candidate@main@final       # cross-db is legit
 ```
@@ -200,12 +201,15 @@ offshoot diff evals@golden@v1 candidate@main@final       # cross-db is legit
 Materializes both sides READ-ONLY through the same primitives `export`/
 `checkout --at --read-only` use (never a live checkout, never a lease — safe
 alongside an open daemon session on either branch) and either streams
-`sqldiff`'s output over them (default) or prints a stdlib-only table-level
-row-count summary (`--summary`, no `sqldiff` dependency at all;
-row-counts-only — equal counts with different values still report `same`,
-use the default `sqldiff` mode for content). Each target uses the same
-triple-`@` form `export` does — `db` alone means `db@main` head, `db@branch`
-means that branch's head, `db@branch@checkpoint` means that named
+`sqldiff`'s output over them (default) or prints a stdlib-only, content-aware
+per-table summary (`--summary`, no `sqldiff` dependency at all): rows
+added/removed/changed by the table's declared primary key (falling back to
+its internal rowid when there's no usable declared key), with schema changes
+flagged (the STATUS cell gets a trailing " (schema)"); a table whose column
+list differs between the two sides is reported, with row counts, but not
+compared. `--table` restricts either mode to one table. Each target uses the
+same triple-`@` form `export` does — `db` alone means `db@main` head,
+`db@branch` means that branch's head, `db@branch@checkpoint` means that named
 checkpoint. The two targets may name the same `db` or two different ones.
 Full walkthrough, the raw by-hand recipe, and the exact staleness rule for a
 head-side (no-checkpoint) target: [docs/diff.md](diff.md).
@@ -1126,10 +1130,10 @@ offshoot mcp [-default-ttl DURATION|none] [-socket PATH]
 claude mcp add offshoot -- offshoot -store ./.offshoot mcp
 ```
 
-Serves the Model Context Protocol on stdio: eight tools (`offshoot_list`,
+Serves the Model Context Protocol on stdio: nine tools (`offshoot_list`,
 `offshoot_checkout`, `offshoot_checkpoint`, `offshoot_fork`,
 `offshoot_rollback`, `offshoot_promote`, `offshoot_destroy`,
-`offshoot_touch`), each described so a model knows not just what it does
+`offshoot_touch`, `offshoot_diff`), each described so a model knows not just what it does
 but *when* to reach for it (fork before risky work, checkpoint when tests
 pass, roll back when they fail, promote the attempt that worked). Besides
 `claude mcp add`, the Claude Code plugin (`claude plugin marketplace add
@@ -1349,6 +1353,36 @@ authenticated network client) and remains unix-socket-only; `checkout-at`
 stays available over both transports since it only ever writes inside the
 store's own `checkouts-ro` tree.
 
+## Daemon protocol op: `diff`
+
+Unlike `export`/`checkout-at` above, `diff` has a CLI equivalent (`offshoot
+diff`, documented above) — the daemon op is the same content-aware summary
+reachable from a session-aware SDK client (Python/TypeScript `diff()`) or
+directly over `POST /rpc`.
+
+Request fields: `left`, `right` — `db[@branch[@checkpoint]]` targets, the
+same form `export` takes (the two sides may name the same `db` or two
+different ones); `table` (optional) restricts the comparison to one table;
+`full` (optional bool) also runs `sqldiff` on the daemon host and returns its
+SQL, capped at `max_bytes` (0 means `ops.DefaultSqldiffMaxBytes`, 1 MiB; the
+daemon refuses anything over an 8 MiB ceiling). Both sides materialize
+through the same read-only primitives as `export`/`checkout-at` (never a
+live checkout, never a lease).
+
+Response: a `diff` object — `left`, `right` (the request's own target
+strings, echoed back), `tables` (one entry per table, the same shape as
+`ops.TableDiff`: row counts, `added`/`removed`/`changed` counts, `key`,
+`schema_changed`, `status`), `totals` (`same`/`changed`/`added`/`removed`
+table counts), and, when `full` was set, `full` (the capped `sqldiff` SQL
+text) and `truncated` (true when that text was cut short of the complete
+diff). `full` fails with a clear error if `sqldiff` isn't on the **daemon's**
+PATH — omit `full` for the summary alone, which never needs it.
+
+`diff` is allowed over the HTTP surface (unlike `export`): its response is
+always JSON built from data already inside the store, never a path on the
+daemon's filesystem, so it carries none of `export`'s
+arbitrary-file-write/exfiltration risk for an authenticated network client.
+
 ---
 
 ## Surface parity: CLI vs daemon vs SDKs
@@ -1358,7 +1392,7 @@ Which operations exist on which surface today — verified against
 (`internal/daemon/protocol.go`: `open`, `flush`, `status`, `close`,
 `shutdown`, `create`, `checkout`, `fork`, `destroy`, `rollback`,
 `promote`, `compact`, `touch`, `branches`, `dbs`, `export`, `checkout-at`,
-`subscribe`), and both SDK clients (`sdk/python/offshoot/client.py`,
+`subscribe`, `diff`), and both SDK clients (`sdk/python/offshoot/client.py`,
 `sdk/typescript/src/client.ts`).
 
 | Operation | CLI | Daemon op | Python/TS SDK | Notes |
@@ -1371,16 +1405,17 @@ Which operations exist on which surface today — verified against
 | `create --from` (import) | **CLI-only** | no | no | Deliberately deferred, not an oversight — accepting a source file over the daemon boundary needs an upload-channel or path-trust design of its own; see [docs/status.md](status.md)'s `create --from` row. |
 | `gc` (on-demand reap + collect) | **CLI-only** | no | no | A running daemon's janitor performs the same reap/GC on its `-reap-every` timer, so daemon deployments don't lack GC — they lack an RPC to *trigger* it on demand. |
 | `lease list` / `acquire` / `release` | **CLI-only** | no | no | Daemon sessions manage their own lease lifecycle (`open` acquires, `close` releases); the CLI commands are the manual inspect/break-glass surface. |
-| `diff` | **CLI-only** | no | no | Scoped CLI-only by design; see [docs/status.md](status.md)'s diff row. |
+| `diff` | yes | yes | yes | Full parity, plus an MCP tool (`offshoot_diff`) — the only surface here MCP reaches: one database; `left`/`right` are `branch[@checkpoint]`, not the CLI/daemon's `db@branch[@checkpoint]` (there's no cross-database diff over MCP). See [docs/status.md](status.md)'s diff row. |
 | at-rest `checkpoint` | **CLI-only** | n/a | n/a | Not a gap: a live session's *named flush* is how daemon/SDK checkpoints are created (see `session flush` above). |
 | whole-store `status` | **CLI-only** | no | no | The daemon's per-db `branches` op reports the same branch states/storage classes; only the all-dbs-plus-ro-cache-summary view is CLI-only. |
 | `init` / `serve` / `mcp` / `version` / `path` | CLI | n/a | n/a | Process-level or purely local commands; nothing to proxy (`path` is `checkout`'s no-materialize sibling — see its section above). |
 
 Summary: the SDKs cover the entire daemon protocol except `shutdown`;
 what's genuinely CLI-only today is `init`, `create --from`, on-demand
-`gc`, the `lease` commands, `diff`, at-rest `checkpoint`, and the
-whole-store `status` view. For CI patterns that mix the two surfaces
-(CLI seeding + SDK sessions), see [docs/ci-recipes.md](ci-recipes.md).
+`gc`, the `lease` commands, at-rest `checkpoint`, and the whole-store
+`status` view — `diff` now has full CLI/daemon/SDK parity, plus MCP. For
+CI patterns that mix the two surfaces (CLI seeding + SDK sessions), see
+[docs/ci-recipes.md](ci-recipes.md).
 
 ## What's not here
 

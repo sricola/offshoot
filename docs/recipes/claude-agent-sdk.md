@@ -24,14 +24,15 @@ claude mcp add offshoot -- offshoot -store ./.offshoot mcp
 
 This registers `offshoot mcp` as an MCP server over stdio (see
 [docs/reference.md](../reference.md)'s `offshoot mcp` entry) — no daemon
-required to get eight tools into Claude's tool list: `offshoot_list`,
+required to get nine tools into Claude's tool list: `offshoot_list`,
 `offshoot_checkout`, `offshoot_checkpoint`, `offshoot_fork`,
 `offshoot_rollback`, `offshoot_promote`, `offshoot_destroy`,
-`offshoot_touch`. Each tool's
+`offshoot_touch`, `offshoot_diff`. Each tool's
 description tells Claude *when* to reach for it (fork before a risky
-change, checkpoint when something works, roll back when it doesn't), so a
-bare `claude mcp add` is enough to get an agent branching on its own
-initiative in an at-rest workflow — no hooks needed for that baseline case.
+change, checkpoint when something works, roll back when it doesn't, diff
+two attempts before promoting), so a bare `claude mcp add` is enough to get
+an agent branching on its own initiative in an at-rest workflow — no hooks
+needed for that baseline case.
 
 One default worth knowing before you rely on this baseline: every branch
 `offshoot_fork` creates gets a **24h TTL by default** (`offshoot mcp
@@ -205,7 +206,7 @@ fi
 ```
 
 Note what this pattern is *not* claiming: there is no MCP-level "on tool
-failure" event in this repo's own eight tools, and offshoot has no opinion
+failure" event in this repo's own nine tools, and offshoot has no opinion
 about how your harness decides a task succeeded — `make test` above is a
 stand-in for whatever your project's own success signal is. The fork's
 `--ttl 2h` is the backstop if the `Stop` hook never runs at all (a crashed
