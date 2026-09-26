@@ -278,7 +278,7 @@ func annotate(title string, readOnly, destructive, idempotent bool) *ToolAnnotat
 	}
 }
 
-// Tools returns the seven lifecycle tools this server exposes. Descriptions
+// Tools returns the eight lifecycle tools this server exposes. Descriptions
 // are the agent's only documentation: each explains not just what the tool
 // does but when an agent should reach for it.
 func (t *OffshootTools) Tools() []Tool {
@@ -396,6 +396,18 @@ func (t *OffshootTools) Tools() []Tool {
 			InputSchema: schema(reqStr("database"), reqStr("branch"), optBool("force")),
 			Annotations: annotate("Destroy a branch", false, true, false),
 		},
+		{
+			Name: "offshoot_touch",
+			Description: "Reset a branch's activity clock so its TTL does not expire mid-task, and " +
+				"optionally change the TTL. Call this when an attempt on a TTL'd fork is taking " +
+				"longer than expected, or before handing a fork to a long-running step. `ttl` " +
+				"omitted keeps the current TTL; a Go duration like \"2h\" sets it; \"none\" clears " +
+				"it so the branch never expires (prefer a longer duration over \"none\" — " +
+				"branches without a TTL are only removed by an explicit destroy). A TTL alone " +
+				"reaps nothing: the janitor (`offshoot serve`) or `offshoot gc` does.",
+			InputSchema: schema(reqStr("database"), optStrDefault("branch", "main"), optStr("ttl")),
+			Annotations: annotate("Extend a branch's life", false, false, true),
+		},
 	}
 }
 
@@ -464,6 +476,8 @@ func (t *OffshootTools) Call(ctx context.Context, name string, args json.RawMess
 		return t.promote(args)
 	case "offshoot_destroy":
 		return t.destroy(args)
+	case "offshoot_touch":
+		return t.touch(args)
 	default:
 		return ToolResult{}, fmt.Errorf("mcp: unknown tool %q", name)
 	}
@@ -941,4 +955,53 @@ func (t *OffshootTools) destroy(args json.RawMessage) (ToolResult, error) {
 	return StructuredResult(map[string]any{
 		"database": a.Database, "branch": a.Branch,
 	}, "destroyed %s@%s", a.Database, a.Branch), nil
+}
+
+type touchArgs struct {
+	Database string `json:"database"`
+	Branch   string `json:"branch"`
+	// TTL: "" keeps the current TTL, "none" clears it, a Go duration sets it.
+	TTL string `json:"ttl"`
+}
+
+// touch resets db@branch's activity clock (ops.Touch: CAS-retried, refuses
+// a branch a reaper has already claimed) and optionally sets/clears its TTL.
+// Safe alongside an open daemon session: the ref CAS races only lease
+// renewals, and ops.Touch retries.
+func (t *OffshootTools) touch(args json.RawMessage) (ToolResult, error) {
+	var a touchArgs
+	if err := json.Unmarshal(args, &a); err != nil {
+		return ErrorResult("invalid arguments: %v", err), nil
+	}
+	if a.Database == "" {
+		return ErrorResult("database is required"), nil
+	}
+	branch := branchOr(a.Branch)
+	if r, bad := validateNames(namedArg("database", a.Database), namedArg("branch", branch)); bad {
+		return r, nil
+	}
+	var ttl *time.Duration
+	switch a.TTL {
+	case "":
+	case "none":
+		var zero time.Duration
+		ttl = &zero
+	default:
+		d, err := time.ParseDuration(a.TTL)
+		if err != nil || d <= 0 {
+			return ErrorResult("ttl must be a positive Go duration (e.g. \"2h\") or \"none\", got %q", a.TTL), nil
+		}
+		ttl = &d
+	}
+	ref, err := t.ws.Touch(a.Database, branch, ttl, time.Now())
+	if err != nil {
+		return ErrorResult("%v", err), nil
+	}
+	shown := ref.TTL
+	if shown == "" {
+		shown = "none"
+	}
+	return StructuredResult(
+		map[string]any{"database": a.Database, "branch": branch, "ttl": ref.TTL, "touched_at": ref.TouchedAt},
+		"touched %s@%s ttl=%s touched_at=%s", a.Database, branch, shown, ref.TouchedAt), nil
 }

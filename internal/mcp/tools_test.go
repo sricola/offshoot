@@ -70,7 +70,7 @@ func text(r ToolResult) string {
 func TestToolsAdvertiseSchemas(t *testing.T) {
 	ts, _ := newTools(t)
 	tools := ts.Tools()
-	if len(tools) < 7 {
+	if len(tools) < 8 {
 		t.Fatalf("want the full lifecycle surface, got %d tools", len(tools))
 	}
 	seen := map[string]bool{}
@@ -253,6 +253,7 @@ var toolArgStructs = map[string]any{
 	"offshoot_rollback":   rollbackArgs{},
 	"offshoot_promote":    promoteArgs{},
 	"offshoot_destroy":    destroyArgs{},
+	"offshoot_touch":      touchArgs{},
 }
 
 // jsonSchemaTypeForKind maps a Go reflect.Kind to the JSON Schema "type"
@@ -750,6 +751,7 @@ func TestToolAnnotationsClassifyEveryTool(t *testing.T) {
 		"offshoot_rollback":   {false, true, false},
 		"offshoot_promote":    {false, true, false},
 		"offshoot_destroy":    {false, true, false},
+		"offshoot_touch":      {false, false, true},
 	}
 	for _, tl := range ts.Tools() {
 		w, ok := want[tl.Name]
@@ -982,5 +984,50 @@ func TestForkAndCheckpointCarryMeta(t *testing.T) {
 		if !ok || meta["type"] != "object" {
 			t.Fatalf("%s: meta must be advertised as an object, got %v", tl.Name, props["meta"])
 		}
+	}
+}
+
+// TestTouchExtendsALeasedAttempt: an agent mid-task on a TTL'd fork can
+// reset its activity clock (and optionally change or clear the TTL) so the
+// janitor does not reap the branch under it. "" keeps the TTL, "none"
+// clears it, a duration sets it — the daemon touch op's exact contract.
+func TestTouchExtendsALeasedAttempt(t *testing.T) {
+	ts, w := newTools(t)
+	if _, err := w.Fork("app", "main", "attempt-1", "", 2*time.Hour, nil); err != nil {
+		t.Fatal(err)
+	}
+	before, _, _ := w.Store.GetRef("app", "attempt-1")
+	time.Sleep(5 * time.Millisecond)
+	r := call(t, ts, "offshoot_touch", map[string]any{"database": "app", "branch": "attempt-1"})
+	if r.IsError {
+		t.Fatalf("touch: %s", text(r))
+	}
+	after, _, _ := w.Store.GetRef("app", "attempt-1")
+	if after.TTL != "2h0m0s" || !(after.TouchedAt > before.TouchedAt) {
+		t.Fatalf("touch must keep the TTL and advance touched_at: before=%+v after=%+v", before, after)
+	}
+	sc := r.StructuredContent.(map[string]any)
+	if sc["ttl"] != "2h0m0s" || sc["branch"] != "attempt-1" {
+		t.Fatalf("touch structuredContent = %v", sc)
+	}
+	if r := call(t, ts, "offshoot_touch", map[string]any{"database": "app", "branch": "attempt-1", "ttl": "30m"}); r.IsError {
+		t.Fatalf("touch with ttl: %s", text(r))
+	}
+	after, _, _ = w.Store.GetRef("app", "attempt-1")
+	if after.TTL != "30m0s" {
+		t.Fatalf("ttl not applied: %q", after.TTL)
+	}
+	if r := call(t, ts, "offshoot_touch", map[string]any{"database": "app", "branch": "attempt-1", "ttl": "none"}); r.IsError {
+		t.Fatalf("touch ttl none: %s", text(r))
+	}
+	after, _, _ = w.Store.GetRef("app", "attempt-1")
+	if after.TTL != "" {
+		t.Fatalf("ttl not cleared: %q", after.TTL)
+	}
+	if r := call(t, ts, "offshoot_touch", map[string]any{"database": "app", "branch": "attempt-1", "ttl": "soon"}); !r.IsError {
+		t.Fatal("garbage ttl must be a tool error")
+	}
+	if r := call(t, ts, "offshoot_touch", map[string]any{"database": "app", "branch": "nope"}); !r.IsError {
+		t.Fatal("unknown branch must be a tool error")
 	}
 }
