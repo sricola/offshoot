@@ -404,6 +404,12 @@ test("rollback, promote, status", async (t: TestContext) => {
     const path = await c.rollback("rp", "main", "cp1");
     const rows = sqlite3(path, "SELECT count(*) FROM t;").trim();
     assert.equal(rows, "0"); // rolled back before the insert
+    // rollback keeps main's previous head as main-pre-rollback by default (a
+    // TTL'd shared fork); noBackup skips it.
+    assert.ok((await c.branches("rp")).some((b) => b.branch === "main-pre-rollback"));
+    await c.destroy("rp", "main-pre-rollback");
+    await c.rollback("rp", "main", "cp1", { noBackup: true });
+    assert.ok(!(await c.branches("rp")).some((b) => b.branch === "main-pre-rollback"));
 
     await c.fork("rp", "main", "feature");
     const txid = await c.promote("rp", "feature", "main", { force: true, backupTtl: "2h" });

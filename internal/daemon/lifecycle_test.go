@@ -1197,6 +1197,73 @@ func TestPromoteKeepsSafetyForkThroughDaemon(t *testing.T) {
 	}
 }
 
+// TestRollbackKeepsSafetyForkThroughDaemon: the "rollback" op mints the
+// <branch>-pre-rollback safety fork by default and reports its name; the
+// no_backup/backup_ttl fields are honored; and an open session on the
+// PREVIOUS safety fork refuses the rollback up front (it would have to be
+// replaced) with the same close-the-session error the branch itself gets,
+// mirroring TestPromoteKeepsSafetyForkThroughDaemon.
+func TestRollbackKeepsSafetyForkThroughDaemon(t *testing.T) {
+	srv, w := newServer(t)
+	sock := srv.SocketPath()
+
+	open := call(t, sock, Request{Op: "open", DB: "app", Branch: "main"})
+	if !open.OK {
+		t.Fatalf("open = %+v", open)
+	}
+	sqliteExec(t, open.Checkout, "CREATE TABLE t (v); INSERT INTO t VALUES (1);")
+	flush1 := call(t, sock, Request{Op: "flush", DB: "app", Branch: "main", Name: "v1"})
+	if !flush1.OK {
+		t.Fatalf("flush v1 = %+v", flush1)
+	}
+	sqliteExec(t, open.Checkout, "INSERT INTO t VALUES (2);")
+	flush2 := call(t, sock, Request{Op: "flush", DB: "app", Branch: "main", Name: "v2"})
+	if !flush2.OK {
+		t.Fatalf("flush v2 = %+v", flush2)
+	}
+	if cl := call(t, sock, Request{Op: "close", DB: "app", Branch: "main"}); !cl.OK {
+		t.Fatalf("close = %+v", cl)
+	}
+
+	r := call(t, sock, Request{Op: "rollback", DB: "app", Branch: "main", Name: "v1", BackupTTL: "3h"})
+	if !r.OK {
+		t.Fatalf("rollback = %+v", r)
+	}
+	if r.Backup != "main"+ops.RollbackBackupSuffix {
+		t.Fatalf("Backup = %q, want %q", r.Backup, "main"+ops.RollbackBackupSuffix)
+	}
+	ref, _, err := w.Store.GetRef("app", r.Backup)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if ref.TTL != "3h0m0s" {
+		t.Fatalf("backup_ttl not honored: TTL = %q", ref.TTL)
+	}
+	if r := call(t, sock, Request{Op: "rollback", DB: "app", Branch: "main", Name: "v1", BackupTTL: "-1h"}); r.OK || !strings.Contains(r.Error, "backup_ttl") {
+		t.Fatalf("negative backup_ttl must be refused, got %+v", r)
+	}
+
+	// A session on the previous safety fork blocks its replacement.
+	openBackup := call(t, sock, Request{Op: "open", DB: "app", Branch: r.Backup})
+	if !openBackup.OK {
+		t.Fatalf("open = %+v", openBackup)
+	}
+	if r := call(t, sock, Request{Op: "rollback", DB: "app", Branch: "main", Name: "v1"}); r.OK || !strings.Contains(r.Error, "close") {
+		t.Fatalf("rollback must refuse while the previous safety fork has an open session, got %+v", r)
+	}
+	// ...unless the caller opts out of the safety fork entirely.
+	r2 := call(t, sock, Request{Op: "rollback", DB: "app", Branch: "main", Name: "v1", NoBackup: true})
+	if !r2.OK {
+		t.Fatalf("no_backup rollback = %+v", r2)
+	}
+	if r2.Backup != "" {
+		t.Fatalf("no_backup must report no safety fork, got %q", r2.Backup)
+	}
+	if cl := call(t, sock, Request{Op: "close", DB: "app", Branch: r.Backup}); !cl.OK {
+		t.Fatalf("close = %+v", cl)
+	}
+}
+
 // TestDiffOpReturnsContentAwareSummaryOverTheWire: the daemon diff op
 // materializes both sides read-only, returns JSON (never a path), and its
 // summary is content-aware — an UPDATE with unchanged row counts shows as

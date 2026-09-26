@@ -140,6 +140,10 @@ func TestQuickstartTranscript(t *testing.T) {
 	}
 
 	call(t, store, "destroy", "app@attempt-1")
+	// rollback (above) minted attempt-1-pre-rollback as its safety fork by
+	// default; clean it up too so the status check below sees no leftover
+	// attempt-1-named branch.
+	call(t, store, "destroy", "app@attempt-1-pre-rollback")
 	call(t, store, "gc", "--grace", "0s")
 
 	status := call(t, store, "status")

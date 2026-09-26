@@ -66,7 +66,8 @@ Usage:
   offshoot touch <db>[@branch] [--ttl duration|none]   reset a branch's activity clock, optionally (re)setting its TTL
   offshoot protect <db>[@branch]        refuse unforced destroy/promote-onto, never reap; MCP cannot force it without -allow-force
   offshoot unprotect <db>[@branch]      clear the protected flag
-  offshoot rollback <db>[@branch] --to <cp>       repoint a branch at a checkpoint
+  offshoot rollback <db>[@branch] --to <cp> [--no-backup] [--backup-ttl DUR]
+                                                          repoint a branch at a checkpoint; keeps the previous head as <branch>-pre-rollback
   offshoot promote <db>@<src> --onto <target> [--force] [--no-backup] [--backup-ttl DUR]
                                                           repoint target at src's head; keeps target's old head as <target>-pre-promote
   offshoot compact <db>[@branch]     make a shared fork self-contained (its
@@ -547,18 +548,47 @@ func run(args []string) error {
 		fmt.Printf("unprotected %s@%s\n", db, branch)
 		return nil
 	case "rollback":
-		if len(rest) != 3 || rest[1] != "--to" {
-			return fmt.Errorf("usage: offshoot rollback <db>[@branch] --to <checkpoint>")
+		const usage = "usage: offshoot rollback <db>[@branch] --to <checkpoint> [--no-backup] [--backup-ttl DUR]"
+		var opts ops.RollbackOptions
+		fs := rest[:0]
+		for i := 0; i < len(rest); i++ {
+			switch a := rest[i]; a {
+			case "--no-backup":
+				opts.NoBackup = true
+			case "--backup-ttl":
+				if i+1 >= len(rest) {
+					return fmt.Errorf("%s", usage)
+				}
+				i++
+				d, err := time.ParseDuration(rest[i])
+				if err != nil || d <= 0 {
+					return fmt.Errorf("--backup-ttl must be a positive Go duration (e.g. 2h), got %q", rest[i])
+				}
+				opts.BackupTTL = d
+			default:
+				fs = append(fs, a)
+			}
 		}
-		db, branch, err := ops.ParseTarget(rest[0])
+		if len(fs) != 3 || fs[1] != "--to" {
+			return fmt.Errorf("%s", usage)
+		}
+		db, branch, err := ops.ParseTarget(fs[0])
 		if err != nil {
 			return err
 		}
-		p, err := w.Rollback(db, branch, rest[2])
+		res, err := w.RollbackWith(db, branch, fs[2], opts)
 		if err != nil {
 			return err
 		}
-		fmt.Println(p)
+		fmt.Println(res.Path)
+		if res.Backup != "" {
+			ttl := opts.BackupTTL
+			if ttl <= 0 {
+				ttl = ops.DefaultPromoteBackupTTL
+			}
+			fmt.Printf("kept the previous %s@%s head as %s@%s (expires in %s; undo with: offshoot promote %s@%s --onto %s --force)\n",
+				db, branch, db, res.Backup, ttl, db, res.Backup, branch)
+		}
 		return nil
 	case "promote":
 		const usage = "usage: offshoot promote <db>@<source> --onto <target> [--force] [--no-backup] [--backup-ttl DUR]"

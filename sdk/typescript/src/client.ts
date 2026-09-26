@@ -121,6 +121,15 @@ export interface DestroyOptions {
   force?: boolean;
 }
 
+/** Options for {@link Client.rollback}. */
+export interface RollbackOptions {
+  /** Skip the `<branch>-pre-rollback` safety fork that keeps the branch's
+   * previous head (one per branch, replaced by the next rollback, TTL'd). */
+  noBackup?: boolean;
+  /** The safety fork's TTL as a Go duration string (default 24h). */
+  backupTtl?: string;
+}
+
 /** Options for {@link Client.promote}. */
 export interface PromoteOptions {
   /** Override the protected-target refusal. */
@@ -469,9 +478,17 @@ export class Client {
     await this._call("destroy", { db, branch, force: opts.force ?? false });
   }
 
-  /** Repoint db@branch at checkpoint `to`; returns the refreshed checkout path. */
-  async rollback(db: string, branch: string, to: string): Promise<string> {
-    const resp = await this._call("rollback", { db, branch, name: to });
+  /** Repoint db@branch at checkpoint `to`; returns the refreshed checkout path.
+   *
+   * By default the branch's previous head is kept first as a shared safety
+   * fork named `<branch>-pre-rollback`, so a rollback is undone by promoting
+   * that fork back onto the branch. See {@link RollbackOptions} to skip or
+   * re-TTL it. */
+  async rollback(db: string, branch: string, to: string, opts: RollbackOptions = {}): Promise<string> {
+    const resp = await this._call("rollback", {
+      db, branch, name: to,
+      no_backup: opts.noBackup ?? false, backup_ttl: opts.backupTtl ?? "",
+    });
     return resp.checkout ?? "";
   }
 

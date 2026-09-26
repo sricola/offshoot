@@ -743,6 +743,57 @@ func TestPromoteKeepsSafetyForkAndSaysSo(t *testing.T) {
 	}
 }
 
+// TestRollbackKeepsSafetyForkAndSaysSo: offshoot_rollback always keeps the
+// branch's previous head as <branch>-pre-rollback, its TTL follows the
+// configured fork default, and the result text names the fork so the agent
+// knows its undo handle. Mirrors TestPromoteKeepsSafetyForkAndSaysSo.
+func TestRollbackKeepsSafetyForkAndSaysSo(t *testing.T) {
+	ts, w := newTools(t, 2*time.Hour)
+	if _, err := w.Fork("app", "main", "attempt-1", "", 0, nil); err != nil {
+		t.Fatal(err)
+	}
+	p, err := w.Checkout("app", "attempt-1")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if out, err := exec.Command("sqlite3", p, "CREATE TABLE t (v); INSERT INTO t VALUES (1);").CombinedOutput(); err != nil {
+		t.Fatalf("%v: %s", err, out)
+	}
+	if _, err := w.Checkpoint("app", "attempt-1", "v1", nil); err != nil {
+		t.Fatal(err)
+	}
+	if out, err := exec.Command("sqlite3", p, "INSERT INTO t VALUES (2);").CombinedOutput(); err != nil {
+		t.Fatalf("%v: %s", err, out)
+	}
+	if _, err := w.Checkpoint("app", "attempt-1", "v2", nil); err != nil {
+		t.Fatal(err)
+	}
+
+	r := call(t, ts, "offshoot_rollback", map[string]any{
+		"database": "app", "branch": "attempt-1", "to": "v1"})
+	if r.IsError {
+		t.Fatalf("rollback: %s", text(r))
+	}
+	backup := "attempt-1" + ops.RollbackBackupSuffix
+	if !strings.Contains(text(r), "app@"+backup) {
+		t.Fatalf("result must name the safety fork %s: %s", backup, text(r))
+	}
+	sc, ok := r.StructuredContent.(map[string]any)
+	if !ok {
+		t.Fatalf("structuredContent must be a map, got %T", r.StructuredContent)
+	}
+	if _, ok := sc["backup"]; !ok {
+		t.Fatalf("structuredContent must have a backup field: %+v", sc)
+	}
+	ref, _, err := w.Store.GetRef("app", backup)
+	if err != nil {
+		t.Fatalf("safety fork must exist: %v", err)
+	}
+	if ref.TTL != "2h0m0s" {
+		t.Fatalf("safety fork TTL must follow the configured fork default, got %q", ref.TTL)
+	}
+}
+
 // TestToolAnnotationsClassifyEveryTool pins the host-facing behavior hints
 // the 2026-07-28 spec lets a tool carry: hosts use readOnlyHint to skip
 // confirmation and destructiveHint to require it, and the spec's default

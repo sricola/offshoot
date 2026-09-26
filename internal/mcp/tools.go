@@ -355,7 +355,10 @@ func (t *OffshootTools) Tools() []Tool {
 				"everything written since. Call this when an attempt on a branch has " +
 				"gone wrong and you want to restore known-good state rather than " +
 				"manually undoing changes. Reports the checkout path to reopen after " +
-				"the rollback. `branch` defaults to \"main\" if omitted. If a daemon " +
+				"the rollback. `branch` defaults to \"main\" if omitted. The branch's " +
+				"previous head is kept first as a TTL'd safety fork `<branch>-pre-rollback` " +
+				"(one per branch, replaced by the next rollback), so a rollback is undone " +
+				"by promoting that fork back onto `branch`. If a daemon " +
 				"session is open on this branch, the call is refused instead of " +
 				"proceeding, since rollback repoints the branch's storage out from " +
 				"under a session the daemon still believes it owns — close the " +
@@ -847,6 +850,8 @@ type rollbackArgs struct {
 // (healthy or fenced) open on branch, this refuses rather than proceeding
 // (see refuseIfSessionOpen) — an at-rest rollback would repoint the branch
 // out from under a session the daemon still believes owns its checkout.
+// The branch's previous head is always kept first as a safety fork (see
+// promote's identical always-on backup and t.defaultTTL comment there).
 func (t *OffshootTools) rollback(args json.RawMessage) (ToolResult, error) {
 	var a rollbackArgs
 	if err := json.Unmarshal(args, &a); err != nil {
@@ -863,13 +868,22 @@ func (t *OffshootTools) rollback(args json.RawMessage) (ToolResult, error) {
 	if r, refused := t.refuseIfSessionOpen(a.Database, branch, "rolling it back"); refused {
 		return r, nil
 	}
-	path, err := t.ws.Rollback(a.Database, branch, a.To)
+	res, err := t.ws.RollbackWith(a.Database, branch, a.To, ops.RollbackOptions{BackupTTL: t.defaultTTL})
 	if err != nil {
 		return ErrorResult("%v", err), nil
 	}
-	return StructuredResult(map[string]any{
-		"database": a.Database, "branch": branch, "to": a.To, "path": path,
-	}, "rolled back %s@%s to checkpoint %q; checkout at %s", a.Database, branch, a.To, path), nil
+	sc := map[string]any{
+		"database": a.Database, "branch": branch, "to": a.To, "path": res.Path, "backup": res.Backup,
+	}
+	if res.Backup == "" {
+		return StructuredResult(sc, "rolled back %s@%s to checkpoint %q; checkout at %s", a.Database, branch, a.To, res.Path), nil
+	}
+	// The backup clause is inserted BEFORE "checkout at %s" (rather than
+	// appended after it) so the checkout path stays the message's trailing
+	// token — callers/tests that pull "the last path-shaped word" out of the
+	// prose (see lastPath in tools_test.go) still find it.
+	return StructuredResult(sc, "rolled back %s@%s to checkpoint %q; the previous head is kept as %s@%s (undo: offshoot_promote it back onto %s); checkout at %s",
+		a.Database, branch, a.To, a.Database, res.Backup, branch, res.Path), nil
 }
 
 type promoteArgs struct {
