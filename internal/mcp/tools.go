@@ -1123,6 +1123,9 @@ func (t *OffshootTools) diff(args json.RawMessage) (ToolResult, error) {
 	}
 	sc := map[string]any{
 		"database": a.Database, "left": a.Left, "right": a.Right, "tables": rows,
+		// totals is over the post-table-filter list (rep.Tables), so a
+		// narrowed `table` call reports counts for just that one table, not
+		// the whole diff.
 		"totals": map[string]any{"same": rep.Totals.Same, "changed": rep.Totals.Changed, "added": rep.Totals.Added, "removed": rep.Totals.Removed},
 	}
 	if a.Full {

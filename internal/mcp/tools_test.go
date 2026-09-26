@@ -217,6 +217,8 @@ func TestToolsRejectEscapingNames(t *testing.T) {
 		{"offshoot_promote", map[string]any{"database": "app", "source": "main", "target": escaping}},
 		{"offshoot_destroy", map[string]any{"database": "app", "branch": escaping}},
 		{"offshoot_destroy", map[string]any{"database": escaping, "branch": "main"}},
+		{"offshoot_diff", map[string]any{"database": "app", "left": escaping, "right": "main"}},
+		{"offshoot_diff", map[string]any{"database": "app", "left": "main", "right": escaping}},
 	}
 
 	for _, tc := range cases {
