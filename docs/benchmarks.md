@@ -310,6 +310,193 @@ still comfortably sub-second here — this container was already locally
 cached (no image pull) and mounts no volume; a colder path (a network
 pull, a mounted volume, a busier host) would cost meaningfully more.
 
+## BranchBench topologies (v0.2.11)
+
+BranchBench ("Aligning Database Branching with Agentic Demands" — Elaine Ang,
+In Keun Kim, Sam Weldon, Kevin Durand, Kostis Kaffes and Eugene Wu, of
+Columbia University's DAPLab, [arXiv:2604.17180](https://arxiv.org/abs/2604.17180))
+is a benchmark for database *branching* under agentic workloads: five
+macrobenchmark workflows, each a parameter tuple over one tree-building loop —
+fork a branch, mutate it, evaluate it, sometimes prune it — run against hosted
+branchable databases. Its harness is at
+[github.com/ElaineAng/db-fork](https://github.com/ElaineAng/db-fork).
+
+**What we ran.** `cmd/branchbench` (`make bench-branchbench`) re-runs those
+five parameter tuples against a local offshoot store. The harness repository
+carries no license file, so none of it is vendored here: we took the *numbers*
+below — BranchBench's own notation: T workers, S steps per worker, F_r root
+fanout, F_i inner fanout, D max depth, C cross-branch queries for the run, γ
+prune probability, M_s schema changes per step, M_d data mutations per step,
+Q_v eval queries per step — and wrote our own generator, schema and SQL around
+them.
+
+| Workflow | T workers | S steps/worker | F_r | F_i | D | C cross-branch | γ prune | M_s schema/step | M_d mutations/step | Q_v eval/step |
+|---|---|---|---|---|---|---|---|---|---|---|
+| `simulation` (flat star) | 1000 | 1 | 1000 | – | 1 | 1 | 1.0 | 0 | 50 | 1 |
+| `data_cleaning` (wide shallow) | 10 | 20 | 10 | 3 | 3 | 2 | 0.0 | 1 | 1 | 1 |
+| `software_dev` (bushy) | 5 | 20 | 5 | 3 | 4 | 1 | 0.1 | 1 | 1 | 2 |
+| `mcts` (deep narrow) | 10 | 100 | 10 | 10 | 25 | 0 | 0.1 | 0 | 1 | 1 |
+| `failure_repro` (flat, 1 worker) | 1 | 10 | 10 | – | 1 | 0 | 1.0 | 5 | 45 | 1 |
+
+That is 2,310 forks in all (one per worker-step).
+
+- **The seed** is our own CH-benCHmark-*shaped* generator
+  (`cmd/branchbench/seed.go`), not BranchBench's SQL dump: TPC-C's
+  transactional tables (`warehouse`, `district`, `customer`, `item`, `stock`,
+  `orders`, `order_line`, `new_order`, `history`) plus TPC-H's
+  `region`/`nation`/`supplier` dimension tables, at the scale BranchBench's
+  configs describe (10 warehouses, 1K items, 100 customers per district —
+  10,000 customers, 10,000 orders, ~100,000 order lines). It is deterministic
+  (`math/rand` seeded 1) and comes out at **17 MiB**. Every workflow forks its
+  whole tree off the same `chbench@main`, whose head never moves after the
+  seed checkpoint, so all five start from byte-identical state.
+- **No daemon, no network.** Each step is `Fork` → `Checkout` → plain
+  `database/sql` work on the checkout file → `Checkpoint`, straight against
+  `internal/ops` (the in-process API the CLI uses). The checkpoint is what
+  makes the loop a *tree*: a child forks from its parent's published state, so
+  the parent's writes have to be snapshotted into the store before any child
+  can fork from them. A node becomes eligible as a parent only once its own
+  step has finished. Workers are goroutines through a semaphore
+  (`-concurrency`, default 8); one mutex guards the tree.
+- **Cross-branch queries are aggregated in the driver** — for each live
+  branch, check it out, sum `ol_amount` read-only, total it up in Go — which
+  is what BranchBench's harness does too. [DoltHub's critique of the
+  benchmark](https://www.dolthub.com/blog/2026-06-03-branch-bench-database-benchmarking-for-agentic-workflows/)
+  makes the point that this "live[s] as global knowledge in the driver rather
+  than leveraging Dolt's native SQL-layer cross-branch support"; offshoot has
+  no cross-branch SQL to undersell, so the driver-side shape is a fair match
+  here — on a system that has one, it would not be.
+- **Branch management** means `fork` + `checkout` + `checkpoint` + `destroy`.
+  The "Branch overhead" column is that time summed across workers over the
+  run's worker-time budget (wall × concurrency) — at concurrency 1 exactly
+  BranchBench's "fraction of wall-clock time spent on branch management"; the
+  per-workflow lines under the table also give the raw summed figure and its
+  ratio to wall. `synchronous=OFF` is set on the step connections, which makes
+  the *productive* SQL cheaper and so the overhead ratio larger: the
+  conservative direction for us.
+
+**Machine:** as the header line below reports — darwin/arm64, Apple M5, macOS
+27.0, local-directory store backend, no other load, no network, measured
+2026-09-26. (`git describe` reports `-dirty` because the benchmark's own code
+was still uncommitted when it ran; it was afterwards reorganized across files,
+with no change to what it does.) Raw
+stdout of `make bench-branchbench` with its defaults (all five workflows,
+concurrency 8, 10 warehouses, 2h per-workflow cap), pasted verbatim, minus
+make's own echoed `go run` line:
+
+darwin/arm64, Apple M5, 10 cores, Go 1.27.1, offshoot dev-329fc05-52-g799efb3-dirty, measured 2026-09-26, seed 17 MiB, concurrency 8
+
+| Workflow | Steps | Wall | Branch overhead | Fork p50/p99 (d=1 → d=max) | Checkout p50/p99 (d=1 → d=max) | Checkpoint p50/p99 (d=1 → d=max) | Eval p50/p99 (d=1 → d=max) | Peak live | Store Δ |
+|---|---|---|---|---|---|---|---|---|---|
+| simulation | 1000/1000 | 74.0 s | 88% | 71.3/133.5 → (d=1 is max) | 316.2/371.3 → (d=1 is max) | 121.9/168.4 → (d=1 is max) | 11.6/17.4 → (d=1 is max) | 8 | 11.9 GiB |
+| data_cleaning | 200/200 | 19.0 s | 73% | 141.0/192.1 → 123.1/181.9 | 334.0/463.2 → 317.8/392.5 | 124.2/139.2 → 111.3/143.2 | 9.0/15.8 → 10.7/21.4 | 200 | 6.1 GiB |
+| software_dev | 100/100 | 9.1 s | 51% | 130.8/137.8 → 90.2/132.1 | 241.3/255.2 → 183.1/269.8 | 90.2/95.7 → 87.4/107.3 | 13.9/16.9 → 13.0/24.6 | 84 | 2.8 GiB |
+| mcts | 1000/1000 | 86.2 s | 98% | 228.0/231.9 → 226.7/297.4 | 439.8/475.4 → 371.5/473.2 | 116.5/122.0 → 103.0/123.3 | 10.2/14.8 → 10.4/15.0 | 890 | 26.4 GiB |
+| failure_repro | 10/10 | 3.4 s | 11% | 87.2/92.9 → (d=1 is max) | 118.7/123.9 → (d=1 is max) | 72.4/74.6 → (d=1 is max) | 5.1/5.2 → (d=1 is max) | 1 | 138 MiB |
+
+- `simulation` (flat star; T=1000, S=1, F_r=1000, F_i=0, D=1, C=1, γ=1.0, M_s=0, M_d=50, Q_v=1): max depth reached 1; 1 cross-branch query over 1 live branch (the root included) in 9 ms; all 1000 steps landed at d=1; branch-management time 523.3 s summed over workers (7.1x wall at concurrency 8); 0 CAS retries
+- `data_cleaning` (wide shallow; T=10, S=20, F_r=10, F_i=3, D=3, C=2, γ=0.0, M_s=1, M_d=1, Q_v=1): max depth reached 3; 2 cross-branch queries over 201 live branches (the root included) in 4.1 s; 18 steps landed at d=1 and 132 at d=3 (the sample counts behind those two p50/p99 pairs); branch-management time 111.1 s summed over workers (5.9x wall at concurrency 8); 0 CAS retries
+- `software_dev` (bushy; T=5, S=20, F_r=5, F_i=3, D=4, C=1, γ=0.1, M_s=1, M_d=1, Q_v=2): max depth reached 4; 1 cross-branch query over 84 live branches (the root included) in 863 ms; 5 steps landed at d=1 and 48 at d=4 (the sample counts behind those two p50/p99 pairs); branch-management time 36.9 s summed over workers (4.1x wall at concurrency 8); 0 CAS retries
+- `mcts` (deep narrow; T=10, S=100, F_r=10, F_i=10, D=25, C=0, γ=0.1, M_s=0, M_d=1, Q_v=1): max depth reached 25; no cross-branch queries (C=0); 10 steps landed at d=1 and 60 at d=25 (the sample counts behind those two p50/p99 pairs); branch-management time 672.2 s summed over workers (7.8x wall at concurrency 8); 0 CAS retries
+- `failure_repro` (flat, 1 worker; T=1, S=10, F_r=10, F_i=0, D=1, C=0, γ=1.0, M_s=5, M_d=45, Q_v=1): max depth reached 1; no cross-branch queries (C=0); all 10 steps landed at d=1; branch-management time 2.8 s summed over workers (0.8x wall at concurrency 8); 0 CAS retries
+
+Every workflow completed every step: 2,310/2,310 worker-steps, ~3.2 minutes of
+workflow wall time in total, no CAS retries, nothing aborted or timed out.
+
+**What BranchBench found on hosted systems.** For context — these are the
+authors' numbers on hosted Postgres-family systems, not ours:
+
+- From the abstract: "systems optimized for fast branching suffer up to
+  5-4000x slower reads as branches deepen, while systems optimized for fast
+  data operations incur 25-1500x higher branch creation and switching
+  latency."
+- Dolt, on the deep-narrow MCTS topology (10 workers × 100 steps), completed
+  **170/1000** worker-steps before the harness's 2-hour cap — its published
+  `run_stats_final` records `timed_out: true` at `elapsed_sec: 7581.85`.
+- Neon's cloud service "does not support more than 20 concurrent 'live'
+  branches", which is what ends its MCTS run rather than the clock:
+  [DAPLab's write-up](https://daplab.cs.columbia.edu/general/2026/05/26/branchable-databases-arent-ready-for-agentic-workloads.html)
+  reports **33/1000** worker-steps. (The harness's raw `neon_full`
+  MCTS stats file sums its per-worker `completed_steps` to 23, not 33. We cite
+  the published figure and flag the discrepancy rather than reconcile it.)
+- And the headline: "no system was able to fully complete the five agentic
+  applications within the 2 hours."
+
+**Not apples to apples.** Those are the authors' runs on hosted, network-
+attached, multi-tenant Postgres-family services. Branch "creation" there
+includes control-plane work and compute provisioning, and every measurement
+carries WAN round trips, TLS, connection pooling and provider-side rate
+limiting — BranchBench's own "mini" configs exist to stay inside Neon's
+20-branch and API-rate ceilings. Ours is a local file store: no network, no
+compute to provision, no other tenants, a different seed, a different
+concurrency model (goroutines over one process's checkout files, not clients
+over a server), and a storage engine whose byte accounting is not on the same
+curve as either reference system's. Our numbers sit next to theirs because the
+*shape* of the workload is the same, not because the systems are comparable.
+Finishing all five in minutes is not evidence that offshoot "beats" Dolt or
+Neon at anything they were measured on; it is what these five topologies cost
+on a local copy-on-write SQLite store.
+
+**What the numbers do and do not show.**
+
+- **Reads do not get slower with depth.** That is the axis BranchBench's
+  "5-4000x slower reads as branches deepen" finding lives on, and it is why
+  the table reports every latency at depth 1 *and* at the deepest depth
+  reached. `mcts` eval p50 is 10.2 ms at depth 1 and 10.4 ms at depth 25;
+  `data_cleaning` 9.0 → 10.7 ms, `software_dev` 13.9 → 13.0 ms. A branch's
+  checkout is a plain SQLite file, so once it is materialized the store is not
+  in the query path at all and depth cannot enter the read cost. The eval p99s
+  do drift up at depth (`software_dev` 16.9 → 24.6 ms), but those quantiles
+  rest on tens of samples, not thousands — the per-workflow lines give the
+  counts.
+- **Fork, checkout and checkpoint show no depth trend either** — all three are
+  flat or slightly *cheaper* at max depth (`mcts` fork 228.0 → 226.7 ms,
+  checkout 439.8 → 371.5 ms, checkpoint 116.5 → 103.0 ms). That is by
+  construction: offshoot forks by sharing the parent's chain (two small
+  objects, no data copy) until the fully-resolved chain reaches 16 members, at
+  which point the next fork materializes a fresh floor snapshot instead
+  (`ops.ForkShareMaxDepth`, and `offshoot compact` on demand). A 25-deep spine
+  therefore never resolves through 25 layers; what it pays instead is an
+  O(size) copy at those floor boundaries — the same O(size) cost the
+  "Per-test isolation primitives" section above documents for materializing a
+  checkout.
+- **These are latencies under 8-way concurrency, not per-op costs in
+  isolation.** A checkout here is ~0.2-0.5 s for a 17 MiB database while the
+  isolation section's uncontended `fork` + `open` + `close` of a 100 MB
+  database is 421 ms; the difference is queueing on one laptop's disk and page
+  cache, eight workers deep. Three things plausibly dominate these
+  columns — 8-way I/O contention, `Fork`-at-head quiescing the *parent's*
+  checkout (which serializes concurrent forks that share a parent), and the
+  O(size) materialization at the chain floor — and this run does not attribute
+  the time between them. Read the columns as what a branch-heavy agentic
+  workload costs end to end, not as primitive latencies; the two sections
+  above are where the primitives are measured.
+- **High branch overhead is a property of these topologies.** `mcts` spends
+  98% of its worker time on branch management because its step is one mutation
+  and one aggregate; `failure_repro`, whose step is 5 schema changes and 45
+  mutations, spends 11%. BranchBench's tuples are deliberately branch-heavy,
+  which is the point of the benchmark — the ratio is a statement about the
+  workload's mix as much as about offshoot.
+- **`Store Δ` is "what the run wrote", not a steady state.** For a local store
+  the materialized checkouts live inside the store directory, so the column
+  counts both store objects and one checkout file per live branch (200 live
+  branches × a 17 MiB seed is ~3.3 GiB of `data_cleaning`'s 6.1 GiB). And
+  `destroy` is a metadata operation — it tombstones, it does not reclaim:
+  `simulation` pruned all 1,000 of its branches (γ=1.0) and still shows 11.9
+  GiB, because nothing runs `offshoot gc` during the benchmark. BranchBench
+  measures reclaim as its own metric; this table does not measure it at all.
+- **Each workflow ran against the store the previous ones left behind**: by
+  the time `mcts` starts, 1,300 forks have already happened and the store
+  holds ~21 GiB (11.9 + 6.1 + 2.8) and ~280 still-live branches. That is a
+  confound between rows — they are comparable in shape, not in absolute
+  latency. `-workflows <name>` runs one topology against a fresh store when
+  that matters.
+- **One host, one run.** These are quantiles within a single run, not a
+  median-of-N across runs, on a laptop. An earlier identical run of the whole
+  table reproduced the same completion counts and closely comparable wall
+  times and p50s, but run-to-run variance on a laptop is real and no fleet
+  average is implied.
+
 ## Method
 
 - Each subtest seeds a fresh SQLite database of the target size (bulk INSERT
