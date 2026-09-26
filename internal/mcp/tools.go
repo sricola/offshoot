@@ -205,6 +205,10 @@ type prop struct {
 	jsonType string
 	required bool
 	def      any
+	// extra carries additional JSON Schema keywords beyond "type"/"default"
+	// (e.g. "additionalProperties" for an object-typed property like
+	// `meta`), merged into the property's schema by schema() below.
+	extra map[string]any
 }
 
 // reqStr and optStr build required/optional string properties, the common
@@ -222,6 +226,14 @@ func optStrDefault(name string, def string) prop {
 // optBool builds an optional boolean property (e.g. `force`).
 func optBool(name string) prop { return prop{name: name, jsonType: "boolean"} }
 
+// optMeta builds the optional `meta` property: a small string->string map
+// stored on the new branch (fork) or the named checkpoint (checkpoint),
+// capped by ops.ValidateMeta. Advertised as an object of strings so a
+// model does not send a JSON-encoded string.
+func optMeta(name string) prop {
+	return prop{name: name, jsonType: "object", extra: map[string]any{"additionalProperties": map[string]any{"type": "string"}}}
+}
+
 // schema builds a JSON Schema object describing a tool's arguments from a
 // list of properties, each carrying its own type/required/default.
 func schema(props ...prop) map[string]any {
@@ -231,6 +243,9 @@ func schema(props ...prop) map[string]any {
 		def := map[string]any{"type": p.jsonType}
 		if p.def != nil {
 			def["default"] = p.def
+		}
+		for k, v := range p.extra {
+			def[k] = v
 		}
 		properties[p.name] = def
 		if p.required {
@@ -247,7 +262,23 @@ func schema(props ...prop) map[string]any {
 	return s
 }
 
-// Tools returns the seven lifecycle tools this server exposes. Descriptions
+// annotate builds a fully explicit ToolAnnotations. openWorldHint is always
+// false: every offshoot tool acts only on its own store, never on the open
+// internet. All four hints are set on purpose — the spec defaults
+// destructiveHint to TRUE, so an unannotated fork would read as destructive
+// to a host that honors the hints.
+func annotate(title string, readOnly, destructive, idempotent bool) *ToolAnnotations {
+	f := false
+	return &ToolAnnotations{
+		Title:           title,
+		ReadOnlyHint:    &readOnly,
+		DestructiveHint: &destructive,
+		IdempotentHint:  &idempotent,
+		OpenWorldHint:   &f,
+	}
+}
+
+// Tools returns the eight lifecycle tools this server exposes. Descriptions
 // are the agent's only documentation: each explains not just what the tool
 // does but when an agent should reach for it.
 func (t *OffshootTools) Tools() []Tool {
@@ -260,6 +291,7 @@ func (t *OffshootTools) Tools() []Tool {
 				"exist, what branches an attempt could fork from, or which checkpoints " +
 				"are available to roll back to or fork from.",
 			InputSchema: schema(),
+			Annotations: annotate("List databases and branches", true, false, true),
 		},
 		{
 			Name: "offshoot_checkout",
@@ -274,6 +306,7 @@ func (t *OffshootTools) Tools() []Tool {
 				"Call offshoot_checkpoint to name the current state so it can be rolled " +
 				"back to or forked from later. `branch` defaults to \"main\" if omitted.",
 			InputSchema: schema(reqStr("database"), optStrDefault("branch", "main")),
+			Annotations: annotate("Materialize a branch to a SQLite file", false, false, true),
 		},
 		{
 			Name: "offshoot_checkpoint",
@@ -284,8 +317,12 @@ func (t *OffshootTools) Tools() []Tool {
 				"If a daemon session is open on this branch, this is a live flush " +
 				"(cheap, only the diff since the last checkpoint, no pause in writes); " +
 				"otherwise it's a full-snapshot checkpoint of the checkout file. " +
-				"`branch` defaults to \"main\" if omitted.",
-			InputSchema: schema(reqStr("database"), reqStr("name"), optStrDefault("branch", "main")),
+				"`branch` defaults to \"main\" if omitted. Optional `meta` " +
+				"(string->string, at most 32 keys) tags the result with your run id, " +
+				"git SHA, or agent name for later lookup.",
+			InputSchema: schema(reqStr("database"), reqStr("name"), optStrDefault("branch", "main"),
+				optMeta("meta")),
+			Annotations: annotate("Checkpoint a branch", false, false, false),
 		},
 		{
 			Name: "offshoot_fork",
@@ -300,10 +337,13 @@ func (t *OffshootTools) Tools() []Tool {
 				"daemon session is open on the source branch, its unflushed writes are " +
 				"flushed first, so the fork always includes everything written so far. " +
 				"`branch` (the source) defaults to \"main\" if omitted. " +
-				forkTTLDescription(t.defaultTTL) + " " + forkTTLJanitorNote,
+				forkTTLDescription(t.defaultTTL) + " " + forkTTLJanitorNote + " " +
+				"Optional `meta` (string->string, at most 32 keys) tags the result " +
+				"with your run id, git SHA, or agent name for later lookup.",
 			InputSchema: schema(reqStr("database"), reqStr("new_branch"),
 				optStrDefault("branch", "main"), optStr("at"),
-				optStrDefault("ttl", ttlDefaultDisplay(t.defaultTTL))),
+				optStrDefault("ttl", ttlDefaultDisplay(t.defaultTTL)), optMeta("meta")),
+			Annotations: annotate("Fork a branch", false, false, false),
 		},
 		{
 			Name: "offshoot_rollback",
@@ -317,6 +357,7 @@ func (t *OffshootTools) Tools() []Tool {
 				"under a session the daemon still believes it owns — close the " +
 				"session first (e.g. `offshoot session close`) and retry.",
 			InputSchema: schema(reqStr("database"), reqStr("to"), optStrDefault("branch", "main")),
+			Annotations: annotate("Roll a branch back to a checkpoint", false, true, false),
 		},
 		{
 			Name: "offshoot_promote",
@@ -340,6 +381,7 @@ func (t *OffshootTools) Tools() []Tool {
 				"live session — flush or checkpoint the source first if you need its " +
 				"very latest state promoted.",
 			InputSchema: schema(reqStr("database"), reqStr("source"), reqStr("target"), optBool("force")),
+			Annotations: annotate("Promote a branch onto a target", false, true, false),
 		},
 		{
 			Name: "offshoot_destroy",
@@ -352,6 +394,19 @@ func (t *OffshootTools) Tools() []Tool {
 				"storage out from under a session the daemon still believes it owns; " +
 				"close the session first (e.g. `offshoot session close`) and retry.",
 			InputSchema: schema(reqStr("database"), reqStr("branch"), optBool("force")),
+			Annotations: annotate("Destroy a branch", false, true, false),
+		},
+		{
+			Name: "offshoot_touch",
+			Description: "Reset a branch's activity clock so its TTL does not expire mid-task, and " +
+				"optionally change the TTL. Call this when an attempt on a TTL'd fork is taking " +
+				"longer than expected, or before handing a fork to a long-running step. `ttl` " +
+				"omitted keeps the current TTL; a Go duration like \"2h\" sets it; \"none\" clears " +
+				"it so the branch never expires (prefer a longer duration over \"none\" — " +
+				"branches without a TTL are only removed by an explicit destroy). A TTL alone " +
+				"reaps nothing: the janitor (`offshoot serve`) or `offshoot gc` does.",
+			InputSchema: schema(reqStr("database"), optStrDefault("branch", "main"), optStr("ttl")),
+			Annotations: annotate("Extend a branch's life", false, false, true),
 		},
 	}
 }
@@ -421,6 +476,8 @@ func (t *OffshootTools) Call(ctx context.Context, name string, args json.RawMess
 		return t.promote(args)
 	case "offshoot_destroy":
 		return t.destroy(args)
+	case "offshoot_touch":
+		return t.touch(args)
 	default:
 		return ToolResult{}, fmt.Errorf("mcp: unknown tool %q", name)
 	}
@@ -432,15 +489,21 @@ func (t *OffshootTools) list(args json.RawMessage) (ToolResult, error) {
 		return ErrorResult("%v", err), nil
 	}
 	if len(statuses) == 0 {
-		return TextResult("no databases yet; create one with the offshoot CLI (`offshoot create <name>`)"), nil
+		return StructuredResult(map[string]any{"branches": []map[string]any{}},
+			"no databases yet; create one with the offshoot CLI (`offshoot create <name>`)"), nil
 	}
 	var b []byte
+	rows := make([]map[string]any, 0, len(statuses))
 	for _, s := range statuses {
 		line := fmt.Sprintf("%s@%s head=%d checkpoints=%v protected=%v checked_out=%v\n",
 			s.DB, s.Branch, s.HeadTXID, s.Checkpoints, s.Protected, s.CheckedOut)
 		b = append(b, line...)
+		rows = append(rows, map[string]any{
+			"database": s.DB, "branch": s.Branch, "head_txid": s.HeadTXID,
+			"checkpoints": s.Checkpoints, "protected": s.Protected, "checked_out": s.CheckedOut,
+		})
 	}
-	return TextResult("%s", string(b)), nil
+	return StructuredResult(map[string]any{"branches": rows}, "%s", string(b)), nil
 }
 
 type checkoutArgs struct {
@@ -485,7 +548,9 @@ func (t *OffshootTools) checkout(args json.RawMessage) (ToolResult, error) {
 				a.Database, branch, info.Checkout)
 			msg += "\nwrite there directly — the daemon captures every commit continuously; " +
 				"call offshoot_checkpoint to name a point you can roll back to or fork from"
-			return TextResult("%s", msg), nil
+			return StructuredResult(map[string]any{
+				"database": a.Database, "branch": branch, "path": info.Checkout, "live": true,
+			}, "%s", msg), nil
 		}
 	}
 
@@ -507,13 +572,16 @@ func (t *OffshootTools) checkout(args json.RawMessage) (ToolResult, error) {
 				"full snapshot, not a live flush, until something opens a session on it"
 		}
 	}
-	return TextResult("%s", msg), nil
+	return StructuredResult(map[string]any{
+		"database": a.Database, "branch": branch, "path": path, "live": false,
+	}, "%s", msg), nil
 }
 
 type checkpointArgs struct {
-	Database string `json:"database"`
-	Branch   string `json:"branch"`
-	Name     string `json:"name"`
+	Database string            `json:"database"`
+	Branch   string            `json:"branch"`
+	Name     string            `json:"name"`
+	Meta     map[string]string `json:"meta"`
 }
 
 // checkpoint names the current state of db@branch. If a daemon session is
@@ -538,23 +606,22 @@ func (t *OffshootTools) checkpoint(args json.RawMessage) (ToolResult, error) {
 		return r, nil
 	}
 	if _, ok := t.openSession(a.Database, branch); ok {
-		resp, err := daemon.Call(t.socket, daemon.Request{Op: "flush", DB: a.Database, Branch: branch, Name: a.Name})
+		resp, err := daemon.Call(t.socket, daemon.Request{Op: "flush", DB: a.Database, Branch: branch, Name: a.Name, Meta: a.Meta})
 		if err != nil {
 			return ErrorResult("%v", err), nil
 		}
-		return TextResult("checkpointed %s@%s as %q at txid %d — captured live from the open daemon session, no pause in writes",
+		return StructuredResult(map[string]any{
+			"database": a.Database, "branch": branch, "name": a.Name, "txid": resp.TXID, "live": true,
+		}, "checkpointed %s@%s as %q at txid %d — captured live from the open daemon session, no pause in writes",
 			a.Database, branch, a.Name, resp.TXID), nil
 	}
-	// meta is nil: MCP tool exposure of checkpoint/fork metadata is
-	// deliberately out of scope for Milestone 3 Task 1 (see ROADMAP's M3
-	// metadata note) — the ops.Workspace.Checkpoint/Fork surface supports
-	// it, but no offshoot_* tool argument threads a caller-supplied map
-	// through to it yet.
-	txid, err := t.ws.Checkpoint(a.Database, branch, a.Name, nil)
+	txid, err := t.ws.Checkpoint(a.Database, branch, a.Name, a.Meta)
 	if err != nil {
 		return ErrorResult("%v", err), nil
 	}
-	return TextResult("checkpointed %s@%s as %q at txid %d", a.Database, branch, a.Name, txid), nil
+	return StructuredResult(map[string]any{
+		"database": a.Database, "branch": branch, "name": a.Name, "txid": txid, "live": false,
+	}, "checkpointed %s@%s as %q at txid %d", a.Database, branch, a.Name, txid), nil
 }
 
 type forkArgs struct {
@@ -565,12 +632,13 @@ type forkArgs struct {
 	// TTL is a Go duration string ("2h"), "none" for no TTL (overrides any
 	// configured default), or "" to fall back to OffshootTools.defaultTTL —
 	// see resolveForkTTL.
-	TTL string `json:"ttl"`
+	TTL  string            `json:"ttl"`
+	Meta map[string]string `json:"meta"`
 }
 
 // forkTTLJanitorNote is appended to offshoot_fork's Description (and, in
-// spirit, its response text — see forkTTLSummary) per the PM amendment: a
-// TTL alone does not reap anything. Reaping is a janitor's job
+// spirit, its response text — see forkTTLSummaryFromFields) per the PM
+// amendment: a TTL alone does not reap anything. Reaping is a janitor's job
 // (`offshoot serve`'s background sweep); a daemonless MCP setup — the
 // common case, since `offshoot mcp` needs no daemon — only reaps expired
 // branches when `offshoot gc` is run by hand.
@@ -638,32 +706,46 @@ func resolveForkTTL(raw string, defaultTTL time.Duration) (time.Duration, error)
 	return d, nil
 }
 
-// forkTTLSummary describes the TTL just applied to a fresh fork, for the
-// tool's response text. Per the PM amendment, this (not just the ref
-// written to the store) is what carries the applied TTL and computed expiry
-// into the agent's transcript, so the model can reason about them later
-// without a separate offshoot_list/offshoot_checkout round trip. Expiry is
-// computed the same way Status does: ops.ReapDeadline from the ref's own
-// TouchedAt, not from time.Now() here, so it reflects what was actually
-// durably written.
-func forkTTLSummary(ws *ops.Workspace, db, branch string, ttl time.Duration) string {
+// forkTTLFieldsFromRef derives the raw ttl and expires_at values fork's
+// structuredContent and prose both report, from a single already-read ref
+// (or read error) — the one GetRef call the caller made — rather than each
+// re-reading the store independently. That single-read discipline matters:
+// two independent re-reads (one for the prose, one for the structured
+// fields) could observe two different ref states across a concurrent touch
+// or reap, making the response's own prose and structuredContent disagree
+// with each other. ttl<=0 means no TTL was applied to this fork (both
+// return ""); readErr non-nil means the post-fork re-read failed (ttlStr
+// falls back to the requested ttl's own String(), expiresAt stays "" since
+// there's no ref to compute a deadline from); otherwise ttlStr is the ref's
+// own TTL and expiresAt is the RFC3339 deadline when ops.ReapDeadline can
+// compute one, else "".
+func forkTTLFieldsFromRef(ref store.Ref, readErr error, ttl time.Duration) (ttlStr, expiresAt string) {
 	if ttl <= 0 {
-		return "ttl=none (never expires)"
+		return "", ""
 	}
-	ref, _, err := ws.Store.GetRef(db, branch)
-	if err != nil {
-		// The fork itself already succeeded; a re-read failure here only
-		// means the response can't include a computed expiry — the janitor
-		// caveat below doesn't depend on that re-read at all (it's a static
-		// fact about how reaping works, not a value derived from the ref),
-		// so it must not degrade along with expires_at.
-		return fmt.Sprintf("ttl=%s; %s", ttl, forkTTLJanitorNote)
+	if readErr != nil {
+		return ttl.String(), ""
 	}
 	deadline, ok := ops.ReapDeadline(ref)
 	if !ok {
-		return fmt.Sprintf("ttl=%s; %s", ref.TTL, forkTTLJanitorNote)
+		return ref.TTL, ""
 	}
-	return fmt.Sprintf("ttl=%s expires_at=%s; %s", ref.TTL, deadline.Format(time.RFC3339), forkTTLJanitorNote)
+	return ref.TTL, deadline.Format(time.RFC3339)
+}
+
+// forkTTLSummaryFromFields renders forkTTLFieldsFromRef's output into the
+// prose clause fork's response appends after "forked ... at txid N". Kept
+// separate from forkTTLFieldsFromRef so fork can read the ref once and
+// derive both the prose and the structured fields from that one read,
+// rather than each needing its own re-read of the store.
+func forkTTLSummaryFromFields(ttlStr, expiresAt string) string {
+	if ttlStr == "" {
+		return "ttl=none (never expires)"
+	}
+	if expiresAt == "" {
+		return fmt.Sprintf("ttl=%s; %s", ttlStr, forkTTLJanitorNote)
+	}
+	return fmt.Sprintf("ttl=%s expires_at=%s; %s", ttlStr, expiresAt, forkTTLJanitorNote)
 }
 
 // fork creates new_branch from branch's head (or checkpoint `at`). If a
@@ -671,9 +753,9 @@ func forkTTLSummary(ws *ops.Workspace, db, branch string, ttl time.Duration) str
 // daemon's own "fork" op handles both), the fork is routed through it, so
 // an open source session's unflushed writes are flushed first and always
 // land in the new branch. No daemon routes to the plain at-rest fork, as
-// before. Either way, the response's TTL/expiry summary is computed by
-// re-reading the ref straight from the store (forkTTLSummary), not from
-// whichever path performed the fork.
+// before. Either way, the response's TTL clause and its structured `ttl`/
+// `expires_at` fields both derive from a single post-fork ref read, via
+// forkTTLFieldsFromRef, so the prose and structuredContent never disagree.
 func (t *OffshootTools) fork(args json.RawMessage) (ToolResult, error) {
 	var a forkArgs
 	if err := json.Unmarshal(args, &a); err != nil {
@@ -698,7 +780,7 @@ func (t *OffshootTools) fork(args json.RawMessage) (ToolResult, error) {
 
 	var txid uint64
 	if _, up := t.daemonStatus(); up {
-		req := daemon.Request{Op: "fork", DB: a.Database, Branch: branch, Name: a.NewBranch, From: a.At}
+		req := daemon.Request{Op: "fork", DB: a.Database, Branch: branch, Name: a.NewBranch, From: a.At, Meta: a.Meta}
 		if ttl > 0 {
 			req.TTL = ttl.String()
 		}
@@ -708,16 +790,25 @@ func (t *OffshootTools) fork(args json.RawMessage) (ToolResult, error) {
 		}
 		txid = resp.TXID
 	} else {
-		// meta is nil — see the identical note on t.ws.Checkpoint's call site
-		// above: MCP metadata exposure is out of scope for Milestone 3 Task 1.
-		txid, err = t.ws.Fork(a.Database, branch, a.NewBranch, a.At, ttl, nil)
+		txid, err = t.ws.Fork(a.Database, branch, a.NewBranch, a.At, ttl, a.Meta)
 		if err != nil {
 			return ErrorResult("%v", err), nil
 		}
 	}
 	msg := fmt.Sprintf("forked %s@%s to %s@%s at txid %d", a.Database, branch, a.Database, a.NewBranch, txid)
-	msg += "; " + forkTTLSummary(t.ws, a.Database, a.NewBranch, ttl)
-	return TextResult("%s", msg), nil
+	// One read (only when there's a TTL to report on), shared by the prose
+	// and the structured fields — see forkTTLFieldsFromRef's doc comment for
+	// why two independent re-reads here would be a race.
+	var ttlStr, expiresAt string
+	if ttl > 0 {
+		ref, _, refErr := t.ws.Store.GetRef(a.Database, a.NewBranch)
+		ttlStr, expiresAt = forkTTLFieldsFromRef(ref, refErr, ttl)
+	}
+	msg += "; " + forkTTLSummaryFromFields(ttlStr, expiresAt)
+	return StructuredResult(map[string]any{
+		"database": a.Database, "branch": branch, "new_branch": a.NewBranch, "txid": txid,
+		"ttl": ttlStr, "expires_at": expiresAt,
+	}, "%s", msg), nil
 }
 
 type rollbackArgs struct {
@@ -753,7 +844,9 @@ func (t *OffshootTools) rollback(args json.RawMessage) (ToolResult, error) {
 	if err != nil {
 		return ErrorResult("%v", err), nil
 	}
-	return TextResult("rolled back %s@%s to checkpoint %q; checkout at %s", a.Database, branch, a.To, path), nil
+	return StructuredResult(map[string]any{
+		"database": a.Database, "branch": branch, "to": a.To, "path": path,
+	}, "rolled back %s@%s to checkpoint %q; checkout at %s", a.Database, branch, a.To, path), nil
 }
 
 type promoteArgs struct {
@@ -800,10 +893,13 @@ func (t *OffshootTools) promote(args json.RawMessage) (ToolResult, error) {
 	if err != nil {
 		return ErrorResult("%v", err), nil
 	}
-	if res.Backup == "" {
-		return TextResult("promoted %s@%s onto %s@%s at txid %d", a.Database, a.Source, a.Database, a.Target, res.TXID), nil
+	sc := map[string]any{
+		"database": a.Database, "source": a.Source, "target": a.Target, "txid": res.TXID, "backup": res.Backup,
 	}
-	return TextResult("promoted %s@%s onto %s@%s at txid %d; the previous %s@%s head is kept as %s@%s (undo: promote it back onto %s)",
+	if res.Backup == "" {
+		return StructuredResult(sc, "promoted %s@%s onto %s@%s at txid %d", a.Database, a.Source, a.Database, a.Target, res.TXID), nil
+	}
+	return StructuredResult(sc, "promoted %s@%s onto %s@%s at txid %d; the previous %s@%s head is kept as %s@%s (undo: promote it back onto %s)",
 		a.Database, a.Source, a.Database, a.Target, res.TXID, a.Database, a.Target, a.Database, res.Backup, a.Target), nil
 }
 
@@ -835,5 +931,56 @@ func (t *OffshootTools) destroy(args json.RawMessage) (ToolResult, error) {
 	if err := t.ws.Destroy(a.Database, a.Branch, a.Force); err != nil {
 		return ErrorResult("%v", err), nil
 	}
-	return TextResult("destroyed %s@%s", a.Database, a.Branch), nil
+	return StructuredResult(map[string]any{
+		"database": a.Database, "branch": a.Branch,
+	}, "destroyed %s@%s", a.Database, a.Branch), nil
+}
+
+type touchArgs struct {
+	Database string `json:"database"`
+	Branch   string `json:"branch"`
+	// TTL: "" keeps the current TTL, "none" clears it, a Go duration sets it.
+	TTL string `json:"ttl"`
+}
+
+// touch resets db@branch's activity clock (ops.Touch: CAS-retried, refuses
+// a branch a reaper has already claimed) and optionally sets/clears its TTL.
+// Safe alongside an open daemon session: the ref CAS races only lease
+// renewals, and ops.Touch retries.
+func (t *OffshootTools) touch(args json.RawMessage) (ToolResult, error) {
+	var a touchArgs
+	if err := json.Unmarshal(args, &a); err != nil {
+		return ErrorResult("invalid arguments: %v", err), nil
+	}
+	if a.Database == "" {
+		return ErrorResult("database is required"), nil
+	}
+	branch := branchOr(a.Branch)
+	if r, bad := validateNames(namedArg("database", a.Database), namedArg("branch", branch)); bad {
+		return r, nil
+	}
+	var ttl *time.Duration
+	switch a.TTL {
+	case "":
+	case "none":
+		var zero time.Duration
+		ttl = &zero
+	default:
+		d, err := time.ParseDuration(a.TTL)
+		if err != nil || d <= 0 {
+			return ErrorResult("ttl must be a positive Go duration (e.g. \"2h\") or \"none\", got %q", a.TTL), nil
+		}
+		ttl = &d
+	}
+	ref, err := t.ws.Touch(a.Database, branch, ttl, time.Now())
+	if err != nil {
+		return ErrorResult("%v", err), nil
+	}
+	shown := ref.TTL
+	if shown == "" {
+		shown = "none"
+	}
+	return StructuredResult(
+		map[string]any{"database": a.Database, "branch": branch, "ttl": ref.TTL, "touched_at": ref.TouchedAt},
+		"touched %s@%s ttl=%s touched_at=%s", a.Database, branch, shown, ref.TouchedAt), nil
 }

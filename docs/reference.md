@@ -1126,15 +1126,49 @@ offshoot mcp [-default-ttl DURATION|none] [-socket PATH]
 claude mcp add offshoot -- offshoot -store ./.offshoot mcp
 ```
 
-Serves the Model Context Protocol on stdio: seven tools (`offshoot_list`,
+Serves the Model Context Protocol on stdio: eight tools (`offshoot_list`,
 `offshoot_checkout`, `offshoot_checkpoint`, `offshoot_fork`,
-`offshoot_rollback`, `offshoot_promote`, `offshoot_destroy`), each described
-so a model knows not just what it does but *when* to reach for it (fork
-before risky work, checkpoint when tests pass, roll back when they fail,
-promote the attempt that worked). Destructive tools honor the same
-protected-branch rules as the CLI — an unforced `offshoot_promote --onto
-main` or `offshoot_destroy` on `main` is refused, and the refusal is
-returned to the agent as the tool result, not a transport-level error.
+`offshoot_rollback`, `offshoot_promote`, `offshoot_destroy`,
+`offshoot_touch`), each described so a model knows not just what it does
+but *when* to reach for it (fork before risky work, checkpoint when tests
+pass, roll back when they fail, promote the attempt that worked). Besides
+`claude mcp add`, the Claude Code plugin (`claude plugin marketplace add
+sricola/offshoot && claude plugin install offshoot@offshoot`) installs the
+same server plus a skill that teaches the loop and advisory hooks; see
+[docs/agents.md](agents.md#wire-it-into-your-agent). Destructive tools
+honor the same protected-branch rules as the CLI — an unforced
+`offshoot_promote --onto main` or `offshoot_destroy` on `main` is refused,
+and the refusal is returned to the agent as the tool result, not a
+transport-level error.
+
+**Annotations.** Every tool's `tools/list` entry carries an explicit
+`annotations` object — `readOnlyHint`, `destructiveHint`, `idempotentHint`,
+and `openWorldHint` (always `false`: every tool acts only on its own
+store). `offshoot_list` is the only read-only tool; `offshoot_checkout`,
+`offshoot_fork`, `offshoot_checkpoint`, and `offshoot_touch` are
+non-destructive; `offshoot_rollback`, `offshoot_promote`, and
+`offshoot_destroy` are destructive, so a host that honors
+`destructiveHint` prompts before them. Nothing is left to the spec's
+default (which is `destructiveHint: true`), so an unannotated fork never
+reads as destructive to a host that checks the hint.
+
+**`structuredContent`.** Every successful tool result returns
+`structuredContent` — a snake_case JSON object (`txid`, `path`, `ttl`,
+`expires_at`, `backup`, …, tool-dependent) — alongside the human-readable
+`content` text, so a harness can read fields instead of parsing sentences.
+An error result (`isError: true`) carries no `structuredContent`.
+
+**`meta`.** `offshoot_fork` and `offshoot_checkpoint` accept an optional
+`meta` argument (string→string, at most 32 keys) that tags the resulting
+branch or checkpoint with a run id, git SHA, or agent name for later
+lookup via `offshoot_list`.
+
+**`offshoot_touch`.** Resets a branch's activity clock so its TTL does not
+expire mid-task, and optionally changes the TTL: omitting `ttl` keeps the
+current one, a Go duration string (e.g. `"2h"`) sets it, and `"none"`
+clears it so the branch never expires. Like every other tool, a TTL change
+alone reaps nothing — that's still the janitor's (`offshoot serve`) or
+`offshoot gc`'s job.
 
 Agent-initiated forks carry a TTL by default: `offshoot_fork` applies
 `-default-ttl` (default `24h`) to any call that omits its own `ttl`

@@ -33,9 +33,10 @@ claude mcp add offshoot -- offshoot -store ./.offshoot mcp
 This is the exact command documented in [`README.md`](../../README.md) and
 [`docs/reference.md`](../reference.md#offshoot-mcp) for this repo. It
 registers `offshoot mcp` as a stdio MCP server scoped to the current
-project's `./.offshoot` store; the agent picks up the seven `offshoot_*`
+project's `./.offshoot` store; the agent picks up the eight `offshoot_*`
 tools (`list`, `checkout`, `checkpoint`, `fork`, `rollback`, `promote`,
-`destroy`) the next time it starts a session with `offshoot` available.
+`destroy`, `touch`) the next time it starts a session with `offshoot`
+available.
 
 Useful variations, also from `docs/reference.md`:
 
@@ -49,7 +50,7 @@ claude mcp add offshoot -- offshoot -store ./.offshoot -socket /tmp/o.sock mcp
 `offshoot_fork` call doesn't specify one (default `24h`; `none` disables it).
 The session below passes `ttl:"none"` explicitly on its one fork call, so
 that default never actually engages — but the tool schema captured in the
-transcript still advertises it (`"ttl":{"default":"24h0m0s", ...}`), which is
+transcript still advertises it (`"ttl":{"default":"24h", ...}`), which is
 worth noticing: the schema is what an agent reads to decide whether it needs
 to pass `ttl` at all.
 
@@ -68,7 +69,7 @@ wrong.
 
 ```
 $ offshoot -store $STORE init
-initialized store at /.../store
+initialized store at /var/folders/r1/h4z43zsj7vlb62zwtkxhgc400000gn/T/tmp.9QVDPWfYzm/store
 
 $ offshoot -store $STORE create shop
 
@@ -107,54 +108,242 @@ paraphrase:
         {
           "name": "offshoot_list",
           "description": "List every database and branch offshoot is tracking, with each branch's head transaction id, named checkpoints, and whether it is protected. Call this first to orient yourself: to see what databases exist, what branches an attempt could fork from, or which checkpoints are available to roll back to or fork from.",
-          "inputSchema": {"properties": {}, "type": "object"}
+          "inputSchema": {
+            "properties": {},
+            "type": "object"
+          },
+          "annotations": {
+            "title": "List databases and branches",
+            "readOnlyHint": true,
+            "destructiveHint": false,
+            "idempotentHint": true,
+            "openWorldHint": false
+          }
         },
         {
           "name": "offshoot_checkout",
-          "description": "Materialize a database branch to a local SQLite file and return the path to open. Call this before reading or writing a branch's data directly with a SQL client. ... `branch` defaults to \"main\" if omitted.",
+          "description": "Materialize a database branch to a local SQLite file and return the path to open. Call this before reading or writing a branch's data directly with a SQL client. If a daemon session is already open on this branch (opened by a harness, not by this tool — this tool never opens one itself), the result is that session's live checkout path instead: writes there are captured continuously, and offshoot_checkpoint against it flushes live rather than writing a fresh snapshot. Otherwise this is a plain at-rest materialization, even if a daemon happens to be running. Call offshoot_checkpoint to name the current state so it can be rolled back to or forked from later. `branch` defaults to \"main\" if omitted.",
           "inputSchema": {
-            "properties": {"branch": {"default": "main", "type": "string"}, "database": {"type": "string"}},
-            "required": ["database"], "type": "object"
+            "properties": {
+              "branch": {
+                "default": "main",
+                "type": "string"
+              },
+              "database": {
+                "type": "string"
+              }
+            },
+            "required": [
+              "database"
+            ],
+            "type": "object"
+          },
+          "annotations": {
+            "title": "Materialize a branch to a SQLite file",
+            "readOnlyHint": false,
+            "destructiveHint": false,
+            "idempotentHint": true,
+            "openWorldHint": false
           }
         },
         {
           "name": "offshoot_checkpoint",
-          "description": "Name the current state of a branch's checkout so it can be returned to later. Call this after a batch of changes you might want to keep or roll back to individually — e.g. after a migration step succeeds, or before starting a riskier change on the same branch. ...",
+          "description": "Name the current state of a branch's checkout so it can be returned to later. Call this after a batch of changes you might want to keep or roll back to individually — e.g. after a migration step succeeds, or before starting a riskier change on the same branch. If a daemon session is open on this branch, this is a live flush (cheap, only the diff since the last checkpoint, no pause in writes); otherwise it's a full-snapshot checkpoint of the checkout file. `branch` defaults to \"main\" if omitted. Optional `meta` (string->string, at most 32 keys) tags the result with your run id, git SHA, or agent name for later lookup.",
           "inputSchema": {
-            "properties": {"branch": {"default": "main", "type": "string"}, "database": {"type": "string"}, "name": {"type": "string"}},
-            "required": ["database", "name"], "type": "object"
+            "properties": {
+              "branch": {
+                "default": "main",
+                "type": "string"
+              },
+              "database": {
+                "type": "string"
+              },
+              "meta": {
+                "additionalProperties": {
+                  "type": "string"
+                },
+                "type": "object"
+              },
+              "name": {
+                "type": "string"
+              }
+            },
+            "required": [
+              "database",
+              "name"
+            ],
+            "type": "object"
+          },
+          "annotations": {
+            "title": "Checkpoint a branch",
+            "readOnlyHint": false,
+            "destructiveHint": false,
+            "idempotentHint": false,
+            "openWorldHint": false
           }
         },
         {
           "name": "offshoot_fork",
-          "description": "Create an isolated copy of a database branch before attempting risky or destructive work (schema migrations, bulk deletes, experiments). Fork storage starts with two small metadata objects, regardless of database size. Forking a named checkpoint does not read database contents; the default at-head fork hashes the checkout to warn about uncheckpointed changes. Prefer forking over backing up by hand. ... Forked branches expire 24h0m0s after their last activity by default, unless promoted or touched; pass `ttl:\"none\"` to keep one indefinitely, or `ttl` as a Go duration string (e.g. \"2h\") to override. ...",
+          "description": "Create an isolated copy of a database branch before attempting risky or destructive work (schema migrations, bulk deletes, experiments). Fork storage starts with two small metadata objects, regardless of database size. Forking a named checkpoint does not read database contents; the default at-head fork hashes the checkout to warn about uncheckpointed changes. Prefer forking over backing up by hand. Forks from the branch's current head by default, or from a named checkpoint via `at`. If a daemon session is open on the source branch, its unflushed writes are flushed first, so the fork always includes everything written so far. `branch` (the source) defaults to \"main\" if omitted. Forked branches expire 24h0m0s after their last activity by default, unless promoted or touched; pass `ttl:\"none\"` to keep one indefinitely, or `ttl` as a Go duration string (e.g. \"2h\") to override. TTL reaping only happens while a janitor is running (`offshoot serve`); a daemonless setup sweeps expired branches only when `offshoot gc` is run. Optional `meta` (string->string, at most 32 keys) tags the result with your run id, git SHA, or agent name for later lookup.",
           "inputSchema": {
-            "properties": {"at": {"type": "string"}, "branch": {"default": "main", "type": "string"}, "database": {"type": "string"}, "new_branch": {"type": "string"}, "ttl": {"default": "24h0m0s", "type": "string"}},
-            "required": ["database", "new_branch"], "type": "object"
+            "properties": {
+              "at": {
+                "type": "string"
+              },
+              "branch": {
+                "default": "main",
+                "type": "string"
+              },
+              "database": {
+                "type": "string"
+              },
+              "meta": {
+                "additionalProperties": {
+                  "type": "string"
+                },
+                "type": "object"
+              },
+              "new_branch": {
+                "type": "string"
+              },
+              "ttl": {
+                "default": "24h",
+                "type": "string"
+              }
+            },
+            "required": [
+              "database",
+              "new_branch"
+            ],
+            "type": "object"
+          },
+          "annotations": {
+            "title": "Fork a branch",
+            "readOnlyHint": false,
+            "destructiveHint": false,
+            "idempotentHint": false,
+            "openWorldHint": false
           }
         },
         {
           "name": "offshoot_rollback",
-          "description": "Return a branch to a previously named checkpoint, discarding everything written since. Call this when an attempt on a branch has gone wrong and you want to restore known-good state rather than manually undoing changes. ...",
+          "description": "Return a branch to a previously named checkpoint, discarding everything written since. Call this when an attempt on a branch has gone wrong and you want to restore known-good state rather than manually undoing changes. Reports the checkout path to reopen after the rollback. `branch` defaults to \"main\" if omitted. If a daemon session is open on this branch, the call is refused instead of proceeding, since rollback repoints the branch's storage out from under a session the daemon still believes it owns — close the session first (e.g. `offshoot session close`) and retry.",
           "inputSchema": {
-            "properties": {"branch": {"default": "main", "type": "string"}, "database": {"type": "string"}, "to": {"type": "string"}},
-            "required": ["database", "to"], "type": "object"
+            "properties": {
+              "branch": {
+                "default": "main",
+                "type": "string"
+              },
+              "database": {
+                "type": "string"
+              },
+              "to": {
+                "type": "string"
+              }
+            },
+            "required": [
+              "database",
+              "to"
+            ],
+            "type": "object"
+          },
+          "annotations": {
+            "title": "Roll a branch back to a checkpoint",
+            "readOnlyHint": false,
+            "destructiveHint": true,
+            "idempotentHint": false,
+            "openWorldHint": false
           }
         },
         {
           "name": "offshoot_promote",
           "description": "Ship a winning attempt: repoint the target branch (often `main`) at the source branch's current head, which resets the target's checkpoint history to just the new promote checkpoint. The target's previous head is kept first as a shared safety fork named `<target>-pre-promote` (TTL'd; one per target, replaced by the next promote), so a promote is undone by promoting that fork back onto the target. Call this once you've validated a forked attempt and are ready to make it the branch of record. Protected branches (main is protected by default) refuse promotion unless `force` is set — treat that refusal as confirmation you need, not a bug. If a daemon session is open on the TARGET branch, the call is refused instead of proceeding — `force` does not override this — since promoting repoints the target's storage out from under a session the daemon still believes it owns; close the session first (e.g. `offshoot session close`) and retry. An open session on the SOURCE does not block the call, but the promoted state is the source's last-flushed/checkpointed head, not any write still unflushed in that live session — flush or checkpoint the source first if you need its very latest state promoted.",
           "inputSchema": {
-            "properties": {"database": {"type": "string"}, "force": {"type": "boolean"}, "source": {"type": "string"}, "target": {"type": "string"}},
-            "required": ["database", "source", "target"], "type": "object"
+            "properties": {
+              "database": {
+                "type": "string"
+              },
+              "force": {
+                "type": "boolean"
+              },
+              "source": {
+                "type": "string"
+              },
+              "target": {
+                "type": "string"
+              }
+            },
+            "required": [
+              "database",
+              "source",
+              "target"
+            ],
+            "type": "object"
+          },
+          "annotations": {
+            "title": "Promote a branch onto a target",
+            "readOnlyHint": false,
+            "destructiveHint": true,
+            "idempotentHint": false,
+            "openWorldHint": false
           }
         },
         {
           "name": "offshoot_destroy",
-          "description": "Permanently discard a branch and its checkout. Call this to clean up a failed or abandoned attempt once you're done with it. Protected branches refuse destruction unless `force` is set — treat that refusal as confirmation you need, not a bug. ...",
+          "description": "Permanently discard a branch and its checkout. Call this to clean up a failed or abandoned attempt once you're done with it. Protected branches refuse destruction unless `force` is set — treat that refusal as confirmation you need, not a bug. If a daemon session is open on this branch, the call is refused instead of proceeding — `force` does not override this — since destroy deletes the branch's storage out from under a session the daemon still believes it owns; close the session first (e.g. `offshoot session close`) and retry.",
           "inputSchema": {
-            "properties": {"branch": {"type": "string"}, "database": {"type": "string"}, "force": {"type": "boolean"}},
-            "required": ["database", "branch"], "type": "object"
+            "properties": {
+              "branch": {
+                "type": "string"
+              },
+              "database": {
+                "type": "string"
+              },
+              "force": {
+                "type": "boolean"
+              }
+            },
+            "required": [
+              "database",
+              "branch"
+            ],
+            "type": "object"
+          },
+          "annotations": {
+            "title": "Destroy a branch",
+            "readOnlyHint": false,
+            "destructiveHint": true,
+            "idempotentHint": false,
+            "openWorldHint": false
+          }
+        },
+        {
+          "name": "offshoot_touch",
+          "description": "Reset a branch's activity clock so its TTL does not expire mid-task, and optionally change the TTL. Call this when an attempt on a TTL'd fork is taking longer than expected, or before handing a fork to a long-running step. `ttl` omitted keeps the current TTL; a Go duration like \"2h\" sets it; \"none\" clears it so the branch never expires (prefer a longer duration over \"none\" — branches without a TTL are only removed by an explicit destroy). A TTL alone reaps nothing: the janitor (`offshoot serve`) or `offshoot gc` does.",
+          "inputSchema": {
+            "properties": {
+              "branch": {
+                "default": "main",
+                "type": "string"
+              },
+              "database": {
+                "type": "string"
+              },
+              "ttl": {
+                "type": "string"
+              }
+            },
+            "required": [
+              "database"
+            ],
+            "type": "object"
+          },
+          "annotations": {
+            "title": "Extend a branch's life",
+            "readOnlyHint": false,
+            "destructiveHint": false,
+            "idempotentHint": true,
+            "openWorldHint": false
           }
         }
       ]
@@ -162,15 +351,16 @@ paraphrase:
   }
 ```
 
-*(Descriptions above are truncated with `...` only where they repeat text
-already quoted in full elsewhere in this doc — see
-[`internal/mcp/tools.go`](../../internal/mcp/tools.go) for the untruncated
-originals; every field name, type, default, and required-list is exactly as
-returned.)*
+*(Nothing above is truncated: every description, `inputSchema`, and
+`annotations` object is reproduced verbatim from a real `tools/list`
+response — see [`internal/mcp/tools.go`](../../internal/mcp/tools.go) for
+the source. `annotations` (behavior hints the host can act on — e.g.
+`destructiveHint` to prompt before a call) and `offshoot_touch` are new
+since this doc's last capture.)*
 
 ```json
 → {"jsonrpc":"2.0","id":3,"method":"tools/call","params":{"name":"offshoot_list","arguments":{}}}
-← {"jsonrpc":"2.0","id":3,"result":{"content":[{"type":"text","text":"shop@main head=2 checkpoints=[baseline init] protected=true checked_out=true\n"}]}}
+← {"jsonrpc":"2.0","id":3,"result":{"content":[{"type":"text","text":"shop@main head=2 checkpoints=[baseline init] protected=true checked_out=true\n"}],"structuredContent":{"branches":[{"branch":"main","checked_out":true,"checkpoints":["baseline","init"],"database":"shop","head_txid":2,"protected":true}]}}}
 ```
 
 ### 3. Fork before the risky migration
@@ -183,12 +373,12 @@ completion in the same session, not a throwaway experiment to let expire.*
 
 ```json
 → {"jsonrpc":"2.0","id":4,"method":"tools/call","params":{"name":"offshoot_fork","arguments":{"database":"shop","new_branch":"migration-attempt","ttl":"none"}}}
-← {"jsonrpc":"2.0","id":4,"result":{"content":[{"type":"text","text":"forked shop@main to shop@migration-attempt at txid 2; ttl=none (never expires)"}]}}
+← {"jsonrpc":"2.0","id":4,"result":{"content":[{"type":"text","text":"forked shop@main to shop@migration-attempt at txid 2; ttl=none (never expires)"}],"structuredContent":{"branch":"main","database":"shop","expires_at":"","new_branch":"migration-attempt","ttl":"","txid":2}}}
 ```
 
 ```json
 → {"jsonrpc":"2.0","id":5,"method":"tools/call","params":{"name":"offshoot_checkout","arguments":{"database":"shop","branch":"migration-attempt"}}}
-← {"jsonrpc":"2.0","id":5,"result":{"content":[{"type":"text","text":"checked out shop@migration-attempt at /.../store/checkouts/shop/migration-attempt.db\nthis checkout is not yet checkpointed: nothing written here can be rolled back to or forked from until you call offshoot_checkpoint"}]}}
+← {"jsonrpc":"2.0","id":5,"result":{"content":[{"type":"text","text":"checked out shop@migration-attempt at /var/folders/r1/h4z43zsj7vlb62zwtkxhgc400000gn/T/tmp.9QVDPWfYzm/store/checkouts/shop/migration-attempt.db\nthis checkout is not yet checkpointed: nothing written here can be rolled back to or forked from until you call offshoot_checkpoint"}],"structuredContent":{"branch":"migration-attempt","database":"shop","live":false,"path":"/var/folders/r1/h4z43zsj7vlb62zwtkxhgc400000gn/T/tmp.9QVDPWfYzm/store/checkouts/shop/migration-attempt.db"}}}
 ```
 
 The response text itself is the nudge: nothing here can be rolled back to
@@ -197,7 +387,7 @@ real rollback target if the migration goes wrong:
 
 ```json
 → {"jsonrpc":"2.0","id":6,"method":"tools/call","params":{"name":"offshoot_checkpoint","arguments":{"database":"shop","branch":"migration-attempt","name":"pre-migration"}}}
-← {"jsonrpc":"2.0","id":6,"result":{"content":[{"type":"text","text":"checkpointed shop@migration-attempt as \"pre-migration\" at txid 3"}]}}
+← {"jsonrpc":"2.0","id":6,"result":{"content":[{"type":"text","text":"checkpointed shop@migration-attempt as \"pre-migration\" at txid 3"}],"structuredContent":{"branch":"migration-attempt","database":"shop","live":false,"name":"pre-migration","txid":3}}}
 ```
 
 ### 4. Rollback on red
@@ -228,7 +418,7 @@ hand-patch the bad migration:*
 
 ```json
 → {"jsonrpc":"2.0","id":7,"method":"tools/call","params":{"name":"offshoot_rollback","arguments":{"database":"shop","branch":"migration-attempt","to":"pre-migration"}}}
-← {"jsonrpc":"2.0","id":7,"result":{"content":[{"type":"text","text":"rolled back shop@migration-attempt to checkpoint \"pre-migration\"; checkout at /.../store/checkouts/shop/migration-attempt.db"}]}}
+← {"jsonrpc":"2.0","id":7,"result":{"content":[{"type":"text","text":"rolled back shop@migration-attempt to checkpoint \"pre-migration\"; checkout at /var/folders/r1/h4z43zsj7vlb62zwtkxhgc400000gn/T/tmp.9QVDPWfYzm/store/checkouts/shop/migration-attempt.db"}],"structuredContent":{"branch":"migration-attempt","database":"shop","path":"/var/folders/r1/h4z43zsj7vlb62zwtkxhgc400000gn/T/tmp.9QVDPWfYzm/store/checkouts/shop/migration-attempt.db","to":"pre-migration"}}}
 ```
 
 ### 5. Checkpoint on green
@@ -248,7 +438,7 @@ Tests are green. The agent checkpoints the now-validated state:
 
 ```json
 → {"jsonrpc":"2.0","id":8,"method":"tools/call","params":{"name":"offshoot_checkpoint","arguments":{"database":"shop","branch":"migration-attempt","name":"migrated"}}}
-← {"jsonrpc":"2.0","id":8,"result":{"content":[{"type":"text","text":"checkpointed shop@migration-attempt as \"migrated\" at txid 4"}]}}
+← {"jsonrpc":"2.0","id":8,"result":{"content":[{"type":"text","text":"checkpointed shop@migration-attempt as \"migrated\" at txid 4"}],"structuredContent":{"branch":"migration-attempt","database":"shop","live":false,"name":"migrated","txid":4}}}
 ```
 
 ### 6. Promote — and the protected-branch guardrail firing for real
@@ -273,19 +463,19 @@ protected-branch guardrail (not a bug in its migration), and retries with
 
 ```json
 → {"jsonrpc":"2.0","id":10,"method":"tools/call","params":{"name":"offshoot_promote","arguments":{"database":"shop","source":"migration-attempt","target":"main","force":true}}}
-← {"jsonrpc":"2.0","id":10,"result":{"content":[{"type":"text","text":"promoted shop@migration-attempt onto shop@main at txid 4; the previous shop@main head is kept as shop@main-pre-promote (undo: promote it back onto main)"}]}}
+← {"jsonrpc":"2.0","id":10,"result":{"content":[{"type":"text","text":"promoted shop@migration-attempt onto shop@main at txid 4; the previous shop@main head is kept as shop@main-pre-promote (undo: promote it back onto main)"}],"structuredContent":{"backup":"main-pre-promote","database":"shop","source":"migration-attempt","target":"main","txid":4}}}
 ```
 
 ### 7. Cleanup and confirmation
 
 ```json
 → {"jsonrpc":"2.0","id":11,"method":"tools/call","params":{"name":"offshoot_destroy","arguments":{"database":"shop","branch":"migration-attempt"}}}
-← {"jsonrpc":"2.0","id":11,"result":{"content":[{"type":"text","text":"destroyed shop@migration-attempt"}]}}
+← {"jsonrpc":"2.0","id":11,"result":{"content":[{"type":"text","text":"destroyed shop@migration-attempt"}],"structuredContent":{"branch":"migration-attempt","database":"shop"}}}
 ```
 
 ```json
 → {"jsonrpc":"2.0","id":12,"method":"tools/call","params":{"name":"offshoot_list","arguments":{}}}
-← {"jsonrpc":"2.0","id":12,"result":{"content":[{"type":"text","text":"shop@main head=4 checkpoints=[promote] protected=true checked_out=true\nshop@main-pre-promote head=2 checkpoints=[fork] protected=false checked_out=false\n"}]}}
+← {"jsonrpc":"2.0","id":12,"result":{"content":[{"type":"text","text":"shop@main head=4 checkpoints=[promote] protected=true checked_out=true\nshop@main-pre-promote head=2 checkpoints=[fork] protected=false checked_out=false\n"}],"structuredContent":{"branches":[{"branch":"main","checked_out":true,"checkpoints":["promote"],"database":"shop","head_txid":4,"protected":true},{"branch":"main-pre-promote","checked_out":false,"checkpoints":["fork"],"database":"shop","head_txid":2,"protected":false}]}}}
 ```
 
 Note `checkpoints=[promote]`: promote resets the target's checkpoint history

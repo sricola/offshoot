@@ -13,6 +13,47 @@ version if you depend on format stability.
 
 ## [Unreleased]
 
+### Added
+
+- **Explicit MCP tool annotations.** Every `offshoot_*` tool's `tools/list`
+  entry now carries a fully explicit `annotations` object
+  (`readOnlyHint`/`destructiveHint`/`idempotentHint`/`openWorldHint`, the
+  last always `false`) instead of relying on the spec's defaults —
+  `destructiveHint` defaults to `true`, so an unannotated tool used to read
+  as destructive to a host that checks the hint. `offshoot_list` is the
+  only read-only tool; `checkout`/`fork`/`checkpoint`/`touch` are
+  non-destructive; `rollback`/`promote`/`destroy` are destructive.
+- **`structuredContent` on every successful MCP result.** Alongside the
+  human-readable text, each result now returns a snake_case JSON object
+  (`txid`, `path`, `ttl`, `expires_at`, `backup`, …, tool-dependent) so a
+  harness can read fields instead of parsing sentences.
+- **`meta` on `offshoot_fork`/`offshoot_checkpoint`.** Both MCP tools now
+  accept an optional `meta` argument (string→string, at most 32 keys) that
+  tags the resulting branch or checkpoint with a run id, git SHA, or agent
+  name for later lookup — closing the gap `docs/status.md` had tracked as
+  deliberately deferred.
+- **`offshoot_touch` MCP tool.** Resets a branch's activity clock so its
+  TTL does not expire mid-task, and optionally changes the TTL (`ttl`
+  omitted keeps the current one, a duration sets it, `"none"` clears it).
+  The server now exposes eight tools, not seven.
+- **Claude Code plugin and marketplace** (`plugin/`,
+  `.claude-plugin/marketplace.json`): `claude plugin marketplace add
+  sricola/offshoot && claude plugin install offshoot@offshoot` installs the
+  MCP server plus a skill that teaches the fork/checkpoint/rollback/promote
+  loop and advisory hooks that only add context, never block a command.
+- **Cursor one-click install link** for `offshoot mcp`
+  (`https://cursor.com/en/install-mcp?...`, which hands off to the Cursor
+  app), alongside the existing `claude mcp add` command.
+
+### Changed
+
+- Docs updated for the eight-tool MCP surface: `README.md`,
+  `docs/agents.md`, `docs/reference.md`, `docs/status.md`, and
+  `docs/demo/mcp-walkthrough.md` (its `tools/list` transcript re-captured
+  from a real `offshoot mcp` run) now describe annotations,
+  `structuredContent`, `meta`, and `offshoot_touch`, and document all three
+  install paths (`claude mcp add`, the Claude Code plugin, and Cursor).
+
 ## [0.2.10] - 2026-09-25
 
 ### Added

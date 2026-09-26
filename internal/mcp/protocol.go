@@ -83,6 +83,22 @@ type Tool struct {
 	Name        string `json:"name"`
 	Description string `json:"description"`
 	InputSchema any    `json:"inputSchema"`
+	// Annotations are the spec's behavior hints
+	// (https://modelcontextprotocol.io/specification/2026-07-28/server/tools#tool):
+	// hosts use them to decide which calls need a confirmation prompt. The
+	// spec's default for destructiveHint is true, so every offshoot tool
+	// sets all four hints explicitly — see tools.go's annotate.
+	Annotations *ToolAnnotations `json:"annotations,omitempty"`
+}
+
+// ToolAnnotations mirrors the spec's ToolAnnotations object. Pointers, so a
+// nil hint is omitted rather than serialized as a misleading false.
+type ToolAnnotations struct {
+	Title           string `json:"title,omitempty"`
+	ReadOnlyHint    *bool  `json:"readOnlyHint,omitempty"`
+	DestructiveHint *bool  `json:"destructiveHint,omitempty"`
+	IdempotentHint  *bool  `json:"idempotentHint,omitempty"`
+	OpenWorldHint   *bool  `json:"openWorldHint,omitempty"`
 }
 
 // ToolSet is what the server exposes; Task 2 implements it over offshoot.
@@ -91,10 +107,16 @@ type ToolSet interface {
 	Call(ctx context.Context, name string, args json.RawMessage) (ToolResult, error)
 }
 
-// ToolResult is an MCP tool response: content blocks plus an error flag.
+// ToolResult is an MCP tool response: content blocks plus an error flag,
+// and — on success — a machine-readable mirror of the prose in
+// StructuredContent (2026-07-28 spec). The prose block stays the single
+// content entry: it is what the model reads, and the spec's "SHOULD also
+// serialize the JSON into a text block" would double the context cost for
+// no reader; harnesses read StructuredContent directly.
 type ToolResult struct {
-	Content []Content `json:"content"`
-	IsError bool      `json:"isError,omitempty"`
+	Content           []Content `json:"content"`
+	IsError           bool      `json:"isError,omitempty"`
+	StructuredContent any       `json:"structuredContent,omitempty"`
 }
 
 type Content struct {
@@ -105,6 +127,15 @@ type Content struct {
 // TextResult is a convenience for a single text block.
 func TextResult(format string, args ...any) ToolResult {
 	return ToolResult{Content: []Content{{Type: "text", Text: fmt.Sprintf(format, args...)}}}
+}
+
+// StructuredResult is TextResult plus a StructuredContent payload. data
+// should be a map[string]any with snake_case keys (the shapes are pinned by
+// TestStructuredContentAccompaniesProse).
+func StructuredResult(data any, format string, args ...any) ToolResult {
+	r := TextResult(format, args...)
+	r.StructuredContent = data
+	return r
 }
 
 // ErrorResult is a tool-level failure (IsError set), distinct from an RPC error.

@@ -62,7 +62,7 @@ That's most of the surface already. The full vocabulary, one line each
 | `create` / `checkout` | new database / materialize a working copy — prints a plain `.db` path |
 | `checkpoint` | snapshot the checkout as a named, rollback-able point |
 | `fork` | branch from head or a checkpoint — instant, copy-on-write, optional `--ttl` |
-| `rollback` / `promote` | repoint a branch at a checkpoint / repoint a target at a branch's head (keeping its old head as `<target>-pre-promote` to undo) |
+| `rollback` / `promote` | repoint a branch at a checkpoint / repoint a target at a branch's head (keeping its old head as `<target>-pre-promote` to undo — TTL'd, 24h by default, one rolling slot per target replaced by the next promote) |
 | `diff` / `export` | sqldiff two branches or checkpoints / copy state out to a plain file |
 | `destroy` / `gc` | delete a branch / collect unreachable objects |
 | `serve` / `session` | the daemon: leases, live capture, flush-without-pausing ([below](#daemon-mode)) |
@@ -439,7 +439,7 @@ same lifecycle API over HTTP (see
 | Surface | What it is | Daemon? |
 |---|---|---|
 | [CLI](#quickstart-60-seconds-no-server-no-bucket) | every verb, no dependencies | no |
-| [MCP](#mcp) — `offshoot mcp` | seven branch tools over stdio, for agents | optional — rides one when reachable |
+| [MCP](#mcp) — `offshoot mcp` | eight branch tools over stdio, for agents | optional — rides one when reachable |
 | [Python SDK](#python-sdk) | stdlib-only thin client, plus pytest fixtures | yes |
 | [TypeScript SDK](#typescript-sdk) | zero-dependency thin client, plus a testkit | yes |
 | [LangGraph companion](#langgraph) | thread ↔ branch mapping for checkpoint rewind | yes |
@@ -452,16 +452,29 @@ branch on its own initiative instead of asking you to run commands:
 
     claude mcp add offshoot -- offshoot -store ./.offshoot mcp
 
-The agent gets seven tools — list, checkout, checkpoint, fork, rollback,
-promote, destroy — described so it knows *when* to use them: fork before a
-risky migration, checkpoint when tests pass, roll back when they don't,
-promote the attempt that worked. See it work end to end:
+**Claude Code plugin** (MCP server + a skill that teaches the loop + advisory hooks):
+
+    claude plugin marketplace add sricola/offshoot
+    claude plugin install offshoot@offshoot
+
+**Cursor:** [![Install in Cursor](https://cursor.com/deeplink/mcp-install-dark.svg)](https://cursor.com/en/install-mcp?name=offshoot&config=eyJjb21tYW5kIjoib2Zmc2hvb3QiLCJhcmdzIjpbIm1jcCJdfQ==)
+(the link opens Cursor's install page, which hands off to the app to install `offshoot mcp` as a stdio server; the store resolves from `OFFSHOOT_STORE` or `./.offshoot`).
+
+The agent gets eight tools — list, checkout, checkpoint, fork, rollback,
+promote, destroy, touch — described so it knows *when* to use them: fork
+before a risky migration, checkpoint when tests pass, roll back when they
+don't, promote the attempt that worked. See it work end to end:
 [docs/demo/mcp-walkthrough.md](docs/demo/mcp-walkthrough.md), a real
 captured session.
 
 Destructive tools respect the same protected-branch rules as the CLI: an
 agent can fork and experiment freely, but promoting onto or destroying
 `main` requires an explicit force, and the refusal tells the agent so.
+Promoting also keeps the target's previous head as a safety fork
+(`<target>-pre-promote` — the result names it), but that fork always
+carries a TTL (24h by default) and is one rolling slot per target,
+replaced by the next promote onto that target, so the undo window closes
+when either happens.
 
 Agent-created forks expire by default, so an agent that forks and forgets
 doesn't leak branches forever: `offshoot_fork` applies `offshoot mcp

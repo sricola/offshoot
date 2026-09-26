@@ -152,10 +152,7 @@ Notes on the illustrative pieces above, spelled out rather than left to
 guesswork:
 
 - `ghcr.io/sricola/offshoot:latest` and `your-agent-image:latest` are
-  placeholders — offshoot does not (yet) publish a container image as part
-  of this milestone; see [docs/status.md](../status.md)'s publish-pipeline
-  row for what *is* actually published today (source + SDKs). Build your
-  own image from this repo's `cmd/offshoot` until an official one exists.
+  placeholders — the release workflow publishes `ghcr.io/sricola/offshoot:<tag>` (linux/amd64 and linux/arm64) on every tagged release; pin a tag.
 - The `offshoot-store-pvc` `PersistentVolumeClaim` referenced isn't created
   by this manifest — either provision one (`kubectl get storageclass` for
   what's available in your cluster) or switch `OFFSHOOT_STORE` to an
@@ -266,8 +263,9 @@ strictly weaker check than either dry-run above.
 
 - No StatefulSet, no `PodDisruptionBudget` tuned for HA, no multi-replica
   story — see the top of this page.
-- No official offshoot container image yet — build your own from this
-  repo until [docs/status.md](../status.md) says otherwise.
+- Official image: `ghcr.io/sricola/offshoot:<tag>` (multi-arch, published on
+  every tagged release; pin a tag). Building your own from `cmd/offshoot`
+  still works if you need a different base.
 - No admission-controller / NetworkPolicy guidance — write the
   `NetworkPolicy` your cluster's security posture requires around this Pod;
   that's environment-specific and out of scope for a single-binary tool's

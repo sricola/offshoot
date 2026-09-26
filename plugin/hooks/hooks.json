@@ -1,0 +1,20 @@
+{
+  "description": "offshoot advisory hooks: SessionStart lists branches for an existing store; PreToolUse(Bash) flags destructive SQL against a SQLite file. Both are silent no-ops when offshoot is not on PATH.",
+  "hooks": {
+    "SessionStart": [
+      {
+        "hooks": [
+          { "type": "command", "command": "${CLAUDE_PLUGIN_ROOT}/hooks/session-start.sh", "timeout": 10 }
+        ]
+      }
+    ],
+    "PreToolUse": [
+      {
+        "matcher": "Bash",
+        "hooks": [
+          { "type": "command", "command": "${CLAUDE_PLUGIN_ROOT}/hooks/pre-bash-sql-guard.sh", "timeout": 5 }
+        ]
+      }
+    ]
+  }
+}

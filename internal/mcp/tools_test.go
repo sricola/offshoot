@@ -1,6 +1,7 @@
 package mcp
 
 import (
+	"bytes"
 	"context"
 	"encoding/json"
 	"fmt"
@@ -8,11 +9,13 @@ import (
 	"os/exec"
 	"path/filepath"
 	"reflect"
+	"strconv"
 	"strings"
 	"testing"
 	"time"
 
 	"github.com/sricola/offshoot/internal/ops"
+	"github.com/sricola/offshoot/internal/store"
 	"github.com/sricola/offshoot/internal/testutil"
 )
 
@@ -67,7 +70,7 @@ func text(r ToolResult) string {
 func TestToolsAdvertiseSchemas(t *testing.T) {
 	ts, _ := newTools(t)
 	tools := ts.Tools()
-	if len(tools) < 7 {
+	if len(tools) < 8 {
 		t.Fatalf("want the full lifecycle surface, got %d tools", len(tools))
 	}
 	seen := map[string]bool{}
@@ -250,6 +253,7 @@ var toolArgStructs = map[string]any{
 	"offshoot_rollback":   rollbackArgs{},
 	"offshoot_promote":    promoteArgs{},
 	"offshoot_destroy":    destroyArgs{},
+	"offshoot_touch":      touchArgs{},
 }
 
 // jsonSchemaTypeForKind maps a Go reflect.Kind to the JSON Schema "type"
@@ -265,6 +269,8 @@ func jsonSchemaTypeForKind(k reflect.Kind) string {
 		return "integer"
 	case reflect.Float32, reflect.Float64:
 		return "number"
+	case reflect.Map:
+		return "object"
 	default:
 		return "unsupported:" + k.String()
 	}
@@ -644,12 +650,13 @@ func TestForkResponseEchoesTTLAndExpiry(t *testing.T) {
 	if !strings.Contains(msg, "2h0m0s") {
 		t.Errorf("response must echo the applied TTL (canonical \"2h0m0s\"): %s", msg)
 	}
-	// Anchor on the "expires_at=" label forkTTLSummary actually emits, not a
-	// bare "20" substring — the latter is nearly vacuous: it happens to pass
-	// today only because the current year starts with "20", so it would keep
-	// passing even if forkTTLSummary's degraded path (see its doc comment)
-	// dropped expires_at while some OTHER "20"-containing text (a txid, a
-	// future year, an unrelated number) remained in the message.
+	// Anchor on the "expires_at=" label forkTTLSummaryFromFields actually
+	// emits, not a bare "20" substring — the latter is nearly vacuous: it
+	// happens to pass today only because the current year starts with "20",
+	// so it would keep passing even if the degraded path (see
+	// forkTTLFieldsFromRef's doc comment) dropped expires_at while some
+	// OTHER "20"-containing text (a txid, a future year, an unrelated
+	// number) remained in the message.
 	if !strings.Contains(msg, "expires_at=") {
 		t.Errorf("response must echo a computed expiry timestamp (expires_at=...): %s", msg)
 	}
@@ -675,17 +682,20 @@ func TestForkResponseNoTTLSaysSo(t *testing.T) {
 }
 
 // TestForkTTLSummaryKeepsJanitorNoteWhenReReadFails is the regression test
-// for the whole-branch review finding that forkTTLSummary's degraded path
-// dropped the janitor caveat along with the computed expiry when the
+// for the whole-branch review finding that the fork TTL summary's degraded
+// path dropped the janitor caveat along with the computed expiry when the
 // post-fork GetRef re-read fails — even though the caveat is a static fact
 // about how reaping works, not something derived from that re-read, so it
 // should never have depended on it succeeding. Exercised directly against
-// forkTTLSummary (rather than through the fork tool end to end) by asking
-// for a branch that was never forked, so GetRef fails exactly the way a real
-// race (the ref vanishing between fork and re-read) would.
+// forkTTLFieldsFromRef + forkTTLSummaryFromFields (rather than through the
+// fork tool end to end) by asking for a branch that was never forked, so
+// GetRef fails exactly the way a real race (the ref vanishing between fork
+// and re-read) would.
 func TestForkTTLSummaryKeepsJanitorNoteWhenReReadFails(t *testing.T) {
 	_, ws := newTools(t)
-	msg := forkTTLSummary(ws, "app", "never-forked", time.Hour)
+	ref, _, err := ws.Store.GetRef("app", "never-forked")
+	ttlStr, expiresAt := forkTTLFieldsFromRef(ref, err, time.Hour)
+	msg := forkTTLSummaryFromFields(ttlStr, expiresAt)
 	if strings.Contains(msg, "expires_at=") {
 		t.Fatalf("expected the degraded (no re-read) path, but got an expiry anyway: %s", msg)
 	}
@@ -727,5 +737,301 @@ func TestPromoteKeepsSafetyForkAndSaysSo(t *testing.T) {
 		if tl.Name == "offshoot_promote" && !strings.Contains(tl.Description, "-pre-promote") {
 			t.Fatalf("offshoot_promote description must state the safety fork: %s", tl.Description)
 		}
+	}
+}
+
+// TestToolAnnotationsClassifyEveryTool pins the host-facing behavior hints
+// the 2026-07-28 spec lets a tool carry: hosts use readOnlyHint to skip
+// confirmation and destructiveHint to require it, and the spec's default
+// for destructiveHint is TRUE, so every tool must state all hints
+// explicitly — an unannotated fork would be treated as destructive.
+func TestToolAnnotationsClassifyEveryTool(t *testing.T) {
+	ts, _ := newTools(t)
+	want := map[string]struct{ readOnly, destructive, idempotent bool }{
+		"offshoot_list":       {true, false, true},
+		"offshoot_checkout":   {false, false, true},
+		"offshoot_checkpoint": {false, false, false},
+		"offshoot_fork":       {false, false, false},
+		"offshoot_rollback":   {false, true, false},
+		"offshoot_promote":    {false, true, false},
+		"offshoot_destroy":    {false, true, false},
+		"offshoot_touch":      {false, false, true},
+	}
+	for _, tl := range ts.Tools() {
+		w, ok := want[tl.Name]
+		if !ok {
+			continue // tools added by later tasks pin their own annotations
+		}
+		a := tl.Annotations
+		if a == nil {
+			t.Fatalf("%s: no annotations", tl.Name)
+		}
+		if a.Title == "" {
+			t.Errorf("%s: annotations.title must be set", tl.Name)
+		}
+		for name, got := range map[string]*bool{
+			"readOnlyHint": a.ReadOnlyHint, "destructiveHint": a.DestructiveHint,
+			"idempotentHint": a.IdempotentHint, "openWorldHint": a.OpenWorldHint,
+		} {
+			if got == nil {
+				t.Errorf("%s: %s must be set explicitly (spec defaults are not ours)", tl.Name, name)
+			}
+		}
+		if a.ReadOnlyHint == nil || a.DestructiveHint == nil || a.IdempotentHint == nil || a.OpenWorldHint == nil {
+			continue
+		}
+		if *a.ReadOnlyHint != w.readOnly || *a.DestructiveHint != w.destructive || *a.IdempotentHint != w.idempotent {
+			t.Errorf("%s: hints readOnly=%v destructive=%v idempotent=%v, want %v/%v/%v",
+				tl.Name, *a.ReadOnlyHint, *a.DestructiveHint, *a.IdempotentHint, w.readOnly, w.destructive, w.idempotent)
+		}
+		if *a.OpenWorldHint {
+			t.Errorf("%s: openWorldHint must be false (offshoot touches only its own store)", tl.Name)
+		}
+	}
+}
+
+// TestToolAnnotationsSerializeOnTheWire: the hints must reach tools/list
+// JSON under the spec's field names, with the omitted-when-nil shape.
+func TestToolAnnotationsSerializeOnTheWire(t *testing.T) {
+	ts, _ := newTools(t)
+	raw, err := json.Marshal(ts.Tools())
+	if err != nil {
+		t.Fatal(err)
+	}
+	var back []map[string]any
+	if err := json.Unmarshal(raw, &back); err != nil {
+		t.Fatal(err)
+	}
+	for _, tl := range back {
+		ann, ok := tl["annotations"].(map[string]any)
+		if !ok {
+			t.Fatalf("%v: annotations missing on the wire", tl["name"])
+		}
+		for _, k := range []string{"title", "readOnlyHint", "destructiveHint", "idempotentHint", "openWorldHint"} {
+			if _, ok := ann[k]; !ok {
+				t.Errorf("%v: annotations.%s missing on the wire", tl["name"], k)
+			}
+		}
+	}
+}
+
+// TestStructuredContentAccompaniesProse: every successful tool result also
+// carries a machine-readable structuredContent (2026-07-28 spec), so a
+// harness can read txids/paths/backup names without parsing prose. The
+// prose stays the only content block on purpose — see the plan's Global
+// Constraints — so this checks structuredContent, not a JSON text block.
+func TestStructuredContentAccompaniesProse(t *testing.T) {
+	ts, w := newTools(t)
+	if _, err := w.Fork("app", "main", "attempt-1", "", 0, nil); err != nil {
+		t.Fatal(err)
+	}
+	// sc round-trips the whole ToolResult through JSON — the actual wire
+	// encoding an MCP client receives — instead of reading
+	// r.StructuredContent as the in-process Go value the handler happened to
+	// construct (same "prove it survives the wire" reason
+	// TestToolAnnotationsSerializeOnTheWire marshals/unmarshals tools/list).
+	// The decoder uses UseNumber() so a later exact numeric comparison isn't
+	// silently lossy: json.Unmarshal's default float64 can't represent every
+	// uint64 exactly, and a txid is a uint64.
+	sc := func(r ToolResult) map[string]any {
+		t.Helper()
+		if r.IsError {
+			t.Fatalf("unexpected error: %s", text(r))
+		}
+		raw, err := json.Marshal(r)
+		if err != nil {
+			t.Fatalf("marshal ToolResult: %v", err)
+		}
+		dec := json.NewDecoder(bytes.NewReader(raw))
+		dec.UseNumber()
+		var whole map[string]any
+		if err := dec.Decode(&whole); err != nil {
+			t.Fatalf("unmarshal ToolResult: %v", err)
+		}
+		m, ok := whole["structuredContent"].(map[string]any)
+		if !ok {
+			t.Fatalf("structuredContent is %T, want map[string]any (wire: %s)", whole["structuredContent"], raw)
+		}
+		return m
+	}
+	// txid asserts m[key] round-tripped as an exact uint64 (via json.Number,
+	// not json.Unmarshal's default lossy-for-large-values float64) and that
+	// it matches db@branch's actual HeadTXID freshly read from the store —
+	// structuredContent must carry the real value, not merely be present.
+	txid := func(m map[string]any, key, db, branch string) {
+		t.Helper()
+		n, ok := m[key].(json.Number)
+		if !ok {
+			t.Fatalf("%s is %T, want json.Number", key, m[key])
+		}
+		got, err := strconv.ParseUint(n.String(), 10, 64)
+		if err != nil {
+			t.Fatalf("%s = %q: %v", key, n, err)
+		}
+		ref, _, err := w.Store.GetRef(db, branch)
+		if err != nil {
+			t.Fatalf("GetRef(%s, %s): %v", db, branch, err)
+		}
+		if got != ref.HeadTXID {
+			t.Fatalf("%s = %d, want %s@%s's actual head txid %d", key, got, db, branch, ref.HeadTXID)
+		}
+	}
+
+	fork := sc(call(t, ts, "offshoot_fork", map[string]any{"database": "app", "new_branch": "attempt-2"}))
+	if fork["new_branch"] != "attempt-2" || fork["ttl"] == nil {
+		t.Fatalf("fork structuredContent = %v", fork)
+	}
+	txid(fork, "txid", "app", "attempt-2")
+
+	// offshoot_checkpoint is at-rest here (no daemon session), and the ops
+	// layer's Checkpoint requires an existing checkout to snapshot from
+	// (see ops.Workspace.Checkpoint's os.Stat guard) — so checkout must run
+	// before checkpoint, matching real CLI/agent usage (checkout, then
+	// checkpoint), unlike the brief's checkpoint-then-checkout ordering.
+	co := sc(call(t, ts, "offshoot_checkout", map[string]any{"database": "app", "branch": "attempt-1"}))
+	if co["path"] == "" || co["path"] == nil {
+		t.Fatalf("checkout structuredContent = %v", co)
+	}
+	cp := sc(call(t, ts, "offshoot_checkpoint", map[string]any{"database": "app", "branch": "attempt-1", "name": "v1"}))
+	if cp["name"] != "v1" || cp["live"] != false {
+		t.Fatalf("checkpoint structuredContent = %v", cp)
+	}
+	txid(cp, "txid", "app", "attempt-1")
+
+	rb := sc(call(t, ts, "offshoot_rollback", map[string]any{"database": "app", "branch": "attempt-1", "to": "v1"}))
+	if rb["to"] != "v1" || rb["path"] == nil {
+		t.Fatalf("rollback structuredContent = %v", rb)
+	}
+	pr := sc(call(t, ts, "offshoot_promote", map[string]any{"database": "app", "source": "attempt-1", "target": "main", "force": true}))
+	if pr["backup"] != "main"+ops.PromoteBackupSuffix {
+		t.Fatalf("promote structuredContent = %v", pr)
+	}
+	txid(pr, "txid", "app", "main")
+
+	ls := sc(call(t, ts, "offshoot_list", map[string]any{}))
+	branches, ok := ls["branches"].([]any)
+	if !ok || len(branches) < 3 {
+		t.Fatalf("list structuredContent branches = %v", ls["branches"])
+	}
+	ds := sc(call(t, ts, "offshoot_destroy", map[string]any{"database": "app", "branch": "attempt-2"}))
+	if ds["branch"] != "attempt-2" {
+		t.Fatalf("destroy structuredContent = %v", ds)
+	}
+	// Errors carry no structuredContent, checked both on the in-process
+	// value and on the actual wire encoding — the omitempty tag must drop
+	// the key entirely rather than emit a JSON null.
+	bad := call(t, ts, "offshoot_destroy", map[string]any{"database": "app", "branch": "nope"})
+	if !bad.IsError || bad.StructuredContent != nil {
+		t.Fatalf("error results must not carry structuredContent: %+v", bad)
+	}
+	raw, err := json.Marshal(bad)
+	if err != nil {
+		t.Fatalf("marshal error ToolResult: %v", err)
+	}
+	if bytes.Contains(raw, []byte("structuredContent")) {
+		t.Fatalf("error result must omit structuredContent on the wire: %s", raw)
+	}
+}
+
+// TestForkAndCheckpointCarryMeta closes status.md's "MCP tool metadata
+// exposure" deferral: a caller-supplied meta map lands on the new branch's
+// ref (fork) and on the named checkpoint (checkpoint), both at rest, with
+// ops.ValidateMeta's caps enforced as a tool error, not a crash.
+func TestForkAndCheckpointCarryMeta(t *testing.T) {
+	ts, w := newTools(t)
+	r := call(t, ts, "offshoot_fork", map[string]any{
+		"database": "app", "new_branch": "attempt-1",
+		"meta": map[string]any{"run_id": "eval-42", "agent": "claude"}})
+	if r.IsError {
+		t.Fatalf("fork with meta: %s", text(r))
+	}
+	ref, _, err := w.Store.GetRef("app", "attempt-1")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if ref.Meta["run_id"] != "eval-42" || ref.Meta["agent"] != "claude" {
+		t.Fatalf("fork meta not stored: %v", ref.Meta)
+	}
+	if _, err := w.Checkout("app", "attempt-1"); err != nil {
+		t.Fatal(err)
+	}
+	r = call(t, ts, "offshoot_checkpoint", map[string]any{
+		"database": "app", "branch": "attempt-1", "name": "v1",
+		"meta": map[string]any{"git_sha": "abc123"}})
+	if r.IsError {
+		t.Fatalf("checkpoint with meta: %s", text(r))
+	}
+	ref, _, err = w.Store.GetRef("app", "attempt-1")
+	if err != nil {
+		t.Fatal(err)
+	}
+	var cp store.Checkpoint = ref.Checkpoints["v1"]
+	if cp.Meta["git_sha"] != "abc123" {
+		t.Fatalf("checkpoint meta not stored: %v", cp.Meta)
+	}
+	// Over the cap is a tool error the model can act on.
+	big := map[string]any{}
+	for i := 0; i < ops.MaxMetaKeys+1; i++ {
+		big[fmt.Sprintf("k%d", i)] = "v"
+	}
+	r = call(t, ts, "offshoot_fork", map[string]any{"database": "app", "new_branch": "attempt-2", "meta": big})
+	if !r.IsError || !strings.Contains(text(r), "exceeds") {
+		t.Fatalf("oversized meta must be a tool error, got %+v", r)
+	}
+	// Schema advertises meta as an object of strings.
+	for _, tl := range ts.Tools() {
+		if tl.Name != "offshoot_fork" && tl.Name != "offshoot_checkpoint" {
+			continue
+		}
+		props := tl.InputSchema.(map[string]any)["properties"].(map[string]any)
+		meta, ok := props["meta"].(map[string]any)
+		if !ok || meta["type"] != "object" {
+			t.Fatalf("%s: meta must be advertised as an object, got %v", tl.Name, props["meta"])
+		}
+	}
+}
+
+// TestTouchExtendsALeasedAttempt: an agent mid-task on a TTL'd fork can
+// reset its activity clock (and optionally change or clear the TTL) so the
+// janitor does not reap the branch under it. "" keeps the TTL, "none"
+// clears it, a duration sets it — the daemon touch op's exact contract.
+func TestTouchExtendsALeasedAttempt(t *testing.T) {
+	ts, w := newTools(t)
+	if _, err := w.Fork("app", "main", "attempt-1", "", 2*time.Hour, nil); err != nil {
+		t.Fatal(err)
+	}
+	before, _, _ := w.Store.GetRef("app", "attempt-1")
+	time.Sleep(5 * time.Millisecond)
+	r := call(t, ts, "offshoot_touch", map[string]any{"database": "app", "branch": "attempt-1"})
+	if r.IsError {
+		t.Fatalf("touch: %s", text(r))
+	}
+	after, _, _ := w.Store.GetRef("app", "attempt-1")
+	if after.TTL != "2h0m0s" || !(after.TouchedAt > before.TouchedAt) {
+		t.Fatalf("touch must keep the TTL and advance touched_at: before=%+v after=%+v", before, after)
+	}
+	sc := r.StructuredContent.(map[string]any)
+	if sc["ttl"] != "2h0m0s" || sc["branch"] != "attempt-1" {
+		t.Fatalf("touch structuredContent = %v", sc)
+	}
+	if r := call(t, ts, "offshoot_touch", map[string]any{"database": "app", "branch": "attempt-1", "ttl": "30m"}); r.IsError {
+		t.Fatalf("touch with ttl: %s", text(r))
+	}
+	after, _, _ = w.Store.GetRef("app", "attempt-1")
+	if after.TTL != "30m0s" {
+		t.Fatalf("ttl not applied: %q", after.TTL)
+	}
+	if r := call(t, ts, "offshoot_touch", map[string]any{"database": "app", "branch": "attempt-1", "ttl": "none"}); r.IsError {
+		t.Fatalf("touch ttl none: %s", text(r))
+	}
+	after, _, _ = w.Store.GetRef("app", "attempt-1")
+	if after.TTL != "" {
+		t.Fatalf("ttl not cleared: %q", after.TTL)
+	}
+	if r := call(t, ts, "offshoot_touch", map[string]any{"database": "app", "branch": "attempt-1", "ttl": "soon"}); !r.IsError {
+		t.Fatal("garbage ttl must be a tool error")
+	}
+	if r := call(t, ts, "offshoot_touch", map[string]any{"database": "app", "branch": "nope"}); !r.IsError {
+		t.Fatal("unknown branch must be a tool error")
 	}
 }
