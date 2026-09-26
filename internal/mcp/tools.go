@@ -455,15 +455,11 @@ func (t *OffshootTools) list(args json.RawMessage) (ToolResult, error) {
 		return ErrorResult("%v", err), nil
 	}
 	if len(statuses) == 0 {
-		return StructuredResult(map[string]any{"branches": []any{}},
+		return StructuredResult(map[string]any{"branches": []map[string]any{}},
 			"no databases yet; create one with the offshoot CLI (`offshoot create <name>`)"), nil
 	}
 	var b []byte
-	// rows is []any, not []map[string]any: structuredContent is read back as
-	// generic JSON-shaped Go values (see TestStructuredContentAccompaniesProse's
-	// []any type assertion on "branches"), matching what a real JSON
-	// round-trip over the wire would produce for an array of objects.
-	rows := make([]any, 0, len(statuses))
+	rows := make([]map[string]any, 0, len(statuses))
 	for _, s := range statuses {
 		line := fmt.Sprintf("%s@%s head=%d checkpoints=%v protected=%v checked_out=%v\n",
 			s.DB, s.Branch, s.HeadTXID, s.Checkpoints, s.Protected, s.CheckedOut)
@@ -679,45 +675,24 @@ func resolveForkTTL(raw string, defaultTTL time.Duration) (time.Duration, error)
 	return d, nil
 }
 
-// forkTTLSummary describes the TTL just applied to a fresh fork, for the
-// tool's response text. Per the PM amendment, this (not just the ref
-// written to the store) is what carries the applied TTL and computed expiry
-// into the agent's transcript, so the model can reason about them later
-// without a separate offshoot_list/offshoot_checkout round trip. Expiry is
-// computed the same way Status does: ops.ReapDeadline from the ref's own
-// TouchedAt, not from time.Now() here, so it reflects what was actually
-// durably written.
-func forkTTLSummary(ws *ops.Workspace, db, branch string, ttl time.Duration) string {
-	if ttl <= 0 {
-		return "ttl=none (never expires)"
-	}
-	ref, _, err := ws.Store.GetRef(db, branch)
-	if err != nil {
-		// The fork itself already succeeded; a re-read failure here only
-		// means the response can't include a computed expiry — the janitor
-		// caveat below doesn't depend on that re-read at all (it's a static
-		// fact about how reaping works, not a value derived from the ref),
-		// so it must not degrade along with expires_at.
-		return fmt.Sprintf("ttl=%s; %s", ttl, forkTTLJanitorNote)
-	}
-	deadline, ok := ops.ReapDeadline(ref)
-	if !ok {
-		return fmt.Sprintf("ttl=%s; %s", ref.TTL, forkTTLJanitorNote)
-	}
-	return fmt.Sprintf("ttl=%s expires_at=%s; %s", ref.TTL, deadline.Format(time.RFC3339), forkTTLJanitorNote)
-}
-
-// forkTTLFields computes the raw ttl and expires_at values for fork's
-// structuredContent, mirroring exactly what forkTTLSummary's prose prints:
-// both empty when there's no TTL or the post-fork re-read couldn't resolve a
-// deadline, otherwise the ref's own TTL string and, when computable, the
-// same RFC3339 deadline forkTTLSummary formats into its "expires_at=" clause.
-func forkTTLFields(ws *ops.Workspace, db, branch string, ttl time.Duration) (ttlStr, expiresAt string) {
+// forkTTLFieldsFromRef derives the raw ttl and expires_at values fork's
+// structuredContent and prose both report, from a single already-read ref
+// (or read error) — the one GetRef call the caller made — rather than each
+// re-reading the store independently. That single-read discipline matters:
+// two independent re-reads (one for the prose, one for the structured
+// fields) could observe two different ref states across a concurrent touch
+// or reap, making the response's own prose and structuredContent disagree
+// with each other. ttl<=0 means no TTL was applied to this fork (both
+// return ""); readErr non-nil means the post-fork re-read failed (ttlStr
+// falls back to the requested ttl's own String(), expiresAt stays "" since
+// there's no ref to compute a deadline from); otherwise ttlStr is the ref's
+// own TTL and expiresAt is the RFC3339 deadline when ops.ReapDeadline can
+// compute one, else "".
+func forkTTLFieldsFromRef(ref store.Ref, readErr error, ttl time.Duration) (ttlStr, expiresAt string) {
 	if ttl <= 0 {
 		return "", ""
 	}
-	ref, _, err := ws.Store.GetRef(db, branch)
-	if err != nil {
+	if readErr != nil {
 		return ttl.String(), ""
 	}
 	deadline, ok := ops.ReapDeadline(ref)
@@ -725,6 +700,42 @@ func forkTTLFields(ws *ops.Workspace, db, branch string, ttl time.Duration) (ttl
 		return ref.TTL, ""
 	}
 	return ref.TTL, deadline.Format(time.RFC3339)
+}
+
+// forkTTLSummaryFromFields renders forkTTLFieldsFromRef's output into the
+// prose clause fork's response appends after "forked ... at txid N". Kept
+// separate from forkTTLFieldsFromRef so both forkTTLSummary (which does its
+// own single read, for callers — including a pinned unit test — that only
+// want the prose) and fork (which reads once and derives both the prose and
+// the structured fields from that one read) build identical sentences from
+// identical inputs.
+func forkTTLSummaryFromFields(ttlStr, expiresAt string) string {
+	if ttlStr == "" {
+		return "ttl=none (never expires)"
+	}
+	if expiresAt == "" {
+		return fmt.Sprintf("ttl=%s; %s", ttlStr, forkTTLJanitorNote)
+	}
+	return fmt.Sprintf("ttl=%s expires_at=%s; %s", ttlStr, expiresAt, forkTTLJanitorNote)
+}
+
+// forkTTLSummary describes the TTL just applied to a fresh fork, for the
+// tool's response text. Per the PM amendment, this (not just the ref
+// written to the store) is what carries the applied TTL and computed expiry
+// into the agent's transcript, so the model can reason about them later
+// without a separate offshoot_list/offshoot_checkout round trip. Expiry is
+// computed the same way Status does: ops.ReapDeadline from the ref's own
+// TouchedAt, not from time.Now() here, so it reflects what was actually
+// durably written. Short-circuits before any read when ttl<=0, matching
+// forkTTLFieldsFromRef's own no-TTL case, so the common "no ttl" fork never
+// pays for a GetRef it doesn't need.
+func forkTTLSummary(ws *ops.Workspace, db, branch string, ttl time.Duration) string {
+	if ttl <= 0 {
+		return "ttl=none (never expires)"
+	}
+	ref, _, err := ws.Store.GetRef(db, branch)
+	ttlStr, expiresAt := forkTTLFieldsFromRef(ref, err, ttl)
+	return forkTTLSummaryFromFields(ttlStr, expiresAt)
 }
 
 // fork creates new_branch from branch's head (or checkpoint `at`). If a
@@ -777,8 +788,15 @@ func (t *OffshootTools) fork(args json.RawMessage) (ToolResult, error) {
 		}
 	}
 	msg := fmt.Sprintf("forked %s@%s to %s@%s at txid %d", a.Database, branch, a.Database, a.NewBranch, txid)
-	msg += "; " + forkTTLSummary(t.ws, a.Database, a.NewBranch, ttl)
-	ttlStr, expiresAt := forkTTLFields(t.ws, a.Database, a.NewBranch, ttl)
+	// One read (only when there's a TTL to report on), shared by the prose
+	// and the structured fields — see forkTTLFieldsFromRef's doc comment for
+	// why two independent re-reads here would be a race.
+	var ttlStr, expiresAt string
+	if ttl > 0 {
+		ref, _, refErr := t.ws.Store.GetRef(a.Database, a.NewBranch)
+		ttlStr, expiresAt = forkTTLFieldsFromRef(ref, refErr, ttl)
+	}
+	msg += "; " + forkTTLSummaryFromFields(ttlStr, expiresAt)
 	return StructuredResult(map[string]any{
 		"database": a.Database, "branch": branch, "new_branch": a.NewBranch, "txid": txid,
 		"ttl": ttlStr, "expires_at": expiresAt,

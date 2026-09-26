@@ -1,6 +1,7 @@
 package mcp
 
 import (
+	"bytes"
 	"context"
 	"encoding/json"
 	"fmt"
@@ -8,6 +9,7 @@ import (
 	"os/exec"
 	"path/filepath"
 	"reflect"
+	"strconv"
 	"strings"
 	"testing"
 	"time"
@@ -814,21 +816,64 @@ func TestStructuredContentAccompaniesProse(t *testing.T) {
 	if _, err := w.Fork("app", "main", "attempt-1", "", 0, nil); err != nil {
 		t.Fatal(err)
 	}
+	// sc round-trips the whole ToolResult through JSON — the actual wire
+	// encoding an MCP client receives — instead of reading
+	// r.StructuredContent as the in-process Go value the handler happened to
+	// construct (same "prove it survives the wire" reason
+	// TestToolAnnotationsSerializeOnTheWire marshals/unmarshals tools/list).
+	// The decoder uses UseNumber() so a later exact numeric comparison isn't
+	// silently lossy: json.Unmarshal's default float64 can't represent every
+	// uint64 exactly, and a txid is a uint64.
 	sc := func(r ToolResult) map[string]any {
 		t.Helper()
 		if r.IsError {
 			t.Fatalf("unexpected error: %s", text(r))
 		}
-		m, ok := r.StructuredContent.(map[string]any)
+		raw, err := json.Marshal(r)
+		if err != nil {
+			t.Fatalf("marshal ToolResult: %v", err)
+		}
+		dec := json.NewDecoder(bytes.NewReader(raw))
+		dec.UseNumber()
+		var whole map[string]any
+		if err := dec.Decode(&whole); err != nil {
+			t.Fatalf("unmarshal ToolResult: %v", err)
+		}
+		m, ok := whole["structuredContent"].(map[string]any)
 		if !ok {
-			t.Fatalf("structuredContent is %T, want map[string]any", r.StructuredContent)
+			t.Fatalf("structuredContent is %T, want map[string]any (wire: %s)", whole["structuredContent"], raw)
 		}
 		return m
 	}
+	// txid asserts m[key] round-tripped as an exact uint64 (via json.Number,
+	// not json.Unmarshal's default lossy-for-large-values float64) and that
+	// it matches db@branch's actual HeadTXID freshly read from the store —
+	// structuredContent must carry the real value, not merely be present.
+	txid := func(m map[string]any, key, db, branch string) {
+		t.Helper()
+		n, ok := m[key].(json.Number)
+		if !ok {
+			t.Fatalf("%s is %T, want json.Number", key, m[key])
+		}
+		got, err := strconv.ParseUint(n.String(), 10, 64)
+		if err != nil {
+			t.Fatalf("%s = %q: %v", key, n, err)
+		}
+		ref, _, err := w.Store.GetRef(db, branch)
+		if err != nil {
+			t.Fatalf("GetRef(%s, %s): %v", db, branch, err)
+		}
+		if got != ref.HeadTXID {
+			t.Fatalf("%s = %d, want %s@%s's actual head txid %d", key, got, db, branch, ref.HeadTXID)
+		}
+	}
+
 	fork := sc(call(t, ts, "offshoot_fork", map[string]any{"database": "app", "new_branch": "attempt-2"}))
-	if fork["new_branch"] != "attempt-2" || fork["txid"] == nil || fork["ttl"] == nil {
+	if fork["new_branch"] != "attempt-2" || fork["ttl"] == nil {
 		t.Fatalf("fork structuredContent = %v", fork)
 	}
+	txid(fork, "txid", "app", "attempt-2")
+
 	// offshoot_checkpoint is at-rest here (no daemon session), and the ops
 	// layer's Checkpoint requires an existing checkout to snapshot from
 	// (see ops.Workspace.Checkpoint's os.Stat guard) — so checkout must run
@@ -839,29 +884,42 @@ func TestStructuredContentAccompaniesProse(t *testing.T) {
 		t.Fatalf("checkout structuredContent = %v", co)
 	}
 	cp := sc(call(t, ts, "offshoot_checkpoint", map[string]any{"database": "app", "branch": "attempt-1", "name": "v1"}))
-	if cp["name"] != "v1" || cp["txid"] == nil || cp["live"] != false {
+	if cp["name"] != "v1" || cp["live"] != false {
 		t.Fatalf("checkpoint structuredContent = %v", cp)
 	}
+	txid(cp, "txid", "app", "attempt-1")
+
 	rb := sc(call(t, ts, "offshoot_rollback", map[string]any{"database": "app", "branch": "attempt-1", "to": "v1"}))
 	if rb["to"] != "v1" || rb["path"] == nil {
 		t.Fatalf("rollback structuredContent = %v", rb)
 	}
 	pr := sc(call(t, ts, "offshoot_promote", map[string]any{"database": "app", "source": "attempt-1", "target": "main", "force": true}))
-	if pr["backup"] != "main"+ops.PromoteBackupSuffix || pr["txid"] == nil {
+	if pr["backup"] != "main"+ops.PromoteBackupSuffix {
 		t.Fatalf("promote structuredContent = %v", pr)
 	}
+	txid(pr, "txid", "app", "main")
+
 	ls := sc(call(t, ts, "offshoot_list", map[string]any{}))
-	branches, _ := ls["branches"].([]any)
-	if len(branches) < 3 {
+	branches, ok := ls["branches"].([]any)
+	if !ok || len(branches) < 3 {
 		t.Fatalf("list structuredContent branches = %v", ls["branches"])
 	}
 	ds := sc(call(t, ts, "offshoot_destroy", map[string]any{"database": "app", "branch": "attempt-2"}))
 	if ds["branch"] != "attempt-2" {
 		t.Fatalf("destroy structuredContent = %v", ds)
 	}
-	// Errors carry no structuredContent.
+	// Errors carry no structuredContent, checked both on the in-process
+	// value and on the actual wire encoding — the omitempty tag must drop
+	// the key entirely rather than emit a JSON null.
 	bad := call(t, ts, "offshoot_destroy", map[string]any{"database": "app", "branch": "nope"})
 	if !bad.IsError || bad.StructuredContent != nil {
 		t.Fatalf("error results must not carry structuredContent: %+v", bad)
+	}
+	raw, err := json.Marshal(bad)
+	if err != nil {
+		t.Fatalf("marshal error ToolResult: %v", err)
+	}
+	if bytes.Contains(raw, []byte("structuredContent")) {
+		t.Fatalf("error result must omit structuredContent on the wire: %s", raw)
 	}
 }
