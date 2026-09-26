@@ -6,6 +6,7 @@ import (
 	"io"
 	"os"
 	"path/filepath"
+	"slices"
 	"sort"
 	"strings"
 	"text/tabwriter"
@@ -188,6 +189,12 @@ type TableDiff struct {
 	Changed       int  `json:"changed"`
 	SchemaChanged bool `json:"schema_changed"`
 
+	// Key is the row identity DiffSummary compared by: "pk" (the declared
+	// primary key, verified unique on both sides), "rowid" (the table's
+	// internal rowid, used when there is no usable PK), or "" when neither
+	// was usable (Comparable is then false even though columns matched).
+	Key string `json:"key"`
+
 	// Status is "added" | "removed" | "same" | "changed".
 	Status string `json:"status"`
 }
@@ -315,16 +322,42 @@ func countQ(db *sql.DB, q string) (int, error) {
 	return n, err
 }
 
-func equalStrings(a, b []string) bool {
-	if len(a) != len(b) {
-		return false
+// isKeyUnique reports whether no two rows of schemaName.table share the same
+// values across key (a GROUP BY ... HAVING count(*) > 1 with zero groups).
+// Needed because SQLite allows a declared PRIMARY KEY on an ordinary rowid
+// table to contain duplicate rows when a key component is NULL (a
+// long-standing SQLite legacy quirk — see DiffSummary's doc comment), so the
+// mere presence of a PK is not enough to trust it as a row identity.
+func isKeyUnique(db *sql.DB, schemaName, table string, key []string) (bool, error) {
+	cols := make([]string, len(key))
+	for i, k := range key {
+		cols[i] = quoteIdent(k)
 	}
-	for i := range a {
-		if a[i] != b[i] {
-			return false
+	q := "SELECT count(*) FROM (SELECT 1 FROM " + quoteIdent(schemaName) + "." + quoteIdent(table) +
+		" GROUP BY " + strings.Join(cols, ", ") + " HAVING count(*) > 1)"
+	n, err := countQ(db, q)
+	return n == 0, err
+}
+
+// rowidAlias returns the first of "rowid", "oid", "_rowid_" whose name does
+// not collide (case-insensitively) with one of cols, or "" if all three are
+// shadowed by a same-named user column. A shadowed alias no longer refers to
+// the table's internal rowid in SQL, so a shadowed name can't be used as a
+// row identity even though the rowid itself still exists.
+func rowidAlias(cols []string) string {
+	for _, alias := range []string{"rowid", "oid", "_rowid_"} {
+		shadowed := false
+		for _, c := range cols {
+			if strings.EqualFold(c, alias) {
+				shadowed = true
+				break
+			}
+		}
+		if !shadowed {
+			return alias
 		}
 	}
-	return true
+	return ""
 }
 
 // DiffSummary computes the --summary table-level diff between two
@@ -337,11 +370,28 @@ func equalStrings(a, b []string) bool {
 //
 // Beyond row counts, DiffSummary is content-aware: for a table present on
 // both sides with matching column lists, it counts rows added/removed/
-// changed by key (the table's declared primary key, else rowid) — needed
-// because two attempts can have equal row counts with different values,
-// and that must never report "same". A table whose column list differs
-// between sides is reported (with row counts) but not compared, since row
-// identity has no defined meaning across a schema change.
+// changed by row identity — needed because two attempts can have equal row
+// counts with different values, and that must never report "same". A table
+// whose column list differs between sides is reported (with row counts) but
+// not compared, since row identity has no defined meaning across a schema
+// change.
+//
+// Row identity is chosen per table, and recorded in TableDiff.Key:
+//
+//   - The table's declared PRIMARY KEY, but only when it is actually unique
+//     on BOTH sides ("pk"). SQLite allows a declared PK on an ordinary
+//     rowid table to contain duplicate rows when a key component is NULL —
+//     a long-standing legacy quirk, not a defect in the caller's schema —
+//     so an unverified PK would silently undercount Added/Removed/Changed.
+//   - Otherwise (no PK, or a PK that isn't unique on one or both sides),
+//     the table's own internal rowid ("rowid"), referenced through
+//     whichever of the aliases rowid/oid/_rowid_ is not itself the name of
+//     a user column on that table (a WITHOUT ROWID table always has a
+//     unique PK, so it never reaches this branch).
+//   - If the PK isn't usable AND all three rowid aliases are shadowed by
+//     user columns, there is no row identity left to compare by at all:
+//     the table is reported with row counts only (Comparable=false,
+//     Key=""), and Status is "changed" or "same" purely by row count.
 //
 // Both sides are opened through ONE connection: the left path is opened
 // read-only/immutable (see TableRowCounts's doc comment for why those URI
@@ -424,19 +474,56 @@ func DiffSummary(leftPath, rightPath string) ([]TableDiff, error) {
 				return nil, fmt.Errorf("ops: diff summary: schema of right %s: %w", t, err)
 			}
 			d.SchemaChanged = li.schema != ri.schema
-			if !equalStrings(li.cols, ri.cols) {
+			if !slices.Equal(li.cols, ri.cols) {
 				d.Status = "changed" // columns differ: rows are not comparable
 				break
 			}
 			d.Comparable = true
-			// Key: declared PK columns, else rowid. Row identity for
-			// EXCEPT includes the key so a row moving to a new key counts
-			// as removed+added, consistent with the anti-joins.
+
+			// Identity: the declared PK if unique on both sides, else the
+			// table's internal rowid via an unshadowed alias — see
+			// DiffSummary's doc comment. Row identity for EXCEPT includes
+			// the key so a row moving to a new key counts as
+			// removed+added, consistent with the anti-joins.
 			key := li.pk
+			keyKind := ""
+			if len(key) > 0 {
+				lUniq, err := isKeyUnique(db, "main", t, key)
+				if err != nil {
+					return nil, fmt.Errorf("ops: diff summary: pk uniqueness of left %s: %w", t, err)
+				}
+				rUniq, err := isKeyUnique(db, "r", t, key)
+				if err != nil {
+					return nil, fmt.Errorf("ops: diff summary: pk uniqueness of right %s: %w", t, err)
+				}
+				if lUniq && rUniq {
+					keyKind = "pk"
+				}
+			}
+			if keyKind == "" {
+				if alias := rowidAlias(li.cols); alias != "" {
+					key = []string{alias}
+					keyKind = "rowid"
+				}
+			}
+			if keyKind == "" {
+				// No usable identity: the PK is missing or non-unique on
+				// at least one side, and rowid/oid/_rowid_ are all
+				// shadowed by user columns. Row-level comparison is
+				// undefined; fall back to a row-count-only verdict.
+				d.Comparable = false
+				if d.Left != d.Right {
+					d.Status = "changed"
+				} else {
+					d.Status = "same"
+				}
+				break
+			}
+			d.Key = keyKind
+
 			selectList := "*"
-			if len(key) == 0 {
-				key = []string{"rowid"}
-				selectList = "rowid, *"
+			if keyKind == "rowid" {
+				selectList = quoteIdent(key[0]) + ", *"
 			}
 			var conds []string
 			for _, k := range key {
@@ -471,8 +558,11 @@ func DiffSummary(leftPath, rightPath string) ([]TableDiff, error) {
 // FormatDiffSummary renders a DiffReport as an aligned table plus the
 // totals line. The two count columns are headered with the caller's own
 // labels (the raw target strings) so the table is self-describing away
-// from the "left: ... right: ..." line the CLI prints above it. Shared by
-// the CLI and offshoot_diff.
+// from the "left: ... right: ..." line the CLI prints above it. A table
+// with SchemaChanged set (its CREATE statement differs between sides,
+// whether or not the column lists still match) has its STATUS cell
+// suffixed with " (schema)" so that case is visible without inspecting the
+// JSON. Shared by the CLI and offshoot_diff.
 func FormatDiffSummary(w io.Writer, rep DiffReport, leftLabel, rightLabel string) error {
 	tw := tabwriter.NewWriter(w, 0, 4, 2, ' ', 0)
 	fmt.Fprintf(tw, "TABLE\t%s\t%s\tADDED\tREMOVED\tCHANGED\tSTATUS\n", leftLabel, rightLabel)

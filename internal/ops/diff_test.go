@@ -177,6 +177,9 @@ func TestDiffSummaryIsContentAware(t *testing.T) {
 	if r.SchemaChanged {
 		t.Fatalf("results schema must not be flagged changed: %+v", r)
 	}
+	if r.Key != "pk" {
+		t.Fatalf("results.Key = %q, want %q (declared PK is unique on both sides)", r.Key, "pk")
+	}
 }
 
 // TestDiffSummaryRowidTablesUseRowidAsKey: a table with no declared primary
@@ -194,6 +197,78 @@ func TestDiffSummaryRowidTablesUseRowidAsKey(t *testing.T) {
 	}
 	if got[0].Changed != 1 || got[0].Added != 0 || got[0].Removed != 0 {
 		t.Fatalf("t = %+v, want changed=1 only", got[0])
+	}
+	if got[0].Key != "rowid" {
+		t.Fatalf("t.Key = %q, want %q (no declared PK)", got[0].Key, "rowid")
+	}
+}
+
+// TestDiffSummaryNonUniqueDeclaredPKFallsBackToRowid: SQLite allows a
+// declared composite PRIMARY KEY on an ordinary rowid table to contain
+// duplicate rows when a key component is NULL (a long-standing legacy
+// quirk, not a defect in the caller's schema). Trusting that PK as a row
+// identity would undercount via the anti-joins/EXCEPT (both rows collide
+// on the same key), so DiffSummary must detect the PK is non-unique and
+// fall back to rowid instead: 2 rows on the left, 1 identical-content row
+// on the right, must be reported as Removed=1, not "same".
+func TestDiffSummaryNonUniqueDeclaredPKFallsBackToRowid(t *testing.T) {
+	testutil.RequireSQLite3(t)
+	left := filepath.Join(t.TempDir(), "left.db")
+	right := filepath.Join(t.TempDir(), "right.db")
+	if out, err := exec.Command("sqlite3", left,
+		"CREATE TABLE t (a, b, v, PRIMARY KEY (a, b));"+
+			"INSERT INTO t (a,b,v) VALUES (1,NULL,'x'),(1,NULL,'y');",
+	).CombinedOutput(); err != nil {
+		t.Fatalf("%v: %s", err, out)
+	}
+	if out, err := exec.Command("sqlite3", right,
+		"CREATE TABLE t (a, b, v, PRIMARY KEY (a, b));"+
+			"INSERT INTO t (a,b,v) VALUES (1,NULL,'x');",
+	).CombinedOutput(); err != nil {
+		t.Fatalf("%v: %s", err, out)
+	}
+	got, err := DiffSummary(left, right)
+	if err != nil {
+		t.Fatal(err)
+	}
+	d := got[0]
+	if d.Key != "rowid" {
+		t.Fatalf("t.Key = %q, want %q (declared PK is non-unique on the left)", d.Key, "rowid")
+	}
+	if !d.Comparable || d.Removed != 1 || d.Status != "changed" {
+		t.Fatalf("t = %+v, want comparable removed=1 status=changed", d)
+	}
+}
+
+// TestDiffSummaryKeylessTableWithShadowedRowidNameFallsBackToOid: a keyless
+// table whose own column is literally named "rowid" shadows that alias, so
+// DiffSummary must fall back further, to "oid" (or "_rowid_"), to reach the
+// table's actual internal rowid rather than misreading the user column as
+// row identity.
+func TestDiffSummaryKeylessTableWithShadowedRowidNameFallsBackToOid(t *testing.T) {
+	testutil.RequireSQLite3(t)
+	left := filepath.Join(t.TempDir(), "left.db")
+	right := filepath.Join(t.TempDir(), "right.db")
+	if out, err := exec.Command("sqlite3", left,
+		`CREATE TABLE t ("rowid", v); INSERT INTO t VALUES ('dup','a'),('dup','b');`,
+	).CombinedOutput(); err != nil {
+		t.Fatalf("%v: %s", err, out)
+	}
+	if out, err := exec.Command("sqlite3", right,
+		`CREATE TABLE t ("rowid", v); INSERT INTO t VALUES ('dup','a');`,
+	).CombinedOutput(); err != nil {
+		t.Fatalf("%v: %s", err, out)
+	}
+	got, err := DiffSummary(left, right)
+	if err != nil {
+		t.Fatal(err)
+	}
+	d := got[0]
+	if d.Key != "rowid" {
+		t.Fatalf("t.Key = %q, want %q (the true rowid, reached via oid/_rowid_)", d.Key, "rowid")
+	}
+	if !d.Comparable || d.Removed != 1 || d.Changed != 0 || d.Status != "changed" {
+		t.Fatalf("t = %+v, want comparable removed=1 changed=0 status=changed", d)
 	}
 }
 
