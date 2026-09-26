@@ -64,6 +64,8 @@ Usage:
                                      stored on the checkpoint (checkpoint) or
                                      the new branch (fork)
   offshoot touch <db>[@branch] [--ttl duration|none]   reset a branch's activity clock, optionally (re)setting its TTL
+  offshoot protect <db>[@branch]        refuse unforced destroy/promote-onto, never reap; MCP cannot force it without -allow-force
+  offshoot unprotect <db>[@branch]      clear the protected flag
   offshoot rollback <db>[@branch] --to <cp>       repoint a branch at a checkpoint
   offshoot promote <db>@<src> --onto <target> [--force] [--no-backup] [--backup-ttl DUR]
                                                           repoint target at src's head; keeps target's old head as <target>-pre-promote
@@ -517,6 +519,32 @@ func run(args []string) error {
 			out = "none"
 		}
 		fmt.Printf("touched %s@%s ttl=%s touched_at=%s\n", db, branch, out, ref.TouchedAt)
+		return nil
+	case "protect":
+		if len(rest) != 1 {
+			return fmt.Errorf("usage: offshoot protect <db>[@branch]")
+		}
+		db, branch, err := ops.ParseTarget(rest[0])
+		if err != nil {
+			return err
+		}
+		if _, err := w.SetProtected(db, branch, true); err != nil {
+			return err
+		}
+		fmt.Printf("protected %s@%s\n", db, branch)
+		return nil
+	case "unprotect":
+		if len(rest) != 1 {
+			return fmt.Errorf("usage: offshoot unprotect <db>[@branch]")
+		}
+		db, branch, err := ops.ParseTarget(rest[0])
+		if err != nil {
+			return err
+		}
+		if _, err := w.SetProtected(db, branch, false); err != nil {
+			return err
+		}
+		fmt.Printf("unprotected %s@%s\n", db, branch)
 		return nil
 	case "rollback":
 		if len(rest) != 3 || rest[1] != "--to" {
