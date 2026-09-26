@@ -1,4 +1,5 @@
 import contextlib
+import hashlib
 import json
 import os
 import shutil
@@ -86,6 +87,41 @@ class TestBranchesWireCompat(unittest.TestCase):
         })
         branches = client.branches("app")
         self.assertEqual(branches[0].state, "active")
+
+
+class TestCreateFromPathResolution(unittest.TestCase):
+    """Pure-logic tests for Client.create's from_path handling; no daemon
+    needed -- Client.__new__ skips __init__ (which opens a real socket) and
+    _call is monkeypatched to capture the fields it was called with, exactly
+    like TestBranchesWireCompat above.
+    """
+
+    def _client_capturing_call(self):
+        client = offshoot.Client.__new__(offshoot.Client)
+        calls = []
+        client._call = lambda op, **fields: calls.append((op, fields)) or {"ok": True}
+        return client, calls
+
+    def test_no_from_path_sends_no_path_field(self):
+        client, calls = self._client_capturing_call()
+        client.create("app")
+        op, fields = calls[0]
+        self.assertEqual(op, "create")
+        self.assertNotIn("path", fields)
+
+    def test_relative_from_path_is_resolved_to_absolute(self):
+        client, calls = self._client_capturing_call()
+        client.create("app", from_path="relative-src.db")
+        op, fields = calls[0]
+        self.assertEqual(op, "create")
+        self.assertTrue(os.path.isabs(fields["path"]))
+        self.assertEqual(fields["path"], os.path.abspath("relative-src.db"))
+
+    def test_pathlike_from_path_is_accepted(self):
+        client, calls = self._client_capturing_call()
+        client.create("app", from_path=Path("relative-src.db"))
+        _, fields = calls[0]
+        self.assertEqual(fields["path"], os.path.abspath("relative-src.db"))
 
 
 def build_binary(tmp: Path) -> Path:
@@ -506,6 +542,30 @@ class TestClient(unittest.TestCase):
             self.assertEqual(rows, 2)
             db.close()
             s.close()
+
+    def test_create_from_path_imports_existing_file(self):
+        src = os.path.join(self.d.dir, "legacy.db")
+        conn = sqlite3.connect(src)
+        conn.execute("CREATE TABLE t (v)")
+        conn.execute("INSERT INTO t VALUES (1)")
+        conn.execute("INSERT INTO t VALUES (2)")
+        conn.execute("INSERT INTO t VALUES (3)")
+        conn.commit()
+        conn.close()
+        with open(src, "rb") as f:
+            before = hashlib.sha256(f.read()).hexdigest()
+
+        with offshoot.connect(self.d.sock) as c:
+            c.create("import-app", from_path=src)
+            path = c.checkout("import-app", "main")
+            conn = sqlite3.connect(path)
+            self.assertEqual(conn.execute("SELECT count(*) FROM t").fetchone()[0], 3)
+            conn.close()
+
+        with open(src, "rb") as f:
+            after = hashlib.sha256(f.read()).hexdigest()
+        self.assertEqual(before, after,
+                          "create(from_path=...) must never modify the source file")
 
     def test_diff_is_content_aware_and_needs_no_sqldiff(self):
         with offshoot.connect(self.d.sock) as c:

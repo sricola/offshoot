@@ -7,6 +7,7 @@ Stdlib only — no dependencies.
 from __future__ import annotations
 
 import json
+import os
 import socket
 from collections.abc import Generator
 from dataclasses import dataclass, field
@@ -233,9 +234,23 @@ class Client:
             raise OffshootError(resp.get("error", "unknown daemon error"))
         return resp
 
-    def create(self, db: str) -> None:
-        """Create a fresh db (branch main at txid 1)."""
-        self._call("create", db=db)
+    def create(self, db: str, from_path: "str | os.PathLike[str] | None" = None) -> None:
+        """Create a fresh db (branch main at txid 1), or, when from_path is
+        given, import an existing SQLite file at that path instead.
+
+        from_path is resolved to an absolute path client-side
+        (os.path.abspath) before being sent to the daemon, server-side, on
+        the daemon's own host/filesystem — same-host/same-user unix-socket
+        trust model as export's out_path (see
+        internal/daemon/protocol.go's ``Request.Path``): this is refused
+        outright over the daemon's HTTP surface, unix-socket only. The
+        source file is never modified — it is copied, the copy is quiesced,
+        and only the copy is imported.
+        """
+        if from_path is None:
+            self._call("create", db=db)
+            return
+        self._call("create", db=db, path=os.path.abspath(os.fspath(from_path)))
 
     def open(self, db: str, branch: str = "main") -> "Session":
         """Open a live session on db@branch; returns its Session."""

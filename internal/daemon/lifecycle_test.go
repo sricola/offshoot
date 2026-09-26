@@ -2,9 +2,12 @@ package daemon
 
 import (
 	"context"
+	"crypto/sha256"
 	"errors"
 	"fmt"
+	"os"
 	"os/exec"
+	"path/filepath"
 	"strconv"
 	"strings"
 	"sync/atomic"
@@ -121,6 +124,80 @@ func sqliteCount(t *testing.T, path, query string) int {
 		t.Fatalf("sqlite3 output %q: %v", out, convErr)
 	}
 	return n
+}
+
+// TestCreateFromPathImportsAnExistingFile exercises the daemon's "create" op
+// with req.Path set: it must import an existing SQLite file via
+// ops.Workspace.CreateFrom (rather than ops.Workspace.Create), leaving the
+// source file's bytes byte-for-byte unchanged (sha256 before/after).
+func TestCreateFromPathImportsAnExistingFile(t *testing.T) {
+	srv, w := newServer(t)
+	sock := srv.SocketPath()
+
+	src := filepath.Join(t.TempDir(), "legacy.db")
+	sqliteExec(t, src, "CREATE TABLE t (v); INSERT INTO t VALUES (1); INSERT INTO t VALUES (2); INSERT INTO t VALUES (3);")
+
+	before, err := os.ReadFile(src)
+	if err != nil {
+		t.Fatal(err)
+	}
+	beforeSum := sha256.Sum256(before)
+
+	r := call(t, sock, Request{Op: "create", DB: "imp", Path: src})
+	if !r.OK {
+		t.Fatalf("create with path = %+v", r)
+	}
+
+	after, err := os.ReadFile(src)
+	if err != nil {
+		t.Fatal(err)
+	}
+	afterSum := sha256.Sum256(after)
+	if beforeSum != afterSum {
+		t.Fatal("create with path must never modify the source file")
+	}
+
+	path, err := w.Checkout("imp", "main")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got := sqliteCount(t, path, "SELECT count(*) FROM t;"); got != 3 {
+		t.Fatalf("imported rows = %d, want 3", got)
+	}
+}
+
+// TestCreateWithRelativePathRefused pins the same absolute-path guard
+// opExport already enforces on Request.Path (see that field's doc comment
+// for the trust model): a relative Path must be refused outright, never
+// resolved against the daemon's own (client-invisible) working directory.
+func TestCreateWithRelativePathRefused(t *testing.T) {
+	srv, _ := newServer(t)
+	sock := srv.SocketPath()
+
+	r := call(t, sock, Request{Op: "create", DB: "imp2", Path: "relative.db"})
+	if r.OK {
+		t.Fatal("create with a relative path must be refused")
+	}
+	if !strings.Contains(r.Error, "absolute") {
+		t.Fatalf("error = %q, want it to mention 'absolute'", r.Error)
+	}
+}
+
+// TestCreateFromPathToNonSQLiteFileErrors pins that importing a file that
+// isn't actually a SQLite database surfaces as an error, not a silently
+// empty/corrupt imported db.
+func TestCreateFromPathToNonSQLiteFileErrors(t *testing.T) {
+	srv, _ := newServer(t)
+	sock := srv.SocketPath()
+
+	bogus := filepath.Join(t.TempDir(), "not-a-db.txt")
+	if err := os.WriteFile(bogus, []byte("this is not a sqlite database file"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	r := call(t, sock, Request{Op: "create", DB: "imp3", Path: bogus})
+	if r.OK {
+		t.Fatal("create from a non-SQLite file must be refused")
+	}
 }
 
 // TestLifecycleOpsRoundTrip exercises the full new lifecycle surface end to

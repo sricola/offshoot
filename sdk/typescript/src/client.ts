@@ -5,6 +5,7 @@
 // runtime dependencies.
 
 import { createConnection, type Socket } from "node:net";
+import * as path from "node:path";
 
 /** An error returned by the daemon, a transport failure, or a malformed
  * response — every failure mode this client can produce surfaces as this
@@ -146,6 +147,19 @@ export interface TouchOptions {
   /** A Go duration string to set the TTL, "none" to clear it, or omitted to
    * keep the branch's current TTL. */
   ttl?: string;
+}
+
+/** Options for {@link Client.create}. */
+export interface CreateOptions {
+  /** An existing SQLite file to import instead of creating an empty db.
+   * Resolved to an absolute path client-side (path.resolve) before being
+   * sent to the daemon, server-side, on the daemon's own host/filesystem —
+   * same-host/same-user unix-socket trust model as export's outPath (see
+   * internal/daemon/protocol.go's `Request.Path`): refused outright over
+   * the daemon's HTTP surface, unix-socket only. The source file is never
+   * modified — it is copied, the copy is quiesced, and only the copy is
+   * imported. */
+  fromPath?: string;
 }
 
 /** Options for {@link Client.export}. */
@@ -436,9 +450,14 @@ export class Client {
     });
   }
 
-  /** Create a fresh db (branch main at txid 1). */
-  async create(db: string): Promise<void> {
-    await this._call("create", { db });
+  /** Create a fresh db (branch main at txid 1), or, when opts.fromPath is
+   * given, import an existing SQLite file at that path instead. See
+   * {@link CreateOptions} for the trust model fromPath is resolved under. */
+  async create(db: string, opts: CreateOptions = {}): Promise<void> {
+    await this._call("create", {
+      db,
+      path: opts.fromPath ? path.resolve(opts.fromPath) : "",
+    });
   }
 
   /** Open a live session on db@branch; returns its Session. */

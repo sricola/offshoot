@@ -1035,6 +1035,51 @@ func TestHTTPExportRejectedSocketExportStillWorks(t *testing.T) {
 	}
 }
 
+// TestHTTPCreateWithPathRejectedPlainCreateStillWorks pins the same
+// filesystem-escaping rationale as export's httpForbiddenOps entry, applied
+// to "create": req.Path names a file on the DAEMON host's filesystem, which
+// means nothing to a remote HTTP caller and would read an arbitrary file as
+// this daemon's own process, so handleRPC refuses "create" with a non-empty
+// Path before dispatch — while plain "create" (no Path at all) is an
+// ordinary op that keeps working fine over HTTP, and the identical
+// with-Path request still succeeds over the unix socket.
+func TestHTTPCreateWithPathRejectedPlainCreateStillWorks(t *testing.T) {
+	srv, _, base, token := newHTTPServer(t)
+	sock := srv.SocketPath()
+
+	src := filepath.Join(t.TempDir(), "legacy.db")
+	if out, err := exec.Command("sqlite3", src,
+		"CREATE TABLE t (v); INSERT INTO t VALUES ('one');").CombinedOutput(); err != nil {
+		t.Fatalf("%v: %s", err, out)
+	}
+
+	req := Request{Op: "create", DB: "imp", Path: src}
+	resp := httpRPC(t, base, "Bearer "+token, req)
+	body, _ := io.ReadAll(resp.Body)
+	resp.Body.Close()
+	if resp.StatusCode != http.StatusBadRequest {
+		t.Fatalf("create with path over HTTP: status = %d (body %q), want 400", resp.StatusCode, body)
+	}
+	const wantMsg = "daemon: create with path is not available over HTTP; use the local socket"
+	if !strings.Contains(string(body), wantMsg) {
+		t.Fatalf("create with path over HTTP: body = %q, want it to contain %q", body, wantMsg)
+	}
+
+	// Plain create (no Path) over HTTP must still work.
+	resp2 := httpRPC(t, base, "Bearer "+token, Request{Op: "create", DB: "plain"})
+	out2 := decodeResponse(t, resp2)
+	if !out2.OK {
+		t.Fatalf("plain create over HTTP must still work: %+v", out2)
+	}
+
+	// The gate is HTTP-only: the SAME request (with Path) over the unix
+	// socket succeeds.
+	r := call(t, sock, req)
+	if !r.OK {
+		t.Fatalf("create with path over the unix socket = %+v, want ok", r)
+	}
+}
+
 // ---- diff ----
 
 // TestHTTPDiffOpReturnsContentAwareSummary exercises the "diff" op over the
