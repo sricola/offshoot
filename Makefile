@@ -232,7 +232,7 @@ bench-isolation: check-python-version
 # against a local offshoot store, full-scale parameters: ~2,300 forks in all.
 # Every workflow runs against its own fresh store (built, seeded and removed
 # per workflow), so this needs about 30 GB of free space in $$TMPDIR -- the
-# largest single workflow, mcts, peaks near 26.5 GiB -- and about 5 minutes on
+# largest single workflow, mcts, peaks near 26.5 GiB -- and under 3 minutes on
 # an Apple M5. `go run ./cmd/branchbench -quick` is the seconds-scale smoke
 # run of the same five topologies, and `go test ./cmd/branchbench` runs it.
 # Prints one markdown table; docs/benchmarks.md pastes it verbatim.
