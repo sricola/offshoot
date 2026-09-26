@@ -13,6 +13,10 @@ version if you depend on format stability.
 
 ## [Unreleased]
 
+Nothing yet.
+
+## [0.2.11] - 2026-09-26
+
 ### Added
 
 - **`create --from` reaches the daemon and both SDKs.** The daemon's

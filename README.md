@@ -208,7 +208,7 @@ More "why not X" (Litestream, Dolt, Neon, plain `cp`):
 
 ## Status
 
-**v0.2.10.** What's shipped and exercised by tests that would
+**v0.2.11.** What's shipped and exercised by tests that would
 fail if it broke:
 
 - local and S3-compatible stores behind a shared conformance suite
