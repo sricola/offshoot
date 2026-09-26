@@ -21,9 +21,14 @@
 //   your framework's top-level teardown).
 // - seedOnce(daemon, {name?, seed}): a NAMED-SEED memoization cache keyed
 //   on the (daemon, name) pair. The first call for a name creates database
-//   `eval-{name}`, runs `seed` — a SQL string, a path to a `.sql` file, or
-//   an async `(dbPath) => void` callback — and checkpoints it `seed`.
-//   Later calls for the same name are a pure memoization hit UNLESS the
+//   `eval-{name}`, runs `seed` — a SQL string, a path to a `.sql` file, a
+//   path to an existing SQLite database file (detected by content, never
+//   by extension — imported via `create --from` and forked from its
+//   `init` checkpoint instead of running any seed script), or an async
+//   `(dbPath) => void` callback — and checkpoints it `seed` (the
+//   database-file form needs no such checkpoint; its `init` checkpoint
+//   from import IS the fork point). Later calls for the same name are a
+//   pure memoization hit UNLESS the
 //   seed doesn't match what actually seeded that name (fingerprinted: SQL/
 //   path text by content hash, callables by identity) — that raises a
 //   clear error rather than silently keeping the first seed, exactly like
@@ -53,7 +58,7 @@
 
 import { type ChildProcess, execFileSync, spawn } from "node:child_process";
 import { createHash } from "node:crypto";
-import { existsSync, mkdtempSync, rmSync, statSync } from "node:fs";
+import { closeSync, existsSync, mkdtempSync, openSync, readSync, rmSync, statSync } from "node:fs";
 import { readFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { delimiter as PATH_DELIMITER, join } from "node:path";
@@ -236,10 +241,13 @@ async function connectWithTail(daemon: DaemonHandle): Promise<Client> {
 
 /** A seed: a SQL string, a path to a `.sql` file (detected — see
  * {@link looksLikeSeedFilePath} — not a separate argument shape, since
- * there's no pytest.ini-style config file here to hold that decision), or
- * an async callback given the writable sqlite path to seed however it
- * likes (not auto-wrapped in a transaction — it owns its own transaction
- * boundaries). */
+ * there's no pytest.ini-style config file here to hold that decision), a
+ * path to an existing SQLite database file (detected by content — see
+ * {@link isSqliteFile} — never by extension; imported via `create --from`
+ * and forked from its `init` checkpoint instead of running any seed
+ * script), or an async callback given the writable sqlite path to seed
+ * however it likes (not auto-wrapped in a transaction — it owns its own
+ * transaction boundaries). */
 export type Seed = string | ((dbPath: string) => void | Promise<void>);
 
 export interface SeedOnceOptions {
@@ -298,6 +306,39 @@ function looksLikeSeedFilePath(s: string): boolean {
   return (
     trimmed.length > 0 && trimmed.length < 4096 && !trimmed.includes("\n") && /\.sql$/i.test(trimmed) && existsSync(trimmed)
   );
+}
+
+const SQLITE_HEADER = Buffer.from("SQLite format 3\0", "latin1");
+
+/** True if p is an existing regular file whose first 16 bytes are SQLite's
+ * own on-disk header magic (`SQLite format 3\0`). Content detection ONLY —
+ * never by extension — so a `seed` string that merely ends in `.db` but
+ * names no real file (ordinary SQL text) is never mistaken for a database
+ * file, and conversely a real SQLite file with any extension (or none) is
+ * still recognized. Ported from `offshoot.pytest_plugin._is_sqlite_file`. */
+function isSqliteFile(p: string): boolean {
+  let st;
+  try {
+    st = statSync(p);
+  } catch {
+    return false;
+  }
+  if (!st.isFile()) return false;
+  let fd: number;
+  try {
+    fd = openSync(p, "r");
+  } catch {
+    return false;
+  }
+  try {
+    const buf = Buffer.alloc(SQLITE_HEADER.length);
+    const bytesRead = readSync(fd, buf, 0, buf.length, 0);
+    return bytesRead === buf.length && buf.equals(SQLITE_HEADER);
+  } catch {
+    return false;
+  } finally {
+    closeSync(fd);
+  }
 }
 
 async function resolveSeedSql(seed: string): Promise<string> {
@@ -375,11 +416,23 @@ function runSeedSql(dbPath: string, sql: string): void {
   execSqlite3([dbPath], wrapped);
 }
 
-/** A seed value, resolved once into a fingerprint (for `seedOnce`'s
- * memoization mismatch check) and a `run` step (what actually writes the
- * seed) — resolving both from a single pass over `seed` so a `.sql`-path
- * seed is read from disk exactly once per `seedOnce` call, not twice (once
- * to fingerprint, once to run).
+/** What {@link resolveSeed} resolves a {@link Seed} value into: a
+ * `fingerprint` (for `seedOnce`'s memoization mismatch check) plus either a
+ * `run` step (SQL/callable seeds — what actually writes the seed against an
+ * already-open session) or a `filePath` (a `dbfile` seed — imported via
+ * `create --from` with no session ever opened; see {@link runSeedOnce}). */
+interface ResolvedSeed {
+  kind: "sql" | "callable" | "dbfile";
+  fingerprint: string;
+  run?: (session: Session) => Promise<void>;
+  filePath?: string;
+}
+
+/** A seed value, resolved once into a fingerprint and a `run` step (or, for
+ * a database-file seed, a `filePath`) — resolving both from a single pass
+ * over `seed` so a `.sql`-path or database-file seed is read from disk
+ * exactly once per `seedOnce` call, not twice (once to fingerprint, once to
+ * run/import).
  *
  * Fingerprinting: string seeds are fingerprinted by content hash of the
  * RESOLVED SQL text — i.e. a `.sql`-path seed is read from disk FIRST,
@@ -387,9 +440,13 @@ function runSeedSql(dbPath: string, sql: string): void {
  * would fingerprint only the path's own text, so editing the file on disk
  * between two `seedOnce` calls for the same name and path would leave the
  * fingerprint unchanged and the mismatch would silently pass — exactly the
- * class of bug this check exists to catch. Callables are fingerprinted by
- * identity (mirrors Python's `id()`-based fingerprint). */
-async function resolveSeed(seed: Seed): Promise<{ fingerprint: string; run: (session: Session) => Promise<void> }> {
+ * class of bug this check exists to catch. A database-file seed (detected
+ * by content — see {@link isSqliteFile} — never by extension, checked
+ * BEFORE `.sql`-path detection since a real SQLite file is never valid SQL
+ * text) is fingerprinted the same way: the content hash of its own bytes,
+ * read fresh each call. Callables are fingerprinted by identity (mirrors
+ * Python's `id()`-based fingerprint). */
+async function resolveSeed(seed: Seed): Promise<ResolvedSeed> {
   if (typeof seed === "function") {
     let id = callableIds.get(seed);
     if (id === undefined) {
@@ -397,14 +454,24 @@ async function resolveSeed(seed: Seed): Promise<{ fingerprint: string; run: (ses
       callableIds.set(seed, id);
     }
     return {
+      kind: "callable",
       fingerprint: `callable:${id}`,
       run: async (session) => {
         await seed(session.path);
       },
     };
   }
+  if (isSqliteFile(seed)) {
+    const bytes = await readFile(seed);
+    return {
+      kind: "dbfile",
+      fingerprint: `db:${createHash("sha256").update(bytes).digest("hex")}`,
+      filePath: seed,
+    };
+  }
   const sql = await resolveSeedSql(seed);
   return {
+    kind: "sql",
     fingerprint: `sql:${createHash("sha256").update(sql, "utf8").digest("hex")}`,
     run: async (session) => {
       runSeedSql(session.path, sql);
@@ -427,18 +494,24 @@ async function resolveSeed(seed: Seed): Promise<{ fingerprint: string; run: (ses
  * checkpoints it — the work `seedOnce` memoizes a PROMISE of, below, so two
  * concurrent callers for the same name share this one call rather than each
  * racing their own. */
-async function runSeedOnce(
-  daemon: DaemonHandle,
-  name: string,
-  resolved: { fingerprint: string; run: (session: Session) => Promise<void> },
-): Promise<SeedCacheEntry> {
+async function runSeedOnce(daemon: DaemonHandle, name: string, resolved: ResolvedSeed): Promise<SeedCacheEntry> {
   const client = await connectWithTail(daemon);
   try {
     const db = `eval-${name}`;
+    if (resolved.kind === "dbfile") {
+      // An imported database's `main` is quiesced at txid 1 with an `init`
+      // checkpoint (see internal/ops/ops.go's createFromQuiesced) — fork
+      // subsequent test branches from THAT, not "seed" (no seed script
+      // runs here, so there is no "seed" checkpoint to fork from), and no
+      // session is opened: the daemon reads/copies/quiesces the source
+      // file itself, server-side.
+      await client.create(db, { fromPath: resolved.filePath! });
+      return { handle: { db, checkpoint: "init", name }, fingerprint: resolved.fingerprint };
+    }
     await client.create(db);
     const session = await client.open(db, "main");
     try {
-      await resolved.run(session);
+      await resolved.run!(session);
       await session.flush("seed");
     } finally {
       await session.close();

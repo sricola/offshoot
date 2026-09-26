@@ -470,6 +470,87 @@ test("seedOnce: editing a .sql seed file on disk between calls is caught as a mi
 });
 
 // --------------------------------------------------------------------------
+// seedOnce: a path to an existing SQLite database file — imported via
+// `create --from` and forked from its `init` checkpoint, not run as SQL.
+// --------------------------------------------------------------------------
+
+function writeGoldenDb(path: string): void {
+  execFileSync("sqlite3", [
+    path,
+    "CREATE TABLE widgets (name TEXT); CREATE TABLE gadgets (name TEXT); " +
+      "INSERT INTO widgets VALUES ('w1'); INSERT INTO widgets VALUES ('w2'); " +
+      "INSERT INTO gadgets VALUES ('g1');",
+  ]);
+}
+
+test("seedOnce: a path to an existing SQLite db file imports it and forks from its init checkpoint", async (t: TestContext) => {
+  if (!canRun) {
+    t.skip("go and/or sqlite3 not on PATH");
+    return;
+  }
+  await withDaemon(async (daemon) => {
+    const dir = mkdtempSync(join(tmpdir(), "offshoot-testkit-dbfileseed-"));
+    try {
+      const golden = join(dir, "golden.db");
+      writeGoldenDb(golden);
+
+      const handle = await seedOnce(daemon, { name: "golden", seed: golden });
+      assert.equal(handle.checkpoint, "init");
+
+      const forked = await forkPerTest(daemon, handle);
+      try {
+        const widgets = execFileSync("sqlite3", [forked.path, "SELECT count(*) FROM widgets;"]).toString().trim();
+        const gadgets = execFileSync("sqlite3", [forked.path, "SELECT count(*) FROM gadgets;"]).toString().trim();
+        assert.equal(widgets, "2");
+        assert.equal(gadgets, "1");
+      } finally {
+        await forked.close();
+      }
+
+      // Second call with the same path is a pure memoization hit.
+      const handle2 = await seedOnce(daemon, { name: "golden", seed: golden });
+      assert.equal(handle2, handle);
+
+      // Editing the file on disk changes its content fingerprint -> mismatch,
+      // even though the path string is unchanged.
+      execFileSync("sqlite3", [golden, "INSERT INTO widgets VALUES ('w3');"]);
+      await assert.rejects(
+        () => seedOnce(daemon, { name: "golden", seed: golden }),
+        (err: unknown) => {
+          assert.ok(err instanceof OffshootError);
+          assert.match(err.message, /DIFFERENT seed/);
+          return true;
+        },
+      );
+    } finally {
+      rmSync(dir, { recursive: true, force: true });
+    }
+  });
+});
+
+test("seedOnce: a SQL string ending in .db that is not a file still runs as SQL", async (t: TestContext) => {
+  if (!canRun) {
+    t.skip("go and/or sqlite3 not on PATH");
+    return;
+  }
+  await withDaemon(async (daemon) => {
+    // The string's own text ends in ".db", but no such file exists — this
+    // must be detected by content (there is none: it isn't a real file at
+    // all), never by the string's suffix, and run as literal SQL.
+    const sql = "CREATE TABLE looks_like_a_seed (v);\n-- seeded from fake.db";
+    const handle = await seedOnce(daemon, { name: "sql-looks-like-db", seed: sql });
+    assert.equal(handle.checkpoint, "seed");
+    const c = await connect(daemon.sock);
+    try {
+      const p = await c.checkoutAt(handle.db, "main", handle.checkpoint);
+      execFileSync("sqlite3", [p, "SELECT * FROM looks_like_a_seed;"]); // must not throw
+    } finally {
+      await c.close();
+    }
+  });
+});
+
+// --------------------------------------------------------------------------
 // forkPerTest: TTL default/override, worker-safe distinct naming,
 // isolation, string-name shorthand, teardown-warn-not-throw.
 // --------------------------------------------------------------------------

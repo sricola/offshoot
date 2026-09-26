@@ -461,6 +461,73 @@ def test_seed_factory_raises_clear_error_with_no_seed_and_no_ini_default(client)
         factory()
 
 
+# --- _SeedFactory: seeding from an existing SQLite database file ("db:" seeds) ---
+
+def _write_golden_db(path):
+    conn = sqlite3.connect(path)
+    conn.execute("CREATE TABLE widgets (name TEXT)")
+    conn.execute("CREATE TABLE gadgets (name TEXT)")
+    conn.execute("INSERT INTO widgets VALUES ('w1')")
+    conn.execute("INSERT INTO widgets VALUES ('w2')")
+    conn.execute("INSERT INTO gadgets VALUES ('g1')")
+    conn.commit()
+    conn.close()
+
+
+def test_db_file_seed_imports_and_forks_from_init(client, tmp_path):
+    golden = tmp_path / "golden.db"
+    _write_golden_db(golden)
+    factory = _SeedFactory(client, default_seed_path=None)
+    handle = factory("golden", seed=str(golden))
+    assert handle.checkpoint == "init"
+
+    forks = _ForkFactory(client, factory, worker="gw0", nodeid="test_db_file", ttl="1h")
+    forked = forks(handle)
+    conn = sqlite3.connect(forked.path)
+    assert conn.execute("SELECT count(*) FROM widgets").fetchone()[0] == 2
+    assert conn.execute("SELECT count(*) FROM gadgets").fetchone()[0] == 1
+    conn.close()
+    forks.teardown()
+
+    # Second call with the same path is a pure memoization hit.
+    handle2 = factory("golden", seed=str(golden))
+    assert handle2 is handle
+
+    # Editing the file on disk changes its content fingerprint -> mismatch.
+    conn = sqlite3.connect(golden)
+    conn.execute("INSERT INTO widgets VALUES ('w3')")
+    conn.commit()
+    conn.close()
+    with pytest.raises(OffshootError, match="DIFFERENT seed"):
+        factory("golden", seed=str(golden))
+
+
+def test_db_file_seed_sql_string_ending_in_dot_db_still_runs_as_sql(client):
+    # A SQL string that merely ENDS IN ".db" but is not an actual file must
+    # still be treated as literal SQL (content detection only, never by
+    # extension/suffix sniffing of the string itself).
+    sql = "CREATE TABLE looks_like_a_seed (v);\n-- seeded from fake.db"
+    factory = _SeedFactory(client, default_seed_path=None)
+    handle = factory("sql-looks-like-db", seed=sql)
+    assert handle.checkpoint == "seed"
+    checkout = client.checkout_at(handle.db, "main", handle.checkpoint)
+    conn = sqlite3.connect(checkout)
+    conn.execute("SELECT * FROM looks_like_a_seed")  # must not raise: table exists
+    conn.close()
+
+
+def test_db_file_seed_falls_back_to_ini_default_seed_path(client, tmp_path):
+    golden = tmp_path / "golden-ini.db"
+    _write_golden_db(golden)
+    factory = _SeedFactory(client, default_seed_path=str(golden))
+    handle = factory()  # no seed= given -> ini default path is a SQLite file
+    assert handle.checkpoint == "init"
+    checkout = client.checkout_at(handle.db, "main", handle.checkpoint)
+    conn = sqlite3.connect(checkout)
+    assert conn.execute("SELECT count(*) FROM widgets").fetchone()[0] == 2
+    conn.close()
+
+
 # --- _connect: dead daemon raises OffshootError, not a bare OSError ---
 
 def test_connect_wraps_dead_daemon_connection_failure(bin_path):
