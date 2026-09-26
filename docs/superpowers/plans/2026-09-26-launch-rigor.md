@@ -12,7 +12,7 @@
 
 ## Global Constraints
 
-- **Every third-party action is pinned to a full commit SHA with a `# vX.Y.Z` comment**, like every existing workflow. SHAs resolved 2026-09-26: `ossf/scorecard-action@2d1146689b8cda280b9bc96326124645441f03bc # v2.4.4`; `actions/attest-build-provenance@4d101475d8b20a2381f78447822ac1eab6504dd8 # v4.2.2`; `actions/attest-sbom@c604332985a26aa8cf1bdc465b92731239ec6b9e # v4.1.0`; `sigstore/cosign-installer@6f9f17788090df1f26f669e9d70d6ae9567deba6 # v4.1.2`; `anchore/sbom-action@3ad7283483fc7af8ff2b4ea19663c2d5ca935e26 # v0.24.2`; `github/codeql-action/upload-sarif@7999b86c43a865dc79d8923397f35af22de63401 # v4`. Reuse the repo's existing pins for `actions/checkout` (`3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1`) and `actions/upload-artifact` (`043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1`).
+- **Every third-party action is pinned to a full commit SHA with a `# vX.Y.Z` comment**, like every existing workflow. SHAs resolved 2026-09-26: `ossf/scorecard-action@2d1146689b8cda280b9bc96326124645441f03bc # v2.4.4`; `actions/attest-build-provenance@4d101475d8b20a2381f78447822ac1eab6504dd8 # v4.2.2`; `actions/attest-sbom@c604332985a26aa8cf1bdc465b92731239ec6b9e # v4.1.0`; `sigstore/cosign-installer@6f9f17788090df1f26f669e9d70d6ae9567deba6 # v4.1.2`; `anchore/sbom-action@3ad7283483fc7af8ff2b4ea19663c2d5ca935e26 # v0.24.2`; `github/codeql-action/upload-sarif@2892aa5e19bbd11bc0cff5427e3b750a04d9e3c2 # v4`. Reuse the repo's existing pins for `actions/checkout` (`3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1`) and `actions/upload-artifact` (`043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1`).
 - **Least privilege stays per-job.** Workflow-level `permissions: contents: read` (or `read-all` for Scorecard); `id-token: write` and `attestations: write` only on the two jobs that publish. No `${{ }}` interpolation of ref-derived values into `run:` scripts — pass them through `env:` exactly as `release.yml` already does.
 - **No install text for unpublished packages**: never `pip install offshoot`, `npm install @offshoot-db/...` (publication is deferred indefinitely). Existing `go install`, Homebrew, Docker and release-tarball instructions are fine.
 - **Benchmarks honesty.** Every number in docs prose derives from a pasted table produced by one run of the committed program, with the machine and date line. BranchBench's Neon/Dolt figures are quoted from the paper with citation and labelled as *their* runs on hosted Postgres systems; never present them as a head-to-head we ran. Name the topology each quote comes from.
@@ -79,7 +79,7 @@ jobs:
           retention-days: 5
 
       - name: Upload to code-scanning
-        uses: github/codeql-action/upload-sarif@7999b86c43a865dc79d8923397f35af22de63401 # v4
+        uses: github/codeql-action/upload-sarif@2892aa5e19bbd11bc0cff5427e3b750a04d9e3c2 # v4
         with:
           sarif_file: results.sarif
 ```
