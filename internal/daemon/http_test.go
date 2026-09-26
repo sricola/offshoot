@@ -1034,3 +1034,53 @@ func TestHTTPExportRejectedSocketExportStillWorks(t *testing.T) {
 		t.Fatalf("socket-exported rows = %d, want 1", got)
 	}
 }
+
+// ---- diff ----
+
+// TestHTTPDiffOpReturnsContentAwareSummary exercises the "diff" op over the
+// HTTP /rpc surface (bearer-authenticated) the same way
+// TestDiffOpReturnsContentAwareSummaryOverTheWire exercises it over the
+// unix socket: seed one checkpointed change directly via ops (w.Checkout/
+// w.Checkpoint — simpler here than round-tripping through more RPC ops just
+// to seed fixture data), then POST a diff request and assert both the
+// envelope (ok) and the content-aware per-table result (changed == 1).
+func TestHTTPDiffOpReturnsContentAwareSummary(t *testing.T) {
+	_, w, base, token := newHTTPServer(t)
+
+	path, err := w.Checkout("app", "main")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if out, err := exec.Command("sqlite3", path,
+		"CREATE TABLE results (id INTEGER PRIMARY KEY, passed INT); "+
+			"INSERT INTO results VALUES (1,1),(2,1),(3,1);").CombinedOutput(); err != nil {
+		t.Fatalf("%v: %s", err, out)
+	}
+	if _, err := w.Checkpoint("app", "main", "v1", nil); err != nil {
+		t.Fatal(err)
+	}
+	if out, err := exec.Command("sqlite3", path,
+		"UPDATE results SET passed=0 WHERE id=2;").CombinedOutput(); err != nil {
+		t.Fatalf("%v: %s", err, out)
+	}
+	if _, err := w.Checkpoint("app", "main", "v2", nil); err != nil {
+		t.Fatal(err)
+	}
+
+	resp := decodeResponse(t, httpRPC(t, base, "Bearer "+token, Request{
+		Op: "diff", Left: "app@main@v1", Right: "app@main@v2",
+	}))
+	if !resp.OK || resp.Diff == nil {
+		t.Fatalf("diff over http = %+v", resp)
+	}
+	if len(resp.Diff.Tables) != 1 {
+		t.Fatalf("diff.tables over http = %+v, want exactly one table", resp.Diff.Tables)
+	}
+	res := resp.Diff.Tables[0]
+	if res.Table != "results" || res.Changed != 1 || res.Status != "changed" {
+		t.Fatalf("diff.tables[0] over http = %+v, want results changed=1 status=changed", res)
+	}
+	if resp.Diff.Totals.Changed != 1 {
+		t.Fatalf("diff.totals over http = %+v, want changed=1", resp.Diff.Totals)
+	}
+}

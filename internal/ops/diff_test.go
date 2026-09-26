@@ -293,6 +293,104 @@ func TestDiffSummarySchemaMismatchIsReportedNotCompared(t *testing.T) {
 	}
 }
 
+// TestDiffSummaryGeneratedColumnOnOneSideStillCompares: PRAGMA table_info
+// hides a GENERATED ALWAYS column, but `SELECT *` does not. Before the EXCEPT
+// projection was built from the explicit, quoted table_info column list, a
+// generated column present on only one side made the two SELECTs either
+// side of EXCEPT disagree on their number of result columns, and SQLite
+// rejected the query outright — killing the whole summary. Column lists
+// (table_info's, which is what Comparable is judged on) still match here,
+// so this must remain Comparable and must not error.
+func TestDiffSummaryGeneratedColumnOnOneSideStillCompares(t *testing.T) {
+	testutil.RequireSQLite3(t)
+
+	// Same row content (1) on both sides; only the right side has the
+	// generated column. The CREATE statements differ (SchemaChanged), but
+	// the stored column's value doesn't, so Changed must be 0.
+	left := filepath.Join(t.TempDir(), "left.db")
+	right := filepath.Join(t.TempDir(), "right.db")
+	if out, err := exec.Command("sqlite3", left,
+		"CREATE TABLE g (a INT); INSERT INTO g VALUES (1);",
+	).CombinedOutput(); err != nil {
+		t.Fatalf("%v: %s", err, out)
+	}
+	if out, err := exec.Command("sqlite3", right,
+		"CREATE TABLE g (a INT, b INT GENERATED ALWAYS AS (a*2) VIRTUAL); INSERT INTO g (a) VALUES (1);",
+	).CombinedOutput(); err != nil {
+		t.Fatalf("%v: %s", err, out)
+	}
+	got, err := DiffSummary(left, right)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(got) != 1 {
+		t.Fatalf("got %d tables, want 1: %+v", len(got), got)
+	}
+	d := got[0]
+	if !d.Comparable {
+		t.Fatalf("g = %+v, want comparable (table_info-visible columns match on both sides)", d)
+	}
+	if d.Changed != 0 {
+		t.Fatalf("g.Changed = %d, want 0 (identical stored content, ignoring the generated column)", d.Changed)
+	}
+	if !d.SchemaChanged {
+		t.Fatalf("g.SchemaChanged = false, want true (CREATE statements differ)")
+	}
+	if d.Status != "changed" {
+		t.Fatalf("g.Status = %q, want %q (schema differs even though stored content doesn't)", d.Status, "changed")
+	}
+
+	// Same shapes, but differing stored content: left (1), right (2) — must
+	// show up as one Changed row via the explicit column list, not error.
+	left2 := filepath.Join(t.TempDir(), "left2.db")
+	right2 := filepath.Join(t.TempDir(), "right2.db")
+	if out, err := exec.Command("sqlite3", left2,
+		"CREATE TABLE g (a INT); INSERT INTO g VALUES (1);",
+	).CombinedOutput(); err != nil {
+		t.Fatalf("%v: %s", err, out)
+	}
+	if out, err := exec.Command("sqlite3", right2,
+		"CREATE TABLE g (a INT, b INT GENERATED ALWAYS AS (a*2) VIRTUAL); INSERT INTO g (a) VALUES (2);",
+	).CombinedOutput(); err != nil {
+		t.Fatalf("%v: %s", err, out)
+	}
+	got2, err := DiffSummary(left2, right2)
+	if err != nil {
+		t.Fatal(err)
+	}
+	d2 := got2[0]
+	if !d2.Comparable || d2.Changed != 1 {
+		t.Fatalf("g = %+v, want comparable changed=1", d2)
+	}
+
+	// Pre-existing case: a generated column present on BOTH sides (e.g.
+	// added via ALTER TABLE ... ADD COLUMN ... VIRTUAL on each) never hit
+	// the "*" bug, since the column counts already matched either way —
+	// confirm it still compares correctly under the explicit list too.
+	left3 := filepath.Join(t.TempDir(), "left3.db")
+	right3 := filepath.Join(t.TempDir(), "right3.db")
+	if out, err := exec.Command("sqlite3", left3,
+		"CREATE TABLE g (a INT); INSERT INTO g VALUES (1);"+
+			"ALTER TABLE g ADD COLUMN b INT GENERATED ALWAYS AS (a*2) VIRTUAL;",
+	).CombinedOutput(); err != nil {
+		t.Fatalf("%v: %s", err, out)
+	}
+	if out, err := exec.Command("sqlite3", right3,
+		"CREATE TABLE g (a INT); INSERT INTO g VALUES (2);"+
+			"ALTER TABLE g ADD COLUMN b INT GENERATED ALWAYS AS (a*2) VIRTUAL;",
+	).CombinedOutput(); err != nil {
+		t.Fatalf("%v: %s", err, out)
+	}
+	got3, err := DiffSummary(left3, right3)
+	if err != nil {
+		t.Fatal(err)
+	}
+	d3 := got3[0]
+	if !d3.Comparable || d3.Changed != 1 {
+		t.Fatalf("g (generated column on both sides) = %+v, want comparable changed=1", d3)
+	}
+}
+
 // TestDiffSummaryIdenticalSidesAreSame: same content, same schema → same.
 func TestDiffSummaryIdenticalSidesAreSame(t *testing.T) {
 	testutil.RequireSQLite3(t)

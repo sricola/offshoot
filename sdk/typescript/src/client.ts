@@ -188,16 +188,25 @@ export interface DiffTotals {
 /** {@link Client.diff}'s result: a content-aware per-table summary plus,
  * when called with `opts.full`, sqldiff's own SQL output.
  *
- * Mirrors `internal/daemon/protocol.go`'s `DiffResult`. `full` is omitted
- * unless requested; `truncated` is true when the daemon capped `full` at
- * `opts.maxBytes`.
+ * Mirrors `internal/daemon/protocol.go`'s `DiffResult`. {@link Client.diff}
+ * sends `full`/`max_bytes` on every request (defaulting to `false`/`0`
+ * when `opts.full` is omitted); the daemon in turn omits `full` and
+ * `truncated` from its response entirely unless that request's `full` was
+ * `true` — never sending them as `false`/`""`/`0`. This client fills the
+ * gap with `""`/`false` fallbacks below, so `full`/`truncated` always come
+ * back as real (if empty) values here even though the daemon left them out.
  */
 export interface DiffResult {
   left: string;
   right: string;
   tables: TableDiff[];
   totals: DiffTotals;
+  /** sqldiff's own SQL output, capped at `opts.maxBytes`. The daemon omits
+   * this field unless the request's `full` was `true`; see this
+   * interface's doc comment. */
   full?: string;
+  /** True when the daemon capped `full` at `opts.maxBytes`. Omitted by the
+   * daemon (like `full`) unless the request's `full` was `true`. */
   truncated?: boolean;
 }
 
@@ -207,7 +216,9 @@ export interface DiffOptions {
    * table. */
   table?: string;
   /** Also return sqldiff's own SQL output (requires sqldiff on the daemon
-   * host). */
+   * host). {@link Client.diff} always sends `full` on the wire (`false`
+   * when this is omitted); the daemon omits `full`/`truncated` from its
+   * response unless this was `true`. */
   full?: boolean;
   /** Cap `full`'s size in bytes; omitted (or 0) means the daemon's default
    * (1 MiB). */

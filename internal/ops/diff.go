@@ -196,6 +196,11 @@ type TableDiff struct {
 	// primary key, verified unique on both sides), "rowid" (the table's
 	// internal rowid, used when there is no usable PK), or "" when neither
 	// was usable (Comparable is then false even though columns matched).
+	// Rowid identity is only meaningful when both sides descend from one
+	// seed and rowids were not renumbered (VACUUM on a table without an
+	// INTEGER PRIMARY KEY, or a cross-database diff); otherwise it
+	// over-reports changes, which is the safe direction for a promote
+	// decision.
 	Key string `json:"key"`
 
 	// Status is "added" | "removed" | "same" | "changed".
@@ -524,9 +529,22 @@ func DiffSummary(leftPath, rightPath string) ([]TableDiff, error) {
 			}
 			d.Key = keyKind
 
-			selectList := "*"
+			// The EXCEPT projection is built from the explicit,
+			// double-quoted table_info column names — never "*". SQLite's
+			// PRAGMA table_info hides a GENERATED ALWAYS column, but
+			// `SELECT *` includes it; if only one side has such a column,
+			// "*" would give the two SELECTs a different number of result
+			// columns and EXCEPT itself would fail ("SELECTs to the left
+			// and right of EXCEPT do not have the same number of result
+			// columns"), killing the whole summary. li.cols/ri.cols are
+			// already confirmed equal above, so either side's list works.
+			quotedCols := make([]string, len(li.cols))
+			for i, c := range li.cols {
+				quotedCols[i] = quoteIdent(c)
+			}
+			selectList := strings.Join(quotedCols, ", ")
 			if keyKind == "rowid" {
-				selectList = quoteIdent(key[0]) + ", *"
+				selectList = quoteIdent(key[0]) + ", " + selectList
 			}
 			var conds []string
 			for _, k := range key {

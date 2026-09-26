@@ -1031,6 +1031,12 @@ func splitSide(arg, side string) (branch, checkpoint string, r ToolResult, bad b
 		branch = parts[0]
 	case 2:
 		branch, checkpoint = parts[0], parts[1]
+		if checkpoint == "" {
+			// "branch@" — an empty checkpoint after the "@" is a malformed
+			// shape, not a way to spell "head" (that's plain "branch", no
+			// "@" at all).
+			return "", "", ErrorResult("%s must be branch or branch@checkpoint, got %q", side, arg), true
+		}
 	default:
 		return "", "", ErrorResult("%s must be branch or branch@checkpoint, got %q", side, arg), true
 	}

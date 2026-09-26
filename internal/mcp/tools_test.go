@@ -1095,6 +1095,7 @@ func TestDiffToolComparesAttemptsContentAware(t *testing.T) {
 		{"database": "app", "left": "../x", "right": "main"},
 		{"database": "app", "left": "main", "right": "main", "max_bytes": 1 << 20},
 		{"database": "app", "left": "main", "right": "main", "table": "nope"},
+		{"database": "app", "left": "main@", "right": "main"}, // trailing "@": empty checkpoint, not head
 	} {
 		if r := call(t, ts, "offshoot_diff", bad); !r.IsError {
 			t.Fatalf("args %v must be a tool error", bad)

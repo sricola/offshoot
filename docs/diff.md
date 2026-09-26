@@ -100,7 +100,11 @@ it lists both sides' tables from `sqlite_master` and, for a table present on
 both sides with matching columns, counts rows added/removed/changed by row
 identity (the table's declared primary key when it's actually unique on
 both sides, otherwise the table's own internal rowid — see
-[docs/reference.md](reference.md) for the exact fallback order), via
+[docs/reference.md](reference.md) for the exact fallback order). Rowid
+identity is meaningful when both sides descend from one seed and rowids
+were not renumbered (a `VACUUM` on a table without an `INTEGER PRIMARY
+KEY`, or a cross-database diff); otherwise it over-reports changes, which
+is the safe direction for a promote decision. Row counting itself is via
 `database/sql` + the `mattn/go-sqlite3` driver this binary is already built
 with, opened strictly read-only (`file:<path>?mode=ro&immutable=1` —
 verified against a `chmod 0444` file, the exact permission `checkout --at

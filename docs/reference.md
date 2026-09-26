@@ -204,10 +204,14 @@ alongside an open daemon session on either branch) and either streams
 `sqldiff`'s output over them (default) or prints a stdlib-only, content-aware
 per-table summary (`--summary`, no `sqldiff` dependency at all): rows
 added/removed/changed by the table's declared primary key (falling back to
-its internal rowid when there's no usable declared key), with schema changes
-flagged (the STATUS cell gets a trailing " (schema)"); a table whose column
-list differs between the two sides is reported, with row counts, but not
-compared. `--table` restricts either mode to one table. Each target uses the
+its internal rowid when there's no usable declared key — meaningful when
+both sides descend from one seed and rowids were not renumbered, e.g. by a
+`VACUUM` on a table without an `INTEGER PRIMARY KEY`, or a cross-database
+diff; otherwise it over-reports changes, the safe direction for a promote
+decision), with schema changes flagged (the STATUS cell gets a trailing
+" (schema)"); a table whose column list differs between the two sides is
+reported, with row counts, but not compared. `--table` restricts either
+mode to one table. Each target uses the
 same triple-`@` form `export` does — `db` alone means `db@main` head,
 `db@branch` means that branch's head, `db@branch@checkpoint` means that named
 checkpoint. The two targets may name the same `db` or two different ones.
