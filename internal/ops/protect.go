@@ -3,7 +3,6 @@ package ops
 import (
 	"errors"
 	"fmt"
-	"time"
 
 	"github.com/sricola/offshoot/internal/store"
 )
@@ -13,7 +12,10 @@ import (
 // through an MCP server without -allow-force — cannot be forced by an
 // agent at all. CAS-retried like Touch; refuses a branch a reaper or a
 // Destroy has already claimed, since flipping the flag under either would
-// race the claim's own outcome.
+// race the claim's own outcome. Deliberately does NOT call Touch: a
+// protection flip is not activity, so the activity clock (TouchedAt) and
+// the TTL deadline it anchors are left exactly as they were — unprotecting
+// a stale, TTL'd branch must not incidentally grant it a fresh TTL window.
 func (w *Workspace) SetProtected(db, branch string, protected bool) (store.Ref, error) {
 	if err := store.ValidateName(db); err != nil {
 		return store.Ref{}, err
@@ -33,7 +35,6 @@ func (w *Workspace) SetProtected(db, branch string, protected bool) (store.Ref, 
 			return ref, nil
 		}
 		ref.Protected = protected
-		ref.Touch(time.Now())
 		if _, err := w.Store.PutRef(db, branch, ref, etag); err != nil {
 			if errors.Is(err, store.ErrCAS) {
 				continue

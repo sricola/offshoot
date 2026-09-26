@@ -3,6 +3,7 @@ package ops
 import (
 	"strings"
 	"testing"
+	"time"
 )
 
 // TestSetProtectedFlipsTheFlagAndGatesDestroy: protect a fork, then an
@@ -42,5 +43,32 @@ func TestSetProtectedFlipsTheFlagAndGatesDestroy(t *testing.T) {
 	}
 	if _, err := w.SetProtected("app", "nope", true); err == nil {
 		t.Fatal("unknown branch must error")
+	}
+
+	// A protection flip is not activity: it must not reset TouchedAt (and
+	// so must not incidentally grant a stale, TTL'd branch a fresh TTL
+	// window).
+	if _, err := w.Fork("app", "main", "ttl-keep", "", time.Hour, nil); err != nil {
+		t.Fatal(err)
+	}
+	before, _, err := w.Store.GetRef("app", "ttl-keep")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if before.TouchedAt == "" {
+		t.Fatal("fork with a ttl must stamp TouchedAt")
+	}
+	if _, err := w.SetProtected("app", "ttl-keep", true); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := w.SetProtected("app", "ttl-keep", false); err != nil {
+		t.Fatal(err)
+	}
+	after, _, err := w.Store.GetRef("app", "ttl-keep")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if after.TouchedAt != before.TouchedAt {
+		t.Fatalf("SetProtected must not touch the activity clock: before=%q after=%q", before.TouchedAt, after.TouchedAt)
 	}
 }
