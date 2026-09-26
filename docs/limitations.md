@@ -123,8 +123,7 @@ dirty and its tail becomes an orphan fork instead
 against a store that can't provide it — fail-closed, on every CLI
 invocation.
 
-**Verified providers, honestly labeled:** MinIO (conformance suite runs
-against real MinIO in CI on every PR) and AWS S3 (probe + conformance +
+**Verified providers, honestly labeled:** RustFS (conformance suite runs against real RustFS in CI on every PR; MinIO was verified through v0.2.9 and is no longer re-verified since its images were withdrawn) and AWS S3 (probe + conformance +
 multipart against a real us-east-1 bucket, 2026-08-13). **Google Cloud
 Storage is unsupported** — its S3-interop API has no conditional writes,
 so the probe refuses it outright
