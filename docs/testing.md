@@ -6,6 +6,18 @@ model that makes concurrent use safe, what the conformance suite proves
 about storage backends, and the gates every change passes. Everything here
 names the code or workflow that backs it.
 
+**At a glance:**
+
+| Claim | Evidence | Where it runs |
+|---|---|---|
+| A `kill -9`'d writer never corrupts the replica | `TestTortureWriterKill`: ~3,500 rounds, ~1,700 SIGKILLs, dump-identical every round | nightly Linux, weekly macOS (`nightly.yml`) |
+| One writer per lineage, always | lease epochs + create-only puts + CAS on every ref; CAS probe refuses stores without it | every `go test`, RustFS on every PR, AWS nightly |
+| Storage backends behave identically | `storetest.RunConformance` | local + fake S3 every run; real RustFS every PR; real AWS nightly since 2026-09-25 |
+| Per-test isolation is cheap and measured | `make bench-isolation`, one pasted run | [benchmarks.md](benchmarks.md#per-test-isolation-primitives-v0211) |
+| Branch-heavy agent topologies hold up | `make bench-branchbench`, one pasted run | [benchmarks.md](benchmarks.md#branchbench-topologies-v0211) |
+| What you download is what CI built | keyless cosign + SLSA provenance + SBOM on every tag | `release.yml`; verify per [installation](installation.md#verify-what-you-downloaded) |
+| Regression tests fail on the bug they fix | mutation-verified against the pre-fix code | review policy, CONTRIBUTING.md |
+
 ## The kill -9 torture harness
 
 The single most load-bearing test in the repo is
@@ -157,6 +169,43 @@ assertion was verified against. [CONTRIBUTING.md](../CONTRIBUTING.md)
 makes the surrounding policy explicit: behavioral changes don't get
 reviewed without tests, and capture/flush changes don't merge without a
 torture run.
+
+## Signed releases
+
+Every tagged release since v0.2.11 is signed by the release workflow
+itself with cosign's keyless mode, bound to a certificate identity scoped
+to `.github/workflows/release.yml` in this repo — there is no
+maintainer-held signing key to leak or rotate. Each artifact also carries
+SLSA build provenance as a GitHub attestation, tying the binary back to
+the exact workflow run and commit that produced it. An SPDX SBOM of the
+Go module graph (`offshoot_<tag>.spdx.json`) ships with every release,
+with its own matching attestation. The three independent checks and the
+exact commands are at
+[installation.md's verification section](installation.md#verify-what-you-downloaded);
+releases before v0.2.11 carry checksums only.
+
+## What is not proven here
+
+- **The capturer process itself is never `SIGKILL`ed.** The torture
+  harness bounces the capture engine through its graceful-shutdown path
+  on every 10th round, not a hard kill of the capturer process itself;
+  that case is argued safe in `internal/capture/engine.go`'s
+  shutdown/resume doc comments but is not exercised by this harness.
+- **macOS runs without the race detector.** The nightly `macos-test` job
+  runs the full suite, including the torture harness, on macOS — but
+  without `-race`. `-race` coverage is Linux-only, on every push and PR.
+- **Only RustFS and AWS S3 are independently verified against real
+  storage.** Every other S3-compatible provider is same-code-path only:
+  it should pass the identical conformance suite, but it has not itself
+  been run against a live instance in CI. MinIO was verified through
+  v0.2.9 and is no longer re-verified after upstream withdrew its
+  community images.
+- **Benchmark numbers are one machine, one run.** The copy-on-write,
+  isolation, and BranchBench numbers in [benchmarks.md](benchmarks.md)
+  are quantiles within a single run on a single laptop, not a
+  median-of-N across runs or a fleet average; repeat runs have reproduced
+  completion counts exactly and wall times within a few percent, but
+  run-to-run variance is real.
 
 ## See also
 
