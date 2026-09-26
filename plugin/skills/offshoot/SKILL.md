@@ -12,7 +12,10 @@ SQLite client opens. You have nine tools; the loop is four calls.
 ## The loop
 
 1. **Orient:** `offshoot_list` — see databases, branches, checkpoints, and
-   which branches are protected (`main` is, by default).
+   which branches are protected (`main` is, by default). A human can
+   protect any other branch too (`offshoot protect <db>[@branch]` /
+   `offshoot unprotect`, CLI-only — there's no MCP tool for it, so you can
+   see the flag here but never change it).
 2. **Fork before risk:** `offshoot_fork {database, new_branch, branch?, at?, ttl?, meta?}`
    — instant, two small metadata objects, no data copy. Forks expire after
    the server's default TTL (24h) unless you pass `ttl`. Then
@@ -21,7 +24,12 @@ SQLite client opens. You have nine tools; the loop is four calls.
 3. **Checkpoint when tests pass:** `offshoot_checkpoint {database, branch, name, meta?}`.
    Name checkpoints for what they mean (`before-migration`, `migrated`).
 4. **Roll back when they fail:** `offshoot_rollback {database, branch, to}`
-   returns the branch to a checkpoint, discarding everything since.
+   returns the branch to a checkpoint, discarding everything since. The
+   branch's previous head is kept first as `<branch>-pre-rollback` — the
+   result's `backup` field names it — so a rollback is undone by promoting
+   that fork back onto the branch (`offshoot_promote {source:
+   "<branch>-pre-rollback", target: branch}`). Same TTL'd, one-rolling-slot
+   shape as promote's own safety fork below.
 5. **Compare before you promote:** `offshoot_diff {database, left:
    "attempt-2@done", right: "main"}` (or against a golden checkpoint) — read
    the per-table added/removed/changed counts; use `table` + `full` to see

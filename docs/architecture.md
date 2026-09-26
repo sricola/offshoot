@@ -106,8 +106,12 @@ existing user file.
   into a self-contained branch: its full base-following chain at head is
   re-encoded as one snapshot in a fresh lineage and the base pointer is
   dropped, so the branch stops reading through — and stops pinning — its
-  ancestors' storage. A no-op on an already self-contained branch. Like
-  promote, it resets the checkpoint map (to `{"compact": head}`).
+  ancestors' storage. A no-op on an already self-contained branch. Unlike
+  promote, it does **not** reset the checkpoint map: every existing
+  checkpoint's snapshot is copied into the new lineage (rollback-style,
+  rewritten to epoch 1), and a `compact` checkpoint is added at head
+  alongside them — one extra snapshot copy per distinct checkpoint txid
+  kept, on top of the head copy compact already pays.
 - **Destroy / GC** — explicit destroy, TTL expiry, and a background
   collector. Destroying a parent is always safe, instant, and allowed
   regardless of live children — a parent's destruction can never corrupt a
@@ -340,9 +344,14 @@ or capture path must preserve:
    without re-touching the chain at all — see
    [docs/status.md](status.md)'s clean-checkout row for that tradeoff.
 7. **Protected branches require an explicit override for anything
-   destructive.** `main` is protected by default; `destroy` and `promote
-   --onto` a protected branch refuse without `--force`, uniformly across
-   the CLI, the daemon, and the MCP server.
+   destructive.** `main` is protected by default (any branch can be, via
+   `offshoot protect`); `destroy` and `promote --onto` a protected branch
+   refuse without `--force`, uniformly across the CLI, the daemon, and the
+   MCP server — except that through `offshoot mcp`, an agent's own
+   `force:true` is honored only when the server itself was started with
+   `-allow-force` (off by default), so the override there is a startup
+   decision the human running the server makes, not an argument the agent
+   can supply on its own.
 8. **Durability is a reported fact, not an assumption.** Whatever the API
    reports as "durable through txid X" is exactly what round-trips through
    a restore — never optimistic, never stale by more than the caller can

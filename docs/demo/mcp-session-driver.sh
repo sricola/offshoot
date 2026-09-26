@@ -116,8 +116,14 @@ send '{"jsonrpc":"2.0","id":8,"method":"tools/call","params":{"name":"offshoot_c
 echo "== JSON-RPC: offshoot_promote without force (main is protected — expect refusal) =="
 send '{"jsonrpc":"2.0","id":9,"method":"tools/call","params":{"name":"offshoot_promote","arguments":{"database":"shop","source":"migration-attempt","target":"main"}}}' > /dev/null
 
-echo "== JSON-RPC: offshoot_promote with force =="
-send '{"jsonrpc":"2.0","id":10,"method":"tools/call","params":{"name":"offshoot_promote","arguments":{"database":"shop","source":"migration-attempt","target":"main","force":true}}}' > /dev/null
+echo "== JSON-RPC: offshoot_diff comparing main with the validated attempt (no force call: the agent compares, it doesn't force) =="
+send '{"jsonrpc":"2.0","id":10,"method":"tools/call","params":{"name":"offshoot_diff","arguments":{"database":"shop","left":"main","right":"migration-attempt@migrated"}}}' > /dev/null
+
+echo "== CLI: human reviews the diff and promotes from the CLI (main is protected; MCP refuses force by default) =="
+section "CLI: human promotes shop@migration-attempt onto main after reviewing the diff"
+OUT=$("$OFFSHOOT" -store "$STORE" promote shop@migration-attempt --onto main --force 2>&1)
+echo '$ offshoot -store $STORE promote shop@migration-attempt --onto main --force' >> "$LOG"
+echo "$OUT" >> "$LOG"
 
 echo "== JSON-RPC: offshoot_destroy the now-merged attempt branch =="
 send '{"jsonrpc":"2.0","id":11,"method":"tools/call","params":{"name":"offshoot_destroy","arguments":{"database":"shop","branch":"migration-attempt"}}}' > /dev/null
