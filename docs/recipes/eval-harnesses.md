@@ -83,7 +83,7 @@ task  description                                                     k   pass@1
 3     Fill in order 4's total, rounded to the cent.                   4     1.00     PASS
 4     Fill in order 5's total, rounded to the cent.                   4     0.75     FAIL
 --------------------------------------------------------------------------------------------
-5 tasks, k=4, wall time: 2.09s
+5 tasks, k=4, wall time: 1.95s
 
 Task 4's pass@1 of 0.75 reads as "mostly fine" -- pass@1 only asks
 "what fraction of trials passed?" pass^k ("would EVERY one of k independent
@@ -143,12 +143,24 @@ between `session.close()` and `client.destroy(...)` if it wants
 ## promptfoo
 
 **This sketch is not exercised in CI; it targets promptfoo's public
-`extensions`/hook API as of 2026-09.** promptfoo's `extensionHooks` let a
-config wire arbitrary JS into its test lifecycle; `beforeEach` and
-`afterEach` are the natural fork/grade-and-destroy pair, run once per test
-case (promptfoo's own repeat unit — configure `repeat` in the test suite to
-get multiple independent attempts at the same case, the `pass^k` unit
-again):
+`extensions` hook API as of 2026-09.**
+<!-- verified against https://www.promptfoo.dev/docs/configuration/reference/ (extensions config key, file://path:function syntax, module.exports, return-to-persist) -->
+
+promptfoo's `extensions` config entries load a JS file's exported hook
+function into its test lifecycle (`beforeAll`/`beforeEach`/`afterEach`/
+`afterAll`); `beforeEach` and `afterEach` are the natural fork/grade-and-
+destroy pair, run once per test case (promptfoo's own repeat unit —
+configure `repeat` in the test suite for multiple independent attempts at
+the same case, the `pass^k` unit again). Three details below are easy to
+get wrong from memory and are exactly what makes this wire up at all:
+the config key is **`extensions`**, not `extensionHooks`; each entry needs
+a **`:functionName` suffix** naming which exported function to call
+(`file://eval-hooks.js:extensionHook`) — matching a `module.exports =
+extensionHook` (or an ESM `export async function extensionHook(hookName,
+context)`) in that file, not a bare default export; and mutating
+`context`/`context.test.vars` in place is **not** enough — promptfoo only
+persists what the hook function returns, so every branch that mutates ends
+with `return context;`.
 
 ```js
 // eval-hooks.js
@@ -157,21 +169,24 @@ import { connect } from "@offshoot-db/client";
 let client;
 const DB = "evals";
 
-export default async function hooks(hookName, context) {
+async function extensionHook(hookName, context) {
   if (hookName === "beforeAll") {
     client = await connect(process.env.OFFSHOOT_SOCKET);
+    return context;
   }
 
   if (hookName === "beforeEach") {
-    const branch = `case-${context.test.vars.caseId}-${context.test.repeatIndex ?? 0}`;
+    const caseId = context.test.vars.caseId;
+    const branch = `case-${caseId}-${context.test.repeatIndex ?? 0}`;
     await client.fork(DB, "main", branch, {
       from: "seed",
-      meta: { case: String(context.test.vars.caseId) },
+      meta: { case: String(caseId) },
     });
     const session = await client.open(DB, branch);
-    context.vars.dbPath = session.path;   // fed to the prompt/provider under test
+    context.test.vars.dbPath = session.path;   // fed to the prompt/provider under test
     context.test.vars._offshootBranch = branch;
     context.test.vars._offshootSession = session;
+    return context;
   }
 
   if (hookName === "afterEach") {
@@ -184,19 +199,23 @@ export default async function hooks(hookName, context) {
       offshoot_diff_clean: diff.tables.every((t) => t.status === "same") ? 1 : 0,
     };
     await client.destroy(DB, branch);
+    return context;
   }
 }
+
+module.exports = extensionHook;
 ```
 
 ```yaml
 # promptfooconfig.yaml
-extensionHooks:
-  - file://eval-hooks.js
+extensions:
+  - file://eval-hooks.js:extensionHook
 ```
 
 Same shape as the Inspect sketch and the runnable example above: fork from
 a shared seed before the attempt, diff against a golden reference after,
-destroy either way.
+destroy either way — `return context;` on every mutating branch is the one
+promptfoo-specific detail that has no analog in the other two.
 
 ## Seeding options, and importing an existing database
 

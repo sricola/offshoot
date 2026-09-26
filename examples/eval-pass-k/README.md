@@ -121,7 +121,7 @@ task  description                                                     k   pass@1
 3     Fill in order 4's total, rounded to the cent.                   4     1.00     PASS
 4     Fill in order 5's total, rounded to the cent.                   4     0.75     FAIL
 --------------------------------------------------------------------------------------------
-5 tasks, k=4, wall time: 2.09s
+5 tasks, k=4, wall time: 1.95s
 
 Task 4's pass@1 of 0.75 reads as "mostly fine" -- pass@1 only asks
 "what fraction of trials passed?" pass^k ("would EVERY one of k independent
@@ -132,4 +132,9 @@ of the time is still wrong every time you'd actually ship it.
 
 Total wall time: under 2 seconds for 21 forks (1 golden + 5 tasks × 4
 trials), 20 diffs, and 20 destroys, on a local unix-socket daemon — well
-under this example's 30s budget.
+under this example's 30s budget. That per-trial cost is fork **+ open**
+(which materializes a checkout — not a bare-fork number; see
+[docs/benchmarks.md](../../docs/benchmarks.md#per-test-isolation-primitives-v0211)'s
+per-test isolation table for how `open`'s checkout materialization and
+settling-flush check dominate over the fork itself) **+ close + diff +
+destroy**, all four counted in every trial's share of the number above.

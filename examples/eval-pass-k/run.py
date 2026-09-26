@@ -117,6 +117,18 @@ class Daemon:
         deadline = time.time() + 10
         while not os.path.exists(self.sock):
             if time.time() > deadline:
+                # The subprocess is still alive (never reached the readiness
+                # check below) but never created its socket -- reap it
+                # before raising, or it's leaked as a zombie/orphan for the
+                # rest of this process's life (nothing else ever calls
+                # .stop() on a Daemon whose __init__ raised).
+                if self.proc.poll() is None:
+                    self.proc.terminate()
+                    try:
+                        self.proc.wait(timeout=10)
+                    except subprocess.TimeoutExpired:
+                        self.proc.kill()
+                        self.proc.wait(timeout=10)
                 raise RuntimeError("daemon did not start: " +
                                     self.proc.stderr.read().decode(errors="replace"))
             if self.proc.poll() is not None:
@@ -176,9 +188,15 @@ def run_eval(sock: str, k: int, n_tasks: int) -> int:
         # evals@golden@expected target.
         client.fork(DB, "main", "golden", from_checkpoint="seed")
         golden = client.open(DB, "golden")
-        apply_sql(golden.path, correct_migration)
-        golden.flush(name="expected")
-        golden.close()
+        try:
+            apply_sql(golden.path, correct_migration)
+            golden.flush(name="expected")
+        finally:
+            # golden itself isn't disposable per attempt -- it's destroyed
+            # once, below, after every task's trials are graded against it
+            # -- but its session's lease must not leak if apply_sql/flush
+            # raises above.
+            golden.close()
 
         print(f"{'task':<6}{'description':<62}{'k':>3}  {'pass@1':>7}  {'pass^k':>7}")
         print("-" * 92)
@@ -191,16 +209,22 @@ def run_eval(sock: str, k: int, n_tasks: int) -> int:
                 buggy = task_id == FLAKY_TASK_ID and trial % 3 == 2
                 client.fork(DB, "main", branch, from_checkpoint="seed",
                             meta={"task": str(task_id), "trial": str(trial)})
-                attempt = client.open(DB, branch)
-                apply_sql(attempt.path, buggy_migration if buggy else correct_migration)
-                attempt.flush()
-                attempt.close()
+                try:
+                    attempt = client.open(DB, branch)
+                    try:
+                        apply_sql(attempt.path, buggy_migration if buggy else correct_migration)
+                        attempt.flush()
+                    finally:
+                        attempt.close()
 
-                diff = client.diff(f"{DB}@{branch}", f"{DB}@golden@expected")
-                passed = all(t.status == "same" for t in diff.tables)
-                outcomes.append(passed)
-
-                client.destroy(DB, branch)
+                    diff = client.diff(f"{DB}@{branch}", f"{DB}@golden@expected")
+                    passed = all(t.status == "same" for t in diff.tables)
+                    outcomes.append(passed)
+                finally:
+                    # Destroy the fork even if apply_sql/flush/diff raised
+                    # above -- a mid-trial exception must not leak a branch
+                    # (or its lease) past this trial.
+                    client.destroy(DB, branch)
 
             pass_at_1 = sum(outcomes) / len(outcomes)
             pass_at_k = all(outcomes)
