@@ -481,6 +481,83 @@ func TestMCPDefaultTTLDefaultsTo24h(t *testing.T) {
 	}
 }
 
+// TestMCPReapEveryNegativeIsRejected mirrors
+// TestMCPDefaultTTLNegativeIsRejected for mcp's -reap-every: a negative
+// duration is (almost certainly) a mistake and must fail closed as a usage
+// error rather than being silently aliased to "disabled" (that's what 0 and
+// "none" are for — see TestMCPReapEveryDisableSpellings). run()'s
+// -reap-every validation happens before StartReaper/srv.Serve are ever
+// reached, so this needs no daemon lifecycle and can't block on os.Stdin
+// either.
+func TestMCPReapEveryNegativeIsRejected(t *testing.T) {
+	dir := filepath.Join(t.TempDir(), "s")
+	if err := run([]string{"-store", dir, "init"}); err != nil {
+		t.Fatal(err)
+	}
+	if err := run([]string{"-store", dir, "mcp", "-reap-every", "-1h"}); err == nil {
+		t.Fatal("mcp -reap-every -1h must be rejected, not silently disable the reaper")
+	}
+}
+
+// TestMCPReapEveryUnparseableIsRejected pins that an unparseable
+// -reap-every comes back as a clear usage error rather than reaching
+// StartReaper with a zero-value duration it never asked for.
+func TestMCPReapEveryUnparseableIsRejected(t *testing.T) {
+	dir := filepath.Join(t.TempDir(), "s")
+	if err := run([]string{"-store", dir, "init"}); err != nil {
+		t.Fatal(err)
+	}
+	err := run([]string{"-store", dir, "mcp", "-reap-every", "bananas"})
+	if err == nil {
+		t.Fatal("mcp -reap-every bananas must be rejected")
+	}
+	if !strings.Contains(err.Error(), "-reap-every") {
+		t.Fatalf("error should name the offending flag: %v", err)
+	}
+}
+
+// TestMCPReapEveryDisableSpellings and TestMCPReapEveryDefaultsTo60s
+// exercise parseReapEveryFlag directly rather than driving `mcp` through
+// run(), for the same reason TestMCPDefaultTTLDisableSpellings/
+// TestMCPDefaultTTLDefaultsTo24h do: a valid -reap-every falls through to
+// srv.Serve(ctx), which blocks reading os.Stdin until EOF or cancellation.
+// parseReapEveryFlag is the actual code the "mcp" case calls, so this
+// covers the real behavior, not a proxy for it.
+
+// TestMCPReapEveryDisableSpellings pins that "0", "0s", and "none" all
+// parse to the same disabled (zero) interval, matching parseDefaultTTLFlag's
+// (and parseTTLFlag's touch/CLI convention) own disable spellings.
+func TestMCPReapEveryDisableSpellings(t *testing.T) {
+	for _, spelling := range []string{"0", "0s", "none"} {
+		got, rest, err := parseReapEveryFlag([]string{"-reap-every", spelling})
+		if err != nil {
+			t.Fatalf("-reap-every %q: %v", spelling, err)
+		}
+		if got != 0 {
+			t.Errorf("-reap-every %q = %v, want 0 (disabled)", spelling, got)
+		}
+		if len(rest) != 0 {
+			t.Errorf("-reap-every %q: leftover args = %v, want none consumed", spelling, rest)
+		}
+	}
+}
+
+// TestMCPReapEveryDefaultsTo60s pins the documented default (the `offshoot
+// mcp` usage line): omitting -reap-every entirely applies 60s, not
+// 0/disabled.
+func TestMCPReapEveryDefaultsTo60s(t *testing.T) {
+	got, rest, err := parseReapEveryFlag(nil)
+	if err != nil {
+		t.Fatalf("parseReapEveryFlag(nil): %v", err)
+	}
+	if got != 60*time.Second {
+		t.Errorf("default reap interval with no -reap-every flag = %v, want 60s", got)
+	}
+	if len(rest) != 0 {
+		t.Errorf("leftover args = %v, want none", rest)
+	}
+}
+
 // TestSessionHonorsServeSocketOverride guards the fix for `serve -socket`
 // and `session` disagreeing on where the socket lives: `serve -socket PATH`
 // used to be unreachable by `session` subcommands because they only ever

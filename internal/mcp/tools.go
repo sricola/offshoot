@@ -1289,8 +1289,19 @@ func (t *OffshootTools) reapOnce(now time.Time) (reaped []string, skipped bool, 
 	if err != nil {
 		firstErr = err
 	}
-	if _, cerr := t.ws.ClearStaleDeleteClaims(now); cerr != nil && firstErr == nil {
-		firstErr = cerr
+	if _, cerr := t.ws.ClearStaleDeleteClaims(now); cerr != nil {
+		if firstErr == nil {
+			firstErr = cerr
+		} else {
+			// Both steps failed this pass: firstErr (Reap's) is what this
+			// call returns, per this function's own doc comment, but that
+			// would otherwise silently drop ClearStaleDeleteClaims' error
+			// on the floor. janitorTick logs each step's error on its own
+			// line regardless of whether an earlier step also failed (see
+			// janitor.go) — mirrored here so an operator watching stderr
+			// still learns about this failure too, not just the first one.
+			fmt.Fprintf(os.Stderr, "offshoot mcp: clear stale delete claims: %v\n", cerr)
+		}
 	}
 	return reaped, false, firstErr
 }
@@ -1322,11 +1333,27 @@ func (t *OffshootTools) reapOnce(now time.Time) (reaped []string, skipped bool, 
 //
 // Never panics: reapOnce's own errors are returned values, not panics, and
 // this loop only ever logs them.
-func (t *OffshootTools) StartReaper(ctx context.Context, every time.Duration) {
+//
+// Returns done, closed the instant the reaper's goroutine actually exits —
+// already closed before this call returns when every <= 0 disabled it
+// outright (no goroutine was ever started), or closed once the running
+// goroutine observes ctx.Done() otherwise. This is a smaller-scoped sibling
+// of StartJanitor/Shutdown's janitorWG synchronization (internal/daemon):
+// that one lets Shutdown block until every daemon goroutine has stopped;
+// this lets a caller (a test, chiefly — see
+// TestStartReaperTicksAndStopsOnCancel in internal/mcp) prove this one
+// goroutine specifically has stopped after cancelling ctx, rather than only
+// ever being able to poll side effects and infer it. cmd/offshoot/main.go's
+// `mcp` case doesn't need to wait on it (its own process teardown after
+// srv.Serve returns is enough), so it discards the return value.
+func (t *OffshootTools) StartReaper(ctx context.Context, every time.Duration) (done <-chan struct{}) {
+	doneCh := make(chan struct{})
 	if every <= 0 {
-		return
+		close(doneCh)
+		return doneCh
 	}
 	go func() {
+		defer close(doneCh)
 		ticker := time.NewTicker(every)
 		defer ticker.Stop()
 		loggedSkip := false
@@ -1352,4 +1379,5 @@ func (t *OffshootTools) StartReaper(ctx context.Context, every time.Duration) {
 			}
 		}
 	}()
+	return doneCh
 }

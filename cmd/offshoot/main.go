@@ -981,7 +981,12 @@ func run(args []string) error {
 		// "none") starts no goroutine at all (see StartReaper).
 		ctx, cancel := context.WithCancel(context.Background())
 		defer cancel()
-		ts.StartReaper(ctx, reapEvery)
+		// StartReaper's returned channel is a test hook (see its own doc
+		// comment) for proving the reaper's goroutine actually stopped
+		// after cancellation — this process's own teardown once srv.Serve
+		// returns already ensures that, so there's nothing more to wait on
+		// here.
+		_ = ts.StartReaper(ctx, reapEvery)
 		srv := mcp.NewServer(os.Stdin, os.Stdout, ts)
 		return srv.Serve(ctx)
 	case "serve":

@@ -1393,3 +1393,68 @@ func TestReapOnceNeverReapsProtected(t *testing.T) {
 		t.Fatalf("app@attempt-1 must survive reapOnce, GetRef err = %v", err)
 	}
 }
+
+// TestStartReaperZeroDisablesIt mirrors internal/daemon/lifecycle_test.go's
+// TestStartJanitorZeroDisablesIt for the MCP reaper: every <= 0 must start
+// no goroutine at all, so an expired branch is never touched no matter how
+// long the test waits.
+func TestStartReaperZeroDisablesIt(t *testing.T) {
+	ts, w := newTools(t)
+	if _, err := w.Fork("app", "main", "attempt-1", "", time.Millisecond, nil); err != nil {
+		t.Fatal(err)
+	}
+
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	done := ts.StartReaper(ctx, 0)
+	select {
+	case <-done:
+	default:
+		t.Fatal("StartReaper(ctx, 0) must report done immediately: no goroutine is ever started")
+	}
+
+	// Give a real (disabled) reaper every chance to wrongly fire.
+	time.Sleep(200 * time.Millisecond)
+
+	if _, _, err := w.Store.GetRef("app", "attempt-1"); err != nil {
+		t.Fatalf("StartReaper(ctx, 0) must disable the reaper; expired branch was reaped: %v", err)
+	}
+}
+
+// TestStartReaperTicksAndStopsOnCancel mirrors
+// TestStartJanitorZeroDisablesIt's sibling shape but for the positive case:
+// a running reaper actually reaps an expired branch on its own ticker, with
+// no test-driven manual tick (unlike janitorTick's own test harness, which
+// can call janitorTick directly — StartReaper has no exported single-tick
+// equivalent, so this drives the real ticker with a short interval and
+// polls). It then proves the goroutine itself stops once ctx is cancelled,
+// via the done channel StartReaper returns — the same proof
+// StartJanitor/Shutdown gets for free from janitorWG, scoped down to one
+// goroutine here (see StartReaper's own doc comment).
+func TestStartReaperTicksAndStopsOnCancel(t *testing.T) {
+	ts, w := newTools(t)
+	if _, err := w.Fork("app", "main", "attempt-1", "", time.Millisecond, nil); err != nil {
+		t.Fatal(err)
+	}
+
+	ctx, cancel := context.WithCancel(context.Background())
+	done := ts.StartReaper(ctx, 20*time.Millisecond)
+
+	deadline := time.Now().Add(2 * time.Second)
+	for {
+		if _, _, err := w.Store.GetRef("app", "attempt-1"); errors.Is(err, store.ErrNotFound) {
+			break
+		}
+		if time.Now().After(deadline) {
+			t.Fatal("StartReaper did not reap the expired branch within 2s")
+		}
+		time.Sleep(10 * time.Millisecond)
+	}
+
+	cancel()
+	select {
+	case <-done:
+	case <-time.After(2 * time.Second):
+		t.Fatal("StartReaper's goroutine did not exit within 2s of ctx cancellation")
+	}
+}
