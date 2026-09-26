@@ -1,7 +1,7 @@
 .PHONY: test test-torture build test-s3 bench bench-cow bench-s3 check-python-version test-python-sdk test-ts-sdk test-sdks test-python-langgraph \
 	check-sdk-versions dry-run-python-sdk dry-run-ts-sdk dry-run-sdks test-pytest-plugin \
 	ci-local ci-local-host ci-local-linux ci-local-s3 ci-local-minio ci-local-sdks lint \
-	check-plugin
+	check-plugin bench-isolation
 
 # Override with `make PYTHON=python3.14 ...` when the platform's unversioned
 # python3 is older than the SDKs' declared Python 3.10 minimum.
@@ -208,3 +208,22 @@ third-party-licenses:
 
 check-plugin:
 	./scripts/check-plugin.sh
+
+# bench-isolation runs scripts/bench-isolation.py: a stdlib-only benchmark
+# of the primitives an eval harness could use to get a fresh, isolated
+# database per test (offshoot fork+open+close, offshoot fork alone,
+# sqlite3.Connection.backup(), shutil.copyfile, and — when Docker and a
+# local postgres:16 image are available — Postgres `CREATE DATABASE ...
+# TEMPLATE` and a cold-container start), at seed sizes 10 and 100 MB. See
+# docs/benchmarks.md's "Per-test isolation primitives" section for the
+# measured numbers this produces, and the script's own docstring for what
+# each row is. Builds the offshoot binary fresh, and creates a throwaway
+# venv (.venv-bench) if one doesn't already exist -- stdlib only, since the
+# script reaches sdk/python via sys.path (like sdk/python/tests/
+# test_client.py's DaemonFixture does), never a pip install. Takes several
+# minutes: the Postgres CREATE DATABASE TEMPLATE row at 100 MB and the
+# cold-container row both do real container/database work.
+bench-isolation: check-python-version
+	go build -o bin/offshoot-bench ./cmd/offshoot
+	test -d .venv-bench || $(PYTHON) -m venv .venv-bench
+	.venv-bench/bin/python3 scripts/bench-isolation.py --sizes 10,100 --iters 20
