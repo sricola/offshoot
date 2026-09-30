@@ -55,6 +55,13 @@ type Metrics struct {
 	// at read time, not as a fork-time rate. Once shipped it is as locked as
 	// the rest: renaming it is a breaking change.
 	ForkModeTotal *metrics.CounterVec // {mode} — shared|materialized
+	// RollbackTotal/PromoteTotal (offshoot_rollback_total{mode},
+	// offshoot_promote_total{mode}) count repoints by storage mode, the
+	// same split as ForkModeTotal: shared = a base pointer to the kept
+	// history, materialized = a self-contained copy (the snapshot floor or
+	// materialize). Locked once shipped, like the rest.
+	RollbackTotal *metrics.CounterVec // {mode} — shared|materialized
+	PromoteTotal  *metrics.CounterVec // {mode} — shared|materialized
 
 	CheckpointDuration *metrics.Histogram
 
@@ -122,6 +129,14 @@ func newMetrics() *Metrics {
 				"zero data objects copied; materialized = a full snapshot copy in the child's own "+
 				"lineage — the fork-time snapshot floor).",
 			"mode"),
+		RollbackTotal: r.NewCounterVec("offshoot_rollback_total",
+			"Rollbacks whose repoint landed, by storage mode (shared = a base pointer to the kept "+
+				"checkpoint, zero data objects copied; materialized = a full snapshot copy).",
+			"mode"),
+		PromoteTotal: r.NewCounterVec("offshoot_promote_total",
+			"Promotes whose repoint landed, by storage mode (shared = a base pointer to the source "+
+				"head, zero data objects copied; materialized = a full snapshot copy).",
+			"mode"),
 
 		CheckpointDuration: r.NewHistogram("offshoot_checkpoint_duration_seconds",
 			"Successful at-rest checkpoint latency in seconds. Only populated by a process that calls "+
@@ -161,6 +176,8 @@ func newMetrics() *Metrics {
 	}
 	for _, mode := range []string{"shared", "materialized"} {
 		m.ForkModeTotal.WithLabelValues(mode)
+		m.RollbackTotal.WithLabelValues(mode)
+		m.PromoteTotal.WithLabelValues(mode)
 	}
 	return m
 }
@@ -244,13 +261,25 @@ func (m *Metrics) observeFork(dur time.Duration, fast, shared bool) {
 	if fast {
 		path = "fast"
 	}
-	mode := "materialized"
-	if shared {
-		mode = "shared"
-	}
 	m.ForkTotal.WithLabelValues(path).Inc()
-	m.ForkModeTotal.WithLabelValues(mode).Inc()
+	m.ForkModeTotal.WithLabelValues(storageMode(shared)).Inc()
 	m.ForkDuration.Observe(dur.Seconds())
+}
+
+// storageMode is the {mode} label for a shared-or-copied lineage.
+func storageMode(shared bool) string {
+	if shared {
+		return "shared"
+	}
+	return "materialized"
+}
+
+func (m *Metrics) observeRollback(shared bool) {
+	m.RollbackTotal.WithLabelValues(storageMode(shared)).Inc()
+}
+
+func (m *Metrics) observePromote(shared bool) {
+	m.PromoteTotal.WithLabelValues(storageMode(shared)).Inc()
 }
 
 func (m *Metrics) observeCheckpoint(dur time.Duration) {
@@ -258,7 +287,8 @@ func (m *Metrics) observeCheckpoint(dur time.Duration) {
 }
 
 // wireHooks assigns this daemon's process-wide instrumentation hooks
-// (ops.ObserveFork, ops.ObserveCheckpoint, session.OnTransition) to close
+// (ops.ObserveFork, ops.ObserveCheckpoint, ops.ObserveRollback,
+// ops.ObservePromote, session.OnTransition) to close
 // over m, and registers m's scrape-time session-gauge collector against srv.
 // Called once, from NewServer, before Serve starts accepting connections —
 // see OnTransition/ObserveFork's own doc comments for why a single,
@@ -268,6 +298,8 @@ func (m *Metrics) observeCheckpoint(dur time.Duration) {
 func (m *Metrics) wireHooks(srv *Server) {
 	ops.ObserveFork = m.observeFork
 	ops.ObserveCheckpoint = m.observeCheckpoint
+	ops.ObserveRollback = m.observeRollback
+	ops.ObservePromote = m.observePromote
 	session.OnTransition = m.observeFlushTransition
 	m.Registry.Collect(srv.collectSessionGauges)
 }

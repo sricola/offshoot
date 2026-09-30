@@ -938,8 +938,8 @@ func TestChainBaseConcatenatesChildSegments(t *testing.T) {
 	}
 }
 
-// A shared child that has grown its OWN snapshot (a divergence floor —
-// ops.Checkpoint always writes one) must anchor resolution at that snapshot
+// A shared child that has grown its OWN snapshot (a divergence floor, or
+// an ops.Checkpoint snapshot) must anchor resolution at that snapshot
 // for any target it covers: the whole chain lives in the child lineage and
 // the base is never consulted. Below the child snapshot, the seam path still
 // applies unchanged.
@@ -1298,5 +1298,76 @@ func TestChainBaseErrorsOnChildHole(t *testing.T) {
 	putObj(t, s, SegmentKey("child", 1, 5, 5))
 	if _, err := s.Chain("child", 5); err == nil {
 		t.Fatal("a hole in the child's own segment run must be an error")
+	}
+}
+
+// TestCheckpointKindRoundTripsAndDefaultsEmpty: Checkpoint.Kind survives a
+// PutRef/GetRef round trip, and a ref written before the field existed
+// (v2 without "kind", or a v1 bare-number checkpoint) decodes with it empty.
+func TestCheckpointKindRoundTripsAndDefaultsEmpty(t *testing.T) {
+	s := newStore(t)
+	r := Ref{Lineage: "lin", Epoch: 1, HeadTXID: 2, HeadEpoch: 1}
+	r.SetCheckpoint("a", Checkpoint{TXID: 1, Epoch: 1, Kind: "snapshot"})
+	r.SetCheckpoint("b", Checkpoint{TXID: 2, Epoch: 1, Kind: "segment"})
+	if _, err := s.PutRef("app", "main", r, ""); err != nil {
+		t.Fatal(err)
+	}
+	got, _, err := s.GetRef("app", "main")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got.Checkpoints["a"].Kind != "snapshot" || got.Checkpoints["b"].Kind != "segment" {
+		t.Fatalf("kinds after round trip: %+v", got.Checkpoints)
+	}
+
+	for _, raw := range []string{
+		`{"schema":2,"lineage":"lin","epoch":1,"head_txid":1,"head_epoch":1,"checkpoints":{"a":{"txid":1,"epoch":1}}}`,
+		`{"schema":1,"lineage":"lin","epoch":1,"head_txid":1,"checkpoints":{"a":1}}`,
+	} {
+		old, err := decodeRef([]byte(raw))
+		if err != nil {
+			t.Fatal(err)
+		}
+		if k := old.Checkpoints["a"].Kind; k != "" {
+			t.Fatalf("kind %q decoded from a ref without the field (%s), want empty", k, raw)
+		}
+	}
+}
+
+// TestCollapseBase: the lineage a new base pointer at txid should name,
+// skipping every hop that is a pure pass-through at txid.
+func TestCollapseBase(t *testing.T) {
+	s := newStore(t)
+	// c -> b@5 -> a@2, a un-based.
+	if err := s.WriteLineageBase("b", BasePointer{Lineage: "a", TXID: 2}); err != nil {
+		t.Fatal(err)
+	}
+	if err := s.WriteLineageBase("c", BasePointer{Lineage: "b", TXID: 5}); err != nil {
+		t.Fatal(err)
+	}
+	for _, c := range []struct {
+		lineage string
+		txid    uint64
+		want    string
+	}{
+		{"a", 9, "a"}, // no base: the lineage itself
+		{"b", 3, "b"}, // above b's base txid: b owns txid 3
+		{"b", 2, "a"}, // at b's base txid: b passes through to a
+		{"c", 6, "c"}, // above c's base txid
+		{"c", 4, "b"}, // through c, but above b's base txid
+		{"c", 2, "a"}, // two pass-through hops collapse to the root
+		{"c", 1, "a"},
+	} {
+		got, err := s.CollapseBase(c.lineage, c.txid)
+		if err != nil || got != c.want {
+			t.Errorf("CollapseBase(%s, %d) = %q, %v; want %q, nil", c.lineage, c.txid, got, err, c.want)
+		}
+	}
+	// A read error is an error, never a silent fall-through.
+	if err := s.B.Put(BaseKey("bad"), []byte("{not json")); err != nil {
+		t.Fatal(err)
+	}
+	if got, err := s.CollapseBase("bad", 1); err == nil {
+		t.Fatalf("CollapseBase over a corrupt base.json = %q, nil; want an error", got)
 	}
 }

@@ -133,8 +133,10 @@ jobs:
           echo "score=$(cat score.txt)" >> "$GITHUB_OUTPUT"
 
       # Persist the attempt's final state back to the store as a named
-      # checkpoint. At rest (no daemon) a checkpoint writes a full
-      # snapshot — fine for CI; a long-running trial that wants continuous
+      # checkpoint. At rest (no daemon) on this ext4 runner, which cannot
+      # reflink, a checkpoint writes a full snapshot (on APFS/btrfs/XFS it
+      # can write just the changed pages) — fine for CI; a long-running
+      # trial that wants continuous
       # incremental capture runs `offshoot serve` + `session open` instead
       # (see eval-harness.md).
       - name: Checkpoint result
@@ -165,8 +167,9 @@ jobs:
 
       # Pick the winner and promote it: the target branch is repointed at
       # a new lineage seeded from the winner's head, atomically (a CAS on
-      # the ref). --force because main is protected by default. Promote
-      # materializes a full copy — fork is free, picking a winner isn't.
+      # the ref). --force because main is protected by default. Like the
+      # fork, the promote shares: main points into the winner's lineage
+      # rather than copying it (add --materialize to copy instead).
       - name: Promote winner
         run: |
           winner=$(sort -k2 -nr score-*.txt | head -1 | cut -d' ' -f1)

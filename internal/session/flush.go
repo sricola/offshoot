@@ -558,6 +558,7 @@ func (s *Session) flush(name string, meta map[string]string, auto bool) (txid ui
 				TXID: txid, Epoch: lease.Epoch,
 				CreatedAt: time.Now().UTC().Format(time.RFC3339),
 				Meta:      meta,
+				Kind:      kind,
 			})
 		}
 		ref.Touch(time.Now())

@@ -3,6 +3,7 @@ package store
 import (
 	"crypto/sha256"
 	"encoding/hex"
+	"errors"
 	"fmt"
 	"io"
 	"io/fs"
@@ -314,9 +315,16 @@ func (l *Local) PutIf(key string, data []byte, ifMatch string) (string, error) {
 func (l *Local) List(prefix string) ([]string, error) {
 	var keys []string
 	root := l.root
-	err := filepath.WalkDir(root, func(p string, d fs.DirEntry, err error) error {
-		if err != nil || d.IsDir() {
+	start := l.listStart(prefix)
+	err := filepath.WalkDir(start, func(p string, d fs.DirEntry, err error) error {
+		if err != nil {
+			if p == start && errors.Is(err, fs.ErrNotExist) {
+				return fs.SkipAll // nothing stored under this prefix
+			}
 			return err
+		}
+		if d.IsDir() {
+			return nil
 		}
 		if strings.HasSuffix(p, ".lock") || strings.Contains(filepath.Base(p), ".tmp-") {
 			return nil
@@ -336,6 +344,31 @@ func (l *Local) List(prefix string) ([]string, error) {
 	}
 	sort.Strings(keys)
 	return keys, nil
+}
+
+// listStart is the directory List walks for prefix: the deepest directory
+// the prefix names in full (everything up to its last "/"), so a lineage
+// List reads that lineage's own directory and a refs List only refs/. A
+// local store's root also holds the checkouts, their shadows and the
+// by-chain cache, which can outnumber the store's objects many times over;
+// walking the root for every List made chain resolution — one List per base
+// hop, several resolutions per fork, checkout and checkpoint — cost time in
+// proportion to every file on disk. Every key under prefix lives under this
+// directory, so the result is the same as a whole-root walk filtered by
+// prefix.
+func (l *Local) listStart(prefix string) string {
+	i := strings.LastIndex(prefix, "/")
+	if i <= 0 {
+		return l.root
+	}
+	p, err := l.path(prefix[:i])
+	if err != nil {
+		// Not a key directory (e.g. ".." in it): keep the whole-root
+		// walk's answer rather than inventing an error List never
+		// returned.
+		return l.root
+	}
+	return p
 }
 
 // tempName returns a unique path in dir (using base as the filename

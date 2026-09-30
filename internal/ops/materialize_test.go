@@ -273,7 +273,8 @@ func TestCheckoutIgnoresAFencedWritersObject(t *testing.T) {
 		"CREATE TABLE t (v); INSERT INTO t VALUES ('live');").CombinedOutput(); err != nil {
 		t.Fatalf("%v: %s", err, out)
 	}
-	if _, err := w.Checkpoint("app", "main", "live", nil); err != nil {
+	// Forced snapshot: the fenced writer's object below shares its key shape.
+	if _, err := w.CheckpointWith("app", "main", "live", nil, CheckpointOptions{Snapshot: true}); err != nil {
 		t.Fatal(err)
 	}
 	ref, etag, err := w.Store.GetRef("app", "main")
@@ -416,7 +417,8 @@ func buildHandSegmentedChain(t *testing.T, w *Workspace, n int) ([]store.ChainMe
 		t.Fatal(err)
 	}
 	mustSQL(t, path, "CREATE TABLE t (v); INSERT INTO t VALUES (1);")
-	if _, err := w.Checkpoint("app", "main", "base", nil); err != nil {
+	// Forced snapshot: the hand-built segments below continue from it.
+	if _, err := w.CheckpointWith("app", "main", "base", nil, CheckpointOptions{Snapshot: true}); err != nil {
 		t.Fatal(err)
 	}
 

@@ -55,8 +55,11 @@ Usage:
                                      may omit the checkpoint for the
                                      branch's current head; the two sides
                                      may name the same db or different ones
-  offshoot checkpoint <db>[@branch] <name> [--meta k=v ...]
-                                     snapshot the checkout as a named checkpoint
+  offshoot checkpoint <db>[@branch] <name> [--snapshot] [--meta k=v ...]
+                                     name the checkout's state: a segment of
+                                     the pages changed since the last
+                                     checkpoint when it can, else a full
+                                     snapshot (--snapshot forces one)
   offshoot fork <db>[@branch] <new> [--at cp] [--ttl duration] [--meta k=v ...]
                                      branch from head or a checkpoint;
                                      --meta is repeatable (capped: 32 keys,
@@ -66,10 +69,11 @@ Usage:
   offshoot touch <db>[@branch] [--ttl duration|none]   reset a branch's activity clock, optionally (re)setting its TTL
   offshoot protect <db>[@branch]        refuse unforced destroy/promote-onto, never reap; MCP cannot force it without -allow-force
   offshoot unprotect <db>[@branch]      clear the protected flag
-  offshoot rollback <db>[@branch] --to <cp> [--no-backup] [--backup-ttl DUR]
+  offshoot rollback <db>[@branch] --to <cp> [--no-backup] [--backup-ttl DUR] [--materialize]
                                                           repoint a branch at a checkpoint; keeps the previous head as <branch>-pre-rollback
-  offshoot promote <db>@<src> --onto <target> [--force] [--no-backup] [--backup-ttl DUR]
-                                                          repoint target at src's head; keeps target's old head as <target>-pre-promote
+  offshoot promote <db>@<src> --onto <target> [--force] [--no-backup] [--backup-ttl DUR] [--materialize]
+                                                          repoint target at src's head; keeps target's old head as <target>-pre-promote;
+                                                          both point at the kept history (shared) unless --materialize copies it
   offshoot compact <db>[@branch]     make a shared fork self-contained (its
                                      ancestor's storage becomes reclaimable
                                      by gc); no-op if already self-contained
@@ -226,6 +230,16 @@ func extractFlag(args []string, name string) (value string, rest []string, ok bo
 		out = append(out, args[i])
 	}
 	return value, out, ok, nil
+}
+
+// checkpointLine is checkpoint's output: the name and txid, then what was
+// written — a segment's page count and size, or a snapshot's size.
+func checkpointLine(name string, res ops.CheckpointResult) string {
+	if res.Kind == "segment" {
+		return fmt.Sprintf("checkpoint %q at txid %d (segment, %d pages, %.1f KiB)",
+			name, res.TXID, res.Pages, float64(res.Bytes)/(1<<10))
+	}
+	return fmt.Sprintf("checkpoint %q at txid %d (snapshot, %.1f MiB)", name, res.TXID, float64(res.Bytes)/(1<<20))
 }
 
 // extractBoolFlag pulls every occurrence of a bare boolean flag (e.g.
@@ -469,22 +483,23 @@ func run(args []string) error {
 			return fmt.Errorf("usage: offshoot create <db> [--from file]")
 		}
 	case "checkpoint":
+		snapshot, rest := extractBoolFlag(rest, "--snapshot")
 		meta, rest, err := extractMetaFlags(rest)
 		if err != nil {
-			return fmt.Errorf("usage: offshoot checkpoint <db>[@branch] <name> [--meta k=v ...]: %w", err)
+			return fmt.Errorf("usage: offshoot checkpoint <db>[@branch] <name> [--snapshot] [--meta k=v ...]: %w", err)
 		}
 		if len(rest) != 2 {
-			return fmt.Errorf("usage: offshoot checkpoint <db>[@branch] <name> [--meta k=v ...]")
+			return fmt.Errorf("usage: offshoot checkpoint <db>[@branch] <name> [--snapshot] [--meta k=v ...]")
 		}
 		db, branch, err := ops.ParseTarget(rest[0])
 		if err != nil {
 			return err
 		}
-		txid, err := w.Checkpoint(db, branch, rest[1], meta)
+		res, err := w.CheckpointWith(db, branch, rest[1], meta, ops.CheckpointOptions{Snapshot: snapshot})
 		if err != nil {
 			return err
 		}
-		fmt.Printf("checkpoint %q at txid %d\n", rest[1], txid)
+		fmt.Println(checkpointLine(rest[1], res))
 		return nil
 	case "fork":
 		fs := rest
@@ -582,13 +597,15 @@ func run(args []string) error {
 		fmt.Printf("unprotected %s@%s\n", db, branch)
 		return nil
 	case "rollback":
-		const usage = "usage: offshoot rollback <db>[@branch] --to <checkpoint> [--no-backup] [--backup-ttl DUR]"
+		const usage = "usage: offshoot rollback <db>[@branch] --to <checkpoint> [--no-backup] [--backup-ttl DUR] [--materialize]"
 		var opts ops.RollbackOptions
 		fs := rest[:0]
 		for i := 0; i < len(rest); i++ {
 			switch a := rest[i]; a {
 			case "--no-backup":
 				opts.NoBackup = true
+			case "--materialize":
+				opts.Materialize = true
 			case "--backup-ttl":
 				if i+1 >= len(rest) {
 					return fmt.Errorf("%s", usage)
@@ -615,6 +632,7 @@ func run(args []string) error {
 			return err
 		}
 		fmt.Println(res.Path)
+		fmt.Printf("rolled back %s@%s to %q %s\n", db, branch, fs[2], storageMode(res.Shared))
 		if res.Backup != "" {
 			ttl := opts.BackupTTL
 			if ttl <= 0 {
@@ -625,13 +643,15 @@ func run(args []string) error {
 		}
 		return nil
 	case "promote":
-		const usage = "usage: offshoot promote <db>@<source> --onto <target> [--force] [--no-backup] [--backup-ttl DUR]"
+		const usage = "usage: offshoot promote <db>@<source> --onto <target> [--force] [--no-backup] [--backup-ttl DUR] [--materialize]"
 		var opts ops.PromoteOptions
 		fs := rest[:0]
 		for i := 0; i < len(rest); i++ {
 			switch a := rest[i]; a {
 			case "--force":
 				opts.Force = true
+			case "--materialize":
+				opts.Materialize = true
 			case "--no-backup":
 				opts.NoBackup = true
 			case "--backup-ttl":
@@ -659,7 +679,7 @@ func run(args []string) error {
 		if err != nil {
 			return err
 		}
-		fmt.Printf("promoted %s@%s -> %s@%s at txid %d\n", db, srcBranch, db, fs[2], res.TXID)
+		fmt.Printf("promoted %s@%s -> %s@%s at txid %d %s\n", db, srcBranch, db, fs[2], res.TXID, storageMode(res.Shared))
 		if res.Backup != "" {
 			ttl := opts.BackupTTL
 			if ttl <= 0 {
@@ -846,8 +866,8 @@ func run(args []string) error {
 			// every line: "shared" means this branch is a base-pointer fork
 			// (near-zero added storage, reading through an ancestor's durable
 			// objects); "materialized" means a fully self-contained lineage.
-			// fork shares; promote/rollback/compact each materialize a full
-			// copy — the asymmetry is deliberate and worth seeing per branch.
+			// fork, rollback and promote share below the snapshot floor;
+			// compact (and --materialize) make a full copy.
 			storage := "materialized"
 			if s.Shared {
 				storage = "shared"
@@ -1262,4 +1282,14 @@ func run(args []string) error {
 	default:
 		return fmt.Errorf("unknown command %q\n%s", cmd, usage)
 	}
+}
+
+// storageMode is rollback's and promote's output tag for the new lineage:
+// "(shared)" when it points at the kept history through a base pointer,
+// "(materialized)" when it is a self-contained copy.
+func storageMode(shared bool) string {
+	if shared {
+		return "(shared)"
+	}
+	return "(materialized)"
 }

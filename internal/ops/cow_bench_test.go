@@ -12,7 +12,8 @@
 // The added-bytes benchmarks account LOGICAL object-store bytes (the sum
 // of stored object sizes, which is exactly what an S3 backend would bill),
 // measured by walking the local store directory and excluding the
-// checkouts/ tree (working copies are not store objects). Note that on
+// checkouts/ and checkouts-ro/ trees (working copies and the local clone
+// cache are not store objects). Note that on
 // APFS the local backend's materialize path clones (clonefile), so
 // PHYSICAL disk usage of a materialized fork is lower than the logical
 // number reported here — the logical number is the one that transfers to
@@ -55,9 +56,11 @@ func cowRequireSQLite3(b *testing.B) {
 
 // cowStoreUsage walks the LOCAL store directory and returns the total
 // logical byte size and count of stored objects, excluding the checkouts/
-// tree (working copies, not store objects) and transient .lock files
-// (Local's CAS artifacts). Skips the benchmark when the workspace is not
-// backed by a local directory store: byte accounting via directory walk
+// and checkouts-ro/ trees (working copies and the local clone cache —
+// including checkouts-ro/<db>/~by-chain/ entries — not store objects) and
+// transient .lock files (Local's CAS artifacts). Skips the benchmark when
+// the workspace is not backed by a local directory store: byte accounting
+// via directory walk
 // only works there, and the object COUNTS are identical on S3 by
 // construction (the same Put/CopyObject calls run either way).
 func cowStoreUsage(b *testing.B, w *ops.Workspace) (bytes int64, objects int) {
@@ -70,7 +73,7 @@ func cowStoreUsage(b *testing.B, w *ops.Workspace) (bytes int64, objects int) {
 			return err
 		}
 		if d.IsDir() {
-			if path == filepath.Join(w.Spec, "checkouts") {
+			if path == filepath.Join(w.Spec, "checkouts") || path == filepath.Join(w.Spec, "checkouts-ro") {
 				return filepath.SkipDir
 			}
 			return nil

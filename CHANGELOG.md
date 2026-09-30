@@ -13,7 +13,120 @@ version if you depend on format stability.
 
 ## [Unreleased]
 
-Nothing yet.
+Pointers and deltas, not copies: the operations that used to copy a whole
+database locally or in the store now clone, diff or point instead, where
+the filesystem and the chain allow it. Measured in
+[docs/benchmarks.md](docs/benchmarks.md) (the "What changed in v0.2.12"
+paragraphs).
+
+### Added
+
+- **Segment checkpoints at rest.** `offshoot checkpoint` (no daemon) now
+  writes an LTX segment of just the changed pages when it can, diffing the
+  checkout against a reflinked `<checkout>.shadow` taken at the last
+  checkout or checkpoint. It falls back to a full snapshot when there is
+  no usable shadow, when the branch's chain has reached the snapshot
+  cadence (`SnapshotEvery`, default 16), or when half or more of the pages
+  changed (databases under 64 pages skip that test). The shadow's rolling
+  checksum is verified against the recorded head before a segment is
+  derived from it.
+- **`offshoot checkpoint --snapshot`** forces a full snapshot.
+- **Checkpoint `kind`.** The CLI prints what was written —
+  `checkpoint "seeded" at txid 2 (segment, 2 pages, 0.4 KiB)` or
+  `checkpoint "v1" at txid 3 (snapshot, 0.0 MiB)` — the MCP `offshoot_checkpoint` at-rest result
+  carries `kind`, and each checkpoint entry in a ref records `kind`
+  (`"snapshot"`/`"segment"`; an additive JSON field, empty on older
+  entries). A checkpoint that loses a concurrent compare-and-swap uses the
+  winner's recorded kind to decide whether to delete its own object.
+- **Shared rollback and promote.** `rollback` to a kept checkpoint and
+  `promote` repoint the branch through a base pointer — the same share
+  path fork uses (`newLineageAt`) — instead of copying the snapshot. The
+  fork-time depth floor still forces a copy. `Store.CollapseBase` skips
+  pass-through hops when writing the pointer, so repeated rollbacks to one
+  checkpoint keep the base spine one hop deep.
+- **`--materialize`** on `offshoot rollback` and `offshoot promote` (daemon
+  request field `materialize`; Python `materialize=False`; TypeScript
+  `materialize?: boolean`) keeps the old copying behaviour.
+- **`shared`** on the daemon's `rollback`/`promote` responses, and
+  `(shared)`/`(materialized)` in the CLI output.
+- **Metrics** `offshoot_rollback_total{mode}` and
+  `offshoot_promote_total{mode}` (`shared`/`materialized`, both
+  pre-registered at 0).
+- **CI:** a `cow-paths` job runs `internal/ops`, `internal/ltxio` and
+  `internal/ops/reflink`, plus `internal/session`'s two clone tests, on
+  `macos-latest` on every push and PR (20-minute timeout), so the clone,
+  shadow and segment paths — which skip on the ubuntu runner's ext4 — are
+  tested before merge, not only weekly.
+
+### Changed
+
+- **Checkouts are clones.** `checkout` (and every internal checkout
+  refresh) and `checkout --at` build an immutable, content-addressed entry
+  under `checkouts-ro/<db>/~by-chain/<chainID>.db` and clone the checkout
+  from it (APFS `clonefile`, Linux `FICLONE`); a chain that extends a
+  cached one clones the prefix and applies only the remaining segments.
+  A second checkout of the same state — a fresh fork, a re-checkout after
+  the file was deleted — is a clone instead of a decode.
+- **By-chain entries count toward `-ro-cache-budget`** at their logical
+  size (they share blocks with the checkouts cloned from them, so this
+  over-states real disk use), and a `checkout --at` miss now leaves two
+  entries. `offshoot status`'s `ro-cache:` line and
+  `offshoot_ro_cache_bytes` include them. Janitor eviction lines and
+  `evicted` events for them carry branch `~by-chain` and the chain ID in
+  the checkpoint position. `rm -rf checkouts-ro` stays safe.
+- **By-chain entries are capped at 64 per database by default**
+  (`ops.DefaultByChainMaxEntries`), pruned least-recently-used first after
+  each checkout that builds one — no daemon or `-ro-cache-budget` needed,
+  so a CLI-only user no longer keeps one full copy per chain forever.
+  `offshoot destroy` does not remove by-chain entries (another branch may
+  share them); the bound ages them out. Entries are `0400` and the
+  `checkouts-ro` directories `0700`, like the store's own `0600` objects;
+  a checkout's `.shadow` is `0600`.
+- **O(1) clean check.** The `.sum` sidecar gained `chain_id`, `size`,
+  `mtime_ns`, `change_counter`, `stamped_ns` and `shadow`. A repeat
+  `checkout` of an unchanged checkout is proven clean from identity, size,
+  mtime and SQLite's change counter without hashing, provided the file's
+  mtime is more than 1 s older than the stamp (git's racily-clean rule);
+  in WAL mode the change counter is not treated as evidence. Anything else
+  hashes as before and re-stamps. Old sidecars hash once. `offshoot status`
+  still always hashes.
+- **`offshoot rollback` prints a second line.** Line 1 is still the
+  checkout path; line 2 is now `rolled back <db>@<branch> to "<cp>"
+  (shared|materialized)`, ahead of the existing safety-fork line. **A
+  script that captured the whole output as the path must take the first
+  line** (`offshoot rollback ... | head -1`). `offshoot promote`'s line
+  gains a trailing `(shared)`/`(materialized)`.
+- **`status` storage class.** Shared rollbacks and promotes report
+  `storage=shared`; they pin the lineage they point into until the branch
+  diverges past it or is compacted (`offshoot compact`, which still always
+  copies).
+- `offshoot destroy` also removes the checkout's `.shadow` (and a
+  leftover `.shadow.tmp`).
+
+### Behaviour on non-reflink filesystems
+
+Everything above that clones — by-chain entries, checkout clones, the
+checkpoint shadow — needs a filesystem that supports reflinks (APFS,
+btrfs, XFS with `reflink=1`). On one that doesn't (ext4, tmpfs, most
+network filesystems), offshoot detects it and falls back without error: no by-chain entries, no shadows, checkouts
+materialize from the store as before, and every at-rest checkpoint is a
+full snapshot. The O(1) clean check, shared rollback/promote and the
+`kind` field do not depend on the filesystem and apply everywhere.
+
+### Fixed
+
+- **Branch operations on a local store no longer slow down as checkouts
+  accumulate.** Listing a lineage's objects walked the whole store
+  directory, which on a local store also holds every checkout, `.shadow`
+  and by-chain entry; it now reads only that lineage's directory. With
+  chains that follow base pointers (one listing per hop), the old walk cost
+  1.1 s per chain resolution late in BranchBench's `mcts` run (the
+  "Diagnostic instrumentation" tables in docs/benchmarks.md) and made
+  that topology 3x slower during this cycle (197.2 s). Measured after the
+  fix: `mcts` 41.9 s, against 63.3 s on v0.2.11, with fork, checkout and
+  checkpoint at 32.6 / 78.5 / 67.3 ms p50 at depth 25; all five topologies
+  are faster than on v0.2.11 (docs/benchmarks.md's "BranchBench
+  topologies" section).
 
 ## [0.2.11] - 2026-09-26
 

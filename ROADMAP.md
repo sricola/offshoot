@@ -324,11 +324,28 @@ open wart (its own spec said "N materialized forks cost up to N×G").
   databases (or sub-object pages) remains the standing non-goal below,
   to be revisited only on evidence that per-object fork sharing isn't
   enough.
-- ⏸ **Promote/rollback (and compact) on sharing — deferred.** All three
-  still materialize a full copy, by design (they abandon or replace a
-  lineage; base-pointing into a lineage meant to die would pin it
-  forever). Rollback-to-a-*kept*-checkpoint onto base pointers is the
-  named follow-up in the design spec, not scoped here.
+- ✅ **Promote/rollback on sharing — shipped (v0.2.12, unreleased).**
+  Rollback to a kept checkpoint and promote now write a base pointer
+  instead of copying (`--materialize` keeps the copy; the fork-time depth
+  floor still forces one), and repeated rollbacks to one checkpoint keep
+  the base spine flat. Shipped alongside it: clone-based checkouts from a
+  by-chain cache, an O(1) clean check, and at-rest segment checkpoints
+  against a reflinked shadow. ⏸ **Compact stays a copy**, by design —
+  dropping the base pointer is what it is for.
+- ⏭ **Tier 2 follow-ups from that work** (none blocks v0.2.12):
+  - Route Rollback/Promote/Compact's local checkout refresh through the
+    by-chain cache (`materializeFromChain`), so the local refresh is
+    O(delta) like `checkout`, not a full decode.
+  - Move `internal/ops/reflink` to `internal/reflink`: `internal/ltxio`
+    imports it today, a layering inversion.
+  - Pass the resolved chain members into `planSegment`, saving one Chain
+    resolution per at-rest checkpoint.
+  - Close the concurrent at-rest checkpoint race
+    ([limitations](docs/limitations.md#one-writer-per-branch)): after
+    winning the ref CAS, read the stored object's trailer checksum; on a
+    mismatch stamp `PostApplyChecksum=0` and drop the shadow, so neither
+    the next checkpoint nor a daemon session trusts content a same-kind
+    loser overwrote.
 
 ## Launch track (parallel to v0.1–v0.3)
 

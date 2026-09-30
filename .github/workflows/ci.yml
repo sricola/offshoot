@@ -30,16 +30,19 @@ permissions:
   contents: read
 
 jobs:
-  # macOS is deliberately absent here: GitHub bills macOS runners at 10x,
-  # and the per-push macOS leg was the single largest line in the Actions
-  # bill. macOS coverage now lives in nightly.yml's weekly leg (full
-  # `go test ./...` + torture on macos-latest) and in every release build.
-  # Linux catches everything platform-independent; the known macOS-specific
-  # breakages (sqlite3 CLI missing from the image, reflink/clonefile paths)
-  # are exercised weekly and at every tag. The macOS sqlite3/brew install
-  # logic itself lives in .github/actions/setup-sqlite (consumed by
-  # nightly.yml's macos-test), so re-adding macOS to this matrix is a
-  # one-line change — no dead macOS step is kept here.
+  # macOS is deliberately absent from this matrix: GitHub bills macOS
+  # runners at 10x, and the per-push macOS leg was the single largest line
+  # in the Actions bill. The full macOS `go test ./...` (+ torture) lives in
+  # nightly.yml's weekly leg and in every release build. One narrow macOS
+  # job did come back, though — `cow-paths` below: since v0.2.12 checkouts
+  # clone from a by-chain cache entry, at-rest checkpoints diff against a
+  # reflinked shadow, and both only run where the filesystem can clone.
+  # ubuntu-latest's ext4 cannot, so every clone/shadow/segment fast-path test
+  # skips in `test` and the only thing it proves is the non-reflink
+  # fallback. `cow-paths` runs just the packages (and, for session, the
+  # tests) that hold those paths, on APFS, to keep the 10x bill bounded. The macOS sqlite3/brew
+  # install logic lives in .github/actions/setup-sqlite (shared with
+  # nightly.yml's macos-test).
   test:
     strategy:
       fail-fast: false
@@ -85,6 +88,50 @@ jobs:
       # here instead of silently skipping the integration suite green.
       - name: go test
         run: go test ./... -count=1 -race
+
+  # cow-paths: the copy-on-write fast paths (by-chain clone checkouts,
+  # reflinked checkpoint shadows, segment checkpoints, clone-based
+  # session opens) on a filesystem that can clone — see the comment above
+  # `test` for why this is its own macOS job and why it is scoped this
+  # tightly. No -race: the ubuntu `test` job already runs these packages
+  # under the race detector; this job exists for the filesystem, not the
+  # scheduler. ./internal/session runs only its two clone tests: the rest of
+  # that package is filesystem-independent (the ubuntu job covers it) and
+  # holds the load-sensitive session-flush heartbeat test, which has no
+  # business gating every push on a shared macOS runner.
+  cow-paths:
+    runs-on: macos-latest
+    timeout-minutes: 20
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+
+      - uses: actions/setup-go@b7ad1dad31e06c5925ef5d2fc7ad053ef454303e # v7.0.0
+        with:
+          go-version-file: go.mod
+
+      # No sqldiff: none of the packages below gates on it.
+      - uses: ./.github/actions/setup-sqlite
+
+      # The clone tests skip (by design) on a filesystem that cannot clone.
+      # If a runner image ever moves TMPDIR off APFS, this job would go
+      # green while testing nothing it exists for — so prove a clone works
+      # here first and fail loudly if the probe test skips.
+      - name: Verify the runner's filesystem clones
+        run: |
+          set -o pipefail
+          go test ./internal/ops/reflink -run '^TestCloneProducesIdenticalFile$' -count=1 -v | tee reflink-probe.txt
+          if grep -q -- '--- SKIP' reflink-probe.txt; then
+            echo "TMPDIR cannot clone on this runner; the copy-on-write tests would all skip" >&2
+            exit 1
+          fi
+
+      - name: go test (copy-on-write paths)
+        run: go test ./internal/ops ./internal/ltxio ./internal/ops/reflink -count=1
+
+      - name: go test (copy-on-write session opens)
+        run: go test ./internal/session -run '^(TestOpenOnClonedCheckoutSkipsSettlingFlush|TestAtRestCheckpointAfterCloseWritesASegment)$' -count=1 -v
 
   # metrics-lint is Milestone 4 PM Amendment 7's hard gate: promtool (the
   # Prometheus project's own exposition-format linter) run against a real

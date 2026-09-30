@@ -45,6 +45,16 @@ type Checkpoint struct {
 	// values <= 512 bytes — see the design spec's metadata cap). Omitempty;
 	// nil/absent means no metadata was given.
 	Meta map[string]string `json:"meta,omitempty"`
+	// Kind is the object this checkpoint's txid was written as on its
+	// lineage: "snapshot" or "segment". Stamped by ops.CheckpointWith, a
+	// named session flush, Create's "init", and the snapshots Rollback and
+	// Compact copy kept checkpoints into. Omitempty so a checkpoint written
+	// before this field existed (or one whose writer does not know, such as
+	// Fork's shared "fork") decodes with it empty, which means unknown.
+	// ops.CheckpointWith's CAS-loser cleanup reads it to tell whether its
+	// own object at the same txid is the winner's key or a different-kind
+	// orphan.
+	Kind string `json:"kind,omitempty"`
 }
 
 type Ref struct {
@@ -367,8 +377,9 @@ func (s *Store) lineageBase(lineage string) (*BasePointer, error) {
 
 // WriteLineageBase durably records a lineage's base pointer, create-only: a
 // lineage's base is immutable once written, so a second write is refused with
-// ErrCAS (surfaced as-is). The shared-fork path (ops.Fork) is the real
-// caller; it writes the base BEFORE the child ref CAS so resolution's source
+// ErrCAS (surfaced as-is). The shared path of ops.Fork, Rollback and
+// Promote (ops' newLineageAt) is the real caller; it writes the base BEFORE
+// the ref CAS so resolution's source
 // of truth exists by the time any reader can see the child.
 //
 // A base naming the lineage itself is refused outright: Chain resolves a
@@ -429,6 +440,33 @@ func (s *Store) BaseSpine(lineage string) ([]string, error) {
 		}
 		seen[b.Lineage] = true
 		spine = append(spine, b.Lineage)
+		cur = b.Lineage
+	}
+}
+
+// CollapseBase returns the lineage a new base pointer at txid should name,
+// starting from lineage: while the current lineage has a base b with
+// txid <= b.TXID, it is a pure pass-through at txid (Chain resolves such a
+// target entirely in b.Lineage), so the walk moves to b.Lineage. Pointing
+// past those hops resolves to identical content and keeps a spine bounded
+// by real divergence points instead of growing one pass-through lineage per
+// shared fork, rollback or promote at an older txid. A read error (or a
+// cycle in a corrupt store) is returned, never skipped.
+func (s *Store) CollapseBase(lineage string, txid uint64) (string, error) {
+	seen := map[string]bool{lineage: true}
+	cur := lineage
+	for {
+		b, err := s.lineageBase(cur)
+		if err != nil {
+			return "", err
+		}
+		if b == nil || txid > b.TXID {
+			return cur, nil
+		}
+		if seen[b.Lineage] {
+			return "", fmt.Errorf("store: base spine of %s revisits lineage %s (cycle)", lineage, b.Lineage)
+		}
+		seen[b.Lineage] = true
 		cur = b.Lineage
 	}
 }
@@ -650,8 +688,9 @@ func (s *Store) chainFrom(lineage string, target uint64, seen map[string]bool) (
 		return s.chainFrom(base.Lineage, target, seen)
 	}
 	// Above the fork point: if the child has grown its OWN snapshot covering
-	// target (a divergence floor — ops.Checkpoint always writes one, and the
-	// session's snapshot cadence will too), resolution anchors there and
+	// target (a divergence floor — an at-rest ops.Checkpoint writes one
+	// whenever it has no usable shadow or reaches the snapshot bound, and
+	// the session's snapshot cadence does too), resolution anchors there and
 	// never touches the base: the whole chain lives in this one lineage.
 	// A shared child is born with zero objects and only ever writes txids
 	// above its fork point, so a child snapshot is necessarily > base.TXID
@@ -918,6 +957,24 @@ func (s *Store) PutRef(db, branch string, r Ref, ifMatch string) (string, error)
 // comment and DeleteRefIf below for what a caller gets instead.
 type ConditionalDeleter interface {
 	DeleteIf(key, ifMatch string) error
+}
+
+// ObjectExists reports whether an object is stored at exactly key, with
+// one request: a List of key itself as the prefix, matched exactly (a
+// longer key sharing the prefix is not a match). Used where a HEAD would
+// do, without adding a method every Backend must implement; List by prefix
+// is already part of the conformance suite for every backend.
+func (s *Store) ObjectExists(key string) (bool, error) {
+	keys, err := s.B.List(key)
+	if err != nil {
+		return false, err
+	}
+	for _, k := range keys {
+		if k == key {
+			return true, nil
+		}
+	}
+	return false, nil
 }
 
 // DeleteRefIf deletes db@branch's ref, conditional on etag when the backend

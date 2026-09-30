@@ -135,6 +135,40 @@ The checkout path is always `<store-root>/checkouts/<db>/<branch>.db`
 (local stores) or under `OFFSHOOT_CHECKOUTS` / the cache dir (remote
 stores) — never used as an identifier, always re-derivable from `db@branch`.
 
+**A checkout is a clone, not a copy, where the filesystem allows it.**
+Since v0.2.12 every materialization goes through a content-addressed
+cache: `<store-root>/checkouts-ro/<db>/~by-chain/<chainID>.db`, where the
+chain ID is the SHA-256 of the resolved chain's object keys, so two
+branches whose heads resolve to the same objects (a fresh shared fork and
+its parent, say) name the same entry. An entry is built once — from the
+store, or from a cached prefix of the chain plus the remaining segments —
+made `0444`, and never written again; the writable checkout is a
+filesystem clone of it (APFS `clonefile`, Linux `FICLONE`), so a second
+checkout of the same state costs a clone, not a decode. Where the
+filesystem cannot clone (ext4, tmpfs, most network filesystems), there is
+no entry and the checkout is materialized straight from the store, as
+before. On a cloning filesystem every checkout also gets a `.shadow`
+file beside it (see `offshoot checkpoint` below).
+
+**The `.sum` sidecar.** Next to every writable checkout sits
+`<branch>.db.sum`, a small JSON record of what the checkout was
+materialized from: `hash` (SHA-256 of the file), `lineage`/`epoch`/`txid`,
+`post_apply_checksum`, and — since v0.2.12 — `chain_id` (the by-chain
+entry it was cloned from, when there was one), `size`, `mtime_ns` and
+`change_counter` (SQLite's header counter) as a fingerprint, `stamped_ns`
+(when the record was written), and `shadow` (whether a checkpoint shadow
+is current). A repeat `checkout` of an unchanged branch proves the file
+clean from the fingerprint alone, without hashing it, when three things
+hold: the recorded identity matches the ref, size, mtime and change
+counter all match, and the file's mtime is more than **1 s** older than
+the stamp (git's racily-clean rule: a write landing in the same mtime tick
+as the stamp could otherwise go unseen). In WAL mode SQLite does not bump
+the change counter on commit, so there only size and mtime count as
+evidence. Any mismatch falls back to hashing the whole file, exactly as
+before, and re-stamps the record so the next call is fast. A sidecar
+written by an older binary lacks the fingerprint and always takes the hash
+path once.
+
 If a checkout already exists at that path, `checkout` requires it to be
 quiescent first (no live writer holding it open) — re-materializing renames
 a fresh file into place, which would delete a live writer's WAL out from
@@ -164,7 +198,13 @@ or a daemon session on the same branch.
 The result is `chmod 0444` (read-only) and has no `.sum` sidecar and no
 lease — it has no ongoing relationship to the store once written, and the
 whole `checkouts-ro` tree is safe to `rm -rf` at any time; the next call for
-anything under it just rebuilds what it needs. A repeat call for the same
+anything under it just rebuilds what it needs. That includes the
+`~by-chain/` directory the same tree now holds (see `offshoot checkout`
+above): a `--at` miss goes through it too, so it is a clone when some
+branch already materialized that state, and on a filesystem that can clone
+it leaves **two** entries behind — the `~by-chain` entry and the
+`<branch>@<checkpoint>.db` file cloned from it. Removing either, or the
+whole tree, costs only a rebuild on the next call. A repeat call for the same
 `db@branch@checkpoint` is a cache hit (returned as-is, no store access at
 all) unless `--force` is given, which re-materializes unconditionally — see
 [docs/status.md](status.md) for the exact staleness caveat this cache
@@ -247,10 +287,11 @@ Ubuntu, `brew install sqldiff` on macOS — both verified, not guessed; see
 **Errors:** no such `db@branch` or checkpoint on either side; `sqldiff` not
 on PATH (default mode only — `--summary` never needs it).
 
-## `offshoot checkpoint <db>[@branch] <name> [--meta k=v ...]`
+## `offshoot checkpoint <db>[@branch] <name> [--snapshot] [--meta k=v ...]`
 
 ```
 offshoot checkpoint app v1
+offshoot checkpoint app v1 --snapshot
 offshoot checkpoint app v1 --meta eval_run=42 --meta git_sha=abc123
 ```
 
@@ -258,11 +299,46 @@ Snapshots the *current checkout's* state (not just the ref) as a named
 checkpoint, quiescing the checkout first (busy timeout ~3s, then a clean
 failure rather than a hang). Checkpoint names are unique per branch — this
 is the only operation actually named "checkpoint"; continuous background
-capture by the daemon is called "flush"/"commit," not "checkpoint." At rest
-(no daemon), every checkpoint writes a full snapshot, because there's no
-capture engine tracking which pages changed since the last one; the daemon's
-`session flush` writes incremental segments instead (see [What a flush
+capture by the daemon is called "flush"/"commit," not "checkpoint."
+
+**Segment or snapshot.** At rest (no daemon) there is no capture engine
+recording which pages changed, so offshoot keeps its own record: after
+every checkout and checkpoint it clones the checkout to
+`<branch>.db.shadow` (a reflink, so it costs no data blocks until the
+checkout diverges from it). The next checkpoint diffs the checkout against
+that shadow page by page and writes an LTX **segment** of just the changed
+pages when all of these hold: the shadow exists and its checksum matches
+the recorded head, the sidecar's identity matches the ref, the branch's
+resolved chain is shorter than the snapshot cadence (`SnapshotEvery`,
+default 16 — the same floor that keeps a daemon's reads bounded), fewer
+than half the pages changed (a database under 64 pages always counts as
+under that bar), and `--snapshot` was not given. Otherwise it writes a
+full **snapshot**, as every at-rest checkpoint did before v0.2.12. The
+shadow is taken at `checkout` too, so even a branch's first checkpoint
+can be a segment; a filesystem that cannot clone never has a shadow, so
+every checkpoint there is a snapshot. The diff still reads the
+whole checkout and the whole shadow — the saving is in what is uploaded
+and stored, not in local I/O. The daemon's `session flush` writes segments
+from its own capture engine instead (see [What a flush
 costs](../README.md#what-a-flush-costs) in the README).
+
+The output names what was written:
+
+```
+$ offshoot checkpoint demo seeded
+checkpoint "seeded" at txid 2 (segment, 2 pages, 0.4 KiB)
+$ offshoot checkpoint demo v1 --snapshot
+checkpoint "v1" at txid 3 (snapshot, 0.0 MiB)
+```
+
+(From the [quickstart](quickstart.md)'s tiny database, which is why the
+snapshot rounds to 0.0 MiB.)
+
+Each checkpoint entry in the ref records the same thing as an additive
+`kind` field (`"snapshot"` or `"segment"`; empty on entries written before
+v0.2.12, on `fork`/`promote` entries, and by writers that don't know).
+Concurrent checkpoints use it to clean up after a lost compare-and-swap
+without deleting the winner's object.
 
 Every checkpoint records a creation timestamp (`created_at`, RFC3339 UTC)
 automatically. `--meta k=v` is repeatable and attaches a small string→string
@@ -303,7 +379,7 @@ through the parent's objects below the fork point and the child's own
 objects above it. The exception is the **fork-time snapshot floor**: when
 the fork point's fully-resolved chain is already at the depth bound, fork
 falls back to materializing one fresh snapshot in the child's own lineage
-(a full copy, the pre-copy-on-write behavior), which keeps read
+(the pre-copy-on-write behavior), which keeps read
 materialization bounded no matter how deep a fork-of-fork spine grows. A
 shared child also self-snapshots on the ordinary snapshot cadence once its
 own divergence crosses it, after which its reads never touch the parent.
@@ -414,20 +490,41 @@ tool, so an agent can observe a branch's `protected` flag (via
 **Errors:** the branch is currently being reaped or destroyed ("too late to
 change its protection"); CAS races are retried internally.
 
-## `offshoot rollback <db>[@branch] --to <checkpoint> [--no-backup] [--backup-ttl DUR]`
+## `offshoot rollback <db>[@branch] --to <checkpoint> [--no-backup] [--backup-ttl DUR] [--materialize]`
 
 ```
 offshoot rollback app@attempt-1 --to fork
+offshoot rollback app@attempt-1 --to fork --materialize
 ```
 
 Repoints the branch at a **new** lineage seeded from `checkpoint`'s state
-(internally, the same machinery as fork). The old lineage is orphaned,
-retained through the GC grace period, then collected. Checkpoints at or
-before the target are kept (their snapshots are copied into the new
-lineage so they survive the old lineage's eventual collection); checkpoints
-after it are dropped. Any lease on the branch is cleared by the repoint, so
-it's immediately acquirable afterward. Prints the (re-materialized) checkout
-path.
+(internally, the same machinery as fork). Checkpoints at or before the
+target are kept; checkpoints after it are dropped. Any lease on the branch
+is cleared by the repoint, so it's immediately acquirable afterward.
+
+**Shared by default (since v0.2.12).** The new lineage is a base pointer
+at the kept checkpoint in the old lineage — two small objects, no data
+copy — exactly as a fork at that checkpoint would be, and the kept
+checkpoints are carried over unchanged. The old lineage's objects *above*
+the checkpoint (the abandoned future) are reclaimed by GC once nothing
+else reads them (the safety fork below holds them until it is reaped or
+destroyed); the objects at and below it stay live for as long as the
+rolled-back branch reads through them. Repeated rollbacks to the same
+checkpoint do not stack base pointers: each one points at the lineage that
+actually holds the checkpoint. Two cases still copy: `--materialize`,
+which seeds a self-contained lineage with a snapshot of the checkpoint and
+copies each kept checkpoint's snapshot into it (the pre-v0.2.12
+behaviour, for when you want the branch to stop pinning the old lineage
+right away), and a checkpoint whose resolved chain is already at the
+fork-time depth floor, which copies for the same reason a fork there
+would. `offshoot compact` converts a shared result later.
+
+Output: the (re-materialized) checkout path on the first line, then
+`rolled back <db>@<branch> to "<checkpoint>" (shared)` — or
+`(materialized)` — on the second, then the safety-fork line below. **The
+second line is new in v0.2.12**: a script that read the whole of
+`offshoot rollback`'s output as the path must now take the first line
+(`offshoot rollback ... | head -1`).
 
 **The safety fork.** Before the repoint lands, the branch's current head
 (the state rollback is about to abandon) is kept first as a shared fork
@@ -458,14 +555,17 @@ fork has a live lease (nothing is touched — close that session first, or
 `--no-backup`); lost a concurrent CAS race (retry).
 
 **Daemon/SDK parity.** The daemon's `rollback` op takes the same knobs as
-request fields — `no_backup` (bool) and `backup_ttl` (a Go duration
-string; a non-positive value is refused) — and echoes the safety fork's
-name back as `backup` in the response (empty when none was minted). Python
-`rollback(db, branch, to, *, backup=True, backup_ttl=None)` and
-TypeScript `rollback(db, branch, to, opts: RollbackOptions)` expose the
-same options.
+request fields — `no_backup` (bool), `backup_ttl` (a Go duration
+string; a non-positive value is refused) and `materialize` (bool) — and
+echoes the safety fork's name back as `backup` (empty when none was
+minted) and whether the result shares as `shared` in the response. Python
+`rollback(db, branch, to, *, backup=True, backup_ttl=None,
+materialize=False)` and TypeScript `rollback(db, branch, to, opts:
+RollbackOptions)` (`materialize?: boolean`) expose the same options.
+`offshoot_rollback` (MCP) takes no `materialize` argument: it shares unless
+the depth floor copies.
 
-## `offshoot promote <db>@<source> --onto <target> [--force] [--no-backup] [--backup-ttl DUR]`
+## `offshoot promote <db>@<source> --onto <target> [--force] [--no-backup] [--backup-ttl DUR] [--materialize]`
 
 ```
 offshoot promote app@attempt-1 --onto main --force
@@ -478,6 +578,17 @@ later, or destroyed explicitly). `target`'s old lineage is orphaned and
 later garbage-collected; its checkpoint map resets to just `{"promote":
 <txid>}`. If `target` is protected (`main` is protected by default),
 `--force` is required.
+
+**Shared by default (since v0.2.12).** Like rollback, the new lineage is
+a base pointer at `source`'s head rather than a copy of it, so promoting
+the winner of a fork-per-attempt run costs two small objects however big
+the database is. The cost moves to reclaim: `target` now reads through
+`source`'s lineage, so destroying or reaping `source` frees nothing that
+`target` still reads until `target` diverges past its own snapshot
+cadence or is compacted (`offshoot compact`). `--materialize` copies
+instead (the pre-v0.2.12 behaviour); the fork-time depth floor copies
+automatically. The output line ends in `(shared)` or `(materialized)`:
+`promoted app@attempt-1 -> app@main at txid 3 (shared)`.
 
 **The safety fork.** Because that reset makes promote the one verb whose
 inverse you'd otherwise have to build by hand ("fork `main` first, then
@@ -517,12 +628,15 @@ busy (repoint still lands; checkout refresh is skipped and reported); lost
 a concurrent CAS race (retry).
 
 **Daemon/SDK parity.** The daemon's `promote` op takes the same knobs as
-request fields — `no_backup` (bool) and `backup_ttl` (a Go duration
-string; a non-positive value is refused) — and echoes the safety fork's
-name back as `backup` in the response (empty when none was minted). Python
-`promote(db, source, onto, force=False, backup=True, backup_ttl=None)` and
-TypeScript `promote(db, source, onto, opts: PromoteOptions)` expose the
-same options.
+request fields — `no_backup` (bool), `backup_ttl` (a Go duration
+string; a non-positive value is refused) and `materialize` (bool) — and
+echoes the safety fork's name back as `backup` (empty when none was
+minted) and whether the result shares as `shared` in the response. Python
+`promote(db, source, onto, force=False, backup=True, backup_ttl=None,
+materialize=False)` and TypeScript `promote(db, source, onto, opts:
+PromoteOptions)` (`materialize?: boolean`) expose the same options.
+`offshoot_promote` (MCP) takes no `materialize` argument: it shares unless
+the depth floor copies.
 
 ## `offshoot compact <db>[@branch]`
 
@@ -541,8 +655,9 @@ reclaim). A branch that is already self-contained is a **no-op** (prints
 the current head txid), so scripted "compact everything" loops never fail
 on branches with nothing to do.
 
-**Checkpoints are preserved**, `rollback`-style (unlike `promote`, which
-still resets its target to a single `promote` checkpoint): every existing
+**Checkpoints are preserved**, as `rollback --materialize` preserves them
+(unlike `promote`, which still resets its target to a single `promote`
+checkpoint): every existing
 checkpoint's snapshot is copied into the new self-contained lineage and
 rewritten to epoch 1 — a location update, `CreatedAt`/`Meta` unchanged, not
 a new checkpoint — and a `compact` checkpoint at the (unchanged) head txid
@@ -554,8 +669,10 @@ anything first to preserve history across a compact.
 
 Cost class: compact is a full materialize — one full copy of the branch's
 head state (~G bytes for a G-byte database) plus one additional snapshot
-copy per *distinct* checkpoint txid kept — the same cost class a single
-`promote` or `rollback` pays, not a cheap metadata flip. (The N×G figure
+copy per *distinct* checkpoint txid kept — the same cost class a
+`promote --materialize` or `rollback --materialize` pays, not a cheap
+metadata flip (compact is the one repointing verb that still always
+copies: copying is its purpose). (The N×G figure
 elsewhere in this page is the *aggregate* cost of N materialized forks;
 one compact pays ~G plus its checkpoint copies, once.) Through the daemon (the
 `compact` op, SDK `compact()`), compact refuses while this daemon has an
@@ -577,7 +694,7 @@ offshoot destroy app@attempt-1 --force
 ```
 
 Deletes the branch's ref and its local checkout files (`.db`, `-wal`,
-`-shm`, `.sum`). Destroying a parent is always safe, instant, and allowed
+`-shm`, `.sum`, `.shadow`). Destroying a parent is always safe, instant, and allowed
 regardless of live children — a parent's destruction can never corrupt a
 child, whether that child is a shared (copy-on-write) fork or a
 materialized one. `--force` is required to destroy a protected branch
@@ -708,21 +825,23 @@ Every branch line carries its copy-on-write cost class, because the two
 classes have genuinely different storage bills and hiding that would be
 dishonest:
 
-- **`storage=shared`** — the branch is a base-pointer fork: it reads
-  through an ancestor's durable objects and added near-zero storage of its
-  own at fork time. Cheap to hold, but it **pins** whatever ancestor
+- **`storage=shared`** — the branch reads through another lineage's
+  durable objects via a base pointer: a fork, and since v0.2.12 the
+  default result of `rollback` and `promote`. It added near-zero storage
+  of its own when it was made. Cheap to hold, but it **pins** whatever
   storage its chain still resolves through (see `offshoot destroy` above).
 - **`storage=materialized`** — the branch is a fully self-contained
-  lineage: created roots, the results of `promote`/`rollback`/`compact`,
-  and forks that tripped the fork-time snapshot floor. It pins nothing and
-  nothing else's destruction can defer its reclaim.
+  lineage: created roots, the results of `compact` and of
+  `rollback --materialize`/`promote --materialize`, and forks, rollbacks
+  or promotes that tripped the fork-time snapshot floor. It pins nothing
+  and nothing else's destruction can defer its reclaim.
 
-The asymmetry to internalize: **`fork` shares (near-free);
-`promote`, `rollback`, and `compact` each materialize a full copy.**
-"Fork at checkpoint X is free but rollback to X costs a full copy" is a
-real, deliberate wart — rollback and promote abandon their old lineage
-(base-pointing into a lineage that is meant to die would pin it forever),
-so they pay up front. The daemon's `branches` op reports the same bit as
+Before v0.2.12, `promote` and `rollback` always copied the whole
+database into a new lineage ("fork at checkpoint X is free but rollback
+to X is not"). They now share like fork does, and the cost they used to pay up front
+moves to reclaim: the lineage they point into stays live until the branch
+diverges past its snapshot cadence or is compacted. `compact` is the one
+verb that still always copies. The daemon's `branches` op reports the same bit as
 `BranchInfo.shared` (wire-additive; an older client simply doesn't read
 the key), computed from the same ref field, so the CLI and daemon surfaces
 can never disagree.
@@ -794,10 +913,9 @@ idle. This runs **per branch**, on every `offshoot status` / `branches`
 call, for every branch that is checked out, unleased, and not already
 `detached` — i.e. exactly the branches where "is it dirty" is still an
 open question. A store with many large, checked-out, unleased branches
-will feel this on every call. There is no cheap short-circuit: file
-size/mtime cannot substitute for a real hash (mtime is exactly what this
-codebase's own `.last-used`-style touch-file conventions elsewhere work
-around, not something trustworthy for content identity). If the checkpoint
+will feel this on every call. `status` does not use the fingerprint
+shortcut `checkout` takes (see the `.sum` sidecar under `offshoot
+checkout` above): it always hashes. If the checkpoint
 attempt itself reports busy — a live connection is actively using that
 unleased checkout right now — the state is reported as `dirty` directly
 (without a hash), on the reasoning that active, untracked use of an
@@ -926,6 +1044,19 @@ Bounds `checkouts-ro` — the read-only cache `offshoot checkout --at
 `checkouts/`** (the writable, leased tree `checkout`/`session open` use) —
 see the writable-never-evicted guarantee below.
 
+**The by-chain entries count too.** Since v0.2.12 the same tree holds
+`<db>/~by-chain/<chainID>.db`, the immutable entries writable checkouts
+are cloned from (see `offshoot checkout` above), and the budget, the
+`offshoot_ro_cache_bytes` gauge and `offshoot status`'s `ro-cache:` line
+all count them at their **logical** size. On a cloning filesystem an entry
+shares its data blocks with every checkout cloned from it, so this
+over-states the real disk they use, and evicting one frees little until
+those checkouts diverge; a `--at` miss leaves both a by-chain entry and its
+`<branch>@<checkpoint>.db` clone, so it counts twice. Size the budget
+with that in mind. An evicted by-chain entry costs only a rebuild the
+next time a checkout of that state misses; it never touches a writable
+checkout.
+
 Default `0` means unlimited, matching `CheckoutAt`'s own unbounded-by-default
 behavior — the janitor still computes and reports usage every pass (see
 below), it just never evicts. A bare integer is bytes, the contract this
@@ -985,8 +1116,11 @@ removed, `offshoot_ro_cache_evictions_total` (a counter) incremented once
 per entry, and an `evicted` event published on the [event
 bus](#eventing-subscribe-op--get-events) (`{type:"evicted", db, branch,
 detail:{checkpoint, bytes}}`) — subscribe (socket or `GET /events`) to
-watch evictions happen in real time. Each eviction removes both the cache
-file and its `.last-used` marker together.
+watch evictions happen in real time. Each eviction removes the cache file
+together with its `.last-used` marker (and, for a by-chain entry, its
+`.sum`). A by-chain entry is reported with branch `~by-chain` and its
+chain ID in the checkpoint position — `evicted app@~by-chain@<chainID>` —
+since it belongs to no single branch.
 
 **TOCTOU under a configured budget:** a path `checkout --at --read-only` /
 `checkout-at` returns — from a fresh materialize OR a cache hit — is not a
@@ -1119,7 +1253,7 @@ sees events published *after* it subscribes.
 | `fenced` | A session is fenced out by a lease it no longer holds | `cause` |
 | `session_closed` | A session closes (daemon `close` op, or `shutdown`) | `error` (only if the close itself errored) |
 | `reaped` | The janitor destroys a branch whose TTL expired | *(none)* |
-| `evicted` | The janitor evicts a `checkouts-ro` entry over `-ro-cache-budget` | `checkpoint`, `bytes` |
+| `evicted` | The janitor evicts a `checkouts-ro` entry over `-ro-cache-budget` | `checkpoint`, `bytes` (a by-chain entry reports branch `~by-chain` and its chain ID as `checkpoint`) |
 | `dropped_slow_consumer` | Sent to a subscriber being dropped (see below), never to anyone else | *(none)* |
 
 **Slow-subscriber drop:** publishing never blocks the daemon (a session
@@ -1318,7 +1452,9 @@ the SDKs, `offshoot session open`, or a custom loop); each call to
 checks whether the daemon named by `-socket` (default: the same socket
 `offshoot serve` derives for this store) has one open for the branch in
 question. If so, `offshoot_checkpoint` flushes it live through the daemon
-instead of writing a full at-rest snapshot; `offshoot_checkout`
+instead of writing an at-rest checkpoint (an at-rest result carries `kind`,
+`"segment"` or `"snapshot"`, as `offshoot checkpoint` above; a live flush's
+result carries none); `offshoot_checkout`
 returns that session's own live checkout path. `offshoot_fork` goes
 further: it routes through the daemon whenever one is merely *reachable*,
 session or no session — so the fork uses the daemon's configured
@@ -1520,7 +1656,7 @@ Which operations exist on which surface today — verified against
 
 | Operation | CLI | Daemon op | Python/TS SDK | Notes |
 |---|---|---|---|---|
-| create / checkout / fork / destroy / rollback / promote / compact / touch / branches / dbs | yes | yes | yes | Full parity. `compact` through the daemon refuses while a session is open on the branch (see above). `rollback`/`promote`'s safety-fork backup (`--no-backup`/`--backup-ttl` on the CLI, `no_backup`/`backup_ttl` request fields and a `backup` response field on the daemon op, `backup`/`backup_ttl` kwargs on both SDKs) is full parity too. |
+| create / checkout / fork / destroy / rollback / promote / compact / touch / branches / dbs | yes | yes | yes | Full parity. `compact` through the daemon refuses while a session is open on the branch (see above). `rollback`/`promote`'s safety-fork backup (`--no-backup`/`--backup-ttl` on the CLI, `no_backup`/`backup_ttl` request fields and a `backup` response field on the daemon op, `backup`/`backup_ttl` kwargs on both SDKs) is full parity too, and so is their `--materialize` (`materialize` request field and `shared` response field on the daemon op; Python `materialize=False`, TypeScript `materialize?: boolean`). |
 | `protect` / `unprotect` | yes | no | no | **CLI-only, by design.** No daemon op or MCP tool sets the `protected` flag — only `offshoot_list`/the daemon's `branches` op reads it. Keeping the write side off every remote-callable surface means an agent (MCP) or a network client (daemon/HTTP) can observe protection but never grant or revoke it. |
 | open / flush / status / close (sessions) | `session ...` | yes | yes | SDK `flush(name, meta=...)` can attach checkpoint metadata; the CLI `session flush` subcommand has no `--meta` flag. |
 | export / historical read-only checkout | yes | yes (`export`, `checkout-at`) | yes | No CLI `session` subcommand — the CLI's `export`/`checkout --at --read-only` are the at-rest equivalents (see the section above); `export` is unix-socket-only over the daemon. |

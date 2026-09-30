@@ -234,18 +234,21 @@ storage layer.
 
 What still costs real bytes, stated plainly:
 
-- **`promote`, `rollback`, and `compact` each materialize a full
-  independent copy** (~G for a G-byte database). Fork is free; picking a
-  winner isn't. This asymmetry is deliberate — those operations abandon or
-  replace a lineage, and base-pointing into a lineage that is meant to die
-  would pin it forever.
+- **`compact` materializes a full independent copy** (~G for a G-byte
+  database) — that is its job. Since v0.2.12 `promote` and `rollback`
+  share like fork does (a base pointer, no copy) unless you pass
+  `--materialize`; what they cost instead is prompt reclaim: a promoted
+  branch keeps the winner's lineage live beneath it, and a rolled-back
+  branch keeps the old lineage up to the checkpoint, until it diverges
+  past them or is compacted.
 - **A destroyed parent's bytes linger while shared children survive.**
   Destroy is instant, but GC reclaims a shared ancestor's storage only
   once no surviving child's chain still reads through it — destroy or
   `compact` the children to get the refund.
-- **Deep fork spines occasionally pay a snapshot floor**: a fork whose
-  resolved chain is already at the depth bound materializes one fresh
-  snapshot instead of sharing, keeping reads bounded.
+- **Deep fork spines occasionally pay a snapshot floor**: a fork (or
+  rollback, or promote) whose resolved chain is already at the depth bound
+  materializes one fresh snapshot instead of sharing, keeping reads
+  bounded.
 
 TTLs remain the cleanup mechanism for attempt branches
 (`offshoot fork app attempt-1 --ttl 2h`); `offshoot status` reports every

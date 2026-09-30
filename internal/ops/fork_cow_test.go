@@ -1,6 +1,6 @@
 // Fork-time snapshot-floor tests. External package (ops_test) because
-// building a deep resolved chain requires session's flush cadence (segments,
-// not the CLI Checkpoint's always-a-snapshot), and session imports ops — see
+// building a deep resolved chain uses session's flush cadence (segments at
+// every flush, not only when a shadow allows one), and session imports ops — see
 // gc_chain_test.go's package doc comment for the cycle rationale.
 package ops_test
 

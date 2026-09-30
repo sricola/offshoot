@@ -20,6 +20,7 @@ import (
 	"github.com/sricola/offshoot/internal/capture"
 	"github.com/sricola/offshoot/internal/ltxio"
 	"github.com/sricola/offshoot/internal/ops"
+	"github.com/sricola/offshoot/internal/ops/reflink"
 	"github.com/sricola/offshoot/internal/store"
 	"github.com/sricola/offshoot/internal/testutil"
 )
@@ -1371,6 +1372,115 @@ func TestReadOnlySessionWithCleanCheckoutMakesNoStoreWrites(t *testing.T) {
 	}
 }
 
+// TestOpenOnClonedCheckoutSkipsSettlingFlush: a checkout produced by
+// cloning a by-chain cache entry (a fresh shared fork whose chain a sibling
+// already materialized) is stamped with the fork's own identity and the
+// entry's recorded hash and checksum, so Open finds it clean and suppresses
+// the settling flush exactly as for a materialized one: no snapshot object
+// is written, and the first real flush is a segment.
+func TestOpenOnClonedCheckoutSkipsSettlingFlush(t *testing.T) {
+	testutil.RequireSQLite3(t)
+	w := newWS(t)
+	probe := filepath.Join(w.Root, "clone-probe")
+	if err := os.WriteFile(probe, []byte("probe"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	err := reflink.Clone(probe+".clone", probe)
+	os.Remove(probe)
+	os.Remove(probe + ".clone")
+	if errors.Is(err, reflink.ErrUnsupported) {
+		t.Skip("workspace filesystem does not support reflink/clonefile")
+	} else if err != nil {
+		t.Fatal(err)
+	}
+
+	if err := w.Create("app"); err != nil {
+		t.Fatal(err)
+	}
+	mainPath, err := w.Checkout("app", "main")
+	if err != nil {
+		t.Fatal(err)
+	}
+	mustExec(t, mainPath, "CREATE TABLE t (v); INSERT INTO t VALUES (1);")
+	// A forced snapshot: seed's chain is then that one object, so no
+	// by-chain entry (main's own txid-1 checkout populated one) is a prefix
+	// of it and the sibling's checkout below really materializes.
+	if _, err := w.CheckpointWith("app", "main", "seed", nil, ops.CheckpointOptions{Snapshot: true}); err != nil {
+		t.Fatal(err)
+	}
+	for _, br := range []string{"sibling", "cloned"} {
+		if _, err := w.Fork("app", "main", br, "seed", 0, nil); err != nil {
+			t.Fatal(err)
+		}
+	}
+	if _, err := w.Checkout("app", "sibling"); err != nil { // materializes, populates the by-chain entry
+		t.Fatal(err)
+	}
+	markers := func() []string {
+		m, _ := filepath.Glob(filepath.Join(w.Root, "checkouts-ro", "app", "*", "*.db.last-used"))
+		return m
+	}
+	if got := markers(); len(got) != 0 {
+		t.Fatalf("by-chain entries already hit before the clone: %v", got)
+	}
+	path, err := w.Checkout("app", "cloned")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got := markers(); len(got) != 1 {
+		t.Fatalf("checkout of the second fork did not clone a by-chain entry (hit markers %v)", got)
+	}
+	want, err := os.ReadFile(w.CheckoutPath("app", "sibling"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got, err := os.ReadFile(path); err != nil || !bytes.Equal(got, want) {
+		t.Fatalf("cloned checkout differs from its sibling's materialized one (err %v)", err)
+	}
+
+	s, err := Open(context.Background(), Options{WS: w, DB: "app", Branch: "cloned"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer s.Close()
+	if !s.cleanAtOpen || !s.headPostApplyValid {
+		t.Fatalf("cloned checkout not clean at open (cleanAtOpen %v, headPostApplyValid %v)", s.cleanAtOpen, s.headPostApplyValid)
+	}
+	waitFor(t, 5*time.Second, "the (suppressed) startup rebase to settle with nothing pending", func() bool {
+		return !s.autoFlushPending()
+	})
+
+	mustExec(t, s.CheckoutPath(), "INSERT INTO t VALUES (2);")
+	txid, err := s.Flush("", nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	ref, _, err := w.Store.GetRef("app", "cloned")
+	if err != nil {
+		t.Fatal(err)
+	}
+	keys, err := w.Store.B.List(store.LineagePrefix(ref.Lineage))
+	if err != nil {
+		t.Fatal(err)
+	}
+	foundSegment := false
+	for _, k := range keys {
+		m, ok := store.ParseMemberKey(k)
+		if !ok {
+			continue
+		}
+		if m.Snapshot {
+			t.Fatalf("a snapshot object %s was written after a cloned, clean open", k)
+		}
+		if m.MaxTXID == txid {
+			foundSegment = true
+		}
+	}
+	if !foundSegment {
+		t.Fatalf("first real flush (txid %d) is not a segment on the fork's lineage: %v", txid, keys)
+	}
+}
+
 // TestSettleStillHappensWhenCheckoutWasStaleAtOpen guards the suppression's
 // safety boundary from the other side: a checkout whose on-disk content
 // differs from the branch head when Open runs — simulated here by dirtying
@@ -1712,6 +1822,62 @@ func TestCloseRefreshesSidecarSoReopenCleanSkips(t *testing.T) {
 	}
 	if !os.SameFile(st1, st2) {
 		t.Fatal("reopen after a clean close should clean-skip re-materializing the checkout (same inode expected)")
+	}
+}
+
+// TestAtRestCheckpointAfterCloseWritesASegment: a clean Close re-clones the
+// checkout's shadow at the head the session flushed, so the next at-rest
+// Checkpoint (no daemon) diffs against it and writes a segment whose
+// materialization equals the checkout.
+func TestAtRestCheckpointAfterCloseWritesASegment(t *testing.T) {
+	testutil.RequireSQLite3(t)
+	w := newWS(t)
+	probe := filepath.Join(w.Root, "clone-probe")
+	if err := os.WriteFile(probe, []byte("probe"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	err := reflink.Clone(probe+".clone", probe)
+	os.Remove(probe)
+	os.Remove(probe + ".clone")
+	if errors.Is(err, reflink.ErrUnsupported) {
+		t.Skip("workspace filesystem does not support reflink/clonefile")
+	} else if err != nil {
+		t.Fatal(err)
+	}
+	if err := w.Create("app"); err != nil {
+		t.Fatal(err)
+	}
+	s, err := Open(context.Background(), Options{WS: w, DB: "app", Branch: "main"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	path := s.CheckoutPath()
+	mustExec(t, path, "CREATE TABLE t (v); INSERT INTO t VALUES (1);")
+	if _, err := s.Flush("", nil); err != nil {
+		t.Fatal(err)
+	}
+	mustExec(t, path, "INSERT INTO t VALUES (2);")
+	if _, err := s.Flush("", nil); err != nil {
+		t.Fatal(err)
+	}
+	if err := s.Close(); err != nil {
+		t.Fatal(err)
+	}
+	mustExec(t, path, "INSERT INTO t VALUES (3);")
+	res, err := w.CheckpointWith("app", "main", "after", nil, ops.CheckpointOptions{})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if res.Kind != "segment" {
+		t.Fatalf("at-rest checkpoint after a clean Close wrote a %s, want a segment", res.Kind)
+	}
+	dst := filepath.Join(t.TempDir(), "export.db")
+	if err := w.Export("app", "main", "after", dst, false); err != nil {
+		t.Fatal(err)
+	}
+	want, _ := os.ReadFile(path)
+	if got, err := os.ReadFile(dst); err != nil || !bytes.Equal(got, want) {
+		t.Fatalf("materialized checkpoint differs from the checkout (err %v)", err)
 	}
 }
 

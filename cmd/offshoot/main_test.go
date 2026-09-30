@@ -6,12 +6,14 @@ import (
 	"os"
 	"os/exec"
 	"path/filepath"
+	"regexp"
 	"runtime"
 	"strings"
 	"testing"
 	"time"
 
 	"github.com/sricola/offshoot/internal/daemon"
+	"github.com/sricola/offshoot/internal/ops/reflink"
 	"github.com/sricola/offshoot/internal/testutil"
 )
 
@@ -149,6 +151,48 @@ func TestQuickstartTranscript(t *testing.T) {
 	status := call(t, store, "status")
 	if !strings.Contains(status, "app@main") || strings.Contains(status, "attempt-1") {
 		t.Fatalf("status:\n%s", status)
+	}
+}
+
+// TestCheckpointOutputNamesItsKind pins checkpoint's output: a segment
+// reports its page count and KiB, a snapshot its MiB, and --snapshot
+// forces a snapshot where a segment would otherwise be written.
+func TestCheckpointOutputNamesItsKind(t *testing.T) {
+	testutil.RequireSQLite3(t)
+	store := filepath.Join(t.TempDir(), "s")
+	call(t, store, "init")
+	call(t, store, "create", "app")
+	path := strings.TrimSpace(call(t, store, "checkout", "app"))
+	if out, err := exec.Command("sqlite3", path, "CREATE TABLE t (v BLOB); "+
+		"WITH RECURSIVE n(i) AS (SELECT 1 UNION ALL SELECT i+1 FROM n WHERE i < 500) "+
+		"INSERT INTO t SELECT randomblob(1000) FROM n;").CombinedOutput(); err != nil {
+		t.Fatalf("%v: %s", err, out)
+	}
+	snapshotLine := regexp.MustCompile(`^checkpoint "(\w+)" at txid (\d+) \(snapshot, \d+\.\d MiB\)\n$`)
+	segmentLine := regexp.MustCompile(`^checkpoint "b" at txid 3 \(segment, \d+ pages, \d+\.\d KiB\)\n$`)
+	if out := call(t, store, "checkpoint", "app", "a"); !snapshotLine.MatchString(out) {
+		t.Fatalf("first checkpoint printed %q, want a snapshot line", out)
+	}
+	insert := func() {
+		if out, err := exec.Command("sqlite3", path, "INSERT INTO t VALUES (randomblob(10));").CombinedOutput(); err != nil {
+			t.Fatalf("%v: %s", err, out)
+		}
+	}
+	insert()
+	out := call(t, store, "checkpoint", "app", "b")
+	probe := filepath.Join(store, "clone-probe")
+	os.WriteFile(probe, []byte("x"), 0o644)
+	cloneErr := reflink.Clone(probe+".c", probe)
+	os.Remove(probe + ".c")
+	switch {
+	case cloneErr == nil && !segmentLine.MatchString(out):
+		t.Fatalf("second checkpoint printed %q, want a segment line", out)
+	case cloneErr != nil && !snapshotLine.MatchString(out):
+		t.Fatalf("second checkpoint without clone support printed %q, want a snapshot line", out)
+	}
+	insert()
+	if out := call(t, store, "checkpoint", "app", "c", "--snapshot"); !snapshotLine.MatchString(out) {
+		t.Fatalf("checkpoint --snapshot printed %q, want a snapshot line", out)
 	}
 }
 
@@ -675,5 +719,34 @@ func TestStatusReportsStorageClass(t *testing.T) {
 	status = call(t, store, "status")
 	if line := statusLineFor(t, status, "app@attempt-1"); !strings.Contains(line, "storage=materialized") {
 		t.Fatalf("compacted branch must report storage=materialized: %q", line)
+	}
+}
+
+// TestRollbackAndPromoteOutputNameTheirMode pins the storage-mode tag on
+// rollback's and promote's output: (shared) by default, (materialized)
+// under --materialize.
+func TestRollbackAndPromoteOutputNameTheirMode(t *testing.T) {
+	testutil.RequireSQLite3(t)
+	store := filepath.Join(t.TempDir(), "s")
+	call(t, store, "init")
+	call(t, store, "create", "app")
+	path := strings.TrimSpace(call(t, store, "checkout", "app"))
+	if out, err := exec.Command("sqlite3", path, "CREATE TABLE t (v);").CombinedOutput(); err != nil {
+		t.Fatalf("%v: %s", err, out)
+	}
+	call(t, store, "checkpoint", "app", "v1")
+	call(t, store, "fork", "app", "attempt")
+	for _, c := range []struct {
+		args []string
+		want string
+	}{
+		{[]string{"rollback", "app", "--to", "v1", "--no-backup"}, `rolled back app@main to "v1" (shared)`},
+		{[]string{"rollback", "app", "--to", "v1", "--no-backup", "--materialize"}, `rolled back app@main to "v1" (materialized)`},
+		{[]string{"promote", "app@attempt", "--onto", "main", "--force", "--no-backup"}, "(shared)"},
+		{[]string{"promote", "app@attempt", "--onto", "main", "--force", "--no-backup", "--materialize"}, "(materialized)"},
+	} {
+		if out := call(t, store, c.args...); !strings.Contains(out, c.want) {
+			t.Fatalf("offshoot %v printed %q, want it to contain %q", c.args, out, c.want)
+		}
 	}
 }

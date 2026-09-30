@@ -90,7 +90,7 @@ two — `./examples/parallel-attempts/run.sh`. Real recording:
     attempt-3: PASS
 ==> winner: attempt-3
 ==> promoting the winner onto main
-    promoted shop@attempt-3 -> shop@main at txid 3
+    promoted shop@attempt-3 -> shop@main at txid 3 (shared)
     kept the previous shop@main head as shop@main-pre-promote (expires in 24h0m0s; undo with: offshoot promote shop@main-pre-promote --onto main --force)
 ==> discarding the losers
 ==> main now has the migrated data:
@@ -166,8 +166,8 @@ fork-per-attempt/diff-per-attempt pattern and a runnable example
 
 - **Copy-on-write forks, measured.** A shared fork writes two tiny
   objects — 377 B for a 100 MB database, flat from 1 to 100 forks — and
-  forking a named checkpoint takes ~9–12 ms whether the database is 12 MB
-  or 1 GB. A diverging child pays only for the pages it changes (~776 B
+  forking a named checkpoint takes ~9–10 ms whether the database is 12 MB
+  or 1 GB. A diverging child pays only for the pages it changes (~761 B
   per single-row transaction). Numbers, method, and the honest caveats:
   [docs/benchmarks.md](docs/benchmarks.md#copy-on-write-fork-cost-v02x).
 - **kill&nbsp;-9 durable.** The torture harness runs a stock `sqlite3` CLI
@@ -265,9 +265,11 @@ in unit tests proves nothing about a real provider.
 Checkouts are always real local SQLite files; only the snapshots and refs
 live in the store.
 
-At rest (no daemon running): checkpoints are full snapshots; checkout
-paths are fixed at `<store>/checkouts/{db}/{branch}.db`; operations
-require the checkout to be quiescent (no live writers). Daemon mode
+At rest (no daemon running): a checkpoint writes the pages changed since
+the last one (diffed against a reflinked shadow of the checkout) or, when
+it can't, a full snapshot; checkout paths are fixed at
+`<store>/checkouts/{db}/{branch}.db`; operations require the checkout to
+be quiescent (no live writers). Daemon mode
 (below) layers live capture, incremental segments, and continuous
 durability on top of the same commands.
 
@@ -386,18 +388,26 @@ and the exact suppression condition:
 [docs/benchmarks.md](docs/benchmarks.md#settling-flush-cost-task-2-controller-decision)
 and `internal/session/session.go`'s `rebaseline` doc comment.
 
-The at-rest `offshoot checkpoint` still writes a full snapshot every time —
-it runs without a daemon, so it has no record of which pages changed. If
-you checkpoint large databases in a loop, run a daemon.
+The at-rest `offshoot checkpoint` has no capture engine, so it keeps its
+own record of what changed: a reflinked `.shadow` of the checkout as of
+the last checkpoint. It diffs against that and writes a segment of the
+changed pages when fewer than half changed and the chain is under the
+snapshot cadence, else a full snapshot (`--snapshot` forces one). The diff
+still reads the whole file locally, and on a filesystem that cannot clone
+(ext4, tmpfs) there is no shadow and every at-rest checkpoint is a full
+snapshot — there, if you checkpoint large databases in a loop, run a
+daemon.
 
 Forking is a different cost from flushing — usually no storage cost at
 all. `offshoot fork` shares the parent's already-durable objects through a
 base pointer: the child records where it forked from and writes new
 objects only as it diverges, so N forks of a G-byte database cost
 near-zero added store bytes rather than N×G, and reads stay bounded by
-construction. The asymmetry to know: **fork shares; `promote`,
-`rollback`, and `compact` each materialize a full independent copy**
-(measured numbers in [docs/benchmarks.md](docs/benchmarks.md)). Destroying
+construction. The asymmetry to know: **fork, `promote` and `rollback`
+share; `compact` materializes a full independent copy**, because cutting
+the base pointer is its purpose, and `--materialize` on `promote` or
+`rollback` asks for a copy too (measured numbers in
+[docs/benchmarks.md](docs/benchmarks.md)). Destroying
 a parent stays instant, but its bytes are reclaimed only once no surviving
 shared child still reads through them — `offshoot compact` cuts that cord
 on demand. The first shared fork bumps the store to layout version 2,
@@ -441,9 +451,10 @@ disk without consulting the store's chain. Full mechanics and caveats:
 **Read-only historical checkouts** (`offshoot checkout --at <checkpoint>
 --read-only`) live in a separate `checkouts-ro/` tree — one `chmod 0444`
 file per `(db, branch, checkpoint)`, no sidecar, no lease, no stranded
-descriptor — and **it is safe to `rm -rf` the entire `checkouts-ro`
-directory at any time**; the next call rebuilds what it needs from the
-store. `offshoot export`'s output has the same
+descriptor. The same tree holds `~by-chain/`, the immutable entries every
+checkout is cloned from where the filesystem can clone. **It is safe to
+`rm -rf` the entire `checkouts-ro` directory at any time**; the next call
+rebuilds what it needs from the store. `offshoot export`'s output has the same
 zero-ongoing-relationship property, written wherever you pointed it.
 
 ## Integration surface

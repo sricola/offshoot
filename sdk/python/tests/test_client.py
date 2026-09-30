@@ -124,6 +124,29 @@ class TestCreateFromPathResolution(unittest.TestCase):
         self.assertEqual(fields["path"], os.path.abspath("relative-src.db"))
 
 
+class TestMaterializeWireField(unittest.TestCase):
+    """rollback/promote send the daemon's `materialize` field: False by
+    default (share the kept history), True when asked to copy. No daemon
+    needed; _call is captured as in TestCreateFromPathResolution."""
+
+    def _client_capturing_call(self):
+        client = offshoot.Client.__new__(offshoot.Client)
+        calls = []
+        client._call = lambda op, **fields: calls.append((op, fields)) or {"ok": True}
+        return client, calls
+
+    def test_rollback_and_promote_send_materialize(self):
+        client, calls = self._client_capturing_call()
+        client.rollback("app", "main", "v1")
+        client.rollback("app", "main", "v1", materialize=True)
+        client.promote("app", "attempt", "main")
+        client.promote("app", "attempt", "main", materialize=True)
+        self.assertEqual([(op, f["materialize"]) for op, f in calls], [
+            ("rollback", False), ("rollback", True),
+            ("promote", False), ("promote", True),
+        ])
+
+
 def build_binary(tmp: Path) -> Path:
     binpath = os.environ.get("OFFSHOOT_BIN")
     if binpath:

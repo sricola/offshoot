@@ -361,6 +361,24 @@ test("branches: state is passed through when present", async () => {
   assert.equal(branches[0].state, "active");
 });
 
+test("rollback and promote send the materialize wire field", async () => {
+  const client = Object.create(Client.prototype) as Client;
+  const sent: Array<[string, Record<string, unknown>]> = [];
+  (client as unknown as { _call: (op: string, fields: Record<string, unknown>) => Promise<unknown> })._call =
+    async (op, fields) => {
+      sent.push([op, fields]);
+      return { ok: true };
+    };
+  await client.rollback("app", "main", "v1");
+  await client.rollback("app", "main", "v1", { materialize: true });
+  await client.promote("app", "attempt", "main");
+  await client.promote("app", "attempt", "main", { materialize: true });
+  assert.deepEqual(sent.map(([op, f]) => [op, f.materialize]), [
+    ["rollback", false], ["rollback", true],
+    ["promote", false], ["promote", true],
+  ]);
+});
+
 test("errors are loud", async (t: TestContext) => {
   if (!canRun) {
     t.skip("go and/or sqlite3 not on PATH");

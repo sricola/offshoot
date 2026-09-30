@@ -669,7 +669,7 @@ pytest-specific harness that would just be adding noise.
 For how that per-test cost compares to the alternatives a harness author
 might otherwise reach for — a plain `shutil.copyfile`/`sqlite3.Connection.
 backup()` of a seed file, or a Postgres `CREATE DATABASE ... TEMPLATE`
-clone — see [docs/benchmarks.md](benchmarks.md#per-test-isolation-primitives-v0211)'s
+clone — see [docs/benchmarks.md](benchmarks.md#per-test-isolation-primitives-v0212)'s
 "Per-test isolation primitives" section: bare `offshoot fork` is
 near-constant regardless of database size, while `fork` + `open` + `close`
 together are not, because `open`'s checkout materialization and

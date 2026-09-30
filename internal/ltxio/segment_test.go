@@ -466,3 +466,131 @@ func TestMaterializeChainIncrementalChecksumMatchesFullRescan(t *testing.T) {
 		t.Fatalf("full rescan of materialized result (%016x) != declared post-apply checksum (%016x)", rescan, post2)
 	}
 }
+
+// buildThreeSegmentChain returns a snapshot (txid 1) and three successive
+// single-txid segments (txids 2..4) built from real on-disk states — grow,
+// update in place, shrink — plus the final state's path.
+func buildThreeSegmentChain(t *testing.T) (snap []byte, segs [][]byte, final string) {
+	t.Helper()
+	prev := buildDB(t, "CREATE TABLE t (id INTEGER PRIMARY KEY, v BLOB)",
+		"INSERT INTO t (v) VALUES (randomblob(50))")
+	var sb bytes.Buffer
+	if _, err := EncodeSnapshot(prev, 1, &sb); err != nil {
+		t.Fatal(err)
+	}
+	steps := []string{
+		insertManySQL(60, 300),
+		"UPDATE t SET v = randomblob(40) WHERE id % 3 = 0;",
+		"DELETE FROM t WHERE id > 10; VACUUM;",
+	}
+	for i, stmt := range steps {
+		next := filepath.Join(t.TempDir(), fmt.Sprintf("v%d.sqlite", i+2))
+		if err := copyFileForTest(prev, next); err != nil {
+			t.Fatal(err)
+		}
+		if out, err := exec.Command("sqlite3", next, stmt+"PRAGMA wal_checkpoint(TRUNCATE);").CombinedOutput(); err != nil {
+			t.Fatalf("%v: %s", err, out)
+		}
+		_, _, before := readPages(t, prev)
+		pageSize, commit, after := readPages(t, next)
+		txid := uint64(i + 2)
+		var seg bytes.Buffer
+		if err := EncodeSegment(pageSize, commit, txid, txid, checksumOf(t, prev), checksumOf(t, next), diffPages(before, after), &seg); err != nil {
+			t.Fatal(err)
+		}
+		segs = append(segs, seg.Bytes())
+		prev = next
+	}
+	return sb.Bytes(), segs, prev
+}
+
+func readersOf(bufs [][]byte) []io.Reader {
+	rs := make([]io.Reader, len(bufs))
+	for i, b := range bufs {
+		rs[i] = bytes.NewReader(b)
+	}
+	return rs
+}
+
+// TestApplySegmentsMatchesMaterializeChain: snapshot + 3 segments through
+// MaterializeChain must equal the snapshot materialized alone and then the
+// same 3 segments applied by ApplySegments, byte for byte and checksum for
+// checksum; the start file itself is never modified.
+func TestApplySegmentsMatchesMaterializeChain(t *testing.T) {
+	testutil.RequireSQLite3(t)
+	snap, segs, final := buildThreeSegmentChain(t)
+	dir := t.TempDir()
+
+	whole := filepath.Join(dir, "whole.sqlite")
+	wholeTXID, wholeSum, err := MaterializeChain(bytes.NewReader(snap), readersOf(segs), whole)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	start := filepath.Join(dir, "start.sqlite")
+	_, startSum, err := MaterializeChain(bytes.NewReader(snap), nil, start)
+	if err != nil {
+		t.Fatal(err)
+	}
+	startBytes, err := os.ReadFile(start)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	applied := filepath.Join(dir, "applied.sqlite")
+	txid, sum, err := ApplySegments(start, startSum, readersOf(segs), applied)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if txid != wholeTXID || txid != 4 {
+		t.Fatalf("txid = %d, MaterializeChain's = %d, want 4", txid, wholeTXID)
+	}
+	if sum != wholeSum {
+		t.Fatalf("checksum = %016x, MaterializeChain's = %016x", sum, wholeSum)
+	}
+	if rescan := checksumOf(t, applied); rescan != sum {
+		t.Fatalf("ChecksumDatabase(applied) = %016x, returned %016x", rescan, sum)
+	}
+	a, err := os.ReadFile(applied)
+	if err != nil {
+		t.Fatal(err)
+	}
+	b, err := os.ReadFile(whole)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !bytes.Equal(a, b) {
+		t.Fatal("ApplySegments result differs from MaterializeChain's")
+	}
+	if dumpOf(t, applied) != dumpOf(t, final) {
+		t.Fatal("ApplySegments result does not reproduce the final database")
+	}
+	if got, _ := os.ReadFile(start); !bytes.Equal(got, startBytes) {
+		t.Fatal("ApplySegments modified its start file")
+	}
+}
+
+// TestApplySegmentsRejectsWrongStartChecksum: a start state that does not
+// match the first segment's pre-apply checksum fails closed and leaves no
+// destination file.
+func TestApplySegmentsRejectsWrongStartChecksum(t *testing.T) {
+	testutil.RequireSQLite3(t)
+	snap, segs, _ := buildThreeSegmentChain(t)
+	dir := t.TempDir()
+	start := filepath.Join(dir, "start.sqlite")
+	_, startSum, err := MaterializeChain(bytes.NewReader(snap), nil, start)
+	if err != nil {
+		t.Fatal(err)
+	}
+	dst := filepath.Join(dir, "dst.sqlite")
+	if _, _, err := ApplySegments(start, startSum^1, readersOf(segs), dst); err == nil {
+		t.Fatal("want an error for a start checksum that does not match the first segment")
+	}
+	if _, err := os.Stat(dst); !os.IsNotExist(err) {
+		t.Fatalf("destination exists after a failed apply: %v", err)
+	}
+	entries, _ := os.ReadDir(dir)
+	if len(entries) != 1 {
+		t.Fatalf("temp files left behind: %v", entries)
+	}
+}

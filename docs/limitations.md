@@ -24,6 +24,20 @@ riskier problem than the one offshoot solves
 are copy-on-write and near-free, so fork-per-writer is the intended
 pattern, not a workaround.
 
+**Do not run two at-rest `offshoot checkpoint` commands on one branch
+concurrently.** The at-rest path takes no lease (see
+[One daemon per store](#one-daemon-per-store)); two racers compute the same
+next txid, and when both choose the same kind (snapshot or segment) the
+loser of the ref CAS can overwrite the winner's object with different
+content if a write landed on the checkout between their two encodes. The
+shadow guard forces the next at-rest checkpoint to a snapshot, but a daemon
+session opened on that checkout trusts the checksum recorded in its
+sidecar and can write a segment that does not apply. Serialize at-rest
+checkpoints per branch (one agent, one CLI caller at a time); the fix —
+read the stored object's trailer checksum after winning the CAS and, on a
+mismatch, stamp no checksum and drop the shadow — is a
+[Tier 2 follow-up](../ROADMAP.md#copy-on-write-storage--the-storage-amplification-arc).
+
 ## One daemon per store
 
 **What:** the supported topology today is exactly one daemon (and its
@@ -198,30 +212,62 @@ for as long as any surviving child's chain still reads through them —
 reclaimed only once the last sharing child is destroyed or compacted
 (`offshoot compact` is the manual release valve). Expect storage refunds
 to lag destroys; that's the design, not a leak
-([the ledger](faq.md#storage-cost-honestly)).
+([the ledger](faq.md#storage-cost-honestly)). Locally, too, `destroy`
+removes the branch's checkout, sidecar and shadow but **not** the
+`checkouts-ro/<db>/~by-chain/` entries it was cloned from — another branch
+may share them. They age out under the default LRU bound (64 entries per
+database), or with `-ro-cache-budget`, or an `rm -rf` of `checkouts-ro`
+([operations](operations.md#budgets)).
 
 ## The performance envelope, from measured numbers
 
-All from [benchmarks](benchmarks.md) (darwin/arm64, local store; method
-and caveats there — the byte accounting transfers to S3, the milliseconds
-don't):
+All from [benchmarks](benchmarks.md) (darwin/arm64, Apple M5, local APFS
+store; method and caveats there — the byte accounting transfers to S3, the
+milliseconds don't):
 
-- **Fork at a named checkpoint is near-constant:** ~9–12 ms from 12 MB to
-  1 GB, adding [377 bytes](benchmarks.md#added-object-store-bytes-per-fork-100-mb-database)
-  for a 100 MB database, flat from 1 to 100 forks.
-- **Fork at head is O(size)** in wall clock — not from the share, but
-  from a safety check that SHA-256-hashes the whole checkout (~2.6 GB/s
-  on the benchmark machine) to warn about un-checkpointed changes: 1 GB
-  forks at head in ~418 ms. Fork a named checkpoint when latency matters.
-- **`promote`, `rollback`, and `compact` each materialize a full copy**
-  (~G bytes for a G-byte database). Fork is free; picking a winner isn't.
-- **A diverging shared child pays only for changed pages** (~776 B per
+- **Fork is near-constant, at a named checkpoint and — for a quiet
+  checkout — at head:** ~9–10 ms from 12 MB to 1 GB, adding
+  [377 bytes](benchmarks.md#added-object-store-bytes-per-fork-100-mb-database)
+  for a 100 MB database, flat from 1 to 100 forks; 1 GB forks at head in
+  9.5 ms. *Caveat:* the head check trusts the checkout's size/mtime
+  fingerprint only when its last write is more than 1 s older than its
+  sidecar stamp; inside that second it SHA-256-hashes the whole file as
+  before (100 MB: ~44 ms).
+- **A checkout of a state already on local disk is a clone:** 8.8 ms for a
+  100 MB database (262.8 ms before v0.2.12), and a clean checkout is proven
+  clean in ~0.3 ms at 64 MB and 512 MB alike. *Caveats:* the **first**
+  materialization of a seed or a new chain still decodes it from the
+  store, O(size); and
+  on a filesystem that cannot clone (ext4, tmpfs, most network
+  filesystems) there is no by-chain cache, so every checkout decodes, as
+  before.
+- **`promote` and `rollback` share by default** — a base pointer, like
+  fork — so picking a winner no longer copies it. *Caveats:* `compact`
+  still re-encodes the whole database (~G bytes for a G-byte database), as
+  do `--materialize` and a promote or rollback at the fork-time depth
+  floor;
+  and a shared result keeps the lineage it points into live until it
+  diverges past it or is compacted.
+- **A diverging shared child pays only for changed pages** (~761 B per
   single-row transaction against a 100 MB database) — but every 16th
   flush (`-snapshot-every`, default 16) writes a full self-snapshot to
   keep read chains bounded.
-- **At-rest `checkpoint` always writes a full snapshot** — without a
-  daemon there's no record of which pages changed. If you checkpoint
-  large databases in a loop, run a daemon.
+- **At-rest `checkpoint` writes a segment of the changed pages when it
+  can**, diffed against a reflinked shadow of the checkout. *Caveats:*
+  the diff still **reads the whole checkout and the whole shadow**, so its
+  local I/O is O(size) even when the upload is a few pages; half or more
+  of the pages changing, a chain at the snapshot cadence, or `--snapshot`
+  writes a full snapshot; and on a filesystem that cannot clone there is
+  no shadow, so every at-rest checkpoint is a full snapshot — there, if
+  you checkpoint large databases in a loop, run a daemon.
+- **A fresh checkout's first query reads from disk, not the page
+  cache.** A checkout is now a clone, and a clone starts with a cold page
+  cache even when its source is warm: on the reference machine BranchBench's
+  eval query (a scan of `order_line` in a 17 MiB database) took 50.6-54.9 ms
+  on a fresh clone and 6.3-6.4 ms on a freshly written copy. BranchBench's
+  eval p50 rose accordingly (`simulation` 11.5 → 56.4 ms) while its
+  checkout p50 fell (314.0 → 43.0 ms); the step as a whole got faster
+  ([the numbers, and the "Diagnostic instrumentation" tables](benchmarks.md#branchbench-topologies-v0212)).
 - **A session whose checkout had to be (re)materialized pays one settling
   full-snapshot flush** after open — O(size), once per session; reopening
   a clean, current checkout uploads nothing.

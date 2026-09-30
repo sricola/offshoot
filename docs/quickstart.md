@@ -37,10 +37,15 @@ INSERT INTO users (name) VALUES ('ada'), ('grace'), ('edsger');"
 
 ```
 $ offshoot checkpoint demo seeded
-checkpoint "seeded" at txid 2
+checkpoint "seeded" at txid 2 (segment, 2 pages, 0.4 KiB)
 ```
 
 A checkpoint is a named state you can fork from or roll back to later.
+The part in parentheses is what it stored: here a *segment* of the two
+pages that changed since `checkout`, diffed against a reflinked shadow of
+the checkout. On a filesystem that cannot clone (ext4, tmpfs) there is no
+shadow, and the line reads `(snapshot, … MiB)` — the whole database —
+instead.
 
 ## 4. Fork an experiment branch
 
@@ -53,7 +58,7 @@ This returns immediately: a fork is copy-on-write — it shares the
 parent's already-durable storage through a base pointer instead of copying
 anything. Measured: a shared fork of a 100 MB database adds
 [377 bytes](benchmarks.md#added-object-store-bytes-per-fork-100-mb-database)
-to the store, and forking a named checkpoint takes ~9–12 ms whether the
+to the store, and forking a named checkpoint takes ~9–10 ms whether the
 database is 12 MB or 1 GB
 ([benchmarks](benchmarks.md#shared-fork-latency-vs-database-size)).
 
@@ -81,7 +86,7 @@ edits) and `shared` (a copy-on-write fork, near-zero bytes of its own):
 $ offshoot status
 demo@experiment state=dirty storage=shared txid=2 checkpoints=[fork] checked-out
 demo@main state=idle storage=materialized txid=2 checkpoints=[init,seeded] protected checked-out
-ro-cache: 0 entries, 0 bytes used (budget: unlimited)
+ro-cache: 2 entries, 12288 bytes used (budget: unlimited)
 ```
 
 ## 7. Diff the two branches
@@ -93,11 +98,11 @@ instead):
 
 ```
 $ offshoot checkpoint demo@experiment wiped
-checkpoint "wiped" at txid 3
+checkpoint "wiped" at txid 3 (segment, 1 pages, 0.2 KiB)
 $ offshoot diff demo demo@experiment --summary
 left:  demo right: demo@experiment
-TABLE  demo  demo@experiment  STATUS
-users  3     0                changed (-3)
+TABLE  demo  demo@experiment  ADDED  REMOVED  CHANGED  STATUS
+users  3     0                0      3        0        changed
 1 tables: 0 same, 1 changed, 0 added, 0 removed
 ```
 
@@ -109,14 +114,19 @@ Roll the experiment back to it:
 ```
 $ offshoot rollback demo@experiment --to fork
 .offshoot/checkouts/demo/experiment.db
+rolled back demo@experiment to "fork" (shared)
+kept the previous demo@experiment head as demo@experiment-pre-rollback (expires in 24h0m0s; undo with: offshoot promote demo@experiment-pre-rollback --onto experiment --force)
 $ sqlite3 "$EXP" "SELECT COUNT(*) FROM users;"
 3
 ```
 
-The three rows are back. If the experiment had *worked*, the other ending
-is `offshoot promote demo@experiment --onto main --force` — repoint `main`
-at the experiment's head and ship it (`--force` because `main` is
-protected by default).
+The three rows are back. `(shared)` means the rollback wrote a base
+pointer at the `fork` checkpoint rather than copying it; the second line
+is why a script that wants just the path takes the first line
+(`offshoot rollback ... | head -1`). If the experiment had *worked*, the
+other ending is `offshoot promote demo@experiment --onto main --force` —
+repoint `main` at the experiment's head and ship it (`--force` because
+`main` is protected by default).
 
 ## What just happened
 
@@ -135,7 +145,7 @@ protected by default).
   via a base pointer: instant, near-zero bytes, fully isolated writes.
 - **`diff` / `rollback` / `promote`** — the attempt loop: compare
   attempts, discard a failed one, or
-  [promote](concepts.md#promote-rollback-and-compact-the-materializing-operations)
+  [promote](concepts.md#promote-rollback-and-compact-the-repointing-operations)
   a winner onto `main`.
 
 ## Where next

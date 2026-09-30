@@ -282,7 +282,8 @@ class Client:
         self._call("destroy", db=db, branch=branch, force=force)
 
     def rollback(self, db: str, branch: str, to: str, *,
-                 backup: bool = True, backup_ttl: _TTL = None) -> str:
+                 backup: bool = True, backup_ttl: _TTL = None,
+                 materialize: bool = False) -> str:
         """Repoint db@branch at checkpoint `to`; returns the refreshed checkout path.
 
         By default the branch's previous head is kept first as a shared
@@ -290,13 +291,18 @@ class Client:
         by the next rollback, TTL'd — 24h unless backup_ttl sets a timedelta
         or Go duration string), so a rollback is undone by promoting that
         fork back onto the branch. backup=False skips it.
+
+        The branch points at the kept checkpoint's history instead of
+        copying it; materialize=True copies it into a self-contained lineage.
         """
         resp = self._call("rollback", db=db, branch=branch, name=to,
-                          no_backup=not backup, backup_ttl=_ttl_str(backup_ttl))
+                          no_backup=not backup, backup_ttl=_ttl_str(backup_ttl),
+                          materialize=materialize)
         return cast(str, resp.get("checkout", ""))
 
     def promote(self, db: str, source: str, onto: str, force: bool = False,
-                backup: bool = True, backup_ttl: _TTL = None) -> int:
+                backup: bool = True, backup_ttl: _TTL = None,
+                materialize: bool = False) -> int:
         """Repoint db@onto at db@source's head; returns the promoted txid.
 
         By default the target's previous head is kept first as a shared
@@ -304,9 +310,13 @@ class Client:
         the next promote, TTL'd — 24h unless backup_ttl sets a timedelta or
         Go duration string), so a promote is undone by promoting that fork
         back onto the target. backup=False skips it.
+
+        The target points at the source head's history instead of copying
+        it; materialize=True copies it into a self-contained lineage.
         """
         resp = self._call("promote", db=db, branch=source, name=onto, force=force,
-                          no_backup=not backup, backup_ttl=_ttl_str(backup_ttl))
+                          no_backup=not backup, backup_ttl=_ttl_str(backup_ttl),
+                          materialize=materialize)
         return cast(int, resp.get("txid", 0))
 
     def compact(self, db: str, branch: str = "main") -> int:

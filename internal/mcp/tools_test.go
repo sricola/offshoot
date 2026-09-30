@@ -772,7 +772,8 @@ func TestForkSchemaAdvertisesTTL(t *testing.T) {
 
 // TestForkDescriptionStatesItsRealCost pins the storage/latency boundary an
 // agent sees before choosing the tool. A shared fork is tiny, not free, and
-// only a named-checkpoint fork avoids the default at-head checkout hash.
+// only a named-checkpoint fork avoids the at-head check for uncheckpointed
+// changes, which is a fingerprint comparison that hashes only on a mismatch.
 func TestForkDescriptionStatesItsRealCost(t *testing.T) {
 	ts, _ := newTools(t)
 	for _, tl := range ts.Tools() {
@@ -780,7 +781,7 @@ func TestForkDescriptionStatesItsRealCost(t *testing.T) {
 			continue
 		}
 		desc := strings.ToLower(tl.Description)
-		for _, fact := range []string{"two small metadata objects", "named checkpoint", "at-head", "hashes the checkout"} {
+		for _, fact := range []string{"two small metadata objects", "named checkpoint", "at-head", "fingerprint", "hashing the checkout only when"} {
 			if !strings.Contains(desc, fact) {
 				t.Errorf("offshoot_fork description must include %q: %s", fact, tl.Description)
 			}
@@ -1356,7 +1357,7 @@ func TestStructuredContentAccompaniesProse(t *testing.T) {
 		t.Fatalf("checkout structuredContent = %v", co)
 	}
 	cp := sc(call(t, ts, "offshoot_checkpoint", map[string]any{"database": "app", "branch": "attempt-1", "name": "v1"}))
-	if cp["name"] != "v1" || cp["live"] != false {
+	if cp["name"] != "v1" || cp["live"] != false || (cp["kind"] != "snapshot" && cp["kind"] != "segment") {
 		t.Fatalf("checkpoint structuredContent = %v", cp)
 	}
 	txid(cp, "txid", "app", "attempt-1")

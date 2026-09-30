@@ -74,7 +74,7 @@ func (w *Workspace) Export(db, branch, checkpoint, dstPath string, force bool) e
 	if err := os.MkdirAll(filepath.Dir(dstPath), 0o755); err != nil {
 		return err
 	}
-	if _, err := w.materializeAt(ref, cp, dstPath); err != nil {
+	if _, _, err := w.materializeAt(ref, cp, dstPath); err != nil {
 		return fmt.Errorf("ops: export %s@%s: %w", db, branch, err)
 	}
 	return nil
@@ -234,11 +234,26 @@ func (w *Workspace) CheckoutAt(db, branch, checkpoint string, force bool) (strin
 	if !ok {
 		return "", fmt.Errorf("ops: no checkpoint %q on %s@%s", checkpoint, db, branch)
 	}
-	if err := os.MkdirAll(filepath.Dir(path), 0o755); err != nil {
+	if err := mkdirPrivate(w.roCacheRoot(), filepath.Dir(path)); err != nil {
 		return "", err
 	}
-	if _, err := w.materializeAt(ref, cp, path); err != nil {
+	// Go through the by-chain area (see materializeFromChain) — the same
+	// cache CheckoutProven uses, so a checkpoint any branch has already
+	// materialized is a clone here, and a miss here builds the entry the
+	// next writable checkout of that chain clones.
+	members, err := w.resolveChain(ref, cp, path)
+	if err != nil {
 		return "", fmt.Errorf("ops: checkout-at %s@%s@%s: %w", db, branch, checkpoint, err)
+	}
+	placed, err := w.materializeFromChain(db, ref.Lineage, members, path, 0o444)
+	if err != nil {
+		return "", fmt.Errorf("ops: checkout-at %s@%s@%s: %w", db, branch, checkpoint, err)
+	}
+	if observeCheckoutSource != nil {
+		observeCheckoutSource(placed.kind)
+	}
+	if placed.kind != "clone" { // a populate may have added an entry
+		w.pruneByChain(db, DefaultByChainMaxEntries)
 	}
 	if err := checkoutAtChmod(path, 0o444); err != nil {
 		// The force=false fast path above is a bare os.Stat — it trusts mere
@@ -259,6 +274,26 @@ func (w *Workspace) CheckoutAt(db, branch, checkpoint string, force bool) (strin
 		return "", fmt.Errorf("ops: checkout-at %s@%s@%s materialized but could not be marked read-only (the file was removed; retry will re-materialize): %w", db, branch, checkpoint, err)
 	}
 	return path, nil
+}
+
+// byChainDir is the by-chain area's directory under each database's
+// checkouts-ro directory. The leading '~' is outside store.ValidateName's
+// charset, so no branch/checkpoint name can ever collide with it (and
+// CheckoutAtPath's <branch>@<checkpoint>.db files never can either).
+const byChainDir = "~by-chain"
+
+// byChainPath is the by-chain cache entry for chain id (see chainid.go):
+// <Root>/checkouts-ro/<db>/~by-chain/<id>.db, mode 0400, with a .sum
+// sidecar carrying its content hash, post-apply checksum and chain_id.
+// Entries are immutable content keyed by chain identity: any branch whose
+// resolved chain has this id is byte-identical to it, so an entry is never
+// revalidated, only cloned. Like the rest of checkouts-ro it is safe to
+// `rm -rf` at any time (the next miss re-creates it), is LRU-bounded to
+// DefaultByChainMaxEntries per database (see pruneByChain), and is
+// LRU-evicted under -ro-cache-budget too (see roCacheEntries). id is a hex SHA-256, so the
+// join cannot escape the directory; db must already be validated.
+func (w *Workspace) byChainPath(db, id string) string {
+	return filepath.Join(w.roCacheRoot(), db, byChainDir, id+".db")
 }
 
 // checkoutAtChmod is CheckoutAt's read-only chmod call, indirected only so

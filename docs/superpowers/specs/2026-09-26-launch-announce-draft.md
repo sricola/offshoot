@@ -24,9 +24,11 @@ struggled with. Our deep-narrow "mcts" topology — 10 workers x 100 steps,
 depth 25 — finished all 1,000 worker-steps in 65.1s wall time, with
 eval-query p50 latency at 9.1ms at depth 1 and 10.4ms at depth 25: reads
 don't get slower as branches deepen. Per-test isolation: a fork from a
-checkpoint (the fixture path) stays flat, ~9-12ms from 12MB to 1GB; a fork
-at head instead grows with size (17.0/50.3/418.0ms for 12MB/100MB/1GB)
-because it also hashes the checkout to warn about uncheckpointed changes.
+checkpoint (the fixture path) stays flat, ~9-12ms from 12MB to 1GB. A fork
+at head used to grow with size (17.0/50.3/418.0ms for 12MB/100MB/1GB) because
+it hashed the checkout to warn about uncheckpointed changes; since v0.2.12 it
+proves the checkout clean from its fingerprint and is flat too (9.5ms at 1GB,
+see docs/benchmarks.md).
 
 Every writer is CAS-fenced by a lease epoch, one writer per lineage,
 always. And since v0.2.11, every tagged release is signed keylessly and

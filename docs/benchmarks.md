@@ -6,14 +6,16 @@ Measured numbers for the claim the copy-on-write fork actually makes:
 **forking is storage-O(1) — a shared fork writes two tiny objects (the
 child lineage's `base.json` + the branch ref), regardless of database
 size — and a child pays only for what it changes.** Everything in this
-section was measured on this machine, at v0.2.7 + this harness
-(2026-08-12); every other section of this document predates copy-on-write
-(v0.1.x measurements) and describes the **materialize** path — see the
-version note below it.
+section was re-measured for v0.2.12 on the machine below; every section
+below the `---` rule predates copy-on-write (v0.1.x measurements) and
+describes the **materialize** path — see the version note below it.
 
-**Machine:** darwin/arm64, Apple M4 (10 cores), 16 GiB RAM, macOS 27.0
-(build 26A5388g), local APFS disk, Go 1.26.5. Local directory store
-backend (the default `make bench` target's backend). No other load.
+**Machine:** darwin/arm64, Apple M5 (10 cores), macOS 27.0, local APFS
+disk, Go 1.27.1. Local directory store backend (the default `make bench`
+target's backend). No other load. Measured 2026-09-30 at `751ecb7`
+(v0.2.12, unreleased) — the "after" — and, for the "What changed in
+v0.2.12" comparisons, at `97320cc` (the commit before this work: v0.2.11
+plus the design spec) on the same machine the same day — the "before".
 
 **Reproduce:** `make bench-cow` (benchmarks live in
 `internal/ops/cow_bench_test.go`; the target's invocations are exactly the
@@ -27,28 +29,29 @@ repeat runs.
 
 | DB size | `Fork` at head (default), median | `Fork` at named checkpoint, median |
 |---|---|---|
-| 12 MB | 17.0 ms | 11.7 ms |
-| 100 MB | 50.3 ms | 11.3 ms |
-| 1 GB | 418.0 ms | **9.3 ms** |
+| 12 MB | 15.0 ms | 8.7 ms |
+| 100 MB | 43.6 ms | 8.8 ms |
+| 1 GB | **9.5 ms** | 10.4 ms |
 
-The share path itself (`at=checkpoint`) is **near-constant, ~9–12 ms from
+The share path itself (`at=checkpoint`) is **near-constant, ~9–10 ms from
 12 MB to 1 GB** — it writes two small objects and never touches the
-database's bytes. The honest flag on the default call shape: `Fork` at
-head (`at=""`) **still grows with size** — not from the share, but from
-the pre-existing safety check that SHA-256-hashes the whole checkout file
-to warn about uncheckpointed changes (~2.6 GB/s on this machine; the same
-O(size) check documented in "What's still O(size) after Task 6a" below).
-So "O(1) fork" is true of the storage work and of forking a named
-checkpoint, and NOT yet true of a default at-head fork's wall-clock
-latency. Raw samples:
+database's bytes. `Fork` at head (`at=""`) now is too, *once the checkout
+has been quiet for a second*: its uncheckpointed-changes check proves the
+checkout clean from the `.sum` sidecar's size/mtime/change-counter
+fingerprint instead of SHA-256-hashing it, and 1 GB forks at head in
+9.5 ms. The 12 MB row and the first three 100 MB samples are the
+exception, and they are the honest caveat: the fingerprint is trusted only
+when the file's mtime is more than 1 s older than the sidecar stamp (git's
+racily-clean rule), and those samples ran inside that second after the
+seed's checkpoint, so they hashed. Raw samples:
 
 ```
-BenchmarkCoWSharedFork/size=12MB/at=head-10          3  13807180 ns/op ... (5 samples: 13.8/17.1/21.3/17.0/13.6 ms)
-BenchmarkCoWSharedFork/size=12MB/at=checkpoint-10    3  10676945 ns/op ... (10.7/9.3/12.2/11.7/12.7 ms)
-BenchmarkCoWSharedFork/size=100MB/at=head-10         3  47628208 ns/op ... (47.6/53.3/50.3/51.0/48.6 ms)
-BenchmarkCoWSharedFork/size=100MB/at=checkpoint-10   3   8351125 ns/op ... (8.4/11.3/12.8/10.6/13.2 ms)
-BenchmarkCoWSharedFork/size=1GB/at=head-10           3 418239347 ns/op ... (418.2/409.3/410.6/418.4/418.0 ms)
-BenchmarkCoWSharedFork/size=1GB/at=checkpoint-10     3   8028959 ns/op ... (8.0/8.9/9.3/13.0/13.0 ms)
+BenchmarkCoWSharedFork/size=12MB/at=head-10          3  13671333 ns/op ... (5 samples: 13.7/15.3/14.9/15.6/15.0 ms)
+BenchmarkCoWSharedFork/size=12MB/at=checkpoint-10    3   8664708 ns/op ... (8.7/9.6/9.6/7.4/8.2 ms)
+BenchmarkCoWSharedFork/size=100MB/at=head-10         3  43763459 ns/op ... (43.8/43.7/43.6/20.4/9.1 ms)
+BenchmarkCoWSharedFork/size=100MB/at=checkpoint-10   3   9182083 ns/op ... (9.2/8.8/10.6/8.3/8.7 ms)
+BenchmarkCoWSharedFork/size=1GB/at=head-10           3   8684486 ns/op ... (8.7/8.9/9.5/10.1/10.5 ms)
+BenchmarkCoWSharedFork/size=1GB/at=checkpoint-10     3   9441958 ns/op ... (9.4/10.1/11.4/10.4/11.2 ms)
 ```
 
 ### Added object-store bytes per fork (100 MB database)
@@ -58,19 +61,19 @@ BenchmarkCoWSharedFork/size=1GB/at=checkpoint-10     3   8028959 ns/op ... (8.0/
 | Shared (CoW, the default) | 1 | 377 B | 2 |
 | Shared (CoW, the default) | 10 | 377 B | 2 |
 | Shared (CoW, the default) | 100 | 376.9 B | 2 |
-| Materialized (forced via test hook — the pre-CoW behavior / fork-time floor) | 1 and 10 | 105,807,581 B (~105.8 MB, one full snapshot) | 2 |
-| Plain `cp` of the SQLite file (no offshoot) | — | the full file (~105.8 MB) | — |
+| Materialized (forced via test hook — the pre-CoW behavior / fork-time floor) | 1 and 10 | 105,883,916 B (~105.9 MB, one full snapshot) | 2 |
+| Plain `cp` of the SQLite file (no offshoot) | — | the full file (~105.9 MB) | — |
 
 A shared fork of a 100 MB database adds **377 bytes** — one `base.json`
 (the durable base pointer) plus one branch ref — about **280,000× less**
 than a materialized fork or a `cp`, and flat from N=1 to N=100. For
-latency context, plain `cp` of the same 105.8 MB file took a median
-**43.5 ms** (2.4 GB/s full byte copy) vs the share path's ~11 ms.
+latency context, plain `cp` of the same file took a median **18.5 ms**
+(5.7 GB/s) vs the share path's ~9 ms.
 
 ```
-BenchmarkCoWSharedForkAddedBytes-10         100  47355148 ns/op  376.9 addedBytes/fork  2.000 addedObjects/fork
-BenchmarkCoWMaterializedForkAddedBytes-10    10  47614808 ns/op  105807581 addedBytes/fork  2.000 addedObjects/fork
-BenchmarkCoWCpBaseline-10                     3  42279986 ns/op  2483.08 MB/s   (5 samples: 42.3/44.5/43.5/57.7/40.2 ms)
+BenchmarkCoWSharedForkAddedBytes-10         100  16794541 ns/op  376.9 addedBytes/fork  2.000 addedObjects/fork
+BenchmarkCoWMaterializedForkAddedBytes-10    10  44540458 ns/op  105883916 addedBytes/fork  2.000 addedObjects/fork
+BenchmarkCoWCpBaseline-10                     3  18654527 ns/op  5627.83 MB/s   (5 samples: 18.7/18.5/18.3/18.7/18.4 ms)
 ```
 
 ### Divergence cost: what a shared child pays as it writes
@@ -83,46 +86,132 @@ transactions with one `Flush` each at the default snapshot cadence
 
 | k (transactions) | Added bytes total | Added bytes per transaction |
 |---|---|---|
-| 8 (stays under the cadence) | 6,209 B | **776 B** |
-| 20 (crosses the cadence once) | 105,822,553 B | 5.29 MB amortized |
+| 8 (stays under the cadence) | 6,089 B | **761 B** |
+| 20 (crosses the cadence once) | 105,898,603 B | 5.29 MB amortized |
 
-Under the cadence, divergence is **O(changed pages)**: ~776 B per
+Under the cadence, divergence is **O(changed pages)**: ~761 B per
 single-row transaction against a 100 MB database — segments, the ref
-update, nothing size-proportional. (The 6,209 B numerator also includes
+update, nothing size-proportional. (The 6,089 B numerator also includes
 the fork's own one-time 377 B of `base.json` + ref; the pure per-segment
-cost is ~729 B/txn — 776 is the conservative all-in figure.) The honest
+cost is ~714 B/txn — 761 is the conservative all-in figure.) The honest
 second row: every `SnapshotEvery`-th flush (16th, by default) writes a
 **full self-snapshot** (the divergence floor that keeps read chains
-bounded), which is O(DB) — 105.8 MB here. Its latency also shows up in
-the loop timings below: k=20 runs ~0.70 s longer than k=8, of which the
-12 extra segment flushes (~14 ms each) explain only ~0.17 s — the
-remaining ~0.5 s is the snapshot flush. Steady-state cost is therefore
-~729 B/txn plus one full snapshot per 16 flushes.
+bounded), which is O(DB) — ~105.9 MB here. Steady-state cost is therefore
+~714 B/txn plus one full snapshot per 16 flushes.
+
+**These two rows are from a re-run, not from `make bench-cow`'s own
+paste.** In the `make bench-cow` run for this section the same benchmark
+reported 104,990,993 B at k=8 and 210,883,507 B at k=20 — each exactly
+one ~105 MB file more than the rows above. That file was not a store
+object: the benchmark's byte accounting (`cowStoreUsage`) walked the
+whole store directory except `checkouts/`, and since v0.2.12 the child's
+checkout builds a by-chain cache entry under `checkouts-ro/` (the local
+clone source, never uploaded). `cowStoreUsage` now skips `checkouts-ro/`
+too, and the added-bytes steps of `make bench-cow` were re-run with that
+one change; the fork rows above came out identical to the first run, and
+k=8/k=20 came out as shown, matching the before run at `97320cc` (6,088 B
+and 105,898,603 B).
 
 ```
-BenchmarkCoWDivergenceAddedBytes/k=8-10    1   726884166 ns/op       6209 addedBytes/child     776.1 addedBytes/txn
-BenchmarkCoWDivergenceAddedBytes/k=20-10   1  1428649333 ns/op  105822553 addedBytes/child   5291128 addedBytes/txn
+BenchmarkCoWDivergenceAddedBytes/k=8-10    1   669633334 ns/op       6089 addedBytes/child     761.1 addedBytes/txn
+BenchmarkCoWDivergenceAddedBytes/k=20-10   1  1303934417 ns/op  105898603 addedBytes/child   5294930 addedBytes/txn
 ```
 
 ### Read-path sanity: checking out a shared fork
 
-Full checkout materialization from scratch (checkout file + sidecar
-deleted each iteration; 100 MB database; median of 5):
+Checkout from scratch (checkout file + sidecar deleted each iteration;
+100 MB database; median of 5):
 
-| Branch | Checkout (full materialize), median |
+| Branch | Checkout, median |
 |---|---|
-| Parent (own snapshot) | 610.0 ms |
-| Shared child (resolves through `base.json` into the parent's chain) | 357.7 ms |
+| Parent (own snapshot) | 8.8 ms |
+| Shared child (resolves through `base.json` into the parent's chain) | 9.9 ms |
 
-The shared child's checkout is in the same regime as the parent's — the
-bounded-replay claim holds at this shape (the child's resolved chain is
-the parent's snapshot plus zero own segments, one extra `base.json` read).
-Run-to-run spread is wide (parent samples 421–689 ms; child 336–539 ms),
-so read the table as "no read penalty for a shared fork beyond noise,"
-not as "children are faster." The child-lower medians are likely an
-ordering artifact — the parent sub-benchmark always runs first, so the
-child materializes the same snapshot object with the page cache already
-warm; the spread, not the ordering, is the result.
+Since v0.2.12 neither is a materialization any more: deleting the checkout
+leaves the by-chain entry for its chain in `checkouts-ro/`, so each
+iteration is a clone of that entry plus the sidecar and shadow stamps. The
+shared child's chain is the parent's snapshot, so both clone the same
+entry; the ~1 ms difference is the child's extra `base.json` read and
+chain resolution. The before run, where every iteration decoded the
+snapshot, is in "What changed in v0.2.12" below.
+
+```
+BenchmarkCoWCheckoutAfterFork/branch=parent-10         3   8756458 ns/op ... (8.8/8.8/8.8/9.1/9.1 ms)
+BenchmarkCoWCheckoutAfterFork/branch=shared-child-10   3   9687597 ns/op ... (9.7/10.0/11.2/9.9/9.4 ms)
+```
+
+### `make bench`: fork at head, clean checkout, session open
+
+`make bench` (`-count=3 -short`, `internal/ops/fork_bench_test.go`) runs
+the three benchmarks the pre-copy-on-write sections below were built on.
+Median of 3, same machine, before and after:
+
+| Benchmark | Size | before (`97320cc`) | after (`751ecb7`) |
+|---|---|---|---|
+| ForkAtHead | 64MB | 31.1 ms | 19.8 ms |
+| ForkAtHead | 512MB | 183.0 ms | **11.7 ms** |
+| CheckoutCleanSkip | 64MB | 21.9 ms | **0.31 ms** |
+| CheckoutCleanSkip | 512MB | 177.0 ms | **0.32 ms** |
+| SessionOpen | 64MB | 27.8 ms | **6.2 ms** |
+| SessionOpen | 512MB | 180.1 ms | **5.7 ms** |
+
+Before, all three were dominated by one SHA-256 pass over the checkout
+(~3 GB/s here). After, a clean checkout is proven clean from its
+fingerprint, so `CheckoutCleanSkip` and `SessionOpen` are flat in size.
+`ForkAtHead` at 64MB is the racily-clean caveat again: its seed finishes
+inside the 1 s window, so its early iterations hash. `SessionOpen`'s
+`settleSnapshotBytes` (67,759,458 and 542,254,275) is unchanged: that
+metric forces one settling flush per size by design.
+
+```
+# after
+BenchmarkForkAtHead/size=64MB-10              51    19754832 ns/op    3401.23 MB/s
+BenchmarkForkAtHead/size=512MB-10            100    11698501 ns/op   45943.40 MB/s
+BenchmarkCheckoutCleanSkip/size=64MB-10     3921      312501 ns/op  215009.76 MB/s
+BenchmarkCheckoutCleanSkip/size=512MB-10    3236      323870 ns/op 1659519.69 MB/s
+BenchmarkSessionOpen/size=64MB-10            180     6239043 ns/op   10769.41 MB/s   67759458 settleSnapshotBytes
+BenchmarkSessionOpen/size=512MB-10           216     5688384 ns/op   94485.35 MB/s  542254275 settleSnapshotBytes
+# before (97320cc)
+BenchmarkForkAtHead/size=64MB-10              39    31093848 ns/op    2160.90 MB/s
+BenchmarkForkAtHead/size=512MB-10              6   183046076 ns/op    2936.25 MB/s
+BenchmarkCheckoutCleanSkip/size=64MB-10       54    21897294 ns/op    3068.45 MB/s
+BenchmarkCheckoutCleanSkip/size=512MB-10       6   176981750 ns/op    3036.86 MB/s
+BenchmarkSessionOpen/size=64MB-10             42    27756484 ns/op    2420.72 MB/s   67759458 settleSnapshotBytes
+BenchmarkSessionOpen/size=512MB-10             6   180073896 ns/op    2984.71 MB/s  542254275 settleSnapshotBytes
+```
+
+(Each raw line is the median sample of its three. `make bench` also runs
+the CoW suite at its cheap sizes with Go's default benchtime; those lines
+are in the full output and not repeated here — the `make bench-cow` rows
+above are the ones this section quotes.)
+
+A re-run of `make bench` after the local-store `List` fix (see
+"BranchBench topologies" below) moved only `ForkAtHead`, and by about a
+tenth: 64MB 19.8 → 17.7 ms, 512MB 11.7 → 10.4 ms median; `CheckoutCleanSkip`
+(0.31 / 0.32 ms) and `SessionOpen` (6.4 / 5.8 ms) were unchanged. The
+paste above is the run the table was built from.
+
+### What changed in v0.2.12
+
+Before (`97320cc`) and after (`751ecb7`), same machine, same day, both
+from `make bench-cow` / `make bench`:
+
+- **Fork at head, 1 GB: 376.7 ms → 9.5 ms.** The share never cost
+  anything; the uncheckpointed-changes hash did, and a quiet checkout no
+  longer needs one. Inside the 1 s racily-clean window it still hashes
+  (100 MB at head: 45.4 ms → 43.6 ms median, because three of the five
+  samples ran in that window).
+- **Fork at a named checkpoint: unchanged** (8.7 ms → 10.4 ms at 1 GB,
+  9.2 ms → 8.7 ms at 12 MB — inside each run's sample spread).
+- **Checkout of a state some branch already materialized: 262.8 ms →
+  8.8 ms** (parent) and **262.1 ms → 9.9 ms** (shared child), 100 MB — a
+  clone of the by-chain entry instead of a decode of the snapshot.
+- **Clean checkout and session open: O(size) → O(1)** — 177.0 ms →
+  0.32 ms and 180.1 ms → 5.7 ms at 512MB.
+- **Object-store bytes: unchanged.** 377 B per shared fork, 105,883,916 B
+  per materialized fork, ~761 B per diverging transaction, in both runs —
+  the v0.2.12 changes to the store side (segment checkpoints, shared
+  rollback/promote) are not on these benchmarks' paths.
 
 ### Caveats (read before quoting these numbers)
 
@@ -135,10 +224,14 @@ warm; the spread, not the ordering, is the result.
 - Added bytes are **logical stored-object bytes** (what S3 would bill).
   On APFS the local backend's materialize path clones (`clonefile`), so
   the materialized fork's *physical* local disk usage is far below its
-  105.8 MB logical footprint — the logical number is the one that
+  105.9 MB logical footprint — the logical number is the one that
   transfers to a real object store.
-- Default at-head `Fork` latency is O(size) (the uncheckpointed-changes
-  hash), not O(1) — see the latency table's note.
+- **The clone and fingerprint wins need a filesystem that can clone**
+  (APFS here). On ext4 or tmpfs there are no by-chain entries, so a
+  checkout decodes the snapshot as in the before column; the fingerprint
+  check does not need clones and applies everywhere.
+- **The 1 s racily-clean window**: a fork at head or a checkout within a
+  second of the checkout's last write hashes it, as before v0.2.12.
 - A shared child's write path snapshots in full every `SnapshotEvery`
   (default 16) flushes — divergence is O(changed pages) *between* those
   floors, not unconditionally.
@@ -174,7 +267,13 @@ prior to Task 6a; it is kept, not replaced, so the comparison is checkable.
 > `CopyObject`'s 5 GiB ceiling is now a strategy boundary, not a limit —
 > v0.2.4 added multipart `UploadPartCopy` for sources up to S3's 5 TiB
 > per-object ceiling, so the ">5GB falls back to materialize" behavior
-> described below no longer applies (only >5 TiB falls back).
+> described below no longer applies (only >5 TiB falls back). And since
+> v0.2.12, promote and rollback share by default too (only
+> `--materialize`, the depth floor and compact still take the copy
+> machinery), and the O(size) SHA-256 check that dominates `ForkAtHead`,
+> `CheckoutCleanSkip` and `SessionOpen` below is skipped for a quiet,
+> clean checkout — see "`make bench`: fork at head, clean checkout,
+> session open" above for those three re-measured.
 
 Benchmarks live in `internal/ops/fork_bench_test.go`. Run them with
 `make bench` (local store) or `make bench-s3` (real MinIO in Docker). The
@@ -184,7 +283,7 @@ uncheckpointed-changes check; see "What's still O(size) after Task 6a"
 below) — so before/after numbers are a like-for-like comparison of the same
 call, not two different things being measured.
 
-## Per-test isolation primitives (v0.2.11)
+## Per-test isolation primitives (v0.2.12)
 
 An eval harness needs a fresh, isolated database per test (see
 [docs/eval-harness.md](eval-harness.md)). This section puts offshoot's own
@@ -219,25 +318,25 @@ work).
   container warm between tests. Measured separately, only 3 iterations
   (it's slow, and independent of seed size).
 
-**Machine:** darwin/arm64, Apple M5, macOS 27.0 (build 26A428), Docker
-29.8.0 (Postgres runs inside Docker Desktop's Linux VM here, not
-natively), Go 1.27.1, local-directory store backend, no other load, no
-network. Measured 2026-09-26. Raw output of `make bench-isolation`
-(`--sizes 10,100 --iters 20`), pasted verbatim:
+**Machine:** darwin/arm64, Apple M5, macOS 27.0, Docker 29.8.0
+(Postgres runs inside Docker Desktop's Linux VM here, not natively), Go
+1.27.1, local-directory store backend, no other load, no network.
+Measured 2026-09-30 at `751ecb7` (v0.2.12, unreleased). Raw output of
+`make bench-isolation` (`--sizes 10,100 --iters 20`), pasted verbatim:
 
 | Primitive | 10 MB | 100 MB |
 |---|---|---|
-| `offshoot fork` + `open` + `close` (SDK) | 68.34 / 81.67 | 420.87 / 435.87 |
-| `offshoot fork` alone (no session) | 9.63 / 11.67 | 9.41 / 10.76 |
-| `sqlite3.Connection.backup()` | 9.39 / 11.58 | 93.06 / 102.28 |
-| `shutil.copyfile` | 0.91 / 0.99 | 10.93 / 90.85 |
-| Postgres `CREATE DATABASE trial TEMPLATE seed` | 57.28 / 60.84 | 119.91 / 127.51 |
+| `offshoot fork` + `open` + `close` (SDK) | 54.89 / 111.16 | 199.78 / 230.44 |
+| `offshoot fork` alone (no session) | 11.96 / 26.44 | 9.63 / 10.62 |
+| `sqlite3.Connection.backup()` | 10.39 / 11.15 | 98.66 / 125.87 |
+| `shutil.copyfile` | 0.84 / 0.97 | 9.30 / 82.80 |
+| Postgres `CREATE DATABASE trial TEMPLATE seed` | 50.61 / 52.81 | 118.80 / 125.72 |
 
-Postgres cold container start (`docker run -d postgres:16` until `pg_isready`; N=3, size-independent): **355.88 / 367.67 ms** (median / p95)
+Postgres cold container start (`docker run -d postgres:16` until `pg_isready`; N=3, size-independent): **347.26 / 427.50 ms** (median / p95)
 
-docker exec no-op (SELECT 1) overhead (same `docker exec ... psql` round trip the template-clone row above pays; N=20, size-independent): **37.04 / 41.73 ms** (median / p90)
+docker exec no-op (SELECT 1) overhead (same `docker exec ... psql` round trip the template-clone row above pays; N=20, size-independent): **34.70 / 38.10 ms** (median / p90)
 
-`pg_isready` -> first successful `SELECT 1` gap (measured inside the cold-container start above; N=3, size-independent): **250.79 / 255.32 ms** (median / p90)
+`pg_isready` -> first successful `SELECT 1` gap (measured inside the cold-container start above; N=3, size-independent): **77.16 / 166.92 ms** (median / p90)
 
 Values are `median / p95` milliseconds over 20 iterations (3 for the cold-container row), except the docker-exec-no-op and pg_isready-gap lines above, which report `median / p90`.
 Postgres seed sizes (`pg_total_relation_size`): 10 MB target -> 10.6 MiB actual, 100 MB target -> 105.2 MiB actual.
@@ -250,13 +349,13 @@ SQLite seed sizes (actual file size): 10 MB target -> 10.0 MiB actual, 100 MB ta
 - No network access is used or required by this script; the postgres:16 image must already be present locally or the Postgres rows are skipped.
 
 **Why the SQLite rows are near-constant in size and the Postgres row is
-not:** `offshoot fork` alone stays flat (~9 ms either way) because a
+not:** `offshoot fork` alone stays flat (~10 ms either way) because a
 shared CoW fork writes two small objects — a base pointer and a branch
 ref — regardless of database size (see "Copy-on-write fork cost" above);
 nothing about the fork touches the database's bytes. `sqlite3.Connection.
 backup()` and `shutil.copyfile` scale close to linearly with size, as
-expected, because both physically copy every byte (`backup()`: 9.39 ms ->
-93.06 ms, roughly the 10x size ratio; `copyfile` is under a millisecond at
+expected, because both physically copy every byte (`backup()`: 10.39 ms ->
+98.66 ms, roughly the 10x size ratio; `copyfile` is under a millisecond at
 10 MB, so page-cache noise dominates its p95 there). The two rows are not
 an apples-to-apples I/O comparison, though: `backup()` opens its
 destination connection with SQLite's default `synchronous=FULL`, so every
@@ -270,29 +369,29 @@ block by block through WAL regardless of filesystem, rather than taking a
 filesystem-level reflink/CoW shortcut — but the row's *absolute* numbers
 at these sizes are dominated by the fixed cost of the `docker exec ... psql` round trip
 itself: a no-op `SELECT 1` through the same path, measured directly
-above, costs **37.04 ms** median (p90 41.73 ms) alone on this host. Only
-the roughly 63 ms difference between the two sizes' medians (57.28 ->
-119.91 ms) is the actual template-clone work; that delta does scale with
+above, costs **34.70 ms** median (p90 38.10 ms) alone on this host. Only
+the roughly 68 ms difference between the two sizes' medians (50.61 ->
+118.80 ms) is the actual template-clone work; that delta does scale with
 size, it's just swamped by per-command overhead at 10 MB.
 
 **The honest fork-versus-open statement:** `offshoot fork` by itself is
-the flat, near-constant row above (~9 ms). The `fork` + `open` + `close`
-row is roughly 7.1x slower at 10 MB and roughly 44.7x slower at 100 MB —
+the flat, near-constant row above (~10 ms). The `fork` + `open` + `close`
+row is roughly 4.6x slower at 10 MB and roughly 20.7x slower at 100 MB —
 not because forking got more expensive, but because of what `open` (and
 `close`) does that `fork` doesn't: a real daemon round trip, and — since a
-freshly forked branch has no checkout materialized locally yet (the fork
-itself only wrote a base pointer + ref) — `Open`'s first `CheckoutProven`
-call has to materialize the branch's actual database bytes to local disk
-before handing back a live session, on top of the settling-flush checksum
-machinery described in "Settling-flush cost" below. That materialization
-is real per-byte I/O, which is why the `fork` + `open` + `close` row,
-unlike bare `fork`, is NOT size-independent (68 ms at 10 MB vs. 421 ms at
-100 MB). `Session.Close` is not free either — it drains the capture
-engine and, on a provably clean close, re-stamps the checkout's sidecar
-(see `docs/status.md`'s sidecar-refresh row) — so this row's overhead is
-not solely `Open`'s materialization cost, though materialization dominates
-it at these sizes. A test that only forks and never opens a session pays
-the flat ~9 ms row instead of this one.
+freshly forked branch has no checkout locally yet (the fork itself only
+wrote a base pointer + ref) — `Open`'s first `CheckoutProven` call has to
+put the branch's database bytes on local disk before handing back a live
+session, on top of the settling-flush checksum machinery described in
+"Settling-flush cost" below. Since v0.2.12 that step is a clone of the
+by-chain cache entry the first fork's open built, not a decode of the
+snapshot, which is most of the drop in "What changed" below. The row is
+still NOT size-independent (55 ms at 10 MB vs. 200 ms at 100 MB); this
+benchmark does not break down which part of `open`/`close` the remaining
+size-dependent time is (the settling flush and `Session.Close`'s drain
+and sidecar re-stamp are the candidates — see `docs/status.md`'s
+sidecar-refresh row). A test that only forks and never opens a session
+pays the flat ~10 ms row instead of this one.
 
 **A note on the cold-container number:** the Postgres image's entrypoint
 briefly runs a temporary, setup-only server on the same socket before the
@@ -300,8 +399,8 @@ real server starts, and `pg_isready` (used here, per this row's own
 definition) can report ready during that window. A follow-up check this
 script uses elsewhere, before it runs any real SQL against a container it
 just started (an actual `SELECT 1`, retried until it succeeds), measured
-directly above as its own line, took another **250.79 ms** median (p90
-255.32 ms) past `pg_isready`'s signal on this host — note that this figure
+directly above as its own line, took another **77.16 ms** median (p90
+166.92 ms) past `pg_isready`'s signal on this host — note that this figure
 is measured via `_wait_pg_queryable`, which re-checks `pg_isready` (already
 satisfied at that point) before it starts polling `SELECT 1`, so the
 measured gap includes one redundant `pg_isready` docker-exec round trip and
@@ -310,7 +409,28 @@ still comfortably sub-second here — this container was already locally
 cached (no image pull) and mounts no volume; a colder path (a network
 pull, a mounted volume, a busier host) would cost meaningfully more.
 
-## BranchBench topologies (v0.2.11)
+**What changed in v0.2.12.** From the v0.2.11 paste this section carried
+before (same machine, measured 2026-09-26) to the run above: **`fork` +
+`open` + `close` at 100 MB went from 420.87 to 199.78 ms median** (p95
+435.87 -> 230.44), and from 68.34 to 54.89 ms at 10 MB; `fork` alone
+stayed flat (9.41 -> 9.63 ms at 100 MB). The difference is the open's
+checkout: a clone of the by-chain entry rather than a snapshot decode
+(see "Read-path sanity" above). The copy baselines moved by run-to-run
+noise only (`backup()` 93.06 -> 98.66 ms, Postgres template clone
+119.91 -> 118.80 ms at 100 MB). One caveat on provenance: this run is the
+second `make bench-isolation` of the day — the first ran with Docker
+Desktop stopped, skipped the Postgres rows, and measured the offshoot
+rows at 55.63 / 201.43 ms (`fork` + `open` + `close`) and 9.70 / 8.80 ms
+(`fork` alone), within noise of the run above.
+
+**Re-run after the local-store `List` fix** (`d8f50dd`, see "BranchBench
+topologies" below), same machine, 2026-09-30, Docker not reachable so the
+Postgres rows were skipped and the paste above is kept rather than
+replaced: `fork` alone 8.79 / 8.62 ms median at 10 / 100 MB (p95
+10.24 / 9.71), against 11.96 / 9.63 ms above; `fork` + `open` + `close`
+52.64 / 198.33 ms, within noise of the 54.89 / 199.78 ms above.
+
+## BranchBench topologies (v0.2.12)
 
 BranchBench ("Aligning Database Branching with Agentic Demands" — Elaine Ang,
 In Keun Kim, Sam Weldon, Kevin Durand, Kostis Kaffes and Eugene Wu, of
@@ -338,8 +458,9 @@ them.
 | `mcts` (deep narrow) | 10 | 100 | 10 | 10 | 25 | 0 | 0.1 | 0 | 1 | 1 |
 | `failure_repro` (flat, 1 worker) | 1 | 10 | 10 | – | 1 | 0 | 1.0 | 5 | 45 | 1 |
 
-That is 2,310 forks in all (one per worker-step). The whole table takes **under
-3 minutes** on the machine below and needs **about 30 GB of free space in
+That is 2,310 forks in all (one per worker-step). The whole table takes
+**about 2 minutes** on the machine below (under 3 before v0.2.12 — see
+"What changed" below) and needs **about 30 GB of free space in
 `$TMPDIR`** — see the per-workflow stores below. `go run ./cmd/branchbench
 -quick` is a seconds-scale smoke run of the same five topologies (it is what
 `go test ./cmd/branchbench` runs).
@@ -350,8 +471,12 @@ That is 2,310 forks in all (one per worker-step). The whole table takes **under
   run removes them on the way out). The rows are therefore independent: no
   workflow's latencies or bytes are measured against the branches an earlier
   one left lying around. It also bounds the disk needed to the largest single
-  workflow — `mcts` peaks at 26.5 GiB, hence the ~30 GB above, against well
-  over 45 GB if the five shared one store.
+  workflow — `mcts` peaked at 26.5 GiB before v0.2.12, hence the ~30 GB
+  above, against well over 45 GB if the five shared one store. (Its
+  `Store peak` now reads 43.0 GiB, but that is a logical sum over clones —
+  see `Store peak` below. On a filesystem that cannot clone there are no
+  shadows or by-chain entries; that case was not re-measured, so ~30 GB
+  stays the figure to plan for.)
 - **The seed** is our own CH-benCHmark-*shaped* generator
   (`cmd/branchbench/seed.go`), not BranchBench's SQL dump: TPC-C's
   transactional tables (`warehouse`, `district`, `customer`, `item`, `stock`,
@@ -408,46 +533,182 @@ That is 2,310 forks in all (one per worker-step). The whole table takes **under
   a p99 is simply the slowest sample — the counts are on the per-workflow
   lines, and the note under the table repeats the caveat.
 - **`Store peak`** is the largest the workflow's store directory got, sampled
-  while it ran and once at the end. For a local store the materialized
-  checkouts live inside that directory, so it counts both store objects and
-  one checkout file per live branch. **`Peak live`** counts live *forked*
+  while it ran and once at the end, as the sum of the files' **logical**
+  sizes. For a local store the checkouts live inside that directory, so it
+  counts store objects and, per live branch, the checkout file — and since
+  v0.2.12 also its `.shadow` and the `checkouts-ro/~by-chain/` entries,
+  each at full logical size although they are clones sharing blocks. **`Peak live`** counts live *forked*
   branches, excluding the root; for the γ=1.0 workflows, which prune every
   branch immediately after evaluating it, that number measures in-flight
   concurrency rather than accumulation — worth keeping in mind next to Neon's
   20-live-branch ceiling quoted below.
 
 **Machine:** as the header line below reports — darwin/arm64, Apple M5, macOS
-27.0, local-directory store backend, no other load, no network, measured
-2026-09-26. Raw stdout of `make bench-branchbench` with its defaults (all five
-workflows, concurrency 8, 10 warehouses, 2h per-workflow cap), pasted
-verbatim, minus make's own echoed `go run` line:
+27.0, local APFS disk, local-directory store backend, no other load, no
+network, measured 2026-09-30. Raw stdout of `make bench-branchbench` with its
+defaults (all five workflows, concurrency 8, 10 warehouses, 2h per-workflow
+cap), pasted verbatim, minus make's own echoed `go run` line and the
+per-workflow progress lines on stderr:
 
-darwin/arm64, Apple M5, 10 cores, Go 1.27.1, offshoot dev-329fc05-54-g1057bd1, measured 2026-09-26, seed 17 MiB, concurrency 8
-
-(`dev-329fc05-54-g1057bd1` is `git describe`'s own dev-tag format, counting
-from the last tag reachable on this machine at measurement time — the
-`g1057bd1` suffix is commit `1057bd1`, not a released version.)
+darwin/arm64, Apple M5, 10 cores, Go 1.27.1, offshoot v0.2.11-15-g67cc6b1-dirty, measured 2026-09-30, seed 17 MiB, concurrency 8
 
 | Workflow | Steps | Wall | Branch overhead | Fork p50/p99 (d=1 → d=max) | Checkout p50/p99 (d=1 → d=max) | Checkpoint p50/p99 (d=1 → d=max) | Eval p50/p99 (d=1 → d=max) | Peak live | Store peak |
 |---|---|---|---|---|---|---|---|---|---|
-| simulation | 1000/1000 | 73.9 s | 88% | 73.2/136.7 → (d=1 is max) | 316.4/381.4 → (d=1 is max) | 119.5/162.0 → (d=1 is max) | 11.4/17.5 → (d=1 is max) | 8 | 12.0 GiB |
-| data_cleaning | 200/200 | 17.8 s | 71% | 46.2/58.9 → 39.4/76.2 | 335.7/365.6 → 347.4/416.6 | 136.0/151.2 → 132.1/161.0 | 8.3/14.4 → 7.1/21.7 | 200 | 6.1 GiB |
-| software_dev | 100/100 | 7.8 s | 81% | 35.8/39.9 → 29.5/46.3 | 178.0/181.7 → 180.4/211.8 | 102.9/109.9 → 105.8/130.9 | 12.6/16.6 → 12.5/17.9 | 84 | 2.8 GiB |
-| mcts | 1000/1000 | 65.1 s | 96% | 52.8/59.9 → 77.0/141.0 | 331.0/377.2 → 312.2/379.6 | 138.3/150.8 → 111.8/146.2 | 9.1/9.7 → 10.4/18.6 | 890 | 26.5 GiB |
-| failure_repro | 10/10 | 1.9 s | 73% | 15.3/15.7 → (d=1 is max) | 49.2/60.9 → (d=1 is max) | 70.3/72.4 → (d=1 is max) | 5.1/5.1 → (d=1 is max) | 1 | 167 MiB |
+| simulation | 1000/1000 | 45.7 s | 60% | 40.3/63.7 → (d=1 is max) | 43.0/68.0 → (d=1 is max) | 102.6/150.6 → (d=1 is max) | 56.4/80.2 → (d=1 is max) | 8 | 650 MiB |
+| data_cleaning | 200/200 | 9.8 s | 40% | 39.1/77.0 → 27.9/47.8 | 40.1/426.1 → 32.2/172.4 | 63.6/85.8 → 62.6/100.4 | 50.3/107.8 → 66.9/115.4 | 200 | 8.3 GiB |
+| software_dev | 100/100 | 5.4 s | 48% | 35.5/38.7 → 23.0/43.6 | 225.3/225.6 → 34.8/118.7 | 54.0/87.6 → 55.3/81.4 | 15.6/50.6 → 13.3/86.8 | 84 | 3.8 GiB |
+| mcts | 1000/1000 | 41.9 s | 65% | 61.0/73.1 → 32.6/69.5 | 405.1/427.6 → 78.5/130.6 | 79.2/101.5 → 67.3/118.4 | 68.4/99.5 → 103.0/133.4 | 890 | 43.0 GiB |
+| failure_repro | 10/10 | 1.6 s | 47% | 14.4/16.7 → (d=1 is max) | 8.1/61.2 → (d=1 is max) | 47.4/49.0 → (d=1 is max) | 5.1/5.1 → (d=1 is max) | 1 | 82 MiB |
 
 Latencies are milliseconds. p99 is the maximum sample wherever a cell has fewer than 100 samples at that depth, which is most of them — the per-workflow lines below give the counts. Branch overhead is fork+checkout+checkpoint+destroy time summed over workers, over wall x effective concurrency (min(-concurrency, T workers)). Peak live counts live forked branches, excluding the root.
 
-- `simulation` (flat star; T=1000, S=1, F_r=1000, F_i=0, D=1, C=1, γ=1.0, M_s=0, M_d=50, Q_v=1): max depth reached 1; 1 cross-branch query over 1 live branch (the root included) in 9 ms; all 1000 steps landed at d=1; store ended at 12.0 GiB of which 17 MiB is the seed; branch-management time 522.7 s summed over workers (7.1x wall at effective concurrency 8 of 8 requested); 0 CAS retries; store sizes approximate: 4 entries vanished or were unreadable during the size walks
-- `data_cleaning` (wide shallow; T=10, S=20, F_r=10, F_i=3, D=3, C=2, γ=0.0, M_s=1, M_d=1, Q_v=1): max depth reached 3; 2 cross-branch queries over 201 live branches (the root included) in 4.1 s; 20 steps landed at d=1 and 129 at d=3 (the sample counts behind those two p50/p99 pairs); store ended at 6.1 GiB of which 17 MiB is the seed; 10 forks fell back to the root after the tree filled; branch-management time 101.3 s summed over workers (5.7x wall at effective concurrency 8 of 8 requested); 0 CAS retries
-- `software_dev` (bushy; T=5, S=20, F_r=5, F_i=3, D=4, C=1, γ=0.1, M_s=1, M_d=1, Q_v=2): max depth reached 4; 1 cross-branch query over 84 live branches (the root included) in 862 ms; 5 steps landed at d=1 and 50 at d=4 (the sample counts behind those two p50/p99 pairs); store ended at 2.8 GiB of which 17 MiB is the seed; branch-management time 31.4 s summed over workers (4.0x wall at effective concurrency 5 of 8 requested); 0 CAS retries
-- `mcts` (deep narrow; T=10, S=100, F_r=10, F_i=10, D=25, C=0, γ=0.1, M_s=0, M_d=1, Q_v=1): max depth reached 25; no cross-branch queries (C=0); 10 steps landed at d=1 and 78 at d=25 (the sample counts behind those two p50/p99 pairs); store ended at 26.5 GiB of which 17 MiB is the seed; branch-management time 500.5 s summed over workers (7.7x wall at effective concurrency 8 of 8 requested); 0 CAS retries
-- `failure_repro` (flat, 1 worker; T=1, S=10, F_r=10, F_i=0, D=1, C=0, γ=1.0, M_s=5, M_d=45, Q_v=1): max depth reached 1; no cross-branch queries (C=0); all 10 steps landed at d=1; store ended at 167 MiB of which 17 MiB is the seed; branch-management time 1.4 s summed over workers (0.7x wall at effective concurrency 1 of 8 requested); 0 CAS retries
+- `simulation` (flat star; T=1000, S=1, F_r=1000, F_i=0, D=1, C=1, γ=1.0, M_s=0, M_d=50, Q_v=1): max depth reached 1; 1 cross-branch query over 1 live branch (the root included) in 31 ms; all 1000 steps landed at d=1; store ended at 429 MiB of which 17 MiB is the seed; branch-management time 220.3 s summed over workers (4.8x wall at effective concurrency 8 of 8 requested); 0 CAS retries; store sizes approximate: 10 entries vanished or were unreadable during the size walks
+- `data_cleaning` (wide shallow; T=10, S=20, F_r=10, F_i=3, D=3, C=2, γ=0.0, M_s=1, M_d=1, Q_v=1): max depth reached 3; 2 cross-branch queries over 201 live branches (the root included) in 2.4 s; 17 steps landed at d=1 and 133 at d=3 (the sample counts behind those two p50/p99 pairs); store ended at 8.3 GiB of which 17 MiB is the seed; 7 forks fell back to the root after the tree filled; branch-management time 31.3 s summed over workers (3.2x wall at effective concurrency 8 of 8 requested); 0 CAS retries; store sizes approximate: 1 entries vanished or were unreadable during the size walks
+- `software_dev` (bushy; T=5, S=20, F_r=5, F_i=3, D=4, C=1, γ=0.1, M_s=1, M_d=1, Q_v=2): max depth reached 4; 1 cross-branch query over 84 live branches (the root included) in 745 ms; 5 steps landed at d=1 and 51 at d=4 (the sample counts behind those two p50/p99 pairs); store ended at 3.8 GiB of which 17 MiB is the seed; branch-management time 13.0 s summed over workers (2.4x wall at effective concurrency 5 of 8 requested); 0 CAS retries
+- `mcts` (deep narrow; T=10, S=100, F_r=10, F_i=10, D=25, C=0, γ=0.1, M_s=0, M_d=1, Q_v=1): max depth reached 25; no cross-branch queries (C=0); 10 steps landed at d=1 and 80 at d=25 (the sample counts behind those two p50/p99 pairs); store ended at 43.0 GiB of which 17 MiB is the seed; branch-management time 219.1 s summed over workers (5.2x wall at effective concurrency 8 of 8 requested); 0 CAS retries; store sizes approximate: 15 entries vanished or were unreadable during the size walks
+- `failure_repro` (flat, 1 worker; T=1, S=10, F_r=10, F_i=0, D=1, C=0, γ=1.0, M_s=5, M_d=45, Q_v=1): max depth reached 1; no cross-branch queries (C=0); all 10 steps landed at d=1; store ended at 82 MiB of which 17 MiB is the seed; branch-management time 776 ms summed over workers (0.5x wall at effective concurrency 1 of 8 requested); 0 CAS retries
 
-Every workflow completed every step: 2,310/2,310 worker-steps, 166.5 s of
-workflow wall time in total (2 m 50 s for the whole `make` invocation,
-including a seed build per workflow), no CAS retries, nothing aborted or timed
-out.
+(`v0.2.11-15-g67cc6b1-dirty` is `git describe` for commit `67cc6b1`, v0.2.12
+unreleased; `-dirty` because this run was taken with the local-store
+`List` fix (see "What changed") applied but not yet committed; it was then
+committed unchanged as `d8f50dd`, and is the only Go source that differed
+from `67cc6b1`.)
+
+Every workflow completed every step: 2,310/2,310 worker-steps, 104.5 s of
+workflow wall time in total (1 min 49 s for the whole `make` invocation,
+including a seed build per workflow), no CAS retries, nothing aborted or
+timed out.
+
+**What changed in v0.2.12.** The before is the same target run at
+`97320cc` (the commit before this work) on the same machine the same day;
+its wall times reproduce the v0.2.11 table this section used to carry to
+within a few percent:
+
+| Workflow | Wall, before → after | Branch overhead | Checkout p50 d=1 | Eval p50 d=1 → d=max, after (before) | Store peak |
+|---|---|---|---|---|---|
+| simulation | 72.2 → 45.7 s | 88% → 60% | 314.0 → 43.0 ms | 56.4 (11.5) | 12.0 GiB → 650 MiB |
+| data_cleaning | 17.8 → 9.8 s | 71% → 40% | 339.6 → 40.1 ms | 50.3 → 66.9 (7.0 → 7.0) | 6.1 → 8.3 GiB |
+| software_dev | 7.6 → 5.4 s | 80% → 48% | 158.0 → 225.3 ms | 15.6 → 13.3 (12.9 → 12.9) | 2.8 → 3.8 GiB |
+| mcts | 63.3 → 41.9 s | 96% → 65% | 348.6 → 405.1 ms | 68.4 → 103.0 (8.2 → 9.5) | 26.5 → 43.0 GiB |
+| failure_repro | 1.9 → 1.6 s | 73% → 47% | 48.4 → 8.1 ms | 5.1 (5.0) | 167 → 82 MiB |
+
+- **All five topologies got faster end to end:** `simulation` 72.2 →
+  45.7 s, `data_cleaning` 17.8 → 9.8 s, `software_dev` 7.6 → 5.4 s,
+  `mcts` 63.3 → 41.9 s, `failure_repro` 1.9 → 1.6 s, and branch
+  management's share of the time dropped by 26 to 32 points in each. The
+  changes they exercise are clone checkouts, segment checkpoints and a
+  fix to how a local store lists a lineage's objects (next bullet).
+- **`mcts` was 3x slower (197.2 s) partway through this work, and the cause
+  was a store listing, not cloning.** A local store's `List` walked the
+  whole store directory — which also holds every checkout, its `.shadow`
+  and the by-chain entries — and filtered by prefix. Resolving a chain
+  Lists one lineage per base hop (up to 16 since forks share), and each
+  fork, checkout and checkpoint resolves about one chain. Instrumented
+  (table 1 under "Diagnostic instrumentation" below), one `List` cost
+  23.8 ms early in an `mcts` run and 132.0 ms late (with ~890 live
+  checkouts on disk), one chain resolution 1,099.5 ms, and that was the
+  ~0.7 s p50 every operation had gained at depth 25; the clone calls
+  themselves stayed at 0.22-0.47 ms plus a 3.90-4.65 ms fsync. `List` now
+  reads only the directory its prefix names: 0.06 ms per call late in an
+  instrumented run with the fix. At depth 25, fork / checkout / checkpoint p50 went 703.8 /
+  734.7 / 730.6 ms (the regressed run) → 32.6 / 78.5 / 67.3 ms, against
+  84.1 / 290.1 / 103.1 ms before v0.2.12. The whole-directory walk predates
+  v0.2.12; it only became expensive once chains recursed across base
+  pointers and the directory filled with shadows and by-chain entries.
+- **Eval (read) latency rose where checkouts are fresh clones, and that is
+  the page cache.** `simulation` 11.5 → 56.4 ms, `data_cleaning`
+  7.0 → 50.3 ms and `mcts` 8.2 → 68.4 ms at depth 1; `software_dev` rose
+  far less (12.9 → 15.6 ms) and `failure_repro` is unchanged
+  (5.0 → 5.1 ms). A clone does not share its source's
+  cached pages. Measured on its own (table 2 under "Diagnostic
+  instrumentation" below): the eval query on a fresh clone of a 17 MiB
+  `mcts` state took 50.6-54.9 ms, the same query on a freshly *written*
+  copy 6.3-6.4 ms, and a second query on the clone 6.2-6.3 ms. So a checkout that got
+  hundreds of ms cheaper hands its first query a cold cache; the step as a
+  whole is still faster (the wall times above). `mcts` at depth 25 reads
+  103.0 ms; that is not the file's depth — fresh clones of kept `mcts`
+  checkouts queried one at a time took 37.1 ms p50 at depth 1 and 39.7 ms
+  at depth 25 (8 each, table 2) — and is attributed, by elimination rather than
+  measurement, to 8 workers' cold reads and branch I/O sharing one disk.
+- **Checkout p50 at depth 1 rose for two topologies** — `software_dev`
+  158.0 → 225.3 ms and `mcts` 348.6 → 405.1 ms — while it fell 7x to 8x
+  for the other three. No diagnostic run isolated a depth-1 checkout, so
+  this is not attributed here. What the runs above do show is where such
+  a checkout can spend time that a pre-v0.2.12 one did not: a first miss
+  on a chain builds the by-chain entry before cloning the checkout from
+  it (see [operations](operations.md#the-by-chain-cache-and-the-checkout-sidecars)),
+  and whatever the step reads from a fresh clone reads it with a cold page
+  cache (table 2). Table 1's clone and fsync spans are single-digit
+  milliseconds, so the clone call itself does not account for a
+  57-67 ms rise.
+- **Store objects shrank; the logical `Store peak` did not.** `simulation`
+  fell from 12.0 GiB to 650 MiB because its checkpoints are now segments of
+  the pages its 50 mutations touched, not 17 MiB snapshots, and
+  `failure_repro` fell from 167 to 82 MiB (no diagnostic run broke that
+  store down, so this page does not attribute it). `data_cleaning`,
+  `software_dev` and `mcts` grew because `Store peak` now also counts each live branch's `.shadow` and by-chain
+  entries at full size. A diagnostic `mcts` run (before the `List` fix)
+  kept its store to look (table 3 below): of 43.2 GiB logical, 0.64 GiB was store objects
+  under `data/`; the rest was 14.55 GiB of checkouts, 14.55 GiB of shadows
+  and 13.44 GiB of by-chain entries — clones of one another. The disk's
+  used space grew by about 1.8 GiB over that run (`df`, so approximate —
+  other processes wrote too).
+
+**Diagnostic instrumentation (2026-09-30, not a make target).** The
+figures the three bullets above quote that are not in the pasted table.
+Machine: darwin/arm64, Apple M5, 10 cores, macOS 27.0, local APFS disk,
+Go 1.27.1, no other load, measured 2026-09-30.
+
+*Table 1 — wall-clock profile of `mcts`.* Temporary instrumentation (a
+wall-clock span at the top of ~40 functions in `internal/store`,
+`internal/ops`, `internal/ops/reflink` and `internal/ltxio`, bucketed by
+30 s of run time; removed before committing) during `go run
+./cmd/branchbench -workflows mcts`. Run 1 is the code before the `List`
+fix (216.1 s); its depth-25 samples fall in the late bucket. Run 2 has the
+fix (42.8 s). Means per call; the raw dumps were not kept, and these are
+the figures transcribed from them the same day.
+
+| Span | Run 1, 0-30 s | Run 1, 180-210 s | Run 2, 30-60 s |
+|---|---|---|---|
+| `Fork` / `Checkout` / `Checkpoint` | 211.6 / 219.7 / 209.8 ms | 1,170.5 / 1,119.0 / 1,119.9 ms | 63.7 / 95.1 / 67.3 ms |
+| `store.Chain` (one per operation) | 164.9 ms | 1,099.5 ms | 0.68 ms |
+| local `List` | 23.8 ms | 132.0 ms | 0.06 ms |
+| `List` calls per `Chain` | ~7.0 | ~8.3 | ~7.4 |
+| `clonefile(2)` | 0.47 ms | 0.22 ms | 1.21 ms |
+| fsync after a clone | 4.65 ms | 3.90 ms | 6.48 ms |
+| parent-checkout quiesce and check in `Fork` | 10.8 ms | 4.6 ms | – |
+
+*Table 2 — cold page cache on a clone.* The eval query (`SELECT ol_w_id,
+SUM(ol_amount) FROM order_line GROUP BY ol_w_id`, Python's `sqlite3`)
+against files from a kept `mcts` store (after the fix), one query at a
+time. Rows A: a by-chain entry cloned with `cp -c`, or written out
+byte-for-byte, then queried; three trials. Rows B: a fresh clone of each
+of 8 kept checkouts per depth, p50.
+
+| Case | Fresh clone | Same clone, second query | Freshly written copy |
+|---|---|---|---|
+| A, trial 1 | 54.9 ms | 6.2 ms | 6.3 ms |
+| A, trial 2 | 50.6 ms | 6.3 ms | 6.4 ms |
+| A, trial 3 | 52.3 ms | 6.3 ms | 6.3 ms |
+| B, depth 1 | 37.1 ms | 6.2 ms | 7.9 ms |
+| B, depth 5 | 37.6 ms | 6.1 ms | 7.3 ms |
+| B, depth 10 | 40.1 ms | 6.2 ms | 7.5 ms |
+| B, depth 15 | 39.7 ms | 6.2 ms | 7.1 ms |
+| B, depth 20 | 38.2 ms | 6.2 ms | 6.9 ms |
+| B, depth 25 | 39.7 ms | 6.2 ms | 6.8 ms |
+
+*Table 3 — what the logical `Store peak` holds.* A kept `mcts` store
+(before the fix, 214.8 s run), logical sizes by area (`os.walk`,
+`st_size`):
+
+| Area | Files | Logical size |
+|---|---|---|
+| `checkouts-ro/…/~by-chain` entries | 2,380 | 13.44 GiB |
+| checkout `.db` files | 891 | 14.55 GiB |
+| `.shadow` files | 891 | 14.55 GiB |
+| store objects (`data/`) | 2,002 | 0.64 GiB |
+
+`df` used space grew 1,897,452 KiB (1.81 GiB) over that run.
 
 **What BranchBench found on hosted systems.** For context — these are the
 authors' numbers on hosted Postgres-family systems, not ours:
@@ -490,66 +751,62 @@ on a local copy-on-write SQLite store.
 - **Reads do not get slower with depth.** That is the axis BranchBench's
   "5-4000x slower reads as branches deepen" finding lives on, and it is why
   the table reports every latency at depth 1 *and* at the deepest depth
-  reached. `mcts` eval p50 is 9.1 ms at depth 1 and 10.4 ms at depth 25;
-  `data_cleaning` 8.3 → 7.1 ms, `software_dev` 12.6 → 12.5 ms. A branch's
-  checkout is a plain SQLite file, so once it is materialized the store is not
-  in the query path at all and depth cannot enter the read cost. The eval p99s
-  do drift up at depth (`mcts` 9.7 → 18.6 ms, `data_cleaning` 14.4 → 21.7 ms),
-  but each of those is the slowest of a few dozen samples, not a tail over
-  thousands.
-- **Checkout and checkpoint are flat in depth; fork is the one operation with
-  a depth signal.** A checkout at depth 25 costs what one at depth 1 costs
-  (`mcts` 331.0 → 312.2 ms p50; `data_cleaning` 335.7 → 347.4; `software_dev`
-  178.0 → 180.4), and so does a checkpoint (`mcts` 138.3 → 111.8 ms). Fork is
-  flat in the shallow topologies (`data_cleaning` 46.2 → 39.4 ms,
-  `software_dev` 35.8 → 29.5) but in `mcts`, the only workflow that goes deep,
-  it grows about 1.5x: 52.8 ms p50 at depth 1 against 77.0 ms at depth 25 (p99
-  59.9 → 141.0 ms). That is the expected shape, not a surprise: offshoot forks
-  by sharing the parent's chain (two small objects, no data copy) until the
-  fully-resolved chain reaches 16 members, at which point the next fork
-  materializes a fresh floor snapshot instead (`ops.ForkShareMaxDepth`;
-  `offshoot compact` does the same on demand). A deep spine crosses that floor
-  repeatedly and pays an O(size) copy each time — the same O(size) cost the
-  "Per-test isolation primitives" section above documents for materializing a
-  checkout. What depth does *not* do is compound: the floor resets the spine
-  rather than letting the chain grow with it, which is why 25 levels cost
-  about 1.5x depth 1 and not 25x.
+  reached. A branch's checkout is a plain SQLite file, so once it is on
+  disk the store is not in the query path at all and depth cannot enter
+  the read cost: `software_dev` reads 15.6 → 13.3 ms. The table's
+  `data_cleaning` (50.3 → 66.9 ms) and `mcts` (68.4 → 103.0 ms) cells do
+  rise with depth; queried one at a time, fresh clones of `mcts` checkouts
+  read the same at depth 1 and depth 25 (37.1 vs 39.7 ms p50, table 2 under
+  "Diagnostic instrumentation"), so the rise
+  in the table is the cold-cache first read under 8-way load described
+  under "What changed", not depth in the file.
+- **Depth does not cost branch operations.** At depth 25, `mcts` fork,
+  checkout and checkpoint are 32.6 / 78.5 / 67.3 ms p50, against 61.0 /
+  405.1 / 79.2 ms at depth 1 (the first steps, whose checkouts build the
+  by-chain entries from the store) and 84.1 / 290.1 / 103.1 ms at depth 25
+  before v0.2.12. By design, offshoot forks by sharing the parent's chain
+  until the fully-resolved chain reaches 16 members, at which point the
+  next fork materializes a fresh floor snapshot instead
+  (`ops.ForkShareMaxDepth`; `offshoot compact` does the same on demand),
+  and an at-rest checkpoint writes a snapshot rather than a segment at the
+  same bound — so a deep spine crosses that floor repeatedly and pays an
+  O(size) copy each time; that is in these p50s and p99s.
 - **These are latencies under 8-way concurrency, not per-op costs in
-  isolation.** A checkout of a 17 MiB database is 0.18-0.35 s here, while the
-  isolation section's *uncontended* `fork` + `open` + `close` of a 100 MB
-  database is 421 ms. `failure_repro` (T=1, no other worker sharing this run's
-  disk and page cache) gives a control point from inside this same table:
-  its uncontended checkout is 49.2 ms p50 — an order of magnitude under the
-  8-way-contended 0.18-0.35 s above on a database roughly comparable in size.
-  The difference is queueing: eight workers deep on one laptop's disk and
-  page cache. One hypothesis this run does not test is that
-  `Fork` at head also quiesces the *parent's* checkout, which would serialize
-  concurrent forks that share a parent — plausible given the fanouts here, but
-  unmeasured; 8-way I/O contention and the floor materialization above are the
-  other candidates. Read these columns as what a branch-heavy agentic workload
-  costs end to end, not as primitive latencies; the two sections above are
-  where the primitives are measured.
-- **Branch management dominates every one of these topologies.** With the
+  isolation.** `failure_repro` (T=1, no other worker sharing this run's disk
+  and page cache) gives a control point from inside this same table: its
+  uncontended checkout is 8.1 ms p50, against 40.1-405.1 ms at depth 1 in the
+  8-way topologies on the same 17 MiB seed. The difference is queueing:
+  eight workers deep on one laptop's disk and page cache. `Fork` at head
+  also quiesces and checks the *parent's* checkout; instrumented in an
+  `mcts` run that cost 4.6-10.8 ms mean per fork (table 1 under
+  "Diagnostic instrumentation"), so it is not what
+  separates these cells from `failure_repro` — 8-way I/O contention and
+  the floor materialization above are what is left, and this run does not
+  split them. Read these
+  columns as what a branch-heavy agentic workload costs end to end, not as
+  primitive latencies; the two sections above are where the primitives are
+  measured.
+- **Branch management dominates most of these topologies.** With the
   denominator built from the concurrency each workflow can actually use, the
-  spread is 71% (`data_cleaning`) to 96% (`mcts`) — `simulation` 88%,
-  `software_dev` 81%, `failure_repro` 73%. There is no "cheap" topology here:
-  even `failure_repro`, whose step does 5 schema changes and 45 mutations,
-  spends nearly three quarters of its single worker's time forking, checking
-  out, checkpointing and destroying, because that cycle moves a 17 MiB
-  database while the SQL touches a few hundred rows. `data_cleaning` is lowest
-  partly for a bookkeeping reason: its two cross-branch passes (4.1 s of its
-  17.8 s wall) count in wall time but not as branch management. The honest
-  reading is that BranchBench's tuples are deliberately branch-heavy — the
-  ratio is a statement about the workload's mix at least as much as about
-  offshoot, and the way to move it is to do more work per branch.
-- **`Store peak` is "what the run held", not a steady state.** It counts the
-  materialized checkouts as well as the store objects (200 live branches × a
-  17 MiB seed is ~3.3 GiB of `data_cleaning`'s 6.1 GiB), and `destroy` is a
-  metadata operation — it tombstones, it does not reclaim, because reclaiming
-  is `offshoot gc`'s job and nothing runs `gc` during the benchmark. That is
-  why `simulation` peaks at 12.0 GiB after pruning all 1,000 of its branches
-  (γ=1.0). BranchBench measures reclaim as its own metric; this table does not
-  measure it at all.
+  spread is 40% (`data_cleaning`) to 65% (`mcts`) — `failure_repro` 47%,
+  `software_dev` 48%, `simulation` 60% — down from 71-96% before v0.2.12.
+  `failure_repro`, whose step does 5 schema changes and 45 mutations, now
+  spends under half its single worker's time forking, checking out,
+  checkpointing and destroying. `data_cleaning` counts its two cross-branch
+  passes (2.4 s of its 9.8 s wall) in wall time but not as branch
+  management. The honest reading is still that BranchBench's tuples are
+  deliberately branch-heavy — the ratio is a statement about the workload's
+  mix at least as much as about offshoot, and the way to move it is to do
+  more work per branch.
+- **`Store peak` is "what the run held", not a steady state, and not disk
+  used.** It sums logical file sizes: store objects, and per live branch the
+  checkout, its `.shadow` and the by-chain entries — the last three clones
+  of one another on APFS (the `mcts` breakdown under "What changed" is the
+  worked example). `destroy` is a metadata operation — it tombstones, it
+  does not reclaim, because reclaiming is `offshoot gc`'s job and nothing
+  runs `gc` during the benchmark; `simulation` still holds 429 MiB after
+  pruning all 1,000 of its branches (γ=1.0). BranchBench measures reclaim
+  as its own metric; this table does not measure it at all.
 - **Rows are independent, and that mattered.** Each workflow gets its own
   fresh store (see "What we ran"). An earlier version of this benchmark reused
   one store across all five: the same topologies reported substantially higher
@@ -559,8 +816,9 @@ on a local copy-on-write SQLite store.
 - **One host, one run.** These are quantiles within a single run, not a
   median-of-N across runs, on a laptop. Repeat runs of the whole table have
   reproduced the completion counts exactly and the wall times within a few
-  percent, but run-to-run variance on a laptop is real and no fleet average is
-  implied.
+  percent (`mcts` after the `List` fix: 41.9 s here, 42.4 s and 42.8 s in
+  two `mcts`-only runs the same day), but run-to-run variance on a laptop is real and
+  no fleet average is implied.
 
 ## Method
 

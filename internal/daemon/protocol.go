@@ -56,6 +56,10 @@ type Request struct {
 	// that fork's TTL as a Go duration string ("" = ops.DefaultPromoteBackupTTL).
 	NoBackup  bool   `json:"no_backup,omitempty"`
 	BackupTTL string `json:"backup_ttl,omitempty"`
+	// Materialize (promote and rollback) copies the target state into a
+	// self-contained lineage instead of pointing at it through a base
+	// pointer (ops.PromoteOptions/ops.RollbackOptions.Materialize).
+	Materialize bool `json:"materialize,omitempty"`
 	// Path is a server-side file path — on the daemon's own host/
 	// filesystem — used by two ops: export's destination file path, and
 	// create's optional source file to import (Path == "" means an
@@ -108,7 +112,11 @@ type Response struct {
 	// the branch's for rollback (ops.RollbackResult.Backup); empty when
 	// none was minted (no_backup, or, for promote, the source was itself
 	// that safety fork).
-	Backup   string        `json:"backup,omitempty"`
+	Backup string `json:"backup,omitempty"`
+	// Shared (promote and rollback) reports that the branch's new lineage
+	// points at the kept history through a base pointer; false means a
+	// self-contained copy (ops.PromoteResult/ops.RollbackResult.Shared).
+	Shared   bool          `json:"shared,omitempty"`
 	Sessions []SessionInfo `json:"sessions,omitempty"`
 	Branches []BranchInfo  `json:"branches,omitempty"`
 	// Databases is every database this store has at least one ref for

@@ -845,7 +845,7 @@ func (s *Server) opRollback(req Request) Response {
 	if err := s.refuseIfClaimed(req.DB, branch); err != nil {
 		return errResp(err)
 	}
-	opts := ops.RollbackOptions{NoBackup: req.NoBackup}
+	opts := ops.RollbackOptions{NoBackup: req.NoBackup, Materialize: req.Materialize}
 	if req.BackupTTL != "" {
 		d, err := time.ParseDuration(req.BackupTTL)
 		if err != nil || d <= 0 {
@@ -862,7 +862,7 @@ func (s *Server) opRollback(req Request) Response {
 	if err != nil {
 		return errResp(err)
 	}
-	return Response{OK: true, Checkout: res.Path, Backup: res.Backup}
+	return Response{OK: true, Checkout: res.Path, Backup: res.Backup, Shared: res.Shared}
 }
 
 // opPromote repoints db@req.Name (target) at db@req.Branch's (source) head
@@ -888,7 +888,7 @@ func (s *Server) opPromote(req Request) Response {
 	if err := s.refuseIfClaimed(req.DB, target); err != nil {
 		return errResp(err)
 	}
-	opts := ops.PromoteOptions{Force: req.Force, NoBackup: req.NoBackup}
+	opts := ops.PromoteOptions{Force: req.Force, NoBackup: req.NoBackup, Materialize: req.Materialize}
 	if req.BackupTTL != "" {
 		d, err := time.ParseDuration(req.BackupTTL)
 		if err != nil || d <= 0 {
@@ -912,7 +912,7 @@ func (s *Server) opPromote(req Request) Response {
 	if err != nil {
 		return errResp(err)
 	}
-	return Response{OK: true, TXID: res.TXID, Backup: res.Backup}
+	return Response{OK: true, TXID: res.TXID, Backup: res.Backup, Shared: res.Shared}
 }
 
 // opCompact makes db@branch self-contained (ops.Compact): its full chain is

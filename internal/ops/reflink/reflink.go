@@ -4,7 +4,9 @@
 // path (Task 6a) can seed a child lineage's snapshot object without paying
 // for a full read+decode+re-encode: on a clone-capable filesystem (APFS,
 // btrfs, xfs with reflink=1), CopyFile is near-constant-time regardless of
-// file size.
+// file size. Clone is the strict variant — clone or ErrUnsupported, never a
+// byte copy — for callers (ops' by-chain checkout cache) whose fast path is
+// only worth taking when it is actually copy-on-write.
 //
 // This package works standalone — it knows nothing about offshoot's object
 // keys, lineages, or the store.Backend interface; it is a pure local
@@ -12,9 +14,19 @@
 package reflink
 
 import (
+	"errors"
 	"io"
 	"os"
 )
+
+// ErrUnsupported is Clone's verdict that this platform or filesystem cannot
+// make a copy-on-write clone of src at dst. Callers treat it as "no fast
+// path" and take their ordinary route; it is never a data error.
+var ErrUnsupported = errors.New("reflink: clone unsupported on this filesystem")
+
+// forceUnsupportedForTest, when true, makes Clone report ErrUnsupported
+// without attempting a clone. Test-only, mirroring forceFallbackForTest.
+var forceUnsupportedForTest bool
 
 // forceFallbackForTest, when true, makes CopyFile skip the platform clone
 // attempt entirely and go straight to the plain-copy fallback. Test-only:
@@ -59,8 +71,32 @@ func CopyFile(dst, src string) (cloned bool, err error) {
 	return false, nil
 }
 
-// syncFile opens path (which CopyFile has just populated via a successful
-// clone) and fsyncs it, then closes it.
+// Clone makes dst a copy-on-write clone of src, or returns ErrUnsupported
+// without creating dst when the platform or filesystem cannot clone. Unlike
+// CopyFile it never falls back to a byte copy, so a caller on a non-CoW
+// filesystem never pays for a second full write it did not ask for.
+//
+// A missing src is reported as that error, not ErrUnsupported: the clone
+// syscalls only say "no", so src is checked first to keep "the source
+// vanished" (e.g. a concurrent cache eviction) distinguishable from "this
+// filesystem cannot clone". dst must not exist (create-only, as CopyFile),
+// and is fsynced before a successful return, as CopyFile's clone path is.
+func Clone(dst, src string) error {
+	if _, err := os.Stat(src); err != nil {
+		return err
+	}
+	if forceUnsupportedForTest || !cloneFile(dst, src) {
+		return ErrUnsupported
+	}
+	if err := syncFile(dst); err != nil {
+		os.Remove(dst)
+		return err
+	}
+	return nil
+}
+
+// syncFile opens path (which CopyFile or Clone has just populated via a
+// successful clone) and fsyncs it, then closes it.
 //
 // Neither clone mechanism hands CopyFile an open descriptor it could fsync
 // directly: clonefile(2) (darwin) only ever takes paths, never returning an
@@ -72,8 +108,12 @@ func CopyFile(dst, src string) (cloned bool, err error) {
 // a power loss immediately after CopyFile returns must never leave dst
 // missing or truncated once fsynced metadata (e.g. a ref written after a
 // rename of dst into place) claims it exists.
+//
+// It opens read-only: fsync needs no write access, and a clone carries its
+// source's mode (clonefile(2)), so a clone of a read-only 0444 file — a
+// by-chain cache entry — is itself 0444 and could not be opened for writing.
 func syncFile(path string) error {
-	f, err := os.OpenFile(path, os.O_WRONLY, 0)
+	f, err := os.Open(path)
 	if err != nil {
 		return err
 	}

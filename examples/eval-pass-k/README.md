@@ -132,7 +132,7 @@ Total wall time: under 2 seconds for 21 forks (1 golden + 5 tasks × 4
 trials), 20 diffs, and 20 destroys, on a local unix-socket daemon — well
 under this example's 30s budget. That per-trial cost is fork **+ open**
 (which materializes a checkout — not a bare-fork number; see
-[docs/benchmarks.md](../../docs/benchmarks.md#per-test-isolation-primitives-v0211)'s
+[docs/benchmarks.md](../../docs/benchmarks.md#per-test-isolation-primitives-v0212)'s
 per-test isolation table for how `open`'s checkout materialization and
 settling-flush check dominate over the fork itself) **+ close + diff +
 destroy**, all four counted in every trial's share of the number above.

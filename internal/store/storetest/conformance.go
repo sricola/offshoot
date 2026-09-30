@@ -168,6 +168,47 @@ func RunConformance(t *testing.T, keyPrefix string, newBackend func(t *testing.T
 		}
 	})
 
+	// A List whose prefix is one full key is how store.Store.ObjectExists
+	// probes for an object with one request (ops.CheckpointWith's stale
+	// snapshot check): the key itself is listed, a longer key sharing it
+	// as a prefix is listed too (the caller matches exactly), and an absent
+	// key under an existing directory, or under none at all, lists nothing.
+	t.Run("ListFullKeyPrefixProbesOneObject", func(t *testing.T) {
+		b := newBackend(t)
+		for _, key := range []string{"data/l1/7/snapshot-01.ltx", "data/l1/7/snapshot-01.ltx.x"} {
+			if err := b.Put(k(key), []byte("x")); err != nil {
+				t.Fatal(err)
+			}
+		}
+		keys, err := b.List(k("data/l1/7/snapshot-01.ltx"))
+		if err != nil {
+			t.Fatal(err)
+		}
+		if len(keys) != 2 || keys[0] != k("data/l1/7/snapshot-01.ltx") || keys[1] != k("data/l1/7/snapshot-01.ltx.x") {
+			t.Fatalf("keys = %v, want the key itself then the longer key", keys)
+		}
+		for _, absent := range []string{"data/l1/7/snapshot-02.ltx", "data/l2/9/snapshot-01.ltx"} {
+			keys, err := b.List(k(absent))
+			if err != nil {
+				t.Fatalf("List(%s): %v", absent, err)
+			}
+			if len(keys) != 0 {
+				t.Fatalf("List(%s) = %v, want none", absent, keys)
+			}
+		}
+		st := &store.Store{B: b}
+		for key, want := range map[string]bool{
+			"data/l1/7/snapshot-01.ltx": true,
+			"data/l1/7/snapshot-0":      false, // a prefix of a key, not a key
+			"data/l1/7/snapshot-02.ltx": false,
+		} {
+			got, err := st.ObjectExists(k(key))
+			if err != nil || got != want {
+				t.Fatalf("ObjectExists(%s) = %v, %v; want %v", key, got, err, want)
+			}
+		}
+	})
+
 	t.Run("DeleteIsIdempotent", func(t *testing.T) {
 		b := newBackend(t)
 		if err := b.Delete(k("data/never-existed")); err != nil {

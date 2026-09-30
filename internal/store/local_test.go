@@ -140,6 +140,53 @@ func TestLocalListAndDelete(t *testing.T) {
 	}
 }
 
+// TestLocalListWalksOnlyThePrefixDirectory pins that List reads only the
+// directory its prefix names, never the whole store root: a local store's
+// root also holds every checkout, shadow and by-chain cache file, and chain
+// resolution Lists one lineage per hop, so a whole-root walk made every
+// fork, checkout and checkpoint cost grow with the number of checkouts on
+// disk. An unreadable sibling tree fails a whole-root walk and must not
+// be touched here. A prefix that ends mid-name still matches every key
+// under its directory that starts with it, and a prefix whose directory
+// does not exist lists nothing without error.
+func TestLocalListWalksOnlyThePrefixDirectory(t *testing.T) {
+	if os.Geteuid() == 0 {
+		t.Skip("root reads a mode-000 directory anyway")
+	}
+	root := t.TempDir()
+	b, _ := NewLocal(root)
+	for _, k := range []string{"data/l1/a", "data/l1/b", "data/l2/a", "refs/db/main"} {
+		if err := b.Put(k, []byte("x")); err != nil {
+			t.Fatal(err)
+		}
+	}
+	blocked := filepath.Join(root, "checkouts", "db")
+	if err := os.MkdirAll(blocked, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.Chmod(blocked, 0); err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { os.Chmod(blocked, 0o755) })
+
+	keys, err := b.List("data/l1/")
+	if err != nil || len(keys) != 2 || keys[0] != "data/l1/a" || keys[1] != "data/l1/b" {
+		t.Fatalf("List(data/l1/) = %v, %v", keys, err)
+	}
+	keys, err = b.List("data/l")
+	if err != nil || len(keys) != 3 {
+		t.Fatalf("List(data/l) = %v, %v; want the three data/l* keys", keys, err)
+	}
+	keys, err = b.List("refs/")
+	if err != nil || len(keys) != 1 || keys[0] != "refs/db/main" {
+		t.Fatalf("List(refs/) = %v, %v", keys, err)
+	}
+	keys, err = b.List("data/missing/")
+	if err != nil || len(keys) != 0 {
+		t.Fatalf("List of an absent directory = %v, %v; want empty, no error", keys, err)
+	}
+}
+
 // TestLocalDeleteObjects pins Local's BatchDeleter capability as an exact
 // stand-in for a per-key Delete loop: every key it reports deleted is gone,
 // a key that never existed still counts as deleted (matching Delete's

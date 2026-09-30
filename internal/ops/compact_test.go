@@ -138,11 +138,12 @@ func TestCompactCASRaceCleansOrphan(t *testing.T) {
 
 // TestPromoteAndRollbackClearStaleBaseMirror pins the Ref.Base invariant
 // both repointing ops must uphold: Ref.Base != nil iff
-// base.json(Ref.Lineage) exists. Promote and Rollback both repoint a
-// branch at a FRESH self-contained lineage (copySnapshotToNewLineage
-// writes no base.json), so a formerly-shared branch's Base mirror must
-// come out nil — a stale non-nil mirror misreports the branch as shared
-// (status, and any mirror-reading op) on a lineage that shares nothing.
+// base.json(Ref.Lineage) exists. A materialized Promote or Rollback
+// repoints a branch at a FRESH self-contained lineage
+// (copySnapshotToNewLineage writes no base.json), so a formerly-shared
+// branch's Base mirror must come out nil — a stale non-nil mirror
+// misreports the branch as shared (status, and any mirror-reading op) on a
+// lineage that shares nothing.
 func TestPromoteAndRollbackClearStaleBaseMirror(t *testing.T) {
 	w := newWS(t)
 	if err := w.Create("app"); err != nil {
@@ -160,7 +161,7 @@ func TestPromoteAndRollbackClearStaleBaseMirror(t *testing.T) {
 	if ref.Base == nil {
 		t.Fatal("test precondition: a shallow fork must share (Base set)")
 	}
-	if _, err := w.Promote("app", "main", "tgt", false); err != nil {
+	if _, err := w.PromoteWith("app", "main", "tgt", PromoteOptions{Materialize: true}); err != nil {
 		t.Fatal(err)
 	}
 	got, _, err := w.Store.GetRef("app", "tgt")
@@ -185,7 +186,7 @@ func TestPromoteAndRollbackClearStaleBaseMirror(t *testing.T) {
 	if ref.Base == nil {
 		t.Fatal("test precondition: a shallow fork must share (Base set)")
 	}
-	if _, err := w.Rollback("app", "rb", "fork"); err != nil {
+	if _, err := w.RollbackWith("app", "rb", "fork", RollbackOptions{Materialize: true}); err != nil {
 		t.Fatal(err)
 	}
 	got, _, err = w.Store.GetRef("app", "rb")
@@ -246,9 +247,10 @@ func TestCompactNoOpAfterRollbackPreservesCheckpoints(t *testing.T) {
 		t.Fatal(err)
 	}
 
-	// Rollback to cp1: repoints to a self-contained lineage and preserves
-	// the kept checkpoints ("fork", "cp1") by copying their snapshots in.
-	if _, err := w.Rollback("app", "child", "cp1"); err != nil {
+	// A materialized rollback to cp1: repoints to a self-contained lineage
+	// and preserves the kept checkpoints ("fork", "cp1") by copying their
+	// snapshots in.
+	if _, err := w.RollbackWith("app", "child", "cp1", RollbackOptions{Materialize: true}); err != nil {
 		t.Fatal(err)
 	}
 	rbRef, _, err := w.Store.GetRef("app", "child")
