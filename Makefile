@@ -235,12 +235,12 @@ bench-isolation: check-python-version
 # largest single workflow, mcts, peaked near 26.5 GiB before v0.2.12 (now
 # 43 GiB logical but ~2 GiB physical on APFS, where checkouts, shadows and
 # by-chain entries are clones; not measured on a filesystem that cannot
-# clone) -- and about 5 minutes on an
-# Apple M5 (docs/benchmarks.md has the v0.2.12 mcts regression). `go run ./cmd/branchbench -quick` is the seconds-scale smoke
+# clone) -- and about 2 minutes on an
+# Apple M5. `go run ./cmd/branchbench -quick` is the seconds-scale smoke
 # run of the same five topologies, and `go test ./cmd/branchbench` runs it.
 # Prints one markdown table; docs/benchmarks.md pastes it verbatim.
 bench-branchbench:
-	@echo "branchbench: needs ~30 GB free in TMPDIR and ~5 minutes; Ctrl-C removes the store. Smoke run: go run ./cmd/branchbench -quick"
+	@echo "branchbench: needs ~30 GB free in TMPDIR and ~2 minutes; Ctrl-C removes the store. Smoke run: go run ./cmd/branchbench -quick"
 	go run ./cmd/branchbench
 
 # example-pass-k runs examples/eval-pass-k/run.py: a runnable pass^k eval

@@ -103,13 +103,19 @@ materialize from the store as before, and every at-rest checkpoint is a
 full snapshot. The O(1) clean check, shared rollback/promote and the
 `kind` field do not depend on the filesystem and apply everywhere.
 
-### Known regression
+### Fixed
 
-BranchBench's deep `mcts` topology (depth 25, 8 concurrent workers) takes
-about 3x as long as on v0.2.11 on the reference machine (197.2 s against
-63.3 s), with fork, checkout and checkpoint each ~0.7 s at p50 at depth
-25; the four shallower topologies got faster. The cause is not yet
-identified; see docs/benchmarks.md's "BranchBench topologies" section.
+- **Branch operations on a local store no longer slow down as checkouts
+  accumulate.** Listing a lineage's objects walked the whole store
+  directory, which on a local store also holds every checkout, `.shadow`
+  and by-chain entry; it now reads only that lineage's directory. With
+  chains that follow base pointers (one listing per hop), the old walk was
+  1.1 s per chain resolution late in BranchBench's `mcts` run and made
+  that topology 3x slower during this cycle (197.2 s). Measured after the
+  fix: `mcts` 41.9 s, against 63.3 s on v0.2.11, with fork, checkout and
+  checkpoint at 32.6 / 78.5 / 67.3 ms p50 at depth 25; all five topologies
+  are faster than on v0.2.11 (docs/benchmarks.md's "BranchBench
+  topologies" section).
 
 ## [0.2.11] - 2026-09-26
 
