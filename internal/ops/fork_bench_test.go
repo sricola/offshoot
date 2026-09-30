@@ -206,14 +206,18 @@ func BenchmarkForkAtHead(b *testing.B) {
 	})
 }
 
-// BenchmarkCheckoutCleanSkip measures Task 1's win: a Checkout call against
-// an already-clean, already-current checkout returns the existing file
-// without re-materializing. mustSeed's Checkpoint call already leaves the
-// checkout in exactly that state, and repeated Checkout calls never dirty
-// it (the clean path performs no write), so every iteration exercises the
-// same fast path. Honest framing (see docs/benchmarks.md): this is cheaper
-// than a rebuild, not free — checkoutState still quiesces and hashes the
-// whole file every call, so it remains O(size), just a smaller constant.
+// BenchmarkCheckoutCleanSkip measures Task 1 and Task 2's combined win: a
+// Checkout call against an already-clean, already-current checkout returns
+// the existing file without re-materializing (Task 1). mustSeed's
+// Checkpoint call already leaves the checkout's sidecar fingerprint (size,
+// mtime, SQLite header change counter) matching the live file, and repeated
+// Checkout calls never dirty either (the clean path performs no write), so
+// every iteration exercises the same fast path — and checkoutState now
+// proves it clean straight from that fingerprint, in O(1), without ever
+// hashing the file (Task 2). Honest framing (see docs/benchmarks.md): the
+// caller still quiesces every call (a bounded wal_checkpoint, not O(size));
+// only a fingerprint mismatch still falls back to the O(size) full hash
+// this benchmark no longer pays.
 func BenchmarkCheckoutCleanSkip(b *testing.B) {
 	for _, sz := range benchSizes {
 		sz := sz
