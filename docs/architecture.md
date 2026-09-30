@@ -88,8 +88,10 @@ existing user file.
   `checkouts-ro` cache tree, never the writable path).
 - **Rollback** — `rollback <db>@<branch> --to <checkpoint>` repoints the
   branch at a new lineage seeded from the checkpoint state (internally, the
-  fork machinery). The branch's old lineage is orphaned, retained for the GC
-  grace period, then collected. The old checkout (and any
+  fork machinery — since v0.2.12 a base pointer at the checkpoint, not a
+  copy; `--materialize` copies). The part of the old lineage above the
+  checkpoint is orphaned, retained for the GC grace period, then
+  collected; the part the new lineage reads through stays live. The old checkout (and any
   acknowledged-but-not-durable writes) is closed out; rollback reports what
   transaction range was abandoned. The branch's canonical checkout path is
   then re-materialized fresh (the path itself is stable —
@@ -97,7 +99,8 @@ existing user file.
   never rewritten under a live connection.
 - **Promote** — `promote <db>@<source> --onto <target>` repoints the target
   branch at a **new lineage seeded from the source's head** (fork machinery
-  again). Because promote creates a fresh lineage, the one-writer-per-lineage
+  again — a base pointer at the source's head since v0.2.12;
+  `--materialize` copies). Because promote creates a fresh lineage, the one-writer-per-lineage
   invariant holds unconditionally — no epoch collisions are possible. The
   target's old lineage is orphaned → grace period → GC. The source branch
   survives unchanged (typically TTL-reaped later, or destroyed explicitly).
@@ -108,10 +111,11 @@ existing user file.
   dropped, so the branch stops reading through — and stops pinning — its
   ancestors' storage. A no-op on an already self-contained branch. Unlike
   promote, it does **not** reset the checkpoint map: every existing
-  checkpoint's snapshot is copied into the new lineage (rollback-style,
-  rewritten to epoch 1), and a `compact` checkpoint is added at head
-  alongside them — one extra snapshot copy per distinct checkpoint txid
-  kept, on top of the head copy compact already pays.
+  checkpoint's snapshot is copied into the new lineage (as
+  `rollback --materialize` does, rewritten to epoch 1), and a `compact`
+  checkpoint is added at head alongside them — one extra snapshot copy per
+  distinct checkpoint txid kept, on top of the head copy compact already
+  pays.
 - **Destroy / GC** — explicit destroy, TTL expiry, and a background
   collector. Destroying a parent is always safe, instant, and allowed
   regardless of live children — a parent's destruction can never corrupt a
@@ -151,22 +155,51 @@ both keyed on the snapshot cadence (`SnapshotEvery`, default 16):
   of the branch, not the process; a shared child stops touching its parent
   once it has written its own snapshot.
 
-The materialize fallback (and `promote`/`rollback`/`compact`, which always
-materialize) uses a snapshot-copy fast path when the source resolves to a
-single snapshot: a filesystem clone locally (APFS `clonefile`, Linux
+The materialize fallback (the floor-tripped fork, rollback or promote,
+`--materialize`, and `compact`, which always materializes) uses a
+snapshot-copy fast path when the source resolves to a single snapshot: a filesystem clone locally (APFS `clonefile`, Linux
 `FICLONE`, plain-copy fallback), a server-side `CopyObject` on S3 —
 single-request under 5 GiB, multipart `UploadPartCopy` up to S3's 5 TiB
 per-object ceiling above it (since v0.2.4). Multi-member chains
 materialize-and-re-encode. Measured numbers: [docs/benchmarks.md](benchmarks.md).
 
-**The two cost models, stated honestly:** fork shares (near-free — N forks
-of a G-byte database cost near-zero added store bytes, not N×G);
-`promote`, `rollback`, and `compact` each still materialize a full
-independent copy. The asymmetry is deliberate, not an oversight —
-rollback/promote abandon their old lineage, and base-pointing into a
-lineage that is meant to die would pin it forever. Page-level /
-content-addressed dedupe remains a non-goal — see
+**The two cost models, stated honestly:** fork, promote and rollback share
+(near-free — N forks of a G-byte database cost near-zero added store
+bytes, not N×G); `compact` still materializes a full independent copy,
+because cutting the base pointer is its purpose. Until v0.2.12 promote and
+rollback copied too, on the reasoning that base-pointing into a lineage
+meant to die would pin it. They now share through one helper with fork
+(`newLineageAt`), and the pin is bounded instead: rollback points at a
+*kept* checkpoint, so only the abandoned future above it becomes garbage;
+promote pins the source's lineage under the target until the target
+diverges past it or is compacted; and `Store.CollapseBase` skips
+pass-through hops when it writes the pointer, so repeated rollbacks to one
+checkpoint keep the base spine one hop deep instead of growing it. The
+fork-time depth floor still forces a copy, and `--materialize` asks for
+one. Page-level / content-addressed dedupe remains a non-goal — see
 [docs/faq.md](faq.md#storage-cost-honestly).
+
+**Local files: clones, a shadow, and a fingerprint.** The store side
+shares objects; since v0.2.12 the local side shares blocks. Materializing
+a checkout builds (or reuses) an immutable entry at
+`checkouts-ro/<db>/~by-chain/<chainID>.db`, keyed by the SHA-256 of the
+resolved chain's object keys — so equal chains are equal bytes by
+construction — and clones the writable checkout from it (APFS
+`clonefile`, Linux `FICLONE`). A chain that extends a cached one clones the
+prefix and applies only the remaining segments
+(`ltxio.ApplySegments`). The entry is written and made `0444` before it
+is visible, and nothing reads a writable checkout to make one, so a write
+racing into a fresh checkout can never poison another branch's future
+clone. Each checkout also gets a reflinked `.shadow` as of its last
+checkpoint: an at-rest checkpoint diffs against it page by page and
+writes an LTX segment when the change is small and the chain is below the
+snapshot cadence, verifying the shadow's rolling checksum against the
+recorded head first. The `.sum` sidecar gained a size/mtime/change-counter
+fingerprint so a clean checkout is proven clean in O(1) (behind git's
+racily-clean 1 s margin, and without trusting the change counter in WAL
+mode). On a filesystem that cannot clone, none of this exists: no entry,
+no shadow, and every path falls back to the pre-v0.2.12 materialize and
+snapshot.
 
 ## Storage layout (epoch-fenced, versioned)
 

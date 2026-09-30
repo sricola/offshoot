@@ -26,6 +26,14 @@ SQL run against its real checkouts, captured by driving the server myself.
   the human's stand-in, after the diff — that shape (agent compares, human
   forces from the CLI) is the intended shape of the guardrail, not a
   workaround for it.
+- Re-driven again for v0.2.12 (segment checkpoints and shared promote):
+  the new run's log was compared line by line against this transcript, and
+  exactly the lines that changed were replaced with the new run's text —
+  the `checkpoint` CLI line and both `offshoot_checkpoint` results (which
+  now name what they wrote: `segment` and its size), the `tools/list`
+  response (the `offshoot_checkpoint` description changed), and
+  the human's `promote` line (now ending `(shared)`). Every other line was
+  byte-identical, modulo the temp-store path.
 - The prose *between* those blocks — the "the agent notices X and decides to
   Y" narration — is **illustrative**. It's how an actual coding agent (e.g.,
   Claude Code with `offshoot` wired in as below) would plausibly narrate and
@@ -85,7 +93,7 @@ $ offshoot -store $STORE create shop
 $ sqlite3 $(offshoot checkout shop) "CREATE TABLE orders...; INSERT ..."
 
 $ offshoot -store $STORE checkpoint shop baseline
-checkpoint "baseline" at txid 2
+checkpoint "baseline" at txid 2 (segment, 2 pages, 0.4 KiB)
 ```
 
 ### 2. The agent connects and orients itself
@@ -157,7 +165,7 @@ paraphrase:
         },
         {
           "name": "offshoot_checkpoint",
-          "description": "Name the current state of a branch's checkout so it can be returned to later. Call this after a batch of changes you might want to keep or roll back to individually — e.g. after a migration step succeeds, or before starting a riskier change on the same branch. If a daemon session is open on this branch, this is a live flush (cheap, only the diff since the last checkpoint, no pause in writes); otherwise it's a full-snapshot checkpoint of the checkout file. `branch` defaults to \"main\" if omitted. Optional `meta` (string->string, at most 32 keys) tags the result with your run id, git SHA, or agent name for later lookup.",
+          "description": "Name the current state of a branch's checkout so it can be returned to later. Call this after a batch of changes you might want to keep or roll back to individually — e.g. after a migration step succeeds, or before starting a riskier change on the same branch. If a daemon session is open on this branch, this is a live flush (cheap, only the diff since the last checkpoint, no pause in writes); otherwise it's an at-rest checkpoint of the checkout file: a segment of the pages changed since the last checkpoint when it can, else a full snapshot (the result's `kind` says which). `branch` defaults to \"main\" if omitted. Optional `meta` (string->string, at most 32 keys) tags the result with your run id, git SHA, or agent name for later lookup.",
           "inputSchema": {
             "properties": {
               "branch": {
@@ -448,7 +456,7 @@ real rollback target if the migration goes wrong:
 
 ```json
 → {"jsonrpc":"2.0","id":6,"method":"tools/call","params":{"name":"offshoot_checkpoint","arguments":{"database":"shop","branch":"migration-attempt","name":"pre-migration"}}}
-← {"jsonrpc":"2.0","id":6,"result":{"content":[{"type":"text","text":"checkpointed shop@migration-attempt as \"pre-migration\" at txid 3"}],"structuredContent":{"branch":"migration-attempt","database":"shop","live":false,"name":"pre-migration","txid":3}}}
+← {"jsonrpc":"2.0","id":6,"result":{"content":[{"type":"text","text":"checkpointed shop@migration-attempt as \"pre-migration\" at txid 3 (segment, 131 bytes)"}],"structuredContent":{"branch":"migration-attempt","database":"shop","kind":"segment","live":false,"name":"pre-migration","txid":3}}}
 ```
 
 ### 4. Rollback on red
@@ -506,7 +514,7 @@ Tests are green. The agent checkpoints the now-validated state:
 
 ```json
 → {"jsonrpc":"2.0","id":8,"method":"tools/call","params":{"name":"offshoot_checkpoint","arguments":{"database":"shop","branch":"migration-attempt","name":"migrated"}}}
-← {"jsonrpc":"2.0","id":8,"result":{"content":[{"type":"text","text":"checkpointed shop@migration-attempt as \"migrated\" at txid 4"}],"structuredContent":{"branch":"migration-attempt","database":"shop","live":false,"name":"migrated","txid":4}}}
+← {"jsonrpc":"2.0","id":8,"result":{"content":[{"type":"text","text":"checkpointed shop@migration-attempt as \"migrated\" at txid 4 (segment, 430 bytes)"}],"structuredContent":{"branch":"migration-attempt","database":"shop","kind":"segment","live":false,"name":"migrated","txid":4}}}
 ```
 
 ### 6. Promote — the guardrail holds, the agent compares, the human ships it
@@ -558,7 +566,7 @@ and nothing else, and runs the promote themselves, from the CLI, where
 
 ```
 $ offshoot -store $STORE promote shop@migration-attempt --onto main --force
-promoted shop@migration-attempt -> shop@main at txid 4
+promoted shop@migration-attempt -> shop@main at txid 4 (shared)
 kept the previous shop@main head as shop@main-pre-promote (expires in 24h0m0s; undo with: offshoot promote shop@main-pre-promote --onto main --force)
 ```
 

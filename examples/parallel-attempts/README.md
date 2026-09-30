@@ -65,8 +65,9 @@ clean up (it runs entirely out of a temp directory).
   `attempt-3`'s history instead, those TXIDs identify a lineage `main` no
   longer has any relationship to, so they can't be carried forward. (Contrast
   `offshoot rollback`, which seeds its new lineage from the *same* branch's
-  own prior lineage, so it both can and does copy every still-valid
-  checkpoint forward — see the `kept` map and copy loop in `ops.Rollback`.)
+  own prior lineage, so it both can and does carry every still-valid
+  checkpoint forward — unchanged when it shares, copied when it
+  materializes; see `kept` in `ops.RollbackWith`.)
   What actually makes promote safe to force onto a protected branch is that
   the whole repoint lands as a single compare-and-swap write of the branch's
   ref — there is no partially-updated state to land in, independent of

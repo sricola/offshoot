@@ -52,6 +52,8 @@ build a dashboard against a name not in this table.
 | `offshoot_fork_total` | counter | `path` (`fast`/`slow`) | Successful forks, by path — `fast` = single-snapshot object copy (reflink/clonefile locally, server-side `CopyObject` on S3-compatible backends), `slow` = materialize + re-encode. Both label values are pre-registered at `0`. |
 | `offshoot_fork_duration_seconds` | histogram | — | Successful fork latency. |
 | `offshoot_fork_mode_total` | counter | `mode` (`shared`/`materialized`) | Successful forks, by **storage mode** — `shared` = a base pointer into the parent's chain, zero data objects copied (the copy-on-write common case); `materialized` = a full snapshot copy in the child's own lineage (the fork-time snapshot floor). Orthogonal to `offshoot_fork_total{path}`, which names the materialize path's copy strategy. Both label values pre-registered at `0`. |
+| `offshoot_rollback_total` | counter | `mode` (`shared`/`materialized`) | Successful rollbacks, by storage mode — `shared` = the new lineage is a base pointer at the kept checkpoint (the default since v0.2.12); `materialized` = a snapshot copy (`--materialize`, or the fork-time depth floor). Both label values pre-registered at `0`. Counted once the ref repoint lands. |
+| `offshoot_promote_total` | counter | `mode` (`shared`/`materialized`) | Successful promotes, by storage mode, with the same meaning as `offshoot_rollback_total`. Both label values pre-registered at `0`. |
 | `offshoot_checkpoint_duration_seconds` | histogram | — | **At-rest** checkpoint latency only — a process that calls `ops.Workspace.Checkpoint` directly (the CLI or `offshoot mcp`, no daemon session involved). A live session's named `flush` is *not* counted here; it's a flush, tallied under `offshoot_flush_duration_seconds` instead. This histogram reads all-zero on a daemon that only ever serves live sessions and never itself runs an at-rest checkpoint. |
 | `offshoot_reap_total` | counter | — | Branches reaped (TTL-expired, destroyed) by the janitor. |
 | `offshoot_gc_tombstoned_total` | counter | — | Objects newly tombstoned by a GC pass. |
@@ -96,6 +98,8 @@ $ curl -s -H "Authorization: Bearer verify-token-123" http://127.0.0.1:18080/met
 # TYPE offshoot_fork_total counter
 # TYPE offshoot_fork_duration_seconds histogram
 # TYPE offshoot_fork_mode_total counter
+# TYPE offshoot_rollback_total counter
+# TYPE offshoot_promote_total counter
 # TYPE offshoot_checkpoint_duration_seconds histogram
 # TYPE offshoot_reap_total counter
 # TYPE offshoot_gc_tombstoned_total counter
@@ -232,7 +236,9 @@ the stream on its own.
 Today there is exactly one disk budget: `serve -ro-cache-budget
 <bytes|0>` (default `0` = unlimited), bounding `checkouts-ro` — the
 read-only cache `offshoot checkout --at --read-only` / the daemon
-`checkout-at` op materializes into. **`checkouts/` (the writable, leased
+`checkout-at` op materializes into, and, since v0.2.12, the
+`checkouts-ro/<db>/~by-chain/` entries every writable checkout is cloned
+from (see [below](#the-by-chain-cache-and-the-checkout-sidecars)). **`checkouts/` (the writable, leased
 tree) is never evicted, by construction** — there is no code path in the
 eviction pass that can even name a `checkouts/` path, so a leased, currently
 open session's checkout survives even the most aggressive budget (`1`, which
@@ -253,12 +259,26 @@ created.
 **`checkouts-ro` remains safe to `rm -rf` at any time, budget or not** — a
 budget just automates what manual cleanup would otherwise require by hand;
 the next call for anything under it rebuilds what it needs, since a
-checkpoint's content never changes.
+checkpoint's content never changes. That holds for `~by-chain/` too: an
+entry is only ever a clone source, so removing it costs the next checkout
+of that state a rebuild, never a writable checkout's content.
 
 **Eviction is loud:** one stderr line per entry
 (`offshoot: janitor: ro-cache: evicted <db>@<branch>@<checkpoint> (<bytes>
 bytes)`), `offshoot_ro_cache_evictions_total` incremented, and an `evicted`
-event published on the [event bus](#eventing).
+event published on the [event bus](#eventing). A by-chain entry belongs to
+no branch, so its line and event carry branch `~by-chain` and the chain ID
+where the checkpoint name would be: `evicted app@~by-chain@3f9c…
+(104857600 bytes)`.
+
+**Budget by-chain entries at logical size.** Usage, the budget and
+`offshoot_ro_cache_bytes` count every entry at its file size. A by-chain
+entry shares its data blocks with each checkout cloned from it, so the
+figure over-states real disk use, and evicting an entry frees little while
+those checkouts still match it. A `--at` miss on a cloning filesystem
+leaves two files — the by-chain entry and the `<branch>@<checkpoint>.db`
+cloned from it — and both count. A budget sized for the pre-v0.2.12
+cache (only `--at` files) will now evict sooner.
 
 **The eviction-vs-CheckoutAt race, and why it's safe:** a path
 `checkout --at --read-only` returns isn't a guarantee the file still exists
@@ -282,6 +302,49 @@ a data-loss risk:
 to run a daemon with — it's never persisted, so `status` has no other way to
 know what a *running* daemon was actually started with).
 
+## The by-chain cache and the checkout sidecars
+
+Since v0.2.12 a store's local directory holds three kinds of file that
+exist to avoid copying and hashing. None of them is a source of truth —
+each can be deleted and is rebuilt — but each shows up in `ls` and in disk
+accounting, so it's worth knowing what they are.
+
+**`checkouts-ro/<db>/~by-chain/<chainID>.db`** (plus `.sum` and
+`.last-used`) — an immutable, `0444` copy of one resolved chain's content,
+named by the SHA-256 of its object keys. Every writable checkout is a
+clone of one of these (APFS `clonefile`, Linux `FICLONE`); a miss builds
+the entry first, from a cached prefix of the chain plus the remaining
+segments when one exists, else from the store. Nothing ever reads a
+writable checkout to build an entry. On a filesystem that cannot clone
+there are no entries and checkouts materialize from the store as before.
+The entries live under the [`-ro-cache-budget`](#budgets) and are safe to
+`rm -rf` with the rest of `checkouts-ro`.
+
+**`checkouts/<db>/<branch>.db.sum`** — the sidecar recording what the
+checkout was materialized from. Its v0.2.12 fields — `chain_id`, `size`,
+`mtime_ns`, `change_counter`, `stamped_ns` and `shadow` — let `offshoot
+checkout` prove an unchanged checkout clean from `stat` and SQLite's header
+change counter, without hashing it: identity, size, mtime and counter must
+all match, and the file's mtime must be more than **1 s** older than the
+stamp (git's racily-clean rule). In WAL mode the counter is not bumped on
+commit, so only size and mtime count there. Anything else hashes the file
+as before and re-stamps. If you edit a checkout with a tool that restores
+the original mtime and size, offshoot cannot see the change until the next
+hash — the same blind spot `git status` has, and the reason the 1 s margin
+exists. `offshoot status` does not take this shortcut; it always hashes.
+
+**`checkouts/<db>/<branch>.db.shadow`** — a reflinked copy of the checkout
+as of its last checkout or checkpoint. An at-rest `offshoot checkpoint`
+diffs the checkout against it and uploads a segment of the changed pages
+instead of a full snapshot when it can (the rule is in
+[reference.md](reference.md#offshoot-checkpoint-dbbranch-name---snapshot---meta-kv-)).
+It shares blocks with the checkout until pages diverge, so its real cost
+is the pages changed since the last checkpoint. `offshoot destroy` removes
+it; deleting it by hand just makes the next checkpoint a snapshot.
+`offshoot checkpoint --snapshot` forces a snapshot regardless — use it to
+cut a branch's chain on purpose. Each ref checkpoint entry now records
+which it was, as `kind` (`"snapshot"`/`"segment"`).
+
 ## Storage sharing (copy-on-write forks)
 
 Forks are copy-on-write: a fork writes a base pointer into its parent's
@@ -292,12 +355,15 @@ actually writes — not N×G. Four operator-facing consequences:
 **Two cost classes, reported per branch — believe them.** `offshoot
 status` prints `storage=shared` or `storage=materialized` on every branch
 line, and the daemon `branches` op reports the same bit as
-`BranchInfo.shared`. The asymmetry is deliberate and not hidden: **`fork`
-shares (near-free); `promote`, `rollback`, and `compact` each materialize
-a full independent copy** (they abandon or replace a lineage, and
-base-pointing into a lineage that is meant to die would pin it forever).
-Budget accordingly: a promote of a large database is a full-size store
-write even though the fork that produced the candidate was free.
+`BranchInfo.shared`. **`fork`, and since v0.2.12 `promote` and
+`rollback`, share (near-free); `compact` materializes a full independent
+copy**, as do `promote --materialize` / `rollback --materialize` and any
+of the three at the fork-time depth floor. `offshoot_promote_total{mode}`
+and `offshoot_rollback_total{mode}` count which path each took. What
+sharing moves is the bill for reclaim, not its size: a promoted `main`
+reads through the winning attempt's lineage, so reaping that attempt
+frees nothing `main` still reads — `compact main` (or `--materialize` at
+promote time) when you need the old lineage gone.
 
 **Destroy is instant; the storage refund waits for the last sharing
 child.** Destroying a branch always removes its ref immediately — that
@@ -311,7 +377,7 @@ it re-encodes the branch as one self-contained snapshot and drops its base
 pointer, at full-copy cost, plus one extra snapshot copy per distinct
 checkpoint txid the branch has: unlike `promote`, compact **preserves
 every checkpoint** (copied into the new lineage and rewritten to epoch 1,
-rollback-style) and adds a `compact` checkpoint at head alongside them —
+as `rollback --materialize` does) and adds a `compact` checkpoint at head alongside them —
 nothing to `export` first to keep.
 
 **GC counts objects, not lineages.** `gc: tombstoned N, deleted M objects`

@@ -19,14 +19,15 @@ demo@main     ○ init ──── ○ seeded ──── ○ v2 ────�
 demo@attempt-1            ╰──── ○ fork ──── ○ passed ─▶ head    (lineage B: shared)
 
 promote attempt-1 onto main:
-demo@main     ○ promote ──────────────────────────────▶ head    (lineage C: materialized)
-              main is repointed at a NEW lineage seeded from B's head —
-              a full copy (fork shares; promote materializes). Lineage A
-              is orphaned: tombstoned, held for a grace period, then GC'd.
-              attempt-1 survives unchanged — typically forked with --ttl,
-              so the janitor reaps it after expiry, and a destroyed or
-              reaped branch's shared bytes are reclaimed once no surviving
-              child still reads through them.
+demo@main     ○ promote ──────────────────────────────▶ head    (lineage C: shared)
+              main is repointed at a NEW lineage C whose base pointer names
+              B at attempt-1's head — no data copy (promote shares, like
+              fork; --materialize copies instead). Lineage A is orphaned:
+              tombstoned, held for a grace period, then GC'd. attempt-1
+              survives unchanged — typically forked with --ttl, so the
+              janitor reaps it after expiry; B's objects that main still
+              reads stay live until main diverges past them or is
+              compacted.
 ```
 
 ## The naming model
@@ -78,6 +79,17 @@ connection is never rewritten out from under itself
 checkouts of a named checkpoint live in a separate `checkouts-ro` tree
 (`checkout --at v1 --read-only`).
 
+Where the filesystem can clone (APFS, btrfs, XFS with reflink), a checkout
+is a clone of an immutable **by-chain entry** under
+`checkouts-ro/<db>/~by-chain/`, one per distinct resolved chain, so forty
+forks of one checkpoint are forty clones of one file rather than forty
+decodes of the same snapshot. Beside each checkout sit two companions: a
+`.sum` sidecar that lets a repeat `checkout` prove the file unchanged from
+its size, mtime and SQLite change counter without hashing it, and a
+`.shadow` — a reflinked copy as of the last checkpoint, which an at-rest
+checkpoint diffs against to write only the changed pages
+([what each file is](operations.md#the-by-chain-cache-and-the-checkout-sidecars)).
+
 ## The storage model
 
 ### Lineage
@@ -94,16 +106,21 @@ Apache-2.0 transaction-aware format
 ### Snapshot
 
 A full encoding of the database at one transaction id — the self-contained
-kind of object in a lineage. Every at-rest `offshoot checkpoint` writes
-one; a daemon session also writes one every Nth flush
-(`-snapshot-every`, default 16) to keep replay bounded.
+kind of object in a lineage. An at-rest `offshoot checkpoint` writes one
+when it has no shadow to diff against, when most pages changed, when the
+chain has reached the snapshot cadence, or when asked (`--snapshot`); a
+daemon session writes one every Nth flush (`-snapshot-every`, default 16).
+Either way replay stays bounded.
 
 ### Segment
 
-An incremental object: only the pages changed since the previous flush,
-at a specific transaction id. Only a daemon session writes segments
-(continuous capture knows what changed); measured cost is
-[~776 B per single-row transaction](benchmarks.md#divergence-cost-what-a-shared-child-pays-as-it-writes)
+An incremental object: only the pages changed since the previous flush
+or checkpoint, at a specific transaction id. A daemon session writes them
+from continuous capture; since v0.2.12 an at-rest `offshoot checkpoint`
+writes them too, from a page diff against the checkout's shadow (the
+checkpoint's output and the ref's `kind` field say which it wrote).
+Measured cost of a session's segments is
+[~761 B per single-row transaction](benchmarks.md#divergence-cost-what-a-shared-child-pays-as-it-writes)
 against a 100 MB database.
 
 ### Chain
@@ -130,19 +147,20 @@ keep chains bounded on deep fork-of-fork spines
 ### Storage class: shared vs materialized
 
 `offshoot status` labels every branch `storage=shared` (a base-pointer
-fork: near-free to hold, but it pins whatever ancestor storage its chain
-still reads through) or `storage=materialized` (a fully self-contained
-lineage: branches made by `create`, and the results of
-promote/rollback/compact). The
-asymmetry to internalize: **fork shares (near-free); promote, rollback,
-and compact each materialize a full copy** — deliberate, because those
-operations abandon their old lineage, and base-pointing into a lineage
-that is meant to die would pin it forever
+lineage: near-free to hold, but it pins whatever storage its chain still
+reads through) or `storage=materialized` (a fully self-contained lineage:
+branches made by `create`, and the results of compact and of
+`--materialize`). Fork, promote and rollback share; **compact is the one
+operation that always materializes a copy** — that is its job
 ([the storage-cost ledger](faq.md#storage-cost-honestly)).
 
-### Promote, rollback, and compact: the materializing operations
+### Promote, rollback, and compact: the repointing operations
 
-All three are the fork machinery pointed at a new, self-contained lineage.
+All three are the fork machinery pointed at a new lineage. Since v0.2.12
+promote and rollback make that lineage the way fork does — a base pointer
+at the kept state (the checkpoint, or the source's head), no data copied —
+and `--materialize` asks for the old self-contained copy instead; compact
+always copies.
 **Rollback** (`rollback app@b --to v1`) repoints the branch at a lineage
 seeded from a checkpoint, keeping checkpoints at or before the target —
 and, like promote below, keeps the branch's previous head first as a
@@ -154,14 +172,21 @@ unchanged, and the target's checkpoint map resets to just `promote` — but
 the target's previous head is kept first as a shared, TTL'd safety fork,
 `<target>-pre-promote`, so the promote can be undone by promoting that
 fork back (`--no-backup` skips it; see the
-[reference](reference.md#offshoot-promote-dbsource---onto-target---force---no-backup---backup-ttl-dur)).
+[reference](reference.md#offshoot-promote-dbsource---onto-target---force---no-backup---backup-ttl-dur---materialize)).
 **Compact** (`compact app@b`) turns a shared fork into a self-contained
 branch — the manual lever for releasing a destroyed ancestor's storage.
 Unlike promote, it does not reset the checkpoint map: every existing
-checkpoint's snapshot is copied into the new self-contained lineage
-(rollback-style), with a `compact` checkpoint added at head. Each of the
-three pays a full copy (~G bytes for a G-byte database), plus, for
-compact, one extra snapshot copy per distinct checkpoint txid kept.
+checkpoint's snapshot is copied into the new self-contained lineage (as
+`rollback --materialize` does), with a `compact` checkpoint added at head.
+Compact re-encodes the whole database (~G bytes for a G-byte database)
+plus one extra snapshot copy per distinct checkpoint txid kept; promote
+and rollback pay that only with
+`--materialize`, or when the kept state's chain is already at the
+fork-time depth floor. What sharing trades away is prompt reclaim: a
+shared rollback keeps the old lineage's objects at and below the
+checkpoint live (the abandoned future above it is reclaimed), and a shared
+promote keeps the source's lineage live under the target — until the
+branch diverges past them or is compacted.
 
 ## The concurrency model
 

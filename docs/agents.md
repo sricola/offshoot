@@ -171,7 +171,8 @@ get isolated forks, never interleaved writes
 ## Live capture: the daemon workflow
 
 Bare `offshoot mcp` runs every tool **at rest** — checkpoints quiesce the
-checkout and write a full snapshot. For an agent writing continuously, put
+checkout and write a segment of the changed pages or a full snapshot (the
+result's `kind` says which). For an agent writing continuously, put
 a daemon session under it and the same tools ride live capture instead
 (incremental flushes, no quiesce, writer never paused):
 

@@ -202,26 +202,51 @@ to lag destroys; that's the design, not a leak
 
 ## The performance envelope, from measured numbers
 
-All from [benchmarks](benchmarks.md) (darwin/arm64, local store; method
-and caveats there — the byte accounting transfers to S3, the milliseconds
-don't):
+All from [benchmarks](benchmarks.md) (darwin/arm64, Apple M5, local APFS
+store; method and caveats there — the byte accounting transfers to S3, the
+milliseconds don't):
 
-- **Fork at a named checkpoint is near-constant:** ~9–12 ms from 12 MB to
-  1 GB, adding [377 bytes](benchmarks.md#added-object-store-bytes-per-fork-100-mb-database)
-  for a 100 MB database, flat from 1 to 100 forks.
-- **Fork at head is O(size)** in wall clock — not from the share, but
-  from a safety check that SHA-256-hashes the whole checkout (~2.6 GB/s
-  on the benchmark machine) to warn about un-checkpointed changes: 1 GB
-  forks at head in ~418 ms. Fork a named checkpoint when latency matters.
-- **`promote`, `rollback`, and `compact` each materialize a full copy**
-  (~G bytes for a G-byte database). Fork is free; picking a winner isn't.
-- **A diverging shared child pays only for changed pages** (~776 B per
+- **Fork is near-constant, at a named checkpoint and — for a quiet
+  checkout — at head:** ~9–10 ms from 12 MB to 1 GB, adding
+  [377 bytes](benchmarks.md#added-object-store-bytes-per-fork-100-mb-database)
+  for a 100 MB database, flat from 1 to 100 forks; 1 GB forks at head in
+  9.5 ms. *Caveat:* the head check trusts the checkout's size/mtime
+  fingerprint only when its last write is more than 1 s older than its
+  sidecar stamp; inside that second it SHA-256-hashes the whole file as
+  before (100 MB: ~44 ms).
+- **A checkout of a state already on local disk is a clone:** 8.8 ms for a
+  100 MB database (262.8 ms before v0.2.12), and a clean checkout is proven
+  clean in ~0.3 ms at 64 MB and 512 MB alike. *Caveats:* the **first**
+  materialization of a seed or a new chain still decodes it from the
+  store, O(size); and
+  on a filesystem that cannot clone (ext4, tmpfs, most network
+  filesystems) there is no by-chain cache, so every checkout decodes, as
+  before.
+- **`promote` and `rollback` share by default** — a base pointer, like
+  fork — so picking a winner no longer copies it. *Caveats:* `compact`
+  still re-encodes the whole database (~G bytes for a G-byte database), as
+  do `--materialize` and a promote or rollback at the fork-time depth
+  floor;
+  and a shared result keeps the lineage it points into live until it
+  diverges past it or is compacted.
+- **A diverging shared child pays only for changed pages** (~761 B per
   single-row transaction against a 100 MB database) — but every 16th
   flush (`-snapshot-every`, default 16) writes a full self-snapshot to
   keep read chains bounded.
-- **At-rest `checkpoint` always writes a full snapshot** — without a
-  daemon there's no record of which pages changed. If you checkpoint
-  large databases in a loop, run a daemon.
+- **At-rest `checkpoint` writes a segment of the changed pages when it
+  can**, diffed against a reflinked shadow of the checkout. *Caveats:*
+  the diff still **reads the whole checkout and the whole shadow**, so its
+  local I/O is O(size) even when the upload is a few pages; half or more
+  of the pages changing, a chain at the snapshot cadence, or `--snapshot`
+  writes a full snapshot; and on a filesystem that cannot clone there is
+  no shadow, so every at-rest checkpoint is a full snapshot — there, if
+  you checkpoint large databases in a loop, run a daemon.
+- **Deep, narrow, concurrent fork spines are slower in v0.2.12.**
+  BranchBench's `mcts` topology (depth 25, 8 workers) took 197.2 s against
+  63.3 s before, with fork, checkout and checkpoint each ~0.7 s at p50 at
+  depth 25; the shallower topologies got faster. The cause is not yet
+  identified
+  ([the numbers](benchmarks.md#branchbench-topologies-v0212)).
 - **A session whose checkout had to be (re)materialized pays one settling
   full-snapshot flush** after open — O(size), once per session; reopening
   a clean, current checkout uploads nothing.

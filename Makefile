@@ -232,12 +232,15 @@ bench-isolation: check-python-version
 # against a local offshoot store, full-scale parameters: ~2,300 forks in all.
 # Every workflow runs against its own fresh store (built, seeded and removed
 # per workflow), so this needs about 30 GB of free space in $TMPDIR -- the
-# largest single workflow, mcts, peaks near 26.5 GiB -- and under 3 minutes on
-# an Apple M5. `go run ./cmd/branchbench -quick` is the seconds-scale smoke
+# largest single workflow, mcts, peaked near 26.5 GiB before v0.2.12 (now
+# 43 GiB logical but ~2 GiB physical on APFS, where checkouts, shadows and
+# by-chain entries are clones; not measured on a filesystem that cannot
+# clone) -- and about 5 minutes on an
+# Apple M5 (docs/benchmarks.md has the v0.2.12 mcts regression). `go run ./cmd/branchbench -quick` is the seconds-scale smoke
 # run of the same five topologies, and `go test ./cmd/branchbench` runs it.
 # Prints one markdown table; docs/benchmarks.md pastes it verbatim.
 bench-branchbench:
-	@echo "branchbench: needs ~30 GB free in TMPDIR and ~3 minutes; Ctrl-C removes the store. Smoke run: go run ./cmd/branchbench -quick"
+	@echo "branchbench: needs ~30 GB free in TMPDIR and ~5 minutes; Ctrl-C removes the store. Smoke run: go run ./cmd/branchbench -quick"
 	go run ./cmd/branchbench
 
 # example-pass-k runs examples/eval-pass-k/run.py: a runnable pass^k eval

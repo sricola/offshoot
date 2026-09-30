@@ -42,6 +42,20 @@ with offshoot.connect("/tmp/o.sock") as c:
 `Client` also exposes `branches()` (per-branch head txid, protected flag,
 checkpoints, TTL) and `dbs()` (every database name in the store).
 
+`rollback(db, branch, to)` and `promote(db, source, onto, force=...)`
+share by default (daemon v0.2.12 and later): the branch is repointed
+through a base pointer at the kept checkpoint or the source's head, with
+no data copied. Pass `materialize=True` to copy the state into a
+self-contained lineage instead — the pre-v0.2.12 behaviour, for when the
+old lineage should stop being pinned right away:
+
+```python
+c.rollback("app", "try", "v1", materialize=True)
+c.promote("app", "try", "main", force=True, materialize=True)
+```
+
+An older daemon ignores the field and always copies.
+
 ## Eventing: `Client.events()`
 
 The daemon (`offshoot serve`) publishes one versioned JSON event per state
