@@ -69,10 +69,11 @@ Usage:
   offshoot touch <db>[@branch] [--ttl duration|none]   reset a branch's activity clock, optionally (re)setting its TTL
   offshoot protect <db>[@branch]        refuse unforced destroy/promote-onto, never reap; MCP cannot force it without -allow-force
   offshoot unprotect <db>[@branch]      clear the protected flag
-  offshoot rollback <db>[@branch] --to <cp> [--no-backup] [--backup-ttl DUR]
+  offshoot rollback <db>[@branch] --to <cp> [--no-backup] [--backup-ttl DUR] [--materialize]
                                                           repoint a branch at a checkpoint; keeps the previous head as <branch>-pre-rollback
-  offshoot promote <db>@<src> --onto <target> [--force] [--no-backup] [--backup-ttl DUR]
-                                                          repoint target at src's head; keeps target's old head as <target>-pre-promote
+  offshoot promote <db>@<src> --onto <target> [--force] [--no-backup] [--backup-ttl DUR] [--materialize]
+                                                          repoint target at src's head; keeps target's old head as <target>-pre-promote;
+                                                          both point at the kept history (shared) unless --materialize copies it
   offshoot compact <db>[@branch]     make a shared fork self-contained (its
                                      ancestor's storage becomes reclaimable
                                      by gc); no-op if already self-contained
@@ -596,13 +597,15 @@ func run(args []string) error {
 		fmt.Printf("unprotected %s@%s\n", db, branch)
 		return nil
 	case "rollback":
-		const usage = "usage: offshoot rollback <db>[@branch] --to <checkpoint> [--no-backup] [--backup-ttl DUR]"
+		const usage = "usage: offshoot rollback <db>[@branch] --to <checkpoint> [--no-backup] [--backup-ttl DUR] [--materialize]"
 		var opts ops.RollbackOptions
 		fs := rest[:0]
 		for i := 0; i < len(rest); i++ {
 			switch a := rest[i]; a {
 			case "--no-backup":
 				opts.NoBackup = true
+			case "--materialize":
+				opts.Materialize = true
 			case "--backup-ttl":
 				if i+1 >= len(rest) {
 					return fmt.Errorf("%s", usage)
@@ -629,6 +632,7 @@ func run(args []string) error {
 			return err
 		}
 		fmt.Println(res.Path)
+		fmt.Printf("rolled back %s@%s to %q %s\n", db, branch, fs[2], storageMode(res.Shared))
 		if res.Backup != "" {
 			ttl := opts.BackupTTL
 			if ttl <= 0 {
@@ -639,13 +643,15 @@ func run(args []string) error {
 		}
 		return nil
 	case "promote":
-		const usage = "usage: offshoot promote <db>@<source> --onto <target> [--force] [--no-backup] [--backup-ttl DUR]"
+		const usage = "usage: offshoot promote <db>@<source> --onto <target> [--force] [--no-backup] [--backup-ttl DUR] [--materialize]"
 		var opts ops.PromoteOptions
 		fs := rest[:0]
 		for i := 0; i < len(rest); i++ {
 			switch a := rest[i]; a {
 			case "--force":
 				opts.Force = true
+			case "--materialize":
+				opts.Materialize = true
 			case "--no-backup":
 				opts.NoBackup = true
 			case "--backup-ttl":
@@ -673,7 +679,7 @@ func run(args []string) error {
 		if err != nil {
 			return err
 		}
-		fmt.Printf("promoted %s@%s -> %s@%s at txid %d\n", db, srcBranch, db, fs[2], res.TXID)
+		fmt.Printf("promoted %s@%s -> %s@%s at txid %d %s\n", db, srcBranch, db, fs[2], res.TXID, storageMode(res.Shared))
 		if res.Backup != "" {
 			ttl := opts.BackupTTL
 			if ttl <= 0 {
@@ -860,8 +866,8 @@ func run(args []string) error {
 			// every line: "shared" means this branch is a base-pointer fork
 			// (near-zero added storage, reading through an ancestor's durable
 			// objects); "materialized" means a fully self-contained lineage.
-			// fork shares; promote/rollback/compact each materialize a full
-			// copy — the asymmetry is deliberate and worth seeing per branch.
+			// fork, rollback and promote share below the snapshot floor;
+			// compact (and --materialize) make a full copy.
 			storage := "materialized"
 			if s.Shared {
 				storage = "shared"
@@ -1276,4 +1282,14 @@ func run(args []string) error {
 	default:
 		return fmt.Errorf("unknown command %q\n%s", cmd, usage)
 	}
+}
+
+// storageMode is rollback's and promote's output tag for the new lineage:
+// "(shared)" when it points at the kept history through a base pointer,
+// "(materialized)" when it is a self-contained copy.
+func storageMode(shared bool) string {
+	if shared {
+		return "(shared)"
+	}
+	return "(materialized)"
 }

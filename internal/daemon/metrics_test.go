@@ -127,6 +127,26 @@ func TestMetricsSmokeOpenWriteFlushFork(t *testing.T) {
 	if strings.Contains(afterClose, `db="app"`) {
 		t.Fatalf("expected no db=\"app\" capture_lag/durable_age samples once the session is closed:\n%s", afterClose)
 	}
+
+	// A default rollback shares; a promote with materialize copies. Each
+	// verb's mode counter records exactly that, and the response says so.
+	if rb := call(t, sock, Request{Op: "rollback", DB: "app", Branch: "main", Name: "init", NoBackup: true}); !rb.OK || !rb.Shared {
+		t.Fatalf("rollback = %+v, want ok and shared", rb)
+	}
+	if pr := call(t, sock, Request{Op: "promote", DB: "app", Branch: "child", Name: "main", Force: true, NoBackup: true, Materialize: true}); !pr.OK || pr.Shared {
+		t.Fatalf("promote = %+v, want ok and not shared", pr)
+	}
+	afterRepoint := scrape(t)
+	for _, want := range []string{
+		`offshoot_rollback_total{mode="shared"} 1`,
+		`offshoot_rollback_total{mode="materialized"} 0`,
+		`offshoot_promote_total{mode="shared"} 0`,
+		`offshoot_promote_total{mode="materialized"} 1`,
+	} {
+		if !strings.Contains(afterRepoint, want) {
+			t.Fatalf("expected %s:\n%s", want, afterRepoint)
+		}
+	}
 }
 
 // forkTotal extracts offshoot_fork_total{path="<path>"}'s sample value from

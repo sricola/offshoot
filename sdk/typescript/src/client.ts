@@ -129,6 +129,9 @@ export interface RollbackOptions {
   noBackup?: boolean;
   /** The safety fork's TTL as a Go duration string (default 24h). */
   backupTtl?: string;
+  /** Copy the checkpoint into a self-contained lineage instead of pointing
+   * at its history (the default). */
+  materialize?: boolean;
 }
 
 /** Options for {@link Client.promote}. */
@@ -140,6 +143,9 @@ export interface PromoteOptions {
   noBackup?: boolean;
   /** The safety fork's TTL as a Go duration string (default 24h). */
   backupTtl?: string;
+  /** Copy the source head into a self-contained lineage instead of pointing
+   * at its history (the default). */
+  materialize?: boolean;
 }
 
 /** Options for {@link Client.touch}. */
@@ -507,6 +513,7 @@ export class Client {
     const resp = await this._call("rollback", {
       db, branch, name: to,
       no_backup: opts.noBackup ?? false, backup_ttl: opts.backupTtl ?? "",
+      materialize: opts.materialize ?? false,
     });
     return resp.checkout ?? "";
   }
@@ -520,6 +527,7 @@ export class Client {
     const resp = await this._call("promote", {
       db, branch: source, name: onto, force: opts.force ?? false,
       no_backup: opts.noBackup ?? false, backup_ttl: opts.backupTtl ?? "",
+      materialize: opts.materialize ?? false,
     });
     return resp.txid ?? 0;
   }

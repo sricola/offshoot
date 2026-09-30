@@ -721,3 +721,32 @@ func TestStatusReportsStorageClass(t *testing.T) {
 		t.Fatalf("compacted branch must report storage=materialized: %q", line)
 	}
 }
+
+// TestRollbackAndPromoteOutputNameTheirMode pins the storage-mode tag on
+// rollback's and promote's output: (shared) by default, (materialized)
+// under --materialize.
+func TestRollbackAndPromoteOutputNameTheirMode(t *testing.T) {
+	testutil.RequireSQLite3(t)
+	store := filepath.Join(t.TempDir(), "s")
+	call(t, store, "init")
+	call(t, store, "create", "app")
+	path := strings.TrimSpace(call(t, store, "checkout", "app"))
+	if out, err := exec.Command("sqlite3", path, "CREATE TABLE t (v);").CombinedOutput(); err != nil {
+		t.Fatalf("%v: %s", err, out)
+	}
+	call(t, store, "checkpoint", "app", "v1")
+	call(t, store, "fork", "app", "attempt")
+	for _, c := range []struct {
+		args []string
+		want string
+	}{
+		{[]string{"rollback", "app", "--to", "v1", "--no-backup"}, `rolled back app@main to "v1" (shared)`},
+		{[]string{"rollback", "app", "--to", "v1", "--no-backup", "--materialize"}, `rolled back app@main to "v1" (materialized)`},
+		{[]string{"promote", "app@attempt", "--onto", "main", "--force", "--no-backup"}, "(shared)"},
+		{[]string{"promote", "app@attempt", "--onto", "main", "--force", "--no-backup", "--materialize"}, "(materialized)"},
+	} {
+		if out := call(t, store, c.args...); !strings.Contains(out, c.want) {
+			t.Fatalf("offshoot %v printed %q, want it to contain %q", c.args, out, c.want)
+		}
+	}
+}
