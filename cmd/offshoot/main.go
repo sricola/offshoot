@@ -55,8 +55,11 @@ Usage:
                                      may omit the checkpoint for the
                                      branch's current head; the two sides
                                      may name the same db or different ones
-  offshoot checkpoint <db>[@branch] <name> [--meta k=v ...]
-                                     snapshot the checkout as a named checkpoint
+  offshoot checkpoint <db>[@branch] <name> [--snapshot] [--meta k=v ...]
+                                     name the checkout's state: a segment of
+                                     the pages changed since the last
+                                     checkpoint when it can, else a full
+                                     snapshot (--snapshot forces one)
   offshoot fork <db>[@branch] <new> [--at cp] [--ttl duration] [--meta k=v ...]
                                      branch from head or a checkpoint;
                                      --meta is repeatable (capped: 32 keys,
@@ -226,6 +229,16 @@ func extractFlag(args []string, name string) (value string, rest []string, ok bo
 		out = append(out, args[i])
 	}
 	return value, out, ok, nil
+}
+
+// checkpointLine is checkpoint's output: the name and txid, then what was
+// written — a segment's page count and size, or a snapshot's size.
+func checkpointLine(name string, res ops.CheckpointResult) string {
+	if res.Kind == "segment" {
+		return fmt.Sprintf("checkpoint %q at txid %d (segment, %d pages, %.1f KiB)",
+			name, res.TXID, res.Pages, float64(res.Bytes)/(1<<10))
+	}
+	return fmt.Sprintf("checkpoint %q at txid %d (snapshot, %.1f MiB)", name, res.TXID, float64(res.Bytes)/(1<<20))
 }
 
 // extractBoolFlag pulls every occurrence of a bare boolean flag (e.g.
@@ -469,22 +482,23 @@ func run(args []string) error {
 			return fmt.Errorf("usage: offshoot create <db> [--from file]")
 		}
 	case "checkpoint":
+		snapshot, rest := extractBoolFlag(rest, "--snapshot")
 		meta, rest, err := extractMetaFlags(rest)
 		if err != nil {
-			return fmt.Errorf("usage: offshoot checkpoint <db>[@branch] <name> [--meta k=v ...]: %w", err)
+			return fmt.Errorf("usage: offshoot checkpoint <db>[@branch] <name> [--snapshot] [--meta k=v ...]: %w", err)
 		}
 		if len(rest) != 2 {
-			return fmt.Errorf("usage: offshoot checkpoint <db>[@branch] <name> [--meta k=v ...]")
+			return fmt.Errorf("usage: offshoot checkpoint <db>[@branch] <name> [--snapshot] [--meta k=v ...]")
 		}
 		db, branch, err := ops.ParseTarget(rest[0])
 		if err != nil {
 			return err
 		}
-		txid, err := w.Checkpoint(db, branch, rest[1], meta)
+		res, err := w.CheckpointWith(db, branch, rest[1], meta, ops.CheckpointOptions{Snapshot: snapshot})
 		if err != nil {
 			return err
 		}
-		fmt.Printf("checkpoint %q at txid %d\n", rest[1], txid)
+		fmt.Println(checkpointLine(rest[1], res))
 		return nil
 	case "fork":
 		fs := rest

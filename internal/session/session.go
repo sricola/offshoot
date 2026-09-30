@@ -1026,7 +1026,14 @@ func (s *Session) commitSidecarRefresh() {
 	// simple as it was before fingerprints existed.
 	if err := ops.StampSumHashOnly(s.checkoutPath, st.MainHash, ref.Lineage, ref.HeadEpoch, ref.HeadTXID, flushChecksum, ""); err != nil {
 		s.logTransition("sidecar-refresh-skipped", "reason", err.Error())
+		return
 	}
+	// The stamp above recorded no shadow (the one from Open, if any, is the
+	// pre-session head). Re-clone it at the head this session left, so the
+	// next at-rest Checkpoint can write a segment against it; the
+	// checkpoint verifies the shadow against flushChecksum before trusting
+	// it, so a shadow that somehow differs only costs a snapshot.
+	ops.RefreshShadow(s.checkoutPath)
 }
 
 // sidecarRefreshEligible is the pending/success check both

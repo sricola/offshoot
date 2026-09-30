@@ -1356,7 +1356,7 @@ func TestStructuredContentAccompaniesProse(t *testing.T) {
 		t.Fatalf("checkout structuredContent = %v", co)
 	}
 	cp := sc(call(t, ts, "offshoot_checkpoint", map[string]any{"database": "app", "branch": "attempt-1", "name": "v1"}))
-	if cp["name"] != "v1" || cp["live"] != false {
+	if cp["name"] != "v1" || cp["live"] != false || (cp["kind"] != "snapshot" && cp["kind"] != "segment") {
 		t.Fatalf("checkpoint structuredContent = %v", cp)
 	}
 	txid(cp, "txid", "app", "attempt-1")

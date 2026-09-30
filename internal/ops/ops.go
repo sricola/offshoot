@@ -1,8 +1,9 @@
 // Package ops implements offshoot's branch lifecycle operations over a
 // store.Backend: create, checkout, checkpoint, fork (copy-on-write shared
 // by default), rollback, promote, compact, destroy, leases, TTL/reap, and
-// reachability GC. It backs both the CLI's at-rest mode (full-snapshot
-// checkpoints against fixed checkout paths) and the daemon (which layers
+// reachability GC. It backs both the CLI's at-rest mode (checkpoints
+// against fixed checkout paths: a segment diffed against a reflinked shadow
+// when it can, a full snapshot otherwise) and the daemon (which layers
 // live sessions and segment flushes from internal/session on top).
 package ops
 
@@ -36,7 +37,9 @@ type Workspace struct {
 	// SnapshotEvery is the snapshot cadence the fork-time floor bounds a
 	// shared fork's resolved base chain against; 0 means use the default
 	// (ForkShareMaxDepth). Set by the daemon from its configured session
-	// SnapshotEvery so the fork floor and the divergence floor agree.
+	// SnapshotEvery so the fork floor and the divergence floor agree. An
+	// at-rest CheckpointWith bounds the head's chain by it too: no segment
+	// checkpoint grows the chain past this many members.
 	SnapshotEvery int
 }
 
@@ -352,6 +355,7 @@ func (w *Workspace) CheckoutProven(db, branch string) (CheckoutResult, error) {
 	if err := StampSum(path, hash, ref.Lineage, ref.HeadEpoch, ref.HeadTXID, placed.checksum, placed.chainID); err != nil {
 		return CheckoutResult{}, err
 	}
+	refreshShadow(path)
 	return CheckoutResult{Path: path, Clean: false, Ref: ref}, nil
 }
 
@@ -389,69 +393,109 @@ func copyFile(from, to string) error {
 	return out.Close()
 }
 
-// Checkpoint snapshots the current checkout state as a named checkpoint.
-// Plan-2 (CLI/at-rest) semantics: full-snapshot encode; requires the
-// checkout to be quiescible (busy timeout 3s, then clean failure).
+// CheckpointOptions tunes CheckpointWith.
+type CheckpointOptions struct {
+	// Snapshot forces a full snapshot even when a segment would do.
+	Snapshot bool
+}
+
+// CheckpointResult is what CheckpointWith wrote.
+type CheckpointResult struct {
+	TXID uint64
+	// Kind is "snapshot" or "segment".
+	Kind string
+	// Pages is the number of pages a segment carries (0 for a snapshot).
+	Pages int
+	// Bytes is the size of the object uploaded, segment or snapshot.
+	Bytes int64
+}
+
+// Checkpoint is CheckpointWith with default options, returning only the
+// new txid.
+func (w *Workspace) Checkpoint(db, branch, name string, meta map[string]string) (uint64, error) {
+	res, err := w.CheckpointWith(db, branch, name, meta, CheckpointOptions{})
+	return res.TXID, err
+}
+
+// CheckpointWith records the current checkout state as a named checkpoint.
+// Plan-2 (CLI/at-rest) semantics: requires the checkout to be quiescible
+// (busy timeout 3s, then clean failure). It writes a segment of only the
+// pages changed since the head when planSegment allows (a shadow of the
+// head is kept next to the checkout; see its doc comment for the rule),
+// and a full snapshot otherwise or when opts.Snapshot is set. Either way
+// the object goes up with the same create-only put and ref CAS, and the
+// sidecar and shadow are refreshed after the CAS.
 //
-// NOT SAFE against a live in-process session's checkout: it calls
-// ltxio.EncodeSnapshot, which raw-opens (and closes) the checkout path, and
-// that close drops every SQLite lock this process holds on it — the POSIX
-// (process, inode) lock-drop hazard, see internal/dbfile. Today only the CLI
-// (cmd/offshoot) and MCP (internal/mcp) reach this, both of which are
-// separate processes from the daemon that runs sessions, so no in-process
-// session can be holding that checkout. The daemon conspicuously has no
-// checkpoint op; if one is ever added it MUST NOT call this directly —
-// route the snapshot through the session's own engine, or through dbfile.
+// NOT SAFE against a live in-process session's checkout: it raw-opens (and
+// closes) the checkout path to encode it, and that close drops every
+// SQLite lock this process holds on it — the POSIX (process, inode)
+// lock-drop hazard, see internal/dbfile. Today only the CLI (cmd/offshoot)
+// and MCP (internal/mcp) reach this, both of which are separate processes
+// from the daemon that runs sessions, so no in-process session can be
+// holding that checkout. The daemon conspicuously has no checkpoint op; if
+// one is ever added it MUST NOT call this directly — route the snapshot
+// through the session's own engine, or through dbfile.
 //
 // meta (nil = none) is a small string->string map describing this specific
 // checkpoint (e.g. eval run id, git SHA, agent id), capped by ValidateMeta
 // and stored on the checkpoint's own store.Checkpoint.Meta — not on the
 // branch's Ref.Meta, which Fork's meta param sets instead. Rejected (before
 // any store I/O) if it exceeds the caps.
-func (w *Workspace) Checkpoint(db, branch, name string, meta map[string]string) (uint64, error) {
+func (w *Workspace) CheckpointWith(db, branch, name string, meta map[string]string, opts CheckpointOptions) (CheckpointResult, error) {
 	start := time.Now()
 	if err := store.ValidateName(db); err != nil {
-		return 0, err
+		return CheckpointResult{}, err
 	}
 	if err := store.ValidateName(branch); err != nil {
-		return 0, err
+		return CheckpointResult{}, err
 	}
 	if err := store.ValidateName(name); err != nil {
-		return 0, err
+		return CheckpointResult{}, err
 	}
 	if err := ValidateMeta(meta); err != nil {
-		return 0, err
+		return CheckpointResult{}, err
 	}
 	ref, etag, err := w.Store.GetRef(db, branch)
 	if err != nil {
-		return 0, err
+		return CheckpointResult{}, err
 	}
 	if _, exists := ref.Checkpoints[name]; exists {
-		return 0, fmt.Errorf("ops: checkpoint %q already exists on %s@%s", name, db, branch)
+		return CheckpointResult{}, fmt.Errorf("ops: checkpoint %q already exists on %s@%s", name, db, branch)
 	}
 	path := w.CheckoutPath(db, branch)
 	if _, err := os.Stat(path); err != nil {
-		return 0, fmt.Errorf("ops: no checkout for %s@%s (run checkout first): %w", db, branch, err)
+		return CheckpointResult{}, fmt.Errorf("ops: no checkout for %s@%s (run checkout first): %w", db, branch, err)
 	}
 	if err := quiesce(path); err != nil {
-		return 0, err
+		return CheckpointResult{}, err
 	}
 	txid := ref.HeadTXID + 1
+	res := CheckpointResult{TXID: txid, Kind: "snapshot"}
 	var buf bytes.Buffer
-	checksum, err := ltxio.EncodeSnapshot(path, txid, &buf)
-	if err != nil {
-		return 0, err
+	var key string
+	var checksum uint64
+	if d, ok := w.planSegment(path, ref, opts); ok {
+		if err := ltxio.EncodeSegment(d.pageSize, d.commit, txid, txid, d.pre, d.post, d.pages, &buf); err != nil {
+			return CheckpointResult{}, err
+		}
+		key, checksum = store.SegmentKey(ref.Lineage, ref.Epoch, txid, txid), d.post
+		res.Kind, res.Pages = "segment", len(d.pages)
+	} else {
+		if checksum, err = ltxio.EncodeSnapshot(path, txid, &buf); err != nil {
+			return CheckpointResult{}, err
+		}
+		key = store.SnapshotKey(ref.Lineage, ref.Epoch, txid)
 	}
-	snapKey := store.SnapshotKey(ref.Lineage, ref.Epoch, txid)
-	if _, err := w.Store.B.PutIf(snapKey, buf.Bytes(), ""); err != nil {
+	res.Bytes = int64(buf.Len())
+	if _, err := w.Store.B.PutIf(key, buf.Bytes(), ""); err != nil {
 		if !errors.Is(err, store.ErrCAS) {
-			return 0, err
+			return CheckpointResult{}, err
 		}
 		// An object already lives at this deterministic key. HeadTXID only
 		// ever advances via a successful ref write, and nothing is written
 		// under a txid beyond HeadTXID+1 until that happens, so nothing can
 		// legitimately reference this key yet: it can only be (a) an orphan
-		// left by a crashed prior Checkpoint attempt (snapshot uploaded, ref
+		// left by a crashed prior Checkpoint attempt (object uploaded, ref
 		// write never landed), or (b) a rival Checkpoint call racing on this
 		// same branch right now, which computed the identical HeadTXID+1 and
 		// simply lost the write here. Overwriting is benign under either
@@ -460,9 +504,12 @@ func (w *Workspace) Checkpoint(db, branch, name string, meta map[string]string) 
 		// stored is content-equivalent, and only one of the two racers can
 		// possibly win the PutRef CAS below to ever reference this key by
 		// name — there is no rival ref left dangling by the overwrite. Safe
-		// to overwrite unconditionally and proceed.
-		if err := w.Store.B.Put(snapKey, buf.Bytes()); err != nil {
-			return 0, err
+		// to overwrite unconditionally and proceed. The key names the kind
+		// (snapshot or segment), so a racer that chose the other kind wrote
+		// a different key; both then race the same CAS below, and the
+		// loser's object is an orphan like any other.
+		if err := w.Store.B.Put(key, buf.Bytes()); err != nil {
+			return CheckpointResult{}, err
 		}
 	}
 	ref.HeadTXID = txid
@@ -470,45 +517,48 @@ func (w *Workspace) Checkpoint(db, branch, name string, meta map[string]string) 
 	ref.SetCheckpoint(name, store.Checkpoint{TXID: txid, Epoch: ref.Epoch, CreatedAt: nowStamp(), Meta: meta})
 	ref.Touch(time.Now())
 	if _, err := w.Store.PutRef(db, branch, ref, etag); err != nil {
-		// Decide whether to clean up the snapshot after PutRef failure.
+		// Decide whether to clean up the object after PutRef failure.
 		// Unlike Fork/Rollback/Promote (which delete keys in freshly-minted
 		// lineages no rival can reference), we must gate cleanup on the error
 		// type: under concurrent Checkpoint calls on the same branch, every
-		// racer computes the same deterministic txid (HeadTXID+1) and snapKey.
+		// racer computes the same deterministic txid (HeadTXID+1) and key.
 		//
 		// On ErrCAS (lost the CAS race): serialization via PutIf means the
-		// winner's ref is already visible, so the snapshot is confirmed an
+		// winner's ref is already visible, so the object is confirmed an
 		// orphan left by a crashed prior Checkpoint — safe to delete so a
 		// retry's create-only put doesn't wedge behind our orphan.
 		//
 		// On non-CAS errors (lock timeout, I/O error): deletion is UNSAFE.
 		// A concurrent checkpointer may already be mid-write, and we can't
 		// tell from here whether they've landed their ref yet. Deleting would
-		// rip the snapshot out from under them, leaving a checkpoint recorded
+		// rip the object out from under them, leaving a checkpoint recorded
 		// in their ref with no backing object — silent corruption for them.
 		// Leave the object alone; worst case it's a harmless orphan for a
 		// later GC pass.
 		if errors.Is(err, store.ErrCAS) {
 			if cur, _, gerr := w.Store.GetRef(db, branch); gerr == nil && (cur.Lineage != ref.Lineage || cur.HeadTXID < txid) {
-				w.bestEffortDelete(snapKey)
+				w.bestEffortDelete(key)
 			}
-			return 0, fmt.Errorf("ops: ref update lost a race (retry): %w", err)
+			return CheckpointResult{}, fmt.Errorf("ops: ref update lost a race (retry): %w", err)
 		}
-		return 0, fmt.Errorf("ops: ref update for checkpoint %q on %s@%s: %w", name, db, branch, err)
+		return CheckpointResult{}, fmt.Errorf("ops: ref update for checkpoint %q on %s@%s: %w", name, db, branch, err)
 	}
 	// The ref CAS is the point of no return: only now does the checkout truly
 	// equal committed state (lineage unchanged, head advanced to txid).
 	// Writing the sidecar here, after the CAS, means an interrupt between the
 	// encode above and this point leaves the OLD sidecar in place — which
 	// still correctly describes the checkout's actual (pre-checkpoint)
-	// identity, rather than claiming a commit that never landed.
+	// identity, rather than claiming a commit that never landed. The same
+	// goes for the shadow: it is re-cloned only after the new stamp, which
+	// records no shadow until refreshShadow has one in place.
 	if err := writeSum(path, ref.Lineage, ref.HeadEpoch, txid, checksum, ""); err != nil {
-		return 0, fmt.Errorf("ops: checkpoint %q committed (txid %d), but the checkout fingerprint could not be refreshed: %w", name, txid, err)
+		return CheckpointResult{}, fmt.Errorf("ops: checkpoint %q committed (txid %d), but the checkout fingerprint could not be refreshed: %w", name, txid, err)
 	}
+	refreshShadow(path)
 	if ObserveCheckpoint != nil {
 		ObserveCheckpoint(time.Since(start))
 	}
-	return txid, nil
+	return res, nil
 }
 
 // errQuiesceBusy is quiesce's error specifically for wal_checkpoint(TRUNCATE)
@@ -1144,7 +1194,11 @@ func (w *Workspace) RollbackWith(db, branch, to string, opts RollbackOptions) (R
 		// The checkout now equals committed state: refresh the fingerprint
 		// (identity too, since this repointed to a new lineage) so a later
 		// Fork sees it as clean rather than stale.
-		return writeSum(path, next.Lineage, next.HeadEpoch, txid, checksum, chain)
+		if err := writeSum(path, next.Lineage, next.HeadEpoch, txid, checksum, chain); err != nil {
+			return err
+		}
+		refreshShadow(path)
+		return nil
 	}
 	if err := refresh(); err != nil {
 		return RollbackResult{}, fmt.Errorf("ops: branch repointed to checkpoint %q (txid %d), but the checkout could not be refreshed (run 'offshoot checkout' to re-materialize): %w", to, txid, err)
@@ -1349,6 +1403,7 @@ func (w *Workspace) PromoteWith(db, source, target string, opts PromoteOptions) 
 		if err := writeSum(path, next.Lineage, next.HeadEpoch, txid, checksum, chain); err != nil {
 			return result, fmt.Errorf("ops: promoted, but checkout %s could not be refreshed: %w", path, err)
 		}
+		refreshShadow(path)
 	}
 	return result, nil
 }
@@ -1490,6 +1545,7 @@ func (w *Workspace) Compact(db, branch string) (uint64, error) {
 		if err := writeSum(path, next.Lineage, next.HeadEpoch, txid, checksum, chain); err != nil {
 			return txid, fmt.Errorf("ops: compacted, but checkout %s could not be refreshed: %w", path, err)
 		}
+		refreshShadow(path)
 	}
 	return txid, nil
 }

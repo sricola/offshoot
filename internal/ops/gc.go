@@ -95,7 +95,7 @@ func (w *Workspace) Destroy(db, branch string, force bool) error {
 	// remove cannot corrupt anything (a re-created branch's Checkout
 	// overwrites), but nothing else ever cleans checkouts/ — log so the
 	// stale files aren't a silent disk leak.
-	for _, p := range []string{path, path + "-wal", path + "-shm", path + ".sum"} {
+	for _, p := range []string{path, path + "-wal", path + "-shm", path + ".sum", shadowPath(path)} {
 		if err := os.Remove(p); err != nil && !os.IsNotExist(err) {
 			fmt.Fprintf(os.Stderr, "offshoot: destroy %s@%s: remove checkout file %s: %v\n",
 				db, branch, p, err)

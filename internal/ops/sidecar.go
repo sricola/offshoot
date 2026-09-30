@@ -173,7 +173,7 @@ func StampSum(path, hash, lineage string, epoch, txid, postApplyChecksum uint64,
 	if err != nil {
 		return err
 	}
-	return stampSumWithFingerprint(path, hash, lineage, epoch, txid, postApplyChecksum, chainID, fp, true)
+	return stampSumWithFingerprint(path, hash, lineage, epoch, txid, postApplyChecksum, chainID, fp, true, false)
 }
 
 // StampSumHashOnly writes path's .sum sidecar from a hash and identity the
@@ -196,7 +196,7 @@ func StampSum(path, hash, lineage string, epoch, txid, postApplyChecksum uint64,
 // avoids, and commitSidecarRefresh's own doc comment for why re-deriving a
 // hash at that call site is specifically undesirable.
 func StampSumHashOnly(path, hash, lineage string, epoch, txid, postApplyChecksum uint64, chainID string) error {
-	return stampSumWithFingerprint(path, hash, lineage, epoch, txid, postApplyChecksum, chainID, fingerprint{}, false)
+	return stampSumWithFingerprint(path, hash, lineage, epoch, txid, postApplyChecksum, chainID, fingerprint{}, false, false)
 }
 
 // stampSumWithFingerprint writes path's .sum sidecar from a hash, identity,
@@ -208,10 +208,16 @@ func StampSumHashOnly(path, hash, lineage string, epoch, txid, postApplyChecksum
 // hashing still matched one taken just after). ok=false omits Size,
 // ModTimeNS and ChangeCounter from the record (StampedNS along with them),
 // exactly like a pre-fingerprint sidecar.
-func stampSumWithFingerprint(path, hash, lineage string, epoch, txid, postApplyChecksum uint64, chainID string, fp fingerprint, ok bool) error {
+//
+// shadow is sumRecord.Shadow. Every stamp of new content passes false: the
+// shadow (if any) was cloned from the PREVIOUS content, and only
+// refreshShadow, after re-cloning, sets it again. checkoutState's
+// hash-verified re-stamp is the one caller that passes the record's own
+// value through, since it re-stamps the same identity and content.
+func stampSumWithFingerprint(path, hash, lineage string, epoch, txid, postApplyChecksum uint64, chainID string, fp fingerprint, ok, shadow bool) error {
 	rec := sumRecord{
 		Hash: hash, Lineage: lineage, Epoch: epoch, TXID: txid,
-		PostApplyChecksum: postApplyChecksum, ChainID: chainID,
+		PostApplyChecksum: postApplyChecksum, ChainID: chainID, Shadow: shadow,
 	}
 	if ok {
 		rec.Size, rec.ModTimeNS, rec.ChangeCounter = fp.size, fp.mtimeNS, fp.changeCounter
@@ -281,7 +287,13 @@ func stampSumWithFingerprint(path, hash, lineage string, epoch, txid, postApplyC
 // (file-format version bytes 18-19 == 2): Size, ModTimeNS and the
 // racily-clean guard alone carry that case.
 //
-// All four fields are additive and omitted (zero value) together on a
+// Shadow records that shadowPath(path) is a copy-on-write clone of this
+// checkout taken right after this record was stamped, so it holds exactly
+// the content at (Lineage, Epoch, TXID) — what an at-rest Checkpoint diffs
+// against to write a segment (see planSegment). Additive: a sidecar
+// without it decodes as false, which only means "no shadow; snapshot".
+//
+// All four fingerprint fields are additive and omitted (zero value) together on a
 // pre-this-field sidecar; a real checked-out SQLite file always has a
 // non-empty header and a real mtime, so an all-zero fingerprint can never
 // spuriously match one, and checkoutState falls back to its full hash
@@ -300,6 +312,7 @@ type sumRecord struct {
 	ModTimeNS         int64  `json:"mtime_ns,omitempty"`
 	ChangeCounter     uint32 `json:"change_counter,omitempty"`
 	StampedNS         int64  `json:"stamped_ns,omitempty"`
+	Shadow            bool   `json:"shadow,omitempty"`
 }
 
 // fingerprintMatches reports whether fp — a LIVE fingerprint, just read —
@@ -359,9 +372,9 @@ func writeSum(path string, lineage string, epoch, txid, postApplyChecksum uint64
 	}
 	fpAfter, errAfter := stampFingerprint(path)
 	if errBefore == nil && errAfter == nil && fpBefore == fpAfter {
-		return stampSumWithFingerprint(path, sum, lineage, epoch, txid, postApplyChecksum, chainID, fpAfter, true)
+		return stampSumWithFingerprint(path, sum, lineage, epoch, txid, postApplyChecksum, chainID, fpAfter, true, false)
 	}
-	return stampSumWithFingerprint(path, sum, lineage, epoch, txid, postApplyChecksum, chainID, fingerprint{}, false)
+	return stampSumWithFingerprint(path, sum, lineage, epoch, txid, postApplyChecksum, chainID, fingerprint{}, false, false)
 }
 
 // checkoutState reports how the checkout at path relates to ref, and — only
@@ -440,9 +453,9 @@ func checkoutState(path string, ref store.Ref) (string, uint64) {
 		return "modified", 0
 	}
 	if fpAfter, err2 := stampFingerprint(path); fpErr == nil && err2 == nil && fpBefore == fpAfter {
-		_ = stampSumWithFingerprint(path, got, ref.Lineage, ref.HeadEpoch, ref.HeadTXID, rec.PostApplyChecksum, rec.ChainID, fpAfter, true)
+		_ = stampSumWithFingerprint(path, got, ref.Lineage, ref.HeadEpoch, ref.HeadTXID, rec.PostApplyChecksum, rec.ChainID, fpAfter, true, rec.Shadow)
 	} else {
-		_ = stampSumWithFingerprint(path, got, ref.Lineage, ref.HeadEpoch, ref.HeadTXID, rec.PostApplyChecksum, rec.ChainID, fingerprint{}, false)
+		_ = stampSumWithFingerprint(path, got, ref.Lineage, ref.HeadEpoch, ref.HeadTXID, rec.PostApplyChecksum, rec.ChainID, fingerprint{}, false, rec.Shadow)
 	}
 	return "clean", rec.PostApplyChecksum
 }
@@ -510,4 +523,75 @@ func fileSum(path string) (string, error) {
 		return "", err
 	}
 	return hex.EncodeToString(h.Sum(nil)), nil
+}
+
+// shadowPath is where a writable checkout's shadow lives: a sibling file,
+// never under checkouts-ro (see sumRecord.Shadow).
+func shadowPath(checkoutPath string) string { return checkoutPath + ".shadow" }
+
+// refreshShadow makes path's shadow a copy-on-write clone of path as it is
+// now and records that in its sidecar. Call it right after stamping path's
+// sidecar with the committed state path now holds (a checkpoint's CAS, a
+// materialize, a repoint's refresh): the stamp wrote Shadow=false, so a
+// failure anywhere below leaves a sidecar that already says "no shadow".
+// The clone goes to a temp name and is renamed into place, never written
+// over the old shadow. A filesystem that cannot clone (reflink.
+// ErrUnsupported), or any other failure, drops the shadow instead: the
+// next Checkpoint then writes a snapshot, exactly as before shadows
+// existed. Best-effort by design, so it returns nothing.
+func refreshShadow(path string) {
+	shadow := shadowPath(path)
+	tmp := shadow + ".tmp"
+	os.Remove(tmp) // a leftover from an interrupted refresh is never live
+	if err := cloneFile(tmp, path); err != nil {
+		dropShadow(path)
+		return
+	}
+	if err := os.Rename(tmp, shadow); err != nil {
+		os.Remove(tmp)
+		dropShadow(path)
+		return
+	}
+	if err := setSidecarShadow(path, true); err != nil {
+		dropShadow(path)
+	}
+}
+
+// RefreshShadow is refreshShadow for internal/session, whose clean Close
+// re-stamps the checkout after its daemon session moved the head by
+// segments, so the next at-rest Checkpoint can diff against that head.
+func RefreshShadow(path string) { refreshShadow(path) }
+
+// dropShadow records Shadow=false in path's sidecar (when it has one) and
+// removes the shadow file, in that order, so no moment exists where the
+// sidecar vouches for a shadow that is gone. Best-effort.
+func dropShadow(path string) {
+	_ = setSidecarShadow(path, false)
+	os.Remove(shadowPath(path))
+	os.Remove(shadowPath(path) + ".tmp")
+}
+
+// setSidecarShadow rewrites path's sidecar with Shadow=on and every other
+// field as recorded. It never re-stamps the fingerprint: the checkout's
+// bytes did not change, so the recorded fingerprint (or its absence) stays
+// exactly as true as it was. A sidecar that is missing or unreadable is
+// left alone when on is false (nothing vouches for a shadow) and is an
+// error when on is true.
+func setSidecarShadow(path string, on bool) error {
+	rec, ok := readSidecar(path)
+	if !ok {
+		if on {
+			return errors.New("ops: no readable sidecar to record a shadow in")
+		}
+		return nil
+	}
+	if rec.Shadow == on {
+		return nil
+	}
+	rec.Shadow = on
+	data, err := json.Marshal(rec)
+	if err != nil {
+		return err
+	}
+	return os.WriteFile(path+".sum", data, 0o644)
 }

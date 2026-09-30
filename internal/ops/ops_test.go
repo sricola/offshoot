@@ -697,9 +697,8 @@ func TestForkAtCheckpointAfterRollback(t *testing.T) {
 }
 
 // TestForkFastPathMatchesSlowPath is Task 6's core equivalence test: forking
-// the same source (a freshly checkpointed branch, whose chain is always
-// exactly one snapshot — ops.Checkpoint always writes a full snapshot, never
-// a segment) via the fast object-copy path and via the slow
+// the same source (a branch freshly checkpointed with a forced snapshot,
+// whose chain is exactly that one snapshot) via the fast object-copy path and via the slow
 // materialize-and-re-encode path (forced via forkSlowPathForTest) must
 // produce equivalent children two ways:
 //   - Row-level: both children's `.dump` output is byte-identical.
@@ -723,7 +722,7 @@ func TestForkFastPathMatchesSlowPath(t *testing.T) {
 		"CREATE TABLE t (v); INSERT INTO t VALUES (1),(2),(3);").CombinedOutput(); err != nil {
 		t.Fatalf("seed: %v: %s", err, out)
 	}
-	if _, err := w.Checkpoint("app", "main", "v1", nil); err != nil {
+	if _, err := w.CheckpointWith("app", "main", "v1", nil, CheckpointOptions{Snapshot: true}); err != nil {
 		t.Fatal(err)
 	}
 	srcRef, _, err := w.Store.GetRef("app", "main")
@@ -840,7 +839,8 @@ func TestForkFastPathFiresOnS3WithinSizeLimit(t *testing.T) {
 		"CREATE TABLE t (v); INSERT INTO t VALUES (1),(2);").CombinedOutput(); err != nil {
 		t.Fatalf("seed: %v: %s", err, out)
 	}
-	if _, err := w.Checkpoint("app", "main", "v1", nil); err != nil {
+	// Forced snapshot: the fast path needs a single-snapshot chain.
+	if _, err := w.CheckpointWith("app", "main", "v1", nil, CheckpointOptions{Snapshot: true}); err != nil {
 		t.Fatal(err)
 	}
 
@@ -1392,9 +1392,19 @@ func TestConcurrentCheckpointsOnlyOneWins(t *testing.T) {
 		if cp.TXID > r.HeadTXID {
 			t.Fatalf("checkpoint %s@txid %d beyond head %d", name, cp.TXID, r.HeadTXID)
 		}
-		if _, _, err := w.Store.B.Get(store.SnapshotKey(r.Lineage, r.Epoch, cp.TXID)); err != nil {
-			t.Fatalf("recorded checkpoint %s has no snapshot object: %v", name, err)
-		}
+		assertCheckpointObject(t, w, r, name, cp.TXID)
+	}
+}
+
+// assertCheckpointObject fails unless the object a checkpoint at txid
+// wrote on r's lineage exists: a snapshot, or a segment covering just txid.
+func assertCheckpointObject(t *testing.T, w *Workspace, r store.Ref, name string, txid uint64) {
+	t.Helper()
+	if _, _, err := w.Store.B.Get(store.SnapshotKey(r.Lineage, r.Epoch, txid)); err == nil {
+		return
+	}
+	if _, _, err := w.Store.B.Get(store.SegmentKey(r.Lineage, r.Epoch, txid, txid)); err != nil {
+		t.Fatalf("recorded checkpoint %s has no snapshot or segment object: %v", name, err)
 	}
 }
 
@@ -1408,7 +1418,7 @@ func TestConcurrentCheckpointsOnlyOneWins(t *testing.T) {
 // diverge from S3's Put (PutObject, unconditional overwrite) without any
 // test noticing. Same assertions as the Local version: at least one
 // checkpoint wins, the ref stays internally consistent, and every recorded
-// checkpoint's snapshot object is actually present.
+// checkpoint's object (snapshot or segment) is actually present.
 func TestConcurrentCheckpointsOnlyOneWinsOnS3(t *testing.T) {
 	testutil.RequireSQLite3(t)
 	w := newWSOnFakeS3(t)
@@ -1452,9 +1462,7 @@ func TestConcurrentCheckpointsOnlyOneWinsOnS3(t *testing.T) {
 		if cp.TXID > r.HeadTXID {
 			t.Fatalf("checkpoint %s@txid %d beyond head %d", name, cp.TXID, r.HeadTXID)
 		}
-		if _, _, err := w.Store.B.Get(store.SnapshotKey(r.Lineage, r.Epoch, cp.TXID)); err != nil {
-			t.Fatalf("recorded checkpoint %s has no snapshot object: %v", name, err)
-		}
+		assertCheckpointObject(t, w, r, name, cp.TXID)
 	}
 }
 

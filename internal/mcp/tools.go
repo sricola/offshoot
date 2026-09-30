@@ -457,7 +457,9 @@ func (t *OffshootTools) Tools() []Tool {
 				"succeeds, or before starting a riskier change on the same branch. " +
 				"If a daemon session is open on this branch, this is a live flush " +
 				"(cheap, only the diff since the last checkpoint, no pause in writes); " +
-				"otherwise it's a full-snapshot checkpoint of the checkout file. " +
+				"otherwise it's an at-rest checkpoint of the checkout file: a segment " +
+				"of the pages changed since the last checkpoint when it can, else a " +
+				"full snapshot (the result's `kind` says which). " +
 				"`branch` defaults to \"main\" if omitted. Optional `meta` " +
 				"(string->string, at most 32 keys) tags the result with your run id, " +
 				"git SHA, or agent name for later lookup.",
@@ -741,8 +743,9 @@ func (t *OffshootTools) checkout(args json.RawMessage) (ToolResult, error) {
 				"until a new session replaces it", info.Holder, info.Error)
 		} else {
 			msg += "\na daemon is running for this store, but no session is open on this " +
-				"branch, so this checkout is at rest: offshoot_checkpoint here will write a " +
-				"full snapshot, not a live flush, until something opens a session on it"
+				"branch, so this checkout is at rest: offshoot_checkpoint here will write an " +
+				"at-rest checkpoint (a segment or a full snapshot), not a live flush, until " +
+				"something opens a session on it"
 		}
 	}
 	return StructuredResult(map[string]any{
@@ -788,13 +791,14 @@ func (t *OffshootTools) checkpoint(args json.RawMessage) (ToolResult, error) {
 		}, "checkpointed %s@%s as %q at txid %d — captured live from the open daemon session, no pause in writes",
 			a.Database, branch, a.Name, resp.TXID), nil
 	}
-	txid, err := t.ws.Checkpoint(a.Database, branch, a.Name, a.Meta)
+	res, err := t.ws.CheckpointWith(a.Database, branch, a.Name, a.Meta, ops.CheckpointOptions{})
 	if err != nil {
 		return ErrorResult("%v", err), nil
 	}
 	return StructuredResult(map[string]any{
-		"database": a.Database, "branch": branch, "name": a.Name, "txid": txid, "live": false,
-	}, "checkpointed %s@%s as %q at txid %d", a.Database, branch, a.Name, txid), nil
+		"database": a.Database, "branch": branch, "name": a.Name, "txid": res.TXID, "live": false,
+		"kind": res.Kind,
+	}, "checkpointed %s@%s as %q at txid %d (%s, %d bytes)", a.Database, branch, a.Name, res.TXID, res.Kind, res.Bytes), nil
 }
 
 type forkArgs struct {

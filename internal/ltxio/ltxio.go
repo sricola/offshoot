@@ -17,6 +17,13 @@ import (
 
 const dbHeaderSize = 100
 
+// ReadDBHeader is readDBHeader for callers outside this package that must
+// agree with it on a database's page size and size in pages (ops' at-rest
+// segment diff, which walks exactly the pages a snapshot would encode).
+func ReadDBHeader(r io.Reader) (pageSize, nPages uint32, err error) {
+	return readDBHeader(r)
+}
+
 // readDBHeader reads a quiesced SQLite database's page size and page count
 // (database size in pages) from its 100-byte header. r must be positioned at
 // the start of the file. Shared by EncodeSnapshot and ChecksumDatabase, which

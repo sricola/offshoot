@@ -938,8 +938,8 @@ func TestChainBaseConcatenatesChildSegments(t *testing.T) {
 	}
 }
 
-// A shared child that has grown its OWN snapshot (a divergence floor —
-// ops.Checkpoint always writes one) must anchor resolution at that snapshot
+// A shared child that has grown its OWN snapshot (a divergence floor, or
+// an ops.Checkpoint snapshot) must anchor resolution at that snapshot
 // for any target it covers: the whole chain lives in the child lineage and
 // the base is never consulted. Below the child snapshot, the seam path still
 // applies unchanged.
