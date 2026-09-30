@@ -9,6 +9,8 @@ import (
 	"time"
 
 	"github.com/superfly/ltx"
+
+	"github.com/sricola/offshoot/internal/ops/reflink"
 )
 
 // Page is one database page destined for a segment.
@@ -305,7 +307,7 @@ func UpdateChecksum(running uint64, pgno uint32, oldData, newData []byte) uint64
 // resulting MaxTXID and the resulting content's checksum (the same value
 // ltxio.ChecksumDatabase would compute over dbPath afterward) — the second
 // is a byproduct of verification this function already does at every step
-// (runningChecksum, below), so a caller that also needs to fingerprint the
+// (applySegments's running checksum), so a caller that also needs to fingerprint the
 // materialized content (e.g. ops' checkout-sidecar stamping) doesn't have
 // to pay a second full-file pass to get it.
 func MaterializeChain(snapshot io.Reader, segments []io.Reader, dbPath string) (txid uint64, checksum uint64, err error) {
@@ -328,11 +330,30 @@ func MaterializeChain(snapshot io.Reader, segments []io.Reader, dbPath string) (
 		return 0, 0, err
 	}
 
-	pageSize := hdr.PageSize
-	prevMaxTXID := uint64(hdr.MaxTXID)
-	prevCommit := hdr.Commit
-	runningChecksum := trailer.PostApplyChecksum
+	txid, checksum, err = applySegments(tmp, hdr.PageSize, uint64(hdr.MaxTXID), hdr.Commit, trailer.PostApplyChecksum, segments)
+	if err != nil {
+		return 0, 0, err
+	}
 
+	if err := finalizeDestination(tmp, tmpPath, dbPath); err != nil {
+		return 0, 0, err
+	}
+	ok = true
+	return txid, checksum, nil
+}
+
+// applySegments is the segment-apply loop MaterializeChain and ApplySegments
+// share: it applies segments in order onto f, whose current content is the
+// database state (pageSize, prevCommit pages, rolling checksum
+// runningChecksum) as of txid prevMaxTXID, verifying TXID contiguity, each
+// segment's pre-apply checksum against the running state, and each
+// segment's post-apply checksum after its pages land. prevMaxTXID == 0
+// means "unknown" (ApplySegments starts from a plain file, which does not
+// record its txid): the first segment's MinTXID is then taken as given, and
+// the pre-apply checksum check — tied to actual page content, not a
+// declared number — is what anchors it. Returns the final MaxTXID and
+// checksum; f is left open and unsynced for the caller to finalize.
+func applySegments(f *os.File, pageSize uint32, prevMaxTXID uint64, prevCommit uint32, runningChecksum ltx.Checksum, segments []io.Reader) (txid uint64, checksum uint64, err error) {
 	for i, segR := range segments {
 		dec := ltx.NewDecoder(segR)
 		if err := dec.DecodeHeader(); err != nil {
@@ -344,6 +365,9 @@ func MaterializeChain(snapshot io.Reader, segments []io.Reader, dbPath string) (
 		}
 		if shdr.PageSize != pageSize {
 			return 0, 0, fmt.Errorf("ltxio: segment %d page size %d does not match chain page size %d", i, shdr.PageSize, pageSize)
+		}
+		if i == 0 && prevMaxTXID == 0 {
+			prevMaxTXID = uint64(shdr.MinTXID) - 1
 		}
 		if uint64(shdr.MinTXID) != prevMaxTXID+1 {
 			return 0, 0, fmt.Errorf("ltxio: segment %d has a TXID gap: chain is at %d, segment starts at %d", i, prevMaxTXID, shdr.MinTXID)
@@ -373,13 +397,13 @@ func MaterializeChain(snapshot io.Reader, segments []io.Reader, dbPath string) (
 			// out below.
 			var oldData []byte
 			if pgno <= prevCommit && pgno != lockPgno {
-				if _, err := tmp.ReadAt(oldBuf, int64(pgno-1)*int64(pageSize)); err != nil {
+				if _, err := f.ReadAt(oldBuf, int64(pgno-1)*int64(pageSize)); err != nil {
 					return 0, 0, fmt.Errorf("ltxio: read old page %d: %w", pgno, err)
 				}
 				oldData = oldBuf
 			}
 
-			if _, err := tmp.WriteAt(buf, int64(pgno-1)*int64(pageSize)); err != nil {
+			if _, err := f.WriteAt(buf, int64(pgno-1)*int64(pageSize)); err != nil {
 				return 0, 0, fmt.Errorf("ltxio: write page %d: %w", pgno, err)
 			}
 
@@ -409,14 +433,14 @@ func MaterializeChain(snapshot io.Reader, segments []io.Reader, dbPath string) (
 				if pgno == lockPgno || touched[pgno] {
 					continue
 				}
-				if _, err := tmp.ReadAt(oldBuf, int64(pgno-1)*int64(pageSize)); err != nil {
+				if _, err := f.ReadAt(oldBuf, int64(pgno-1)*int64(pageSize)); err != nil {
 					return 0, 0, fmt.Errorf("ltxio: read dropped page %d: %w", pgno, err)
 				}
 				running = UpdateChecksum(running, pgno, oldBuf, nil)
 			}
 		}
 
-		if err := tmp.Truncate(int64(shdr.Commit) * int64(pageSize)); err != nil {
+		if err := f.Truncate(int64(shdr.Commit) * int64(pageSize)); err != nil {
 			return 0, 0, fmt.Errorf("ltxio: truncate to commit size: %w", err)
 		}
 
@@ -430,7 +454,7 @@ func MaterializeChain(snapshot io.Reader, segments []io.Reader, dbPath string) (
 				if pgno == lockPgno || touched[pgno] {
 					continue
 				}
-				if _, err := tmp.ReadAt(oldBuf, int64(pgno-1)*int64(pageSize)); err != nil {
+				if _, err := f.ReadAt(oldBuf, int64(pgno-1)*int64(pageSize)); err != nil {
 					return 0, 0, fmt.Errorf("ltxio: read new page %d: %w", pgno, err)
 				}
 				running = UpdateChecksum(running, pgno, nil, oldBuf)
@@ -447,9 +471,74 @@ func MaterializeChain(snapshot io.Reader, segments []io.Reader, dbPath string) (
 		prevCommit = shdr.Commit
 	}
 
-	if err := finalizeDestination(tmp, tmpPath, dbPath); err != nil {
+	return prevMaxTXID, uint64(runningChecksum), nil
+}
+
+// ApplySegments writes into dstPath the database formed by applying
+// segments, in order, on top of the database at startPath, whose LTX
+// rolling checksum is startChecksum (as recorded when it was
+// materialized). It is MaterializeChain's segment half, starting from an
+// existing file instead of a snapshot: the first segment's
+// PreApplyChecksum must equal startChecksum, and every check
+// MaterializeChain makes per segment is made here too.
+//
+// startPath is never modified. Its content is copied into a temp file in
+// dstPath's directory — a copy-on-write clone where the filesystem supports
+// one (reflink.CopyFile), so only the pages the segments touch are ever
+// written — and the result is renamed over dstPath only after every segment
+// verified, the same finalizeDestination discipline MaterializeChain uses:
+// a failure anywhere leaves dstPath untouched and no temp file behind.
+// Returns the last segment's MaxTXID and the resulting content's checksum
+// (what ChecksumDatabase would compute over dstPath).
+func ApplySegments(startPath string, startChecksum uint64, segments []io.Reader, dstPath string) (txid, checksum uint64, err error) {
+	if len(segments) == 0 {
+		return 0, 0, fmt.Errorf("ltxio: ApplySegments needs at least one segment")
+	}
+	src, err := os.Open(startPath)
+	if err != nil {
 		return 0, 0, err
 	}
-	ok = true
-	return prevMaxTXID, uint64(runningChecksum), nil
+	pageSize, nPages, err := readDBHeader(src)
+	src.Close()
+	if err != nil {
+		return 0, 0, err
+	}
+
+	tmp, err := os.CreateTemp(filepath.Dir(dstPath), filepath.Base(dstPath)+".tmp-*")
+	if err != nil {
+		return 0, 0, fmt.Errorf("ltxio: create temp file: %w", err)
+	}
+	tmpPath := tmp.Name()
+	tmp.Close()
+	if err := os.Remove(tmpPath); err != nil {
+		return 0, 0, err
+	}
+	var f *os.File
+	defer func() {
+		if err != nil {
+			if f != nil {
+				f.Close()
+			}
+			os.Remove(tmpPath)
+		}
+	}()
+	if _, err = reflink.CopyFile(tmpPath, startPath); err != nil {
+		return 0, 0, fmt.Errorf("ltxio: copy start file: %w", err)
+	}
+	// A clone carries src's mode (a read-only cache entry is 0444); the
+	// working copy must be writable, and match MaterializeChain's temp mode.
+	if err = os.Chmod(tmpPath, 0o600); err != nil {
+		return 0, 0, err
+	}
+	if f, err = os.OpenFile(tmpPath, os.O_RDWR, 0); err != nil {
+		return 0, 0, err
+	}
+	txid, checksum, err = applySegments(f, pageSize, 0, nPages, ltx.Checksum(startChecksum), segments)
+	if err != nil {
+		return 0, 0, err
+	}
+	if err = finalizeDestination(f, tmpPath, dstPath); err != nil {
+		return 0, 0, err
+	}
+	return txid, checksum, nil
 }

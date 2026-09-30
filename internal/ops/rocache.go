@@ -168,6 +168,14 @@ func (w *Workspace) roCacheEntries() ([]roCacheEntry, error) {
 		}
 		for _, f := range files {
 			name := f.Name()
+			if name == byChainDir && f.IsDir() {
+				chained, err := byChainEntries(db, filepath.Join(dir, name))
+				if err != nil {
+					return nil, err
+				}
+				out = append(out, chained...)
+				continue
+			}
 			if !strings.HasSuffix(name, ".db") {
 				continue // skip .last-used markers and anything else
 			}
@@ -175,22 +183,63 @@ func (w *Workspace) roCacheEntries() ([]roCacheEntry, error) {
 			if !ok {
 				continue // not a filename this package ever wrote; ignore
 			}
-			info, err := f.Info()
+			e, ok, err := statCacheEntry(f, db, branch, checkpoint, filepath.Join(dir, name))
 			if err != nil {
-				if os.IsNotExist(err) {
-					continue // removed concurrently since ReadDir
-				}
 				return nil, err
 			}
-			path := filepath.Join(dir, name)
-			out = append(out, roCacheEntry{
-				DB: db, Branch: branch, Checkpoint: checkpoint,
-				Path: path, Bytes: info.Size(),
-				LastUsed: lruClock(path, info),
-			})
+			if ok {
+				out = append(out, e)
+			}
 		}
 	}
 	return out, nil
+}
+
+// byChainEntries enumerates one database's by-chain area (see
+// byChainPath): every <chainID>.db is an entry with Branch = byChainDir
+// and Checkpoint = its chainID, so ROCacheUsage counts it and EvictROCache
+// ranks and evicts it exactly like a CheckoutAt file. A directory removed
+// concurrently is simply empty.
+func byChainEntries(db, dir string) ([]roCacheEntry, error) {
+	files, err := os.ReadDir(dir)
+	if err != nil {
+		if os.IsNotExist(err) {
+			return nil, nil
+		}
+		return nil, err
+	}
+	var out []roCacheEntry
+	for _, f := range files {
+		name := f.Name()
+		if !strings.HasSuffix(name, ".db") {
+			continue // .sum sidecars, .last-used markers, in-flight temps
+		}
+		e, ok, err := statCacheEntry(f, db, byChainDir, strings.TrimSuffix(name, ".db"), filepath.Join(dir, name))
+		if err != nil {
+			return nil, err
+		}
+		if ok {
+			out = append(out, e)
+		}
+	}
+	return out, nil
+}
+
+// statCacheEntry builds f's roCacheEntry; ok=false (no error) when f was
+// removed concurrently since its directory was read.
+func statCacheEntry(f os.DirEntry, db, branch, checkpoint, path string) (roCacheEntry, bool, error) {
+	info, err := f.Info()
+	if err != nil {
+		if os.IsNotExist(err) {
+			return roCacheEntry{}, false, nil
+		}
+		return roCacheEntry{}, false, err
+	}
+	return roCacheEntry{
+		DB: db, Branch: branch, Checkpoint: checkpoint,
+		Path: path, Bytes: info.Size(),
+		LastUsed: lruClock(path, info),
+	}, true, nil
 }
 
 // ROCacheUsage reports checkouts-ro's total current usage — bytes summed
@@ -237,7 +286,8 @@ func (w *Workspace) ROCacheUsage() (bytes int64, count int, err error) {
 // among genuine ties has no other meaningful tiebreak.
 //
 // Each eviction removes BOTH the .db cache file and its `.last-used`
-// marker (if any — a never-hit entry has none, and os.Remove's
+// marker, plus a by-chain entry's `.sum` sidecar (if any — a never-hit
+// entry has no marker, a CheckoutAt file has no sidecar, and os.Remove's
 // IsNotExist is treated as success either way, not an error). If a
 // os.Remove fails for a reason OTHER than "already gone," eviction stops
 // immediately and returns everything evicted so far alongside that error —
@@ -324,8 +374,12 @@ func (w *Workspace) EvictROCache(budget int64) (evicted []ROCacheEviction, usage
 		if rmErr := os.Remove(e.Path); rmErr != nil && !os.IsNotExist(rmErr) {
 			return evicted, usageAfter, rmErr
 		}
-		if rmErr := os.Remove(e.Path + lastUsedSuffix); rmErr != nil && !os.IsNotExist(rmErr) {
-			return evicted, usageAfter, rmErr
+		// The marker, and a by-chain entry's .sum sidecar (absent for a
+		// CheckoutAt file, which has none).
+		for _, companion := range []string{lastUsedSuffix, ".sum"} {
+			if rmErr := os.Remove(e.Path + companion); rmErr != nil && !os.IsNotExist(rmErr) {
+				return evicted, usageAfter, rmErr
+			}
 		}
 		usageAfter -= e.Bytes
 		evicted = append(evicted, ROCacheEviction{DB: e.DB, Branch: e.Branch, Checkpoint: e.Checkpoint, Bytes: e.Bytes})

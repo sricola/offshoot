@@ -23,14 +23,30 @@ import (
 // Returns the materialized content's checksum (see ltxio.MaterializeChain)
 // as a byproduct of the verification MaterializeChain already does — a
 // caller that also needs to fingerprint what it just wrote (e.g. a checkout
-// .sum sidecar stamp) gets it for free, no second full-file scan.
-func (w *Workspace) materializeChainAt(ref store.Ref, cp store.Checkpoint, dst string) (uint64, error) {
+// .sum sidecar stamp) gets it for free, no second full-file scan. Also
+// returns the resolved chain's chainID (see chainid.go), for the sidecar.
+func (w *Workspace) materializeChainAt(ref store.Ref, cp store.Checkpoint, dst string) (uint64, string, error) {
+	members, err := w.resolveChain(ref, cp, dst)
+	if err != nil {
+		return 0, "", err
+	}
+	checksum, err := w.materializeMembersAt(ref.Lineage, members, dst)
+	if err != nil {
+		return 0, "", err
+	}
+	return checksum, chainID(members), nil
+}
+
+// resolveChain is store.Chain for ref's lineage at cp, with the error
+// wrapped the way every materialization path reports it; dst is only for
+// the message.
+func (w *Workspace) resolveChain(ref store.Ref, cp store.Checkpoint, dst string) ([]store.ChainMember, error) {
 	members, err := w.Store.Chain(ref.Lineage, cp.TXID)
 	if err != nil {
-		return 0, fmt.Errorf("ops: resolving chain for lineage %s to txid %d (target %s): %w",
+		return nil, fmt.Errorf("ops: resolving chain for lineage %s to txid %d (target %s): %w",
 			ref.Lineage, cp.TXID, dst, err)
 	}
-	return w.materializeMembersAt(ref.Lineage, members, dst)
+	return members, nil
 }
 
 // materializeMembersAt applies an already-resolved chain (see store.Chain)
@@ -185,4 +201,38 @@ func (l *lazyReader) close() error {
 		return nil
 	}
 	return l.r.Close()
+}
+
+// memberReaders returns one lazyReader per segment member, for
+// ltxio.ApplySegments' strictly sequential consumption — at most one
+// member's stream open at a time, as materializeMembersAtStreaming — and a
+// func closing any still open. A backend without store.ReaderGetter is read
+// through a one-Get-per-member adapter, still fetched lazily in order.
+func (w *Workspace) memberReaders(members []store.ChainMember) ([]io.Reader, func()) {
+	rg, ok := w.Store.B.(store.ReaderGetter)
+	if !ok {
+		rg = getReaderAdapter{w.Store.B}
+	}
+	lazy := make([]*lazyReader, len(members))
+	readers := make([]io.Reader, len(members))
+	for i, m := range members {
+		lazy[i] = newLazyReader(rg, m.Key, "segment")
+		readers[i] = lazy[i]
+	}
+	return readers, func() {
+		for _, r := range lazy {
+			_ = r.close()
+		}
+	}
+}
+
+// getReaderAdapter serves store.ReaderGetter from a plain Backend's Get.
+type getReaderAdapter struct{ b store.Backend }
+
+func (g getReaderAdapter) GetReader(key string) (io.ReadCloser, string, error) {
+	data, etag, err := g.b.Get(key)
+	if err != nil {
+		return nil, "", err
+	}
+	return io.NopCloser(bytes.NewReader(data)), etag, nil
 }

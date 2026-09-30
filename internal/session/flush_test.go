@@ -20,6 +20,7 @@ import (
 	"github.com/sricola/offshoot/internal/capture"
 	"github.com/sricola/offshoot/internal/ltxio"
 	"github.com/sricola/offshoot/internal/ops"
+	"github.com/sricola/offshoot/internal/ops/reflink"
 	"github.com/sricola/offshoot/internal/store"
 	"github.com/sricola/offshoot/internal/testutil"
 )
@@ -1368,6 +1369,112 @@ func TestReadOnlySessionWithCleanCheckoutMakesNoStoreWrites(t *testing.T) {
 	}
 	if s.autoFlushPending() {
 		t.Fatal("expected the suppressed startup rebase to leave nothing pending")
+	}
+}
+
+// TestOpenOnClonedCheckoutSkipsSettlingFlush: a checkout produced by
+// cloning a by-chain cache entry (a fresh shared fork whose chain a sibling
+// already materialized) is stamped with the fork's own identity and the
+// entry's recorded hash and checksum, so Open finds it clean and suppresses
+// the settling flush exactly as for a materialized one: no snapshot object
+// is written, and the first real flush is a segment.
+func TestOpenOnClonedCheckoutSkipsSettlingFlush(t *testing.T) {
+	testutil.RequireSQLite3(t)
+	w := newWS(t)
+	probe := filepath.Join(w.Root, "clone-probe")
+	if err := os.WriteFile(probe, []byte("probe"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	err := reflink.Clone(probe+".clone", probe)
+	os.Remove(probe)
+	os.Remove(probe + ".clone")
+	if errors.Is(err, reflink.ErrUnsupported) {
+		t.Skip("workspace filesystem does not support reflink/clonefile")
+	} else if err != nil {
+		t.Fatal(err)
+	}
+
+	if err := w.Create("app"); err != nil {
+		t.Fatal(err)
+	}
+	mainPath, err := w.Checkout("app", "main")
+	if err != nil {
+		t.Fatal(err)
+	}
+	mustExec(t, mainPath, "CREATE TABLE t (v); INSERT INTO t VALUES (1);")
+	if _, err := w.Checkpoint("app", "main", "seed", nil); err != nil {
+		t.Fatal(err)
+	}
+	for _, br := range []string{"sibling", "cloned"} {
+		if _, err := w.Fork("app", "main", br, "seed", 0, nil); err != nil {
+			t.Fatal(err)
+		}
+	}
+	if _, err := w.Checkout("app", "sibling"); err != nil { // materializes, populates the by-chain entry
+		t.Fatal(err)
+	}
+	markers := func() []string {
+		m, _ := filepath.Glob(filepath.Join(w.Root, "checkouts-ro", "app", "*", "*.db.last-used"))
+		return m
+	}
+	if got := markers(); len(got) != 0 {
+		t.Fatalf("by-chain entries already hit before the clone: %v", got)
+	}
+	path, err := w.Checkout("app", "cloned")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got := markers(); len(got) != 1 {
+		t.Fatalf("checkout of the second fork did not clone a by-chain entry (hit markers %v)", got)
+	}
+	want, err := os.ReadFile(w.CheckoutPath("app", "sibling"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got, err := os.ReadFile(path); err != nil || !bytes.Equal(got, want) {
+		t.Fatalf("cloned checkout differs from its sibling's materialized one (err %v)", err)
+	}
+
+	s, err := Open(context.Background(), Options{WS: w, DB: "app", Branch: "cloned"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer s.Close()
+	if !s.cleanAtOpen || !s.headPostApplyValid {
+		t.Fatalf("cloned checkout not clean at open (cleanAtOpen %v, headPostApplyValid %v)", s.cleanAtOpen, s.headPostApplyValid)
+	}
+	waitFor(t, 5*time.Second, "the (suppressed) startup rebase to settle with nothing pending", func() bool {
+		return !s.autoFlushPending()
+	})
+
+	mustExec(t, s.CheckoutPath(), "INSERT INTO t VALUES (2);")
+	txid, err := s.Flush("", nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	ref, _, err := w.Store.GetRef("app", "cloned")
+	if err != nil {
+		t.Fatal(err)
+	}
+	keys, err := w.Store.B.List(store.LineagePrefix(ref.Lineage))
+	if err != nil {
+		t.Fatal(err)
+	}
+	foundSegment := false
+	for _, k := range keys {
+		m, ok := store.ParseMemberKey(k)
+		if !ok {
+			continue
+		}
+		if m.Snapshot {
+			t.Fatalf("a snapshot object %s was written after a cloned, clean open", k)
+		}
+		if m.MaxTXID == txid {
+			foundSegment = true
+		}
+	}
+	if !foundSegment {
+		t.Fatalf("first real flush (txid %d) is not a segment on the fork's lineage: %v", txid, keys)
 	}
 }
 

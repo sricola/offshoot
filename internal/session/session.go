@@ -1013,7 +1013,7 @@ func (s *Session) commitSidecarRefresh() {
 	// just confirmed above, and exactly what a future Open's settling-flush
 	// suppression needs to read back out of this stamp — see
 	// ops.CheckoutResult.PostApplyChecksum's doc comment.
-	if err := ops.StampSum(s.checkoutPath, st.MainHash, ref.Lineage, ref.HeadEpoch, ref.HeadTXID, flushChecksum); err != nil {
+	if err := ops.StampSum(s.checkoutPath, st.MainHash, ref.Lineage, ref.HeadEpoch, ref.HeadTXID, flushChecksum, ""); err != nil {
 		s.logTransition("sidecar-refresh-skipped", "reason", err.Error())
 	}
 }

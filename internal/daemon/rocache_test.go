@@ -3,6 +3,7 @@ package daemon
 import (
 	"os"
 	"os/exec"
+	"path/filepath"
 	"testing"
 	"time"
 )
@@ -21,6 +22,26 @@ func mkCheckpointAt(t *testing.T, w interface {
 	}
 	if _, err := w.Checkpoint("app", "main", name, nil); err != nil {
 		t.Fatal(err)
+	}
+}
+
+// dropByChainEntries removes every subdirectory of checkouts-ro/<db> — the
+// by-chain clone cache a writable Checkout or CheckoutAt miss populates
+// (see ops' byChainPath) — leaving only CheckoutAt's own <branch>@<cp>.db
+// files, whose exact counts and LRU order these tests pin. Safe by the
+// cache's own contract: checkouts-ro may be rm -rf'd at any time.
+func dropByChainEntries(t *testing.T, root string) {
+	t.Helper()
+	dirs, err := filepath.Glob(filepath.Join(root, "checkouts-ro", "*", "*"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	for _, d := range dirs {
+		if fi, err := os.Stat(d); err == nil && fi.IsDir() {
+			if err := os.RemoveAll(d); err != nil {
+				t.Fatal(err)
+			}
+		}
 	}
 }
 
@@ -67,6 +88,7 @@ func TestJanitorTickEvictsLRUUnderBudgetAndFiresEvictedEvent(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
+	dropByChainEntries(t, w.Root)
 
 	// Backdate all three .db mtimes into an unambiguous creation order:
 	// v1 oldest, v2 middle, v3 newest.
@@ -165,6 +187,7 @@ func TestJanitorTickBudgetZeroNeverEvicts(t *testing.T) {
 		}
 		_ = i
 	}
+	dropByChainEntries(t, w.Root)
 
 	total, count, err := w.ROCacheUsage()
 	if err != nil {

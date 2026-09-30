@@ -69,8 +69,9 @@ type CheckoutResult struct {
 // path entirely — see sumRecord's doc comment for the on-disk shape.
 // postApplyChecksum is optional (0 = absent, matching sumRecord's own
 // zero-means-absent convention — see its doc comment); Session.
-// commitSidecarRefresh, this function's one caller, always has one (its
-// last successful flush's checksumAtEncode, tracked as s.flushChecksum).
+// commitSidecarRefresh always has one (its last successful flush's
+// checksumAtEncode, tracked as s.flushChecksum). Inside this package,
+// writeSum and the by-chain cache (chainid.go) stamp through it too.
 //
 // Exported for Session.Close's clean-close sidecar refresh (M2 follow-up):
 // Session.commitSidecarRefresh has the capture engine's own post-shutdown
@@ -86,9 +87,14 @@ type CheckoutResult struct {
 // re-deriving one, is what keeps this call site off that hazard (and, as a
 // second-order benefit, off the risk of folding in content the engine's own
 // shutdown verification specifically refused to vouch for).
-func StampSum(path, hash, lineage string, epoch, txid, postApplyChecksum uint64) error {
+//
+// chainID is the chainID (see chainid.go) of the store chain the file's
+// content is known to equal, or "" when the caller has none in hand (e.g. a
+// session's close, whose content came from local writes, not a chain).
+func StampSum(path, hash, lineage string, epoch, txid, postApplyChecksum uint64, chainID string) error {
 	data, err := json.Marshal(sumRecord{
 		Hash: hash, Lineage: lineage, Epoch: epoch, TXID: txid, PostApplyChecksum: postApplyChecksum,
+		ChainID: chainID,
 	})
 	if err != nil {
 		return err
@@ -123,12 +129,20 @@ func StampSum(path, hash, lineage string, epoch, txid, postApplyChecksum uint64)
 // object from the store on every single Open — see CheckoutResult's doc
 // comment for exactly why trusting it is safe under the SAME identity guard
 // this whole sidecar mechanism already enforces, not a new one.
+//
+// ChainID is the chainID (see chainid.go) of the resolved store chain the
+// content was materialized from, omitted when unknown. It is additive: a
+// sidecar without it decodes with ChainID "" and simply offers no by-chain
+// fast path. It never replaces the (Lineage, Epoch, TXID) identity above,
+// which stays the destination branch's own even when the bytes were cloned
+// from another branch's identical chain.
 type sumRecord struct {
 	Hash              string `json:"hash"`
 	Lineage           string `json:"lineage"`
 	Epoch             uint64 `json:"epoch"`
 	TXID              uint64 `json:"txid"`
 	PostApplyChecksum uint64 `json:"post_apply_checksum,omitempty"`
+	ChainID           string `json:"chain_id,omitempty"`
 }
 
 // writeSum computes the hex SHA-256 of the file at path and writes it, along
@@ -140,19 +154,14 @@ type sumRecord struct {
 // committed state (fresh materialize, a successful checkpoint encode, or a
 // post-repoint refresh). Callers pass the ref's HeadEpoch (the epoch the
 // checkout's current head was written under), not the ref's own
-// (writer-generation) Epoch — see sumRecord's doc comment.
-func writeSum(path string, lineage string, epoch, txid, postApplyChecksum uint64) error {
+// (writer-generation) Epoch — see sumRecord's doc comment. chainID is as
+// StampSum's.
+func writeSum(path string, lineage string, epoch, txid, postApplyChecksum uint64, chainID string) error {
 	sum, err := fileSum(path)
 	if err != nil {
 		return err
 	}
-	data, err := json.Marshal(sumRecord{
-		Hash: sum, Lineage: lineage, Epoch: epoch, TXID: txid, PostApplyChecksum: postApplyChecksum,
-	})
-	if err != nil {
-		return err
-	}
-	return os.WriteFile(path+".sum", data, 0o644)
+	return StampSum(path, sum, lineage, epoch, txid, postApplyChecksum, chainID)
 }
 
 // checkoutState reports how the checkout at path relates to ref, and — only

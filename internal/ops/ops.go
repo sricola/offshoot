@@ -327,23 +327,46 @@ func (w *Workspace) CheckoutProven(db, branch string) (CheckoutResult, error) {
 	if err := os.MkdirAll(filepath.Dir(path), 0o755); err != nil {
 		return CheckoutResult{}, err
 	}
-	checksum, err := w.materializeAt(ref, headCheckpoint(ref), path)
+	// Stale or missing: resolve the chain first, so an identical (or
+	// prefix-sharing) file already in the by-chain cache is cloned instead
+	// of decoded — see materializeFromChain. Whichever way the bytes
+	// arrive, the sidecar is stamped with THIS branch's identity; only the
+	// content fingerprint (hash, checksum, chain_id) is shared.
+	members, err := w.resolveChain(ref, headCheckpoint(ref), path)
 	if err != nil {
 		return CheckoutResult{}, err
 	}
-	if err := writeSum(path, ref.Lineage, ref.HeadEpoch, ref.HeadTXID, checksum); err != nil {
+	placed, err := w.materializeFromChain(db, ref.Lineage, members, path, 0o600)
+	if err != nil {
 		return CheckoutResult{}, err
+	}
+	if observeCheckoutSource != nil {
+		observeCheckoutSource(placed.kind)
+	}
+	hash := placed.hash
+	if hash == "" {
+		if hash, err = fileSum(path); err != nil {
+			return CheckoutResult{}, err
+		}
+	}
+	if err := StampSum(path, hash, ref.Lineage, ref.HeadEpoch, ref.HeadTXID, placed.checksum, placed.chainID); err != nil {
+		return CheckoutResult{}, err
+	}
+	if placed.kind != "clone" {
+		w.populateByChain(db, placed.chainID, path, hash, placed.checksum)
 	}
 	return CheckoutResult{Path: path, Clean: false, Ref: ref}, nil
 }
 
 // materializeAt writes the state identified by cp into dst, and returns its
-// checksum (see materializeChainAt). It is a thin wrapper over
+// checksum and chainID (see materializeChainAt). It is a thin wrapper over
 // materializeChainAt (see materialize.go), which resolves the full
 // snapshot+segment chain rather than assuming cp's txid is itself a
-// snapshot: every caller here (Checkout, Rollback's refresh, Promote's
-// refresh, copySnapshotIntoLineage's read side) picks that up unchanged.
-func (w *Workspace) materializeAt(ref store.Ref, cp store.Checkpoint, dst string) (uint64, error) {
+// snapshot: every caller here (Export, Rollback's refresh, Promote's
+// refresh, Compact's refresh) picks that up unchanged. CheckoutProven and
+// CheckoutAt resolve the chain themselves and go through
+// materializeFromChain (chainid.go) instead, to consult the by-chain cache.
+func (w *Workspace) materializeAt(ref store.Ref, cp store.Checkpoint, dst string) (postApply uint64, chainID string, err error) {
 	return w.materializeChainAt(ref, cp, dst)
 }
 
@@ -482,7 +505,7 @@ func (w *Workspace) Checkpoint(db, branch, name string, meta map[string]string) 
 	// encode above and this point leaves the OLD sidecar in place — which
 	// still correctly describes the checkout's actual (pre-checkpoint)
 	// identity, rather than claiming a commit that never landed.
-	if err := writeSum(path, ref.Lineage, ref.HeadEpoch, txid, checksum); err != nil {
+	if err := writeSum(path, ref.Lineage, ref.HeadEpoch, txid, checksum, ""); err != nil {
 		return 0, fmt.Errorf("ops: checkpoint %q committed (txid %d), but the checkout fingerprint could not be refreshed: %w", name, txid, err)
 	}
 	if ObserveCheckpoint != nil {
@@ -1117,14 +1140,14 @@ func (w *Workspace) RollbackWith(db, branch, to string, opts RollbackOptions) (R
 		if err := os.MkdirAll(filepath.Dir(path), 0o755); err != nil {
 			return err
 		}
-		checksum, err := w.materializeAt(next, headCheckpoint(next), path)
+		checksum, chain, err := w.materializeAt(next, headCheckpoint(next), path)
 		if err != nil {
 			return err
 		}
 		// The checkout now equals committed state: refresh the fingerprint
 		// (identity too, since this repointed to a new lineage) so a later
 		// Fork sees it as clean rather than stale.
-		return writeSum(path, next.Lineage, next.HeadEpoch, txid, checksum)
+		return writeSum(path, next.Lineage, next.HeadEpoch, txid, checksum, chain)
 	}
 	if err := refresh(); err != nil {
 		return RollbackResult{}, fmt.Errorf("ops: branch repointed to checkpoint %q (txid %d), but the checkout could not be refreshed (run 'offshoot checkout' to re-materialize): %w", to, txid, err)
@@ -1319,14 +1342,14 @@ func (w *Workspace) PromoteWith(db, source, target string, opts PromoteOptions) 
 		if err := quiesce(path); err != nil {
 			return result, fmt.Errorf("ops: promoted, but checkout %s is in use and was NOT refreshed: %w", path, err)
 		}
-		checksum, err := w.materializeAt(next, headCheckpoint(next), path)
+		checksum, chain, err := w.materializeAt(next, headCheckpoint(next), path)
 		if err != nil {
 			return result, fmt.Errorf("ops: promoted, but checkout %s could not be refreshed: %w", path, err)
 		}
 		// The checkout now equals committed state: refresh the fingerprint
 		// (identity too, since this repointed to a new lineage) so a later
 		// Fork sees it as clean rather than stale.
-		if err := writeSum(path, next.Lineage, next.HeadEpoch, txid, checksum); err != nil {
+		if err := writeSum(path, next.Lineage, next.HeadEpoch, txid, checksum, chain); err != nil {
 			return result, fmt.Errorf("ops: promoted, but checkout %s could not be refreshed: %w", path, err)
 		}
 	}
@@ -1460,14 +1483,14 @@ func (w *Workspace) Compact(db, branch string) (uint64, error) {
 		if err := quiesce(path); err != nil {
 			return txid, fmt.Errorf("ops: compacted, but checkout %s is in use and was NOT refreshed: %w", path, err)
 		}
-		checksum, err := w.materializeAt(next, headCheckpoint(next), path)
+		checksum, chain, err := w.materializeAt(next, headCheckpoint(next), path)
 		if err != nil {
 			return txid, fmt.Errorf("ops: compacted, but checkout %s could not be refreshed: %w", path, err)
 		}
 		// The checkout now equals committed state: refresh the fingerprint
 		// (identity too, since this repointed to a new lineage) so a later
 		// Fork sees it as clean rather than stale.
-		if err := writeSum(path, next.Lineage, next.HeadEpoch, txid, checksum); err != nil {
+		if err := writeSum(path, next.Lineage, next.HeadEpoch, txid, checksum, chain); err != nil {
 			return txid, fmt.Errorf("ops: compacted, but checkout %s could not be refreshed: %w", path, err)
 		}
 	}

@@ -35,6 +35,17 @@ func chtime(t *testing.T, path string, when time.Time) {
 	}
 }
 
+// withoutByChainEntries keeps the by-chain area (clone_test.go) empty for
+// the rest of the test, by making every clone report unsupported: these
+// tests pin exact counts and LRU order among CheckoutAt files, and the
+// by-chain entries a writable Checkout or CheckoutAt miss would otherwise
+// populate are extra entries in the same budget.
+func withoutByChainEntries(t *testing.T) {
+	t.Helper()
+	reflinkUnsupportedForTest = true
+	t.Cleanup(func() { reflinkUnsupportedForTest = false })
+}
+
 func TestROCacheUsageEmptyWhenNoCacheDirectory(t *testing.T) {
 	w := newWS(t)
 	if err := w.Create("app"); err != nil {
@@ -50,6 +61,7 @@ func TestROCacheUsageEmptyWhenNoCacheDirectory(t *testing.T) {
 }
 
 func TestROCacheUsageCountsCachedEntries(t *testing.T) {
+	withoutByChainEntries(t)
 	testutil.RequireSQLite3(t)
 	w := newWS(t)
 	if err := w.Create("app"); err != nil {
@@ -167,6 +179,7 @@ func TestEvictROCacheAlreadyUnderBudgetNeverEvicts(t *testing.T) {
 // oldest is gone, the other two survive, and reported usage is at or under
 // budget.
 func TestEvictROCacheEvictsOldestFirstUntilUnderBudget(t *testing.T) {
+	withoutByChainEntries(t)
 	testutil.RequireSQLite3(t)
 	w := newWS(t)
 	if err := w.Create("app"); err != nil {
@@ -309,6 +322,7 @@ func TestEvictROCacheRemovesBothDBAndMarker(t *testing.T) {
 // permissions — because EvictROCache only ever walks/removes paths under
 // the SEPARATE checkouts-ro tree.
 func TestEvictROCacheNeverTouchesWritableCheckout(t *testing.T) {
+	withoutByChainEntries(t)
 	testutil.RequireSQLite3(t)
 	w := newWS(t)
 	if err := w.Create("app"); err != nil {
@@ -472,6 +486,7 @@ func TestEvictROCacheLastUsedTouchBeatsCreationOrder(t *testing.T) {
 // window instead of relying on real goroutine scheduling to hit a
 // microscopic race.
 func TestEvictROCacheSparesEntryTouchedDuringThisPass(t *testing.T) {
+	withoutByChainEntries(t)
 	testutil.RequireSQLite3(t)
 	w := newWS(t)
 	if err := w.Create("app"); err != nil {

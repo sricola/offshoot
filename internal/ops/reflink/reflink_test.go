@@ -3,6 +3,7 @@ package reflink
 import (
 	"bytes"
 	"crypto/rand"
+	"errors"
 	"os"
 	"path/filepath"
 	"strconv"
@@ -173,5 +174,65 @@ func TestCopyFileExistingDstErrors(t *testing.T) {
 	}
 	if string(got) != "already here" {
 		t.Fatal("a rejected copy must not modify the existing destination")
+	}
+}
+
+// TestCloneProducesIdenticalFile: on a clone-capable temp filesystem Clone
+// succeeds and both files read identical; elsewhere it reports
+// ErrUnsupported and leaves no dst.
+//
+// src is read-only (0444, like a by-chain cache entry): a clone that
+// inherits that mode must still be fsynced and succeed.
+func TestCloneProducesIdenticalFile(t *testing.T) {
+	dir := t.TempDir()
+	src, want := writeSrc(t, dir, "src", 1<<20+5)
+	if err := os.Chmod(src, 0o444); err != nil {
+		t.Fatal(err)
+	}
+	dst := filepath.Join(dir, "dst")
+	err := Clone(dst, src)
+	if errors.Is(err, ErrUnsupported) {
+		if _, statErr := os.Stat(dst); !os.IsNotExist(statErr) {
+			t.Fatalf("unsupported clone left dst behind: %v", statErr)
+		}
+		t.Skip("temp filesystem does not support reflink/clonefile")
+	}
+	if err != nil {
+		t.Fatal(err)
+	}
+	got, err := os.ReadFile(dst)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !bytes.Equal(got, want) {
+		t.Fatal("cloned content mismatch")
+	}
+}
+
+// TestCloneForcedUnsupported: the test hook forces ErrUnsupported and no dst
+// is created — Clone never falls back to a byte copy.
+func TestCloneForcedUnsupported(t *testing.T) {
+	orig := forceUnsupportedForTest
+	forceUnsupportedForTest = true
+	defer func() { forceUnsupportedForTest = orig }()
+
+	dir := t.TempDir()
+	src, _ := writeSrc(t, dir, "src", 100)
+	dst := filepath.Join(dir, "dst")
+	if err := Clone(dst, src); !errors.Is(err, ErrUnsupported) {
+		t.Fatalf("Clone = %v, want ErrUnsupported", err)
+	}
+	if _, err := os.Stat(dst); !os.IsNotExist(err) {
+		t.Fatalf("forced-unsupported Clone created dst: %v", err)
+	}
+}
+
+// TestCloneMissingSrcIsNotUnsupported: a missing source is a real error, not
+// a capability verdict a caller would silently degrade on.
+func TestCloneMissingSrcIsNotUnsupported(t *testing.T) {
+	dir := t.TempDir()
+	err := Clone(filepath.Join(dir, "dst"), filepath.Join(dir, "missing"))
+	if err == nil || errors.Is(err, ErrUnsupported) {
+		t.Fatalf("Clone of a missing src = %v, want a non-ErrUnsupported error", err)
 	}
 }
