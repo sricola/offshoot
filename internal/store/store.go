@@ -958,6 +958,24 @@ type ConditionalDeleter interface {
 	DeleteIf(key, ifMatch string) error
 }
 
+// ObjectExists reports whether an object is stored at exactly key, with
+// one request: a List of key itself as the prefix, matched exactly (a
+// longer key sharing the prefix is not a match). Used where a HEAD would
+// do, without adding a method every Backend must implement; List by prefix
+// is already part of the conformance suite for every backend.
+func (s *Store) ObjectExists(key string) (bool, error) {
+	keys, err := s.B.List(key)
+	if err != nil {
+		return false, err
+	}
+	for _, k := range keys {
+		if k == key {
+			return true, nil
+		}
+	}
+	return false, nil
+}
+
 // DeleteRefIf deletes db@branch's ref, conditional on etag when the backend
 // can actually honor that (ConditionalDeleter — today, Local) and
 // unconditional otherwise (S3). Milestone 4 Task 6b's Destroy claim-guard

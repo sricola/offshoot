@@ -417,3 +417,130 @@ func TestShortHeaderStampSumSucceedsAndCheckoutStateHashes(t *testing.T) {
 		})
 	}
 }
+
+// hookFileSum installs fn as observeFileSum for the rest of the test.
+func hookFileSum(t *testing.T, fn func()) {
+	t.Helper()
+	prev := observeFileSum
+	observeFileSum = fn
+	t.Cleanup(func() { observeFileSum = prev })
+}
+
+// TestNoCacheFallbackWriteDuringHashRecordsNoFingerprint pins ruling I2: on
+// a filesystem that cannot clone, CheckoutProven hashes the fresh file
+// itself, and a write landing while it hashes must leave a stamp with the
+// hash and identity but no fingerprint — never the new file's fingerprint
+// paired with a hash of other bytes — so the next check hashes again.
+func TestNoCacheFallbackWriteDuringHashRecordsNoFingerprint(t *testing.T) {
+	testutil.RequireSQLite3(t)
+	reflinkUnsupportedForTest = true
+	t.Cleanup(func() { reflinkUnsupportedForTest = false })
+	w := newWS(t)
+	if err := w.Create("app"); err != nil {
+		t.Fatal(err)
+	}
+	path := mustCheckout(t, w, "app", "main")
+	mustSQL(t, path, "CREATE TABLE t (v); INSERT INTO t VALUES (1);")
+	if _, err := w.Checkpoint("app", "main", "v1", nil); err != nil {
+		t.Fatal(err)
+	}
+	for _, p := range []string{path, path + ".sum"} {
+		os.Remove(p)
+	}
+
+	// The first fileSum is the fallback's own hash: the write lands after
+	// the before-fingerprint and before the after-fingerprint.
+	calls := 0
+	hookFileSum(t, func() {
+		calls++
+		if calls != 1 {
+			return
+		}
+		f, err := os.OpenFile(path, os.O_WRONLY|os.O_APPEND, 0)
+		if err != nil {
+			t.Error(err)
+			return
+		}
+		f.Write(make([]byte, 4096))
+		f.Close()
+	})
+	res, err := w.CheckoutProven("app", "main")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if calls != 1 {
+		t.Fatalf("fileSum called %d times by the no-cache fallback, want 1", calls)
+	}
+	rec, ok := readSidecar(res.Path)
+	if !ok {
+		t.Fatal("no sidecar")
+	}
+	if rec.Hash == "" || rec.TXID != res.Ref.HeadTXID {
+		t.Fatalf("sidecar lacks the hash or identity: %+v", rec)
+	}
+	if rec.Size != 0 || rec.ModTimeNS != 0 || rec.ChangeCounter != 0 || rec.StampedNS != 0 {
+		t.Fatalf("a fingerprint was recorded across a write during the hash: %+v", rec)
+	}
+	// With no fingerprint, the next check can only prove anything by
+	// hashing the file again.
+	ageMtime(t, res.Path)
+	calls = 1 // the hook no longer writes
+	before := calls
+	checkoutState(res.Path, res.Ref)
+	if calls != before+1 {
+		t.Fatalf("checkoutState hashed %d times after an unverified stamp, want 1", calls-before)
+	}
+}
+
+// TestSandwichedStampAnchorsStampedNSBeforeTheHash pins the other half of
+// ruling I2: a sandwiched stamp (writeSum, and checkoutState's re-stamp)
+// records StampedNS as the time just before its before-fingerprint, not
+// the time it writes the sidecar — so a slow hash cannot make a
+// fingerprint look older, relative to its stamp, than it was observed.
+func TestSandwichedStampAnchorsStampedNSBeforeTheHash(t *testing.T) {
+	testutil.RequireSQLite3(t)
+	w := newWS(t)
+	if err := w.Create("app"); err != nil {
+		t.Fatal(err)
+	}
+	res, err := w.CheckoutProven("app", "main")
+	if err != nil {
+		t.Fatal(err)
+	}
+	path := res.Path
+	const hashTime = 50 * time.Millisecond
+	var hashStart time.Time
+	hookFileSum(t, func() {
+		hashStart = time.Now()
+		time.Sleep(hashTime)
+	})
+	const epsilon = int64(time.Millisecond)
+
+	check := func(what string, before time.Time) {
+		t.Helper()
+		rec, ok := readSidecar(path)
+		if !ok {
+			t.Fatalf("%s: no sidecar", what)
+		}
+		if rec.StampedNS == 0 {
+			t.Fatalf("%s: no fingerprint recorded for an unchanged file: %+v", what, rec)
+		}
+		if rec.StampedNS < before.UnixNano() || rec.StampedNS > hashStart.UnixNano()+epsilon {
+			t.Fatalf("%s: StampedNS %d outside [call start %d, hash start %d + epsilon]; a write-time anchor would be >= %d",
+				what, rec.StampedNS, before.UnixNano(), hashStart.UnixNano(), hashStart.Add(hashTime).UnixNano())
+		}
+	}
+
+	before := time.Now()
+	if err := writeSum(path, res.Ref.Lineage, res.Ref.HeadEpoch, res.Ref.HeadTXID, 0, ""); err != nil {
+		t.Fatal(err)
+	}
+	check("writeSum", before)
+
+	// checkoutState within the racily-clean margin hashes and re-stamps.
+	before = time.Now()
+	if st, _ := checkoutState(path, res.Ref); st != "clean" {
+		t.Fatalf("checkout state %q, want clean", st)
+	}
+	check("checkoutState re-stamp", before)
+}

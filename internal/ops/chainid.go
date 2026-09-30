@@ -5,6 +5,7 @@ import (
 	"encoding/hex"
 	"os"
 	"path/filepath"
+	"sort"
 	"strings"
 
 	"github.com/sricola/offshoot/internal/ltxio"
@@ -48,6 +49,74 @@ func cloneFile(dst, src string) error {
 	return reflink.Clone(dst, src)
 }
 
+// byChainEntryMode is a by-chain entry's mode: owner read-only, like the
+// store's own 0600 objects and the writable checkouts (never world- or
+// group-readable). The directories above it are 0700 (mkdirPrivate).
+const byChainEntryMode os.FileMode = 0o400
+
+// DefaultByChainMaxEntries bounds how many by-chain entries one database
+// keeps: after every populate, CheckoutProven and CheckoutAt prune that
+// database's by-chain area to this many entries, least recently used first
+// (see pruneByChain). Without a bound every checkout miss on a
+// clone-capable filesystem would leave one full physical copy behind for
+// good, since only the daemon janitor evicts and -ro-cache-budget defaults
+// to unlimited. Eviction is always safe: an entry is re-creatable content
+// keyed by chain identity, and a later miss on an evicted chain simply
+// rebuilds it (from a cached prefix or the store). 64 covers a deep MCTS
+// spine plus its live siblings with room to spare; a workload with more
+// distinct live chains per database than that pays a re-materialize on a
+// miss, which is exactly the cost without this cache. -ro-cache-budget's
+// byte accounting still applies on top when set.
+const DefaultByChainMaxEntries = 64
+
+// mkdirPrivate creates each directory (in order, parents first) with mode
+// 0700, and tightens one that already exists with a wider mode. Cache
+// content derived from the store is no more readable than the store's own
+// 0600 objects.
+func mkdirPrivate(dirs ...string) error {
+	for _, d := range dirs {
+		if err := os.MkdirAll(d, 0o700); err != nil {
+			return err
+		}
+		if fi, err := os.Stat(d); err == nil && fi.Mode().Perm() != 0o700 {
+			if err := os.Chmod(d, 0o700); err != nil {
+				return err
+			}
+		}
+	}
+	return nil
+}
+
+// pruneByChain removes db's least recently used by-chain entries (the LRU
+// clock is rocache's lruClock: the .last-used marker a clone or prefix hit
+// touches, else the entry's own mtime, which is when its content was
+// written) until at most max remain, each with its .sum sidecar and marker.
+// It only ever sees <chainID>.db files in the by-chain directory: staging
+// files of an entry still being built (<id>.db.stage-*) and probe files
+// are not entries, and the writable checkouts live in a separate tree.
+// Best-effort: an entry that another process evicts or rebuilds
+// concurrently is harmless either way, since a clone of it that loses the
+// race falls through to rebuilding (see materializeFromChain).
+func (w *Workspace) pruneByChain(db string, max int) {
+	entries, err := byChainEntries(db, filepath.Join(w.roCacheRoot(), db, byChainDir))
+	if err != nil || len(entries) <= max {
+		return
+	}
+	sort.Slice(entries, func(i, j int) bool {
+		if !entries[i].LastUsed.Equal(entries[j].LastUsed) {
+			return entries[i].LastUsed.Before(entries[j].LastUsed)
+		}
+		return entries[i].Path < entries[j].Path
+	})
+	for _, e := range entries[:len(entries)-max] {
+		if err := os.Remove(e.Path); err != nil && !os.IsNotExist(err) {
+			continue
+		}
+		os.Remove(e.Path + ".sum")
+		os.Remove(e.Path + lastUsedSuffix)
+	}
+}
+
 // chainPlacement is what materializeFromChain wrote at its destination.
 type chainPlacement struct {
 	kind     string // see observeCheckoutSource
@@ -73,7 +142,7 @@ type chainPlacement struct {
 //     before this cache existed ("materialize", no entry).
 //
 // Building the entry before dst exists is what keeps the cache honest: an
-// entry's bytes, hash and checksum all describe a file that was 0444
+// entry's bytes, hash and checksum all describe a file that was 0400
 // before it was ever visible under its entry name, and nothing reads the
 // writable checkout to create one — a write racing into a fresh checkout
 // can corrupt that checkout only, never another branch's future clone.
@@ -81,9 +150,9 @@ type chainPlacement struct {
 // Any failure of a fast path (clone unsupported, an entry evicted between
 // its sidecar read and the clone, a prefix apply that does not verify)
 // falls through to the next; only the final direct materialize's errors
-// are returned. mode is dst's mode after cloning (an entry is 0444; a writable
+// are returned. mode is dst's mode after cloning (an entry is 0400; a writable
 // checkout wants 0600 like a materialized temp file; a checkouts-ro file
-// keeps 0444).
+// keeps 0444, inside 0700 directories).
 func (w *Workspace) materializeFromChain(db, lineage string, members []store.ChainMember, dst string, mode os.FileMode) (chainPlacement, error) {
 	id := chainID(members)
 	if entry, rec, ok := w.byChainEntry(db, id); ok {
@@ -112,17 +181,27 @@ func (w *Workspace) materializeFromChain(db, lineage string, members []store.Cha
 // canCloneByChain reports whether a file in db's by-chain directory can be
 // cloned into dst's directory, by cloning a tiny probe file across exactly
 // that pair (a few syscalls, next to a materialize). When it cannot, the
-// by-chain directory is removed again if this left it empty, so a non-CoW
-// filesystem carries no trace of the cache.
+// by-chain directory and the checkouts-ro/<db> and checkouts-ro directories
+// above it are removed again when this left them empty (unless dst itself
+// lives there, as a CheckoutAt file does), so a non-CoW filesystem carries
+// no trace of the cache beyond the files it was asked for.
 func (w *Workspace) canCloneByChain(db, dst string) bool {
-	dir := filepath.Join(w.roCacheRoot(), db, byChainDir)
-	if err := os.MkdirAll(dir, 0o755); err != nil {
+	dbDir := filepath.Join(w.roCacheRoot(), db)
+	dir := filepath.Join(dbDir, byChainDir)
+	if err := mkdirPrivate(w.roCacheRoot(), dbDir, dir); err != nil {
 		return false
 	}
 	ok := false
 	defer func() {
 		if !ok {
-			os.Remove(dir) // only succeeds while empty
+			// Each only succeeds while empty, innermost first — and never
+			// dst's own directory (CheckoutAt's checkouts-ro/<db>), which
+			// the caller is about to write into.
+			os.Remove(dir)
+			if filepath.Clean(filepath.Dir(dst)) != dbDir {
+				os.Remove(dbDir)
+				os.Remove(w.roCacheRoot())
+			}
 		}
 	}()
 	probe, err := os.CreateTemp(dir, "probe-*")
@@ -143,7 +222,7 @@ func (w *Workspace) canCloneByChain(db, dst string) bool {
 // buildByChainEntry creates the entry for chain id: its content is written
 // to a staging file in the by-chain directory — applied onto the longest
 // cached prefix entry when one verifies, else materialized from the store —
-// made 0444, hashed, renamed to the entry name, and only then given the
+// made 0400, hashed, renamed to the entry name, and only then given the
 // .sum sidecar that makes byChainEntry accept it. Returns how the content
 // was produced ("clone+segments" or "materialize") and the entry's record.
 func (w *Workspace) buildByChainEntry(db, lineage string, members []store.ChainMember, id string) (string, sumRecord, error) {
@@ -163,7 +242,7 @@ func (w *Workspace) buildByChainEntry(db, lineage string, members []store.ChainM
 	} else if checksum, err = w.materializeMembersAt(lineage, members, stage); err != nil {
 		return "", sumRecord{}, err
 	}
-	if err := os.Chmod(stage, 0o444); err != nil {
+	if err := os.Chmod(stage, byChainEntryMode); err != nil {
 		return "", sumRecord{}, err
 	}
 	hash, err := fileSum(stage)

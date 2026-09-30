@@ -169,11 +169,12 @@ func stampFingerprint(path string) (fingerprint, error) {
 // recording) the fingerprint when they agree — see writeSum and
 // checkoutState.
 func StampSum(path, hash, lineage string, epoch, txid, postApplyChecksum uint64, chainID string) error {
+	statNS := time.Now().UnixNano()
 	fp, err := stampFingerprint(path)
 	if err != nil {
 		return err
 	}
-	return stampSumWithFingerprint(path, hash, lineage, epoch, txid, postApplyChecksum, chainID, fp, true, false)
+	return stampSumWithFingerprint(path, hash, lineage, epoch, txid, postApplyChecksum, chainID, fp, statNS, true, false)
 }
 
 // StampSumHashOnly writes path's .sum sidecar from a hash and identity the
@@ -196,7 +197,7 @@ func StampSum(path, hash, lineage string, epoch, txid, postApplyChecksum uint64,
 // avoids, and commitSidecarRefresh's own doc comment for why re-deriving a
 // hash at that call site is specifically undesirable.
 func StampSumHashOnly(path, hash, lineage string, epoch, txid, postApplyChecksum uint64, chainID string) error {
-	return stampSumWithFingerprint(path, hash, lineage, epoch, txid, postApplyChecksum, chainID, fingerprint{}, false, false)
+	return stampSumWithFingerprint(path, hash, lineage, epoch, txid, postApplyChecksum, chainID, fingerprint{}, 0, false, false)
 }
 
 // stampSumWithFingerprint writes path's .sum sidecar from a hash, identity,
@@ -209,19 +210,28 @@ func StampSumHashOnly(path, hash, lineage string, epoch, txid, postApplyChecksum
 // ModTimeNS and ChangeCounter from the record (StampedNS along with them),
 // exactly like a pre-fingerprint sidecar.
 //
+// stampedNS (meaningful only when ok) is recorded as StampedNS: the wall
+// clock read just BEFORE fp's stat, never the time of this write. The
+// racily-clean guard (fingerprintMatches) trusts a fingerprint only when
+// its mtime is a margin older than StampedNS, and that guard is about the
+// instant the evidence was observed: a sandwiched hash can take longer
+// than the margin, and anchoring at write time would let an mtime written
+// just after the before-stat, in the same coarse mtime tick, pass as
+// settled.
+//
 // shadow is sumRecord.Shadow. Every stamp of new content passes false: the
 // shadow (if any) was cloned from the PREVIOUS content, and only
 // refreshShadow, after re-cloning, sets it again. checkoutState's
 // hash-verified re-stamp is the one caller that passes the record's own
 // value through, since it re-stamps the same identity and content.
-func stampSumWithFingerprint(path, hash, lineage string, epoch, txid, postApplyChecksum uint64, chainID string, fp fingerprint, ok, shadow bool) error {
+func stampSumWithFingerprint(path, hash, lineage string, epoch, txid, postApplyChecksum uint64, chainID string, fp fingerprint, stampedNS int64, ok, shadow bool) error {
 	rec := sumRecord{
 		Hash: hash, Lineage: lineage, Epoch: epoch, TXID: txid,
 		PostApplyChecksum: postApplyChecksum, ChainID: chainID, Shadow: shadow,
 	}
 	if ok {
 		rec.Size, rec.ModTimeNS, rec.ChangeCounter = fp.size, fp.mtimeNS, fp.changeCounter
-		rec.StampedNS = time.Now().UnixNano()
+		rec.StampedNS = stampedNS
 	}
 	data, err := json.Marshal(rec)
 	if err != nil {
@@ -365,16 +375,29 @@ func fingerprintMatches(rec sumRecord, fp fingerprint) bool {
 // checkoutState call simply hashes once more rather than trusting an
 // unverified linkage.
 func writeSum(path string, lineage string, epoch, txid, postApplyChecksum uint64, chainID string) error {
-	fpBefore, errBefore := stampFingerprint(path)
-	sum, err := fileSum(path)
+	sum, fp, beforeNS, ok, err := sandwichedSum(path)
 	if err != nil {
 		return err
 	}
+	return stampSumWithFingerprint(path, sum, lineage, epoch, txid, postApplyChecksum, chainID, fp, beforeNS, ok, false)
+}
+
+// sandwichedSum hashes path (fileSum) between two fingerprint reads. ok
+// reports whether both reads succeeded and agree — nothing wrote to path
+// while it was hashed — and only then is fp the fingerprint to record,
+// with beforeNS (the wall clock read just before the first stat) as its
+// StampedNS; see writeSum and stampSumWithFingerprint.
+func sandwichedSum(path string) (sum string, fp fingerprint, beforeNS int64, ok bool, err error) {
+	beforeNS = time.Now().UnixNano()
+	fpBefore, errBefore := stampFingerprint(path)
+	if sum, err = fileSum(path); err != nil {
+		return "", fingerprint{}, 0, false, err
+	}
 	fpAfter, errAfter := stampFingerprint(path)
 	if errBefore == nil && errAfter == nil && fpBefore == fpAfter {
-		return stampSumWithFingerprint(path, sum, lineage, epoch, txid, postApplyChecksum, chainID, fpAfter, true, false)
+		return sum, fpAfter, beforeNS, true, nil
 	}
-	return stampSumWithFingerprint(path, sum, lineage, epoch, txid, postApplyChecksum, chainID, fingerprint{}, false, false)
+	return sum, fingerprint{}, 0, false, nil
 }
 
 // checkoutState reports how the checkout at path relates to ref, and — only
@@ -441,6 +464,7 @@ func checkoutState(path string, ref store.Ref) (string, uint64) {
 	if rec.Lineage != ref.Lineage || rec.Epoch != ref.HeadEpoch || rec.TXID != ref.HeadTXID {
 		return "stale", 0
 	}
+	beforeNS := time.Now().UnixNano()
 	fpBefore, fpErr := stampFingerprint(path)
 	if fpErr == nil && fingerprintMatches(rec, fpBefore) {
 		return "clean", rec.PostApplyChecksum
@@ -453,9 +477,9 @@ func checkoutState(path string, ref store.Ref) (string, uint64) {
 		return "modified", 0
 	}
 	if fpAfter, err2 := stampFingerprint(path); fpErr == nil && err2 == nil && fpBefore == fpAfter {
-		_ = stampSumWithFingerprint(path, got, ref.Lineage, ref.HeadEpoch, ref.HeadTXID, rec.PostApplyChecksum, rec.ChainID, fpAfter, true, rec.Shadow)
+		_ = stampSumWithFingerprint(path, got, ref.Lineage, ref.HeadEpoch, ref.HeadTXID, rec.PostApplyChecksum, rec.ChainID, fpAfter, beforeNS, true, rec.Shadow)
 	} else {
-		_ = stampSumWithFingerprint(path, got, ref.Lineage, ref.HeadEpoch, ref.HeadTXID, rec.PostApplyChecksum, rec.ChainID, fingerprint{}, false, rec.Shadow)
+		_ = stampSumWithFingerprint(path, got, ref.Lineage, ref.HeadEpoch, ref.HeadTXID, rec.PostApplyChecksum, rec.ChainID, fingerprint{}, 0, false, rec.Shadow)
 	}
 	return "clean", rec.PostApplyChecksum
 }
@@ -544,6 +568,14 @@ func refreshShadow(path string) {
 	tmp := shadow + ".tmp"
 	os.Remove(tmp) // a leftover from an interrupted refresh is never live
 	if err := cloneFile(tmp, path); err != nil {
+		dropShadow(path)
+		return
+	}
+	// The shadow holds the checkout's content, so it gets the checkout's
+	// 0600 whatever mode the clone was created with (Linux FICLONE creates
+	// its destination itself).
+	if err := os.Chmod(tmp, 0o600); err != nil {
+		os.Remove(tmp)
 		dropShadow(path)
 		return
 	}

@@ -346,13 +346,17 @@ func (w *Workspace) CheckoutProven(db, branch string) (CheckoutResult, error) {
 	if observeCheckoutSource != nil {
 		observeCheckoutSource(placed.kind)
 	}
-	hash := placed.hash
-	if hash == "" { // no-cache fallback: hash it as writeSum always did
-		if hash, err = fileSum(path); err != nil {
+	if placed.kind != "clone" { // a populate may have added an entry
+		w.pruneByChain(db, DefaultByChainMaxEntries)
+	}
+	if placed.hash == "" {
+		// No-cache fallback: hash the file here, sandwiched between two
+		// fingerprints exactly as writeSum does, so a write racing the hash
+		// is never recorded as a fingerprint paired with the old hash.
+		if err := writeSum(path, ref.Lineage, ref.HeadEpoch, ref.HeadTXID, placed.checksum, placed.chainID); err != nil {
 			return CheckoutResult{}, err
 		}
-	}
-	if err := StampSum(path, hash, ref.Lineage, ref.HeadEpoch, ref.HeadTXID, placed.checksum, placed.chainID); err != nil {
+	} else if err := StampSum(path, placed.hash, ref.Lineage, ref.HeadEpoch, ref.HeadTXID, placed.checksum, placed.chainID); err != nil {
 		return CheckoutResult{}, err
 	}
 	refreshShadow(path)
@@ -484,7 +488,17 @@ func (w *Workspace) CheckpointWith(db, branch, name string, meta map[string]stri
 	var buf bytes.Buffer
 	var key string
 	var checksum uint64
-	if d, ok := w.planSegment(path, ref, opts); ok {
+	// A segment is written only when no snapshot already sits at txid. Only
+	// a failed earlier attempt (object uploaded, ref write never landed, or
+	// a crash between them) can have left one there, since no ref names
+	// that key; left beside a segment it would anchor the head (the chain
+	// resolver anchors on the newest snapshot at or below the target), so
+	// the head would resolve to that attempt's older content. Checking
+	// before the write rather than deleting after the CAS means no failure
+	// or crash can leave the two side by side: a snapshot here takes the
+	// create-only put's overwrite path below instead. An error from the
+	// probe also answers "write a snapshot", which is always correct.
+	if d, ok := w.planSegment(path, ref, opts); ok && !w.snapshotMayExist(ref, txid) {
 		if err := ltxio.EncodeSegment(d.pageSize, d.commit, txid, txid, d.pre, d.post, d.pages, &buf); err != nil {
 			return CheckpointResult{}, err
 		}
@@ -572,15 +586,6 @@ func (w *Workspace) CheckpointWith(db, branch, name string, meta map[string]stri
 		}
 		return CheckpointResult{}, fmt.Errorf("ops: ref update for checkpoint %q on %s@%s: %w", name, db, branch, err)
 	}
-	// A segment that won the CAS removes any snapshot at its own txid: only
-	// a failed earlier attempt (object uploaded, ref write never landed, no
-	// sidecar or shadow stamped) can have left one there, since the winner's
-	// recorded kind is segment and no ref names that key. Left in place, it
-	// would anchor the head (the chain resolver anchors on the newest
-	// snapshot at or below the target) instead of this segment.
-	if res.Kind == "segment" {
-		w.bestEffortDelete(store.SnapshotKey(ref.Lineage, ref.Epoch, txid))
-	}
 	// The ref CAS is the point of no return: only now does the checkout truly
 	// equal committed state (lineage unchanged, head advanced to txid).
 	// Writing the sidecar here, after the CAS, means an interrupt between the
@@ -597,6 +602,15 @@ func (w *Workspace) CheckpointWith(db, branch, name string, meta map[string]stri
 		ObserveCheckpoint(time.Since(start))
 	}
 	return res, nil
+}
+
+// snapshotMayExist reports whether a snapshot object may already sit at
+// txid in ref's lineage and writer epoch: true when one does, and when the
+// probe (one List of that exact key) fails, since the caller's safe answer
+// to "maybe" is to write a snapshot. See CheckpointWith.
+func (w *Workspace) snapshotMayExist(ref store.Ref, txid uint64) bool {
+	exists, err := w.Store.ObjectExists(store.SnapshotKey(ref.Lineage, ref.Epoch, txid))
+	return err != nil || exists
 }
 
 // checkpointKindAt is the recorded Kind of ref's checkpoint at txid, or ""

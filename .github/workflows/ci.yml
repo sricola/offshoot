@@ -39,8 +39,8 @@ jobs:
   # reflinked shadow, and both only run where the filesystem can clone.
   # ubuntu-latest's ext4 cannot, so every clone/shadow/segment fast-path test
   # skips in `test` and the only thing it proves is the non-reflink
-  # fallback. `cow-paths` runs just the four packages that hold those
-  # paths, on APFS, to keep the 10x bill bounded. The macOS sqlite3/brew
+  # fallback. `cow-paths` runs just the packages (and, for session, the
+  # tests) that hold those paths, on APFS, to keep the 10x bill bounded. The macOS sqlite3/brew
   # install logic lives in .github/actions/setup-sqlite (shared with
   # nightly.yml's macos-test).
   test:
@@ -92,12 +92,16 @@ jobs:
   # cow-paths: the copy-on-write fast paths (by-chain clone checkouts,
   # reflinked checkpoint shadows, segment checkpoints, clone-based
   # session opens) on a filesystem that can clone — see the comment above
-  # `test` for why this is its own macOS job and why it is scoped to four
-  # packages. No -race: the ubuntu `test` job already runs these packages
+  # `test` for why this is its own macOS job and why it is scoped this
+  # tightly. No -race: the ubuntu `test` job already runs these packages
   # under the race detector; this job exists for the filesystem, not the
-  # scheduler.
+  # scheduler. ./internal/session runs only its two clone tests: the rest of
+  # that package is filesystem-independent (the ubuntu job covers it) and
+  # holds the load-sensitive session-flush heartbeat test, which has no
+  # business gating every push on a shared macOS runner.
   cow-paths:
     runs-on: macos-latest
+    timeout-minutes: 20
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
@@ -107,7 +111,7 @@ jobs:
         with:
           go-version-file: go.mod
 
-      # No sqldiff: none of the four packages below gates on it.
+      # No sqldiff: none of the packages below gates on it.
       - uses: ./.github/actions/setup-sqlite
 
       # The clone tests skip (by design) on a filesystem that cannot clone.
@@ -124,7 +128,10 @@ jobs:
           fi
 
       - name: go test (copy-on-write paths)
-        run: go test ./internal/ops ./internal/ltxio ./internal/ops/reflink ./internal/session -count=1
+        run: go test ./internal/ops ./internal/ltxio ./internal/ops/reflink -count=1
+
+      - name: go test (copy-on-write session opens)
+        run: go test ./internal/session -run '^(TestOpenOnClonedCheckoutSkipsSettlingFlush|TestAtRestCheckpointAfterCloseWritesASegment)$' -count=1 -v
 
   # metrics-lint is Milestone 4 PM Amendment 7's hard gate: promtool (the
   # Prometheus project's own exposition-format linter) run against a real

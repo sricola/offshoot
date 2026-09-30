@@ -6,8 +6,10 @@ import (
 	"fmt"
 	"os"
 	"path/filepath"
+	"runtime"
 	"strings"
 	"testing"
+	"time"
 
 	"github.com/sricola/offshoot/internal/ltxio"
 	"github.com/sricola/offshoot/internal/ops/reflink"
@@ -192,8 +194,8 @@ func TestForkCheckoutsCloneFromByChainCache(t *testing.T) {
 	if err != nil {
 		t.Fatalf("by-chain entry not populated: %v", err)
 	}
-	if info.Mode().Perm() != 0o444 {
-		t.Fatalf("by-chain entry mode %v, want 0444", info.Mode().Perm())
+	if info.Mode().Perm() != byChainEntryMode {
+		t.Fatalf("by-chain entry mode %v, want %v", info.Mode().Perm(), byChainEntryMode)
 	}
 	if !bytes.Equal(readFile(t, entry), want) {
 		t.Fatal("by-chain entry differs from seed export")
@@ -264,6 +266,18 @@ func TestClonePathDegradesWhenUnsupported(t *testing.T) {
 	}
 	if _, err := os.Stat(filepath.Join(w.roCacheRoot(), "app", byChainDir)); !os.IsNotExist(err) {
 		t.Fatalf("by-chain directory exists on a filesystem that cannot clone: %v", err)
+	}
+	if _, err := os.Stat(w.roCacheRoot()); !os.IsNotExist(err) {
+		t.Fatalf("checkouts-ro exists on a filesystem that cannot clone, with no --at checkout: %v", err)
+	}
+	// A --at checkout still lands in checkouts-ro/<db>, which the probe
+	// must not remove from under it.
+	at, err := w.CheckoutAt("app", "main", "seed", false)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !bytes.Equal(readFile(t, at), exportBytes(t, w, "app", "main", "seed")) {
+		t.Fatal("checkout-at differs from an export on a filesystem that cannot clone")
 	}
 }
 
@@ -476,5 +490,178 @@ func TestMaterializeMissBuildsImmutableEntryFirst(t *testing.T) {
 	assertCheckoutMatches(t, w, "app", "m1", mustCheckout(t, w, "app", "m1"))
 	if got := strings.Join(*kinds, ","); got != "materialize,clone" {
 		t.Fatalf("checkout sources = %s, want materialize,clone", got)
+	}
+}
+
+// byChainIDs lists db's by-chain entry ids (the <id>.db files only).
+func byChainIDs(t *testing.T, w *Workspace, db string) map[string]bool {
+	t.Helper()
+	entries, err := byChainEntries(db, filepath.Join(w.roCacheRoot(), db, byChainDir))
+	if err != nil {
+		t.Fatal(err)
+	}
+	ids := make(map[string]bool, len(entries))
+	for _, e := range entries {
+		ids[e.Checkpoint] = true
+	}
+	return ids
+}
+
+// TestByChainAreaIsBoundedByDefault pins ruling I1: with no
+// -ro-cache-budget and no janitor, a run of checkout misses over more than
+// DefaultByChainMaxEntries distinct chains never leaves more than that many
+// entries, the survivors are the most recently used ones, a staging file of
+// an entry being built is never touched, and a checkout of an evicted chain
+// still works (it rebuilds the entry).
+func TestByChainAreaIsBoundedByDefault(t *testing.T) {
+	testutil.RequireSQLite3(t)
+	w := newWS(t)
+	requireClone(t, w)
+	if err := w.Create("app"); err != nil {
+		t.Fatal(err)
+	}
+	path := mustCheckout(t, w, "app", "main")
+	mustSQL(t, path, "CREATE TABLE t (id INTEGER PRIMARY KEY, v BLOB);")
+
+	// An entry mid-build: a staging file, old enough to rank first.
+	byChain := filepath.Join(w.roCacheRoot(), "app", byChainDir)
+	stage := filepath.Join(byChain, strings.Repeat("0", 64)+".db.stage-test")
+	if err := os.WriteFile(stage, []byte("building"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	chtime(t, stage, time.Now().Add(-time.Hour))
+
+	const bound = DefaultByChainMaxEntries
+	var order []string // chain ids in populate order
+	var headOf []string
+	for i := 0; i < bound+8; i++ {
+		mustSQL(t, path, fmt.Sprintf("INSERT INTO t (v) VALUES (randomblob(%d));", 500+i))
+		name := fmt.Sprintf("c%d", i)
+		if _, err := w.Checkpoint("app", "main", name, nil); err != nil {
+			t.Fatal(err)
+		}
+		// Drop the checkout so the next CheckoutProven is a by-chain miss
+		// that builds this head's entry.
+		for _, p := range []string{path, path + ".sum", shadowPath(path)} {
+			os.Remove(p)
+		}
+		res, err := w.CheckoutProven("app", "main")
+		if err != nil {
+			t.Fatal(err)
+		}
+		if res.Path != path {
+			t.Fatalf("checkout path %s, want %s", res.Path, path)
+		}
+		id := headChainID(t, w, "app", "main")
+		order = append(order, id)
+		headOf = append(headOf, name)
+		ids := byChainIDs(t, w, "app")
+		if len(ids) > bound {
+			t.Fatalf("after %d populates: %d by-chain entries, bound %d", i+1, len(ids), bound)
+		}
+		if !ids[id] {
+			t.Fatalf("after %d populates: the entry just built was pruned", i+1)
+		}
+	}
+
+	ids := byChainIDs(t, w, "app")
+	if len(ids) != bound {
+		t.Fatalf("%d entries survive, want exactly the bound %d", len(ids), bound)
+	}
+	for _, id := range order[len(order)-bound:] {
+		if !ids[id] {
+			t.Fatalf("a most recently used entry %s was pruned", id)
+		}
+	}
+	evicted := order[0]
+	if ids[evicted] {
+		t.Fatalf("the least recently used entry %s survived", evicted)
+	}
+	for _, p := range []string{".db", ".db.sum", ".db" + lastUsedSuffix} {
+		if _, err := os.Stat(filepath.Join(byChain, evicted+p)); !os.IsNotExist(err) {
+			t.Fatalf("evicted entry's %s survived: %v", p, err)
+		}
+	}
+	if _, err := os.Stat(stage); err != nil {
+		t.Fatalf("a staging file was pruned: %v", err)
+	}
+	if _, err := os.Stat(path); err != nil {
+		t.Fatalf("the writable checkout is gone: %v", err)
+	}
+
+	// A branch whose head is the evicted chain rebuilds it on checkout.
+	kinds := recordKinds(t)
+	mustFork(t, w, "app", "main", "old", headOf[0])
+	if got := headChainID(t, w, "app", "old"); got != evicted {
+		t.Fatalf("fork at %s resolves chain %s, want the evicted %s", headOf[0], got, evicted)
+	}
+	oldPath := mustCheckout(t, w, "app", "old")
+	assertCheckoutMatches(t, w, "app", "old", oldPath)
+	if len(*kinds) != 1 || (*kinds)[0] == "clone" {
+		t.Fatalf("checkout of an evicted chain: sources %v, want a rebuild", *kinds)
+	}
+	ids = byChainIDs(t, w, "app")
+	if !ids[evicted] || len(ids) != bound {
+		t.Fatalf("after the rebuild: entry present %v, %d entries (want present, %d)", ids[evicted], len(ids), bound)
+	}
+}
+
+// TestByChainAndShadowModesArePrivate pins ruling I4: a by-chain entry is
+// 0400, the checkouts-ro, checkouts-ro/<db> and by-chain directories are
+// 0700 (a pre-existing wider one is tightened), a CheckoutAt file stays
+// 0444 inside them, and a shadow is 0600 after refreshShadow.
+func TestByChainAndShadowModesArePrivate(t *testing.T) {
+	if runtime.GOOS == "windows" {
+		t.Skip("POSIX modes are not enforced on windows")
+	}
+	w := newWS(t)
+	requireClone(t, w)
+	// A wider directory left by an earlier version is tightened.
+	if err := os.MkdirAll(filepath.Join(w.roCacheRoot(), "app"), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	seedDB(t, w, "app", 1<<20)
+	mustFork(t, w, "app", "main", "b", "seed")
+	path := mustCheckout(t, w, "app", "b")
+	entry := w.byChainPath("app", headChainID(t, w, "app", "b"))
+
+	mode := func(p string) os.FileMode {
+		t.Helper()
+		fi, err := os.Stat(p)
+		if err != nil {
+			t.Fatal(err)
+		}
+		return fi.Mode().Perm()
+	}
+	if m := mode(entry); m != 0o400 {
+		t.Fatalf("by-chain entry mode %v, want 0400", m)
+	}
+	for _, d := range []string{w.roCacheRoot(), filepath.Join(w.roCacheRoot(), "app"), filepath.Dir(entry)} {
+		if m := mode(d); m != 0o700 {
+			t.Fatalf("%s mode %v, want 0700", d, m)
+		}
+	}
+	at, err := w.CheckoutAt("app", "main", "seed", false)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if m := mode(at); m != 0o444 {
+		t.Fatalf("checkout-at mode %v, want 0444", m)
+	}
+
+	// The shadow: widen the checkout, then refresh — the shadow is 0600
+	// whatever mode its clone source had.
+	if err := os.Chmod(path, 0o644); err != nil {
+		t.Fatal(err)
+	}
+	refreshShadow(path)
+	if rec, ok := readSidecar(path); !ok || !rec.Shadow {
+		t.Fatalf("refreshShadow recorded no shadow: %+v", rec)
+	}
+	if m := mode(shadowPath(path)); m != 0o600 {
+		t.Fatalf("shadow mode %v, want 0600", m)
+	}
+	if _, err := os.Stat(shadowPath(path) + ".tmp"); !os.IsNotExist(err) {
+		t.Fatalf("shadow temp left behind: %v", err)
 	}
 }

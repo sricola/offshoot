@@ -460,13 +460,15 @@ func TestSnapshotLoserKeepsSharedKeyWhenWinnerIsAlsoSnapshot(t *testing.T) {
 	}
 }
 
-// TestSegmentWinnerRemovesStaleSnapshotAtItsTXID: a snapshot attempt that
+// TestStaleSnapshotAtNextTXIDForcesASnapshot: a snapshot attempt that
 // uploaded its object and then never landed its ref (a crash between PutIf
 // and PutRef, or a PutRef failure that was not a CAS loss) leaves a
 // snapshot at the next txid with no sidecar or shadow stamped. The next
-// checkpoint plans a segment at that same txid; once it wins the CAS it must
-// remove the stale snapshot, or the chain would anchor the head on it.
-func TestSegmentWinnerRemovesStaleSnapshotAtItsTXID(t *testing.T) {
+// checkpoint would plan a segment at that same txid; the pre-write probe
+// finds the stale snapshot and writes a snapshot over it instead, so no
+// segment ever sits beside it and the head resolves to this checkpoint's
+// own content.
+func TestStaleSnapshotAtNextTXIDForcesASnapshot(t *testing.T) {
 	w := newWS(t)
 	requireClone(t, w)
 	seedDB(t, w, "app", 1<<20)
@@ -485,24 +487,72 @@ func TestSegmentWinnerRemovesStaleSnapshotAtItsTXID(t *testing.T) {
 	// The checkout moves on after the failed attempt, so the stale snapshot
 	// no longer matches what the next checkpoint commits.
 	mustSQL(t, path, "INSERT INTO t (v) VALUES (randomblob(200));")
+	// Without the stale object this checkpoint would be a segment.
+	if _, ok := w.planSegment(path, ref, CheckpointOptions{}); !ok {
+		t.Fatal("precondition: planSegment would not choose a segment here")
+	}
 
 	res := mustCheckpointWith(t, w, "app", "main", "b", CheckpointOptions{})
-	if res.Kind != "segment" || res.TXID != txid {
-		t.Fatalf("checkpoint = %+v, want a segment at txid %d", res, txid)
-	}
-	if storeHas(w, staleKey) {
-		t.Fatal("the stale snapshot at the segment's txid survived")
+	if res.Kind != "snapshot" || res.TXID != txid {
+		t.Fatalf("checkpoint = %+v, want a snapshot at txid %d", res, txid)
 	}
 	segKey := store.SegmentKey(ref.Lineage, ref.Epoch, txid, txid)
-	if !storeHas(w, segKey) {
-		t.Fatal("the segment object is missing")
+	if storeHas(w, segKey) {
+		t.Fatal("a segment was written beside the stale snapshot")
+	}
+	data, _, err := w.Store.B.Get(staleKey)
+	if err != nil {
+		t.Fatalf("snapshot at txid %d: %v", txid, err)
+	}
+	if bytes.Equal(data, stale.Bytes()) {
+		t.Fatal("the stale snapshot's bytes survived; the checkpoint did not overwrite them")
+	}
+	if int64(len(data)) != res.Bytes {
+		t.Fatalf("result reports %d bytes, object is %d", res.Bytes, len(data))
 	}
 	members, err := w.Store.Chain(ref.Lineage, txid)
 	if err != nil {
 		t.Fatal(err)
 	}
-	if last := members[len(members)-1]; last.Key != segKey {
-		t.Fatalf("head resolves through %s, want the segment %s", last.Key, segKey)
+	if len(members) != 1 || members[0].Key != staleKey || !members[0].Snapshot {
+		t.Fatalf("head resolves through %+v, want exactly the snapshot %s", members, staleKey)
 	}
-	assertSegmentHead(t, w, "app", "main", "b", path, res)
+	at, err := w.CheckoutAt("app", "main", "b", false)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !bytes.Equal(readFile(t, at), readFile(t, path)) {
+		t.Fatal("the checkpoint materializes to bytes that differ from the checkout")
+	}
+
+	// The next checkpoint, with no stale object ahead of it, is a segment
+	// again.
+	mustSQL(t, path, "INSERT INTO t (v) VALUES (randomblob(300));")
+	next := mustCheckpointWith(t, w, "app", "main", "c", CheckpointOptions{})
+	assertSegmentHead(t, w, "app", "main", "c", path, next)
+}
+
+// TestDestroyRemovesShadowAndItsTemp: Destroy removes a checkout's shadow
+// and a leftover shadow temp from an interrupted refresh along with the
+// checkout, so neither outlives the branch.
+func TestDestroyRemovesShadowAndItsTemp(t *testing.T) {
+	w := newWS(t)
+	requireClone(t, w)
+	seedDB(t, w, "app", 1<<16)
+	mustFork(t, w, "app", "main", "b", "seed")
+	path := mustCheckout(t, w, "app", "b")
+	if _, err := os.Stat(shadowPath(path)); err != nil {
+		t.Fatalf("precondition: no shadow after checkout: %v", err)
+	}
+	if err := os.WriteFile(shadowPath(path)+".tmp", []byte("interrupted"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	if err := w.Destroy("app", "b", false); err != nil {
+		t.Fatal(err)
+	}
+	for _, p := range []string{path, path + ".sum", shadowPath(path), shadowPath(path) + ".tmp"} {
+		if _, err := os.Stat(p); !os.IsNotExist(err) {
+			t.Fatalf("%s survived destroy: %v", p, err)
+		}
+	}
 }
