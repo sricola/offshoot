@@ -12,7 +12,7 @@ Ground rules carried over from the design spec: correctness stays paranoid
 (limits documented as plainly as features), and the storage format carries a
 layout version so incompatibility is always detected, never guessed.
 
-Releases use the 0.x prerelease series (tags `v0.1.0` … `v0.2.11`); 1.0 is
+Releases use the 0.x prerelease series (tags `v0.1.0` … `v0.2.12`); 1.0 is
 reserved for the storage-format freeze. 0.2.0 is the copy-on-write release —
 a minor (not patch) bump because it changes the storage format
 (LayoutVersion 1 → 2; see the copy-on-write milestone below). The 0.2.x
@@ -324,7 +324,7 @@ open wart (its own spec said "N materialized forks cost up to N×G").
   databases (or sub-object pages) remains the standing non-goal below,
   to be revisited only on evidence that per-object fork sharing isn't
   enough.
-- ✅ **Promote/rollback on sharing — shipped (v0.2.12, unreleased).**
+- ✅ **Promote/rollback on sharing — shipped (v0.2.12).**
   Rollback to a kept checkpoint and promote now write a base pointer
   instead of copying (`--materialize` keeps the copy; the fork-time depth
   floor still forces one), and repeated rollbacks to one checkpoint keep

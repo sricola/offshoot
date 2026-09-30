@@ -13,7 +13,7 @@ describes the **materialize** path — see the version note below it.
 **Machine:** darwin/arm64, Apple M5 (10 cores), macOS 27.0, local APFS
 disk, Go 1.27.1. Local directory store backend (the default `make bench`
 target's backend). No other load. Measured 2026-09-30 at `751ecb7`
-(v0.2.12, unreleased) — the "after" — and, for the "What changed in
+(v0.2.12) — the "after" — and, for the "What changed in
 v0.2.12" comparisons, at `97320cc` (the commit before this work: v0.2.11
 plus the design spec) on the same machine the same day — the "before".
 
@@ -321,7 +321,7 @@ work).
 **Machine:** darwin/arm64, Apple M5, macOS 27.0, Docker 29.8.0
 (Postgres runs inside Docker Desktop's Linux VM here, not natively), Go
 1.27.1, local-directory store backend, no other load, no network.
-Measured 2026-09-30 at `751ecb7` (v0.2.12, unreleased). Raw output of
+Measured 2026-09-30 at `751ecb7` (v0.2.12). Raw output of
 `make bench-isolation` (`--sizes 10,100 --iters 20`), pasted verbatim:
 
 | Primitive | 10 MB | 100 MB |
@@ -568,8 +568,8 @@ Latencies are milliseconds. p99 is the maximum sample wherever a cell has fewer 
 - `mcts` (deep narrow; T=10, S=100, F_r=10, F_i=10, D=25, C=0, γ=0.1, M_s=0, M_d=1, Q_v=1): max depth reached 25; no cross-branch queries (C=0); 10 steps landed at d=1 and 80 at d=25 (the sample counts behind those two p50/p99 pairs); store ended at 43.0 GiB of which 17 MiB is the seed; branch-management time 219.1 s summed over workers (5.2x wall at effective concurrency 8 of 8 requested); 0 CAS retries; store sizes approximate: 15 entries vanished or were unreadable during the size walks
 - `failure_repro` (flat, 1 worker; T=1, S=10, F_r=10, F_i=0, D=1, C=0, γ=1.0, M_s=5, M_d=45, Q_v=1): max depth reached 1; no cross-branch queries (C=0); all 10 steps landed at d=1; store ended at 82 MiB of which 17 MiB is the seed; branch-management time 776 ms summed over workers (0.5x wall at effective concurrency 1 of 8 requested); 0 CAS retries
 
-(`v0.2.11-15-g67cc6b1-dirty` is `git describe` for commit `67cc6b1`, v0.2.12
-unreleased; `-dirty` because this run was taken with the local-store
+(`v0.2.11-15-g67cc6b1-dirty` is `git describe` for commit `67cc6b1`, before the v0.2.12
+tag; `-dirty` because this run was taken with the local-store
 `List` fix (see "What changed") applied but not yet committed; it was then
 committed unchanged as `d8f50dd`, and is the only Go source that differed
 from `67cc6b1`.)

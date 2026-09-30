@@ -13,6 +13,10 @@ version if you depend on format stability.
 
 ## [Unreleased]
 
+Nothing yet.
+
+## [0.2.12] - 2026-09-30
+
 Pointers and deltas, not copies: the operations that used to copy a whole
 database locally or in the store now clone, diff or point instead, where
 the filesystem and the chain allow it. Measured in
