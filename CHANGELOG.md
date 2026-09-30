@@ -109,8 +109,9 @@ full snapshot. The O(1) clean check, shared rollback/promote and the
   accumulate.** Listing a lineage's objects walked the whole store
   directory, which on a local store also holds every checkout, `.shadow`
   and by-chain entry; it now reads only that lineage's directory. With
-  chains that follow base pointers (one listing per hop), the old walk was
-  1.1 s per chain resolution late in BranchBench's `mcts` run and made
+  chains that follow base pointers (one listing per hop), the old walk cost
+  1.1 s per chain resolution late in BranchBench's `mcts` run (the
+  "Diagnostic instrumentation" tables in docs/benchmarks.md) and made
   that topology 3x slower during this cycle (197.2 s). Measured after the
   fix: `mcts` 41.9 s, against 63.3 s on v0.2.11, with fork, checkout and
   checkpoint at 32.6 / 78.5 / 67.3 ms p50 at depth 25; all five topologies

@@ -244,11 +244,11 @@ milliseconds don't):
 - **A fresh checkout's first query reads from disk, not the page
   cache.** A checkout is now a clone, and a clone starts with a cold page
   cache even when its source is warm: on the reference machine BranchBench's
-  eval query (a scan of `order_line` in the 17 MiB seed) took ~58 ms on a
-  fresh clone and ~6 ms on a freshly written copy. BranchBench's eval p50 rose
-  accordingly (`simulation` 11.5 → 56.4 ms) while its checkout p50 fell
-  (314.0 → 43.0 ms); the step as a whole got faster
-  ([the numbers](benchmarks.md#branchbench-topologies-v0212)).
+  eval query (a scan of `order_line` in a 17 MiB database) took 50.6-54.9 ms
+  on a fresh clone and 6.3-6.4 ms on a freshly written copy. BranchBench's
+  eval p50 rose accordingly (`simulation` 11.5 → 56.4 ms) while its
+  checkout p50 fell (314.0 → 43.0 ms); the step as a whole got faster
+  ([the numbers, and the "Diagnostic instrumentation" tables](benchmarks.md#branchbench-topologies-v0212)).
 - **A session whose checkout had to be (re)materialized pays one settling
   full-snapshot flush** after open — O(size), once per session; reopening
   a clean, current checkout uploads nothing.

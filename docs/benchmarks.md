@@ -596,13 +596,14 @@ within a few percent:
   whole store directory — which also holds every checkout, its `.shadow`
   and the by-chain entries — and filtered by prefix. Resolving a chain
   Lists one lineage per base hop (up to 16 since forks share), and each
-  fork, checkout and checkpoint resolves about one chain. Instrumented,
-  one `List` cost 23.8 ms early in an `mcts` run and 132 ms late (with
-  ~890 live checkouts on disk), one chain resolution 1.1 s, and that was
-  the ~0.7 s p50 every operation had gained at depth 25; the clone calls
-  themselves stayed at 0.1-0.5 ms plus a ~4-5 ms fsync throughout. `List`
-  now reads only the directory its prefix names: 0.06 ms per call late in
-  the same run. At depth 25, fork / checkout / checkpoint p50 went 703.8 /
+  fork, checkout and checkpoint resolves about one chain. Instrumented
+  (table 1 under "Diagnostic instrumentation" below), one `List` cost
+  23.8 ms early in an `mcts` run and 132.0 ms late (with ~890 live
+  checkouts on disk), one chain resolution 1,099.5 ms, and that was the
+  ~0.7 s p50 every operation had gained at depth 25; the clone calls
+  themselves stayed at 0.22-0.47 ms plus a 3.90-4.65 ms fsync. `List` now
+  reads only the directory its prefix names: 0.06 ms per call late in an
+  instrumented run with the fix. At depth 25, fork / checkout / checkpoint p50 went 703.8 /
   734.7 / 730.6 ms (the regressed run) → 32.6 / 78.5 / 67.3 ms, against
   84.1 / 290.1 / 103.1 ms before v0.2.12. The whole-directory walk predates
   v0.2.12; it only became expensive once chains recursed across base
@@ -611,25 +612,82 @@ within a few percent:
   the page cache.** `simulation` 11.5 → 56.4 ms, `data_cleaning`
   7.0 → 50.3 ms and `mcts` 8.2 → 68.4 ms at depth 1; `software_dev` and
   `failure_repro` are unchanged. A clone does not share its source's
-  cached pages. Measured on its own: the eval query on a fresh clone of the
-  17 MiB seed took ~58 ms, the same query on a freshly *written* copy ~6
-  ms, and a second query on the clone ~6 ms. So a checkout that got
+  cached pages. Measured on its own (table 2 under "Diagnostic
+  instrumentation" below): the eval query on a fresh clone of a 17 MiB
+  `mcts` state took 50.6-54.9 ms, the same query on a freshly *written*
+  copy 6.3-6.4 ms, and a second query on the clone 6.2-6.3 ms. So a checkout that got
   hundreds of ms cheaper hands its first query a cold cache; the step as a
   whole is still faster (the wall times above). `mcts` at depth 25 reads
   103.0 ms; that is not the file's depth — fresh clones of kept `mcts`
-  checkouts queried one at a time took 36.4 ms p50 at depth 1 and 39.2 ms
-  at depth 25 (8 each) — and is attributed, by elimination rather than
+  checkouts queried one at a time took 37.1 ms p50 at depth 1 and 39.7 ms
+  at depth 25 (8 each, table 2) — and is attributed, by elimination rather than
   measurement, to 8 workers' cold reads and branch I/O sharing one disk.
 - **Store objects shrank; the logical `Store peak` did not.** `simulation`
   fell from 12.0 GiB to 650 MiB because its checkpoints are now segments of
   the pages its 50 mutations touched, not 17 MiB snapshots. The others grew because
   `Store peak` now also counts each live branch's `.shadow` and by-chain
   entries at full size. A diagnostic `mcts` run (before the `List` fix)
-  kept its store to look: of 43.2 GiB logical, 0.64 GiB was store objects
+  kept its store to look (table 3 below): of 43.2 GiB logical, 0.64 GiB was store objects
   under `data/`; the rest was 14.55 GiB of checkouts, 14.55 GiB of shadows
   and 13.44 GiB of by-chain entries — clones of one another. The disk's
   used space grew by about 1.8 GiB over that run (`df`, so approximate —
   other processes wrote too).
+
+**Diagnostic instrumentation (2026-09-30, not a make target).** The
+figures the three bullets above quote that are not in the pasted table.
+Machine: darwin/arm64, Apple M5, 10 cores, macOS 27.0, local APFS disk,
+Go 1.27.1, no other load, measured 2026-09-30.
+
+*Table 1 — wall-clock profile of `mcts`.* Temporary instrumentation (a
+wall-clock span at the top of ~40 functions in `internal/store`,
+`internal/ops`, `internal/ops/reflink` and `internal/ltxio`, bucketed by
+30 s of run time; removed before committing) during `go run
+./cmd/branchbench -workflows mcts`. Run 1 is the code before the `List`
+fix (216.1 s); its depth-25 samples fall in the late bucket. Run 2 has the
+fix (42.8 s). Means per call; the raw dumps were not kept, and these are
+the figures transcribed from them the same day.
+
+| Span | Run 1, 0-30 s | Run 1, 180-210 s | Run 2, 30-60 s |
+|---|---|---|---|
+| `Fork` / `Checkout` / `Checkpoint` | 211.6 / 219.7 / 209.8 ms | 1,170.5 / 1,119.0 / 1,119.9 ms | 63.7 / 95.1 / 67.3 ms |
+| `store.Chain` (one per operation) | 164.9 ms | 1,099.5 ms | 0.68 ms |
+| local `List` | 23.8 ms | 132.0 ms | 0.06 ms |
+| `List` calls per `Chain` | ~7.0 | ~8.3 | ~7.4 |
+| `clonefile(2)` | 0.47 ms | 0.22 ms | 1.21 ms |
+| fsync after a clone | 4.65 ms | 3.90 ms | 6.48 ms |
+| parent-checkout quiesce and check in `Fork` | 10.8 ms | 4.6 ms | – |
+
+*Table 2 — cold page cache on a clone.* The eval query (`SELECT ol_w_id,
+SUM(ol_amount) FROM order_line GROUP BY ol_w_id`, Python's `sqlite3`)
+against files from a kept `mcts` store (after the fix), one query at a
+time. Rows A: a by-chain entry cloned with `cp -c`, or written out
+byte-for-byte, then queried; three trials. Rows B: a fresh clone of each
+of 8 kept checkouts per depth, p50.
+
+| Case | Fresh clone | Same clone, second query | Freshly written copy |
+|---|---|---|---|
+| A, trial 1 | 54.9 ms | 6.2 ms | 6.3 ms |
+| A, trial 2 | 50.6 ms | 6.3 ms | 6.4 ms |
+| A, trial 3 | 52.3 ms | 6.3 ms | 6.3 ms |
+| B, depth 1 | 37.1 ms | 6.2 ms | 7.9 ms |
+| B, depth 5 | 37.6 ms | 6.1 ms | 7.3 ms |
+| B, depth 10 | 40.1 ms | 6.2 ms | 7.5 ms |
+| B, depth 15 | 39.7 ms | 6.2 ms | 7.1 ms |
+| B, depth 20 | 38.2 ms | 6.2 ms | 6.9 ms |
+| B, depth 25 | 39.7 ms | 6.2 ms | 6.8 ms |
+
+*Table 3 — what the logical `Store peak` holds.* A kept `mcts` store
+(before the fix, 214.8 s run), logical sizes by area (`os.walk`,
+`st_size`):
+
+| Area | Files | Logical size |
+|---|---|---|
+| `checkouts-ro/…/~by-chain` entries | 2,380 | 13.44 GiB |
+| checkout `.db` files | 891 | 14.55 GiB |
+| `.shadow` files | 891 | 14.55 GiB |
+| store objects (`data/`) | 2,002 | 0.64 GiB |
+
+`df` used space grew 1,897,452 KiB (1.81 GiB) over that run.
 
 **What BranchBench found on hosted systems.** For context — these are the
 authors' numbers on hosted Postgres-family systems, not ours:
@@ -677,7 +735,8 @@ on a local copy-on-write SQLite store.
   the read cost: `software_dev` reads 15.6 → 13.3 ms. The table's
   `data_cleaning` (50.3 → 66.9 ms) and `mcts` (68.4 → 103.0 ms) cells do
   rise with depth; queried one at a time, fresh clones of `mcts` checkouts
-  read the same at depth 1 and depth 25 (36.4 vs 39.2 ms p50), so the rise
+  read the same at depth 1 and depth 25 (37.1 vs 39.7 ms p50, table 2 under
+  "Diagnostic instrumentation"), so the rise
   in the table is the cold-cache first read under 8-way load described
   under "What changed", not depth in the file.
 - **Depth does not cost branch operations.** At depth 25, `mcts` fork,
@@ -698,7 +757,8 @@ on a local copy-on-write SQLite store.
   8-way topologies on the same 17 MiB seed. The difference is queueing:
   eight workers deep on one laptop's disk and page cache. `Fork` at head
   also quiesces and checks the *parent's* checkout; instrumented in an
-  `mcts` run that cost 4.5-10.8 ms mean per fork, so it is not what
+  `mcts` run that cost 4.6-10.8 ms mean per fork (table 1 under
+  "Diagnostic instrumentation"), so it is not what
   separates these cells from `failure_repro` — 8-way I/O contention and
   the floor materialization above are what is left, and this run does not
   split them. Read these

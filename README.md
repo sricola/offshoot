@@ -403,9 +403,11 @@ all. `offshoot fork` shares the parent's already-durable objects through a
 base pointer: the child records where it forked from and writes new
 objects only as it diverges, so N forks of a G-byte database cost
 near-zero added store bytes rather than N×G, and reads stay bounded by
-construction. The asymmetry to know: **fork shares; `promote`,
-`rollback`, and `compact` each materialize a full independent copy**
-(measured numbers in [docs/benchmarks.md](docs/benchmarks.md)). Destroying
+construction. The asymmetry to know: **fork, `promote` and `rollback`
+share; `compact` materializes a full independent copy**, because cutting
+the base pointer is its purpose, and `--materialize` on `promote` or
+`rollback` asks for a copy too (measured numbers in
+[docs/benchmarks.md](docs/benchmarks.md)). Destroying
 a parent stays instant, but its bytes are reclaimed only once no surviving
 shared child still reads through them — `offshoot compact` cuts that cord
 on demand. The first shared fork bumps the store to layout version 2,
