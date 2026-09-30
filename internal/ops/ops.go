@@ -344,16 +344,13 @@ func (w *Workspace) CheckoutProven(db, branch string) (CheckoutResult, error) {
 		observeCheckoutSource(placed.kind)
 	}
 	hash := placed.hash
-	if hash == "" {
+	if hash == "" { // no-cache fallback: hash it as writeSum always did
 		if hash, err = fileSum(path); err != nil {
 			return CheckoutResult{}, err
 		}
 	}
 	if err := StampSum(path, hash, ref.Lineage, ref.HeadEpoch, ref.HeadTXID, placed.checksum, placed.chainID); err != nil {
 		return CheckoutResult{}, err
-	}
-	if placed.kind != "clone" {
-		w.populateByChain(db, placed.chainID, path, hash, placed.checksum)
 	}
 	return CheckoutResult{Path: path, Clean: false, Ref: ref}, nil
 }

@@ -237,10 +237,10 @@ func (w *Workspace) CheckoutAt(db, branch, checkpoint string, force bool) (strin
 	if err := os.MkdirAll(filepath.Dir(path), 0o755); err != nil {
 		return "", err
 	}
-	// Consult the by-chain area before materializing, and populate it
-	// after a miss (see materializeFromChain / populateByChain) — the same
+	// Go through the by-chain area (see materializeFromChain) — the same
 	// cache CheckoutProven uses, so a checkpoint any branch has already
-	// materialized is a clone here, and vice versa.
+	// materialized is a clone here, and a miss here builds the entry the
+	// next writable checkout of that chain clones.
 	members, err := w.resolveChain(ref, cp, path)
 	if err != nil {
 		return "", fmt.Errorf("ops: checkout-at %s@%s@%s: %w", db, branch, checkpoint, err)
@@ -269,14 +269,6 @@ func (w *Workspace) CheckoutAt(db, branch, checkpoint string, force bool) (strin
 				db, branch, checkpoint, err, rmErr)
 		}
 		return "", fmt.Errorf("ops: checkout-at %s@%s@%s materialized but could not be marked read-only (the file was removed; retry will re-materialize): %w", db, branch, checkpoint, err)
-	}
-	if placed.kind != "clone" {
-		// A by-chain entry needs its content hash (CheckoutProven stamps a
-		// clone with it instead of re-hashing); this file has no sidecar, so
-		// hash it once here, on the miss path that just wrote it anyway.
-		if hash, err := fileSum(path); err == nil {
-			w.populateByChain(db, placed.chainID, path, hash, placed.checksum)
-		}
 	}
 	return path, nil
 }

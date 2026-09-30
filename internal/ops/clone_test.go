@@ -429,3 +429,52 @@ func TestCheckoutAtSharesTheByChainCache(t *testing.T) {
 		t.Fatalf("checkout sources = %s, want materialize,clone,clone", got)
 	}
 }
+
+// TestMaterializeMissBuildsImmutableEntryFirst pins the populate order: on
+// a materialize miss the entry is built first and the writable checkout is
+// a clone of it, so the entry's recorded hash and checksum describe the
+// entry's own bytes (not the checkout's), and a write to the checkout
+// afterwards never reaches the entry a later fork clones.
+func TestMaterializeMissBuildsImmutableEntryFirst(t *testing.T) {
+	w := newWS(t)
+	requireClone(t, w)
+	seedDB(t, w, "app", 1<<20)
+	kinds := recordKinds(t)
+	mustFork(t, w, "app", "main", "m0", "seed")
+	path := mustCheckout(t, w, "app", "m0")
+	id := headChainID(t, w, "app", "m0")
+	entry := w.byChainPath("app", id)
+
+	if !bytes.Equal(readFile(t, path), readFile(t, entry)) {
+		t.Fatal("writable checkout and its by-chain entry differ")
+	}
+	assertEntryRecordMatchesItself := func() {
+		t.Helper()
+		rec, ok := readSidecar(entry)
+		if !ok || rec.ChainID != id {
+			t.Fatalf("entry sidecar = %+v (ok %v), want chain_id %s", rec, ok, id)
+		}
+		hash, err := fileSum(entry)
+		if err != nil {
+			t.Fatal(err)
+		}
+		sum, err := ltxio.ChecksumDatabase(entry)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if rec.Hash != hash || rec.PostApplyChecksum != sum {
+			t.Fatalf("entry record (hash %s, checksum %016x) != entry's own bytes (hash %s, checksum %016x)",
+				rec.Hash, rec.PostApplyChecksum, hash, sum)
+		}
+	}
+	assertEntryRecordMatchesItself()
+
+	// A write to the fresh checkout lands in the checkout's own extents only.
+	mustSQL(t, path, "INSERT INTO t (v) VALUES (randomblob(5000));")
+	assertEntryRecordMatchesItself()
+	mustFork(t, w, "app", "main", "m1", "seed")
+	assertCheckoutMatches(t, w, "app", "m1", mustCheckout(t, w, "app", "m1"))
+	if got := strings.Join(*kinds, ","); got != "materialize,clone" {
+		t.Fatalf("checkout sources = %s, want materialize,clone", got)
+	}
+}

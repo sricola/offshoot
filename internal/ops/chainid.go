@@ -53,29 +53,37 @@ type chainPlacement struct {
 	kind     string // see observeCheckoutSource
 	chainID  string
 	checksum uint64 // LTX post-apply checksum of the content
-	// hash is the content's SHA-256 when known without reading the file
-	// (a whole-chain clone carries its entry's recorded hash: identical
-	// bytes); "" when the content was freshly written and must be hashed.
+	// hash is the content's SHA-256 when known without reading dst: the
+	// by-chain entry's recorded hash, since dst is a clone of it (identical
+	// bytes). "" only on the no-cache fallback, where dst must be hashed.
 	hash string
 }
 
 // materializeFromChain writes the content of the resolved chain members
-// (ref lineage lineage, database db) into dst via a temp file renamed into
-// place — never in place — preferring, in order:
+// (lineage lineage, database db) at dst, via a temp file renamed into
+// place — never in place. dst is always either a clone of an immutable
+// by-chain entry or, where cloning is impossible, a plain materialize:
 //
-//  1. a by-chain entry for the whole chain: cloned, chmod'd to mode,
-//     renamed over dst;
-//  2. a by-chain entry for the longest proper prefix: ltxio.ApplySegments
-//     from it with only the remaining members fetched from the store;
-//  3. a full materialize from the store, exactly as before this cache.
+//  1. an entry for the whole chain exists: clone it to dst ("clone");
+//  2. otherwise, when the filesystem can clone, build the whole-chain entry
+//     first — from the longest cached prefix plus ltxio.ApplySegments of
+//     the remaining members ("clone+segments"), or from the store
+//     ("materialize") — and then clone it to dst;
+//  3. otherwise materialize from the store straight into dst, exactly as
+//     before this cache existed ("materialize", no entry).
+//
+// Building the entry before dst exists is what keeps the cache honest: an
+// entry's bytes, hash and checksum all describe a file that was 0444
+// before it was ever visible under its entry name, and nothing reads the
+// writable checkout to create one — a write racing into a fresh checkout
+// can corrupt that checkout only, never another branch's future clone.
 //
 // Any failure of a fast path (clone unsupported, an entry evicted between
 // its sidecar read and the clone, a prefix apply that does not verify)
-// falls through to the next; only the full materialize's own errors are
-// returned. dst's stale -wal/-shm siblings are removed after a rename, as
-// ltxio's finalizeDestination does. mode applies to a cloned file only
-// (an entry is 0444; a writable checkout wants 0600 like a materialized
-// temp file, a checkouts-ro file keeps 0444).
+// falls through to the next; only the final direct materialize's errors
+// are returned. mode is dst's mode after cloning (an entry is 0444; a writable
+// checkout wants 0600 like a materialized temp file; a checkouts-ro file
+// keeps 0444).
 func (w *Workspace) materializeFromChain(db, lineage string, members []store.ChainMember, dst string, mode os.FileMode) (chainPlacement, error) {
 	id := chainID(members)
 	if entry, rec, ok := w.byChainEntry(db, id); ok {
@@ -84,22 +92,114 @@ func (w *Workspace) materializeFromChain(db, lineage string, members []store.Cha
 			return chainPlacement{kind: "clone", chainID: id, checksum: rec.PostApplyChecksum, hash: rec.Hash}, nil
 		}
 	}
-	for k := len(members) - 1; k >= 1; k-- {
-		entry, rec, ok := w.byChainEntry(db, chainID(members[:k]))
-		if !ok {
-			continue
+	if w.canCloneByChain(db, dst) {
+		// Any failure here — including a store error, which the fallback
+		// below then reports — or an entry evicted before the clone, falls
+		// back to materializing dst directly.
+		if kind, rec, err := w.buildByChainEntry(db, lineage, members, id); err == nil {
+			if err := cloneIntoPlace(w.byChainPath(db, id), dst, mode); err == nil {
+				return chainPlacement{kind: kind, chainID: id, checksum: rec.PostApplyChecksum, hash: rec.Hash}, nil
+			}
 		}
-		if checksum, err := w.applyMembersOnto(entry, rec.PostApplyChecksum, members[k:], dst); err == nil {
-			touchLastUsed(entry)
-			return chainPlacement{kind: "clone+segments", chainID: id, checksum: checksum}, nil
-		}
-		break // the longest cached prefix failed; a shorter one is no better than the store
 	}
 	checksum, err := w.materializeMembersAt(lineage, members, dst)
 	if err != nil {
 		return chainPlacement{}, err
 	}
 	return chainPlacement{kind: "materialize", chainID: id, checksum: checksum}, nil
+}
+
+// canCloneByChain reports whether a file in db's by-chain directory can be
+// cloned into dst's directory, by cloning a tiny probe file across exactly
+// that pair (a few syscalls, next to a materialize). When it cannot, the
+// by-chain directory is removed again if this left it empty, so a non-CoW
+// filesystem carries no trace of the cache.
+func (w *Workspace) canCloneByChain(db, dst string) bool {
+	dir := filepath.Join(w.roCacheRoot(), db, byChainDir)
+	if err := os.MkdirAll(dir, 0o755); err != nil {
+		return false
+	}
+	ok := false
+	defer func() {
+		if !ok {
+			os.Remove(dir) // only succeeds while empty
+		}
+	}()
+	probe, err := os.CreateTemp(dir, "probe-*")
+	if err != nil {
+		return false
+	}
+	probe.Close()
+	defer os.Remove(probe.Name())
+	tmp, err := cloneToTemp(probe.Name(), dst)
+	if err != nil {
+		return false
+	}
+	os.Remove(tmp)
+	ok = true
+	return true
+}
+
+// buildByChainEntry creates the entry for chain id: its content is written
+// to a staging file in the by-chain directory — applied onto the longest
+// cached prefix entry when one verifies, else materialized from the store —
+// made 0444, hashed, renamed to the entry name, and only then given the
+// .sum sidecar that makes byChainEntry accept it. Returns how the content
+// was produced ("clone+segments" or "materialize") and the entry's record.
+func (w *Workspace) buildByChainEntry(db, lineage string, members []store.ChainMember, id string) (string, sumRecord, error) {
+	entry := w.byChainPath(db, id)
+	f, err := os.CreateTemp(filepath.Dir(entry), filepath.Base(entry)+".stage-*")
+	if err != nil {
+		return "", sumRecord{}, err
+	}
+	stage := f.Name()
+	f.Close()
+	defer os.Remove(stage) // a no-op once renamed to the entry
+
+	kind := "materialize"
+	checksum, applied := w.applyLongestPrefix(db, members, stage)
+	if applied {
+		kind = "clone+segments"
+	} else if checksum, err = w.materializeMembersAt(lineage, members, stage); err != nil {
+		return "", sumRecord{}, err
+	}
+	if err := os.Chmod(stage, 0o444); err != nil {
+		return "", sumRecord{}, err
+	}
+	hash, err := fileSum(stage)
+	if err != nil {
+		return "", sumRecord{}, err
+	}
+	if err := os.Rename(stage, entry); err != nil {
+		return "", sumRecord{}, err
+	}
+	if err := StampSum(entry, hash, "", 0, 0, checksum, id); err != nil {
+		return "", sumRecord{}, err
+	}
+	return kind, sumRecord{Hash: hash, PostApplyChecksum: checksum, ChainID: id}, nil
+}
+
+// applyLongestPrefix finds the longest proper prefix of members with a
+// by-chain entry and applies the remaining members onto a copy of it at
+// dst (see ltxio.ApplySegments). ok=false when there is no such entry or
+// its apply does not verify; a shorter prefix is not tried then, as it is
+// no better than the store.
+func (w *Workspace) applyLongestPrefix(db string, members []store.ChainMember, dst string) (checksum uint64, ok bool) {
+	for k := len(members) - 1; k >= 1; k-- {
+		entry, rec, found := w.byChainEntry(db, chainID(members[:k]))
+		if !found {
+			continue
+		}
+		readers, closeAll := w.memberReaders(members[k:])
+		defer closeAll()
+		_, checksum, err := ltxio.ApplySegments(entry, rec.PostApplyChecksum, readers, dst)
+		if err != nil {
+			return 0, false
+		}
+		touchLastUsed(entry)
+		return checksum, true
+	}
+	return 0, false
 }
 
 // byChainEntry returns the by-chain entry for id when both its file and a
@@ -116,7 +216,8 @@ func (w *Workspace) byChainEntry(db, id string) (string, sumRecord, bool) {
 }
 
 // cloneIntoPlace clones src to a temp file in dst's directory, sets mode,
-// and renames it over dst.
+// and renames it over dst, removing dst's stale -wal/-shm siblings as
+// ltxio's finalizeDestination does.
 func cloneIntoPlace(src, dst string, mode os.FileMode) error {
 	tmp, err := cloneToTemp(src, dst)
 	if err != nil {
@@ -152,48 +253,4 @@ func cloneToTemp(src, dst string) (string, error) {
 		return "", err
 	}
 	return tmp, nil
-}
-
-// applyMembersOnto applies the segment members onto a copy of start (whose
-// checksum is startChecksum) and renames the result over dst — see
-// ltxio.ApplySegments.
-func (w *Workspace) applyMembersOnto(start string, startChecksum uint64, segments []store.ChainMember, dst string) (uint64, error) {
-	readers, closeAll := w.memberReaders(segments)
-	defer closeAll()
-	_, checksum, err := ltxio.ApplySegments(start, startChecksum, readers, dst)
-	return checksum, err
-}
-
-// populateByChain records src (content of chain id, with the given SHA-256
-// and post-apply checksum) as the by-chain entry for id: cloned into the
-// entry directory, chmod 0444, renamed into place, then its sidecar
-// written. Best-effort and silent — the checkout it follows has already
-// succeeded — and a no-op where the filesystem cannot clone, so a non-CoW
-// filesystem never pays a second full write (and gets no by-chain
-// directory at all).
-//
-// src is a file this process has just renamed into place (a fresh writable
-// checkout, or a checkouts-ro file): no SQLite connection anywhere holds
-// its new inode yet, so the clone's brief open of it (FICLONE on Linux)
-// cannot drop anyone's POSIX locks.
-func (w *Workspace) populateByChain(db, id, src, hash string, checksum uint64) {
-	entry := w.byChainPath(db, id)
-	dir := filepath.Dir(entry)
-	if err := os.MkdirAll(dir, 0o755); err != nil {
-		return
-	}
-	tmp, err := cloneToTemp(src, entry)
-	if err != nil {
-		os.Remove(dir) // only succeeds while empty: leave no trace of a failed populate
-		return
-	}
-	if err := os.Chmod(tmp, 0o444); err != nil {
-		os.Remove(tmp)
-		return
-	}
-	if err := os.Rename(tmp, entry); err != nil {
-		os.Remove(tmp)
-		return
-	}
-	_ = StampSum(entry, hash, "", 0, 0, checksum, id)
 }
