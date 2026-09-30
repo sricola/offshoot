@@ -377,8 +377,9 @@ func (s *Store) lineageBase(lineage string) (*BasePointer, error) {
 
 // WriteLineageBase durably records a lineage's base pointer, create-only: a
 // lineage's base is immutable once written, so a second write is refused with
-// ErrCAS (surfaced as-is). The shared-fork path (ops.Fork) is the real
-// caller; it writes the base BEFORE the child ref CAS so resolution's source
+// ErrCAS (surfaced as-is). The shared path of ops.Fork, Rollback and
+// Promote (ops' newLineageAt) is the real caller; it writes the base BEFORE
+// the ref CAS so resolution's source
 // of truth exists by the time any reader can see the child.
 //
 // A base naming the lineage itself is refused outright: Chain resolves a
@@ -439,6 +440,33 @@ func (s *Store) BaseSpine(lineage string) ([]string, error) {
 		}
 		seen[b.Lineage] = true
 		spine = append(spine, b.Lineage)
+		cur = b.Lineage
+	}
+}
+
+// CollapseBase returns the lineage a new base pointer at txid should name,
+// starting from lineage: while the current lineage has a base b with
+// txid <= b.TXID, it is a pure pass-through at txid (Chain resolves such a
+// target entirely in b.Lineage), so the walk moves to b.Lineage. Pointing
+// past those hops resolves to identical content and keeps a spine bounded
+// by real divergence points instead of growing one pass-through lineage per
+// shared fork, rollback or promote at an older txid. A read error (or a
+// cycle in a corrupt store) is returned, never skipped.
+func (s *Store) CollapseBase(lineage string, txid uint64) (string, error) {
+	seen := map[string]bool{lineage: true}
+	cur := lineage
+	for {
+		b, err := s.lineageBase(cur)
+		if err != nil {
+			return "", err
+		}
+		if b == nil || txid > b.TXID {
+			return cur, nil
+		}
+		if seen[b.Lineage] {
+			return "", fmt.Errorf("store: base spine of %s revisits lineage %s (cycle)", lineage, b.Lineage)
+		}
+		seen[b.Lineage] = true
 		cur = b.Lineage
 	}
 }

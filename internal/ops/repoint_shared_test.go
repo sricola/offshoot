@@ -3,6 +3,7 @@ package ops
 import (
 	"bytes"
 	"errors"
+	"fmt"
 	"io/fs"
 	"path/filepath"
 	"testing"
@@ -306,5 +307,41 @@ func TestMaterializeOptionForcesCopy(t *testing.T) {
 	}
 	if !bytes.Equal(exportBytes(t, w, "app", "main", ""), a) {
 		t.Fatal("promoted content differs from the export of a")
+	}
+}
+
+// TestRepeatedRollbacksToOneCheckpointKeepTheSpineFlat: the routine agent
+// loop (try, roll back to "a", try, roll back to "a") must not stack a
+// pass-through lineage per rollback. Each new base pointer skips the hops
+// that pass through at a's txid, so the spine stays at the one real
+// divergence point.
+func TestRepeatedRollbacksToOneCheckpointKeepTheSpineFlat(t *testing.T) {
+	w := newWS(t)
+	path, a := seedAB(t, w, "app", 1<<20)
+	root := refOf(t, w, "app", "main").Lineage
+	for i := 0; i < 6; i++ {
+		res, err := w.RollbackWith("app", "main", "a", RollbackOptions{NoBackup: true})
+		if err != nil {
+			t.Fatal(err)
+		}
+		if !res.Shared {
+			t.Fatalf("rollback %d did not share", i)
+		}
+		ref := refOf(t, w, "app", "main")
+		spine, err := w.Store.BaseSpine(ref.Lineage)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if len(spine) != 1 || spine[0] != root {
+			t.Fatalf("rollback %d: spine %v, want [%s]", i, spine, root)
+		}
+		if ref.Base == nil || ref.Base.Lineage != root {
+			t.Fatalf("rollback %d: ref.Base %+v, want lineage %s", i, ref.Base, root)
+		}
+		if !bytes.Equal(readFile(t, res.Path), a) {
+			t.Fatalf("rollback %d: checkout differs from the export of a", i)
+		}
+		mustSQL(t, path, "INSERT INTO t (v) VALUES (randomblob(700));")
+		mustCheckpointWith(t, w, "app", "main", fmt.Sprintf("try%d", i), CheckpointOptions{})
 	}
 }

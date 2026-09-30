@@ -1038,8 +1038,10 @@ func (w *Workspace) shareBound() int {
 // the share-versus-materialize decision Fork, Rollback and Promote all take:
 //
 //   - SHARE (below the floor, materialize false): no snapshot/segment
-//     objects at all — the lineage is born as a base pointer {src.Lineage,
-//     cp.TXID} into src's already-durable chain, returned as base. Reads at
+//     objects at all — the lineage is born as a base pointer {L, cp.TXID}
+//     into src's already-durable chain, returned as base, where L is
+//     src.Lineage with every pass-through hop at cp.TXID skipped
+//     (store.CollapseBase): same resolved content, flat spine. Reads at
 //     or below cp.TXID resolve purely in src (Chain's target <= base.TXID
 //     branch); the new lineage's own segments concatenate on top.
 //   - MATERIALIZE (members at the floor, or materialize set): cp is copied
@@ -1057,6 +1059,13 @@ func (w *Workspace) newLineageAt(src store.Ref, cp store.Checkpoint, members []s
 		lineage, fast, err = w.copySnapshotToNewLineageFromChain(src, cp, members)
 		return lineage, nil, fast, err
 	}
+	// Name the nearest lineage that owns cp.TXID, skipping hops that only
+	// pass through at it, so repeated shares of one old txid (the rollback
+	// loop) never stack a pass-through lineage per call.
+	baseLineage, err := w.Store.CollapseBase(src.Lineage, cp.TXID)
+	if err != nil {
+		return "", nil, false, fmt.Errorf("ops: %s: resolving base for lineage %s at txid %d: %w", what, src.Lineage, cp.TXID, err)
+	}
 	lineage = store.NewLineageID()
 	// A base pointer must never land in a store an old (layout v1) binary
 	// could still open — its lineage-granular GC would sweep the shared
@@ -1064,7 +1073,7 @@ func (w *Workspace) newLineageAt(src store.Ref, cp store.Checkpoint, members []s
 	if err := w.Store.EnsureLayoutV2(); err != nil {
 		return "", nil, false, fmt.Errorf("ops: %s: %w", what, err)
 	}
-	bp := store.BasePointer{Lineage: src.Lineage, TXID: cp.TXID}
+	bp := store.BasePointer{Lineage: baseLineage, TXID: cp.TXID}
 	// The durable per-lineage base object is the resolution source of truth
 	// (it outlives the ref if src's branch is destroyed); Ref.Base is only
 	// its reporting mirror.

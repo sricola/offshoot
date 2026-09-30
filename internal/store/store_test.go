@@ -1333,3 +1333,41 @@ func TestCheckpointKindRoundTripsAndDefaultsEmpty(t *testing.T) {
 		}
 	}
 }
+
+// TestCollapseBase: the lineage a new base pointer at txid should name,
+// skipping every hop that is a pure pass-through at txid.
+func TestCollapseBase(t *testing.T) {
+	s := newStore(t)
+	// c -> b@5 -> a@2, a un-based.
+	if err := s.WriteLineageBase("b", BasePointer{Lineage: "a", TXID: 2}); err != nil {
+		t.Fatal(err)
+	}
+	if err := s.WriteLineageBase("c", BasePointer{Lineage: "b", TXID: 5}); err != nil {
+		t.Fatal(err)
+	}
+	for _, c := range []struct {
+		lineage string
+		txid    uint64
+		want    string
+	}{
+		{"a", 9, "a"}, // no base: the lineage itself
+		{"b", 3, "b"}, // above b's base txid: b owns txid 3
+		{"b", 2, "a"}, // at b's base txid: b passes through to a
+		{"c", 6, "c"}, // above c's base txid
+		{"c", 4, "b"}, // through c, but above b's base txid
+		{"c", 2, "a"}, // two pass-through hops collapse to the root
+		{"c", 1, "a"},
+	} {
+		got, err := s.CollapseBase(c.lineage, c.txid)
+		if err != nil || got != c.want {
+			t.Errorf("CollapseBase(%s, %d) = %q, %v; want %q, nil", c.lineage, c.txid, got, err, c.want)
+		}
+	}
+	// A read error is an error, never a silent fall-through.
+	if err := s.B.Put(BaseKey("bad"), []byte("{not json")); err != nil {
+		t.Fatal(err)
+	}
+	if got, err := s.CollapseBase("bad", 1); err == nil {
+		t.Fatalf("CollapseBase over a corrupt base.json = %q, nil; want an error", got)
+	}
+}

@@ -702,15 +702,22 @@ func TestGCKeepsPassThroughLineageBaseJSON(t *testing.T) {
 	if _, err := w.Fork("app", "main", "b", "", 0, nil); err != nil {
 		t.Fatal(err)
 	}
-	if _, err := w.Fork("app", "b", "c", "", 0, nil); err != nil {
-		t.Fatal(err)
-	}
 	bref, _, err := w.Store.GetRef("app", "b")
 	if err != nil {
 		t.Fatal(err)
 	}
-	cref, _, err := w.Store.GetRef("app", "c")
-	if err != nil {
+	// Fork now collapses pass-through hops (store.CollapseBase), so a fork
+	// of b at its fork point would base straight on A. Stores written
+	// before that change still hold C -> B -> A spines, and GC must keep
+	// them resolvable: build C exactly as the pre-collapse Fork did.
+	cLineage := store.NewLineageID()
+	cbase := store.BasePointer{Lineage: bref.Lineage, TXID: bref.HeadTXID}
+	if err := w.Store.WriteLineageBase(cLineage, cbase); err != nil {
+		t.Fatal(err)
+	}
+	cref := store.Ref{Lineage: cLineage, Epoch: 1, HeadTXID: bref.HeadTXID, HeadEpoch: 1, Base: &cbase}
+	cref.SetCheckpoint("fork", store.Checkpoint{TXID: bref.HeadTXID, Epoch: 1})
+	if _, err := w.Store.PutRef("app", "c", cref, ""); err != nil {
 		t.Fatal(err)
 	}
 	if bref.Base == nil || cref.Base == nil || cref.Base.Lineage != bref.Lineage {
