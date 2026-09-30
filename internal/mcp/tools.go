@@ -473,8 +473,10 @@ func (t *OffshootTools) Tools() []Tool {
 				"risky or destructive work (schema migrations, bulk deletes, " +
 				"experiments). Fork storage starts with two small metadata objects, " +
 				"regardless of database size. Forking a named checkpoint does not read " +
-				"database contents; the default at-head fork hashes the checkout to warn " +
-				"about uncheckpointed changes. " +
+				"database contents; the default at-head fork checks the checkout for " +
+				"uncheckpointed changes, proving it clean from its fingerprint (size, " +
+				"mtime, SQLite change counter) and hashing the checkout only when that " +
+				"does not match. " +
 				"Prefer forking over backing up by hand. Forks from the branch's " +
 				"current head by default, or from a named checkpoint via `at`. If a " +
 				"daemon session is open on the source branch, its unflushed writes are " +

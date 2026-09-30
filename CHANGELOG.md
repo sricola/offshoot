@@ -52,10 +52,11 @@ paragraphs).
 - **Metrics** `offshoot_rollback_total{mode}` and
   `offshoot_promote_total{mode}` (`shared`/`materialized`, both
   pre-registered at 0).
-- **CI:** a `cow-paths` job runs `internal/ops`, `internal/ltxio`,
-  `internal/ops/reflink` and `internal/session` on `macos-latest` on every
-  push and PR, so the clone, shadow and segment paths — which skip on the
-  ubuntu runner's ext4 — are tested before merge, not only weekly.
+- **CI:** a `cow-paths` job runs `internal/ops`, `internal/ltxio` and
+  `internal/ops/reflink`, plus `internal/session`'s two clone tests, on
+  `macos-latest` on every push and PR (20-minute timeout), so the clone,
+  shadow and segment paths — which skip on the ubuntu runner's ext4 — are
+  tested before merge, not only weekly.
 
 ### Changed
 
@@ -73,7 +74,14 @@ paragraphs).
   `offshoot_ro_cache_bytes` include them. Janitor eviction lines and
   `evicted` events for them carry branch `~by-chain` and the chain ID in
   the checkpoint position. `rm -rf checkouts-ro` stays safe.
-- **O(1) clean check.** The `.sum` sidecar gained `chain_id`, `size`,
+- **By-chain entries are capped at 64 per database by default**
+  (`ops.DefaultByChainMaxEntries`), pruned least-recently-used first after
+  each checkout that builds one — no daemon or `-ro-cache-budget` needed,
+  so a CLI-only user no longer keeps one full copy per chain forever.
+  `offshoot destroy` does not remove by-chain entries (another branch may
+  share them); the bound ages them out. Entries are `0400` and the
+  `checkouts-ro` directories `0700`, like the store's own `0600` objects;
+  a checkout's `.shadow` is `0600`.- **O(1) clean check.** The `.sum` sidecar gained `chain_id`, `size`,
   `mtime_ns`, `change_counter`, `stamped_ns` and `shadow`. A repeat
   `checkout` of an unchanged checkout is proven clean from identity, size,
   mtime and SQLite's change counter without hashing, provided the file's
@@ -91,7 +99,8 @@ paragraphs).
   `storage=shared`; they pin the lineage they point into until the branch
   diverges past it or is compacted (`offshoot compact`, which still always
   copies).
-- `offshoot destroy` also removes the checkout's `.shadow`.
+- `offshoot destroy` also removes the checkout's `.shadow` (and a
+  leftover `.shadow.tmp`).
 
 ### Behaviour on non-reflink filesystems
 

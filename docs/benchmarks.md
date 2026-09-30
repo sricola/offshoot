@@ -423,6 +423,13 @@ Desktop stopped, skipped the Postgres rows, and measured the offshoot
 rows at 55.63 / 201.43 ms (`fork` + `open` + `close`) and 9.70 / 8.80 ms
 (`fork` alone), within noise of the run above.
 
+**Re-run after the local-store `List` fix** (`d8f50dd`, see "BranchBench
+topologies" below), same machine, 2026-09-30, Docker not reachable so the
+Postgres rows were skipped and the paste above is kept rather than
+replaced: `fork` alone 8.79 / 8.62 ms median at 10 / 100 MB (p95
+10.24 / 9.71), against 11.96 / 9.63 ms above; `fork` + `open` + `close`
+52.64 / 198.33 ms, within noise of the 54.89 / 199.78 ms above.
+
 ## BranchBench topologies (v0.2.12)
 
 BranchBench ("Aligning Database Branching with Agentic Demands" — Elaine Ang,
@@ -610,8 +617,9 @@ within a few percent:
   pointers and the directory filled with shadows and by-chain entries.
 - **Eval (read) latency rose where checkouts are fresh clones, and that is
   the page cache.** `simulation` 11.5 → 56.4 ms, `data_cleaning`
-  7.0 → 50.3 ms and `mcts` 8.2 → 68.4 ms at depth 1; `software_dev` and
-  `failure_repro` are unchanged. A clone does not share its source's
+  7.0 → 50.3 ms and `mcts` 8.2 → 68.4 ms at depth 1; `software_dev` rose
+  far less (12.9 → 15.6 ms) and `failure_repro` is unchanged
+  (5.0 → 5.1 ms). A clone does not share its source's
   cached pages. Measured on its own (table 2 under "Diagnostic
   instrumentation" below): the eval query on a fresh clone of a 17 MiB
   `mcts` state took 50.6-54.9 ms, the same query on a freshly *written*
@@ -622,10 +630,23 @@ within a few percent:
   checkouts queried one at a time took 37.1 ms p50 at depth 1 and 39.7 ms
   at depth 25 (8 each, table 2) — and is attributed, by elimination rather than
   measurement, to 8 workers' cold reads and branch I/O sharing one disk.
+- **Checkout p50 at depth 1 rose for two topologies** — `software_dev`
+  158.0 → 225.3 ms and `mcts` 348.6 → 405.1 ms — while it fell 7x to 8x
+  for the other three. No diagnostic run isolated a depth-1 checkout, so
+  this is not attributed here. What the runs above do show is where such
+  a checkout can spend time that a pre-v0.2.12 one did not: a first miss
+  on a chain builds the by-chain entry before cloning the checkout from
+  it (see [operations](operations.md#the-by-chain-cache-and-the-checkout-sidecars)),
+  and whatever the step reads from a fresh clone reads it with a cold page
+  cache (table 2). Table 1's clone and fsync spans are single-digit
+  milliseconds, so the clone call itself does not account for a
+  57-67 ms rise.
 - **Store objects shrank; the logical `Store peak` did not.** `simulation`
   fell from 12.0 GiB to 650 MiB because its checkpoints are now segments of
-  the pages its 50 mutations touched, not 17 MiB snapshots. The others grew because
-  `Store peak` now also counts each live branch's `.shadow` and by-chain
+  the pages its 50 mutations touched, not 17 MiB snapshots, and
+  `failure_repro` fell from 167 to 82 MiB (no diagnostic run broke that
+  store down, so this page does not attribute it). `data_cleaning`,
+  `software_dev` and `mcts` grew because `Store peak` now also counts each live branch's `.shadow` and by-chain
   entries at full size. A diagnostic `mcts` run (before the `List` fix)
   kept its store to look (table 3 below): of 43.2 GiB logical, 0.64 GiB was store objects
   under `data/`; the rest was 14.55 GiB of checkouts, 14.55 GiB of shadows

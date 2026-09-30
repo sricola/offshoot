@@ -256,6 +256,20 @@ touches a `<cachefile>.last-used` sidecar to now; ranking falls back to the
 `.db` file's own mtime only for an entry that's never been hit since it was
 created.
 
+**By-chain entries are bounded by count, budget or not.** Each database
+keeps at most **64** `~by-chain/` entries (`ops.DefaultByChainMaxEntries`):
+after every checkout that builds an entry, that database's by-chain area is
+pruned least-recently-used first (same `.last-used` clock), with no daemon
+and no `-ro-cache-budget` needed. Without the bound every checkout miss on
+a cloning filesystem would leave one full physical copy behind for good.
+Eviction is always safe (the next miss on that chain rebuilds it); 64
+covers a deep MCTS spine plus its live siblings. `-ro-cache-budget` still
+applies on top, in bytes, when set. An entry belongs to no branch, so
+**`offshoot destroy` does not remove by-chain entries immediately** —
+another branch may share the same chain; a destroyed branch's entries age
+out under the bound as later checkouts push them down the LRU (or go with
+the budget, or an `rm -rf` of `checkouts-ro`).
+
 **`checkouts-ro` remains safe to `rm -rf` at any time, budget or not** — a
 budget just automates what manual cleanup would otherwise require by hand;
 the next call for anything under it rebuilds what it needs, since a
@@ -310,15 +324,18 @@ each can be deleted and is rebuilt — but each shows up in `ls` and in disk
 accounting, so it's worth knowing what they are.
 
 **`checkouts-ro/<db>/~by-chain/<chainID>.db`** (plus `.sum` and
-`.last-used`) — an immutable, `0444` copy of one resolved chain's content,
+`.last-used`) — an immutable, `0400` copy of one resolved chain's content
+(in `0700` directories),
 named by the SHA-256 of its object keys. Every writable checkout is a
 clone of one of these (APFS `clonefile`, Linux `FICLONE`); a miss builds
 the entry first, from a cached prefix of the chain plus the remaining
 segments when one exists, else from the store. Nothing ever reads a
 writable checkout to build an entry. On a filesystem that cannot clone
 there are no entries and checkouts materialize from the store as before.
-The entries live under the [`-ro-cache-budget`](#budgets) and are safe to
-`rm -rf` with the rest of `checkouts-ro`.
+The entries are capped at 64 per database and live under the
+[`-ro-cache-budget`](#budgets) (see [Budgets](#budgets)), are not removed
+by `offshoot destroy`, and are safe to `rm -rf` with the rest of
+`checkouts-ro`.
 
 **`checkouts/<db>/<branch>.db.sum`** — the sidecar recording what the
 checkout was materialized from. Its v0.2.12 fields — `chain_id`, `size`,

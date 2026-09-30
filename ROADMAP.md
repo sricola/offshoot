@@ -332,6 +332,20 @@ open wart (its own spec said "N materialized forks cost up to N×G").
   by-chain cache, an O(1) clean check, and at-rest segment checkpoints
   against a reflinked shadow. ⏸ **Compact stays a copy**, by design —
   dropping the base pointer is what it is for.
+- ⏭ **Tier 2 follow-ups from that work** (none blocks v0.2.12):
+  - Route Rollback/Promote/Compact's local checkout refresh through the
+    by-chain cache (`materializeFromChain`), so the local refresh is
+    O(delta) like `checkout`, not a full decode.
+  - Move `internal/ops/reflink` to `internal/reflink`: `internal/ltxio`
+    imports it today, a layering inversion.
+  - Pass the resolved chain members into `planSegment`, saving one Chain
+    resolution per at-rest checkpoint.
+  - Close the concurrent at-rest checkpoint race
+    ([limitations](docs/limitations.md#one-writer-per-branch)): after
+    winning the ref CAS, read the stored object's trailer checksum; on a
+    mismatch stamp `PostApplyChecksum=0` and drop the shadow, so neither
+    the next checkpoint nor a daemon session trusts content a same-kind
+    loser overwrote.
 
 ## Launch track (parallel to v0.1–v0.3)
 

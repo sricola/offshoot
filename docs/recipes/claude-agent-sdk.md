@@ -53,8 +53,14 @@ baseline case too.
 
 The rest of this recipe is about a specific upgrade: making
 `offshoot_checkpoint` and `offshoot_fork` ride *live daemon capture*
-(incremental, no full-snapshot re-encode) instead of running at rest, by
-making sure a session is already open before the agent's first tool call.
+(incremental from the captured WAL, no quiesce) instead of running at
+rest, by making sure a session is already open before the agent's first
+tool call. Since v0.2.12 the at-rest path is incremental too where it can
+be — it diffs the checkout against a reflinked shadow and uploads a
+segment of the changed pages — but it quiesces the checkout and reads it
+whole to find them, and falls back to a full snapshot when there is no
+usable shadow (a filesystem that cannot clone), at the snapshot cadence,
+or when half the pages changed.
 
 ## The MCP daemon-mode reality (read this before wiring hooks)
 
@@ -103,7 +109,8 @@ claude "Fix the flaky test in tests/test_orders.py, then checkpoint when it's gr
 
 Now every `offshoot_checkpoint` call the agent makes against `app` flushes
 through the already-open daemon session — incremental, no quiesce, no
-full-snapshot re-encode — instead of running the at-rest path. When the
+read of the whole checkout — instead of running the at-rest path (which
+writes a segment when its shadow allows, a full snapshot otherwise). When the
 agent is done, close the session the same way you opened it:
 
 ```

@@ -688,8 +688,9 @@ func (s *Store) chainFrom(lineage string, target uint64, seen map[string]bool) (
 		return s.chainFrom(base.Lineage, target, seen)
 	}
 	// Above the fork point: if the child has grown its OWN snapshot covering
-	// target (a divergence floor — ops.Checkpoint always writes one, and the
-	// session's snapshot cadence will too), resolution anchors there and
+	// target (a divergence floor — an at-rest ops.Checkpoint writes one
+	// whenever it has no usable shadow or reaches the snapshot bound, and
+	// the session's snapshot cadence does too), resolution anchors there and
 	// never touches the base: the whole chain lives in this one lineage.
 	// A shared child is born with zero objects and only ever writes txids
 	// above its fork point, so a child snapshot is necessarily > base.TXID

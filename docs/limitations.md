@@ -24,6 +24,20 @@ riskier problem than the one offshoot solves
 are copy-on-write and near-free, so fork-per-writer is the intended
 pattern, not a workaround.
 
+**Do not run two at-rest `offshoot checkpoint` commands on one branch
+concurrently.** The at-rest path takes no lease (see
+[One daemon per store](#one-daemon-per-store)); two racers compute the same
+next txid, and when both choose the same kind (snapshot or segment) the
+loser of the ref CAS can overwrite the winner's object with different
+content if a write landed on the checkout between their two encodes. The
+shadow guard forces the next at-rest checkpoint to a snapshot, but a daemon
+session opened on that checkout trusts the checksum recorded in its
+sidecar and can write a segment that does not apply. Serialize at-rest
+checkpoints per branch (one agent, one CLI caller at a time); the fix —
+read the stored object's trailer checksum after winning the CAS and, on a
+mismatch, stamp no checksum and drop the shadow — is a
+[Tier 2 follow-up](../ROADMAP.md#copy-on-write-storage--the-storage-amplification-arc).
+
 ## One daemon per store
 
 **What:** the supported topology today is exactly one daemon (and its
@@ -198,7 +212,12 @@ for as long as any surviving child's chain still reads through them —
 reclaimed only once the last sharing child is destroyed or compacted
 (`offshoot compact` is the manual release valve). Expect storage refunds
 to lag destroys; that's the design, not a leak
-([the ledger](faq.md#storage-cost-honestly)).
+([the ledger](faq.md#storage-cost-honestly)). Locally, too, `destroy`
+removes the branch's checkout, sidecar and shadow but **not** the
+`checkouts-ro/<db>/~by-chain/` entries it was cloned from — another branch
+may share them. They age out under the default LRU bound (64 entries per
+database), or with `-ro-cache-budget`, or an `rm -rf` of `checkouts-ro`
+([operations](operations.md#budgets)).
 
 ## The performance envelope, from measured numbers
 
