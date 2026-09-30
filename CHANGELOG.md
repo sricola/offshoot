@@ -81,7 +81,8 @@ paragraphs).
   `offshoot destroy` does not remove by-chain entries (another branch may
   share them); the bound ages them out. Entries are `0400` and the
   `checkouts-ro` directories `0700`, like the store's own `0600` objects;
-  a checkout's `.shadow` is `0600`.- **O(1) clean check.** The `.sum` sidecar gained `chain_id`, `size`,
+  a checkout's `.shadow` is `0600`.
+- **O(1) clean check.** The `.sum` sidecar gained `chain_id`, `size`,
   `mtime_ns`, `change_counter`, `stamped_ns` and `shadow`. A repeat
   `checkout` of an unchanged checkout is proven clean from identity, size,
   mtime and SQLite's change counter without hashing, provided the file's

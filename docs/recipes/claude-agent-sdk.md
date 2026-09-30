@@ -81,7 +81,7 @@ What that means in practice, quoted from the README's MCP section:
 > itself... on every call, `offshoot_checkpoint`, `offshoot_fork`, and
 > `offshoot_checkout` each check fresh whether the daemon has one open for
 > the branch in question. If so: `offshoot_checkpoint` flushes it live
-> through the daemon (no quiesce, no full-snapshot re-encode, no lease
+> through the daemon (no quiesce, no shadow diff or snapshot encode, no lease
 > collision)... **Without an already-open session, every one of those
 > tools runs exactly as it does with no daemon at all.**
 
