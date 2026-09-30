@@ -14,6 +14,7 @@ import (
 	"path/filepath"
 	"strings"
 	"testing"
+	"time"
 
 	_ "github.com/mattn/go-sqlite3"
 	"github.com/sricola/offshoot/internal/ops"
@@ -210,14 +211,26 @@ func BenchmarkForkAtHead(b *testing.B) {
 // Checkout call against an already-clean, already-current checkout returns
 // the existing file without re-materializing (Task 1). mustSeed's
 // Checkpoint call already leaves the checkout's sidecar fingerprint (size,
-// mtime, SQLite header change counter) matching the live file, and repeated
-// Checkout calls never dirty either (the clean path performs no write), so
-// every iteration exercises the same fast path — and checkoutState now
-// proves it clean straight from that fingerprint, in O(1), without ever
-// hashing the file (Task 2). Honest framing (see docs/benchmarks.md): the
-// caller still quiesces every call (a bounded wal_checkpoint, not O(size));
-// only a fingerprint mismatch still falls back to the O(size) full hash
-// this benchmark no longer pays.
+// mtime, SQLite header change counter, stamp time) matching the live file,
+// and repeated Checkout calls never dirty either (the clean path performs
+// no write), so every iteration exercises the same fast path — and
+// checkoutState now proves it clean straight from that fingerprint, in
+// O(1), without ever hashing the file (Task 2).
+//
+// checkoutState only trusts a fingerprint once its recorded mtime is
+// safely older than its own stamp time (git's "racily clean" rule — see
+// fingerprintSafetyMargin's doc comment in sidecar.go): a stamp taken
+// moments ago, as mustSeed's Checkpoint just did, cannot yet be trusted.
+// The os.Chtimes + settling Checkout below age the checkout's recorded
+// mtime and let one call re-stamp against it BEFORE the timer starts, so
+// every timed iteration is deterministically past that margin — without
+// this, how much of the timed loop actually hit the fast path would depend
+// on how long mustSeed itself happened to take relative to the margin,
+// which is exactly the flakiness this setup avoids.
+//
+// Honest framing (see docs/benchmarks.md): the caller still quiesces every
+// call (a bounded wal_checkpoint, not O(size)); only a fingerprint mismatch
+// still falls back to the O(size) full hash this benchmark no longer pays.
 func BenchmarkCheckoutCleanSkip(b *testing.B) {
 	for _, sz := range benchSizes {
 		sz := sz
@@ -225,6 +238,14 @@ func BenchmarkCheckoutCleanSkip(b *testing.B) {
 			w := newBenchWorkspace(b)
 			const db = "app"
 			mustSeed(b, w, db, sz.mb)
+			path := w.CheckoutPath(db, "main")
+			past := time.Now().Add(-2 * time.Hour)
+			if err := os.Chtimes(path, past, past); err != nil {
+				b.Fatal(err)
+			}
+			if _, err := w.Checkout(db, "main"); err != nil { // settles: hashes once, re-stamps against the aged mtime
+				b.Fatal(err)
+			}
 			b.SetBytes(checkoutSize(b, w, db, "main"))
 			b.ReportAllocs()
 			b.ResetTimer()

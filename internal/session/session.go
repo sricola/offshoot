@@ -858,7 +858,7 @@ func (s *Session) Close() error {
 }
 
 // prepareSidecarRefresh and commitSidecarRefresh together re-stamp the
-// checkout's .sum sidecar (via ops.StampSum) on a CLEAN Close, so the next
+// checkout's .sum sidecar (via ops.StampSumHashOnly) on a CLEAN Close, so the next
 // Open/Checkout against this db@branch clean-skips re-materializing instead
 // of paying a full chain replay — restoring, for the daemon-reopen pattern,
 // the win Milestone 2 Task 1 already established for a Checkout call
@@ -1013,7 +1013,18 @@ func (s *Session) commitSidecarRefresh() {
 	// just confirmed above, and exactly what a future Open's settling-flush
 	// suppression needs to read back out of this stamp — see
 	// ops.CheckoutResult.PostApplyChecksum's doc comment.
-	if err := ops.StampSum(s.checkoutPath, st.MainHash, ref.Lineage, ref.HeadEpoch, ref.HeadTXID, flushChecksum, ""); err != nil {
+	//
+	// StampSumHashOnly, not StampSum: st.MainHash was computed by the
+	// capture engine itself, at its own verified-clean shutdown, with no
+	// fingerprint of this process's own taken alongside it — a stat done
+	// here, independently and later, cannot prove s.checkoutPath still
+	// holds exactly the bytes MainHash was computed from (see
+	// StampSumHashOnly's doc comment). Recording no fingerprint costs the
+	// FIRST checkoutState call after a reopen one full hash pass, which
+	// then re-stamps with a real, sandwich-verified fingerprint of its own —
+	// every call after that is fast again, and this call site stays as
+	// simple as it was before fingerprints existed.
+	if err := ops.StampSumHashOnly(s.checkoutPath, st.MainHash, ref.Lineage, ref.HeadEpoch, ref.HeadTXID, flushChecksum, ""); err != nil {
 		s.logTransition("sidecar-refresh-skipped", "reason", err.Error())
 	}
 }

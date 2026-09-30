@@ -5,8 +5,10 @@ import (
 	"encoding/binary"
 	"encoding/hex"
 	"encoding/json"
+	"errors"
 	"io"
 	"os"
+	"time"
 
 	"github.com/sricola/offshoot/internal/dbfile"
 	"github.com/sricola/offshoot/internal/store"
@@ -65,81 +67,161 @@ type CheckoutResult struct {
 	PostApplyChecksum uint64
 }
 
+// fingerprintSafetyMargin is the minimum wall-clock gap checkoutState
+// requires between a sidecar's recorded mtime and the moment it was stamped
+// before it will trust a fingerprint match — git's "racily clean" rule
+// (see the racy-git problem in git's own index code) applied to this
+// sidecar.
+//
+// Without this margin, a write landing in the same mtime TICK as the stamp
+// (materialize, checkpoint, or a hash-verified re-stamp all stamp
+// immediately after reading the file they just proved clean) could leave
+// the file's reported mtime IDENTICAL to what was just recorded even though
+// the content changed again moments later, on any filesystem whose mtime
+// resolution is coarser than the gap between the two writes: HFS+ (1s),
+// many network filesystems (1s or worse), and even local filesystems under
+// certain configurations. 1 second is what git itself uses for exactly this
+// reason and comfortably covers every filesystem this codebase runs on.
+//
+// checkoutState only ever needs to wait out this margin once per stamp: a
+// call that arrives too soon falls back to a full hash (as it always did
+// before this field existed) and, on a match, re-stamps with a fresh
+// StampedNS — so the very next call that arrives at least one margin later
+// is fast again. See checkoutState's doc comment.
+const fingerprintSafetyMargin = 1 * time.Second
+
+// fingerprint is a checkout's fast-path evidence at some instant: its size,
+// modification time (nanoseconds), SQLite's on-disk header change counter
+// (bytes 24-27, big-endian), and whether the header's file-format
+// read/write version bytes (18-19) currently read 2 (WAL mode). See
+// stampFingerprint and sumRecord's doc comment for how each field is used.
+type fingerprint struct {
+	size          int64
+	mtimeNS       int64
+	changeCounter uint32
+	walMode       bool
+}
+
+// stampFingerprint reads path's current fingerprint (see the fingerprint
+// type's doc comment). A header shorter than 28 bytes — not a valid SQLite
+// file yet, or one that predates its first committed transaction — is NOT
+// an error: changeCounter and walMode simply read as their zero values,
+// exactly as if the header held all-zero bytes there, and size/mtimeNS are
+// still the real stat. A caller comparing this fingerprint against a
+// recorded one for a REAL SQLite file will find size or mtime differ (a
+// real database file is never this short), and falls back to a hash exactly
+// like any other fingerprint mismatch.
+//
+// The header is read through internal/dbfile, not a bare os.Open, for the
+// same reason fileSum is (see fileSum's doc comment): path may be a live
+// checkout with SQLite connections held on it in this same process, and an
+// ordinary open/close would silently drop this process's POSIX advisory
+// locks on it.
+func stampFingerprint(path string) (fingerprint, error) {
+	fi, err := os.Stat(path)
+	if err != nil {
+		return fingerprint{}, err
+	}
+	r, err := dbfile.Reader(path)
+	if err != nil {
+		return fingerprint{}, err
+	}
+	var header [28]byte
+	n, err := r.ReadAt(header[:], 0)
+	if err != nil && !errors.Is(err, io.EOF) {
+		return fingerprint{}, err
+	}
+	fp := fingerprint{size: fi.Size(), mtimeNS: fi.ModTime().UnixNano()}
+	if n >= len(header) {
+		fp.changeCounter = binary.BigEndian.Uint32(header[24:28])
+		fp.walMode = header[18] == 2 && header[19] == 2
+	}
+	return fp, nil
+}
+
 // StampSum writes path's .sum sidecar directly from a hash the caller
 // already obtained independently, skipping writeSum's own read-and-hash of
 // path entirely — see sumRecord's doc comment for the on-disk shape.
 // postApplyChecksum is optional (0 = absent, matching sumRecord's own
 // zero-means-absent convention — see its doc comment); Session.
-// commitSidecarRefresh always has one (its last successful flush's
-// checksumAtEncode, tracked as s.flushChecksum). Inside this package,
-// writeSum and the by-chain cache (chainid.go) stamp through it too.
-//
-// Exported for Session.Close's clean-close sidecar refresh (M2 follow-up):
-// Session.commitSidecarRefresh has the capture engine's own post-shutdown
-// MainHash fingerprint (capture.State — a SHA-256 of the checkout's main
-// file, computed by the engine itself immediately after its shutdown
-// verified everything captured was cleanly folded in, see that type's doc
-// comment) and reuses that number directly rather than re-deriving one.
-// That is a deliberate choice, not just an optimization: an independent
-// hash pass here would need its own fresh SQLite connection on path, and
-// this checkout may still have the capture engine's own connection state
-// nearby in the same process — see commitSidecarRefresh's doc comment for
-// why trusting the engine's already-verified fingerprint, rather than
-// re-deriving one, is what keeps this call site off that hazard (and, as a
-// second-order benefit, off the risk of folding in content the engine's own
-// shutdown verification specifically refused to vouch for).
+// commitSidecarRefresh instead uses StampSumHashOnly (see its doc comment
+// for why). Inside this package, ops.go's post-materialize stamp and the
+// by-chain cache (chainid.go) stamp through StampSum too.
 //
 // chainID is the chainID (see chainid.go) of the store chain the file's
 // content is known to equal, or "" when the caller has none in hand (e.g. a
 // session's close, whose content came from local writes, not a chain).
 //
-// StampSum also stats path itself and records its fingerprint (size, mtime,
-// SQLite header change counter — see sumRecord's doc comment): every
-// existing StampSum caller stamps the SAME file whose bytes the hash
-// argument describes, taken after that file reached its final path (a
-// rename, where applicable, already happened) — see this function's own
-// callers in ops.go and chainid.go. A caller with no file yet on disk is,
-// by construction, not a StampSum caller.
+// StampSum also stats path itself and records its fingerprint (see the
+// fingerprint type's doc comment): every StampSum caller stamps the SAME
+// file whose bytes the hash argument describes, taken after that file
+// reached its final path (a rename, where applicable, already happened) —
+// see this function's own callers in ops.go and chainid.go. A caller with
+// no file yet on disk is, by construction, not a StampSum caller.
+//
+// This single post-hash stat is why StampSum is not itself used by writeSum
+// or checkoutState's own re-stamp: a stat taken here, after hash was
+// already computed by some earlier, independent read, cannot prove hash
+// still describes path's CURRENT bytes — a write could land in the gap
+// between that read and this stat. Callers that compute the hash
+// themselves via fileSum use stampSumWithFingerprint directly, sandwiching
+// fileSum's read between two fingerprint reads and only trusting (and
+// recording) the fingerprint when they agree — see writeSum and
+// checkoutState.
 func StampSum(path, hash, lineage string, epoch, txid, postApplyChecksum uint64, chainID string) error {
-	size, mtimeNS, changeCounter, err := stampFingerprint(path)
+	fp, err := stampFingerprint(path)
 	if err != nil {
 		return err
 	}
-	data, err := json.Marshal(sumRecord{
-		Hash: hash, Lineage: lineage, Epoch: epoch, TXID: txid, PostApplyChecksum: postApplyChecksum,
-		ChainID: chainID, Size: size, ModTimeNS: mtimeNS, ChangeCounter: changeCounter,
-	})
+	return stampSumWithFingerprint(path, hash, lineage, epoch, txid, postApplyChecksum, chainID, fp, true)
+}
+
+// StampSumHashOnly writes path's .sum sidecar from a hash and identity the
+// caller already has, recording NO fingerprint at all (as if this were a
+// pre-fingerprint sidecar) — the next checkoutState call against path
+// always falls back to a full hash rather than trusting a fingerprint
+// nothing actually verified against that specific hash. It then re-stamps
+// with a real, sandwich-verified fingerprint on its own (see checkoutState's
+// doc comment), so every call after that first one is fast again.
+//
+// Use this instead of StampSum whenever hash's provenance can't be
+// correlated with a fresh stat of path taken here: Session.
+// commitSidecarRefresh's hash is capture.State.MainHash, computed by the
+// capture engine itself at its own verified-clean shutdown with no
+// fingerprint recorded alongside it, so a stat taken independently, later,
+// by this call cannot prove path still holds exactly the bytes MainHash was
+// computed from. Re-hashing here to verify would defeat the entire point of
+// trusting the engine's already-verified hash instead of paying for a
+// second one — see StampSum's doc comment for the general hazard this
+// avoids, and commitSidecarRefresh's own doc comment for why re-deriving a
+// hash at that call site is specifically undesirable.
+func StampSumHashOnly(path, hash, lineage string, epoch, txid, postApplyChecksum uint64, chainID string) error {
+	return stampSumWithFingerprint(path, hash, lineage, epoch, txid, postApplyChecksum, chainID, fingerprint{}, false)
+}
+
+// stampSumWithFingerprint writes path's .sum sidecar from a hash, identity,
+// and a fingerprint the caller already captured (fp, meaningful only when
+// ok) rather than one derived from a fresh stat of its own — the shared
+// writer behind StampSum (single stat, ok always true), StampSumHashOnly
+// (ok always false), and the sandwiched stamps in writeSum and
+// checkoutState (ok reflects whether a fingerprint taken just before
+// hashing still matched one taken just after). ok=false omits Size,
+// ModTimeNS and ChangeCounter from the record (StampedNS along with them),
+// exactly like a pre-fingerprint sidecar.
+func stampSumWithFingerprint(path, hash, lineage string, epoch, txid, postApplyChecksum uint64, chainID string, fp fingerprint, ok bool) error {
+	rec := sumRecord{
+		Hash: hash, Lineage: lineage, Epoch: epoch, TXID: txid,
+		PostApplyChecksum: postApplyChecksum, ChainID: chainID,
+	}
+	if ok {
+		rec.Size, rec.ModTimeNS, rec.ChangeCounter = fp.size, fp.mtimeNS, fp.changeCounter
+		rec.StampedNS = time.Now().UnixNano()
+	}
+	data, err := json.Marshal(rec)
 	if err != nil {
 		return err
 	}
 	return os.WriteFile(path+".sum", data, 0o644)
-}
-
-// stampFingerprint reads path's current size, modification time (in
-// nanoseconds) and SQLite's on-disk header change counter (bytes 24-27,
-// big-endian) — the three fields checkoutState later compares against a
-// live file to prove it clean without hashing (see sumRecord's doc
-// comment).
-//
-// The change counter is read through internal/dbfile, not a bare os.Open,
-// for the same reason fileSum is (see fileSum's doc comment): path may be a
-// live checkout with SQLite connections held on it in this same process,
-// and an ordinary open/close would silently drop this process's POSIX
-// advisory locks on it.
-func stampFingerprint(path string) (size, mtimeNS int64, changeCounter uint32, err error) {
-	fi, err := os.Stat(path)
-	if err != nil {
-		return 0, 0, 0, err
-	}
-	r, err := dbfile.Reader(path)
-	if err != nil {
-		return 0, 0, 0, err
-	}
-	var header [4]byte
-	if _, err := r.ReadAt(header[:], 24); err != nil {
-		return 0, 0, 0, err
-	}
-	return fi.Size(), fi.ModTime().UnixNano(), binary.BigEndian.Uint32(header[:]), nil
 }
 
 // sumRecord is the on-disk shape of a checkout's .sum sidecar: a content hash
@@ -177,22 +259,36 @@ func stampFingerprint(path string) (size, mtimeNS int64, changeCounter uint32, e
 // which stays the destination branch's own even when the bytes were cloned
 // from another branch's identical chain.
 //
-// Size, ModTimeNS and ChangeCounter are the checkout's fingerprint at stamp
-// time (see stampFingerprint) — the file's size, its modification time in
-// nanoseconds, and SQLite's own header change counter (bytes 24-27,
-// big-endian; SQLite bumps it on every committed transaction that touches
-// the main file). checkoutState compares all three against the LIVE file
-// before ever falling back to a hash: when identity already matches (above)
-// and all three fingerprint fields also match, the checkout is proven clean
-// in O(1) — no full-file read at all. All three are additive and omitted
-// (zero value) together on a pre-this-field sidecar; a real checked-out
-// SQLite file always has a non-empty header and a real mtime, so a
-// zero-valued fingerprint can never spuriously match one, and checkoutState
-// falls back to its full hash exactly as it always has. A fingerprint
-// mismatch (including this all-zero old-format case) only ever costs an
-// extra hash pass — it can never report "clean" for content that changed,
-// because the hash comparison it falls back to is the same one this package
-// always trusted.
+// Size, ModTimeNS, ChangeCounter and StampedNS are the checkout's fingerprint
+// (see the fingerprint type) at the moment it was stamped, plus the
+// wall-clock instant (nanoseconds since the Unix epoch) that stamp was
+// taken. checkoutState compares Size, ModTimeNS and (outside WAL mode)
+// ChangeCounter against the LIVE file before ever falling back to a hash:
+// when identity already matches (above), those fields also match, and
+// ModTimeNS is safely older than StampedNS (by at least
+// fingerprintSafetyMargin — the racily-clean guard; see its doc comment for
+// why this is required, not optional), the checkout is proven clean in
+// O(1) — no full-file read at all.
+//
+// ChangeCounter is NOT bumped on every committed write, contrary to an
+// earlier draft of this comment: it is reliable evidence in
+// rollback-journal mode, but SQLite's own WAL-mode commit path can leave it
+// (and the rest of the main file's header) completely unchanged across
+// several real, content-changing commits — verified empirically (three
+// committed WAL writes, each followed by wal_checkpoint(TRUNCATE), left
+// bytes 24-27 unchanged). checkoutState therefore never treats a matching
+// ChangeCounter as evidence when the LIVE file's header reads as WAL mode
+// (file-format version bytes 18-19 == 2): Size, ModTimeNS and the
+// racily-clean guard alone carry that case.
+//
+// All four fields are additive and omitted (zero value) together on a
+// pre-this-field sidecar; a real checked-out SQLite file always has a
+// non-empty header and a real mtime, so an all-zero fingerprint can never
+// spuriously match one, and checkoutState falls back to its full hash
+// exactly as it always has. A fingerprint mismatch (including this all-zero
+// old-format case) only ever costs an extra hash pass — it can never report
+// "clean" for content that changed, because the hash comparison it falls
+// back to is the same one this package always trusted.
 type sumRecord struct {
 	Hash              string `json:"hash"`
 	Lineage           string `json:"lineage"`
@@ -203,6 +299,32 @@ type sumRecord struct {
 	Size              int64  `json:"size,omitempty"`
 	ModTimeNS         int64  `json:"mtime_ns,omitempty"`
 	ChangeCounter     uint32 `json:"change_counter,omitempty"`
+	StampedNS         int64  `json:"stamped_ns,omitempty"`
+}
+
+// fingerprintMatches reports whether fp — a LIVE fingerprint, just read —
+// is trustworthy evidence that path still holds rec's recorded content,
+// without hashing:
+//
+//   - Size and ModTimeNS must both equal rec's.
+//   - ChangeCounter must also equal rec's, UNLESS fp.walMode: SQLite's
+//     WAL-mode commit path can leave the change counter unchanged across
+//     real, content-changing commits (see sumRecord's doc comment), so it
+//     must never be what makes this return true in WAL mode.
+//   - rec.ModTimeNS must be strictly older than rec.StampedNS minus
+//     fingerprintSafetyMargin — the racily-clean guard (see
+//     fingerprintSafetyMargin's doc comment). A pre-fingerprint sidecar has
+//     StampedNS == 0, so this is never satisfied by a real mtime (always a
+//     large positive nanosecond timestamp) — the same zero-means-absent
+//     fallback the other fields already rely on.
+func fingerprintMatches(rec sumRecord, fp fingerprint) bool {
+	if fp.size != rec.Size || fp.mtimeNS != rec.ModTimeNS {
+		return false
+	}
+	if !fp.walMode && fp.changeCounter != rec.ChangeCounter {
+		return false
+	}
+	return rec.ModTimeNS < rec.StampedNS-int64(fingerprintSafetyMargin)
 }
 
 // writeSum computes the hex SHA-256 of the file at path and writes it, along
@@ -216,12 +338,30 @@ type sumRecord struct {
 // checkout's current head was written under), not the ref's own
 // (writer-generation) Epoch — see sumRecord's doc comment. chainID is as
 // StampSum's.
+//
+// The fingerprint is taken BEFORE fileSum's read and again AFTER: fileSum
+// can take arbitrarily long on a large file, and path may have a capture
+// engine holding connections on it in this same process (see fileSum's own
+// doc comment) — a write landing anywhere in that window would otherwise
+// get silently attributed to the hash computed from the OLD bytes, and
+// every later checkoutState call would then trust that stale hash as
+// "clean" without ever having hashed the new content. Only when the two
+// fingerprints agree — nothing wrote to path while it was being hashed — is
+// it safe to record one at all; on a mismatch, no fingerprint is recorded
+// (the sidecar still gets the correct hash and identity), so the next
+// checkoutState call simply hashes once more rather than trusting an
+// unverified linkage.
 func writeSum(path string, lineage string, epoch, txid, postApplyChecksum uint64, chainID string) error {
+	fpBefore, errBefore := stampFingerprint(path)
 	sum, err := fileSum(path)
 	if err != nil {
 		return err
 	}
-	return StampSum(path, sum, lineage, epoch, txid, postApplyChecksum, chainID)
+	fpAfter, errAfter := stampFingerprint(path)
+	if errBefore == nil && errAfter == nil && fpBefore == fpAfter {
+		return stampSumWithFingerprint(path, sum, lineage, epoch, txid, postApplyChecksum, chainID, fpAfter, true)
+	}
+	return stampSumWithFingerprint(path, sum, lineage, epoch, txid, postApplyChecksum, chainID, fingerprint{}, false)
 }
 
 // checkoutState reports how the checkout at path relates to ref, and — only
@@ -233,13 +373,12 @@ func writeSum(path string, lineage string, epoch, txid, postApplyChecksum uint64
 //
 //   - "clean": the sidecar's recorded identity (lineage, epoch, txid)
 //     matches ref, and the file's content still matches the recorded hash
-//     — proven either from a full hash (as always) or, when the sidecar's
-//     recorded fingerprint (size, mtime, SQLite header change counter — see
-//     sumRecord's doc comment) all match the LIVE file, without hashing at
-//     all: two targets can only share a fingerprint by having identical
-//     bytes, short of a same-nanosecond, same-change-counter, same-size
-//     coincidence that also happens to alter content, which the change
-//     counter's own semantics (bumped on every committed write) rule out.
+//     — proven either from a full hash (as always) or, when
+//     fingerprintMatches finds the sidecar's recorded fingerprint
+//     trustworthy against the LIVE file, without hashing at all (see
+//     fingerprintMatches's doc comment for exactly what that requires,
+//     including the racily-clean guard and the WAL-mode change-counter
+//     exclusion).
 //   - "modified": the sidecar's recorded identity matches ref, but the
 //     file's content has changed since it was last fingerprinted — local,
 //     un-checkpointed edits.
@@ -256,24 +395,31 @@ func writeSum(path string, lineage string, epoch, txid, postApplyChecksum uint64
 //     stay silent rather than warn spuriously.
 //
 // The fingerprint fast path never overrides the identity check above: it
-// only ever runs once (lineage, epoch, txid) already matches ref. A
-// fingerprint mismatch — including every pre-fingerprint sidecar, whose
-// three fields all decode to zero and so can never match a real file's
-// (always non-zero) size and mtime — falls back to the full hash exactly as
-// this function always behaved; when that hash still matches, the sidecar
-// is re-stamped (fingerprint included) so the NEXT call is fast. Nothing
-// here can make an actually-modified file read as clean: the hash
-// comparison a fingerprint mismatch falls back to is the same one this
-// function always trusted.
+// only ever runs once (lineage, epoch, txid) already matches ref. Nothing
+// in fingerprintMatches can make an actually-modified file read as clean:
+// any fingerprint mismatch (including every pre-fingerprint sidecar, whose
+// four fields all decode to zero and so can never match a real file's
+// fingerprint) falls back to the full hash exactly as this function always
+// behaved.
+//
+// When that hash still matches, the sidecar is re-stamped so a LATER call
+// can take the fast path — but only with a fingerprint taken just before
+// this function's own fileSum call if one taken just after still agrees
+// (the same sandwich writeSum uses, and for the same reason: fileSum's read
+// is not instantaneous, and a write racing it must not get attributed to
+// the hash just computed from the bytes before it). Best-effort either way
+// — a failure, or a disagreeing sandwich, costs a future call a hash pass,
+// never correctness, and never changes this call's own "clean" verdict.
 //
 // Correctness for both SQLite journal modes rests entirely on this
 // function's callers (CheckoutProven, warnIfUncheckpointed), which already
 // quiesce path (a full wal_checkpoint(TRUNCATE)) before ever calling this:
 // a rollback-journal commit bumps the main file's header change counter (and
-// mtime) directly, but a WAL-mode commit leaves the main file's header
-// untouched until checkpointed — quiescing first is what makes the main
-// file's header trustworthy in either mode, exactly as it already had to be
-// for fileSum's own read below.
+// mtime) directly, but a WAL-mode commit can leave the header (change
+// counter included) untouched even once checkpointed — quiescing first is
+// what makes the main file's SIZE and MTIME trustworthy in either mode
+// (what fingerprintMatches actually leans on for WAL), exactly as it
+// already had to be for fileSum's own read below.
 func checkoutState(path string, ref store.Ref) (string, uint64) {
 	rec, ok := readSidecar(path)
 	if !ok {
@@ -282,8 +428,8 @@ func checkoutState(path string, ref store.Ref) (string, uint64) {
 	if rec.Lineage != ref.Lineage || rec.Epoch != ref.HeadEpoch || rec.TXID != ref.HeadTXID {
 		return "stale", 0
 	}
-	if size, mtimeNS, changeCounter, err := stampFingerprint(path); err == nil &&
-		size == rec.Size && mtimeNS == rec.ModTimeNS && changeCounter == rec.ChangeCounter {
+	fpBefore, fpErr := stampFingerprint(path)
+	if fpErr == nil && fingerprintMatches(rec, fpBefore) {
 		return "clean", rec.PostApplyChecksum
 	}
 	got, err := fileSum(path)
@@ -293,12 +439,11 @@ func checkoutState(path string, ref store.Ref) (string, uint64) {
 	if got != rec.Hash {
 		return "modified", 0
 	}
-	// The fingerprint didn't match (or this is a pre-fingerprint sidecar),
-	// but the full hash just proved the content unchanged: re-stamp so the
-	// next call can take the fast path above instead of hashing again.
-	// Best-effort — a failure here costs the next call a hash pass, never
-	// correctness, so it does not change this "clean" verdict.
-	_ = StampSum(path, got, ref.Lineage, ref.HeadEpoch, ref.HeadTXID, rec.PostApplyChecksum, rec.ChainID)
+	if fpAfter, err2 := stampFingerprint(path); fpErr == nil && err2 == nil && fpBefore == fpAfter {
+		_ = stampSumWithFingerprint(path, got, ref.Lineage, ref.HeadEpoch, ref.HeadTXID, rec.PostApplyChecksum, rec.ChainID, fpAfter, true)
+	} else {
+		_ = stampSumWithFingerprint(path, got, ref.Lineage, ref.HeadEpoch, ref.HeadTXID, rec.PostApplyChecksum, rec.ChainID, fingerprint{}, false)
+	}
 	return "clean", rec.PostApplyChecksum
 }
 
