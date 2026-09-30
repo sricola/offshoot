@@ -1392,19 +1392,49 @@ func TestConcurrentCheckpointsOnlyOneWins(t *testing.T) {
 		if cp.TXID > r.HeadTXID {
 			t.Fatalf("checkpoint %s@txid %d beyond head %d", name, cp.TXID, r.HeadTXID)
 		}
-		assertCheckpointObject(t, w, r, name, cp.TXID)
 	}
+	assertRaceWinner(t, w, r, path)
 }
 
-// assertCheckpointObject fails unless the object a checkpoint at txid
-// wrote on r's lineage exists: a snapshot, or a segment covering just txid.
-func assertCheckpointObject(t *testing.T, w *Workspace, r store.Ref, name string, txid uint64) {
+// assertRaceWinner checks the checkpoint that won a concurrent-checkpoint
+// race on r: exactly one object kind exists at its txid (a snapshot or a
+// segment, never both, since a losing snapshot beside a winning segment
+// would become the head's anchor), and materializing it reproduces the
+// checkout byte for byte.
+func assertRaceWinner(t *testing.T, w *Workspace, r store.Ref, checkout string) {
 	t.Helper()
-	if _, _, err := w.Store.B.Get(store.SnapshotKey(r.Lineage, r.Epoch, txid)); err == nil {
-		return
+	winner := ""
+	for name := range r.Checkpoints {
+		if name != "init" {
+			if winner != "" {
+				t.Fatalf("two checkpoints recorded after a race: %s and %s", winner, name)
+			}
+			winner = name
+		}
 	}
-	if _, _, err := w.Store.B.Get(store.SegmentKey(r.Lineage, r.Epoch, txid, txid)); err != nil {
-		t.Fatalf("recorded checkpoint %s has no snapshot or segment object: %v", name, err)
+	if winner == "" {
+		t.Fatal("no winning checkpoint recorded")
+	}
+	txid := r.Checkpoints[winner].TXID
+	snap := w.objectExists(store.SnapshotKey(r.Lineage, r.Epoch, txid))
+	seg := w.objectExists(store.SegmentKey(r.Lineage, r.Epoch, txid, txid))
+	if snap == seg {
+		t.Fatalf("winner %s at txid %d: snapshot present %v, segment present %v; want exactly one", winner, txid, snap, seg)
+	}
+	at, err := w.CheckoutAt("app", "main", winner, false)
+	if err != nil {
+		t.Fatal(err)
+	}
+	got, err := os.ReadFile(at)
+	if err != nil {
+		t.Fatal(err)
+	}
+	want, err := os.ReadFile(checkout)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !bytes.Equal(got, want) {
+		t.Fatalf("winner %s materializes to bytes that differ from the checkout", winner)
 	}
 }
 
@@ -1417,8 +1447,8 @@ func assertCheckpointObject(t *testing.T, w *Workspace, r store.Ref, name string
 // was added, and Local's Put (rename-over-existing-file) could silently
 // diverge from S3's Put (PutObject, unconditional overwrite) without any
 // test noticing. Same assertions as the Local version: at least one
-// checkpoint wins, the ref stays internally consistent, and every recorded
-// checkpoint's object (snapshot or segment) is actually present.
+// checkpoint wins, the ref stays internally consistent, and the winning
+// checkpoint has exactly one object kind and materializes to the checkout.
 func TestConcurrentCheckpointsOnlyOneWinsOnS3(t *testing.T) {
 	testutil.RequireSQLite3(t)
 	w := newWSOnFakeS3(t)
@@ -1462,8 +1492,8 @@ func TestConcurrentCheckpointsOnlyOneWinsOnS3(t *testing.T) {
 		if cp.TXID > r.HeadTXID {
 			t.Fatalf("checkpoint %s@txid %d beyond head %d", name, cp.TXID, r.HeadTXID)
 		}
-		assertCheckpointObject(t, w, r, name, cp.TXID)
 	}
+	assertRaceWinner(t, w, r, path)
 }
 
 func TestInitAndOpenAgainstS3Spec(t *testing.T) {

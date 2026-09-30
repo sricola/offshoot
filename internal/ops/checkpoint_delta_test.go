@@ -341,3 +341,46 @@ func TestDivergedShadowFallsBackToSnapshot(t *testing.T) {
 		t.Fatal("checkout differs from an independent export of the head")
 	}
 }
+
+// TestLateSnapshotLoserDeletesItsSnapshot: a checkpoint that read the ref
+// before a rival committed a segment, and planned after the rival's stamp,
+// writes a snapshot at the same txid and loses the CAS. It must delete that
+// snapshot, or the chain would anchor the head on it instead of the
+// winner's segment.
+func TestLateSnapshotLoserDeletesItsSnapshot(t *testing.T) {
+	w := newWS(t)
+	requireClone(t, w)
+	seedDB(t, w, "app", 1<<20)
+	path := w.CheckoutPath("app", "main")
+	mustSQL(t, path, "INSERT INTO t (v) VALUES (randomblob(100));")
+
+	paused, resume := make(chan struct{}), make(chan struct{})
+	first := true
+	checkpointAfterQuiesceForTest = func() {
+		if first {
+			first = false
+			close(paused)
+			<-resume
+		}
+	}
+	t.Cleanup(func() { checkpointAfterQuiesceForTest = nil })
+	loserErr := make(chan error, 1)
+	go func() {
+		_, err := w.CheckpointWith("app", "main", "loser", nil, CheckpointOptions{})
+		loserErr <- err
+	}()
+	<-paused
+	winner := mustCheckpointWith(t, w, "app", "main", "winner", CheckpointOptions{})
+	if winner.Kind != "segment" {
+		t.Fatalf("winner kind %q, want segment", winner.Kind)
+	}
+	close(resume)
+	if err := <-loserErr; err == nil || !strings.Contains(err.Error(), "lost a race") {
+		t.Fatalf("late checkpoint error = %v, want a lost race", err)
+	}
+	ref := refOf(t, w, "app", "main")
+	if w.objectExists(store.SnapshotKey(ref.Lineage, ref.Epoch, winner.TXID)) {
+		t.Fatal("the late loser's snapshot survived beside the winning segment")
+	}
+	assertSegmentHead(t, w, "app", "main", "winner", path, winner)
+}

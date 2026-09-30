@@ -393,6 +393,13 @@ func copyFile(from, to string) error {
 	return out.Close()
 }
 
+// checkpointAfterQuiesceForTest, when non-nil, runs in CheckpointWith after
+// it has read the ref and quiesced the checkout, before it plans and encodes
+// — where a rival checkpoint can commit and leave this call a late loser.
+// Test-only; process-global, restore via t.Cleanup (as
+// compactBeforeCASForTest).
+var checkpointAfterQuiesceForTest func()
+
 // CheckpointOptions tunes CheckpointWith.
 type CheckpointOptions struct {
 	// Snapshot forces a full snapshot even when a segment would do.
@@ -469,6 +476,9 @@ func (w *Workspace) CheckpointWith(db, branch, name string, meta map[string]stri
 	if err := quiesce(path); err != nil {
 		return CheckpointResult{}, err
 	}
+	if checkpointAfterQuiesceForTest != nil {
+		checkpointAfterQuiesceForTest()
+	}
 	txid := ref.HeadTXID + 1
 	res := CheckpointResult{TXID: txid, Kind: "snapshot"}
 	var buf bytes.Buffer
@@ -535,9 +545,30 @@ func (w *Workspace) CheckpointWith(db, branch, name string, meta map[string]stri
 		// in their ref with no backing object — silent corruption for them.
 		// Leave the object alone; worst case it's a harmless orphan for a
 		// later GC pass.
+		//
+		// On ErrCAS with a winner on this lineage whose head covers txid, our
+		// key is normally the winner's own (same kind, same key) and must
+		// stay. The exception is a loser that wrote a SNAPSHOT while the
+		// winner wrote a SEGMENT at the same txid: the chain resolver
+		// anchors on the newest snapshot at or below the head, so our
+		// snapshot would silently replace the winner's segment as the head,
+		// and if the checkout changed between the two encodes, every later
+		// segment's pre-apply checksum would then fail. That is the only
+		// mixed-kind shape a race produces: every racer that planned before
+		// the winner's post-CAS stamp saw the same sidecar and shadow and
+		// chose the winner's kind, and a racer that planned after it sees
+		// an identity past its own ref head (or a re-cloned shadow) and
+		// always falls back to a snapshot. So a snapshot loser deletes its
+		// snapshot when the segment key at txid exists; a segment loser
+		// never deletes, since its key is the winner's.
 		if errors.Is(err, store.ErrCAS) {
-			if cur, _, gerr := w.Store.GetRef(db, branch); gerr == nil && (cur.Lineage != ref.Lineage || cur.HeadTXID < txid) {
-				w.bestEffortDelete(key)
+			if cur, _, gerr := w.Store.GetRef(db, branch); gerr == nil {
+				switch {
+				case cur.Lineage != ref.Lineage || cur.HeadTXID < txid:
+					w.bestEffortDelete(key)
+				case res.Kind == "snapshot" && w.objectExists(store.SegmentKey(ref.Lineage, ref.Epoch, txid, txid)):
+					w.bestEffortDelete(key)
+				}
 			}
 			return CheckpointResult{}, fmt.Errorf("ops: ref update lost a race (retry): %w", err)
 		}
@@ -559,6 +590,22 @@ func (w *Workspace) CheckpointWith(db, branch, name string, meta map[string]stri
 		ObserveCheckpoint(time.Since(start))
 	}
 	return res, nil
+}
+
+// objectExists reports whether key is present in the store, listing it
+// rather than fetching it so a large object is never downloaded. A List
+// error reads as absent.
+func (w *Workspace) objectExists(key string) bool {
+	keys, err := w.Store.B.List(key)
+	if err != nil {
+		return false
+	}
+	for _, k := range keys {
+		if k == key {
+			return true
+		}
+	}
+	return false
 }
 
 // errQuiesceBusy is quiesce's error specifically for wal_checkpoint(TRUNCATE)
