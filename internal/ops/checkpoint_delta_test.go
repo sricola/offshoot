@@ -459,3 +459,50 @@ func TestSnapshotLoserKeepsSharedKeyWhenWinnerIsAlsoSnapshot(t *testing.T) {
 		t.Fatal("winner materializes to bytes that differ from the checkout")
 	}
 }
+
+// TestSegmentWinnerRemovesStaleSnapshotAtItsTXID: a snapshot attempt that
+// uploaded its object and then never landed its ref (a crash between PutIf
+// and PutRef, or a PutRef failure that was not a CAS loss) leaves a
+// snapshot at the next txid with no sidecar or shadow stamped. The next
+// checkpoint plans a segment at that same txid; once it wins the CAS it must
+// remove the stale snapshot, or the chain would anchor the head on it.
+func TestSegmentWinnerRemovesStaleSnapshotAtItsTXID(t *testing.T) {
+	w := newWS(t)
+	requireClone(t, w)
+	seedDB(t, w, "app", 1<<20)
+	path := w.CheckoutPath("app", "main")
+	mustSQL(t, path, "INSERT INTO t (v) VALUES (randomblob(100));")
+	ref := refOf(t, w, "app", "main")
+	txid := ref.HeadTXID + 1
+	var stale bytes.Buffer
+	if _, err := ltxio.EncodeSnapshot(path, txid, &stale); err != nil {
+		t.Fatal(err)
+	}
+	staleKey := store.SnapshotKey(ref.Lineage, ref.Epoch, txid)
+	if _, err := w.Store.B.PutIf(staleKey, stale.Bytes(), ""); err != nil {
+		t.Fatal(err)
+	}
+	// The checkout moves on after the failed attempt, so the stale snapshot
+	// no longer matches what the next checkpoint commits.
+	mustSQL(t, path, "INSERT INTO t (v) VALUES (randomblob(200));")
+
+	res := mustCheckpointWith(t, w, "app", "main", "b", CheckpointOptions{})
+	if res.Kind != "segment" || res.TXID != txid {
+		t.Fatalf("checkpoint = %+v, want a segment at txid %d", res, txid)
+	}
+	if storeHas(w, staleKey) {
+		t.Fatal("the stale snapshot at the segment's txid survived")
+	}
+	segKey := store.SegmentKey(ref.Lineage, ref.Epoch, txid, txid)
+	if !storeHas(w, segKey) {
+		t.Fatal("the segment object is missing")
+	}
+	members, err := w.Store.Chain(ref.Lineage, txid)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if last := members[len(members)-1]; last.Key != segKey {
+		t.Fatalf("head resolves through %s, want the segment %s", last.Key, segKey)
+	}
+	assertSegmentHead(t, w, "app", "main", "b", path, res)
+}

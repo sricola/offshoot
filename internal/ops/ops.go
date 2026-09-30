@@ -572,6 +572,15 @@ func (w *Workspace) CheckpointWith(db, branch, name string, meta map[string]stri
 		}
 		return CheckpointResult{}, fmt.Errorf("ops: ref update for checkpoint %q on %s@%s: %w", name, db, branch, err)
 	}
+	// A segment that won the CAS removes any snapshot at its own txid: only
+	// a failed earlier attempt (object uploaded, ref write never landed, no
+	// sidecar or shadow stamped) can have left one there, since the winner's
+	// recorded kind is segment and no ref names that key. Left in place, it
+	// would anchor the head (the chain resolver anchors on the newest
+	// snapshot at or below the target) instead of this segment.
+	if res.Kind == "segment" {
+		w.bestEffortDelete(store.SnapshotKey(ref.Lineage, ref.Epoch, txid))
+	}
 	// The ref CAS is the point of no return: only now does the checkout truly
 	// equal committed state (lineage unchanged, head advanced to txid).
 	// Writing the sidecar here, after the CAS, means an interrupt between the
