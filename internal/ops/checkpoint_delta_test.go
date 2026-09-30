@@ -379,8 +379,83 @@ func TestLateSnapshotLoserDeletesItsSnapshot(t *testing.T) {
 		t.Fatalf("late checkpoint error = %v, want a lost race", err)
 	}
 	ref := refOf(t, w, "app", "main")
-	if w.objectExists(store.SnapshotKey(ref.Lineage, ref.Epoch, winner.TXID)) {
+	if storeHas(w, store.SnapshotKey(ref.Lineage, ref.Epoch, winner.TXID)) {
 		t.Fatal("the late loser's snapshot survived beside the winning segment")
 	}
 	assertSegmentHead(t, w, "app", "main", "winner", path, winner)
+}
+
+// storeHas reports whether key is present in w's store, listing it rather
+// than fetching it.
+func storeHas(w *Workspace, key string) bool {
+	keys, err := w.Store.B.List(key)
+	if err != nil {
+		return false
+	}
+	for _, k := range keys {
+		if k == key {
+			return true
+		}
+	}
+	return false
+}
+
+// TestSnapshotLoserKeepsSharedKeyWhenWinnerIsAlsoSnapshot: a segment that a
+// crashed earlier attempt orphaned at the next txid must not make a losing
+// snapshot writer delete the snapshot key it shares with the winning
+// snapshot. The loser reads the winner's kind from its checkpoint entry,
+// not from which keys exist.
+func TestSnapshotLoserKeepsSharedKeyWhenWinnerIsAlsoSnapshot(t *testing.T) {
+	w := newWS(t)
+	requireClone(t, w)
+	seedDB(t, w, "app", 1<<20)
+	path := w.CheckoutPath("app", "main")
+	mustSQL(t, path, "INSERT INTO t (v) VALUES (randomblob(100));")
+	ref := refOf(t, w, "app", "main")
+	txid := ref.HeadTXID + 1
+	orphan := store.SegmentKey(ref.Lineage, ref.Epoch, txid, txid)
+	if _, err := w.Store.B.PutIf(orphan, []byte("orphan from a crashed attempt"), ""); err != nil {
+		t.Fatal(err)
+	}
+
+	paused, resume := make(chan struct{}), make(chan struct{})
+	first := true
+	checkpointAfterQuiesceForTest = func() {
+		if first {
+			first = false
+			close(paused)
+			<-resume
+		}
+	}
+	t.Cleanup(func() { checkpointAfterQuiesceForTest = nil })
+	loserErr := make(chan error, 1)
+	go func() {
+		_, err := w.CheckpointWith("app", "main", "loser", nil, CheckpointOptions{Snapshot: true})
+		loserErr <- err
+	}()
+	<-paused
+	winner := mustCheckpointWith(t, w, "app", "main", "winner", CheckpointOptions{Snapshot: true})
+	close(resume)
+	if err := <-loserErr; err == nil || !strings.Contains(err.Error(), "lost a race") {
+		t.Fatalf("late checkpoint error = %v, want a lost race", err)
+	}
+	if winner.TXID != txid {
+		t.Fatalf("winner at txid %d, want %d", winner.TXID, txid)
+	}
+	if got := refOf(t, w, "app", "main").Checkpoints["winner"].Kind; got != "snapshot" {
+		t.Fatalf("winner's recorded kind %q, want snapshot", got)
+	}
+	if !storeHas(w, store.SnapshotKey(ref.Lineage, ref.Epoch, txid)) {
+		t.Fatal("the losing snapshot writer deleted the snapshot key it shares with the winner")
+	}
+	if !storeHas(w, orphan) {
+		t.Fatal("the orphan segment was touched; only the loser's own key is ever deleted")
+	}
+	at, err := w.CheckoutAt("app", "main", "winner", false)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !bytes.Equal(readFile(t, at), readFile(t, path)) {
+		t.Fatal("winner materializes to bytes that differ from the checkout")
+	}
 }

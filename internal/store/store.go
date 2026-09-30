@@ -45,6 +45,16 @@ type Checkpoint struct {
 	// values <= 512 bytes — see the design spec's metadata cap). Omitempty;
 	// nil/absent means no metadata was given.
 	Meta map[string]string `json:"meta,omitempty"`
+	// Kind is the object this checkpoint's txid was written as on its
+	// lineage: "snapshot" or "segment". Stamped by ops.CheckpointWith, a
+	// named session flush, Create's "init", and the snapshots Rollback and
+	// Compact copy kept checkpoints into. Omitempty so a checkpoint written
+	// before this field existed (or one whose writer does not know, such as
+	// Fork's shared "fork") decodes with it empty, which means unknown.
+	// ops.CheckpointWith's CAS-loser cleanup reads it to tell whether its
+	// own object at the same txid is the winner's key or a different-kind
+	// orphan.
+	Kind string `json:"kind,omitempty"`
 }
 
 type Ref struct {

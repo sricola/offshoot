@@ -229,7 +229,7 @@ func (w *Workspace) createFromQuiesced(db, quiescedPath string) error {
 		Lineage: lineage, Epoch: 1, HeadTXID: 1,
 		Protected: true, // main is protected by default (spec § Security posture)
 	}
-	ref.SetCheckpoint("init", store.Checkpoint{TXID: 1, Epoch: 1, CreatedAt: nowStamp()})
+	ref.SetCheckpoint("init", store.Checkpoint{TXID: 1, Epoch: 1, CreatedAt: nowStamp(), Kind: "snapshot"})
 	if _, err := w.Store.PutRef(db, "main", ref, ""); err != nil {
 		// Freshly-minted lineage no rival can reference: safe to delete the
 		// orphaned snapshot (mirrors Fork's cleanup on the same failure).
@@ -524,7 +524,7 @@ func (w *Workspace) CheckpointWith(db, branch, name string, meta map[string]stri
 	}
 	ref.HeadTXID = txid
 	ref.HeadEpoch = ref.Epoch
-	ref.SetCheckpoint(name, store.Checkpoint{TXID: txid, Epoch: ref.Epoch, CreatedAt: nowStamp(), Meta: meta})
+	ref.SetCheckpoint(name, store.Checkpoint{TXID: txid, Epoch: ref.Epoch, CreatedAt: nowStamp(), Meta: meta, Kind: res.Kind})
 	ref.Touch(time.Now())
 	if _, err := w.Store.PutRef(db, branch, ref, etag); err != nil {
 		// Decide whether to clean up the object after PutRef failure.
@@ -547,26 +547,24 @@ func (w *Workspace) CheckpointWith(db, branch, name string, meta map[string]stri
 		// later GC pass.
 		//
 		// On ErrCAS with a winner on this lineage whose head covers txid, our
-		// key is normally the winner's own (same kind, same key) and must
-		// stay. The exception is a loser that wrote a SNAPSHOT while the
-		// winner wrote a SEGMENT at the same txid: the chain resolver
-		// anchors on the newest snapshot at or below the head, so our
-		// snapshot would silently replace the winner's segment as the head,
-		// and if the checkout changed between the two encodes, every later
-		// segment's pre-apply checksum would then fail. That is the only
-		// mixed-kind shape a race produces: every racer that planned before
-		// the winner's post-CAS stamp saw the same sidecar and shadow and
-		// chose the winner's kind, and a racer that planned after it sees
-		// an identity past its own ref head (or a re-cloned shadow) and
-		// always falls back to a snapshot. So a snapshot loser deletes its
-		// snapshot when the segment key at txid exists; a segment loser
-		// never deletes, since its key is the winner's.
+		// key is the winner's own when the winner wrote the same kind (the
+		// key is deterministic per kind), and must stay. When the winner
+		// wrote the OTHER kind at txid, our object is an orphan beside it,
+		// and a harmful one: a loser's snapshot beside a winner's segment
+		// becomes the head's anchor (the chain resolver anchors on the
+		// newest snapshot at or below the head), so if the checkout changed
+		// between the two encodes every later segment's pre-apply checksum
+		// fails. The winner's ref records its kind on the checkpoint entry
+		// at txid (store.Checkpoint.Kind); we delete our object only when
+		// that entry exists with a known kind different from ours. An
+		// unknown kind, or no entry at txid, keeps it: probing for the
+		// other key's existence instead cannot tell the winner's object
+		// from an orphan a crashed earlier attempt left at the same txid.
 		if errors.Is(err, store.ErrCAS) {
 			if cur, _, gerr := w.Store.GetRef(db, branch); gerr == nil {
-				switch {
-				case cur.Lineage != ref.Lineage || cur.HeadTXID < txid:
+				if cur.Lineage != ref.Lineage || cur.HeadTXID < txid {
 					w.bestEffortDelete(key)
-				case res.Kind == "snapshot" && w.objectExists(store.SegmentKey(ref.Lineage, ref.Epoch, txid, txid)):
+				} else if k := checkpointKindAt(cur, txid); k != "" && k != res.Kind {
 					w.bestEffortDelete(key)
 				}
 			}
@@ -592,20 +590,15 @@ func (w *Workspace) CheckpointWith(db, branch, name string, meta map[string]stri
 	return res, nil
 }
 
-// objectExists reports whether key is present in the store, listing it
-// rather than fetching it so a large object is never downloaded. A List
-// error reads as absent.
-func (w *Workspace) objectExists(key string) bool {
-	keys, err := w.Store.B.List(key)
-	if err != nil {
-		return false
-	}
-	for _, k := range keys {
-		if k == key {
-			return true
+// checkpointKindAt is the recorded Kind of ref's checkpoint at txid, or ""
+// when none is recorded there or its writer did not record a kind.
+func checkpointKindAt(ref store.Ref, txid uint64) string {
+	for _, c := range ref.Checkpoints {
+		if c.TXID == txid && c.Kind != "" {
+			return c.Kind
 		}
 	}
-	return false
+	return ""
 }
 
 // errQuiesceBusy is quiesce's error specifically for wal_checkpoint(TRUNCATE)
@@ -1196,8 +1189,9 @@ func (w *Workspace) RollbackWith(db, branch, to string, opts RollbackOptions) (R
 		// Rewrite epoch to 1 (where the copy now actually lives) while
 		// preserving CreatedAt/Meta — this is a location update, not a new
 		// checkpoint, so its recorded creation time and metadata must
-		// survive the rewrite unchanged.
-		kept[name] = store.Checkpoint{TXID: c.TXID, Epoch: 1, CreatedAt: c.CreatedAt, Meta: c.Meta}
+		// survive the rewrite unchanged. Kind is not carried over: whatever
+		// it was in the old lineage, the copy is a snapshot.
+		kept[name] = store.Checkpoint{TXID: c.TXID, Epoch: 1, CreatedAt: c.CreatedAt, Meta: c.Meta, Kind: "snapshot"}
 	}
 
 	next := ref
@@ -1557,9 +1551,9 @@ func (w *Workspace) Compact(db, branch string) (uint64, error) {
 			}
 			copiedKeys = append(copiedKeys, key)
 		}
-		kept[name] = store.Checkpoint{TXID: c.TXID, Epoch: 1, CreatedAt: c.CreatedAt, Meta: c.Meta}
+		kept[name] = store.Checkpoint{TXID: c.TXID, Epoch: 1, CreatedAt: c.CreatedAt, Meta: c.Meta, Kind: "snapshot"}
 	}
-	kept["compact"] = store.Checkpoint{TXID: txid, Epoch: 1, CreatedAt: nowStamp()}
+	kept["compact"] = store.Checkpoint{TXID: txid, Epoch: 1, CreatedAt: nowStamp(), Kind: "snapshot"}
 
 	next := ref
 	next.Lineage, next.Epoch, next.HeadTXID, next.HeadEpoch = lineage, 1, txid, 1

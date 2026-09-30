@@ -1300,3 +1300,36 @@ func TestChainBaseErrorsOnChildHole(t *testing.T) {
 		t.Fatal("a hole in the child's own segment run must be an error")
 	}
 }
+
+// TestCheckpointKindRoundTripsAndDefaultsEmpty: Checkpoint.Kind survives a
+// PutRef/GetRef round trip, and a ref written before the field existed
+// (v2 without "kind", or a v1 bare-number checkpoint) decodes with it empty.
+func TestCheckpointKindRoundTripsAndDefaultsEmpty(t *testing.T) {
+	s := newStore(t)
+	r := Ref{Lineage: "lin", Epoch: 1, HeadTXID: 2, HeadEpoch: 1}
+	r.SetCheckpoint("a", Checkpoint{TXID: 1, Epoch: 1, Kind: "snapshot"})
+	r.SetCheckpoint("b", Checkpoint{TXID: 2, Epoch: 1, Kind: "segment"})
+	if _, err := s.PutRef("app", "main", r, ""); err != nil {
+		t.Fatal(err)
+	}
+	got, _, err := s.GetRef("app", "main")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got.Checkpoints["a"].Kind != "snapshot" || got.Checkpoints["b"].Kind != "segment" {
+		t.Fatalf("kinds after round trip: %+v", got.Checkpoints)
+	}
+
+	for _, raw := range []string{
+		`{"schema":2,"lineage":"lin","epoch":1,"head_txid":1,"head_epoch":1,"checkpoints":{"a":{"txid":1,"epoch":1}}}`,
+		`{"schema":1,"lineage":"lin","epoch":1,"head_txid":1,"checkpoints":{"a":1}}`,
+	} {
+		old, err := decodeRef([]byte(raw))
+		if err != nil {
+			t.Fatal(err)
+		}
+		if k := old.Checkpoints["a"].Kind; k != "" {
+			t.Fatalf("kind %q decoded from a ref without the field (%s), want empty", k, raw)
+		}
+	}
+}

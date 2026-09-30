@@ -1416,8 +1416,8 @@ func assertRaceWinner(t *testing.T, w *Workspace, r store.Ref, checkout string) 
 		t.Fatal("no winning checkpoint recorded")
 	}
 	txid := r.Checkpoints[winner].TXID
-	snap := w.objectExists(store.SnapshotKey(r.Lineage, r.Epoch, txid))
-	seg := w.objectExists(store.SegmentKey(r.Lineage, r.Epoch, txid, txid))
+	snap := storeHas(w, store.SnapshotKey(r.Lineage, r.Epoch, txid))
+	seg := storeHas(w, store.SegmentKey(r.Lineage, r.Epoch, txid, txid))
 	if snap == seg {
 		t.Fatalf("winner %s at txid %d: snapshot present %v, segment present %v; want exactly one", winner, txid, snap, seg)
 	}
