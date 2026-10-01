@@ -59,13 +59,41 @@ func (l *Local) Get(key string) ([]byte, string, error) {
 }
 
 // Head implements store.Header. A local etag is a sha256 over the content
-// (etagOf), so Head reads the file to compute it, exactly as Get does.
+// (etagOf), which every write records on the object as an extended
+// attribute (setEtagAttr) so Head can answer from one open+fstat+fgetxattr
+// instead of re-reading the object: ops.verifyOwnObject calls Head after
+// every winning checkpoint CAS, and without the attribute each at-rest
+// checkpoint on a local store paid a second full read and hash of the
+// snapshot it had just written. When the attribute is missing (a
+// filesystem without user xattrs, or an object written by an older
+// version) or does not describe the file's current size, Head hashes the
+// content, exactly as Get does. etag and size come from the same open
+// descriptor, so they describe one inode even under a concurrent replace.
 func (l *Local) Head(key string) (string, int64, error) {
-	data, etag, err := l.Get(key)
+	p, err := l.path(key)
 	if err != nil {
 		return "", 0, err
 	}
-	return etag, int64(len(data)), nil
+	f, err := os.Open(p)
+	if os.IsNotExist(err) {
+		return "", 0, ErrNotFound
+	}
+	if err != nil {
+		return "", 0, err
+	}
+	defer f.Close()
+	fi, err := f.Stat()
+	if err != nil {
+		return "", 0, err
+	}
+	if etag, ok := readEtagAttr(f, fi.Size()); ok {
+		return etag, fi.Size(), nil
+	}
+	data, err := io.ReadAll(f)
+	if err != nil {
+		return "", 0, err
+	}
+	return etagOf(data), int64(len(data)), nil
 }
 
 // GetReader implements store.ReaderGetter: it opens the file directly
@@ -107,35 +135,41 @@ func (l *Local) GetReader(key string) (io.ReadCloser, string, error) {
 // lost or won. A unique temp name per call makes each writer self-contained;
 // the final os.Rename is still atomic, so the last one to rename wins
 // cleanly with no torn or missing file in between.
-func (l *Local) write(p string, data []byte) error {
+//
+// The returned etag (etagOf over data) is also recorded on the temp file
+// as an extended attribute before the rename (see etagAttr), so the object
+// lands with its etag attached and Head need not re-read it.
+func (l *Local) write(p string, data []byte) (etag string, err error) {
 	dir := filepath.Dir(p)
 	if err := os.MkdirAll(dir, 0o755); err != nil {
-		return err
+		return "", err
 	}
 	f, err := os.CreateTemp(dir, filepath.Base(p)+".tmp-*")
 	if err != nil {
-		return err
+		return "", err
 	}
 	tmp := f.Name()
 	if _, err := f.Write(data); err != nil {
 		f.Close()
 		os.Remove(tmp)
-		return err
+		return "", err
 	}
+	etag = etagOf(data)
+	setEtagAttr(f, etag, int64(len(data)))
 	if err := f.Sync(); err != nil {
 		f.Close()
 		os.Remove(tmp)
-		return err
+		return "", err
 	}
 	if err := f.Close(); err != nil {
 		os.Remove(tmp)
-		return err
+		return "", err
 	}
 	if err := os.Rename(tmp, p); err != nil {
 		os.Remove(tmp)
-		return err
+		return "", err
 	}
-	return nil
+	return etag, nil
 }
 
 func (l *Local) Put(key string, data []byte) error {
@@ -143,7 +177,8 @@ func (l *Local) Put(key string, data []byte) error {
 	if err != nil {
 		return err
 	}
-	return l.write(p, data)
+	_, err = l.write(p, data)
+	return err
 }
 
 // writeReader is write()'s streaming counterpart: it copies r (exactly size
@@ -158,7 +193,8 @@ func (l *Local) Put(key string, data []byte) error {
 // The returned etag is a sha256 over the streamed content, computed
 // incrementally via io.MultiWriter alongside the write to disk — the same
 // digest etagOf(data) would produce over the same bytes read back, without
-// a second full-file pass to compute it after the fact.
+// a second full-file pass to compute it after the fact. Like write(), it
+// records that etag on the temp file (etagAttr) before the rename.
 func (l *Local) writeReader(p string, r io.Reader, size int64) (etag string, err error) {
 	dir := filepath.Dir(p)
 	if err := os.MkdirAll(dir, 0o755); err != nil {
@@ -181,6 +217,8 @@ func (l *Local) writeReader(p string, r io.Reader, size int64) (etag string, err
 		os.Remove(tmp)
 		return "", fmt.Errorf("store: streamed %d bytes for %s, want %d", n, p, size)
 	}
+	etag = hex.EncodeToString(h.Sum(nil))
+	setEtagAttr(f, etag, n)
 	if err := f.Sync(); err != nil {
 		f.Close()
 		os.Remove(tmp)
@@ -194,7 +232,7 @@ func (l *Local) writeReader(p string, r io.Reader, size int64) (etag string, err
 		os.Remove(tmp)
 		return "", err
 	}
-	return hex.EncodeToString(h.Sum(nil)), nil
+	return etag, nil
 }
 
 // PutReader implements store.ReaderPutter's unconditional overwrite: same
@@ -316,10 +354,7 @@ func (l *Local) PutIf(key string, data []byte, ifMatch string) (string, error) {
 			return "", fmt.Errorf("%w: etag mismatch", ErrCAS)
 		}
 	}
-	if err := l.write(p, data); err != nil {
-		return "", err
-	}
-	return etagOf(data), nil
+	return l.write(p, data)
 }
 
 func (l *Local) List(prefix string) ([]string, error) {

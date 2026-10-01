@@ -1,6 +1,7 @@
 package store
 
 import (
+	"bytes"
 	"errors"
 	"fmt"
 	"io"
@@ -420,5 +421,103 @@ func TestLocalRejectsTraversal(t *testing.T) {
 	b, _ := NewLocal(t.TempDir())
 	if err := b.Put("../evil", []byte("x")); err == nil {
 		t.Fatal("want error on path traversal")
+	}
+}
+
+// TestLocalHeadRecordedEtag pins how Local.Head answers without re-reading
+// the object: every write path (Put, PutIf, PutReader, PutReaderIf) leaves
+// the content etag on the object as an extended attribute, Head returns
+// that etag with the stat size, and anything that makes the attribute
+// untrustworthy — an object written without one (an older version, or a
+// filesystem without user xattrs), or one changed in place so its size no
+// longer matches — makes Head hash the content instead, so it is never
+// wrong, only slower.
+func TestLocalHeadRecordedEtag(t *testing.T) {
+	root := t.TempDir()
+	b, err := NewLocal(root)
+	if err != nil {
+		t.Fatal(err)
+	}
+	head := func(key string) (string, int64) {
+		t.Helper()
+		etag, size, err := b.Head(key)
+		if err != nil {
+			t.Fatalf("Head(%s): %v", key, err)
+		}
+		return etag, size
+	}
+	payload := []byte("recorded etag payload")
+	want := etagOf(payload)
+
+	// Each write path records the etag, and Head reports it with the size.
+	if _, err := b.PutIf("data/putif", payload, ""); err != nil {
+		t.Fatal(err)
+	}
+	if err := b.Put("data/put", payload); err != nil {
+		t.Fatal(err)
+	}
+	if err := b.PutReader("data/putreader", bytes.NewReader(payload), int64(len(payload))); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := b.PutReaderIf("data/putreaderif", bytes.NewReader(payload), int64(len(payload)), ""); err != nil {
+		t.Fatal(err)
+	}
+	for _, key := range []string{"data/putif", "data/put", "data/putreader", "data/putreaderif"} {
+		if etag, size := head(key); etag != want || size != int64(len(payload)) {
+			t.Fatalf("Head(%s) = (%s, %d), want (%s, %d)", key, etag, size, want, len(payload))
+		}
+	}
+
+	// The attribute is really there (so the Head answers above came from
+	// it, not from hashing) on a filesystem that supports user xattrs; on
+	// one that does not, Head's fallback is what the assertions above
+	// exercised, and the rest of this test has nothing more to pin.
+	f, err := os.Open(filepath.Join(root, "data", "putif"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	recorded, ok := readEtagAttr(f, int64(len(payload)))
+	f.Close()
+	if !ok {
+		t.Skip("filesystem does not record user xattrs; Head hashed instead")
+	}
+	if recorded != want {
+		t.Fatalf("recorded etag %s, want %s", recorded, want)
+	}
+
+	// An object with no attribute (written by something other than this
+	// version of Local) is hashed.
+	if err := os.WriteFile(filepath.Join(root, "data", "bare"), payload, 0o644); err != nil {
+		t.Fatal(err)
+	}
+	if etag, size := head("data/bare"); etag != want || size != int64(len(payload)) {
+		t.Fatalf("Head(bare) = (%s, %d), want (%s, %d)", etag, size, want, len(payload))
+	}
+
+	// An object changed in place keeps a stale attribute, but its size no
+	// longer matches, so Head hashes the current content.
+	grown := append(append([]byte{}, payload...), " and more"...)
+	if err := os.WriteFile(filepath.Join(root, "data", "putif"), grown, 0o644); err != nil {
+		t.Fatal(err)
+	}
+	if etag, size := head("data/putif"); etag != etagOf(grown) || size != int64(len(grown)) {
+		t.Fatalf("Head after in-place growth = (%s, %d), want (%s, %d)", etag, size, etagOf(grown), len(grown))
+	}
+
+	// A replace through Local lands the new etag with the new object.
+	if err := b.Put("data/putif", []byte("second")); err != nil {
+		t.Fatal(err)
+	}
+	if etag, size := head("data/putif"); etag != etagOf([]byte("second")) || size != int64(len("second")) {
+		t.Fatalf("Head after Put = (%s, %d), want (%s, %d)", etag, size, etagOf([]byte("second")), len("second"))
+	}
+
+	// A CopyObject's destination answers the source's etag whether or not
+	// the copy carried the attribute (clonefile does, a byte copy does not).
+	if err := b.CopyObject("data/copy", "data/put"); err != nil {
+		t.Fatal(err)
+	}
+	if etag, size := head("data/copy"); etag != want || size != int64(len(payload)) {
+		t.Fatalf("Head(copy) = (%s, %d), want (%s, %d)", etag, size, want, len(payload))
 	}
 }
