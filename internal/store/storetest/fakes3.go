@@ -563,7 +563,7 @@ func (f *FakeS3) handle(w http.ResponseWriter, r *http.Request) {
 			defer f.signalPartCompleted()
 			w = piw
 			f.awaitPartGate()
-			if n, err := strconv.Atoi(q.Get("partNumber")); err == nil {
+			if n, err := strconv.ParseInt(q.Get("partNumber"), 10, 32); err == nil {
 				f.awaitPartHold(int32(n))
 				if d := f.partDelay(int32(n)); d > 0 {
 					time.Sleep(d)
@@ -837,7 +837,7 @@ func (f *FakeS3) uploadPart(w http.ResponseWriter, r *http.Request, key string) 
 		xmlError(w, http.StatusNotFound, "NoSuchUpload")
 		return
 	}
-	n, err := strconv.Atoi(q.Get("partNumber"))
+	n, err := strconv.ParseInt(q.Get("partNumber"), 10, 32)
 	if err != nil || n < 1 {
 		xmlError(w, http.StatusBadRequest, "InvalidArgument")
 		return
@@ -879,7 +879,7 @@ func (f *FakeS3) uploadPartCopy(w http.ResponseWriter, r *http.Request, dstKey, 
 		xmlError(w, http.StatusNotFound, "NoSuchUpload")
 		return
 	}
-	n, err := strconv.Atoi(q.Get("partNumber"))
+	n, err := strconv.ParseInt(q.Get("partNumber"), 10, 32)
 	if err != nil || n < 1 {
 		xmlError(w, http.StatusBadRequest, "InvalidArgument")
 		return
