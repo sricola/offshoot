@@ -18,9 +18,12 @@ on:
     - cron: "23 5 * * 3"   # Wednesdays 05:23 UTC
   workflow_dispatch:
 
+# Only PR runs supersede each other: a cancelled push-to-main or scheduled
+# run would leave that commit unanalyzed, which is exactly what the SAST
+# check counts against.
 concurrency:
   group: codeql-${{ github.ref }}
-  cancel-in-progress: true
+  cancel-in-progress: ${{ github.event_name == 'pull_request' }}
 
 permissions:
   contents: read
