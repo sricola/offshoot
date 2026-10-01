@@ -25,3 +25,15 @@ updates:
     groups:
       go-deps:
         patterns: ["*"]
+
+  # The Dockerfile pins both base images by digest (`image:tag@sha256:...`);
+  # this bumps the digest when the tag's image is rebuilt upstream (security
+  # patches to bookworm / the Go toolchain), the same way the actions entry
+  # above keeps SHA pins from rotting.
+  - package-ecosystem: docker
+    directory: /
+    schedule:
+      interval: weekly
+    groups:
+      docker-images:
+        patterns: ["*"]

@@ -977,6 +977,21 @@ func (s *Store) ObjectExists(key string) (bool, error) {
 	return false, nil
 }
 
+// Head returns the etag and size of the object at key, ErrNotFound when
+// there is none. It uses the backend's Header capability when present (one
+// HEAD request on S3) and otherwise falls back to Get, whose etag is the
+// one PutIf returns on every backend. Read-only.
+func (s *Store) Head(key string) (etag string, size int64, err error) {
+	if h, ok := s.B.(Header); ok {
+		return h.Head(key)
+	}
+	data, etag, err := s.B.Get(key)
+	if err != nil {
+		return "", 0, err
+	}
+	return etag, int64(len(data)), nil
+}
+
 // DeleteRefIf deletes db@branch's ref, conditional on etag when the backend
 // can actually honor that (ConditionalDeleter — today, Local) and
 // unconditional otherwise (S3). Milestone 4 Task 6b's Destroy claim-guard

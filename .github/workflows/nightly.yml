@@ -94,6 +94,59 @@ jobs:
       - name: make test-torture
         run: make test-torture
 
+  # Go native fuzzing of the parsers that read untrusted bytes (store
+  # names, LTX snapshot/segment decode, the .sum sidecar, the daemon
+  # request decoder). Daily leg, ubuntu only. `-fuzz` takes one target per
+  # package run, so the targets run sequentially, 60s each; every target
+  # runs even after one fails, and the job then fails. A crasher is written
+  # under the package's testdata/fuzz/<Target>/ and uploaded so it can be
+  # reproduced locally with `go test ./internal/<pkg> -run '<Target>/<id>'`.
+  fuzz:
+    needs: activity
+    if: github.ref == 'refs/heads/main' && needs.activity.outputs.fresh == 'true'
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+
+      - uses: actions/setup-go@b7ad1dad31e06c5925ef5d2fc7ad053ef454303e # v7.0.0
+        with:
+          go-version-file: go.mod
+
+      # Same loop as `make fuzz` (30s there). -fuzzminimizetime caps how
+      # long each new corpus entry is minimized, which otherwise eats most
+      # of a short budget on the LTX targets; a crasher is saved either way.
+      - name: go test -fuzz (60s per target)
+        run: |
+          failed=""
+          for spec in store:FuzzValidateName ltxio:FuzzDecodeSnapshot ltxio:FuzzApplySegments ops:FuzzReadSidecar daemon:FuzzDecodeRequest; do
+            pkg="${spec%%:*}"; target="${spec##*:}"
+            echo "::group::$target (internal/$pkg)"
+            if ! go test "./internal/$pkg" -run '^$' -fuzz "^${target}\$" -fuzztime 60s -fuzzminimizetime 5s; then
+              failed="$failed $target"
+            fi
+            echo "::endgroup::"
+          done
+          if [ -n "$failed" ]; then
+            echo "::error::fuzz targets failed:$failed (crashers uploaded as the fuzz-crashers artifact)"
+            exit 1
+          fi
+
+      - name: Upload crashers
+        # failure() alone skips this when the job hits timeout-minutes (the
+        # job is then cancelled, not failed), and any crashers already saved
+        # would be lost with it.
+        if: failure() || cancelled()
+        # actions/upload-artifact v7.0.1: refs/tags/v7.0.1 is a lightweight
+        # tag pointing straight at commit 043fb46 (same pin as scorecard.yml).
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        with:
+          name: fuzz-crashers
+          path: internal/**/testdata/fuzz/**
+          if-no-files-found: ignore
+
   # The full macOS test suite (the coverage removed from ci.yml's per-push
   # matrix, where its 10x billing dominated the Actions bill): weekly
   # Sunday leg and manual dispatch only (activity's weekly output).

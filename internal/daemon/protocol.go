@@ -10,7 +10,22 @@
 // before sending the next Request on the same connection.
 package daemon
 
-import "github.com/sricola/offshoot/internal/ops"
+import (
+	"encoding/json"
+
+	"github.com/sricola/offshoot/internal/ops"
+)
+
+// decodeRequest reads the next Request from dec — the one wire decode both
+// surfaces share: the unix socket's per-connection loop (Server.handle)
+// and POST /rpc (Server.handleRPC). Kept as a single function so the
+// decoder fuzz target (FuzzDecodeRequest) exercises exactly what the
+// server runs on untrusted bytes.
+func decodeRequest(dec *json.Decoder) (Request, error) {
+	var req Request
+	err := dec.Decode(&req)
+	return req, err
+}
 
 // Request is one client request sent to the daemon.
 type Request struct {

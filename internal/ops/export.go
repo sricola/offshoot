@@ -97,7 +97,7 @@ func (w *Workspace) Export(db, branch, checkpoint, dstPath string, force bool) e
 // exactly the path-traversal hole CheckoutAt's own validation closes; see
 // its doc comment.
 func (w *Workspace) CheckoutAtPath(db, branch, checkpoint string) string {
-	return filepath.Join(w.Root, "checkouts-ro", db, branch+"@"+checkpoint+".db")
+	return w.underRoot("checkouts-ro", db, branch+"@"+checkpoint+".db")
 }
 
 // CheckoutAt materializes db@branch's state at checkpoint into its
@@ -291,9 +291,10 @@ const byChainDir = "~by-chain"
 // `rm -rf` at any time (the next miss re-creates it), is LRU-bounded to
 // DefaultByChainMaxEntries per database (see pruneByChain), and is
 // LRU-evicted under -ro-cache-budget too (see roCacheEntries). id is a hex SHA-256, so the
-// join cannot escape the directory; db must already be validated.
+// join cannot escape the directory; db must already be validated (underRoot
+// enforces both).
 func (w *Workspace) byChainPath(db, id string) string {
-	return filepath.Join(w.roCacheRoot(), db, byChainDir, id+".db")
+	return w.underRoot("checkouts-ro", db, byChainDir, id+".db")
 }
 
 // checkoutAtChmod is CheckoutAt's read-only chmod call, indirected only so

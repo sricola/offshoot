@@ -9,7 +9,7 @@ import (
 	"strings"
 
 	"github.com/sricola/offshoot/internal/ltxio"
-	"github.com/sricola/offshoot/internal/ops/reflink"
+	"github.com/sricola/offshoot/internal/reflink"
 	"github.com/sricola/offshoot/internal/store"
 )
 
@@ -176,6 +176,34 @@ func (w *Workspace) materializeFromChain(db, lineage string, members []store.Cha
 		return chainPlacement{}, err
 	}
 	return chainPlacement{kind: "materialize", chainID: id, checksum: checksum}, nil
+}
+
+// refreshFromChain lands ref's head in the writable checkout at path the
+// way CheckoutProven does — Rollback, Promote and Compact refresh through
+// it: the head's chain is resolved once and handed to materializeFromChain,
+// so the bytes are a clone of a by-chain entry when the chain (or a prefix
+// of it) is cached, and a plain materialize where the filesystem cannot
+// clone. The source is reported to observeCheckoutSource, and db's by-chain
+// area is pruned after a populate. It returns the post-apply checksum and
+// chain ID for the caller's stamp; the caller still stamps with writeSum,
+// whose fingerprint sandwich guards a write racing the hash, and then
+// refreshes the shadow.
+func (w *Workspace) refreshFromChain(db string, ref store.Ref, path string) (uint64, string, error) {
+	members, err := w.resolveChain(ref, headCheckpoint(ref), path)
+	if err != nil {
+		return 0, "", err
+	}
+	placed, err := w.materializeFromChain(db, ref.Lineage, members, path, 0o600)
+	if err != nil {
+		return 0, "", err
+	}
+	if observeCheckoutSource != nil {
+		observeCheckoutSource(placed.kind)
+	}
+	if placed.kind != "clone" { // a populate may have added an entry
+		w.pruneByChain(db, DefaultByChainMaxEntries)
+	}
+	return placed.checksum, placed.chainID, nil
 }
 
 // canCloneByChain reports whether a file in db's by-chain directory can be

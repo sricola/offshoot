@@ -121,14 +121,14 @@ jobs:
       - name: Verify the runner's filesystem clones
         run: |
           set -o pipefail
-          go test ./internal/ops/reflink -run '^TestCloneProducesIdenticalFile$' -count=1 -v | tee reflink-probe.txt
+          go test ./internal/reflink -run '^TestCloneProducesIdenticalFile$' -count=1 -v | tee reflink-probe.txt
           if grep -q -- '--- SKIP' reflink-probe.txt; then
             echo "TMPDIR cannot clone on this runner; the copy-on-write tests would all skip" >&2
             exit 1
           fi
 
       - name: go test (copy-on-write paths)
-        run: go test ./internal/ops ./internal/ltxio ./internal/ops/reflink -count=1
+        run: go test ./internal/ops ./internal/ltxio ./internal/reflink -count=1
 
       - name: go test (copy-on-write session opens)
         run: go test ./internal/session -run '^(TestOpenOnClonedCheckoutSkipsSettlingFlush|TestAtRestCheckpointAfterCloseWritesASegment)$' -count=1 -v
@@ -264,7 +264,9 @@ jobs:
       - name: Install offshoot-db[pytest] + pytest-xdist
         run: |
           python3 -m venv .venv-pytest-plugin
-          .venv-pytest-plugin/bin/pip install --quiet -e "sdk/python[pytest]" pytest-xdist
+          .venv-pytest-plugin/bin/pip install --quiet --require-hashes \
+            -r requirements/ci-pytest-plugin.txt
+          .venv-pytest-plugin/bin/pip install --quiet --no-deps -e sdk/python
 
       - name: make test-pytest-plugin
         run: PATH="$PWD/.venv-pytest-plugin/bin:$PATH" make test-pytest-plugin
@@ -279,8 +281,10 @@ jobs:
       - name: Install LangGraph companion test environment
         run: |
           python3 -m venv .venv-langgraph
-          .venv-langgraph/bin/pip install --quiet \
-            -e sdk/python -e "sdk/python-langgraph[test]"
+          .venv-langgraph/bin/pip install --quiet --require-hashes \
+            -r requirements/ci-langgraph.txt
+          .venv-langgraph/bin/pip install --quiet --no-deps \
+            -e sdk/python -e sdk/python-langgraph
 
       - name: make test-python-langgraph
         run: PATH="$PWD/.venv-langgraph/bin:$PATH" make test-python-langgraph
@@ -299,7 +303,7 @@ jobs:
       # jobs use actions/setup-python, which isn't externally managed and
       # doesn't need this flag).
       - name: Install SDK build/publish check tooling
-        run: python3 -m pip install --break-system-packages --quiet build twine
+        run: python3 -m pip install --break-system-packages --quiet --require-hashes -r requirements/ci-publish-tooling.txt
 
       - name: make dry-run-sdks
         run: make dry-run-sdks

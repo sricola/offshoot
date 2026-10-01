@@ -13,7 +13,53 @@ version if you depend on format stability.
 
 ## [Unreleased]
 
-Nothing yet.
+### Added
+
+- **`offshoot_checkpoint_overwrite_detected_total`.** Counts at-rest
+  checkpoints that committed but found the store's head may not be their
+  own content (see Changed). Registered at `0`; a stat panel on the
+  Grafana dashboard.
+- **Fuzz targets.** Go native fuzz targets for store names, LTX snapshot
+  decoding, segment application, the checkout sidecar and the daemon
+  protocol; `make fuzz` runs them all, and a nightly `fuzz` job runs each
+  for 60 s and uploads any crasher.
+- **`Store.Head`.** An optional `store.Header` backend capability (one
+  `HeadObject` on S3) returning an object's etag and size, with a `Get`
+  fallback for backends without it.
+- **CodeQL** static analysis on pushes to `main`, pull requests and a weekly schedule.
+- **Hash-pinned CI installs.** Every third-party Python package CI installs
+  comes from a hash-pinned lock under `requirements/`.
+
+### Changed
+
+- **Rollback, promote and compact refresh the checkout through the by-chain
+  cache,** like `checkout`: an identical or prefix-sharing file is cloned
+  instead of decoded from the store.
+- **Concurrent at-rest checkpoints on one branch are detected and
+  recovered.** After winning the ref CAS, a checkpoint verifies that the
+  store resolves the head to its own content: its object was not replaced
+  by a same-kind racer, and (for a segment) no racer's snapshot sits at
+  the same txid. It also checks that the checkout did not change between
+  its encode and its stamp. When the head and the checkout may differ, the
+  checkout reads as modified, no checksum is trusted, and the next
+  checkpoint writes a full snapshot. Two concurrent at-rest checkpoints are
+  still not a supported pattern; see
+  [limitations](docs/limitations.md#one-writer-per-branch).
+- **Flush CAS retry budget.** A flush that loses its ref CAS to its own
+  lease heartbeat (or to a metadata write) keeps retrying for up to a
+  lease TTL instead of a fixed count, with a short jittered pause between
+  retries.
+- **`internal/reflink`** replaces `internal/ops/reflink` (package path only).
+
+### Stricter decoding
+
+An LTX object is now refused, before it is decoded, when it has: an LZ4
+frame shape other than the one ltx v0.5.1 wrote; a legacy or skippable LZ4
+magic; a page frame larger than the LZ4 bound for one page; an illegal page
+size; or a segment that grows the database beyond the pages it carries.
+The pinned upstream decoder would accept some of these, at the cost of
+allocations of up to 4 GiB or zero-filled pages. No object this project
+ever wrote is affected.
 
 ## [0.2.12] - 2026-09-30
 

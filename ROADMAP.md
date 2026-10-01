@@ -333,19 +333,47 @@ open wart (its own spec said "N materialized forks cost up to N×G").
   against a reflinked shadow. ⏸ **Compact stays a copy**, by design —
   dropping the base pointer is what it is for.
 - ⏭ **Tier 2 follow-ups from that work** (none blocks v0.2.12):
-  - Route Rollback/Promote/Compact's local checkout refresh through the
+  - ✅ Route Rollback/Promote/Compact's local checkout refresh through the
     by-chain cache (`materializeFromChain`), so the local refresh is
     O(delta) like `checkout`, not a full decode.
-  - Move `internal/ops/reflink` to `internal/reflink`: `internal/ltxio`
-    imports it today, a layering inversion.
-  - Pass the resolved chain members into `planSegment`, saving one Chain
+  - ✅ Move `internal/ops/reflink` to `internal/reflink`: `internal/ltxio`
+    imported it, a layering inversion.
+  - ✅ Pass the resolved chain members into `planSegment`, saving one Chain
     resolution per at-rest checkpoint.
-  - Close the concurrent at-rest checkpoint race
+  - ✅ Close the concurrent at-rest checkpoint race
     ([limitations](docs/limitations.md#one-writer-per-branch)): after
-    winning the ref CAS, read the stored object's trailer checksum; on a
-    mismatch stamp `PostApplyChecksum=0` and drop the shadow, so neither
-    the next checkpoint nor a daemon session trusts content a same-kind
-    loser overwrote.
+    winning the ref CAS, the checkpoint `Head`s its object and, on an etag
+    mismatch, reads the stored trailer checksum; on a content mismatch it
+    stamps `PostApplyChecksum=0`, drops the shadow and counts
+    `offshoot_checkpoint_overwrite_detected_total`, so neither the next
+    checkpoint nor a daemon session trusts content a same-kind loser
+    overwrote. The final review widened it: a segment winner also probes
+    for a racer's snapshot at its txid (which would anchor the head), a
+    write between encode and stamp is caught by fingerprint, and a
+    distrusted stamp records a hash no file matches, so the checkout reads
+    "modified" unless it provably equals the store's head.
+  - A third concurrent at-rest checkpoint that overwrites the object after
+    the winner's check is still unnoticed; closing it needs a lease (or a
+    create-only key per attempt) on the at-rest path.
+  - Normalize etags across providers before comparing them (strip quotes
+    and a weak `W/` prefix), so an S3-compatible provider that reformats
+    the etag between `PUT` and `HEAD` costs no needless `GET`.
+  - A Local `Head` that does not re-hash the whole object (for example a
+    cached digest keyed by size and mtime): today it reads the file to
+    compute the etag `PutIf` returned.
+  - A Dependabot `pip` entry for `requirements/`, so the hash-pinned CI
+    locks get update PRs like the Go modules and Actions do.
+  - Commit a 64 KiB-page, incompressible ltx v0.5.1 fixture beside the
+    4 KiB ones, so the pinned frame shape is tested at the largest page
+    size and at the LZ4 worst-case block.
+  - Apply the 1 s racily-clean margin to the checkpoint stamp's
+    matching-fingerprint shortcut (`stampCheckpoint`): on a coarse-mtime
+    filesystem in WAL mode a foreign same-size write inside the quiesce
+    tick could otherwise be stamped trusted; fall back to
+    `ChecksumDatabase` when the mtime is younger than the margin.
+  - Decide whether the runtime image should `apt-get upgrade` at build
+    time or rely solely on Dependabot's weekly base-image digest bumps for
+    security updates; the Dockerfile comment documents the current choice.
 
 ## Launch track (parallel to v0.1–v0.3)
 

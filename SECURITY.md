@@ -18,12 +18,14 @@ provenance, with no maintainer-held key involved. The identity to pin when
 verifying is the release workflow itself
 (`.github/workflows/release.yml` on `sricola/offshoot`), not a person. See
 the [installation page](docs/installation.md#verify-what-you-downloaded)
-for the exact verification commands.
+for the exact verification commands
+(<https://github.com/sricola/offshoot/blob/main/docs/installation.md#verify-what-you-downloaded>).
 
 ## Reporting a vulnerability
 
 **Do not open a public issue for a security report.** Use GitHub's private
-vulnerability reporting instead:
+vulnerability reporting instead, at
+<https://github.com/sricola/offshoot/security/advisories/new> — or by hand:
 
 1. Go to the repo's **Security** tab.
 2. Click **Report a vulnerability**.
@@ -55,7 +57,12 @@ secret. In rough priority order:
 - **Path traversal / prefix escape** — anything in checkout materialization,
   store key construction, or import (`--from`) that lets a branch name, db
   name, or checkpoint name reach outside its intended directory or store
-  prefix.
+  prefix. By design, a file path the caller names outright is not a name:
+  the daemon trusts a unix-socket client's `path` field (`export`'s
+  destination, `create`'s import source) as an ordinary server-side path
+  that same-user caller could already write or read, and refuses both over
+  HTTP (see [docs/reference.md](docs/reference.md)'s daemon-ops threat
+  model).
 - **Credential handling** — anything that logs, persists, or leaks S3
   credentials, the single-token auth secret, or other configured secrets
   beyond their intended scope.

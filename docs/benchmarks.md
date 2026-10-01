@@ -661,7 +661,7 @@ Go 1.27.1, no other load, measured 2026-09-30.
 
 *Table 1 — wall-clock profile of `mcts`.* Temporary instrumentation (a
 wall-clock span at the top of ~40 functions in `internal/store`,
-`internal/ops`, `internal/ops/reflink` and `internal/ltxio`, bucketed by
+`internal/ops`, `internal/reflink` and `internal/ltxio`, bucketed by
 30 s of run time; removed before committing) during `go run
 ./cmd/branchbench -workflows mcts`. Run 1 is the code before the `List`
 fix (216.1 s); its depth-25 samples fall in the late bucket. Run 2 has the
@@ -870,7 +870,7 @@ on a local copy-on-write SQLite store.
   `apt-get` before running `go test`. The container's writable layer (where
   `t.TempDir()`/`b.TempDir()` land, since no `GOTMPDIR` is set) is backed by
   Docker Desktop's Linux VM disk — confirmed via
-  `go test ./internal/ops/reflink -run TestCopyFileClonedFlagOnClonableFS -v`
+  `go test ./internal/reflink -run TestCopyFileClonedFlagOnClonableFS -v`
   inside the container, which skips loudly ("temp filesystem does not
   support reflink/clonefile"). This is the "ext4-without-reflink" case
   referenced throughout: Task 6a's fast path still fires (one object copy
@@ -914,7 +914,7 @@ round trip the fast path pays that the slow path doesn't need — it's what's
 included in every `ForkAtHead` number in this document (the numbers were
 never measured with it stripped out), and on the S3 backend it's a real
 extra HTTP request per fork alongside the `HEAD`/`CopyObject`/`PutRef`
-sequence described in "Results: S3 path" below. `internal/ops/reflink` backs
+sequence described in "Results: S3 path" below. `internal/reflink` backs
 the local implementation: a
 filesystem clone (`clonefile(2)` on darwin, the `FICLONE` ioctl on Linux)
 when the filesystem supports it, silently falling back to a plain byte copy

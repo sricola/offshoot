@@ -1,0 +1,12 @@
+# Input for requirements/ci-pytest-plugin.txt, the hash-pinned lock CI
+# installs with `pip install --require-hashes -r requirements/ci-pytest-plugin.txt`.
+# Used by ci.yml's test-pytest-plugin venv: sdk/python's [pytest] extra
+# (keep in sync with sdk/python/pyproject.toml) plus pytest-xdist. sdk/python
+# itself installs afterwards with `pip install --no-deps -e sdk/python`.
+#
+# Regenerate the lock after editing this file (or to pick up new releases):
+#   uv pip compile --python-version 3.12 --generate-hashes --universal \
+#     -o requirements/ci-pytest-plugin.txt requirements/ci-pytest-plugin.in
+# See CONTRIBUTING.md "Refreshing the hash-pinned CI requirements".
+pytest>=7
+pytest-xdist

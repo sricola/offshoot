@@ -1,0 +1,15 @@
+# Input for requirements/ci-langgraph.txt, the hash-pinned lock CI installs
+# with `pip install --require-hashes -r requirements/ci-langgraph.txt`.
+# Used by ci.yml's LangGraph companion venv: sdk/python-langgraph's runtime
+# dependencies plus its [test] extra (keep in sync with
+# sdk/python-langgraph/pyproject.toml). sdk/python and sdk/python-langgraph
+# install afterwards with `pip install --no-deps -e`.
+#
+# Regenerate the lock after editing this file (or to pick up new releases):
+#   uv pip compile --python-version 3.12 --generate-hashes --universal \
+#     -o requirements/ci-langgraph.txt requirements/ci-langgraph.in
+# See CONTRIBUTING.md "Refreshing the hash-pinned CI requirements".
+langgraph-checkpoint>=4.2,<5
+langgraph-checkpoint-sqlite>=3.1,<4
+langgraph>=1.2,<2
+pytest>=7

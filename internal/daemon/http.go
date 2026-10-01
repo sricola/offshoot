@@ -500,8 +500,8 @@ func (s *Server) handleRPC(w http.ResponseWriter, r *http.Request) {
 	}
 
 	r.Body = http.MaxBytesReader(w, r.Body, maxRPCBodyBytes)
-	var req Request
-	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
+	req, err := decodeRequest(json.NewDecoder(r.Body))
+	if err != nil {
 		var mbe *http.MaxBytesError
 		if errors.As(err, &mbe) {
 			http.Error(w, "request body too large", http.StatusRequestEntityTooLarge)

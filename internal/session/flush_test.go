@@ -20,7 +20,7 @@ import (
 	"github.com/sricola/offshoot/internal/capture"
 	"github.com/sricola/offshoot/internal/ltxio"
 	"github.com/sricola/offshoot/internal/ops"
-	"github.com/sricola/offshoot/internal/ops/reflink"
+	"github.com/sricola/offshoot/internal/reflink"
 	"github.com/sricola/offshoot/internal/store"
 	"github.com/sricola/offshoot/internal/testutil"
 )
@@ -646,13 +646,16 @@ func TestMustExecWaitsOutTransientLocks(t *testing.T) {
 // TestFlushIncludesEverythingCommittedBeforeIt hit intermittently
 // (renewals fire every LeaseTTL/3 = 10s there; its blocker-throttled
 // flushes run >6s). An aggressive 4ms heartbeat — orders of magnitude
-// faster than production's cadence, yet slow enough that Flush's bounded
-// benign-retry can't be exhausted even under race-detector slowdown —
-// makes that collision near-certain on every flush here (a flush's
-// GetRef→PutRef window spans tens of ms): all of them must still succeed,
+// faster than production's cadence — makes that collision near-certain on
+// every flush here (a flush's GetRef→PutRef window spans tens of ms, and
+// under race-detector slowdown on a loaded machine a single retry cycle
+// outlasts several heartbeats): all of them must still succeed,
 // because a CAS loss to a writer holding our own holder+epoch with the
 // head untouched is proof the premise didn't change — Flush reapplies onto
-// the fresh revision and retries instead of failing.
+// the fresh revision and retries instead of failing. That holds under load
+// only because the retry bound is a budget (flushCASMinAttempts retries OR
+// flushCASMinLeaseTTLs of wall time, see flush.go) rather than the fixed
+// count of 8 that flaked here on 2026-09-26.
 func TestFlushSurvivesOwnLeaseRenewalRace(t *testing.T) {
 	testutil.RequireSQLite3(t)
 	w := newWS(t)
@@ -2732,5 +2735,27 @@ func TestFencedSnapshotOrphanDoesNotShadowTheNextSessionsSegment(t *testing.T) {
 		t.Fatalf("read after the takeover = %q err=%v, want \"session-b\\n\" — "+
 			"%q means the fenced writer's snapshot at txid %d shadowed B's committed segment",
 			out, err, out, txid)
+	}
+}
+
+// TestFlushCASRetryPauseIsBounded pins the retry backoff: a quarter of the
+// renewal period, capped at flushCASRetryPauseMax, within ±25%, and never
+// negative.
+func TestFlushCASRetryPauseIsBounded(t *testing.T) {
+	for _, tc := range []struct {
+		renewEvery time.Duration
+		base       time.Duration
+	}{
+		{0, 0},
+		{4 * time.Millisecond, time.Millisecond},
+		{40 * time.Millisecond, 10 * time.Millisecond},
+		{10 * time.Second, flushCASRetryPauseMax},
+	} {
+		lo, hi := tc.base-tc.base/4, tc.base+tc.base/4
+		for range 200 {
+			if got := flushCASRetryPause(tc.renewEvery); got < lo || got > hi {
+				t.Fatalf("flushCASRetryPause(%v) = %v, want within [%v, %v]", tc.renewEvery, got, lo, hi)
+			}
+		}
 	}
 }

@@ -301,6 +301,28 @@ func (s *S3) Get(key string) ([]byte, string, error) {
 	return data, aws.ToString(out.ETag), nil
 }
 
+// Head implements store.Header with one HeadObject request. The etag is the
+// response's ETag header exactly as PutIf and Get return it (quoted), so the
+// three compare equal for the same stored object.
+func (s *S3) Head(key string) (string, int64, error) {
+	fk, err := s.full(key)
+	if err != nil {
+		return "", 0, err
+	}
+	ctx, cancel := singleShotCtx(0)
+	out, err := s.cl.HeadObject(ctx, &s3.HeadObjectInput{
+		Bucket: aws.String(s.bucket), Key: aws.String(fk),
+	})
+	cancel()
+	if err != nil {
+		if isNotFound(err) {
+			return "", 0, ErrNotFound
+		}
+		return "", 0, fmt.Errorf("store: s3 head %s: %w", key, err)
+	}
+	return aws.ToString(out.ETag), aws.ToInt64(out.ContentLength), nil
+}
+
 // GetReader implements store.ReaderGetter: it returns the GetObject
 // response's Body directly, without buffering it into memory first (unlike
 // Get, which io.ReadAlls it) — so a caller applying a large object (e.g. a

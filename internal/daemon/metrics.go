@@ -64,6 +64,15 @@ type Metrics struct {
 	PromoteTotal  *metrics.CounterVec // {mode} — shared|materialized
 
 	CheckpointDuration *metrics.Histogram
+	// CheckpointOverwriteTotal (offshoot_checkpoint_overwrite_detected_total)
+	// counts at-rest checkpoints whose post-CAS check found the store's
+	// head may not be their own content: their object replaced by a racing
+	// same-kind checkpoint's different content, a racer's snapshot anchoring
+	// the head beside their segment, or an object they could not verify
+	// (see ops.ObserveCheckpointOverwrite). Like CheckpointDuration it only
+	// moves in a process that runs ops.Workspace.CheckpointWith itself.
+	// Locked once shipped, like the rest.
+	CheckpointOverwriteTotal *metrics.Counter
 
 	ReapTotal         *metrics.Counter
 	GCTombstonedTotal *metrics.Counter
@@ -143,6 +152,12 @@ func newMetrics() *Metrics {
 				"ops.Workspace.Checkpoint directly (CLI/MCP) — a live session's checkpoint is a named "+
 				"flush instead, counted under offshoot_flush_duration_seconds; see internal/ops's "+
 				"ObserveCheckpoint doc comment.", metrics.DefaultDurationBuckets),
+		CheckpointOverwriteTotal: r.NewCounter("offshoot_checkpoint_overwrite_detected_total",
+			"At-rest checkpoints that committed but found the store's head may not be their own content "+
+				"(object replaced by a racing same-kind checkpoint, a racer's snapshot beside their segment, "+
+				"or an object that could not be verified); unless the checkout equals the head, its checksum "+
+				"is then not trusted and the next checkpoint writes a snapshot. Only populated by a process "+
+				"that runs checkpoints itself (CLI/MCP)."),
 
 		ReapTotal:         r.NewCounter("offshoot_reap_total", "Branches reaped by the janitor."),
 		GCTombstonedTotal: r.NewCounter("offshoot_gc_tombstoned_total", "Objects newly tombstoned by GC."),
@@ -286,9 +301,13 @@ func (m *Metrics) observeCheckpoint(dur time.Duration) {
 	m.CheckpointDuration.Observe(dur.Seconds())
 }
 
+func (m *Metrics) observeCheckpointOverwrite() {
+	m.CheckpointOverwriteTotal.Inc()
+}
+
 // wireHooks assigns this daemon's process-wide instrumentation hooks
-// (ops.ObserveFork, ops.ObserveCheckpoint, ops.ObserveRollback,
-// ops.ObservePromote, session.OnTransition) to close
+// (ops.ObserveFork, ops.ObserveCheckpoint, ops.ObserveCheckpointOverwrite,
+// ops.ObserveRollback, ops.ObservePromote, session.OnTransition) to close
 // over m, and registers m's scrape-time session-gauge collector against srv.
 // Called once, from NewServer, before Serve starts accepting connections —
 // see OnTransition/ObserveFork's own doc comments for why a single,
@@ -298,6 +317,7 @@ func (m *Metrics) observeCheckpoint(dur time.Duration) {
 func (m *Metrics) wireHooks(srv *Server) {
 	ops.ObserveFork = m.observeFork
 	ops.ObserveCheckpoint = m.observeCheckpoint
+	ops.ObserveCheckpointOverwrite = m.observeCheckpointOverwrite
 	ops.ObserveRollback = m.observeRollback
 	ops.ObservePromote = m.observePromote
 	session.OnTransition = m.observeFlushTransition

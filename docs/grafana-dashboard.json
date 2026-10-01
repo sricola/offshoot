@@ -1,5 +1,5 @@
 {
-  "__comment": "offshoot daemon dashboard \u2014 covers all 18 offshoot_* metric families served by GET /metrics (see docs/operations.md#metrics; names locked per that page). Generated for schemaVersion 39; import via Dashboards > Import and pick your Prometheus datasource.",
+  "__comment": "offshoot daemon dashboard \u2014 covers 19 of the 21 offshoot_* metric families (all but offshoot_rollback_total and offshoot_promote_total) served by GET /metrics (see docs/operations.md#metrics; names locked per that page). Generated for schemaVersion 39; import via Dashboards > Import and pick your Prometheus datasource.",
   "title": "offshoot",
   "uid": "offshoot-daemon",
   "tags": [
@@ -632,6 +632,64 @@
           "expr": "histogram_quantile(0.99, rate(offshoot_checkpoint_duration_seconds_bucket[$__rate_interval]))",
           "legendFormat": "p99",
           "refId": "C"
+        }
+      ]
+    },
+    {
+      "id": 24,
+      "type": "stat",
+      "title": "Checkpoint overwrites detected",
+      "description": "offshoot_checkpoint_overwrite_detected_total: at-rest checkpoints that committed but found the store's head may not be their own content: their object replaced by a racing same-kind checkpoint, a racer's snapshot beside their segment (two at-rest checkpoints on one branch at once, with a write between their encodes), or an object that could not be verified. Unless the checkout equals the head, it then reads as modified and the next checkpoint writes a snapshot. At-rest only (CLI/MCP), like checkpoint latency; any increase means at-rest checkpoints on one branch are not serialized.",
+      "datasource": {
+        "type": "prometheus",
+        "uid": "${datasource}"
+      },
+      "gridPos": {
+        "x": 8,
+        "y": 23,
+        "w": 8,
+        "h": 7
+      },
+      "fieldConfig": {
+        "defaults": {
+          "unit": "short",
+          "thresholds": {
+            "mode": "absolute",
+            "steps": [
+              {
+                "color": "green",
+                "value": null
+              },
+              {
+                "color": "red",
+                "value": 1
+              }
+            ]
+          }
+        },
+        "overrides": []
+      },
+      "options": {
+        "reduceOptions": {
+          "calcs": [
+            "lastNotNull"
+          ],
+          "fields": "",
+          "values": false
+        },
+        "graphMode": "area",
+        "colorMode": "value",
+        "textMode": "auto"
+      },
+      "targets": [
+        {
+          "datasource": {
+            "type": "prometheus",
+            "uid": "${datasource}"
+          },
+          "expr": "offshoot_checkpoint_overwrite_detected_total",
+          "legendFormat": "overwrites",
+          "refId": "A"
         }
       ]
     },

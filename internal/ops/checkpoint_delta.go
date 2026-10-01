@@ -45,16 +45,17 @@ type segmentDelta struct {
 
 // planSegment decides whether the checkpoint about to be written at
 // ref.HeadTXID+1 from the quiesced checkout at path can be a segment, and
-// returns its content when it can. Every precondition that fails, and
-// every error along the way, answers "no": the caller then writes a
-// snapshot exactly as it always has, which depends on nothing here.
+// returns its content when it can. members is the head's resolved chain
+// (store.Chain at ref.HeadTXID), resolved once by the caller and never
+// re-resolved here; nil (the caller skipped resolving because
+// segmentShadow said no, or the resolve failed) answers "no". Every
+// precondition that fails, and every error along the way, answers "no":
+// the caller then writes a snapshot exactly as it always has, which
+// depends on nothing here.
 //
 // The rule, all of which must hold:
-//   - the caller did not ask for a snapshot, and txid > 1 (a segment
-//     cannot start a chain);
-//   - the sidecar records a shadow (sumRecord.Shadow), the shadow file
-//     exists, and the sidecar's identity is the ref's head, so the shadow
-//     is the head's content and its PostApplyChecksum the head's checksum;
+//   - segmentShadow holds: the caller did not ask for a snapshot, txid > 1,
+//     and the checkout has a shadow recorded for the ref's head;
 //   - the head's resolved chain is shorter than the snapshot bound
 //     (SnapshotEvery, or ForkShareMaxDepth when unset), so the new member
 //     keeps it within the bound; the bound-th checkpoint is a snapshot;
@@ -63,25 +64,16 @@ type segmentDelta struct {
 //   - the changed fraction is below largeSegmentFraction (skipped when the
 //     checkout is under minPagesForFractionCheck pages, as session.Flush
 //     skips it by the replica's current size).
-func (w *Workspace) planSegment(path string, ref store.Ref, opts CheckpointOptions) (segmentDelta, bool) {
-	if opts.Snapshot || ref.HeadTXID+1 <= 1 {
-		return segmentDelta{}, false
-	}
-	rec, ok := readSidecar(path)
-	if !ok || !rec.Shadow || rec.PostApplyChecksum == 0 ||
-		rec.Lineage != ref.Lineage || rec.Epoch != ref.HeadEpoch || rec.TXID != ref.HeadTXID {
-		return segmentDelta{}, false
-	}
-	shadow := shadowPath(path)
-	if _, err := os.Stat(shadow); err != nil {
+func (w *Workspace) planSegment(path string, ref store.Ref, members []store.ChainMember, opts CheckpointOptions) (segmentDelta, bool) {
+	rec, shadow, ok := segmentShadow(path, ref, opts)
+	if !ok {
 		return segmentDelta{}, false
 	}
 	bound := w.SnapshotEvery
 	if bound <= 0 {
 		bound = ForkShareMaxDepth
 	}
-	members, err := w.Store.Chain(ref.Lineage, ref.HeadTXID)
-	if err != nil || len(members) >= bound {
+	if len(members) == 0 || len(members) >= bound {
 		return segmentDelta{}, false
 	}
 	pages, commit, pageSize, changedFrac, post, err := diffPages(path, shadow, rec.PostApplyChecksum)
@@ -92,6 +84,31 @@ func (w *Workspace) planSegment(path string, ref store.Ref, opts CheckpointOptio
 		return segmentDelta{}, false
 	}
 	return segmentDelta{pages: pages, commit: commit, pageSize: pageSize, pre: rec.PostApplyChecksum, post: post}, true
+}
+
+// segmentShadow is planSegment's local preconditions, which cost no store
+// round trip: the caller did not ask for a snapshot, and txid > 1 (a
+// segment cannot start a chain); the sidecar records a shadow
+// (sumRecord.Shadow), the shadow file exists, and the sidecar's identity
+// is the ref's head, so the shadow is the head's content and its
+// PostApplyChecksum the head's checksum. CheckpointWith resolves the
+// head's chain only when these hold, so a checkpoint that can only be a
+// snapshot never pays for the resolve. Returns the sidecar and the shadow's
+// path.
+func segmentShadow(path string, ref store.Ref, opts CheckpointOptions) (sumRecord, string, bool) {
+	if opts.Snapshot || ref.HeadTXID+1 <= 1 {
+		return sumRecord{}, "", false
+	}
+	rec, ok := readSidecar(path)
+	if !ok || !rec.Shadow || rec.PostApplyChecksum == 0 ||
+		rec.Lineage != ref.Lineage || rec.Epoch != ref.HeadEpoch || rec.TXID != ref.HeadTXID {
+		return sumRecord{}, "", false
+	}
+	shadow := shadowPath(path)
+	if _, err := os.Stat(shadow); err != nil {
+		return sumRecord{}, "", false
+	}
+	return rec, shadow, true
 }
 
 // diffPages compares the quiesced database at cur with shadow, the state

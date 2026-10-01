@@ -24,19 +24,50 @@ riskier problem than the one offshoot solves
 are copy-on-write and near-free, so fork-per-writer is the intended
 pattern, not a workaround.
 
-**Do not run two at-rest `offshoot checkpoint` commands on one branch
-concurrently.** The at-rest path takes no lease (see
-[One daemon per store](#one-daemon-per-store)); two racers compute the same
-next txid, and when both choose the same kind (snapshot or segment) the
-loser of the ref CAS can overwrite the winner's object with different
-content if a write landed on the checkout between their two encodes. The
-shadow guard forces the next at-rest checkpoint to a snapshot, but a daemon
-session opened on that checkout trusts the checksum recorded in its
-sidecar and can write a segment that does not apply. Serialize at-rest
-checkpoints per branch (one agent, one CLI caller at a time); the fix —
-read the stored object's trailer checksum after winning the CAS and, on a
-mismatch, stamp no checksum and drop the shadow — is a
-[Tier 2 follow-up](../ROADMAP.md#copy-on-write-storage--the-storage-amplification-arc).
+**Two at-rest `offshoot checkpoint` commands on one branch at once are
+still not a supported pattern; they are now safe to survive.** The at-rest
+path takes no lease (see [One daemon per store](#one-daemon-per-store)), so
+two racers compute the same next txid and race one ref CAS. Exactly one
+wins, but what the store then resolves the head to can be the loser's
+content rather than the winner's. After its CAS, the winner checks for each
+way that can happen:
+
+- **Same-kind overwrite.** Both racers chose the same kind (snapshot or
+  segment), so they share one object key, and the loser's upload replaced
+  the winner's. The winner sends one `HEAD` and compares the etag with the
+  one its own upload returned; on a mismatch it reads the object's trailer
+  checksum.
+- **Mixed kind.** The winner wrote a segment and the loser a snapshot at
+  the same txid. The chain resolver anchors the head on the newest snapshot
+  at or below it, so the loser's snapshot becomes the head. A live loser
+  deletes its snapshot when it sees the winner's kind, but one that died
+  first (or has not got there yet) cannot. So a segment winner also lists
+  the snapshot key at its txid (one `LIST`) and, when one is there, reads
+  that snapshot's trailer checksum.
+- **A write between encode and stamp.** No racer is needed for this one. A
+  write landing on the checkout after the winner's encode and before its
+  stamp means the checkout no longer holds what was committed. The winner
+  compares the checkout's fingerprint from right after quiesce with the one
+  at stamp time.
+
+When any check finds that the store's head may differ from the checkout,
+the winner compares the head's checksum with the checkout's own. If they
+are equal, the store holds exactly what the checkout holds, and the stamp
+is trusted as usual. Otherwise it records no checksum and a hash no file
+can match. The checkout then reads as having un-checkpointed changes, so
+`fork` warns and `checkout` says it is overwriting them. The shadow is
+dropped, so the next checkpoint writes a full snapshot of whatever the
+checkout holds, and no daemon session opened on the checkout trusts a
+checksum for it. A racer's content replacing (or anchoring) the head is
+also counted in `offshoot_checkpoint_overwrite_detected_total`, and so is
+an object that could not be re-read to check it. Either way, the branch
+holds a valid checkpoint at that txid, but it may be the loser's encode.
+
+**What remains:** a third racer that overwrites the object after the
+winner's check has run is not noticed, and neither is a two-racer
+ordering where the losing snapshot lands after the winner's probe and its
+writer dies before reaching its own ref CAS (so its cleanup never runs). To get exactly the content you
+checkpointed, serialize at-rest checkpoints per branch, or fork per writer.
 
 ## One daemon per store
 

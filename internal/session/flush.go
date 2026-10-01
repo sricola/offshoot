@@ -5,13 +5,14 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"math/rand/v2"
 	"os"
 	"path/filepath"
 	"time"
 
 	"github.com/sricola/offshoot/internal/ltxio"
 	"github.com/sricola/offshoot/internal/ops"
-	"github.com/sricola/offshoot/internal/ops/reflink"
+	"github.com/sricola/offshoot/internal/reflink"
 	"github.com/sricola/offshoot/internal/store"
 )
 
@@ -35,6 +36,62 @@ var ErrFenced = errors.New("session: fenced — lease lost")
 // this constant should be revisited rather than left silently coupled to
 // them.
 const drainNowBudget = 30 * time.Second
+
+// The flush's ref-CAS retry exists for rivals that leave its premise intact,
+// chiefly our own lease heartbeat (renewLoop) renewing the ref under us. A
+// fixed retry count is a
+// flake under load (the 2026-09-26 TestFlushSurvivesOwnLeaseRenewalRace
+// failures): once a single GetRef→PutRef retry takes longer than a heartbeat
+// period, every retry can lose to the next renewal, and no count is safe.
+// So the bound is a budget: a retry is allowed while fewer than
+// flushCASMinAttempts retries have been spent OR less than
+// flushCASMinLeaseTTLs lease TTLs of wall time have passed since the first
+// PutRef.
+//
+// The wall-time unit is the lease TTL, not the renewal period, on purpose.
+// Measured under the race detector with `go test ./internal/ops` loading the
+// machine, one retry cycle took 20-40 ms against that test's 4 ms
+// heartbeat, so a budget of a few renewal periods is spent before the
+// second retry and adds nothing in exactly the regime that flakes. The
+// lease TTL is the natural horizon instead: every retry re-verifies that
+// the ref still names our holder, epoch, lineage and untouched head, so
+// within one TTL a CAS loss can only be a writer that left our holder,
+// epoch, lineage and head untouched (our own heartbeat proving the lease is
+// alive, or metadata such as touch/protect); a flush that cannot land a single PutRef between its own
+// renewals for a whole TTL is a pathological storm, and only then does it
+// surface "lost a race". In production (TTL 30 s, heartbeat 10 s) eight
+// losses already take longer than a TTL, so the count term is what binds
+// and nothing changes there. The budget never changes what a flush commits,
+// only how long it keeps reapplying an unchanged head advance.
+const (
+	flushCASMinAttempts  = 8
+	flushCASMinLeaseTTLs = 1
+)
+
+// flushCASRetryPauseMax caps the pause between two ref-CAS retries; see
+// flushCASRetryPause.
+const flushCASRetryPauseMax = 50 * time.Millisecond
+
+// flushCASRetryPause is how long a flush waits before reapplying its head
+// advance after a CAS loss that left its premise intact: a quarter of the
+// renewal period, capped at flushCASRetryPauseMax, jittered by ±25%. The
+// retry budget can now span a whole lease TTL with flushMu held, and
+// without a pause the loop would spin GetRef+PutRef against the store for
+// that long; a quarter period is short enough that the next heartbeat
+// still finds a landed flush, and the jitter keeps two flushers (or a
+// flush and a metadata writer) from retrying in lockstep. Only the retry
+// path waits; a flush whose first PutRef lands never does.
+func flushCASRetryPause(renewEvery time.Duration) time.Duration {
+	d := min(renewEvery/4, flushCASRetryPauseMax)
+	if d <= 0 {
+		return 0
+	}
+	jitter := d / 2
+	if jitter <= 0 {
+		return d
+	}
+	return d - jitter/2 + rand.N(jitter+1)
+}
 
 // Flush uploads the replica's current state as a snapshot under the session's
 // lease epoch and advances the branch head. name is optional: when non-empty
@@ -551,6 +608,7 @@ func (s *Session) flush(name string, meta map[string]string, auto bool) (txid ui
 		}
 	}
 
+	casStart := time.Now()
 	for attempt := 0; ; attempt++ {
 		ref.HeadTXID, ref.HeadEpoch = txid, lease.Epoch
 		if name != "" {
@@ -575,19 +633,21 @@ func (s *Session) flush(name string, meta map[string]string, auto bool) (txid ui
 		// the only thing that moved was lease bookkeeping — nothing about
 		// this flush's premise changed, so reapply the head advance onto the
 		// fresh revision and try again. Every retry re-verifies that premise,
-		// so looping is safe by construction; the cap is purely a termination
-		// backstop against a pathological renewal storm and is sized so that
-		// even a heartbeat orders of magnitude faster than production's
-		// LeaseTTL/3 cadence (as the race-instrumented
-		// TestFlushSurvivesOwnLeaseRenewalRace deliberately runs) exhausts it
-		// only with negligible probability. Any other shape — foreign holder,
-		// new epoch, new lineage, moved head — falls through to the
-		// loss/cleanup handling below exactly as before.
-		if errors.Is(err, store.ErrCAS) && attempt < 8 {
+		// so looping is safe by construction; the bound is purely a
+		// termination backstop against a pathological renewal storm (see
+		// flushCASMinAttempts/flushCASMinLeaseTTLs for why it is a budget
+		// and not a count), and each retry first waits flushCASRetryPause so
+		// the loop backs off instead of spinning on the store. Any other shape — foreign holder, new epoch, new
+		// lineage, moved head — falls through to the loss/cleanup handling
+		// below exactly as before.
+		withinBudget := attempt < flushCASMinAttempts ||
+			time.Since(casStart) < flushCASMinLeaseTTLs*s.leaseTTL
+		if errors.Is(err, store.ErrCAS) && withinBudget {
 			if cur, curEtag, gerr := st.GetRef(s.db, s.branch); gerr == nil &&
 				cur.LeaseHolder == lease.Holder && cur.Epoch == lease.Epoch &&
 				cur.Lineage == ref.Lineage && cur.HeadTXID == txid-1 {
 				ref, etag = cur, curEtag
+				time.Sleep(flushCASRetryPause(s.renewEvery))
 				continue
 			}
 		}

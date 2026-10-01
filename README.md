@@ -676,7 +676,7 @@ getting-started track:
 **Operate it**
 
 - [Operations](docs/operations.md) — metrics, branch states, eventing, budgets, HTTP/auth threat model (single node)
-- [Grafana dashboard](docs/grafana-dashboard.json) — ready to import, all 18 metric families
+- [Grafana dashboard](docs/grafana-dashboard.json) — ready to import, 19 of the 21 metric families
 - [Kubernetes sidecar recipe](docs/recipes/kubernetes.md)
 
 **Track it**

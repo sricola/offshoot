@@ -55,6 +55,7 @@ build a dashboard against a name not in this table.
 | `offshoot_rollback_total` | counter | `mode` (`shared`/`materialized`) | Successful rollbacks, by storage mode — `shared` = the new lineage is a base pointer at the kept checkpoint (the default since v0.2.12); `materialized` = a snapshot copy (`--materialize`, or the fork-time depth floor). Both label values pre-registered at `0`. Counted once the ref repoint lands. |
 | `offshoot_promote_total` | counter | `mode` (`shared`/`materialized`) | Successful promotes, by storage mode, with the same meaning as `offshoot_rollback_total`. Both label values pre-registered at `0`. |
 | `offshoot_checkpoint_duration_seconds` | histogram | — | **At-rest** checkpoint latency only — a process that calls `ops.Workspace.Checkpoint` directly (the CLI or `offshoot mcp`, no daemon session involved). A live session's named `flush` is *not* counted here; it's a flush, tallied under `offshoot_flush_duration_seconds` instead. This histogram reads all-zero on a daemon that only ever serves live sessions and never itself runs an at-rest checkpoint. |
+| `offshoot_checkpoint_overwrite_detected_total` | counter | — | **At-rest** checkpoints that committed but found the store's head may not be their own content: their object was replaced by a racing same-kind checkpoint's different content, a racing snapshot with different content sits beside their winning segment and anchors the head (two `offshoot checkpoint` calls on one branch at once, with a write between their encodes), or the object could not be verified after an etag mismatch (it could not be fetched or decoded; logged to stderr). Unless the checkout turns out to hold exactly the store's content, it then reads as modified, records no checksum, and the next checkpoint writes a snapshot; see [limitations](limitations.md#one-writer-per-branch). Like `offshoot_checkpoint_duration_seconds`, it only moves in a process that runs at-rest checkpoints itself. Registered at `0`. |
 | `offshoot_reap_total` | counter | — | Branches reaped (TTL-expired, destroyed) by the janitor. |
 | `offshoot_gc_tombstoned_total` | counter | — | Objects newly tombstoned by a GC pass. |
 | `offshoot_gc_deleted_total` | counter | — | Objects actually deleted by GC, after their grace period. |
@@ -101,6 +102,7 @@ $ curl -s -H "Authorization: Bearer verify-token-123" http://127.0.0.1:18080/met
 # TYPE offshoot_rollback_total counter
 # TYPE offshoot_promote_total counter
 # TYPE offshoot_checkpoint_duration_seconds histogram
+# TYPE offshoot_checkpoint_overwrite_detected_total counter
 # TYPE offshoot_reap_total counter
 # TYPE offshoot_gc_tombstoned_total counter
 # TYPE offshoot_gc_deleted_total counter
@@ -111,15 +113,17 @@ $ curl -s -H "Authorization: Bearer verify-token-123" http://127.0.0.1:18080/met
 # TYPE offshoot_janitor_runs_total counter
 ```
 
-Eighteen `# TYPE` lines, matching the eighteen rows in the table above exactly
+Twenty-one `# TYPE` lines, matching the twenty-one rows in the table above exactly
 — that grep is the whole verification: run it yourself against a running
 daemon any time this table is in doubt.
 
 ### Grafana dashboard
 
-A ready-to-import dashboard covering all eighteen families above ships as
-[docs/grafana-dashboard.json](grafana-dashboard.json) — flush rate/latency,
-the shared-vs-materialized fork split, GC (with `offshoot_gc_errors_total`
+A ready-to-import dashboard covering nineteen of the twenty-one families
+above (all but `offshoot_rollback_total` and `offshoot_promote_total`) ships
+as [docs/grafana-dashboard.json](grafana-dashboard.json) — flush
+rate/latency, the shared-vs-materialized fork split, at-rest checkpoint
+latency and detected overwrites, GC (with `offshoot_gc_errors_total`
 front and center as the fail-closed alarm), sessions/capture lag, and the
 janitor/ro-cache panels. Import it via Dashboards → Import and pick your
 Prometheus datasource when prompted.

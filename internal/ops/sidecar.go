@@ -8,9 +8,11 @@ import (
 	"errors"
 	"io"
 	"os"
+	"strconv"
 	"time"
 
 	"github.com/sricola/offshoot/internal/dbfile"
+	"github.com/sricola/offshoot/internal/ltxio"
 	"github.com/sricola/offshoot/internal/store"
 )
 
@@ -380,6 +382,57 @@ func writeSum(path string, lineage string, epoch, txid, postApplyChecksum uint64
 		return err
 	}
 	return stampSumWithFingerprint(path, sum, lineage, epoch, txid, postApplyChecksum, chainID, fp, beforeNS, ok, false)
+}
+
+// untrustedHash is the Hash a checkpoint stamps when it cannot vouch that
+// the checkout holds the content its committed head resolves to (see
+// stampCheckpoint). It is not a hex SHA-256, so no file's fileSum ever
+// equals it: checkoutState reads such a checkout "modified" against that
+// head, never "clean", and warnIfUncheckpointed and CheckoutProven treat
+// it as un-checkpointed changes.
+func untrustedHash(txid uint64) string {
+	return "untrusted:" + strconv.FormatUint(txid, 10)
+}
+
+// stampCheckpoint writes the sidecar for a checkpoint that just won its ref
+// CAS at (lineage, epoch, txid), and reports whether it trusted the stamp
+// (only then may the caller refresh the shadow).
+//
+// headSum is the post-apply checksum of the content the store resolves the
+// head to (headKnown false when it could not be established), and encSum
+// the checksum of the bytes this checkpoint encoded, whose fingerprint
+// (taken right after quiesce, before the encode) is fpEncode (fpEncodeOK
+// false when that stat failed). The live checkout is hashed between two
+// fingerprints as in writeSum; its post-apply checksum is encSum when that
+// fingerprint still equals fpEncode, and otherwise ltxio.ChecksumDatabase
+// read under the same fingerprint.
+//
+// The stamp is trusted — the real hash, fingerprint and headSum — only
+// when the live checkout's checksum is known and equals headSum: the store
+// holds exactly what the checkout holds. Otherwise (a racer's different
+// content resolves the head, the checkout changed between the encode and
+// now, or either side is unknown) it records checksum 0 and untrustedHash
+// with no fingerprint, so checkoutState reads "modified" and the next
+// checkpoint writes a snapshot.
+func stampCheckpoint(path, lineage string, epoch, txid, headSum uint64, headKnown bool, encSum uint64, fpEncode fingerprint, fpEncodeOK bool) (bool, error) {
+	sum, fp, beforeNS, ok, err := sandwichedSum(path)
+	if err != nil {
+		return false, err
+	}
+	if headKnown && ok {
+		liveSum, liveKnown := encSum, fpEncodeOK && fp == fpEncode
+		if !liveKnown {
+			if c, cerr := ltxio.ChecksumDatabase(path); cerr == nil {
+				if fpAfter, ferr := stampFingerprint(path); ferr == nil && fpAfter == fp {
+					liveSum, liveKnown = c, true
+				}
+			}
+		}
+		if liveKnown && liveSum == headSum {
+			return true, stampSumWithFingerprint(path, sum, lineage, epoch, txid, headSum, "", fp, beforeNS, true, false)
+		}
+	}
+	return false, StampSumHashOnly(path, untrustedHash(txid), lineage, epoch, txid, 0, "")
 }
 
 // sandwichedSum hashes path (fileSum) between two fingerprint reads. ok

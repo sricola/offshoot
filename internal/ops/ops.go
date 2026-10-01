@@ -182,8 +182,52 @@ func ParseTarget(s string) (string, string, error) {
 	return db, branch, nil
 }
 
+// underRoot joins elems under w.Root and asserts the result is still inside
+// it. It is the one containment check every name-derived local path goes
+// through (CheckoutPath, CheckoutAtPath, byChainPath; sidecar and shadow
+// paths are suffixes of those). The returned string is exactly
+// filepath.Join(w.Root, elems...): the check adds no normalization a
+// caller could observe.
+//
+// Every element reaching here is a literal, a hex digest, or a name that
+// has already passed store.ValidateName ([a-z0-9-_.], never "." or "..",
+// never containing ".." or a separator), so the check cannot fail for any
+// input the package admits. A failure therefore means a caller skipped
+// validation: a programming error that would otherwise read, write or
+// rename a file outside the workspace. Returning an error would invite a
+// caller to log it and carry on with a path it should never have built,
+// and none of the builders has an error return to carry one, so the
+// impossible case panics, loudly and at the point of the bypass, naming
+// the invariant that was broken.
+//
+// The check is strings.HasPrefix on the filepath.Clean-ed join, the form
+// static analysis (CodeQL go/path-injection) recognizes as a containment
+// barrier. A root of "." (or "") has no prefix to test, since Join drops
+// it, so there the equivalent check is filepath.IsLocal.
+func (w *Workspace) underRoot(elems ...string) string {
+	root := filepath.Clean(w.Root)
+	p := filepath.Clean(filepath.Join(append([]string{root}, elems...)...))
+	if root == "." {
+		if filepath.IsLocal(p) {
+			return p
+		}
+	} else {
+		prefix := root
+		if !strings.HasSuffix(prefix, string(filepath.Separator)) {
+			prefix += string(filepath.Separator)
+		}
+		if strings.HasPrefix(p, prefix) {
+			return p
+		}
+	}
+	panic(fmt.Sprintf("ops: path %q escapes workspace root %q: invariant violated: every element must be a name validated by store.ValidateName", p, w.Root))
+}
+
+// CheckoutPath is db@branch's writable checkout file. db and branch must
+// already have passed store.ValidateName; underRoot enforces that the
+// result stays under w.Root.
 func (w *Workspace) CheckoutPath(db, branch string) string {
-	return filepath.Join(w.Root, "checkouts", db, branch+".db")
+	return w.underRoot("checkouts", db, branch+".db")
 }
 
 // snapshotTo encodes dbPath (a quiesced SQLite file) as snapshot txid into a
@@ -367,10 +411,10 @@ func (w *Workspace) CheckoutProven(db, branch string) (CheckoutResult, error) {
 // checksum and chainID (see materializeChainAt). It is a thin wrapper over
 // materializeChainAt (see materialize.go), which resolves the full
 // snapshot+segment chain rather than assuming cp's txid is itself a
-// snapshot: every caller here (Export, Rollback's refresh, Promote's
-// refresh, Compact's refresh) picks that up unchanged. CheckoutProven and
-// CheckoutAt resolve the chain themselves and go through
-// materializeFromChain (chainid.go) instead, to consult the by-chain cache.
+// snapshot; Export picks that up unchanged. CheckoutProven, CheckoutAt and
+// the Rollback/Promote/Compact refreshes (refreshFromChain) resolve the
+// chain themselves and go through materializeFromChain (chainid.go)
+// instead, to consult the by-chain cache.
 func (w *Workspace) materializeAt(ref store.Ref, cp store.Checkpoint, dst string) (postApply uint64, chainID string, err error) {
 	return w.materializeChainAt(ref, cp, dst)
 }
@@ -480,6 +524,11 @@ func (w *Workspace) CheckpointWith(db, branch, name string, meta map[string]stri
 	if err := quiesce(path); err != nil {
 		return CheckpointResult{}, err
 	}
+	// The checkout's fingerprint right after quiesce, before the encode:
+	// stampCheckpoint compares it with the file it stamps, so a write
+	// landing between the encode and the stamp cannot get our checksum
+	// attributed to bytes we never encoded.
+	fpEncode, fpEncodeErr := stampFingerprint(path)
 	if checkpointAfterQuiesceForTest != nil {
 		checkpointAfterQuiesceForTest()
 	}
@@ -498,7 +547,16 @@ func (w *Workspace) CheckpointWith(db, branch, name string, meta map[string]stri
 	// or crash can leave the two side by side: a snapshot here takes the
 	// create-only put's overwrite path below instead. An error from the
 	// probe also answers "write a snapshot", which is always correct.
-	if d, ok := w.planSegment(path, ref, opts); ok && !w.snapshotMayExist(ref, txid) {
+	//
+	// The head's chain is resolved here, once, and only when a segment is
+	// locally possible (segmentShadow); planSegment uses this resolution
+	// and never re-resolves. A failed resolve leaves members nil, which
+	// planSegment answers with a snapshot.
+	var members []store.ChainMember
+	if _, _, ok := segmentShadow(path, ref, opts); ok {
+		members, _ = w.Store.Chain(ref.Lineage, ref.HeadTXID)
+	}
+	if d, ok := w.planSegment(path, ref, members, opts); ok && !w.snapshotMayExist(ref, txid) {
 		if err := ltxio.EncodeSegment(d.pageSize, d.commit, txid, txid, d.pre, d.post, d.pages, &buf); err != nil {
 			return CheckpointResult{}, err
 		}
@@ -511,7 +569,8 @@ func (w *Workspace) CheckpointWith(db, branch, name string, meta map[string]stri
 		key = store.SnapshotKey(ref.Lineage, ref.Epoch, txid)
 	}
 	res.Bytes = int64(buf.Len())
-	if _, err := w.Store.B.PutIf(key, buf.Bytes(), ""); err != nil {
+	ownEtag, err := w.Store.B.PutIf(key, buf.Bytes(), "")
+	if err != nil {
 		if !errors.Is(err, store.ErrCAS) {
 			return CheckpointResult{}, err
 		}
@@ -530,8 +589,19 @@ func (w *Workspace) CheckpointWith(db, branch, name string, meta map[string]stri
 		// name — there is no rival ref left dangling by the overwrite. Safe
 		// to overwrite unconditionally and proceed. The key names the kind
 		// (snapshot or segment), so a racer that chose the other kind wrote
-		// a different key; both then race the same CAS below, and the
-		// loser's object is an orphan like any other.
+		// a different key; both then race the same CAS below. That loser's
+		// object is NOT an orphan like any other when it is a snapshot
+		// beside a winning segment: the chain resolver anchors the head on
+		// the newest snapshot at or below it, so the head resolves to the
+		// loser's content. A live loser deletes it (the ErrCAS path below);
+		// a dead one, or one that has not got there yet, is caught by the
+		// winner's post-CAS probe (snapshotMayExist after PutRef).
+		//
+		// "Content-equivalent" holds only when nothing wrote to the checkout
+		// between the two encodes. When something did, whichever racer
+		// wins the CAS may find the other's content under its key; the
+		// post-CAS verifyOwnObject below detects exactly that. Put returns
+		// no etag, so ownEtag stays "" here and the check compares content.
 		if err := w.Store.B.Put(key, buf.Bytes()); err != nil {
 			return CheckpointResult{}, err
 		}
@@ -594,14 +664,102 @@ func (w *Workspace) CheckpointWith(db, branch, name string, meta map[string]stri
 	// identity, rather than claiming a commit that never landed. The same
 	// goes for the shadow: it is re-cloned only after the new stamp, which
 	// records no shadow until refreshShadow has one in place.
-	if err := writeSum(path, ref.Lineage, ref.HeadEpoch, txid, checksum, ""); err != nil {
+	//
+	// What the store now resolves the head to may not be what we encoded:
+	//
+	//   - a racing same-kind checkpoint can have replaced the object at our
+	//     key with its own content (verifyOwnObject);
+	//   - a racing snapshot checkpoint can have left its snapshot at txid
+	//     beside our segment, and the chain resolver anchors the head on
+	//     that snapshot, not on our segment. Its loser-side cleanup does
+	//     not help when the loser died first or has not reached it yet, so
+	//     a segment winner probes for one (one List) and, when present,
+	//     takes the head's checksum from it.
+	//
+	// Either way the overwrite is counted, and stampCheckpoint then stamps
+	// the checksum only when the live checkout provably holds the content
+	// the store resolves the head to; otherwise the stamp records no
+	// checksum and a hash no file can match, so the checkout reads
+	// "modified", the shadow is dropped, and the next checkpoint writes a
+	// snapshot of whatever the checkout holds. The same happens when the
+	// checkout changed between our encode and this stamp.
+	headSum, headKnown := w.verifyOwnObject(key, ownEtag, checksum)
+	if res.Kind == "segment" && w.snapshotMayExist(ref, txid) {
+		headSum, headKnown = w.snapshotBesideSegment(store.SnapshotKey(ref.Lineage, ref.Epoch, txid), headSum, headKnown)
+	}
+	if (!headKnown || headSum != checksum) && ObserveCheckpointOverwrite != nil {
+		ObserveCheckpointOverwrite()
+	}
+	trusted, err := stampCheckpoint(path, ref.Lineage, ref.HeadEpoch, txid, headSum, headKnown, checksum, fpEncode, fpEncodeErr == nil)
+	if err != nil {
 		return CheckpointResult{}, fmt.Errorf("ops: checkpoint %q committed (txid %d), but the checkout fingerprint could not be refreshed: %w", name, txid, err)
 	}
-	refreshShadow(path)
+	if trusted {
+		refreshShadow(path)
+	} else {
+		dropShadow(path)
+	}
 	if ObserveCheckpoint != nil {
 		ObserveCheckpoint(time.Since(start))
 	}
 	return res, nil
+}
+
+// verifyOwnObject returns the post-apply checksum of the object at key,
+// just committed by a winning ref CAS, and whether it is known. A Head
+// whose etag equals ownEtag (the etag our create-only put returned)
+// answers checksum with one request. Otherwise — a rival's overwrite, or
+// our own unconditional overwrite, which returns no etag — the object is
+// fetched and its trailer read: two encodes of the same checkout state
+// differ in bytes (an LTX header carries its encode time) but not in
+// checksum, so only a real content change returns a different one. An
+// object that cannot be read or decoded after an etag mismatch is logged
+// and answers unknown: distrusting costs one snapshot, trusting a wrong
+// checksum costs a session's correctness. A failing Head never fails the
+// checkpoint: it is logged and answers checksum, as before this check
+// existed.
+func (w *Workspace) verifyOwnObject(key, ownEtag string, checksum uint64) (uint64, bool) {
+	etag, _, err := w.Store.Head(key)
+	if err != nil {
+		fmt.Fprintf(os.Stderr, "offshoot: warning: could not verify checkpoint object %s after committing it (trusting it): %v\n", key, err)
+		return checksum, true
+	}
+	if ownEtag != "" && etag == ownEtag {
+		return checksum, true
+	}
+	data, _, err := w.Store.B.Get(key)
+	return objectChecksum(key, data, err)
+}
+
+// snapshotBesideSegment is the head's checksum when a segment checkpoint
+// has just won its CAS and snapshotMayExist reported a snapshot at the
+// same txid (snapKey): that snapshot anchors the head, so its trailer is
+// the head's content. A snapshot that turns out not to exist (the probe
+// answers "maybe" when its List fails) leaves the segment's own (sum,
+// known).
+func (w *Workspace) snapshotBesideSegment(snapKey string, sum uint64, known bool) (uint64, bool) {
+	data, _, err := w.Store.B.Get(snapKey)
+	if errors.Is(err, store.ErrNotFound) {
+		return sum, known
+	}
+	return objectChecksum(snapKey, data, err)
+}
+
+// objectChecksum is the trailer post-apply checksum of data, the LTX
+// object fetched from key (getErr is that fetch's error), or unknown —
+// logged, since the caller then counts it as an overwrite it could not
+// verify — when it could not be fetched or decoded.
+func objectChecksum(key string, data []byte, getErr error) (uint64, bool) {
+	if getErr != nil {
+		fmt.Fprintf(os.Stderr, "offshoot: warning: could not verify checkpoint object %s after committing it (distrusting it): %v\n", key, getErr)
+		return 0, false
+	}
+	sum, err := ltxio.TrailerPostApplyChecksum(data)
+	if err != nil {
+		fmt.Fprintf(os.Stderr, "offshoot: warning: could not decode checkpoint object %s after committing it (distrusting it): %v\n", key, err)
+		return 0, false
+	}
+	return sum, true
 }
 
 // snapshotMayExist reports whether a snapshot object may already sit at
@@ -834,6 +992,18 @@ var ObserveFork func(dur time.Duration, fast, shared bool)
 // reads as all-zero on a daemon that never gains a direct checkpoint op —
 // a known, documented gap, not a bug; see this task's report.
 var ObserveCheckpoint func(dur time.Duration)
+
+// ObserveCheckpointOverwrite, when non-nil, is invoked by CheckpointWith
+// each time its post-CAS check finds that the store may not resolve the
+// head to the content it encoded: the object it committed was replaced, at
+// its shared key, by a racing same-kind checkpoint's different content, or
+// could not be verified after an etag mismatch (see verifyOwnObject); or a
+// racing snapshot with different content (or one that could not be read)
+// sits beside its winning segment and anchors the head (see
+// snapshotBesideSegment). The checkpoint still succeeds; the daemon
+// feeds this into offshoot_checkpoint_overwrite_detected_total. Same
+// injection shape as ObserveFork.
+var ObserveCheckpointOverwrite func()
 
 // ObserveRollback and ObservePromote, when non-nil, are invoked once the
 // verb's ref CAS has landed (the repoint happened, whatever the checkout
@@ -1283,7 +1453,7 @@ func (w *Workspace) RollbackWith(db, branch, to string, opts RollbackOptions) (R
 		if err := os.MkdirAll(filepath.Dir(path), 0o755); err != nil {
 			return err
 		}
-		checksum, chain, err := w.materializeAt(next, headCheckpoint(next), path)
+		checksum, chain, err := w.refreshFromChain(db, next, path)
 		if err != nil {
 			return err
 		}
@@ -1512,7 +1682,7 @@ func (w *Workspace) PromoteWith(db, source, target string, opts PromoteOptions) 
 		if err := quiesce(path); err != nil {
 			return result, fmt.Errorf("ops: promoted, but checkout %s is in use and was NOT refreshed: %w", path, err)
 		}
-		checksum, chain, err := w.materializeAt(next, headCheckpoint(next), path)
+		checksum, chain, err := w.refreshFromChain(db, next, path)
 		if err != nil {
 			return result, fmt.Errorf("ops: promoted, but checkout %s could not be refreshed: %w", path, err)
 		}
@@ -1654,7 +1824,7 @@ func (w *Workspace) Compact(db, branch string) (uint64, error) {
 		if err := quiesce(path); err != nil {
 			return txid, fmt.Errorf("ops: compacted, but checkout %s is in use and was NOT refreshed: %w", path, err)
 		}
-		checksum, chain, err := w.materializeAt(next, headCheckpoint(next), path)
+		checksum, chain, err := w.refreshFromChain(db, next, path)
 		if err != nil {
 			return txid, fmt.Errorf("ops: compacted, but checkout %s could not be refreshed: %w", path, err)
 		}

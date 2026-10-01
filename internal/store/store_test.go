@@ -1371,3 +1371,32 @@ func TestCollapseBase(t *testing.T) {
 		t.Fatalf("CollapseBase over a corrupt base.json = %q, nil; want an error", got)
 	}
 }
+
+// noHeadBackend hides Local's Header capability: it embeds the Backend
+// interface, so only Backend's own methods are promoted.
+type noHeadBackend struct{ Backend }
+
+// TestStoreHeadFallsBackToGet: a backend without Header still answers
+// Store.Head, with Get's etag (the one PutIf returned) and the byte length.
+func TestStoreHeadFallsBackToGet(t *testing.T) {
+	l, err := NewLocal(t.TempDir())
+	if err != nil {
+		t.Fatal(err)
+	}
+	b := noHeadBackend{l}
+	if _, ok := Backend(b).(Header); ok {
+		t.Fatal("noHeadBackend must not implement Header")
+	}
+	s := &Store{B: b}
+	etag, err := b.PutIf("data/x", []byte("fallback"), "")
+	if err != nil {
+		t.Fatal(err)
+	}
+	got, size, err := s.Head("data/x")
+	if err != nil || got != etag || size != int64(len("fallback")) {
+		t.Fatalf("Head = (%q, %d, %v), want (%q, %d, nil)", got, size, err, etag, len("fallback"))
+	}
+	if _, _, err := s.Head("data/missing"); !errors.Is(err, ErrNotFound) {
+		t.Fatalf("Head of a missing key: want ErrNotFound, got %v", err)
+	}
+}

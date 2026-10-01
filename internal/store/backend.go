@@ -129,3 +129,14 @@ type ReaderPutter interface {
 	PutReaderIf(key string, r io.Reader, size int64, ifMatch string) (etag string, err error)
 	PutReader(key string, r io.Reader, size int64) error
 }
+
+// Header is an optional Backend capability: report an object's current etag
+// and size without returning its bytes (S3: one HeadObject request). The
+// etag is the same string Get and PutIf return for that content on the same
+// backend, so a caller can compare a Head against the etag its own PutIf
+// returned to learn whether the object was replaced since. A missing key is
+// ErrNotFound. Read-only. Like the capabilities above it is discovered by
+// type assertion; Store.Head falls back to Get for a backend without it.
+type Header interface {
+	Head(key string) (etag string, size int64, err error)
+}
