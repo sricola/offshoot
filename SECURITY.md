@@ -57,7 +57,12 @@ secret. In rough priority order:
 - **Path traversal / prefix escape** — anything in checkout materialization,
   store key construction, or import (`--from`) that lets a branch name, db
   name, or checkpoint name reach outside its intended directory or store
-  prefix.
+  prefix. By design, a file path the caller names outright is not a name:
+  the daemon trusts a unix-socket client's `path` field (`export`'s
+  destination, `create`'s import source) as an ordinary server-side path
+  that same-user caller could already write or read, and refuses both over
+  HTTP (see [docs/reference.md](docs/reference.md)'s daemon-ops threat
+  model).
 - **Credential handling** — anything that logs, persists, or leaks S3
   credentials, the single-token auth secret, or other configured secrets
   beyond their intended scope.
