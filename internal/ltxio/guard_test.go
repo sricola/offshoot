@@ -12,6 +12,7 @@ import (
 	"testing"
 	"time"
 
+	"github.com/pierrec/lz4/v4"
 	"github.com/superfly/ltx"
 )
 
@@ -196,6 +197,121 @@ func TestDecodesLTXv051FrameFormat(t *testing.T) {
 	if declared, err := TrailerPostApplyChecksum(seg); err != nil || declared != sum {
 		t.Fatalf("TrailerPostApplyChecksum = %016x, %v; want %016x", declared, err, sum)
 	}
+}
+
+// lz4Frame is one page frame as pierrec's lz4.Writer produces it with opts
+// (ltx v0.5.1 used Block64Kb and defaults otherwise), holding content.
+func lz4Frame(tb testing.TB, content []byte, opts ...lz4.Option) []byte {
+	tb.Helper()
+	var b bytes.Buffer
+	zw := lz4.NewWriter(&b)
+	if err := zw.Apply(opts...); err != nil {
+		tb.Fatal(err)
+	}
+	if _, err := zw.Write(content); err != nil {
+		tb.Fatal(err)
+	}
+	if err := zw.Close(); err != nil {
+		tb.Fatal(err)
+	}
+	return b.Bytes()
+}
+
+// frameObject is an LTX segment (4096-byte pages) whose page 1 is the given
+// LZ4 frame, followed by tail.
+func frameObject(tb testing.TB, frame, tail []byte) []byte {
+	tb.Helper()
+	h := ltx.Header{Version: ltx.Version, PageSize: 4096, Commit: 1 << 20, MinTXID: 2, MaxTXID: 2, Timestamp: 1, PreApplyChecksum: ltx.ChecksumFlag | 1}
+	hb, err := h.MarshalBinary()
+	if err != nil {
+		tb.Fatal(err)
+	}
+	var o bytes.Buffer
+	o.Write(hb)
+	o.Write([]byte{0, 0, 0, 1, 0, 0}) // page 1, frame format (no size flag)
+	o.Write(frame)
+	o.Write(tail)
+	o.Write(make([]byte, 32))
+	return o.Bytes()
+}
+
+// frameDesyncTail is what a decoder that has drifted out of step with the
+// guard would read as a block-format page with a ~4 GiB size prefix, if
+// the guard took it for the start of the next page header — the PoC's
+// payload.
+var frameDesyncTail = []byte{0x04, 0x22, 0x4D, 0x18, 0x00, 0x01, 0x00, 0x00, 0x00, 0x01, 0xFF, 0xFF, 0xFF, 0xF0}
+
+// TestFrameGuardPinsTheV051FrameShape: an LZ4-frame page in any shape other
+// than the one ltx v0.5.1 wrote is refused before pierrec can consume bytes
+// the guard has not parsed, so the 4 GiB allocation the guard exists to
+// prevent stays unreachable. Each case is a route a review found by which
+// pierrec reads past what a field-by-field parse accounts for.
+func TestFrameGuardPinsTheV051FrameShape(t *testing.T) {
+	page := make([]byte, 4096)
+	for i := range page[16:] {
+		page[16+i] = byte(i * 7)
+	}
+	v051 := lz4Frame(t, page, lz4.BlockSizeOption(lz4.Block64Kb))
+	withDict := bytes.Clone(v051)
+	withDict[4] |= 1 // FLG dictionary-ID bit; pierrec never reads the ID
+
+	for _, tc := range []struct {
+		name string
+		obj  []byte
+		want string
+	}{
+		// (a) No content checksum: after the EndMark pierrec peeks 4 bytes
+		// for a concatenated frame, bytes the guard would take as the next
+		// page header.
+		{"no content checksum", frameObject(t, lz4Frame(t, page, lz4.BlockSizeOption(lz4.Block64Kb), lz4.ChecksumOption(false)), frameDesyncTail), "descriptor"},
+		// (b) Dictionary ID flagged: 4 bytes pierrec does not read.
+		{"dictionary ID", frameObject(t, withDict, frameDesyncTail), "descriptor"},
+		// (c) Frame holding less than a page: pierrec reads on past the
+		// EndMark into a "concatenated frame" during the page read.
+		{"short frame", frameObject(t, lz4Frame(t, page[:1000], lz4.BlockSizeOption(lz4.Block64Kb)), frameDesyncTail), "decompresses"},
+		// Larger block maximum than v0.5.1's 64 KiB.
+		{"256 KiB blocks", frameObject(t, lz4Frame(t, page, lz4.BlockSizeOption(lz4.Block256Kb)), frameDesyncTail), "descriptor"},
+		// A second data block where the EndMark belongs.
+		{"two blocks", frameObject(t, append(bytes.Clone(v051[:len(v051)-8]), 0x10, 0, 0, 0), frameDesyncTail), "end frame"}, // ltx reports the guard's refusal as its own trailer error
+	} {
+		var before, after runtimeAlloc
+		before.read()
+		_, err := TrailerPostApplyChecksum(tc.obj)
+		after.read()
+		if err == nil || !strings.Contains(err.Error(), tc.want) {
+			t.Errorf("%s: err = %v, want a refusal mentioning %q", tc.name, err, tc.want)
+		}
+		if grew := after.total - before.total; grew > 8<<20 {
+			t.Errorf("%s: decode allocated %d MiB before refusing", tc.name, grew>>20)
+		}
+	}
+
+	// Control: the v0.5.1 shape itself passes the guard and decodes; the
+	// object then fails only where it is meant to (the bogus next page).
+	if _, err := TrailerPostApplyChecksum(frameObject(t, v051, []byte{0, 0, 0, 2, 0, 1, 0xFF, 0xFF, 0xFF, 0xF0})); err == nil || !strings.Contains(err.Error(), "compressed size") {
+		t.Fatalf("control: err = %v, want the next page's compressed-size refusal", err)
+	}
+}
+
+// frameSeeds are the frame-format fuzz seeds: the real ltx v0.5.1 snapshot
+// and segment fixtures, and the review's desync PoC (an unchecksummed frame
+// followed by a fake ~4 GiB block page). The block-format encoder produces
+// none of these, so without them the fuzzer barely reaches the guard's
+// frame half.
+func frameSeeds(tb testing.TB) [][]byte {
+	tb.Helper()
+	var out [][]byte
+	for _, name := range []string{"snapshot.ltx", "segment.ltx"} {
+		b, err := os.ReadFile(filepath.Join("testdata", "ltx-v0.5.1", name))
+		if err != nil {
+			tb.Fatal(err)
+		}
+		out = append(out, b)
+	}
+	page := make([]byte, 4096)
+	page[100] = 1
+	poc := frameObject(tb, lz4Frame(tb, page, lz4.BlockSizeOption(lz4.Block64Kb), lz4.ChecksumOption(false)), frameDesyncTail)
+	return append(out, poc)
 }
 
 type runtimeAlloc struct{ total uint64 }

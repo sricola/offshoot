@@ -214,6 +214,9 @@ func FuzzDecodeSnapshot(f *testing.F) {
 	f.Add([]byte{})
 	f.Add(snap[:ltx.HeaderSize])
 	f.Add(oversizedBlockSnapshot(f))
+	for _, s := range frameSeeds(f) {
+		f.Add(s)
+	}
 
 	f.Fuzz(func(t *testing.T, data []byte) {
 		if len(data) > maxFuzzInput {
@@ -286,6 +289,9 @@ func FuzzApplySegments(f *testing.F) {
 	f.Add([]byte{})
 	// The CRC-valid Commit = 2^30 segment that used to hang applySegments.
 	f.Add(hugeCommitSegment(f, startSum))
+	for _, s := range frameSeeds(f) {
+		f.Add(s)
+	}
 	// Structured-mode recipes (see structuredSegment): a carried growth, a
 	// shrink to one page, a wrong post-apply checksum, an uncarried growth,
 	// and a wild commit of 2^30 pages.

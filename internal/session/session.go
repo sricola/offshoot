@@ -94,9 +94,18 @@ func (s replicaSink) Rebase(path string) error {
 	return s.sess.rebaseline()
 }
 
+// applyFramesHook, when non-nil, rewrites each captured transaction's
+// frames before replicaSink.Apply processes them. It exists only for tests
+// that need a transaction SQLite itself never produces (see
+// TestUncarriedGrowthFailsTheSession). Nil in production.
+var applyFramesHook func([]wal.Frame) []wal.Frame
+
 func (s replicaSink) Apply(ps uint32, f []wal.Frame) error {
 	s.sess.replicaMu.Lock()
 	defer s.sess.replicaMu.Unlock()
+	if applyFramesHook != nil {
+		f = applyFramesHook(f) // test hook; nil (a no-op) in production
+	}
 	// recordApply must run BEFORE the replica file is mutated: it reads each
 	// touched page's prior content from the still-unmodified file to fold
 	// out its old checksum contribution (see recordApply's doc comment).
@@ -1132,10 +1141,12 @@ func (s *Session) singleStartupRebase() bool {
 // before replica.Apply below has validated the commit frame; that's safe
 // because it relies on the same contract Apply itself requires (the last
 // frame in a well-formed transaction is a commit frame — see
-// replay.Replica.Apply), and because any Apply failure surfaces to the
-// capture engine as fatal, which forces a rebase before capture resumes —
-// rebaseline() re-establishes all of this state from scratch rather than
-// leaving a partially-folded update in place.
+// replay.Replica.Apply), and because any Apply failure is terminal for
+// this session: the error returns through the capture engine's drain, its
+// Run returns it, and runEngine calls fail, which records it for Err(),
+// logs the "fenced" transition and stops the session. Capture never
+// resumes on top of a partially folded update; a later Open starts from a
+// fresh rebase (rebaseline) instead.
 func (s *Session) recordApply(pageSize uint32, frames []wal.Frame) error {
 	if len(frames) == 0 {
 		return nil
@@ -1216,10 +1227,13 @@ func (s *Session) recordApply(pageSize uint32, frames []wal.Frame) error {
 	// dirty page up to the commit size; only the lock page is never
 	// carried). ltxio's applySegments refuses a segment that grows past
 	// its pages, so a transaction that did would be captured into a
-	// segment no reader accepts; refuse it here instead, which surfaces to
-	// the capture engine as fatal and forces a rebase (see this function's
-	// doc comment) rather than writing an unreadable chain. With every
-	// added page carried, the loop above has already folded them all in.
+	// segment no reader accepts. Refuse it here instead: the error is
+	// terminal for the session (see this function's doc comment), which
+	// fails loudly through Err() rather than writing an unreadable chain.
+	// SQLite never emits such a transaction, and the replica's size (the
+	// prevCommit above) cannot understate the database, so this is a guard
+	// against a broken invariant, not a path real workloads take. With
+	// every added page carried, the loop above has already folded them in.
 	if err := ltxio.CheckGrowth(newCommit, prevCommit, pageSize, seen); err != nil {
 		return fmt.Errorf("session: transaction: %w", err)
 	}

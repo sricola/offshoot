@@ -5,6 +5,7 @@ import (
 	"fmt"
 	"io"
 
+	"github.com/pierrec/lz4/v4"
 	"github.com/superfly/ltx"
 )
 
@@ -25,9 +26,15 @@ const maxCommit = 0xFFFFFFFE
 //     the LZ4 worst-case bound for one page. ltx's Decoder.DecodePage
 //     allocates that many bytes before reading them, so without this a
 //     single corrupted 4-byte field costs an allocation of up to 4 GiB;
-//   - each block of an LZ4-frame-format page (what ltx v0.5.1, which this
-//     repo used until 2026-09-26, wrote — stores hold such objects) must be
-//     at most its frame's declared maximum block size.
+//   - an LZ4-frame-format page (what ltx v0.5.1, which this repo used until
+//     2026-09-26, wrote, so stores hold such objects) must have exactly the
+//     shape v0.5.1 wrote: see frameHeader and frameBlock. Pinning the shape
+//     is what keeps the guard in step with the decoder. ltx hands frame
+//     pages to pierrec's lz4.Reader, which on other shapes reads bytes the
+//     guard has not parsed: a 4-byte peek for a concatenated frame after an
+//     unchecksummed frame, past the EndMark when the frame holds less than
+//     a page, and never the dictionary ID. The guard would then be checking
+//     a different byte stream from the one the decoder consumes.
 //
 // It is a pass-through parser: bytes reach the decoder unchanged and in
 // order, only ever after the field that governs them has been checked, so
@@ -42,11 +49,6 @@ type frameGuard struct {
 	state    guardState
 	pageSize uint32
 	err      error // sticky: returned once pending drains
-
-	// LZ4 frame state for the current page (frame format only).
-	blockChecksum   bool
-	contentChecksum bool
-	maxBlock        uint32
 }
 
 type guardState int
@@ -57,6 +59,7 @@ const (
 	guardBlockSize
 	guardFrameHeader
 	guardFrameBlock
+	guardFrameEnd
 	guardRest
 )
 
@@ -159,36 +162,42 @@ func (g *frameGuard) step() {
 	case guardFrameHeader:
 		g.frameHeader()
 	case guardFrameBlock:
-		b, ok := g.field(4)
+		g.frameBlock()
+	case guardFrameEnd:
+		// EndMark (a zero block size), then the 4-byte content checksum,
+		// which pierrec verifies. pierrec's next read, a peek for a
+		// concatenated frame, is cut off by ltx's 8-byte footer limit
+		// (decoder.go: lr.N = lz4FrameFooterSize), so it consumes nothing
+		// past these 8 bytes.
+		b, ok := g.field(8)
 		if !ok {
 			return
 		}
-		g.pending = b
-		size := binary.LittleEndian.Uint32(b)
-		if size == 0 { // EndMark
-			if g.contentChecksum {
-				g.payload = 4
-			}
-			g.state = guardPageHeader
+		if end := binary.LittleEndian.Uint32(b); end != 0 {
+			g.fail("LZ4 frame holds more than one block (next block size %#x, want the EndMark)", end)
 			return
 		}
-		size &^= 1 << 31 // high bit: block stored uncompressed
-		if size > g.maxBlock {
-			g.pending = nil
-			g.fail("LZ4 block size %d exceeds the frame's %d-byte maximum", size, g.maxBlock)
-			return
-		}
-		g.payload = int64(size)
-		if g.blockChecksum {
-			g.payload += 4
-		}
+		g.pending, g.state = b, guardPageHeader
 	}
 }
 
-// frameHeader parses an LZ4 frame descriptor: magic, FLG, BD, the optional
-// content size and dictionary ID, and the header checksum byte.
+// v051FLG and v051BD are the LZ4 frame descriptor bytes every ltx v0.5.1
+// page frame carries (lz4.NewWriter with Block64Kb, defaults otherwise):
+// FLG = version 01, independent blocks, content checksum, and no block
+// checksum, content size, dictionary ID or reserved bits; BD = 64 KiB
+// maximum block size. A 64 KiB block holds the largest SQLite page, so
+// v0.5.1 wrote every page as exactly one block.
+const (
+	v051FLG = 0x64
+	v051BD  = 0x40
+)
+
+// frameHeader checks an LZ4 frame descriptor: the magic, then exactly the
+// FLG and BD bytes v0.5.1 wrote, then the header checksum byte (verified by
+// pierrec). That is seven bytes, exactly what pierrec's frame reader
+// consumes for this descriptor.
 func (g *frameGuard) frameHeader() {
-	b, ok := g.field(6) // magic, FLG, BD
+	b, ok := g.field(7)
 	if !ok {
 		return
 	}
@@ -196,38 +205,48 @@ func (g *frameGuard) frameHeader() {
 		g.fail("page frame is neither block-format nor an LZ4 frame (magic %#x)", magic)
 		return
 	}
-	flg, bd := b[4], b[5]
-	if flg>>6 != 1 {
-		g.fail("LZ4 frame version %d is not 1", flg>>6)
+	if flg, bd := b[4], b[5]; flg != v051FLG || bd != v051BD {
+		g.fail("LZ4 frame descriptor FLG %#02x BD %#02x is not the shape ltx v0.5.1 writes (%#02x %#02x)", flg, bd, v051FLG, v051BD)
 		return
 	}
-	switch (bd >> 4) & 7 {
-	case 4:
-		g.maxBlock = 64 << 10
-	case 5:
-		g.maxBlock = 256 << 10
-	case 6:
-		g.maxBlock = 1 << 20
-	case 7:
-		g.maxBlock = 4 << 20
-	default:
-		g.fail("LZ4 frame block-size code %d is invalid", (bd>>4)&7)
+	g.pending, g.state = b, guardFrameBlock
+}
+
+// frameBlock checks the frame's one data block: its size field, then the
+// block itself, which must hold exactly one page, either stored (size ==
+// PageSize) or compressed and decompressing, here, to exactly PageSize
+// bytes. pierrec then serves the decoder's full-page read from this block
+// alone and never reads ahead for more data.
+func (g *frameGuard) frameBlock() {
+	b, ok := g.field(4)
+	if !ok {
 		return
 	}
-	g.blockChecksum = flg&(1<<4) != 0
-	g.contentChecksum = flg&(1<<2) != 0
-	extra := 1 // header checksum
-	if flg&(1<<3) != 0 {
-		extra += 8 // content size
+	raw := binary.LittleEndian.Uint32(b)
+	stored := raw&(1<<31) != 0
+	size := raw &^ (1 << 31)
+	switch {
+	case raw == 0:
+		g.fail("LZ4 frame has no data block")
+		return
+	case stored && size != g.pageSize:
+		g.fail("stored LZ4 block is %d bytes, want the page size %d", size, g.pageSize)
+		return
+	case size > 64<<10:
+		g.fail("LZ4 block size %d exceeds the frame's 65536-byte maximum", size)
+		return
 	}
-	if flg&1 != 0 {
-		extra += 4 // dictionary ID
-	}
-	rest, ok := g.field(extra)
+	data, ok := g.field(int(size))
 	if !ok {
 		g.pending = append(b, g.pending...)
 		return
 	}
-	g.pending = append(b, rest...)
-	g.state = guardFrameBlock
+	if !stored {
+		page := make([]byte, g.pageSize)
+		if n, err := lz4.UncompressBlock(data, page); err != nil || n != int(g.pageSize) {
+			g.fail("LZ4 block decompresses to %d bytes (err %v), want the page size %d", n, err, g.pageSize)
+			return
+		}
+	}
+	g.pending, g.state = append(b, data...), guardFrameEnd
 }
