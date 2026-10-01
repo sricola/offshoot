@@ -1212,19 +1212,16 @@ func (s *Session) recordApply(pageSize uint32, frames []wal.Frame) error {
 			running = ltxio.UpdateChecksum(running, pgno, buf, nil)
 		}
 	}
-	// A growing commit can, in principle, extend past what this transaction
-	// explicitly wrote — Truncate zero-extends the file, so any such page's
-	// "new" content is all-zero. Every real SQLite commit writes every page
-	// it introduces, so in practice this never runs; kept for the same
-	// reason ltxio.MaterializeChain keeps its analogous loop.
-	if newCommit > prevCommit {
-		zero := make([]byte, pageSize)
-		for pgno := prevCommit + 1; pgno <= newCommit; pgno++ {
-			if seen[pgno] || pgno == lockPgno {
-				continue
-			}
-			running = ltxio.UpdateChecksum(running, pgno, nil, zero)
-		}
+	// A growing commit must carry every page it adds (SQLite logs every
+	// dirty page up to the commit size; only the lock page is never
+	// carried). ltxio's applySegments refuses a segment that grows past
+	// its pages, so a transaction that did would be captured into a
+	// segment no reader accepts; refuse it here instead, which surfaces to
+	// the capture engine as fatal and forces a rebase (see this function's
+	// doc comment) rather than writing an unreadable chain. With every
+	// added page carried, the loop above has already folded them all in.
+	if err := ltxio.CheckGrowth(newCommit, prevCommit, pageSize, seen); err != nil {
+		return fmt.Errorf("session: transaction: %w", err)
 	}
 
 	s.checksum = running

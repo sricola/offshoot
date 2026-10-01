@@ -4,6 +4,7 @@ import (
 	"bytes"
 	"database/sql"
 	"encoding/binary"
+	"errors"
 	"io"
 	"os"
 	"path/filepath"
@@ -198,13 +199,10 @@ func requireNoLeftovers(t *testing.T, dir string) {
 // never panic or hang; either fail closed (no destination, no temp file) or
 // produce a file whose checksum equals the trailer's post-apply checksum.
 //
-// Known upstream gap this target reaches within seconds (not a failure,
-// so it does not stop the run, but it shows as stalls in the exec rate):
-// github.com/superfly/ltx v0.5.3's Decoder.DecodePage allocates the
-// compressed-block size read from the page frame before reading it, so one
-// corrupted 4-byte size field costs a transient allocation of up to 4 GiB
-// ahead of any CRC check. Deliberately not seeded here, so plain `go test`
-// never pays it.
+// It found that github.com/superfly/ltx's Decoder.DecodePage allocates a
+// page frame's compressed-size prefix before reading it, ahead of any CRC
+// check — up to 4 GiB for one corrupted field. frameGuard now refuses that
+// field; the crasher shape is seeded below.
 func FuzzDecodeSnapshot(f *testing.F) {
 	snap, segs, _ := fuzzSeedChain(f)
 	f.Add(snap)
@@ -215,6 +213,7 @@ func FuzzDecodeSnapshot(f *testing.F) {
 	f.Add(flipped)
 	f.Add([]byte{})
 	f.Add(snap[:ltx.HeaderSize])
+	f.Add(oversizedBlockSnapshot(f))
 
 	f.Fuzz(func(t *testing.T, data []byte) {
 		if len(data) > maxFuzzInput {
@@ -285,11 +284,16 @@ func FuzzApplySegments(f *testing.F) {
 	}
 	f.Add(snap)
 	f.Add([]byte{})
-	// Structured-mode recipes (see structuredSegment): grow with a written
-	// page, shrink to one page, and a wrong post-apply checksum.
-	f.Add([]byte{0, 3, 2, 0xaa, 4, 0x55})
+	// The CRC-valid Commit = 2^30 segment that used to hang applySegments.
+	f.Add(hugeCommitSegment(f, startSum))
+	// Structured-mode recipes (see structuredSegment): a carried growth, a
+	// shrink to one page, a wrong post-apply checksum, an uncarried growth,
+	// and a wild commit of 2^30 pages.
+	f.Add([]byte{0, 4, 2, 0xaa, 3, 0x55})
 	f.Add([]byte{0, 0x80})
 	f.Add([]byte{1, 1, 1, 0x11})
+	f.Add([]byte{0, 7})
+	f.Add([]byte{4, 0x40, 0, 0, 0, 1, 0x22})
 
 	f.Fuzz(func(t *testing.T, data []byte) {
 		if len(data) > maxFuzzInput {
@@ -310,7 +314,7 @@ func FuzzApplySegments(f *testing.F) {
 		}
 
 		// Structured.
-		seg, want, wantSum, valid := structuredSegment(startBytes, pageSize, startSum, data)
+		seg, want, wantSum, outcome := structuredSegment(startBytes, pageSize, startSum, data)
 		if seg == nil {
 			return
 		}
@@ -318,13 +322,9 @@ func FuzzApplySegments(f *testing.F) {
 		sdst := filepath.Join(sdir, "dst.sqlite")
 		_, sum, err = ApplySegments(start, startSum, []io.Reader{bytes.NewReader(seg)}, sdst)
 		switch {
-		case err != nil && valid:
+		case outcome == recipeValid && err != nil:
 			t.Fatalf("well-formed segment with correct checksums rejected: %v", err)
-		case err != nil:
-			requireNoLeftovers(t, sdir)
-		case !valid:
-			t.Fatal("segment with a corrupted pre- or post-apply checksum was accepted")
-		default:
+		case outcome == recipeValid:
 			if sum != wantSum {
 				t.Fatalf("returned checksum %016x, model %016x", sum, wantSum)
 			}
@@ -333,39 +333,66 @@ func FuzzApplySegments(f *testing.F) {
 				t.Fatal("applied file differs from the model of the same apply")
 			}
 			requireConsistent(t, sdst, pageSize, sum, seg)
+		case err == nil:
+			t.Fatalf("malformed segment (outcome %d) was accepted", outcome)
+		case outcome == recipeUncarried && !errors.Is(err, ErrUncarriedGrowth):
+			t.Fatalf("segment growing past its pages refused for another reason: %v", err)
+		default:
+			requireNoLeftovers(t, sdir)
 		}
 	})
 }
 
+// recipeOutcome is what applying a structured segment must do.
+type recipeOutcome int
+
+const (
+	recipeValid     recipeOutcome = iota // apply succeeds and matches the model
+	recipeBadPre                         // corrupted pre-apply checksum: any error
+	recipeUncarried                      // grows past its pages: ErrUncarriedGrowth
+	recipeBadPost                        // corrupted post-apply checksum: any error
+)
+
+// maxRecipePages bounds a recipe's page count, and with it the model's
+// memory (a carried growth adds at most this many pages).
+const maxRecipePages = 64
+
 // structuredSegment decodes data as a segment recipe and encodes it with
-// the real ltx encoder (valid CRC), returning the segment, the modeled
-// result of applying it to base, that result's checksum, and whether the
-// declared checksums are the true ones. Recipe: data[0] bit 0 corrupts the
-// post-apply checksum, bit 1 the pre-apply checksum; data[1] picks the
-// commit size within [0, base pages + 8] — bounded, see below; each
-// following byte pair is (page selector, fill byte). Returns a nil segment
-// for a recipe the encoder itself refuses.
-//
-// The commit size is bounded because a segment that grows the database far
-// past the pages it carries makes applySegments fold every zero-extended
-// page into its checksum one by one: a 120-byte, CRC-valid segment
-// declaring a commit of 2^30 pages runs for hours. That is a reported
-// robustness gap (crafting it needs write access to the store), not
-// something this target should rediscover every night.
-func structuredSegment(base []byte, pageSize uint32, startSum uint64, data []byte) (seg, want []byte, wantSum uint64, valid bool) {
+// the real ltx encoder (valid CRC), returning the segment, the expected
+// outcome of applying it to base and, for recipeValid, the modeled result
+// and its checksum. Recipe: data[0] bit 0 corrupts the post-apply checksum,
+// bit 1 the pre-apply checksum, bit 2 selects a "wild" commit — any uint32,
+// read from data[1:5] — instead of one in [0, base pages + 8] picked by
+// data[1]; each following byte pair is (page selector, fill byte), at most
+// maxRecipePages of them. A wild commit is almost always a growth the
+// segment does not carry (the Commit = 2^30 shape that used to hang
+// applySegments), which must be refused with ErrUncarriedGrowth. Returns a
+// nil segment for a recipe the encoder itself refuses.
+func structuredSegment(base []byte, pageSize uint32, startSum uint64, data []byte) (seg, want []byte, wantSum uint64, outcome recipeOutcome) {
 	if len(data) < 2 {
-		return nil, nil, 0, false
+		return nil, nil, 0, 0
 	}
 	basePages := uint32(len(base)) / pageSize
-	commit := uint32(data[1]) % (basePages + 9)
+	var commit uint32
+	var rest []byte
+	if data[0]&4 != 0 {
+		if len(data) < 5 {
+			return nil, nil, 0, 0
+		}
+		commit, rest = binary.BigEndian.Uint32(data[1:5]), data[5:]
+	} else {
+		commit, rest = uint32(data[1])%(basePages+9), data[2:]
+	}
 	lockPgno := ltx.LockPgno(pageSize)
 
 	byPgno := map[uint32]byte{}
+	carried := map[uint32]bool{}
 	if commit > 0 {
-		for rest := data[2:]; len(rest) >= 2; rest = rest[2:] {
+		for n := 0; len(rest) >= 2 && n < maxRecipePages; rest, n = rest[2:], n+1 {
 			pgno := 1 + uint32(rest[0])%commit
 			if pgno != lockPgno {
 				byPgno[pgno] = rest[1]
+				carried[pgno] = true
 			}
 		}
 	}
@@ -374,52 +401,68 @@ func structuredSegment(base []byte, pageSize uint32, startSum uint64, data []byt
 		pgnos = append(pgnos, p)
 	}
 	sort.Slice(pgnos, func(i, j int) bool { return pgnos[i] < pgnos[j] })
-
-	// Model: base, pages overwritten, then truncated or zero-extended to
-	// commit — exactly what a correct apply must produce.
-	want = make([]byte, max(len(base), int(commit)*int(pageSize)))
-	copy(want, base)
 	pages := make([]Page, len(pgnos))
 	for i, p := range pgnos {
 		buf := bytes.Repeat([]byte{byPgno[p]}, int(pageSize))
 		binary.BigEndian.PutUint32(buf, p)
 		pages[i] = Page{Pgno: p, Data: buf}
-		copy(want[int(p-1)*int(pageSize):], buf)
 	}
-	want = want[:int(commit)*int(pageSize)]
-	c, err := checksumPages(bytes.NewReader(want), pageSize, commit)
-	if err != nil {
-		return nil, nil, 0, false
-	}
-	wantSum = uint64(c)
 
-	pre, post := startSum, wantSum
+	switch {
+	case data[0]&2 != 0:
+		outcome = recipeBadPre
+	case checkGrowth(commit, basePages, lockPgno, carried) != nil:
+		outcome = recipeUncarried
+	case data[0]&1 != 0:
+		outcome = recipeBadPost
+	}
+
+	post := uint64(ltx.ChecksumFlag | 1)
+	if checkGrowth(commit, basePages, lockPgno, carried) == nil {
+		// Model: base, pages overwritten, then truncated or extended to
+		// commit — exactly what a correct apply must produce. Bounded:
+		// commit <= base pages + maxRecipePages here.
+		want = make([]byte, max(len(base), int(commit)*int(pageSize)))
+		copy(want, base)
+		for _, p := range pages {
+			copy(want[int(p.Pgno-1)*int(pageSize):], p.Data)
+		}
+		want = want[:int(commit)*int(pageSize)]
+		c, err := checksumPages(bytes.NewReader(want), pageSize, commit)
+		if err != nil {
+			return nil, nil, 0, 0
+		}
+		wantSum = uint64(c)
+		post = wantSum
+	}
+	pre := startSum
 	if data[0]&1 != 0 {
 		post ^= 2 // keeps ltx.ChecksumFlag set
 	}
 	if data[0]&2 != 0 {
 		pre ^= 2
 	}
+
 	var buf bytes.Buffer
 	enc, err := ltx.NewEncoder(&buf)
 	if err != nil {
-		return nil, nil, 0, false
+		return nil, nil, 0, 0
 	}
 	hdr := ltx.Header{
 		Version: ltx.Version, PageSize: pageSize, Commit: commit,
 		MinTXID: 2, MaxTXID: 2, PreApplyChecksum: ltx.Checksum(pre),
 	}
 	if err := enc.EncodeHeader(hdr); err != nil {
-		return nil, nil, 0, false
+		return nil, nil, 0, 0
 	}
 	for _, p := range pages {
 		if err := enc.EncodePage(ltx.PageHeader{Pgno: p.Pgno}, p.Data); err != nil {
-			return nil, nil, 0, false
+			return nil, nil, 0, 0
 		}
 	}
 	enc.SetPostApplyChecksum(ltx.Checksum(post))
 	if err := enc.Close(); err != nil {
-		return nil, nil, 0, false
+		return nil, nil, 0, 0
 	}
-	return buf.Bytes(), want, wantSum, data[0]&3 == 0
+	return buf.Bytes(), want, wantSum, outcome
 }

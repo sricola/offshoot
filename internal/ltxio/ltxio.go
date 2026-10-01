@@ -152,7 +152,7 @@ func Materialize(r io.Reader, dbPath string) (txid uint64, err error) {
 // touches its real destination. Returns the decoded header and trailer so
 // callers (e.g. MaterializeChain) can continue a chain from this state.
 func decodeSnapshot(r io.Reader, w io.Writer) (ltx.Header, ltx.Trailer, error) {
-	dec := ltx.NewDecoder(r)
+	dec := ltx.NewDecoder(newFrameGuard(r))
 	if err := dec.DecodeDatabaseTo(w); err != nil {
 		return ltx.Header{}, ltx.Trailer{}, fmt.Errorf("ltxio: decode snapshot: %w", err)
 	}

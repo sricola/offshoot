@@ -2,6 +2,7 @@ package ltxio
 
 import (
 	"bytes"
+	"errors"
 	"fmt"
 	"io"
 	"os"
@@ -136,7 +137,7 @@ func EncodeSegment(pageSize, commit uint32, minTXID, maxTXID uint64, preApplyChe
 // writer at all, is sufficient and correct for either a snapshot's
 // contiguous full page run or a segment's sparse changed-page set.
 func TrailerPostApplyChecksum(data []byte) (uint64, error) {
-	dec := ltx.NewDecoder(bytes.NewReader(data))
+	dec := ltx.NewDecoder(newFrameGuard(bytes.NewReader(data)))
 	if err := dec.DecodeHeader(); err != nil {
 		return 0, fmt.Errorf("ltxio: decode header: %w", err)
 	}
@@ -355,7 +356,7 @@ func MaterializeChain(snapshot io.Reader, segments []io.Reader, dbPath string) (
 // checksum; f is left open and unsynced for the caller to finalize.
 func applySegments(f *os.File, pageSize uint32, prevMaxTXID uint64, prevCommit uint32, runningChecksum ltx.Checksum, segments []io.Reader) (txid uint64, checksum uint64, err error) {
 	for i, segR := range segments {
-		dec := ltx.NewDecoder(segR)
+		dec := ltx.NewDecoder(newFrameGuard(segR))
 		if err := dec.DecodeHeader(); err != nil {
 			return 0, 0, fmt.Errorf("ltxio: decode segment %d header: %w", i, err)
 		}
@@ -423,6 +424,20 @@ func applySegments(f *os.File, pageSize uint32, prevMaxTXID uint64, prevCommit u
 			return 0, 0, fmt.Errorf("ltxio: close segment %d: %w", i, err)
 		}
 
+		// A segment can grow the database only by pages it carries: SQLite
+		// writes every page it adds to the database (pagerWalFrames logs
+		// every dirty page up to the commit size), except the lock page,
+		// which never holds data and is never carried. A segment that
+		// declares a larger commit than its pages cover is malformed, and
+		// accepting it used to mean folding every missing, zero-extended
+		// page into the checksum one at a time — a CRC-valid 120-byte
+		// segment declaring 2^30 pages ran for hours (found by
+		// FuzzApplySegments). session.recordApply enforces the same rule on
+		// the write side, so no segment this repo writes can trip it.
+		if err := checkGrowth(shdr.Commit, prevCommit, lockPgno, touched); err != nil {
+			return 0, 0, fmt.Errorf("ltxio: segment %d: %w", i, err)
+		}
+
 		// A shrinking commit drops trailing pages the segment had no reason
 		// to write (there is no new content for a page that is going away).
 		// Their old contribution is still baked into `running`, so it must
@@ -444,22 +459,9 @@ func applySegments(f *os.File, pageSize uint32, prevMaxTXID uint64, prevCommit u
 			return 0, 0, fmt.Errorf("ltxio: truncate to commit size: %w", err)
 		}
 
-		// A growing commit can, in principle, extend past what the segment
-		// explicitly wrote (Truncate zero-extends the file); fold in any
-		// such page so the running checksum matches what a full re-scan of
-		// the resulting file would compute. Every real segment writes every
-		// page it introduces, so in practice this loop never executes.
-		if shdr.Commit > prevCommit {
-			for pgno := prevCommit + 1; pgno <= shdr.Commit; pgno++ {
-				if pgno == lockPgno || touched[pgno] {
-					continue
-				}
-				if _, err := f.ReadAt(oldBuf, int64(pgno-1)*int64(pageSize)); err != nil {
-					return 0, 0, fmt.Errorf("ltxio: read new page %d: %w", pgno, err)
-				}
-				running = UpdateChecksum(running, pgno, nil, oldBuf)
-			}
-		}
+		// No growth fold is needed here: checkGrowth above guarantees every
+		// page a growing commit adds (other than the lock page, which the
+		// checksum skips) was carried and already folded in.
 
 		declared := dec.Trailer().PostApplyChecksum
 		if actual := ltx.Checksum(running); actual != declared {
@@ -472,6 +474,42 @@ func applySegments(f *os.File, pageSize uint32, prevMaxTXID uint64, prevCommit u
 	}
 
 	return prevMaxTXID, uint64(runningChecksum), nil
+}
+
+// ErrUncarriedGrowth reports a commit that grows the database past pages
+// the segment (or, in session, the transaction) does not carry.
+var ErrUncarriedGrowth = errors.New("commit grows the database beyond the pages it carries")
+
+// checkGrowth enforces "a commit grows the database only by pages it
+// carries": when commit > prevCommit, every page number in
+// (prevCommit, commit] except lockPgno must be in carried. Exported to
+// session's write path through CheckGrowth so the two sides agree.
+func checkGrowth(commit, prevCommit, lockPgno uint32, carried map[uint32]bool) error {
+	if commit <= prevCommit {
+		return nil
+	}
+	need := commit - prevCommit
+	if lockPgno > prevCommit && lockPgno <= commit {
+		need--
+	}
+	var have uint32
+	for pgno := range carried {
+		if pgno > prevCommit && pgno <= commit && pgno != lockPgno {
+			have++
+		}
+	}
+	if have != need {
+		return fmt.Errorf("%w: commit %d after %d pages needs %d new pages, has %d",
+			ErrUncarriedGrowth, commit, prevCommit, need, have)
+	}
+	return nil
+}
+
+// CheckGrowth is checkGrowth for callers outside this package that build
+// segments (session.recordApply): it must refuse a transaction exactly when
+// applySegments would refuse the segment carrying it.
+func CheckGrowth(commit, prevCommit uint32, pageSize uint32, carried map[uint32]bool) error {
+	return checkGrowth(commit, prevCommit, ltx.LockPgno(pageSize), carried)
 }
 
 // ApplySegments writes into dstPath the database formed by applying
