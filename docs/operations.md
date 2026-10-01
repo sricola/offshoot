@@ -102,6 +102,7 @@ $ curl -s -H "Authorization: Bearer verify-token-123" http://127.0.0.1:18080/met
 # TYPE offshoot_rollback_total counter
 # TYPE offshoot_promote_total counter
 # TYPE offshoot_checkpoint_duration_seconds histogram
+# TYPE offshoot_checkpoint_overwrite_detected_total counter
 # TYPE offshoot_reap_total counter
 # TYPE offshoot_gc_tombstoned_total counter
 # TYPE offshoot_gc_deleted_total counter
@@ -112,15 +113,17 @@ $ curl -s -H "Authorization: Bearer verify-token-123" http://127.0.0.1:18080/met
 # TYPE offshoot_janitor_runs_total counter
 ```
 
-Eighteen `# TYPE` lines, matching the eighteen rows in the table above exactly
+Twenty-one `# TYPE` lines, matching the twenty-one rows in the table above exactly
 — that grep is the whole verification: run it yourself against a running
 daemon any time this table is in doubt.
 
 ### Grafana dashboard
 
-A ready-to-import dashboard covering all eighteen families above ships as
-[docs/grafana-dashboard.json](grafana-dashboard.json) — flush rate/latency,
-the shared-vs-materialized fork split, GC (with `offshoot_gc_errors_total`
+A ready-to-import dashboard covering nineteen of the twenty-one families
+above (all but `offshoot_rollback_total` and `offshoot_promote_total`) ships
+as [docs/grafana-dashboard.json](grafana-dashboard.json) — flush
+rate/latency, the shared-vs-materialized fork split, at-rest checkpoint
+latency and detected overwrites, GC (with `offshoot_gc_errors_total`
 front and center as the fail-closed alarm), sessions/capture lag, and the
 janitor/ro-cache panels. Import it via Dashboards → Import and pick your
 Prometheus datasource when prompted.
