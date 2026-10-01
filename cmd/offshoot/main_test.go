@@ -13,7 +13,7 @@ import (
 	"time"
 
 	"github.com/sricola/offshoot/internal/daemon"
-	"github.com/sricola/offshoot/internal/ops/reflink"
+	"github.com/sricola/offshoot/internal/reflink"
 	"github.com/sricola/offshoot/internal/testutil"
 )
 

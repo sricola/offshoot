@@ -11,7 +11,7 @@ import (
 
 	"github.com/sricola/offshoot/internal/ltxio"
 	"github.com/sricola/offshoot/internal/ops"
-	"github.com/sricola/offshoot/internal/ops/reflink"
+	"github.com/sricola/offshoot/internal/reflink"
 	"github.com/sricola/offshoot/internal/store"
 )
 

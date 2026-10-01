@@ -10,7 +10,7 @@ import (
 
 	"github.com/superfly/ltx"
 
-	"github.com/sricola/offshoot/internal/ops/reflink"
+	"github.com/sricola/offshoot/internal/reflink"
 )
 
 // Page is one database page destined for a segment.

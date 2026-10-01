@@ -121,14 +121,14 @@ jobs:
       - name: Verify the runner's filesystem clones
         run: |
           set -o pipefail
-          go test ./internal/ops/reflink -run '^TestCloneProducesIdenticalFile$' -count=1 -v | tee reflink-probe.txt
+          go test ./internal/reflink -run '^TestCloneProducesIdenticalFile$' -count=1 -v | tee reflink-probe.txt
           if grep -q -- '--- SKIP' reflink-probe.txt; then
             echo "TMPDIR cannot clone on this runner; the copy-on-write tests would all skip" >&2
             exit 1
           fi
 
       - name: go test (copy-on-write paths)
-        run: go test ./internal/ops ./internal/ltxio ./internal/ops/reflink -count=1
+        run: go test ./internal/ops ./internal/ltxio ./internal/reflink -count=1
 
       - name: go test (copy-on-write session opens)
         run: go test ./internal/session -run '^(TestOpenOnClonedCheckoutSkipsSettlingFlush|TestAtRestCheckpointAfterCloseWritesASegment)$' -count=1 -v

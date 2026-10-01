@@ -336,8 +336,8 @@ open wart (its own spec said "N materialized forks cost up to N×G").
   - Route Rollback/Promote/Compact's local checkout refresh through the
     by-chain cache (`materializeFromChain`), so the local refresh is
     O(delta) like `checkout`, not a full decode.
-  - Move `internal/ops/reflink` to `internal/reflink`: `internal/ltxio`
-    imports it today, a layering inversion.
+  - ✅ Move `internal/ops/reflink` to `internal/reflink`: `internal/ltxio`
+    imported it, a layering inversion.
   - Pass the resolved chain members into `planSegment`, saving one Chain
     resolution per at-rest checkpoint.
   - ✅ Close the concurrent at-rest checkpoint race
