@@ -64,7 +64,9 @@ an object that could not be re-read to check it. Either way, the branch
 holds a valid checkpoint at that txid, but it may be the loser's encode.
 
 **What remains:** a third racer that overwrites the object after the
-winner's check has run is not noticed. To get exactly the content you
+winner's check has run is not noticed, and neither is a two-racer
+ordering where the losing snapshot lands after the winner's probe and its
+writer dies before reaching its own ref CAS (so its cleanup never runs). To get exactly the content you
 checkpointed, serialize at-rest checkpoints per branch, or fork per writer.
 
 ## One daemon per store

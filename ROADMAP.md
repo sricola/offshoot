@@ -366,6 +366,14 @@ open wart (its own spec said "N materialized forks cost up to N×G").
   - Commit a 64 KiB-page, incompressible ltx v0.5.1 fixture beside the
     4 KiB ones, so the pinned frame shape is tested at the largest page
     size and at the LZ4 worst-case block.
+  - Apply the 1 s racily-clean margin to the checkpoint stamp's
+    matching-fingerprint shortcut (`stampCheckpoint`): on a coarse-mtime
+    filesystem in WAL mode a foreign same-size write inside the quiesce
+    tick could otherwise be stamped trusted; fall back to
+    `ChecksumDatabase` when the mtime is younger than the margin.
+  - Decide whether the runtime image should `apt-get upgrade` at build
+    time or rely solely on Dependabot's weekly base-image digest bumps for
+    security updates; the Dockerfile comment documents the current choice.
 
 ## Launch track (parallel to v0.1–v0.3)
 
