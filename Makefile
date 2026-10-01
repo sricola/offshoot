@@ -1,4 +1,4 @@
-.PHONY: test test-torture build test-s3 bench bench-cow bench-s3 check-python-version test-python-sdk test-ts-sdk test-sdks test-python-langgraph \
+.PHONY: test test-torture fuzz build test-s3 bench bench-cow bench-s3 check-python-version test-python-sdk test-ts-sdk test-sdks test-python-langgraph \
 	check-sdk-versions dry-run-python-sdk dry-run-ts-sdk dry-run-sdks test-pytest-plugin \
 	ci-local ci-local-host ci-local-linux ci-local-s3 ci-local-minio ci-local-sdks lint \
 	check-plugin bench-isolation bench-branchbench example-pass-k
@@ -25,6 +25,20 @@ lint:
 	go run honnef.co/go/tools/cmd/staticcheck@latest ./... || echo "staticcheck failed or unavailable (non-blocking)"
 test-torture:
 	go test ./internal/capture -tags=torture -run TestTorture -count=1 -timeout 30m -v
+
+# fuzz runs every Go native fuzz target for 30s each (~3 min), sequentially:
+# `-fuzz` takes one target per package run. The nightly fuzz job runs the
+# same loop at 60s per target. A crasher lands in the package's
+# testdata/fuzz/<Target>/ and reproduces with
+# `go test ./internal/<pkg> -run '<Target>/<id>'`.
+FUZZ_TARGETS := store:FuzzValidateName ltxio:FuzzDecodeSnapshot ltxio:FuzzApplySegments ops:FuzzReadSidecar daemon:FuzzDecodeRequest
+FUZZTIME ?= 30s
+fuzz:
+	@set -e; for spec in $(FUZZ_TARGETS); do \
+		pkg=$${spec%%:*}; target=$${spec##*:}; \
+		echo "== $$target (internal/$$pkg, $(FUZZTIME))"; \
+		go test ./internal/$$pkg -run '^$$' -fuzz "^$$target\$$" -fuzztime $(FUZZTIME) -fuzzminimizetime 5s; \
+	done
 build:
 	go build -o bin/torture ./cmd/torture
 test-s3:

@@ -70,7 +70,7 @@ ecosystem bumps them weekly.
 
 ## Test tiers
 
-There are seven, and they cost very different amounts of time. Run the tier
+There are eight, and they cost very different amounts of time. Run the tier
 that matches what you touched — don't run torture on a docs typo, and don't
 skip it on a capture-engine change.
 
@@ -78,6 +78,7 @@ skip it on a capture-engine change.
 |---|---|---|---|
 | Unit/integration | `go test ./... -race` | seconds | Always, every PR |
 | Torture (writer kill-9 + capturer restart) | `make test-torture` | ~5 minutes | Touching `internal/capture` or `internal/session` flush paths |
+| Fuzz | `make fuzz` | ~3 min | nightly, on demand |
 | S3 conformance | `make test-s3` | needs a real S3-compatible provider running (`make ci-local-s3` spins up RustFS in Docker) | Touching `internal/store`'s S3 backend or the CAS probe |
 | SDKs | `make test-sdks` | needs `python3` + Node 20+ | Touching `sdk/python`, `sdk/typescript`, or the daemon API surface they depend on |
 | pytest fixture plugin | `make test-pytest-plugin` | needs `pip install -e "sdk/python[pytest]" pytest-xdist` | Touching `sdk/python/offshoot/pytest_plugin.py` or its test suite — kept OUT of `test-sdks` on purpose, since that tier proves the base SDK works with no pytest installed at all |

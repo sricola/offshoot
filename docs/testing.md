@@ -13,6 +13,7 @@ names the code or workflow that backs it.
 | A `kill -9`'d writer never corrupts the replica | `TestTortureWriterKill`: ~3,500 rounds, ~1,700 SIGKILLs, dump-identical every round | nightly Linux, weekly macOS (`nightly.yml`) |
 | One writer per lineage, always | lease epochs + create-only puts + CAS on every ref; CAS probe refuses stores without it | every `go test`, RustFS on every PR, AWS nightly |
 | Storage backends behave identically | `storetest.RunConformance` | local + fake S3 every run; real RustFS every PR; real AWS nightly since 2026-09-25 |
+| Parsers of untrusted bytes fail closed, never panic | five Go native fuzz targets (`make fuzz`) | seed corpora every `go test`; 60 s per target nightly (`nightly.yml`) |
 | Per-test isolation is cheap and measured | `make bench-isolation`, one pasted run | [benchmarks.md](benchmarks.md#per-test-isolation-primitives-v0212) |
 | Branch-heavy agent topologies hold up | `make bench-branchbench`, one pasted run | [benchmarks.md](benchmarks.md#branchbench-topologies-v0212) |
 | What you download is what CI built | keyless cosign + SLSA provenance + SBOM on every tag | `release.yml`; verify per [installation](installation.md#verify-what-you-downloaded) |
@@ -125,6 +126,33 @@ depends on — CAS behavior, create-only puts, list/delete edge cases:
   verified through v0.2.9 and is same-code-path but no longer
   re-verified; other S3-compatible providers are same-code-path only (see
   [stability.md](stability.md#proposed-v10-criteria)).
+
+## Fuzzing the parsers that read untrusted bytes
+
+Five Go native fuzz targets cover every parser that reads bytes offshoot
+did not just write itself. Each seeds its corpus from the real encoder and
+caps an input at 1 MiB; fuzz input never reaches cgo SQLite.
+
+| Target | Package | Property |
+|---|---|---|
+| `FuzzValidateName` | `internal/store` | never panics; an accepted name round-trips through `RefKey`, stays under the local backend's root, is one path element, and is never `~by-chain` |
+| `FuzzDecodeSnapshot` | `internal/ltxio` | `MaterializeChain`/`Materialize` fail closed (no destination, no temp file) or produce a file whose checksum equals the trailer's post-apply checksum |
+| `FuzzApplySegments` | `internal/ltxio` | the same for a segment applied with `ApplySegments`, both as raw bytes and as a CRC-valid segment built from the input and checked against an in-memory model of the apply |
+| `FuzzReadSidecar` | `internal/ops` | `readSidecar` returns ok=false with a zero record, or a record with a hash that is a fixed point of the `.sum` format |
+| `FuzzDecodeRequest` | `internal/daemon` | the request decoder shared by the unix socket and `POST /rpc` never panics or stalls on a stream, and every request it yields is a fixed point of the wire format |
+
+The LTX targets also panic on any execution over 10 s, because Go's fuzzer
+has no per-input timeout and would otherwise report a hang as a pass.
+
+- **On every `go test`**: each target's seed corpus runs as an ordinary
+  test.
+- **On demand**: `make fuzz` runs each target for 30 s (~3 minutes in
+  total; `FUZZTIME=2m make fuzz` for longer).
+- **Nightly**: the `fuzz` job in `.github/workflows/nightly.yml` runs each
+  target for 60 s on the daily leg, fails on any crasher, and uploads
+  `testdata/fuzz/**` as the `fuzz-crashers` artifact. To reproduce one, drop
+  the file into `internal/<pkg>/testdata/fuzz/<Target>/` and run
+  `go test ./internal/<pkg> -run '<Target>/<file>'`.
 
 ## The gates every change passes
 

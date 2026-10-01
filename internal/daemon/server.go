@@ -262,8 +262,8 @@ func (s *Server) handle(c net.Conn) {
 	dec := json.NewDecoder(c)
 	enc := json.NewEncoder(c)
 	for {
-		var req Request
-		if err := dec.Decode(&req); err != nil {
+		req, err := decodeRequest(dec)
+		if err != nil {
 			return // client hung up or sent garbage
 		}
 		// "subscribe" (Milestone 4 Task 4a) is handle()'s SECOND special-
