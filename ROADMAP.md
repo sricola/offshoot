@@ -340,12 +340,14 @@ open wart (its own spec said "N materialized forks cost up to N×G").
     imports it today, a layering inversion.
   - Pass the resolved chain members into `planSegment`, saving one Chain
     resolution per at-rest checkpoint.
-  - Close the concurrent at-rest checkpoint race
+  - ✅ Close the concurrent at-rest checkpoint race
     ([limitations](docs/limitations.md#one-writer-per-branch)): after
-    winning the ref CAS, read the stored object's trailer checksum; on a
-    mismatch stamp `PostApplyChecksum=0` and drop the shadow, so neither
-    the next checkpoint nor a daemon session trusts content a same-kind
-    loser overwrote.
+    winning the ref CAS, the checkpoint `Head`s its object and, on an etag
+    mismatch, reads the stored trailer checksum; on a content mismatch it
+    stamps `PostApplyChecksum=0`, drops the shadow and counts
+    `offshoot_checkpoint_overwrite_detected_total`, so neither the next
+    checkpoint nor a daemon session trusts content a same-kind loser
+    overwrote.
 
 ## Launch track (parallel to v0.1–v0.3)
 

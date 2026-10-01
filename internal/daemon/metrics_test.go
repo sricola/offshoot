@@ -8,6 +8,7 @@ import (
 	"testing"
 	"time"
 
+	"github.com/sricola/offshoot/internal/ops"
 	"github.com/sricola/offshoot/internal/store"
 	"github.com/sricola/offshoot/internal/testutil"
 )
@@ -247,6 +248,30 @@ func TestJanitorTickCountsGCError(t *testing.T) {
 	}
 	if !strings.Contains(out, `offshoot_janitor_runs_total{result="error"} 1`) {
 		t.Fatalf("expected the failed tick under janitor_runs_total{result=error}:\n%s", out)
+	}
+}
+
+// TestCheckpointOverwriteCounterIsWired: offshoot_checkpoint_overwrite_detected_total
+// is exposed at 0 from the first scrape, and ops.ObserveCheckpointOverwrite
+// (assigned by NewServer) moves it.
+func TestCheckpointOverwriteCounterIsWired(t *testing.T) {
+	srv, _ := newServer(t)
+	scrape := func() string {
+		var buf bytes.Buffer
+		if err := srv.WritePrometheus(&buf); err != nil {
+			t.Fatal(err)
+		}
+		return buf.String()
+	}
+	if out := scrape(); !strings.Contains(out, "offshoot_checkpoint_overwrite_detected_total 0") {
+		t.Fatalf("expected the overwrite counter at 0 before any checkpoint:\n%s", out)
+	}
+	if ops.ObserveCheckpointOverwrite == nil {
+		t.Fatal("NewServer did not wire ops.ObserveCheckpointOverwrite")
+	}
+	ops.ObserveCheckpointOverwrite()
+	if out := scrape(); !strings.Contains(out, "offshoot_checkpoint_overwrite_detected_total 1") {
+		t.Fatalf("expected the overwrite counter at 1 after one detection:\n%s", out)
 	}
 }
 

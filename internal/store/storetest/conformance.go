@@ -74,6 +74,71 @@ func RunConformance(t *testing.T, keyPrefix string, newBackend func(t *testing.T
 		}
 	})
 
+	// Head is checked both through the backend's own Header capability
+	// (every shipped backend has one) and through Store.Head, which is what
+	// ops calls. ops compares a Head etag against the etag its own PutIf
+	// returned, so the two must be the same string for the same content.
+	heads := func(b store.Backend) map[string]func(string) (string, int64, error) {
+		m := map[string]func(string) (string, int64, error){"Store": (&store.Store{B: b}).Head}
+		if h, ok := b.(store.Header); ok {
+			m["Header"] = h.Head
+		}
+		return m
+	}
+
+	t.Run("HeadReturnsEtagAndSize", func(t *testing.T) {
+		b := newBackend(t)
+		payload := []byte("head-me-please")
+		etag, err := b.PutIf(k("data/head"), payload, "")
+		if err != nil {
+			t.Fatal(err)
+		}
+		for name, head := range heads(b) {
+			got, size, err := head(k("data/head"))
+			if err != nil {
+				t.Fatalf("%s: %v", name, err)
+			}
+			if got != etag {
+				t.Errorf("%s: Head etag %q != PutIf's returned etag %q", name, got, etag)
+			}
+			if size != int64(len(payload)) {
+				t.Errorf("%s: Head size %d, want %d", name, size, len(payload))
+			}
+		}
+	})
+
+	t.Run("HeadMissingIsErrNotFound", func(t *testing.T) {
+		b := newBackend(t)
+		for name, head := range heads(b) {
+			if _, _, err := head(k("data/no-such-object")); !errors.Is(err, store.ErrNotFound) {
+				t.Errorf("%s: want ErrNotFound, got %v", name, err)
+			}
+		}
+	})
+
+	t.Run("HeadEtagChangesWhenContentChanges", func(t *testing.T) {
+		b := newBackend(t)
+		first, err := b.PutIf(k("data/head-change"), []byte("first"), "")
+		if err != nil {
+			t.Fatal(err)
+		}
+		if err := b.Put(k("data/head-change"), []byte("second, longer")); err != nil {
+			t.Fatal(err)
+		}
+		for name, head := range heads(b) {
+			got, size, err := head(k("data/head-change"))
+			if err != nil {
+				t.Fatalf("%s: %v", name, err)
+			}
+			if got == first {
+				t.Errorf("%s: Head etag unchanged after the content was overwritten", name)
+			}
+			if size != int64(len("second, longer")) {
+				t.Errorf("%s: Head size %d, want %d", name, size, len("second, longer"))
+			}
+		}
+	})
+
 	t.Run("CreateOnlyRejectsExisting", func(t *testing.T) {
 		b := newBackend(t)
 		if _, err := b.PutIf(k("refs/a/main"), []byte("v1"), ""); err != nil {

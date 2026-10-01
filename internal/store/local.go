@@ -58,6 +58,16 @@ func (l *Local) Get(key string) ([]byte, string, error) {
 	return data, etagOf(data), nil
 }
 
+// Head implements store.Header. A local etag is a sha256 over the content
+// (etagOf), so Head reads the file to compute it, exactly as Get does.
+func (l *Local) Head(key string) (string, int64, error) {
+	data, etag, err := l.Get(key)
+	if err != nil {
+		return "", 0, err
+	}
+	return etag, int64(len(data)), nil
+}
+
 // GetReader implements store.ReaderGetter: it opens the file directly
 // rather than os.ReadFile-ing its full contents into memory (unlike Get),
 // so a caller applying a large object (e.g. a snapshot/segment during chain

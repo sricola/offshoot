@@ -24,19 +24,22 @@ riskier problem than the one offshoot solves
 are copy-on-write and near-free, so fork-per-writer is the intended
 pattern, not a workaround.
 
-**Do not run two at-rest `offshoot checkpoint` commands on one branch
-concurrently.** The at-rest path takes no lease (see
-[One daemon per store](#one-daemon-per-store)); two racers compute the same
-next txid, and when both choose the same kind (snapshot or segment) the
-loser of the ref CAS can overwrite the winner's object with different
+**Two at-rest `offshoot checkpoint` commands on one branch at once are
+detected and recovered, not prevented.** The at-rest path takes no lease
+(see [One daemon per store](#one-daemon-per-store)); two racers compute the
+same next txid, and when both choose the same kind (snapshot or segment)
+the loser of the ref CAS can overwrite the winner's object with different
 content if a write landed on the checkout between their two encodes. The
-shadow guard forces the next at-rest checkpoint to a snapshot, but a daemon
-session opened on that checkout trusts the checksum recorded in its
-sidecar and can write a segment that does not apply. Serialize at-rest
-checkpoints per branch (one agent, one CLI caller at a time); the fix —
-read the stored object's trailer checksum after winning the CAS and, on a
-mismatch, stamp no checksum and drop the shadow — is a
-[Tier 2 follow-up](../ROADMAP.md#copy-on-write-storage--the-storage-amplification-arc).
+winner checks its object after the CAS (one `HEAD`, compared with the etag
+its own upload returned; on a mismatch it reads the object's trailer
+checksum): if the content changed, it records no checksum for the checkout
+and drops its shadow, counts the event in
+`offshoot_checkpoint_overwrite_detected_total`, and the next checkpoint
+writes a full snapshot. Neither that checkpoint nor a daemon session opened
+on the checkout trusts content it did not write. The store still holds a
+valid checkpoint of the branch at that txid (the loser's encode); serializing
+at-rest checkpoints per branch remains the way to get exactly the content
+you checkpointed.
 
 ## One daemon per store
 

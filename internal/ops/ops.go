@@ -520,7 +520,8 @@ func (w *Workspace) CheckpointWith(db, branch, name string, meta map[string]stri
 		key = store.SnapshotKey(ref.Lineage, ref.Epoch, txid)
 	}
 	res.Bytes = int64(buf.Len())
-	if _, err := w.Store.B.PutIf(key, buf.Bytes(), ""); err != nil {
+	ownEtag, err := w.Store.B.PutIf(key, buf.Bytes(), "")
+	if err != nil {
 		if !errors.Is(err, store.ErrCAS) {
 			return CheckpointResult{}, err
 		}
@@ -541,6 +542,12 @@ func (w *Workspace) CheckpointWith(db, branch, name string, meta map[string]stri
 		// (snapshot or segment), so a racer that chose the other kind wrote
 		// a different key; both then race the same CAS below, and the
 		// loser's object is an orphan like any other.
+		//
+		// "Content-equivalent" holds only when nothing wrote to the checkout
+		// between the two encodes. When something did, whichever racer
+		// wins the CAS may find the other's content under its key; the
+		// post-CAS verifyOwnObject below detects exactly that. Put returns
+		// no etag, so ownEtag stays "" here and the check compares content.
 		if err := w.Store.B.Put(key, buf.Bytes()); err != nil {
 			return CheckpointResult{}, err
 		}
@@ -603,14 +610,61 @@ func (w *Workspace) CheckpointWith(db, branch, name string, meta map[string]stri
 	// identity, rather than claiming a commit that never landed. The same
 	// goes for the shadow: it is re-cloned only after the new stamp, which
 	// records no shadow until refreshShadow has one in place.
-	if err := writeSum(path, ref.Lineage, ref.HeadEpoch, txid, checksum, ""); err != nil {
+	//
+	// If a racing same-kind checkpoint replaced the object with different
+	// content (verifyOwnObject), the store holds a valid object of this
+	// branch at txid, but not one whose checksum we know: the stamp records
+	// none (0, "unknown" to every reader) and the shadow is dropped, so the
+	// next checkpoint writes a snapshot of whatever the checkout holds.
+	stamp := checksum
+	trusted := w.verifyOwnObject(key, ownEtag, checksum)
+	if !trusted {
+		stamp = 0
+	}
+	if err := writeSum(path, ref.Lineage, ref.HeadEpoch, txid, stamp, ""); err != nil {
 		return CheckpointResult{}, fmt.Errorf("ops: checkpoint %q committed (txid %d), but the checkout fingerprint could not be refreshed: %w", name, txid, err)
 	}
-	refreshShadow(path)
+	if trusted {
+		refreshShadow(path)
+	} else {
+		dropShadow(path)
+		if ObserveCheckpointOverwrite != nil {
+			ObserveCheckpointOverwrite()
+		}
+	}
 	if ObserveCheckpoint != nil {
 		ObserveCheckpoint(time.Since(start))
 	}
 	return res, nil
+}
+
+// verifyOwnObject reports whether the object at key, just committed by a
+// winning ref CAS, still holds content whose post-apply checksum is
+// checksum. A Head whose etag equals ownEtag (the etag our create-only put
+// returned) answers yes with one request. Otherwise — a rival's overwrite,
+// or our own unconditional overwrite, which returns no etag — the object is
+// fetched and its trailer compared: two encodes of the same checkout state
+// differ in bytes (an LTX header carries its encode time) but not in
+// checksum, so only a real content change answers no. An object that
+// cannot be read or decoded after an etag mismatch answers no as well:
+// distrusting costs one snapshot, trusting a wrong checksum costs a
+// session's correctness. A failing Head never fails the checkpoint: it is
+// logged and answers yes, as before this check existed.
+func (w *Workspace) verifyOwnObject(key, ownEtag string, checksum uint64) bool {
+	etag, _, err := w.Store.Head(key)
+	if err != nil {
+		fmt.Fprintf(os.Stderr, "offshoot: warning: could not verify checkpoint object %s after committing it (trusting it): %v\n", key, err)
+		return true
+	}
+	if ownEtag != "" && etag == ownEtag {
+		return true
+	}
+	data, _, err := w.Store.B.Get(key)
+	if err != nil {
+		return false
+	}
+	stored, err := ltxio.TrailerPostApplyChecksum(data)
+	return err == nil && stored == checksum
 }
 
 // snapshotMayExist reports whether a snapshot object may already sit at
@@ -843,6 +897,14 @@ var ObserveFork func(dur time.Duration, fast, shared bool)
 // reads as all-zero on a daemon that never gains a direct checkpoint op —
 // a known, documented gap, not a bug; see this task's report.
 var ObserveCheckpoint func(dur time.Duration)
+
+// ObserveCheckpointOverwrite, when non-nil, is invoked by CheckpointWith
+// each time its post-CAS check finds that the object it committed was
+// replaced, at its shared key, by a racing same-kind checkpoint's different
+// content (see verifyOwnObject). The checkpoint still succeeds; the daemon
+// feeds this into offshoot_checkpoint_overwrite_detected_total. Same
+// injection shape as ObserveFork.
+var ObserveCheckpointOverwrite func()
 
 // ObserveRollback and ObservePromote, when non-nil, are invoked once the
 // verb's ref CAS has landed (the repoint happened, whatever the checkout
