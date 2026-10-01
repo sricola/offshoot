@@ -232,16 +232,25 @@ jobs:
       - name: npm pack (the exact tarball a real publish would upload)
         run: cd sdk/typescript && npm pack --pack-destination dry-run-pack
 
-      - name: Install the packed tarball into a throwaway project and import-test it
+      - name: Unpack the tarball into a throwaway project and import-test it
         # Runs unconditionally — dry-run or real — same reasoning as the
         # PyPI job's install-test step above.
+        #
+        # The tarball is unpacked straight into node_modules rather than
+        # `npm install`ed: the package has no runtime dependencies, so
+        # resolution of `@offshoot-db/client` then exercises exactly what
+        # a consumer's install would (the tarball's `package/` layout, its
+        # `files` list and `exports` map) with no package manager in the
+        # loop, no lifecycle scripts, and no npm install of an unpinned
+        # artifact for Scorecard's Pinned-Dependencies check to flag.
+        # `tar -tzf` first, so a tarball that fails to list fails loud
+        # rather than extracting partially.
         run: |
-          mkdir -p sdk/typescript/dry-run-install
+          mkdir -p sdk/typescript/dry-run-install/node_modules/@offshoot-db/client
           cd sdk/typescript/dry-run-install
-          npm init -y --silent >/dev/null
-          # A local tarball built two steps up, not a registry download;
-          # --ignore-scripts so the install runs no lifecycle hooks.
-          npm install --no-audit --no-fund --silent --ignore-scripts ../dry-run-pack/offshoot-db-client-*.tgz
+          tarball=$(ls ../dry-run-pack/offshoot-db-client-*.tgz)
+          tar -tzf "$tarball" >/dev/null
+          tar -xzf "$tarball" --strip-components=1 -C node_modules/@offshoot-db/client
           node -e "import('@offshoot-db/client').then((m) => { if (typeof m.connect !== 'function') throw new Error('connect export missing from published package'); console.log('import @offshoot-db/client: ok'); })"
 
       - name: Publish to npm (provenance)
