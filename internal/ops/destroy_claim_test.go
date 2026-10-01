@@ -98,7 +98,10 @@ func TestConcurrentDestroyAndAcquireLeaseHaveExactlyOneWinner(t *testing.T) {
 // succeeding AFTER the Deleting claim landed. So the both-succeed case is
 // judged structurally, by the order in which the two ref writes reached the
 // backend: lease-then-claim is a sequential force destroy (fine);
-// claim-then-lease is the claim guard failing (fatal).
+// claim-then-lease is the claim guard failing (fatal). The accepted
+// both-succeed ordering is therefore exactly "lease:holder-b" before "claim"
+// in rec's ref-write log; with that judgment the test ran -count=200 (4000
+// races) green on macOS on 2026-10-01, closing the 2026-09-25 flake.
 func TestForceDestroyStillClaimGuards(t *testing.T) {
 	for i := 0; i < 20; i++ {
 		w := newWS(t)

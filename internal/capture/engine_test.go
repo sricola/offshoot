@@ -711,6 +711,23 @@ func TestEngineResumesCleanly(t *testing.T) {
 	go func() { done2 <- e2.Run(ctx2) }()
 	defer func() { cancel2(); <-done2 }()
 
+	// Wait for e2's startup resume-or-rebase verdict before writing. An
+	// INSERT that lands while tryResume is still checking WAL-emptiness and
+	// the main-file hash makes continuity unprovable, so e2 rebases — a
+	// correct reaction to a write during startup, but not the "no writes
+	// while dead" scenario this test asserts about (it flaked that way once
+	// on a loaded Linux runner, run 36708192769). WaitReady returns exactly
+	// once that verdict is final; see TestEngineTakeoverUnderConcurrentWrites
+	// (5a55fad) for the same wait-on-engine-state pattern.
+	rctx, rcancel := context.WithTimeout(context.Background(), 10*time.Second)
+	defer rcancel()
+	if err := e2.WaitReady(rctx); err != nil {
+		t.Fatalf("WaitReady: %v", err)
+	}
+	if !e2.Resumed() {
+		t.Fatalf("clean restart should resume, not rebase (rebased=%d)", e2.Rebased())
+	}
+
 	if out, err := exec.Command("sqlite3", src,
 		"PRAGMA busy_timeout=5000; INSERT INTO t (v) VALUES (randomblob(64));").CombinedOutput(); err != nil {
 		t.Fatalf("%v: %s", err, out)

@@ -646,13 +646,16 @@ func TestMustExecWaitsOutTransientLocks(t *testing.T) {
 // TestFlushIncludesEverythingCommittedBeforeIt hit intermittently
 // (renewals fire every LeaseTTL/3 = 10s there; its blocker-throttled
 // flushes run >6s). An aggressive 4ms heartbeat — orders of magnitude
-// faster than production's cadence, yet slow enough that Flush's bounded
-// benign-retry can't be exhausted even under race-detector slowdown —
-// makes that collision near-certain on every flush here (a flush's
-// GetRef→PutRef window spans tens of ms): all of them must still succeed,
+// faster than production's cadence — makes that collision near-certain on
+// every flush here (a flush's GetRef→PutRef window spans tens of ms, and
+// under race-detector slowdown on a loaded machine a single retry cycle
+// outlasts several heartbeats): all of them must still succeed,
 // because a CAS loss to a writer holding our own holder+epoch with the
 // head untouched is proof the premise didn't change — Flush reapplies onto
-// the fresh revision and retries instead of failing.
+// the fresh revision and retries instead of failing. That holds under load
+// only because the retry bound is a budget (flushCASMinAttempts retries OR
+// flushCASMinLeaseTTLs of wall time, see flush.go) rather than the fixed
+// count of 8 that flaked here on 2026-09-26.
 func TestFlushSurvivesOwnLeaseRenewalRace(t *testing.T) {
 	testutil.RequireSQLite3(t)
 	w := newWS(t)

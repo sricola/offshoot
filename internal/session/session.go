@@ -327,6 +327,11 @@ type Session struct {
 	flushesSinceSnapshot int
 	divergenceSeeded     bool
 
+	// leaseTTL is the resolved Options.LeaseTTL. Immutable after Open. Flush
+	// sizes the wall-time half of its ref-CAS retry budget in units of it
+	// (see flushCASMinLeaseTTLs in flush.go).
+	leaseTTL time.Duration
+
 	// flushMu serializes the entire body of Flush: two goroutines calling
 	// Flush concurrently would otherwise both read the same ref (same etag,
 	// same HeadTXID), compute the identical next txid, and race to write it —
@@ -458,6 +463,7 @@ func Open(ctx context.Context, o Options) (*Session, error) {
 		lease:                 lease,
 		pages:                 newPageSet(),
 		snapshotEvery:         o.SnapshotEvery,
+		leaseTTL:              o.LeaseTTL,
 		cleanAtOpen:           checkoutRes.Clean,
 		headPostApplyChecksum: checkoutRes.PostApplyChecksum,
 		headPostApplyValid:    checkoutRes.Clean && checkoutRes.PostApplyChecksum != 0,
