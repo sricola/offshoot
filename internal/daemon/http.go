@@ -32,6 +32,7 @@ import (
 	"os"
 	"strconv"
 	"strings"
+	"sync/atomic"
 	"time"
 )
 
@@ -144,6 +145,22 @@ var httpWriteTimeout time.Duration = 90 * time.Second
 // call could tear down this very connection before this response has
 // actually been written. Nil (the default) is a no-op in production.
 var httpShutdownRespondDelay func()
+
+// httpShutdownAfterTriggerDelay, when non-nil, is invoked by handleRPC for
+// a "shutdown" request after it has spawned Shutdown and before the handler
+// returns. It widens the window in which Shutdown's http.Server.Close()
+// runs while this handler is still live, which is the interleaving
+// TestHTTPShutdownResponseSurvivesCloseBeforeHandlerReturn forces: net/http
+// only hands a handler's buffered response to the connection when the
+// handler returns (finishRequest), so a response that was written but not
+// flushed before the trigger is lost when Close() wins. Nil in production.
+//
+// An atomic, unlike the plain-var hooks above, because a "shutdown"
+// handler goroutine from an EARLIER test can still be finishing (nothing
+// joins it) and reading this variable as nil while the next test stores
+// its hook: the race detector flags that pair even though the two never
+// observe each other's values.
+var httpShutdownAfterTriggerDelay atomic.Pointer[func()]
 
 // HTTPConfig configures StartHTTP.
 type HTTPConfig struct {
@@ -458,16 +475,24 @@ func (s *Server) checkAuth(r *http.Request) bool {
 //
 // The "shutdown" op gets the HTTP analog of handle's own fix (see that
 // function's doc comment and shutdownRespondDelay): dispatch runs, then
-// this response is fully WRITTEN — as a single w.Write of a pre-marshaled,
-// Content-Length-framed body, not a streamed json.Encoder+Flush (see
-// below for why that distinction is load-bearing) — and only THEN — never
-// before — does this handler trigger Shutdown (in a fresh goroutine,
-// exactly like handle does). Shutdown's eventual http.Server.Close() call
-// (see Shutdown's doc comment in server.go) can therefore never race ahead
-// of this response actually being written: by the time Close() runs, this
-// handler has already returned, and nothing about the response is still
-// "owed" at that point (see below) — so Close() tearing the connection
-// down cannot truncate it.
+// this response is fully WRITTEN AND FLUSHED — a single w.Write of a
+// pre-marshaled, Content-Length-framed body, not a streamed
+// json.Encoder+Flush (see below for why that distinction is load-bearing),
+// followed by an explicit Flush — and only THEN — never before — does this
+// handler trigger Shutdown (in a fresh goroutine, exactly like handle
+// does). The Flush is load-bearing too: net/http only hands a handler's
+// buffered response to the connection when the handler RETURNS
+// (finishRequest flushes the per-response and per-conn bufio.Writers),
+// and the `go s.Shutdown(...)` below runs BEFORE this handler returns, so
+// without it Shutdown's http.Server.Close() (see Shutdown's doc comment in
+// server.go) could, and on loaded Linux runners did, close this connection
+// with the whole response still in the buffer — the client then saw
+// `Post ...: EOF` before a single byte (2026-10-01, runs 36817109171 and
+// 36818434074; pinned by TestHTTPShutdownResponseSurvivesCloseBeforeHandlerReturn).
+// With the flush, the bytes are in the kernel's send buffer before Close()
+// can run, and nothing about the response is still "owed" at handler
+// return (see below), so Close() tearing the connection down cannot
+// truncate it.
 //
 // Content-Length framing, not chunked: an EARLIER version of this handler
 // wrote the response by streaming json.Encoder straight to w and then
@@ -550,9 +575,21 @@ func (s *Server) handleRPC(w http.ResponseWriter, r *http.Request) {
 		w.Header().Set("Content-Type", "application/json")
 		w.Header().Set("Content-Length", strconv.Itoa(len(body)))
 		_, _ = w.Write(body) // best-effort; see handle's identical reasoning in server.go
+		// Write only buffers: net/http hands a handler's response to the
+		// connection when the handler returns (finishRequest), which is
+		// AFTER the `go s.Shutdown` below. Flush here so the bytes are in
+		// the kernel's send buffer before Shutdown's http.Server.Close()
+		// can run; with Content-Length declared above this flushes a
+		// complete, non-chunked response.
+		if f, ok := w.(http.Flusher); ok {
+			f.Flush()
+		}
 	}
 	if req.Op == "shutdown" {
 		go s.Shutdown(context.Background())
+		if f := httpShutdownAfterTriggerDelay.Load(); f != nil {
+			(*f)() // test hook; nil (a no-op) in production
+		}
 	}
 }
 
