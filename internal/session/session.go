@@ -340,6 +340,10 @@ type Session struct {
 	// sizes the wall-time half of its ref-CAS retry budget in units of it
 	// (see flushCASMinLeaseTTLs in flush.go).
 	leaseTTL time.Duration
+	// renewEvery is the resolved Options.RenewEvery. Immutable after Open.
+	// Flush sizes the pause between its ref-CAS retries from it (see
+	// flushCASRetryPause in flush.go).
+	renewEvery time.Duration
 
 	// flushMu serializes the entire body of Flush: two goroutines calling
 	// Flush concurrently would otherwise both read the same ref (same etag,
@@ -473,6 +477,7 @@ func Open(ctx context.Context, o Options) (*Session, error) {
 		pages:                 newPageSet(),
 		snapshotEvery:         o.SnapshotEvery,
 		leaseTTL:              o.LeaseTTL,
+		renewEvery:            o.RenewEvery,
 		cleanAtOpen:           checkoutRes.Clean,
 		headPostApplyChecksum: checkoutRes.PostApplyChecksum,
 		headPostApplyValid:    checkoutRes.Clean && checkoutRes.PostApplyChecksum != 0,

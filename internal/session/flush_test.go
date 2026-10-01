@@ -2737,3 +2737,25 @@ func TestFencedSnapshotOrphanDoesNotShadowTheNextSessionsSegment(t *testing.T) {
 			out, err, out, txid)
 	}
 }
+
+// TestFlushCASRetryPauseIsBounded pins the retry backoff: a quarter of the
+// renewal period, capped at flushCASRetryPauseMax, within ±25%, and never
+// negative.
+func TestFlushCASRetryPauseIsBounded(t *testing.T) {
+	for _, tc := range []struct {
+		renewEvery time.Duration
+		base       time.Duration
+	}{
+		{0, 0},
+		{4 * time.Millisecond, time.Millisecond},
+		{40 * time.Millisecond, 10 * time.Millisecond},
+		{10 * time.Second, flushCASRetryPauseMax},
+	} {
+		lo, hi := tc.base-tc.base/4, tc.base+tc.base/4
+		for range 200 {
+			if got := flushCASRetryPause(tc.renewEvery); got < lo || got > hi {
+				t.Fatalf("flushCASRetryPause(%v) = %v, want within [%v, %v]", tc.renewEvery, got, lo, hi)
+			}
+		}
+	}
+}
