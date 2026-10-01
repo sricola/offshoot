@@ -333,12 +333,12 @@ open wart (its own spec said "N materialized forks cost up to N×G").
   against a reflinked shadow. ⏸ **Compact stays a copy**, by design —
   dropping the base pointer is what it is for.
 - ⏭ **Tier 2 follow-ups from that work** (none blocks v0.2.12):
-  - Route Rollback/Promote/Compact's local checkout refresh through the
+  - ✅ Route Rollback/Promote/Compact's local checkout refresh through the
     by-chain cache (`materializeFromChain`), so the local refresh is
     O(delta) like `checkout`, not a full decode.
   - ✅ Move `internal/ops/reflink` to `internal/reflink`: `internal/ltxio`
     imported it, a layering inversion.
-  - Pass the resolved chain members into `planSegment`, saving one Chain
+  - ✅ Pass the resolved chain members into `planSegment`, saving one Chain
     resolution per at-rest checkpoint.
   - ✅ Close the concurrent at-rest checkpoint race
     ([limitations](docs/limitations.md#one-writer-per-branch)): after
@@ -347,7 +347,25 @@ open wart (its own spec said "N materialized forks cost up to N×G").
     stamps `PostApplyChecksum=0`, drops the shadow and counts
     `offshoot_checkpoint_overwrite_detected_total`, so neither the next
     checkpoint nor a daemon session trusts content a same-kind loser
-    overwrote.
+    overwrote. The final review widened it: a segment winner also probes
+    for a racer's snapshot at its txid (which would anchor the head), a
+    write between encode and stamp is caught by fingerprint, and a
+    distrusted stamp records a hash no file matches, so the checkout reads
+    "modified" unless it provably equals the store's head.
+  - A third concurrent at-rest checkpoint that overwrites the object after
+    the winner's check is still unnoticed; closing it needs a lease (or a
+    create-only key per attempt) on the at-rest path.
+  - Normalize etags across providers before comparing them (strip quotes
+    and a weak `W/` prefix), so an S3-compatible provider that reformats
+    the etag between `PUT` and `HEAD` costs no needless `GET`.
+  - A Local `Head` that does not re-hash the whole object (for example a
+    cached digest keyed by size and mtime): today it reads the file to
+    compute the etag `PutIf` returned.
+  - A Dependabot `pip` entry for `requirements/`, so the hash-pinned CI
+    locks get update PRs like the Go modules and Actions do.
+  - Commit a 64 KiB-page, incompressible ltx v0.5.1 fixture beside the
+    4 KiB ones, so the pinned frame shape is tested at the largest page
+    size and at the LZ4 worst-case block.
 
 ## Launch track (parallel to v0.1–v0.3)
 

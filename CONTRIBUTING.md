@@ -46,10 +46,13 @@ go vet ./...
 
 ### Refreshing the hash-pinned CI requirements
 
-CI never runs a bare `pip install <package>`: every third-party Python
-package it installs comes from a hash-pinned lock under `requirements/`
+CI never names a third-party Python package on a `pip install` line: every
+one it installs directly comes from a hash-pinned lock under `requirements/`
 (`pip install --require-hashes -r requirements/<name>.txt`), and the repo's
-own packages install afterwards with `pip install --no-deps -e`. Each
+own packages install afterwards with `pip install --no-deps -e`. That
+does not cover build isolation: `pip install -e` and `python -m build`
+still fetch the build backend (setuptools) into an isolated environment
+without hashes. Each
 `.txt` is generated from the `.in` beside it, whose header names the exact
 command. To change a dependency (or pick up new releases), edit the `.in`
 and regenerate with [uv](https://docs.astral.sh/uv/):
