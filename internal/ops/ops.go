@@ -367,10 +367,10 @@ func (w *Workspace) CheckoutProven(db, branch string) (CheckoutResult, error) {
 // checksum and chainID (see materializeChainAt). It is a thin wrapper over
 // materializeChainAt (see materialize.go), which resolves the full
 // snapshot+segment chain rather than assuming cp's txid is itself a
-// snapshot: every caller here (Export, Rollback's refresh, Promote's
-// refresh, Compact's refresh) picks that up unchanged. CheckoutProven and
-// CheckoutAt resolve the chain themselves and go through
-// materializeFromChain (chainid.go) instead, to consult the by-chain cache.
+// snapshot; Export picks that up unchanged. CheckoutProven, CheckoutAt and
+// the Rollback/Promote/Compact refreshes (refreshFromChain) resolve the
+// chain themselves and go through materializeFromChain (chainid.go)
+// instead, to consult the by-chain cache.
 func (w *Workspace) materializeAt(ref store.Ref, cp store.Checkpoint, dst string) (postApply uint64, chainID string, err error) {
 	return w.materializeChainAt(ref, cp, dst)
 }
@@ -498,7 +498,16 @@ func (w *Workspace) CheckpointWith(db, branch, name string, meta map[string]stri
 	// or crash can leave the two side by side: a snapshot here takes the
 	// create-only put's overwrite path below instead. An error from the
 	// probe also answers "write a snapshot", which is always correct.
-	if d, ok := w.planSegment(path, ref, opts); ok && !w.snapshotMayExist(ref, txid) {
+	//
+	// The head's chain is resolved here, once, and only when a segment is
+	// locally possible (segmentShadow); planSegment uses this resolution
+	// and never re-resolves. A failed resolve leaves members nil, which
+	// planSegment answers with a snapshot.
+	var members []store.ChainMember
+	if _, _, ok := segmentShadow(path, ref, opts); ok {
+		members, _ = w.Store.Chain(ref.Lineage, ref.HeadTXID)
+	}
+	if d, ok := w.planSegment(path, ref, members, opts); ok && !w.snapshotMayExist(ref, txid) {
 		if err := ltxio.EncodeSegment(d.pageSize, d.commit, txid, txid, d.pre, d.post, d.pages, &buf); err != nil {
 			return CheckpointResult{}, err
 		}
@@ -1283,7 +1292,7 @@ func (w *Workspace) RollbackWith(db, branch, to string, opts RollbackOptions) (R
 		if err := os.MkdirAll(filepath.Dir(path), 0o755); err != nil {
 			return err
 		}
-		checksum, chain, err := w.materializeAt(next, headCheckpoint(next), path)
+		checksum, chain, err := w.refreshFromChain(db, next, path)
 		if err != nil {
 			return err
 		}
@@ -1512,7 +1521,7 @@ func (w *Workspace) PromoteWith(db, source, target string, opts PromoteOptions) 
 		if err := quiesce(path); err != nil {
 			return result, fmt.Errorf("ops: promoted, but checkout %s is in use and was NOT refreshed: %w", path, err)
 		}
-		checksum, chain, err := w.materializeAt(next, headCheckpoint(next), path)
+		checksum, chain, err := w.refreshFromChain(db, next, path)
 		if err != nil {
 			return result, fmt.Errorf("ops: promoted, but checkout %s could not be refreshed: %w", path, err)
 		}
@@ -1654,7 +1663,7 @@ func (w *Workspace) Compact(db, branch string) (uint64, error) {
 		if err := quiesce(path); err != nil {
 			return txid, fmt.Errorf("ops: compacted, but checkout %s is in use and was NOT refreshed: %w", path, err)
 		}
-		checksum, chain, err := w.materializeAt(next, headCheckpoint(next), path)
+		checksum, chain, err := w.refreshFromChain(db, next, path)
 		if err != nil {
 			return txid, fmt.Errorf("ops: compacted, but checkout %s could not be refreshed: %w", path, err)
 		}
