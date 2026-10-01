@@ -264,7 +264,9 @@ jobs:
       - name: Install offshoot-db[pytest] + pytest-xdist
         run: |
           python3 -m venv .venv-pytest-plugin
-          .venv-pytest-plugin/bin/pip install --quiet -e "sdk/python[pytest]" pytest-xdist
+          .venv-pytest-plugin/bin/pip install --quiet --require-hashes \
+            -r requirements/ci-pytest-plugin.txt
+          .venv-pytest-plugin/bin/pip install --quiet --no-deps -e sdk/python
 
       - name: make test-pytest-plugin
         run: PATH="$PWD/.venv-pytest-plugin/bin:$PATH" make test-pytest-plugin
@@ -279,8 +281,10 @@ jobs:
       - name: Install LangGraph companion test environment
         run: |
           python3 -m venv .venv-langgraph
-          .venv-langgraph/bin/pip install --quiet \
-            -e sdk/python -e "sdk/python-langgraph[test]"
+          .venv-langgraph/bin/pip install --quiet --require-hashes \
+            -r requirements/ci-langgraph.txt
+          .venv-langgraph/bin/pip install --quiet --no-deps \
+            -e sdk/python -e sdk/python-langgraph
 
       - name: make test-python-langgraph
         run: PATH="$PWD/.venv-langgraph/bin:$PATH" make test-python-langgraph
@@ -299,7 +303,7 @@ jobs:
       # jobs use actions/setup-python, which isn't externally managed and
       # doesn't need this flag).
       - name: Install SDK build/publish check tooling
-        run: python3 -m pip install --break-system-packages --quiet build twine
+        run: python3 -m pip install --break-system-packages --quiet --require-hashes -r requirements/ci-publish-tooling.txt
 
       - name: make dry-run-sdks
         run: make dry-run-sdks

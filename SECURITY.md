@@ -18,12 +18,14 @@ provenance, with no maintainer-held key involved. The identity to pin when
 verifying is the release workflow itself
 (`.github/workflows/release.yml` on `sricola/offshoot`), not a person. See
 the [installation page](docs/installation.md#verify-what-you-downloaded)
-for the exact verification commands.
+for the exact verification commands
+(<https://github.com/sricola/offshoot/blob/main/docs/installation.md#verify-what-you-downloaded>).
 
 ## Reporting a vulnerability
 
 **Do not open a public issue for a security report.** Use GitHub's private
-vulnerability reporting instead:
+vulnerability reporting instead, at
+<https://github.com/sricola/offshoot/security/advisories/new> — or by hand:
 
 1. Go to the repo's **Security** tab.
 2. Click **Report a vulnerability**.

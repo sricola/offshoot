@@ -1,0 +1,64 @@
+name: codeql
+
+# Static analysis (SAST) of the Go tree on every PR, every push to main and
+# weekly (new queries land in the CodeQL bundle between pushes). Results
+# go to the repo's code-scanning page; OpenSSF Scorecard's SAST check reads
+# these check-runs off merged PRs.
+#
+# No paths-ignore, unlike ci.yml: Scorecard counts a commit as SAST-checked
+# only if CodeQL actually ran on it, so a docs-only PR skipping this job
+# would read as an unchecked changeset. The job is a single build plus
+# analysis, so the cost of running it on prose PRs is small.
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+  schedule:
+    - cron: "23 5 * * 3"   # Wednesdays 05:23 UTC
+  workflow_dispatch:
+
+concurrency:
+  group: codeql-${{ github.ref }}
+  cancel-in-progress: true
+
+permissions:
+  contents: read
+
+jobs:
+  analyze:
+    name: Analyze (go)
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    permissions:
+      contents: read
+      security-events: write   # upload the SARIF to code scanning
+      actions: read            # read the workflow run for the upload's metadata
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+
+      - uses: actions/setup-go@b7ad1dad31e06c5925ef5d2fc7ad053ef454303e # v7.0.0
+        with:
+          go-version-file: go.mod
+
+      # SHA is the commit the annotated v4.38.2 tag points at (not the tag
+      # object), same pin as scorecard.yml's upload-sarif.
+      - uses: github/codeql-action/init@2892aa5e19bbd11bc0cff5427e3b750a04d9e3c2 # v4.38.2
+        with:
+          languages: go
+          build-mode: manual
+
+      # Manual build rather than autobuild: one explicit command, the same
+      # one a contributor runs. cgo is on (mattn/go-sqlite3 bundles the
+      # sqlite amalgamation, so ubuntu-latest's gcc is all it needs), which
+      # lets CodeQL trace the real build including the cgo-backed packages.
+      - name: go build
+        env:
+          CGO_ENABLED: "1"
+        run: go build ./...
+
+      - uses: github/codeql-action/analyze@2892aa5e19bbd11bc0cff5427e3b750a04d9e3c2 # v4.38.2
+        with:
+          category: "/language:go"

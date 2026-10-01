@@ -6,8 +6,12 @@
 # with cgo against glibc so it matches the runtime stage's glibc; runtime is
 # a slim Debian image with just the sqlite3 CLI and CA certs (needed for the
 # S3 backend's TLS calls) added on top.
+#
+# Both base images are pinned by digest (supply-chain: immune to tag
+# rewrites); the tag stays in the reference so Dependabot's `docker`
+# ecosystem (.github/dependabot.yml) can bump tag and digest together.
 
-FROM golang:1.26-bookworm AS build
+FROM golang:1.26-bookworm@sha256:a688600ca24f8a4d3ca77f95b0dd40704a9fc787c826660eb7ba0b641b8b175d AS build
 WORKDIR /src
 
 # Populate the module cache first so dependency downloads are cached
@@ -22,7 +26,7 @@ ENV CGO_ENABLED=1
 RUN go build -trimpath -ldflags "-s -w -X main.version=${VERSION}" \
     -o /out/offshoot ./cmd/offshoot
 
-FROM debian:bookworm-slim AS runtime
+FROM debian:bookworm-slim@sha256:3783cc01769c7b2b1b83a5c5ad96c815348e28ed7da68e2e3687004faa906251 AS runtime
 
 # sqlite3-tools carries sqldiff, which `offshoot diff` shells out to —
 # Debian packages it separately from the sqlite3 CLI (see

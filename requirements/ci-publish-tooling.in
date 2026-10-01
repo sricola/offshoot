@@ -1,0 +1,11 @@
+# Input for requirements/ci-publish-tooling.txt, the hash-pinned lock CI
+# installs with `pip install --require-hashes -r requirements/ci-publish-tooling.txt`.
+# Used by publish.yml (setup-python 3.12) and ci.yml's sdks job (ubuntu's
+# system python3).
+#
+# Regenerate the lock after editing this file (or to pick up new releases):
+#   uv pip compile --python-version 3.12 --generate-hashes --universal \
+#     -o requirements/ci-publish-tooling.txt requirements/ci-publish-tooling.in
+# See CONTRIBUTING.md "Refreshing the hash-pinned CI requirements".
+build
+twine

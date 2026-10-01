@@ -44,6 +44,30 @@ go build -o offshoot ./cmd/offshoot
 go vet ./...
 ```
 
+### Refreshing the hash-pinned CI requirements
+
+CI never runs a bare `pip install <package>`: every third-party Python
+package it installs comes from a hash-pinned lock under `requirements/`
+(`pip install --require-hashes -r requirements/<name>.txt`), and the repo's
+own packages install afterwards with `pip install --no-deps -e`. Each
+`.txt` is generated from the `.in` beside it, whose header names the exact
+command. To change a dependency (or pick up new releases), edit the `.in`
+and regenerate with [uv](https://docs.astral.sh/uv/):
+
+```
+uv pip compile --python-version 3.12 --generate-hashes --universal \
+  -o requirements/ci-langgraph.txt requirements/ci-langgraph.in
+```
+
+(same for `ci-pytest-plugin` and `ci-publish-tooling`). `--universal` keeps
+the markers valid for both CI interpreters (setup-python 3.12 and ubuntu's
+system python3). When an SDK's `pyproject.toml` changes its dependencies or
+test extras, update the matching `.in` in the same PR — CI installs the
+editable package with `--no-deps`, so a dependency missing from the lock
+fails the job instead of being fetched unpinned. The Dockerfile's base
+images are digest-pinned (`image:tag@sha256:...`) and Dependabot's `docker`
+ecosystem bumps them weekly.
+
 ## Test tiers
 
 There are seven, and they cost very different amounts of time. Run the tier

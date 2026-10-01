@@ -133,8 +133,10 @@ jobs:
         with:
           python-version: "3.12"
 
+      # Hash-pinned (requirements/ci-publish-tooling.in names the regenerate
+      # command): the publish job's build tooling is exactly what CI ran.
       - name: Install build tooling
-        run: python3 -m pip install --upgrade build twine
+        run: python3 -m pip install --require-hashes -r requirements/ci-publish-tooling.txt
 
       - name: Build sdist + wheel
         run: python3 -m build sdk/python
@@ -222,8 +224,10 @@ jobs:
           node-version: "22"
           registry-url: "https://registry.npmjs.org"
 
+      # npm ci installs exactly sdk/typescript/package-lock.json (integrity
+      # hashes included) and fails if it disagrees with package.json.
       - name: Install + build
-        run: cd sdk/typescript && npm install --no-audit --no-fund && npm run build
+        run: cd sdk/typescript && npm ci --no-audit --no-fund && npm run build
 
       - name: npm pack (the exact tarball a real publish would upload)
         run: cd sdk/typescript && npm pack --pack-destination dry-run-pack
@@ -235,7 +239,9 @@ jobs:
           mkdir -p sdk/typescript/dry-run-install
           cd sdk/typescript/dry-run-install
           npm init -y --silent >/dev/null
-          npm install --no-audit --no-fund --silent ../dry-run-pack/offshoot-db-client-*.tgz
+          # A local tarball built two steps up, not a registry download;
+          # --ignore-scripts so the install runs no lifecycle hooks.
+          npm install --no-audit --no-fund --silent --ignore-scripts ../dry-run-pack/offshoot-db-client-*.tgz
           node -e "import('@offshoot-db/client').then((m) => { if (typeof m.connect !== 'function') throw new Error('connect export missing from published package'); console.log('import @offshoot-db/client: ok'); })"
 
       - name: Publish to npm (provenance)
