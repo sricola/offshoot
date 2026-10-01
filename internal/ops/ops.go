@@ -182,8 +182,52 @@ func ParseTarget(s string) (string, string, error) {
 	return db, branch, nil
 }
 
+// underRoot joins elems under w.Root and asserts the result is still inside
+// it. It is the one containment check every name-derived local path goes
+// through (CheckoutPath, CheckoutAtPath, byChainPath; sidecar and shadow
+// paths are suffixes of those). The returned string is exactly
+// filepath.Join(w.Root, elems...): the check adds no normalization a
+// caller could observe.
+//
+// Every element reaching here is a literal, a hex digest, or a name that
+// has already passed store.ValidateName ([a-z0-9-_.], never "." or "..",
+// never containing ".." or a separator), so the check cannot fail for any
+// input the package admits. A failure therefore means a caller skipped
+// validation: a programming error that would otherwise read, write or
+// rename a file outside the workspace. Returning an error would invite a
+// caller to log it and carry on with a path it should never have built,
+// and none of the builders has an error return to carry one, so the
+// impossible case panics, loudly and at the point of the bypass, naming
+// the invariant that was broken.
+//
+// The check is strings.HasPrefix on the filepath.Clean-ed join, the form
+// static analysis (CodeQL go/path-injection) recognizes as a containment
+// barrier. A root of "." (or "") has no prefix to test, since Join drops
+// it, so there the equivalent check is filepath.IsLocal.
+func (w *Workspace) underRoot(elems ...string) string {
+	root := filepath.Clean(w.Root)
+	p := filepath.Clean(filepath.Join(append([]string{root}, elems...)...))
+	if root == "." {
+		if filepath.IsLocal(p) {
+			return p
+		}
+	} else {
+		prefix := root
+		if !strings.HasSuffix(prefix, string(filepath.Separator)) {
+			prefix += string(filepath.Separator)
+		}
+		if strings.HasPrefix(p, prefix) {
+			return p
+		}
+	}
+	panic(fmt.Sprintf("ops: path %q escapes workspace root %q: invariant violated: every element must be a name validated by store.ValidateName", p, w.Root))
+}
+
+// CheckoutPath is db@branch's writable checkout file. db and branch must
+// already have passed store.ValidateName; underRoot enforces that the
+// result stays under w.Root.
 func (w *Workspace) CheckoutPath(db, branch string) string {
-	return filepath.Join(w.Root, "checkouts", db, branch+".db")
+	return w.underRoot("checkouts", db, branch+".db")
 }
 
 // snapshotTo encodes dbPath (a quiesced SQLite file) as snapshot txid into a
