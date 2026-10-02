@@ -35,13 +35,18 @@ func TestUncarriedGrowthFailsTheSession(t *testing.T) {
 	if err := w.Create("app"); err != nil {
 		t.Fatal(err)
 	}
-	s, err := Open(context.Background(), Options{WS: w, DB: "app", Branch: "main"})
-	if err != nil {
-		t.Fatal(err)
-	}
-	defer s.Close()
-
+	// The stderr swap brackets the session's whole lifetime: its engine
+	// goroutine reads os.Stderr to log the fence, so swapping the global
+	// after Open (or restoring it before Close has joined the goroutines)
+	// is a data race the detector catches on a loaded runner.
+	var s *Session
 	captureStderr(t, func() {
+		var err error
+		s, err = Open(context.Background(), Options{WS: w, DB: "app", Branch: "main"})
+		if err != nil {
+			t.Fatal(err)
+		}
+		defer s.Close()
 		if out, err := sqlite3CLI(s.CheckoutPath(), "CREATE TABLE t (v); INSERT INTO t VALUES (1);").CombinedOutput(); err != nil {
 			t.Fatalf("%v: %s", err, out)
 		}

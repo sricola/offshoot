@@ -230,17 +230,19 @@ func TestSessionFencedTransitionIsLogged(t *testing.T) {
 	if err := w.Create("app"); err != nil {
 		t.Fatal(err)
 	}
-	s, err := Open(context.Background(), Options{WS: w, DB: "app", Branch: "main",
-		Holder: "session-a", LeaseTTL: time.Nanosecond})
-	if err != nil {
-		t.Fatal(err)
-	}
-	defer s.Close()
-	if _, err := w.AcquireLease("app", "main", "thief", ops.DefaultLeaseTTL); err != nil {
-		t.Fatal(err)
-	}
-
+	// Open and Close inside the capture: the session's goroutines log to
+	// os.Stderr, so the global must be swapped before they start and
+	// restored only after Close has joined them (a data race otherwise).
 	out := captureStderr(t, func() {
+		s, err := Open(context.Background(), Options{WS: w, DB: "app", Branch: "main",
+			Holder: "session-a", LeaseTTL: time.Nanosecond})
+		if err != nil {
+			t.Fatal(err)
+		}
+		defer s.Close()
+		if _, err := w.AcquireLease("app", "main", "thief", ops.DefaultLeaseTTL); err != nil {
+			t.Fatal(err)
+		}
 		if _, err := s.Flush("", nil); err == nil {
 			t.Fatal("Flush after fencing must fail")
 		}
