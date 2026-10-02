@@ -17,6 +17,14 @@ Pin an exact version if you depend on format stability. The full contract:
 
 ## [Unreleased]
 
+### Fixed
+
+- `gc` persisted its tombstone list with an unconditional write at the end
+  of a pass, so a concurrent GC or janitor pass's prunes and additions could
+  be clobbered, resurrecting an already-expired stone for a deleted key.
+  The final write is now a compare-and-swap of exactly the pass's own
+  removals, retried against the current list on a conflict.
+
 ### Added
 
 - `offshoot serve -token-file PATH` reads the HTTP bearer token from a file
