@@ -17,7 +17,99 @@ Pin an exact version if you depend on format stability. The full contract:
 
 ## [Unreleased]
 
-Nothing yet.
+Launch hardening. Every change below came out of a read-everything,
+run-everything review ahead of the first public announcement; the
+correctness items were reproduced before they were fixed.
+
+### Fixed
+
+- **An at-rest `checkpoint` of a detached checkout silently reverted a
+  promote, rollback or compact.** When a repoint could not refresh the
+  checkout (it was busy, or the process died between the ref update and
+  the refresh), the next `checkpoint` snapshotted the old content onto
+  the new lineage. It is now refused, naming `checkout`, `export` and
+  `--force` as the ways out.
+- **CLI `rollback`, `promote --onto`, `compact` and `checkpoint` ignored a
+  live lease.** A rollback of a branch a daemon session had open fenced
+  the session and discarded its unflushed writes. All four now refuse a
+  branch with a live lease unless `--force` (the rule `destroy` already
+  applied), and refuse a branch mid-destroy or mid-reap outright. A lease
+  on promote's source never blocks.
+- `checkout` warns before replacing a stale checkout that holds
+  un-checkpointed edits, by comparing the file with the hash its sidecar
+  recorded; a checkout with no readable sidecar warns that it cannot be
+  verified.
+- The MCP server told an agent to "use --force" on a protected branch and
+  then refused the forced retry. Every such refusal now says the server
+  does not honor force, not to retry, and the exact CLI command to ask the
+  human for. `offshoot_checkpoint` on a never-checked-out fork, a fork onto
+  an existing name, and any tool on a missing database return the next
+  tool call to make. MCP `initialize` reports the binary's version.
+- `offshoot --help` failed with "store: not found" in a directory with no
+  store, and after `init`, `create --help` created a database named
+  `--help` while `gc --help` ran GC. `help`, `--help`, `-h`, `help <cmd>`,
+  `<cmd> --help` and `--version` never open the store; names cannot start
+  with `-`.
+- "store: not found" and "compare-and-swap conflict: key exists" leaked to
+  users. Errors now say which database, branch or checkpoint is missing,
+  list a branch's own checkpoints when one is not found (and explain that
+  checkpoints belong to one branch), and say "already exists" for a
+  duplicate init, create or fork. S3 misconfiguration fails up front with
+  the variable to set, and the probe-cleanup warning no longer fires when
+  the probe's own put failed. `--ttl` and `--grace` errors name the flag
+  and value.
+- The promptfoo recipe used `require()` on an ESM-only package and could
+  not load; it is ESM now, and the TypeScript package also exports a
+  `default` condition. The pytest plugin's runtime hint no longer suggests
+  a PyPI install that does not exist. `examples/eval-pass-k` fails with
+  one line on Python < 3.10 instead of a traceback.
+
+### Changed
+
+- **Durability discipline on local stores.** Every rename into place (store
+  objects and refs, materialized checkouts, capture state) is followed by a
+  directory `fsync(2)` (plain, not macOS's `F_FULLFSYNC`), and `.sum`
+  sidecars are written atomically but not synced (they are a cache), so a
+  flushed state is designed to survive power loss and not only process
+  death. This is designed for, not torture-tested; the docs say so.
+- `create --from` imports through `VACUUM INTO` under one read transaction
+  and normalizes the copy to WAL mode, instead of copying the bytes of a
+  possibly live file.
+- The local store streams a put before taking its per-key lock and holds
+  the lock only around compare and rename, so a multi-GB snapshot can no
+  longer outlive the lock's 30 s stale-break horizon mid-write.
+- Local store and checkout directories are created `0700` (objects were
+  already `0600`); existing directories keep their mode.
+- `create` and `destroy` confirm what they did; `-store`/`--store`,
+  `--ttl`/`-ttl` and `--flag=value` all parse; TTL remaining is shown
+  rounded to seconds; `offshoot_list` rows carry `ttl` and `expires_at`.
+- Python `Client.fork(at=)` and TypeScript `ForkOptions.at` alias the
+  existing `from_checkpoint` / `from`; both `Session` types gain
+  `checkpoint()` as an alias of `flush()`.
+- Documentation: README rebuilt as a landing page; the "kill -9 durable"
+  wording is replaced everywhere by what is tested (a SIGKILLed writer
+  never diverges capture) with the flush window beside it; limitations no
+  longer claims that two nodes sharing a bucket cannot corrupt each other;
+  a "Recovering data without offshoot" section documents the store layout
+  and the upstream `ltx` rebuild path; SECURITY.md states the threat model
+  as enforced; internal plan documents and an unposted announcement draft
+  are no longer in the public tree.
+
+### Security
+
+- The release job holding the signing identity ran an unpinned
+  `go-licenses@latest` before signing the tarballs. License generation now
+  runs in a read-only job, pinned, and reaches the signing job as an
+  artifact. Releases are created as drafts and published only after the
+  Docker image is pushed, signed and attested; `:latest` moves in that
+  same final step; `workflow_dispatch` smoke builds create no public
+  release. A version-surface check refuses a tag whose manifests still
+  name the previous version.
+- Names read back from a store listing are re-validated before any path
+  or reaper sees them; one unix-socket connection may send at most 16 MiB
+  of requests; a plain-HTTP S3 endpoint on a non-loopback host prints a
+  warning. Dependabot covers the TypeScript lockfile and the hash-pinned
+  Python CI locks.
 
 ## [0.2.13] - 2026-10-02
 

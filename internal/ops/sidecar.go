@@ -240,7 +240,7 @@ func stampSumWithFingerprint(path, hash, lineage string, epoch, txid, postApplyC
 	if err != nil {
 		return err
 	}
-	return fsutil.WriteFileAtomic(path+".sum", data, 0o644)
+	return fsutil.ReplaceFileAtomic(path+".sum", data, 0o644)
 }
 
 // sumRecord is the on-disk shape of a checkout's .sum sidecar: a content hash
@@ -679,5 +679,5 @@ func setSidecarShadow(path string, on bool) error {
 	if err != nil {
 		return err
 	}
-	return fsutil.WriteFileAtomic(path+".sum", data, 0o644)
+	return fsutil.ReplaceFileAtomic(path+".sum", data, 0o644)
 }

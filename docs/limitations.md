@@ -240,9 +240,13 @@ exercised. A daemon that dies, however it dies, loses up to one
 ([the window](#durability-advances-on-flush-and-the-window-is-explicit)).
 No power-loss test exists either: since v0.2.14 every rename into place
 (local store objects and refs, materialized checkouts, capture state) is
-followed by a directory fsync and `.sum` sidecars are written atomically,
-so a local store is *designed* to keep what was flushed across power
-loss — but that design is not torture-tested.
+followed by a directory `fsync(2)` (the plain call, not macOS's
+`F_FULLFSYNC` disk-cache flush, which costs tens of milliseconds per
+rename and is not needed to order a name behind an already-synced file),
+and `.sum` sidecars are written atomically but not synced — they are a
+cache that a reader re-derives by hashing — so a local store is
+*designed* to keep what was flushed across power loss, but that design is
+not torture-tested.
 
 ## Lease expiry is advisory; the fence is the guarantee
 
