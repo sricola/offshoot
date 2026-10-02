@@ -43,6 +43,10 @@ import tempfile
 import time
 from pathlib import Path
 
+if sys.version_info < (3, 10):
+    sys.exit("examples/eval-pass-k needs Python 3.10+ (the SDK uses typing.TypeAlias); "
+             "run with PYTHON=python3.12 make example-pass-k")
+
 REPO = Path(__file__).resolve().parents[2]
 sys.path.insert(0, str(REPO / "sdk" / "python"))
 import offshoot  # noqa: E402  (must follow the sys.path insert above)

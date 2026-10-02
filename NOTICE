@@ -16,7 +16,6 @@ connection to prevent foreign checkpoints from restarting the WAL out from
 under an in-progress capture. offshoot's implementation was independently
 written against the public SQLite WAL file format and Litestream's
 published description of that approach; no Litestream source code was
-copied, vendored, or adapted into this repository. See
-docs/superpowers/plans/2026-07-29-offshoot-capture-spike.md and
-docs/superpowers/specs/2026-07-29-offshoot-spike-report.md for the
+copied, vendored, or adapted into this repository. See the "WAL capture
+and the connection contract" section of docs/architecture.md for the
 implementation record.

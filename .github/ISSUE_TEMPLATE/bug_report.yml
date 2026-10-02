@@ -5,7 +5,7 @@ body:
   - type: markdown
     attributes:
       value: |
-        offshoot is pre-alpha and single-maintainer — the more precise the
+        offshoot is pre-1.0 and single-maintainer — the more precise the
         repro, the faster this gets looked at. If this might be a data-loss,
         fencing, path-traversal, or credential-handling issue, please use
         private reporting instead (see SECURITY.md) rather than filing it
@@ -18,7 +18,7 @@ body:
         Output of `offshoot version`. If your build predates that command,
         paste `git rev-parse HEAD` (or the release tag) of the build you're
         running instead.
-      placeholder: "offshoot version 0.1.0 (abc1234)"
+      placeholder: "offshoot v0.2.13 go1.26.x darwin/arm64"
     validations:
       required: true
   - type: dropdown

@@ -2,6 +2,9 @@
 .github
 .superpowers
 bin/
+.offshoot/
+reports/
+research_notes/
 *.db
 *.db-wal
 *.db-shm

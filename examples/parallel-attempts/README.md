@@ -79,9 +79,3 @@ clean up (it runs entirely out of a temp directory).
   `main-pre-promote` fork before repointing (one per target, replaced by
   the next promote, 24h by default): the undo is `offshoot promote
   shop@main-pre-promote --onto main --force`, and `--no-backup` opts out.
-
-  If you want to keep a state around after a promote, it needs to live on a
-  branch of its own — which is exactly what step 2 above does, forking
-  `pre-migration` off the `before-migration` checkpoint *before* anything
-  gets promoted onto `main`. That fork has its own lineage, so it's
-  untouched by what promote does to `main`.

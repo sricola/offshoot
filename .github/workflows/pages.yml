@@ -14,20 +14,57 @@ on:
         "SECURITY.md",
         "ROADMAP.md",
       ]
+  # The same sources on a PR get a build-only run (the `build` job): the
+  # generator link-checks every intra-doc link and every docs/**/*.md must
+  # be wired into nav.go, so a broken docs change fails the PR instead of
+  # the deploy. ci.yml deliberately skips prose-only changes (its Go matrix
+  # bills real minutes for no signal there); this one ubuntu job is the
+  # docs-PR gate in its place.
+  pull_request:
+    paths:
+      [
+        "site/**",
+        ".github/workflows/pages.yml",
+        "docs/**",
+        "sdk/*/README.md",
+        "CHANGELOG.md",
+        "CONTRIBUTING.md",
+        "SECURITY.md",
+        "ROADMAP.md",
+      ]
   workflow_dispatch:
 
 permissions:
   contents: read
-  pages: write
-  id-token: write
 
 concurrency:
-  group: pages
+  # Deploys stay single-flight under one group; PR builds supersede only
+  # their own ref's earlier run.
+  group: ${{ github.event_name == 'pull_request' && format('pages-pr-{0}', github.ref) || 'pages' }}
   cancel-in-progress: true
 
 jobs:
-  deploy:
+  build:
+    if: github.event_name == 'pull_request'
     runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - uses: actions/setup-go@b7ad1dad31e06c5925ef5d2fc7ad053ef454303e # v7.0.0
+        with:
+          go-version-file: site/gen/go.mod
+      - name: Build docs site (link check + nav coverage, no deploy)
+        run: go -C site/gen run .
+
+  deploy:
+    if: github.event_name != 'pull_request'
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      pages: write
+      id-token: write
     environment:
       name: github-pages
       url: ${{ steps.deployment.outputs.page_url }}
