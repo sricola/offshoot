@@ -11,8 +11,8 @@
 class Offshoot < Formula
   desc "Branch SQLite like git: fork, checkpoint, rollback, promote"
   homepage "https://github.com/sricola/offshoot"
-  url "https://github.com/sricola/offshoot/archive/refs/tags/v0.2.13.tar.gz"
-  sha256 "63572b4aebdf9ac0275b5ea515b2d7f8894ce65c870bc264315270b10d5aba81"
+  url "https://github.com/sricola/offshoot/archive/refs/tags/v0.2.14.tar.gz"
+  sha256 "ed3039b17e07b8c9c885f0268c7b9b4aa9dd98cc81c897156530dc8d0ba1f241"
   license "Apache-2.0"
   head "https://github.com/sricola/offshoot.git", branch: "main"
 
