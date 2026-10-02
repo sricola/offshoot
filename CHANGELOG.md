@@ -27,6 +27,11 @@ Pin an exact version if you depend on format stability. The full contract:
 
 ### Added
 
+- `TestTortureCapturerKill`: a second torture harness that runs the capture
+  engine in a child process, `SIGKILL`s it mid-traffic every round, restarts
+  it on the same state and replica, and requires the replica to equal the
+  source after a graceful drain. Part of `make test-torture` and the nightly
+  torture job. The docs no longer say the capturer's crash is untested.
 - `offshoot serve -token-file PATH` reads the HTTP bearer token from a file
   (whitespace trimmed), so it never appears in `ps` the way `-token` does;
   precedence is `-token`, `-token-file`, `OFFSHOOT_TOKEN`. The recommended

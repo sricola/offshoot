@@ -90,9 +90,10 @@ func TestTortureWriterKill(t *testing.T) {
 		// path (final drain, verified-clean checkpoint attempt), NOT a
 		// process SIGKILL of the capturer — distinct from the real
 		// foreign-writer SIGKILLs above. A true capturer SIGKILL is
-		// argued-safe (see engine.go's shutdown()/tryResume() doc comments)
-		// but untested by this harness; see the spike report's "What was NOT
-		// proven" section. Wait for Run to return, then start a fresh Engine
+		// exercised by TestTortureCapturerKill (torture_capturer_test.go),
+		// which runs the engine in a child process and kills it; this
+		// harness keeps the graceful bounce so BOTH restart paths are
+		// covered. Wait for Run to return, then start a fresh Engine
 		// on the same StateDir/replica and keep going. This is Task 7's
 		// tryResume/rebase decision exercised under real torture-level
 		// concurrency: a bounce can land the capturer in a dirty
