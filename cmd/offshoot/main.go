@@ -119,8 +119,10 @@ Usage:
                                              starts an HTTP listener (POST /rpc, GET
                                              /metrics, GET /healthz, GET /debug/pprof/*,
                                              all but /healthz requiring "Authorization:
-                                             Bearer <token>"); off by default. -token
-                                             (or OFFSHOOT_TOKEN) sets the token; omitted,
+                                             Bearer <token>"); off by default. -token,
+                                             -token-file PATH (a file holding the token;
+                                             recommended, since a flag value shows in
+                                             ps) or OFFSHOOT_TOKEN sets the token; omitted,
                                              one is generated and printed ONCE to stderr
                                              (loopback binds only — treat that output as
                                              sensitive). -http-allow-non-loopback
@@ -1150,7 +1152,7 @@ func run(args []string) error {
 		return srv.Serve(ctx)
 	case "serve":
 		const serveUsage = "usage: offshoot serve [-socket PATH] [-reap-every DURATION] [-gc-grace DURATION] " +
-			"[-flush-every DURATION] [-snapshot-every N] [-ro-cache-budget BYTES] [-http ADDR] [-token TOKEN] [-http-allow-non-loopback]"
+			"[-flush-every DURATION] [-snapshot-every N] [-ro-cache-budget BYTES] [-http ADDR] [-token TOKEN | -token-file PATH] [-http-allow-non-loopback]"
 		sock, rest, err := socketOverride(rest)
 		if err != nil {
 			return fmt.Errorf("%s: %w", serveUsage, err)
@@ -1224,6 +1226,10 @@ func run(args []string) error {
 		if err != nil {
 			return err
 		}
+		tokenFile, rest, _, err := extractFlag(rest, "-token-file")
+		if err != nil {
+			return err
+		}
 		allowNonLoopback, rest := extractBoolFlag(rest, "-http-allow-non-loopback")
 		if len(rest) != 0 {
 			return errors.New(serveUsage)
@@ -1238,6 +1244,9 @@ func run(args []string) error {
 			if tokenFlag != "" {
 				return fmt.Errorf("-token given without -http; it has no effect unless -http ADDR is also set")
 			}
+			if tokenFile != "" {
+				return fmt.Errorf("-token-file given without -http; it has no effect unless -http ADDR is also set")
+			}
 			if allowNonLoopback {
 				return fmt.Errorf("-http-allow-non-loopback given without -http; it has no effect unless -http ADDR is also set")
 			}
@@ -1250,7 +1259,24 @@ func run(args []string) error {
 		// -token, then OFFSHOOT_TOKEN, else auto-generated (loopback binds
 		// only — see daemon.ValidateHTTPBind, called both here and again,
 		// defensively, inside StartHTTP itself).
+		if tokenFlag != "" && tokenFile != "" {
+			return fmt.Errorf("-token and -token-file are mutually exclusive")
+		}
+		// Token precedence: -token, then -token-file, then OFFSHOOT_TOKEN,
+		// else auto-generated. -token-file is the recommended form for a
+		// non-loopback bind: a flag value is visible to every local user in
+		// `ps`, while a 0600 file is not.
 		token := tokenFlag
+		if token == "" && tokenFile != "" {
+			b, err := os.ReadFile(tokenFile)
+			if err != nil {
+				return fmt.Errorf("-token-file %s: %w", tokenFile, err)
+			}
+			token = strings.TrimSpace(string(b))
+			if token == "" {
+				return fmt.Errorf("-token-file %s is empty", tokenFile)
+			}
+		}
 		if token == "" {
 			token = os.Getenv("OFFSHOOT_TOKEN")
 		}

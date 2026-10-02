@@ -482,14 +482,16 @@ printed to stderr exactly once, and that includes your terminal scrollback
 and shell history if you didn't redirect it — treat that moment, not just
 the process's ongoing logs, as the sensitive one.
 
-**Prefer `OFFSHOOT_TOKEN` over `-token` on a shared host.** `-token TOKEN`
-on the command line is visible to any other user on the host via `ps`
-(process argument lists are not private) for as long as the daemon runs;
-`OFFSHOOT_TOKEN=... offshoot serve ...` is not — environment variables set
-this way aren't listed in `ps` output the same way. This is a minor but real
-gap between the two equivalent-looking ways to set the same token; the
-environment variable is the better default on any host you don't fully
-control.
+**Prefer `-token-file` (or `OFFSHOOT_TOKEN`) over `-token` on a shared
+host.** `-token TOKEN` on the command line is visible to any other user on
+the host via `ps` (process argument lists are not private) for as long as
+the daemon runs. `-token-file PATH` reads the token (surrounding whitespace
+trimmed) from a file you can keep at mode `0600`, and is the recommended
+form for a non-loopback bind; `OFFSHOOT_TOKEN=... offshoot serve ...` is the
+equivalent for environments that inject secrets as variables. Precedence
+when more than one is set: `-token`, then `-token-file`, then
+`OFFSHOOT_TOKEN`; `-token` and `-token-file` together are refused as a
+contradiction. All three are subject to the same 16-character minimum.
 
 **Every route but `GET /healthz` requires `Authorization: Bearer
 <token>`**, including `GET /debug/pprof/*` — the highest-value 3am

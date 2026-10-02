@@ -66,7 +66,7 @@ file, IAM role).
 | `OFFSHOOT_STORE` | Default store spec when `-store` isn't passed |
 | `OFFSHOOT_CHECKOUTS` | Where checkouts are materialized, for a *remote* (`s3://`) store; local stores always keep checkouts under the store directory itself. Defaults to a per-store directory under the user cache dir, keyed by the store's resolved identity (endpoint/region/path-style included, not just the literal spec string) |
 | `OFFSHOOT_SOCKET` | Overrides the daemon socket path for `offshoot serve`, `offshoot session ...`, and `offshoot mcp`; if unset, all three derive the same default path from the store spec, so they agree without it |
-| `OFFSHOOT_TOKEN` | The Bearer token for `offshoot serve -http`, in place of `-token`; see [`-http ADDR`](#-http-addr--opt-in-http-listener) below |
+| `OFFSHOOT_TOKEN` | The Bearer token for `offshoot serve -http`, in place of `-token` or `-token-file`; see [`-http ADDR`](#-http-addr--opt-in-http-listener) below |
 
 **Naming rules**, enforced on every database name, branch name, and
 checkpoint name: 1–128 characters, charset `[a-z0-9-_.]`, never starting
@@ -1213,7 +1213,7 @@ reference.
 | `GET` | `/events` | Bearer | Server-Sent Events: the daemon's event stream (see [Eventing](#eventing-subscribe-op--get-events) below) |
 | `GET` | `/debug/pprof/*` | Bearer | `net/http/pprof`'s standard handlers (index, cmdline, profile, symbol, trace) |
 
-**Token:** `-token TOKEN` or `OFFSHOOT_TOKEN` sets it explicitly — an
+**Token:** `-token TOKEN`, `-token-file PATH` (the token read from a file, whitespace trimmed; the form to use on a shared host, since a flag value shows in `ps`) or `OFFSHOOT_TOKEN` sets it explicitly, in that order of precedence — an
 explicit token shorter than **16 characters is a startup error** (a
 too-short bearer token is guessable; generate a real one). If
 neither is given, one is generated and printed to stderr **exactly once**

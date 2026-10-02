@@ -156,3 +156,44 @@ func TestCreateAndDestroyReportWhatTheyDid(t *testing.T) {
 		t.Fatalf("destroy output %q", out)
 	}
 }
+
+// TestServeTokenFile: -token-file reads the HTTP token from a file (so it
+// never appears in ps), trimmed; an empty or missing file, -token together
+// with -token-file, and -token-file without -http are all startup errors.
+func TestServeTokenFile(t *testing.T) {
+	dir := filepath.Join(t.TempDir(), "s")
+	call(t, dir, "init")
+	tf := filepath.Join(t.TempDir(), "token")
+	if err := os.WriteFile(tf, []byte("  file-token-value-0123456789  \n"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	cases := []struct {
+		args []string
+		want string
+	}{
+		{[]string{"serve", "-token-file", tf}, "-token-file given without -http"},
+		{[]string{"serve", "-http", "127.0.0.1:0", "-token", "some-token-value-0123456789", "-token-file", tf}, "mutually exclusive"},
+		{[]string{"serve", "-http", "127.0.0.1:0", "-token-file", filepath.Join(t.TempDir(), "missing")}, "-token-file"},
+	}
+	for _, c := range cases {
+		_, err := callErr(t, dir, c.args...)
+		if err == nil || !strings.Contains(err.Error(), c.want) {
+			t.Errorf("offshoot %v: got %v, want it to contain %q", c.args, err, c.want)
+		}
+	}
+	empty := filepath.Join(t.TempDir(), "empty")
+	if err := os.WriteFile(empty, []byte("\n"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := callErr(t, dir, "serve", "-http", "127.0.0.1:0", "-token-file", empty); err == nil || !strings.Contains(err.Error(), "is empty") {
+		t.Fatalf("empty token file: got %v", err)
+	}
+	// A short token in the file hits the same 16-character floor as -token.
+	short := filepath.Join(t.TempDir(), "short")
+	if err := os.WriteFile(short, []byte("short\n"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := callErr(t, dir, "serve", "-http", "127.0.0.1:0", "-token-file", short); err == nil || !strings.Contains(err.Error(), "16") {
+		t.Fatalf("short token in file: got %v, want the 16-character refusal", err)
+	}
+}

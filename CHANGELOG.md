@@ -17,7 +17,12 @@ Pin an exact version if you depend on format stability. The full contract:
 
 ## [Unreleased]
 
-Nothing yet.
+### Added
+
+- `offshoot serve -token-file PATH` reads the HTTP bearer token from a file
+  (whitespace trimmed), so it never appears in `ps` the way `-token` does;
+  precedence is `-token`, `-token-file`, `OFFSHOOT_TOKEN`. The recommended
+  form for a non-loopback bind.
 
 ## [0.2.14] - 2026-10-02
 
