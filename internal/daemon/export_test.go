@@ -112,8 +112,11 @@ func TestOpExportMissesUnflushedSessionWrites(t *testing.T) {
 	t.Cleanup(func() { call(t, sock, Request{Op: "close", DB: "app", Branch: "main"}) })
 
 	// Write through the LIVE session's checkout, deliberately never flushed.
+	// busy_timeout: the session's capture engine checkpoints the WAL at
+	// startup, and a CLI write landing inside that window gets SQLITE_BUSY
+	// immediately without one (seen once on a loaded runner).
 	if out, err := exec.Command("sqlite3", open.Checkout,
-		"INSERT INTO t VALUES ('unflushed');").CombinedOutput(); err != nil {
+		"PRAGMA busy_timeout=5000; INSERT INTO t VALUES ('unflushed');").CombinedOutput(); err != nil {
 		t.Fatalf("%v: %s", err, out)
 	}
 
