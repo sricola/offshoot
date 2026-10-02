@@ -17,6 +17,15 @@ Pin an exact version if you depend on format stability. The full contract:
 
 ## [Unreleased]
 
+Nothing yet.
+
+## [0.2.15] - 2026-10-02
+
+Post-launch hardening: one concurrency fix in `gc`, a token-file flag for
+`serve`, and two gaps in what the test suite proves closed (the Linux
+reflink path now runs nightly on XFS; the capture engine is now
+`SIGKILL`ed, not just bounced, in the torture harness).
+
 ### Fixed
 
 - `gc` persisted its tombstone list with an unconditional write at the end

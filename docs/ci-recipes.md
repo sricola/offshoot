@@ -63,7 +63,7 @@ env:
   #   OFFSHOOT_S3_ENDPOINT: https://objects.internal:9000
   #   OFFSHOOT_S3_PATH_STYLE: "1"     # local S3-compatible servers need path-style
   DB: evals-${{ github.run_id }}
-  OFFSHOOT_VERSION: v0.2.14
+  OFFSHOOT_VERSION: v0.2.15
 
 jobs:
   seed:
@@ -215,7 +215,7 @@ jobs:
       AWS_ACCESS_KEY_ID: ${{ secrets.AWS_ACCESS_KEY_ID }}
       AWS_SECRET_ACCESS_KEY: ${{ secrets.AWS_SECRET_ACCESS_KEY }}
       AWS_REGION: us-east-1
-      OFFSHOOT_VERSION: v0.2.14
+      OFFSHOOT_VERSION: v0.2.15
     steps:
       - name: Install offshoot
         run: |
