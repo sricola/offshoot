@@ -150,6 +150,58 @@ jobs:
   # The full macOS test suite (the coverage removed from ci.yml's per-push
   # matrix, where its 10x billing dominated the Actions bill): weekly
   # Sunday leg and manual dispatch only (activity's weekly output).
+  # Linux reflink: the copy-on-write fast paths (by-chain clones, checkpoint
+  # shadows, segment checkpoints) run on APFS in ci.yml's cow-paths job and
+  # nowhere else; Linux FICLONE (btrfs, XFS with reflink) was supported but
+  # never exercised. ubuntu-latest's root filesystem cannot clone, so this
+  # job builds a loopback XFS image with reflink=1, points TMPDIR at it, and
+  # applies the same probe gate: if the clone probe skips, the job fails
+  # rather than passing on skips. Also runnable by workflow_dispatch on any
+  # branch, so a change to this job can be proven before it lands on main.
+  linux-reflink:
+    needs: activity
+    if: ${{ !cancelled() && ((github.ref == 'refs/heads/main' && needs.activity.outputs.fresh == 'true') || github.event_name == 'workflow_dispatch') }}
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+
+      - uses: actions/setup-go@b7ad1dad31e06c5925ef5d2fc7ad053ef454303e # v7.0.0
+        with:
+          go-version-file: go.mod
+
+      - uses: ./.github/actions/setup-sqlite
+
+      - name: Mount a loopback XFS filesystem with reflink enabled
+        run: |
+          set -euo pipefail
+          sudo apt-get update -qq && sudo apt-get install -y -qq xfsprogs >/dev/null
+          truncate -s 8G /tmp/xfs-reflink.img
+          mkfs.xfs -q -m reflink=1 /tmp/xfs-reflink.img
+          sudo mkdir -p /mnt/xfs
+          sudo mount -o loop /tmp/xfs-reflink.img /mnt/xfs
+          sudo chown "$(id -u):$(id -g)" /mnt/xfs
+          mkdir -p /mnt/xfs/tmp
+          echo "TMPDIR=/mnt/xfs/tmp" >> "$GITHUB_ENV"
+          df -hT /mnt/xfs
+
+      - name: Verify the mount clones (FICLONE)
+        run: |
+          set -o pipefail
+          go test ./internal/reflink -run '^TestCloneProducesIdenticalFile$' -count=1 -v | tee reflink-probe.txt
+          if grep -q -- '--- SKIP' reflink-probe.txt; then
+            echo "TMPDIR cannot clone on this mount; the copy-on-write tests would all skip" >&2
+            exit 1
+          fi
+
+      - name: go test (copy-on-write paths, Linux reflink)
+        run: go test ./internal/ops ./internal/ltxio ./internal/reflink -count=1
+
+      - name: go test (copy-on-write session opens, Linux reflink)
+        run: go test ./internal/session -run '^(TestOpenOnClonedCheckoutSkipsSettlingFlush|TestAtRestCheckpointAfterCloseWritesASegment)$' -count=1 -v
+
   macos-test:
     needs: activity
     if: github.ref == 'refs/heads/main' && needs.activity.outputs.fresh == 'true' && needs.activity.outputs.weekly == 'true'
