@@ -239,7 +239,7 @@ func (t *OffshootTools) refuseIfSessionOpen(db, branch, opName string) (ToolResu
 // have succeeded (e.g. a transient blip that clears) — the real error
 // (including "no such branch") still surfaces from the downstream ops call,
 // same as before this gate existed, just never with force intact.
-func (t *OffshootTools) refuseForceOnProtected(db, branch string, force bool) (res ToolResult, refused bool, effectiveForce bool) {
+func (t *OffshootTools) refuseForceOnProtected(db, branch string, force bool, cliCmd string) (res ToolResult, refused bool, effectiveForce bool) {
 	if !force || t.allowForce {
 		return ToolResult{}, false, force
 	}
@@ -248,28 +248,70 @@ func (t *OffshootTools) refuseForceOnProtected(db, branch string, force bool) (r
 		return ToolResult{}, false, false
 	}
 	if ref.Protected {
-		return ErrorResult("%s@%s is protected and this MCP server does not allow force "+
-			"(start it with `offshoot mcp -allow-force` to permit it). Ask the human to "+
-			"promote/destroy from the CLI, or work on a fork.", db, branch), true, false
+		return ErrorResult("%s", protectedRefusal(db, branch, cliCmd)), true, false
 	}
 	return ToolResult{}, false, false
 }
 
-// wrapForceRefusal rewraps an ops error that asked for "--force" (the
+// protectedRefusal is the one text an agent sees whenever a protected
+// db@branch refuses a promote/destroy through a server that was not
+// started with -allow-force — whether or not the call passed force. It
+// must never say "use --force": the only lever that works is the human's
+// CLI (cliCmd is that exact command), and telling the agent to retry with
+// force:true would cost a guaranteed wasted round trip against the
+// -allow-force gate.
+func protectedRefusal(db, branch, cliCmd string) string {
+	return fmt.Sprintf("%s@%s is protected. This MCP server does not honor force (operator flag: "+
+		"offshoot mcp -allow-force), so do not retry with force:true. Ask the human to run `%s`, "+
+		"or keep working on the fork.", db, branch, cliCmd)
+}
+
+// rewrapForceRefusal rewraps an ops error that asked for "--force" (the
 // protected-branch and, for destroy, live-lease checks in internal/ops both
 // phrase their refusal that way — see gc.go's Destroy and ops.go's
 // PromoteWith) into one that points at the actual lever an MCP agent has:
-// -allow-force on this server, not `force` on the call (refuseForceOnProtected
-// already downgrades `force` to false whenever this server wasn't started
-// with -allow-force, so a raw "use --force" from ops would otherwise read as
-// a lie — the agent DID pass force:true). Called only when the caller asked
-// for force but this server isn't honoring it; every other ops error passes
-// through untouched.
-func wrapForceRefusal(err error, force, allowForce bool) error {
-	if err == nil || !force || allowForce || !strings.Contains(err.Error(), "use --force") {
+// -allow-force on this server, not `force` on the call. It applies whenever
+// this server isn't honoring force, forced call or not: an unforced call
+// that was handed ops' raw "use --force" would retry with force:true and
+// be refused again by refuseForceOnProtected. A protected refusal becomes
+// protectedRefusal; any other "--force" refusal (destroy's live lease) is
+// kept, minus the --force advice. With -allow-force, and for every other
+// ops error, err passes through untouched.
+func (t *OffshootTools) rewrapForceRefusal(err error, db, branch, cliCmd string) error {
+	if err == nil || t.allowForce || !strings.Contains(err.Error(), "use --force") {
 		return err
 	}
-	return fmt.Errorf("%v — force through this MCP server needs `offshoot mcp -allow-force`; ask the human", err)
+	if strings.Contains(err.Error(), "is protected") {
+		return errors.New(protectedRefusal(db, branch, cliCmd))
+	}
+	msg := strings.Replace(err.Error(), "; use --force", "", 1)
+	return fmt.Errorf("%s. This MCP server does not honor force (operator flag: offshoot mcp -allow-force), "+
+		"so do not retry with force:true; ask the human to run `%s`", msg, cliCmd)
+}
+
+// agentNextStep rewrites the ops errors an agent most often hits into the
+// next tool call to make, instead of the CLI-shaped advice ops attaches.
+// Every other error passes through untouched.
+func agentNextStep(err error, db string) error {
+	if err == nil {
+		return err
+	}
+	if errors.Is(err, store.ErrNotFound) && strings.Contains(err.Error(), "no database \"") {
+		return fmt.Errorf("no database %q; call offshoot_list to see what exists (databases are created "+
+			"with the CLI: offshoot create <name>).", db)
+	}
+	return err
+}
+
+// forkErrorResult turns fork's ops/daemon error into the agent's next step:
+// a name collision names the two ways out, anything else goes through
+// agentNextStep.
+func forkErrorResult(err error, db, newBranch string) ToolResult {
+	if strings.Contains(err.Error(), "already exists") {
+		return ErrorResult("branch %s@%s already exists; choose another new_branch, or offshoot_destroy it first.",
+			db, newBranch)
+	}
+	return ErrorResult("%v", agentNextStep(err, db))
 }
 
 // guardProtectedSafetyFork refuses destroying db@branch, changing its TTL,
@@ -427,8 +469,8 @@ func (t *OffshootTools) Tools() []Tool {
 		{
 			Name: "offshoot_list",
 			Description: "List every database and branch offshoot is tracking, with each " +
-				"branch's head transaction id, named checkpoints, and whether it is " +
-				"protected. Call this first to orient yourself: to see what databases " +
+				"branch's head transaction id, named checkpoints, whether it is " +
+				"protected, and, for TTL'd forks, when each expires. Call this first to orient yourself: to see what databases " +
 				"exist, what branches an attempt could fork from, or which checkpoints " +
 				"are available to roll back to or fork from.",
 			InputSchema: schema(),
@@ -462,7 +504,8 @@ func (t *OffshootTools) Tools() []Tool {
 				"full snapshot (the result's `kind` says which). " +
 				"`branch` defaults to \"main\" if omitted. Optional `meta` " +
 				"(string->string, at most 32 keys) tags the result with your run id, " +
-				"git SHA, or agent name for later lookup.",
+				"git SHA, or agent name for later lookup. At rest (no daemon session), the " +
+				"branch must have been materialized with offshoot_checkout first.",
 			InputSchema: schema(reqStr("database"), reqStr("name"), optStrDefault("branch", "main"),
 				optMeta("meta")),
 			Annotations: annotate("Checkpoint a branch", false, false, false),
@@ -511,7 +554,10 @@ func (t *OffshootTools) Tools() []Tool {
 		},
 		{
 			Name: "offshoot_promote",
-			Description: "Ship a winning attempt: repoint the target branch (often `main`) " +
+			Description: "Protected branches (main by default) refuse this; force is also refused " +
+				"unless the operator started the server with -allow-force, so never retry with " +
+				"force — ask the human. " +
+				"Ship a winning attempt: repoint the target branch (often `main`) " +
 				"at the source branch's current head, which resets the target's " +
 				"checkpoint history to just the new promote checkpoint. The target's " +
 				"previous head is kept first as a shared safety fork named " +
@@ -540,7 +586,10 @@ func (t *OffshootTools) Tools() []Tool {
 		},
 		{
 			Name: "offshoot_destroy",
-			Description: "Permanently discard a branch and its checkout. Call this to " +
+			Description: "Protected branches (main by default) refuse this; force is also refused " +
+				"unless the operator started the server with -allow-force, so never retry with " +
+				"force — ask the human. " +
+				"Permanently discard a branch and its checkout. Call this to " +
 				"clean up a failed or abandoned attempt once you're done with it. " +
 				"`force` is honored only when the server was started with -allow-force; " +
 				"otherwise a protected branch or a live lease refuses and the answer is to " +
@@ -672,13 +721,28 @@ func (t *OffshootTools) list(args json.RawMessage) (ToolResult, error) {
 	var b []byte
 	rows := make([]map[string]any, 0, len(statuses))
 	for _, s := range statuses {
-		line := fmt.Sprintf("%s@%s head=%d checkpoints=%v protected=%v checked_out=%v\n",
+		line := fmt.Sprintf("%s@%s head=%d checkpoints=%v protected=%v checked_out=%v",
 			s.DB, s.Branch, s.HeadTXID, s.Checkpoints, s.Protected, s.CheckedOut)
-		b = append(b, line...)
-		rows = append(rows, map[string]any{
+		row := map[string]any{
 			"database": s.DB, "branch": s.Branch, "head_txid": s.HeadTXID,
 			"checkpoints": s.Checkpoints, "protected": s.Protected, "checked_out": s.CheckedOut,
-		})
+		}
+		// A TTL'd branch also reports its TTL and, when ops.ReapDeadline can
+		// compute one from the ref's activity clock, the RFC3339 moment it
+		// becomes reap-eligible; both are omitted for branches without a TTL.
+		if s.TTL != "" {
+			row["ttl"] = s.TTL
+			line += " ttl=" + s.TTL
+			if ref, _, err := t.ws.Store.GetRef(s.DB, s.Branch); err == nil {
+				if deadline, ok := ops.ReapDeadline(ref); ok {
+					expiresAt := deadline.Format(time.RFC3339)
+					row["expires_at"] = expiresAt
+					line += " expires_at=" + expiresAt
+				}
+			}
+		}
+		b = append(b, line+"\n"...)
+		rows = append(rows, row)
 	}
 	return StructuredResult(map[string]any{"branches": rows}, "%s", string(b)), nil
 }
@@ -733,7 +797,7 @@ func (t *OffshootTools) checkout(args json.RawMessage) (ToolResult, error) {
 
 	path, err := t.ws.Checkout(a.Database, branch)
 	if err != nil {
-		return ErrorResult("%v", err), nil
+		return ErrorResult("%v", agentNextStep(err, a.Database)), nil
 	}
 	msg := fmt.Sprintf("checked out %s@%s at %s", a.Database, branch, path)
 	msg += "\nthis checkout is not yet checkpointed: nothing written here can be rolled " +
@@ -786,7 +850,7 @@ func (t *OffshootTools) checkpoint(args json.RawMessage) (ToolResult, error) {
 	if _, ok := t.openSession(a.Database, branch); ok {
 		resp, err := daemon.Call(t.socket, daemon.Request{Op: "flush", DB: a.Database, Branch: branch, Name: a.Name, Meta: a.Meta})
 		if err != nil {
-			return ErrorResult("%v", err), nil
+			return ErrorResult("%v", agentNextStep(err, a.Database)), nil
 		}
 		return StructuredResult(map[string]any{
 			"database": a.Database, "branch": branch, "name": a.Name, "txid": resp.TXID, "live": true,
@@ -795,7 +859,11 @@ func (t *OffshootTools) checkpoint(args json.RawMessage) (ToolResult, error) {
 	}
 	res, err := t.ws.CheckpointWith(a.Database, branch, a.Name, a.Meta, ops.CheckpointOptions{})
 	if err != nil {
-		return ErrorResult("%v", err), nil
+		if strings.Contains(err.Error(), "no checkout for") {
+			return ErrorResult("no checkout for %s@%s yet; call offshoot_checkout {database:%q, branch:%q} "+
+				"first, write to the returned path, then checkpoint.", a.Database, branch, a.Database, branch), nil
+		}
+		return ErrorResult("%v", agentNextStep(err, a.Database)), nil
 	}
 	return StructuredResult(map[string]any{
 		"database": a.Database, "branch": branch, "name": a.Name, "txid": res.TXID, "live": false,
@@ -837,7 +905,7 @@ func forkTTLDescription(defaultTTL time.Duration) string {
 	return fmt.Sprintf("Forked branches expire %s after their last activity by "+
 		"default, unless promoted or touched; pass `ttl:\"none\"` to keep one "+
 		"indefinitely, or `ttl` as a Go duration string (e.g. \"2h\") to override.",
-		defaultTTL.String())
+		ttlDefaultDisplay(defaultTTL))
 }
 
 // ttlDefaultDisplay renders defaultTTL the way the fork schema's `ttl`
@@ -965,13 +1033,13 @@ func (t *OffshootTools) fork(args json.RawMessage) (ToolResult, error) {
 		}
 		resp, err := daemon.Call(t.socket, req)
 		if err != nil {
-			return ErrorResult("%v", err), nil
+			return forkErrorResult(err, a.Database, a.NewBranch), nil
 		}
 		txid = resp.TXID
 	} else {
 		txid, err = t.ws.Fork(a.Database, branch, a.NewBranch, a.At, ttl, a.Meta)
 		if err != nil {
-			return ErrorResult("%v", err), nil
+			return forkErrorResult(err, a.Database, a.NewBranch), nil
 		}
 	}
 	msg := fmt.Sprintf("forked %s@%s to %s@%s at txid %d", a.Database, branch, a.Database, a.NewBranch, txid)
@@ -1074,7 +1142,7 @@ func (t *OffshootTools) rollback(args json.RawMessage) (ToolResult, error) {
 	backupTTL := max(t.defaultTTL, ops.DefaultPromoteBackupTTL)
 	res, err := t.ws.RollbackWith(a.Database, branch, a.To, ops.RollbackOptions{BackupTTL: backupTTL})
 	if err != nil {
-		return ErrorResult("%v", err), nil
+		return ErrorResult("%v", agentNextStep(err, a.Database)), nil
 	}
 	sc := map[string]any{
 		"database": a.Database, "branch": branch, "to": a.To, "path": res.Path, "backup": res.Backup,
@@ -1149,11 +1217,11 @@ func (t *OffshootTools) promote(args json.RawMessage) (ToolResult, error) {
 	if r, refused := t.refuseIfSessionOpen(a.Database, a.Target, "promoting onto it"); refused {
 		return r, nil
 	}
-	r, refused, eff := t.refuseForceOnProtected(a.Database, a.Target, a.Force)
+	cliCmd := fmt.Sprintf("offshoot promote %s@%s --onto %s --force", a.Database, a.Source, a.Target)
+	r, refused, eff := t.refuseForceOnProtected(a.Database, a.Target, a.Force, cliCmd)
 	if refused {
 		return r, nil
 	}
-	origForce := a.Force
 	a.Force = eff
 	// The safety fork's TTL follows the configured fork default when one is
 	// set and it's at least ops.DefaultPromoteBackupTTL (24h); a shorter
@@ -1163,7 +1231,7 @@ func (t *OffshootTools) promote(args json.RawMessage) (ToolResult, error) {
 	res, err := t.ws.PromoteWith(a.Database, a.Source, a.Target,
 		ops.PromoteOptions{Force: a.Force, BackupTTL: max(t.defaultTTL, ops.DefaultPromoteBackupTTL)})
 	if err != nil {
-		return ErrorResult("%v", wrapForceRefusal(err, origForce, t.allowForce)), nil
+		return ErrorResult("%v", agentNextStep(t.rewrapForceRefusal(err, a.Database, a.Target, cliCmd), a.Database)), nil
 	}
 	sc := map[string]any{
 		"database": a.Database, "source": a.Source, "target": a.Target, "txid": res.TXID, "backup": res.Backup,
@@ -1209,14 +1277,14 @@ func (t *OffshootTools) destroy(args json.RawMessage) (ToolResult, error) {
 	if r, refused := t.refuseIfSessionOpen(a.Database, a.Branch, "destroying it"); refused {
 		return r, nil
 	}
-	r, refused, eff := t.refuseForceOnProtected(a.Database, a.Branch, a.Force)
+	cliCmd := fmt.Sprintf("offshoot destroy %s@%s --force", a.Database, a.Branch)
+	r, refused, eff := t.refuseForceOnProtected(a.Database, a.Branch, a.Force, cliCmd)
 	if refused {
 		return r, nil
 	}
-	origForce := a.Force
 	a.Force = eff
 	if err := t.ws.Destroy(a.Database, a.Branch, a.Force); err != nil {
-		return ErrorResult("%v", wrapForceRefusal(err, origForce, t.allowForce)), nil
+		return ErrorResult("%v", agentNextStep(t.rewrapForceRefusal(err, a.Database, a.Branch, cliCmd), a.Database)), nil
 	}
 	return StructuredResult(map[string]any{
 		"database": a.Database, "branch": a.Branch,
@@ -1271,7 +1339,7 @@ func (t *OffshootTools) touch(args json.RawMessage) (ToolResult, error) {
 	}
 	ref, err := t.ws.Touch(a.Database, branch, ttl, time.Now())
 	if err != nil {
-		return ErrorResult("%v", err), nil
+		return ErrorResult("%v", agentNextStep(err, a.Database)), nil
 	}
 	shown := ref.TTL
 	if shown == "" {
@@ -1359,12 +1427,12 @@ func (t *OffshootTools) diff(args json.RawMessage) (ToolResult, error) {
 	}
 	left, err := t.ws.MaterializeForDiff(a.Database, lbr, lcp)
 	if err != nil {
-		return ErrorResult("left: %v", err), nil
+		return ErrorResult("left: %v", agentNextStep(err, a.Database)), nil
 	}
 	defer left.Close()
 	right, err := t.ws.MaterializeForDiff(a.Database, rbr, rcp)
 	if err != nil {
-		return ErrorResult("right: %v", err), nil
+		return ErrorResult("right: %v", agentNextStep(err, a.Database)), nil
 	}
 	defer right.Close()
 

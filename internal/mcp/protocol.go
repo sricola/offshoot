@@ -26,10 +26,20 @@ const legacyProtocolVersion = "2025-11-25"
 // request whose params carry a modern `_meta` block).
 const modernProtocolVersion = "2026-07-28"
 
-// serverVersion is this package's own implementation version, reported in
-// initialize's serverInfo.version. The offshoot binary does not otherwise
-// track a version string.
-const serverVersion = "0.1.0"
+// serverVersion is the version reported in initialize's serverInfo.version
+// and in every modern result's _meta. It starts as this package's own
+// implementation version and is replaced by the binary's ldflags-injected
+// version (cmd/offshoot's main.version) through SetServerVersion, so an
+// MCP client sees the same version `offshoot version` prints.
+var serverVersion = "0.1.0"
+
+// SetServerVersion sets the version reported to MCP clients. Call it before
+// Serve; an empty v keeps the current value.
+func SetServerVersion(v string) {
+	if v != "" {
+		serverVersion = v
+	}
+}
 
 // Request and Response are JSON-RPC 2.0 messages, one per line.
 type Request struct {

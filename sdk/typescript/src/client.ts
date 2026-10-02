@@ -98,6 +98,9 @@ export interface SessionInfo {
 export interface ForkOptions {
   /** Source checkpoint name; omitted (or "") means source branch's head. */
   from?: string;
+  /** Alias of {@link ForkOptions.from}, named like the CLI's `--at` and the
+   * MCP tool's `at`. Passing both with different values throws. */
+  at?: string;
   /** A Go duration string (e.g. "1h"); omitted means no TTL. */
   ttl?: string;
   /** A small string->string map describing the new branch's lineage (e.g.
@@ -487,11 +490,14 @@ export class Client {
    * Returns the fork point's txid.
    */
   async fork(db: string, source: string, newBranch: string, opts: ForkOptions = {}): Promise<number> {
+    if (opts.at !== undefined && opts.from !== undefined && opts.at !== opts.from) {
+      throw new Error(`fork: from=${JSON.stringify(opts.from)} and at=${JSON.stringify(opts.at)} name different checkpoints; pass one of them`);
+    }
     const resp = await this._call("fork", {
       db,
       branch: source,
       name: newBranch,
-      from: opts.from ?? "",
+      from: opts.from ?? opts.at ?? "",
       ttl: opts.ttl ?? "",
       meta: opts.meta,
     });
@@ -791,6 +797,12 @@ export class Session {
   async flush(name = "", opts: FlushOptions = {}): Promise<number> {
     const r = await this.client._call("flush", { db: this.db, branch: this.branch, name, meta: opts.meta });
     return r.txid ?? 0;
+  }
+
+  /** Alias of {@link Session.flush} with a required name: a named flush is
+   * exactly `offshoot checkpoint` on a live session. */
+  checkpoint(name: string, opts: FlushOptions = {}): Promise<number> {
+    return this.flush(name, opts);
   }
 
   /** Close the session, releasing its lease. */

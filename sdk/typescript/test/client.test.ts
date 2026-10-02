@@ -300,6 +300,10 @@ test("full lifecycle: create, open, write, flush, fork, checkout, branches, guar
     sqlite3(s.path, "CREATE TABLE t (v TEXT); INSERT INTO t VALUES ('one');");
     const txid = await s.flush("v1");
     assert.ok(txid > 0);
+    // session.checkpoint is a named flush; `at` aliases `from`.
+    assert.ok((await s.checkpoint("v1-again")) > 0);
+    await assert.rejects(c.fork("app", "main", "nope", { from: "v1", at: "v1-again" }), /pass one of them/);
+    await c.fork("app", "main", "from-v1", { at: "v1", ttl: "1h" });
 
     // Fork from the LIVE session — the row must be there.
     await c.fork("app", "main", "try", { ttl: "1h" });

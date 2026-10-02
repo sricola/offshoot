@@ -1145,6 +1145,7 @@ func run(args []string) error {
 		// returns already ensures that, so there's nothing more to wait on
 		// here.
 		_ = ts.StartReaper(ctx, reapEvery)
+		mcp.SetServerVersion(version)
 		srv := mcp.NewServer(os.Stdin, os.Stdout, ts)
 		return srv.Serve(ctx)
 	case "serve":

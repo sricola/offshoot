@@ -179,7 +179,7 @@ the same case, the `pass^k` unit again). Three details below are easy to
 get wrong from memory and are exactly what makes this wire up at all:
 the config key is **`extensions`**, not `extensionHooks`; each entry needs
 a **`:functionName` suffix** naming which exported function to call
-(`file://eval-hooks.js:extensionHook`) — matching a `module.exports =
+(`file://eval-hooks.mjs:extensionHook`) — matching a `module.exports =
 extensionHook` (or an ESM `export async function extensionHook(hookName,
 context)`) in that file, not a bare default export; and mutating
 `context`/`context.test.vars` in place is **not** enough — promptfoo only
@@ -191,9 +191,15 @@ plain, JSON-shaped values — never a live `Session` object. The hook below
 keeps sessions in a module-level `Map` keyed by a stable per-test id and
 puts only the checkout path (a string) in `vars`.
 
+The client is not on npm yet — install it from a checkout first
+(`git clone https://github.com/sricola/offshoot && npm install
+./offshoot/sdk/typescript`), and keep the hook file ESM: the package is
+`"type": "module"`, so `require("@offshoot-db/client")` only resolves on
+Node 22.12+ (`require(esm)`), while `import` works everywhere.
+
 ```js
-// eval-hooks.js
-const { connect } = require("@offshoot-db/client");
+// eval-hooks.mjs
+import { connect } from "@offshoot-db/client";
 
 let client;
 const DB = "evals";
@@ -203,7 +209,7 @@ const DB = "evals";
 const sessions = new Map();
 let counter = 0;
 
-async function extensionHook(hookName, context) {
+export async function extensionHook(hookName, context) {
   if (hookName === "beforeAll") {
     client = await connect(process.env.OFFSHOOT_SOCKET);
     return context;
@@ -238,14 +244,12 @@ async function extensionHook(hookName, context) {
     return context;
   }
 }
-
-module.exports = extensionHook;
 ```
 
 ```yaml
 # promptfooconfig.yaml
 extensions:
-  - file://eval-hooks.js:extensionHook
+  - file://eval-hooks.mjs:extensionHook
 ```
 
 Same shape as the Inspect sketch and the runnable example above: fork from

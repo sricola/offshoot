@@ -77,7 +77,10 @@ Three fixtures carry the whole workflow:
 - `offshoot_fork` (function-scoped) — forks a fresh, isolated branch from a
   seed's checkpoint for **this one test**, opens a session on it, and
   destroys it on teardown (TTL as the backstop if teardown itself never
-  runs — a crash, a `kill -9`, a CI runner that gets yanked).
+  runs — a crash, a `kill -9`, a CI runner that gets yanked). It shares its
+  name with the `offshoot_fork` MCP tool but is a pytest fixture: the
+  fixture opens a live session for the test, while the MCP tool only
+  creates the branch and never opens a session.
 
 None of this is exotic: `offshoot_fork` calls `offshoot_db()` for you when
 you don't pass a seed handle, and `offshoot_db`'s default seed is whatever

@@ -28,7 +28,7 @@ claude mcp add offshoot -- offshoot -store ./.offshoot mcp
 
 `offshoot mcp` speaks the Model Context Protocol on stdio — no daemon
 required for the baseline. The plugin's skill includes the
-["rules-file snippet"](#rules-file-snippet) below plus the six-step loop and
+["rules-file snippet"](#rules-file-snippet) below plus the seven-step loop and
 rules it's drawn from; its hooks only add context (they never block a
 command), and they stay silent when `offshoot` is not installed.
 
@@ -71,6 +71,26 @@ wherever it's optional.
 | `offshoot_destroy` | `database`, `branch`, `force?` | Permanently discard a branch and its checkout |
 | `offshoot_touch` | `database`, `branch?`, `ttl?` | Reset a fork's activity clock so its TTL does not expire mid-task; `ttl` sets or (`"none"`) clears it |
 | `offshoot_diff` | `database`, `left`, `right`, `table?`, `full?`, `max_bytes?` | Per-table rows added/removed/changed (and schema changes) between two branches or checkpoints — decide which attempt to promote; `full` adds capped sqldiff SQL |
+
+There is no `offshoot_export` tool, the same way there is no
+`offshoot_protect`: exporting a branch to a standalone `.db` file is CLI-
+and SDK-only (`offshoot export` / `Client.export`), so an agent that needs
+a file hands the human the branch name. `offshoot_list` also reports each
+TTL'd fork's `ttl` and `expires_at` so the agent can see what is about to
+expire.
+
+### The same concept, four names
+
+The CLI, the MCP tools, and the two SDKs each follow their own surface's
+conventions; this is the map between them (the SDK columns list the
+original name first and its additive alias second):
+
+| Concept | CLI | MCP | Python | TypeScript |
+|---|---|---|---|---|
+| Fork source checkpoint | `--at` | `at` | `from_checkpoint=` or `at=` | `from` or `at` |
+| Promote target | `--onto` | `target` | `onto` | `onto` |
+| Rollback backup | `--no-backup` | n/a (always kept) | `backup=False` | `noBackup` |
+| Checkpoint | `offshoot checkpoint` | `offshoot_checkpoint` | `Session.flush(name)` or `Session.checkpoint(name)` | `session.flush(name)` or `session.checkpoint(name)` |
 
 ## What the host sees: annotations and structured results
 

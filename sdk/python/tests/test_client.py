@@ -351,6 +351,11 @@ class TestClient(unittest.TestCase):
             db.commit()
             txid = s.flush("v1")
             self.assertGreater(txid, 0)
+            # Session.checkpoint is a named flush; at= aliases from_checkpoint.
+            self.assertGreater(s.checkpoint("v1-again"), 0)
+            with self.assertRaises(ValueError):
+                c.fork("app", "main", "nope", from_checkpoint="v1", at="v1-again")
+            c.fork("app", "main", "from-v1", at="v1", ttl="1h")
             # Fork from the LIVE session — the row must be there.
             c.fork("app", "main", "try", ttl="1h")
             p = c.checkout("app", "try")
