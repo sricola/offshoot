@@ -1231,6 +1231,15 @@ func (w *Workspace) tryFastForkCopy(members []store.ChainMember, cp store.Checkp
 // lineage is the grain, not per-checkpoint (see Checkpoint's own meta param
 // for that). Rejected (before any store I/O) if it exceeds the caps.
 func (w *Workspace) Fork(db, srcBranch, newBranch, at string, ttl time.Duration, meta map[string]string) (uint64, error) {
+	return w.forkWith(db, srcBranch, newBranch, at, ttl, meta, "forking last committed state")
+}
+
+// forkWith is Fork with the phrase the dirty-checkout warning uses for
+// what is about to happen to the source's un-checkpointed edits: a plain
+// fork leaves them in place, while a rollback or promote safety fork is
+// followed by a repoint that discards them, and the warning should say so
+// rather than talk about "forking" during a rollback.
+func (w *Workspace) forkWith(db, srcBranch, newBranch, at string, ttl time.Duration, meta map[string]string, dirtyAction string) (uint64, error) {
 	start := time.Now()
 	if ttl < 0 {
 		return 0, fmt.Errorf("ops: fork ttl must be zero (no TTL) or positive, got %s", ttl)
@@ -1253,7 +1262,7 @@ func (w *Workspace) Fork(db, srcBranch, newBranch, at string, ttl time.Duration,
 		}
 		cp = c
 	} else {
-		w.warnIfUncheckpointed(db, srcBranch, src, "forking last committed state")
+		w.warnIfUncheckpointed(db, srcBranch, src, dirtyAction)
 	}
 	txid := cp.TXID
 	// Fork-time snapshot-floor decision on the fork point's fully-resolved
@@ -1698,7 +1707,8 @@ func (w *Workspace) safetyFork(db, branch, suffix, metaKey, verb string, ttl tim
 	default:
 		return "", err
 	}
-	if _, err := w.Fork(db, branch, name, "", ttl, map[string]string{metaKey: branch}); err != nil {
+	if _, err := w.forkWith(db, branch, name, "", ttl, map[string]string{metaKey: branch},
+		fmt.Sprintf("this %s discards them and keeps the last committed state as the safety fork", verb)); err != nil {
 		return "", fmt.Errorf("ops: %s: safety fork of %s@%s: %w", verb, db, branch, err)
 	}
 	return name, nil
