@@ -141,7 +141,9 @@ shadow, and those fast paths only run on a filesystem that can clone, which
 ubuntu's ext4 cannot — so that job runs just the packages holding those
 paths on APFS, and proves a clone works before trusting the result. The
 expensive tiers live in `.github/workflows/nightly.yml`: `torture` daily,
-`fuzz` daily, `macos-test` (the full `go test ./...` on macOS) weekly, and
+`fuzz` daily, `linux-reflink` daily (the copy-on-write tests on a loopback
+XFS filesystem with reflinks, so Linux `FICLONE` is covered and not only
+APFS), `macos-test` (the full `go test ./...` on macOS) weekly, and
 `real-provider-conformance` against AWS S3 daily (on `main`, when the
 `NIGHTLY_S3` repository variable is on). [docs/testing.md](docs/testing.md) explains what each of those
 proves.
