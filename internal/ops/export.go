@@ -60,13 +60,13 @@ func (w *Workspace) Export(db, branch, checkpoint, dstPath string, force bool) e
 	if checkpoint != "" {
 		c, ok := ref.Checkpoints[checkpoint]
 		if !ok {
-			return fmt.Errorf("ops: no checkpoint %q on %s@%s", checkpoint, db, branch)
+			return errNoCheckpoint(db, branch, checkpoint, ref)
 		}
 		cp = c
 	}
 	if !force {
 		if _, err := os.Stat(dstPath); err == nil {
-			return fmt.Errorf("ops: export destination %s already exists (use force to overwrite)", dstPath)
+			return fmt.Errorf("ops: export destination %s already exists (pass --force to overwrite)", dstPath)
 		} else if !os.IsNotExist(err) {
 			return fmt.Errorf("ops: export destination %s: %w", dstPath, err)
 		}
@@ -232,7 +232,7 @@ func (w *Workspace) CheckoutAt(db, branch, checkpoint string, force bool) (strin
 	}
 	cp, ok := ref.Checkpoints[checkpoint]
 	if !ok {
-		return "", fmt.Errorf("ops: no checkpoint %q on %s@%s", checkpoint, db, branch)
+		return "", errNoCheckpoint(db, branch, checkpoint, ref)
 	}
 	if err := mkdirPrivate(w.roCacheRoot(), filepath.Dir(path)); err != nil {
 		return "", err

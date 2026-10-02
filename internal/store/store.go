@@ -321,6 +321,12 @@ func ValidateName(name string) error {
 	if name == "." || name == ".." || strings.Contains(name, "..") {
 		return fmt.Errorf("store: invalid name %q (must not be \".\" or \"..\", or contain \"..\")", name)
 	}
+	// A leading '-' reads as a flag on every command line that takes the
+	// name (`offshoot create --help` must mean help, not a database called
+	// "--help"), and no tool downstream needs such a name.
+	if strings.HasPrefix(name, "-") {
+		return fmt.Errorf("store: invalid name %q (must not start with \"-\")", name)
+	}
 	for _, c := range name {
 		if !(c >= 'a' && c <= 'z' || c >= '0' && c <= '9' || c == '-' || c == '_' || c == '.') {
 			return fmt.Errorf("store: invalid name %q (allowed: [a-z0-9-_.])", name)
@@ -916,6 +922,9 @@ func resolveRange(lineage string, lo, hi uint64, segments []ChainMember) ([]Chai
 func (s *Store) GetRef(db, branch string) (Ref, string, error) {
 	data, etag, err := s.B.Get(RefKey(db, branch))
 	if err != nil {
+		if errors.Is(err, ErrNotFound) {
+			return Ref{}, "", s.describeMissingRef(db, branch)
+		}
 		return Ref{}, "", err
 	}
 	r, err := decodeRef(data)
@@ -923,6 +932,18 @@ func (s *Store) GetRef(db, branch string) (Ref, string, error) {
 		return Ref{}, "", fmt.Errorf("store: ref %s@%s: %w", db, branch, err)
 	}
 	return r, etag, nil
+}
+
+// describeMissingRef wraps ErrNotFound for db@branch with what is actually
+// missing: the whole database (no ref under it at all) or just the branch.
+// A bare "store: not found" sent users hunting through the store; naming
+// the level costs one List on a path that is already failing. errors.Is
+// against ErrNotFound keeps working for every caller that checks it.
+func (s *Store) describeMissingRef(db, branch string) error {
+	if keys, lerr := s.B.List("refs/" + db + "/"); lerr == nil && len(keys) == 0 {
+		return fmt.Errorf("%w: no database %q (offshoot status lists databases)", ErrNotFound, db)
+	}
+	return fmt.Errorf("%w: no branch %s@%s (offshoot status lists branches)", ErrNotFound, db, branch)
 }
 
 func (s *Store) PutRef(db, branch string, r Ref, ifMatch string) (string, error) {
@@ -1019,6 +1040,12 @@ func (s *Store) ListRefs() (map[string][]string, error) {
 	for _, k := range keys {
 		parts := strings.Split(k, "/")
 		if len(parts) != 3 {
+			continue
+		}
+		// Defense in depth: every name offshoot writes passed ValidateName,
+		// so one that does not was put in the bucket by something else.
+		// Skip it rather than hand it to a path builder or a reaper.
+		if ValidateName(parts[1]) != nil || ValidateName(parts[2]) != nil {
 			continue
 		}
 		m[parts[1]] = append(m[parts[1]], parts[2])

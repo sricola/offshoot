@@ -46,6 +46,7 @@ func TestTortureWriterKill(t *testing.T) {
 
 	deadline := time.Now().Add(5 * time.Minute)
 	round := 0
+	killCount := 0 // writer SIGKILLs actually sent, for the log line (roughly half the rounds)
 	// totalRebases accumulates Rebased() across every engine instance this
 	// test creates (the initial one plus one per bounce below) — Finding 2
 	// of the task-7 review: a bare `e = NewEngine(...)` discards the outgoing
@@ -80,6 +81,7 @@ func TestTortureWriterKill(t *testing.T) {
 		if rand.Intn(2) == 0 {
 			time.Sleep(time.Duration(rand.Intn(200)) * time.Millisecond)
 			cmd.Process.Signal(syscall.SIGKILL)
+			killCount++
 		}
 		cmd.Wait() // reap either way; exit status irrelevant
 
@@ -145,8 +147,8 @@ func TestTortureWriterKill(t *testing.T) {
 		resumedCount++
 	}
 
-	t.Logf("torture complete: %d rounds, %d bounces, %d aggregate rebases across %d session-starts, %d resumed cleanly (resumed/bounce ratio: %.2f)",
-		round, bounceCount, totalRebases, 1+bounceCount, resumedCount, resumedRatio(resumedCount, bounceCount))
+	t.Logf("torture complete: %d rounds, %d writer SIGKILLs, %d bounces, %d aggregate rebases across %d session-starts, %d resumed cleanly (resumed/bounce ratio: %.2f)",
+		round, killCount, bounceCount, totalRebases, 1+bounceCount, resumedCount, resumedRatio(resumedCount, bounceCount))
 
 	// The very first session always rebases once (no prior state to resume
 	// from), so the aggregate can never be zero.

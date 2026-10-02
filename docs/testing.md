@@ -10,7 +10,7 @@ names the code or workflow that backs it.
 
 | Claim | Evidence | Where it runs |
 |---|---|---|
-| A `kill -9`'d writer never corrupts the replica | `TestTortureWriterKill`: ~3,500 rounds, ~1,700 SIGKILLs, dump-identical every round | nightly Linux, weekly macOS (`nightly.yml`) |
+| A `kill -9`'d writer never corrupts the replica | `TestTortureWriterKill`: ~3,500 rounds, the writer `SIGKILL`ed in roughly half of them, dump-identical every round (the capturer is bounced gracefully, never killed) | nightly Linux, weekly macOS (`nightly.yml`) |
 | One writer per lineage, always | lease epochs + create-only puts + CAS on every ref; CAS probe refuses stores without it | every `go test`, RustFS on every PR, AWS nightly |
 | Storage backends behave identically | `storetest.RunConformance` | local + fake S3 every run; real RustFS every PR; real AWS nightly since 2026-09-25 |
 | Parsers of untrusted bytes fail closed, never panic | five Go native fuzz targets (`make fuzz`) | seed corpora every `go test`; 60 s per target nightly (`nightly.yml`) |
@@ -53,8 +53,9 @@ torture_test.go:148: torture complete: 3478 rounds, 347 bounces, 4 aggregate reb
 ```
 
 In words: a 300-second run drove ~3,500 rounds of live SQLite traffic,
-killed the writer with `SIGKILL` roughly 1,700 times (half of every
-round), bounced the capture engine 347 times mid-traffic — 346 of which
+killed the writer with `SIGKILL` in roughly half of the rounds (the test
+does not log the exact count), bounced the capture engine 347 times
+mid-traffic — 346 of which
 resumed from prior state rather than rebasing — and the replica converged
 to dump-identical content after every one of the ~3,500 rounds. Zero
 divergence.
@@ -99,7 +100,7 @@ rather than degraded to a weaker guarantee
 ([faq.md](faq.md#why-no-google-cloud-storage)). Destructive races have
 their own guard: `destroy` CAS-writes a transient `Deleting` claim before
 doing anything irreversible, closing the check-then-delete window
-([reference.md](reference.md#claim-guarded-delete-milestone-4-task-6b)).
+([reference.md](reference.md#claim-guarded-delete)).
 
 ## Backend conformance, against real storage
 
@@ -218,7 +219,16 @@ releases before v0.2.11 carry checksums only.
   harness bounces the capture engine through its graceful-shutdown path
   on every 10th round, not a hard kill of the capturer process itself;
   that case is argued safe in `internal/capture/engine.go`'s
-  shutdown/resume doc comments but is not exercised by this harness.
+  shutdown/resume doc comments but is not exercised by this harness. What
+  the harness proves is that the *writer's* crash is safe. A daemon that
+  dies — however it dies — loses up to one `-flush-every` interval
+  (default 30 s) of committed-but-unflushed writes
+  ([limitations](limitations.md#durability-advances-on-flush-and-the-window-is-explicit)).
+- **No power-loss test.** Since v0.2.14 every rename into place in the
+  local store, the checkouts and the capture state is followed by a
+  directory fsync, and `.sum` sidecars are written atomically, so a local
+  store is designed to keep what was flushed across power loss; nothing
+  pulls the plug to check.
 - **macOS runs without the race detector.** The nightly `macos-test` job
   runs the full suite, including the torture harness, on macOS — but
   without `-race`. `-race` coverage is Linux-only, on every push and PR.

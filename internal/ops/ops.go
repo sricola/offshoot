@@ -19,6 +19,7 @@ import (
 	"net/url"
 	"os"
 	"path/filepath"
+	"sort"
 	"strings"
 	"sync/atomic"
 	"time"
@@ -105,6 +106,9 @@ func Init(spec string) (*Workspace, error) {
 	}
 	s := &store.Store{B: b}
 	if err := s.InitManifest(); err != nil {
+		if errors.Is(err, store.ErrCAS) {
+			return nil, fmt.Errorf("store already initialized at %s", spec)
+		}
 		return nil, err
 	}
 	root, err := checkoutRoot(spec)
@@ -171,6 +175,9 @@ func ParseTarget(s string) (string, string, error) {
 	case 2:
 		branch = parts[1]
 	default:
+		return "", "", fmt.Errorf("ops: invalid target %q (want db or db@branch)", s)
+	}
+	if db == "" || branch == "" {
 		return "", "", fmt.Errorf("ops: invalid target %q (want db or db@branch)", s)
 	}
 	if err := store.ValidateName(db); err != nil {
@@ -278,6 +285,9 @@ func (w *Workspace) createFromQuiesced(db, quiescedPath string) error {
 		// Freshly-minted lineage no rival can reference: safe to delete the
 		// orphaned snapshot (mirrors Fork's cleanup on the same failure).
 		w.bestEffortDelete(store.SnapshotKey(lineage, 1, 1))
+		if errors.Is(err, store.ErrCAS) {
+			return fmt.Errorf("ops: database %q already exists (offshoot status lists databases)", db)
+		}
 		return fmt.Errorf("ops: create %s: %w", db, err)
 	}
 	return nil
@@ -290,27 +300,39 @@ func (w *Workspace) CreateFrom(db, srcPath string) error {
 	if err := store.ValidateName(db); err != nil {
 		return err
 	}
+	if _, err := os.Stat(srcPath); err != nil {
+		return fmt.Errorf("ops: import %s: %w", srcPath, err)
+	}
 	dir, err := os.MkdirTemp("", "offshoot-import-*")
 	if err != nil {
 		return err
 	}
 	defer os.RemoveAll(dir)
 	cp := filepath.Join(dir, "import.db")
-	for _, suffix := range []string{"", "-wal", "-shm"} {
-		if err := copyFile(srcPath+suffix, cp+suffix); err != nil {
-			if suffix != "" && os.IsNotExist(err) {
-				continue
-			}
-			return err
-		}
+	// VACUUM INTO reads the source under one read transaction, so the copy
+	// is a consistent committed state even when another process is writing
+	// to the source (a byte copy of a live file could tear across pages and
+	// import as a well-formed snapshot of garbage); it honours the source's
+	// WAL without touching it. The source itself is never written.
+	src, err := sql.Open("sqlite3", srcPath+"?_busy_timeout=5000")
+	if err != nil {
+		return fmt.Errorf("ops: import %s: %w", srcPath, err)
 	}
+	_, err = src.Exec("VACUUM INTO ?", cp)
+	src.Close()
+	if err != nil {
+		return fmt.Errorf("ops: import %s: not a usable SQLite database: %w", srcPath, err)
+	}
+	// Normalize the copy the way Create builds a fresh database: WAL mode
+	// in the header, then quiesced, so every checkout materialized from it
+	// is a WAL-mode file the capture engine can follow.
 	conn, err := sql.Open("sqlite3", cp)
 	if err != nil {
 		return err
 	}
-	if _, err := conn.Exec("PRAGMA wal_checkpoint(TRUNCATE)"); err != nil {
+	if _, err := conn.Exec("PRAGMA journal_mode=WAL; PRAGMA wal_checkpoint(TRUNCATE)"); err != nil {
 		conn.Close()
-		return err
+		return fmt.Errorf("ops: import %s: %w", srcPath, err)
 	}
 	conn.Close()
 	return w.createFromQuiesced(db, cp)
@@ -369,9 +391,22 @@ func (w *Workspace) CheckoutProven(db, branch string) (CheckoutResult, error) {
 			return CheckoutResult{Path: path, Clean: true, Ref: ref, PostApplyChecksum: postApplyChecksum}, nil
 		case "modified":
 			fmt.Fprintf(os.Stderr, "offshoot: warning: overwriting un-checkpointed changes in %s@%s checkout\n", db, branch)
+		case "stale":
+			// The branch moved on since this file was materialized. The
+			// file is about to be replaced either way; what matters is
+			// whether it holds edits nobody checkpointed. The sidecar
+			// still records the hash of the content it was stamped with,
+			// so one hash tells.
+			if rec, ok := readSidecar(path); ok {
+				if sum, err := fileSum(path); err == nil && sum != rec.Hash {
+					fmt.Fprintf(os.Stderr, "offshoot: warning: overwriting un-checkpointed changes in %s@%s checkout (the branch was repointed since it was materialized)\n", db, branch)
+				}
+			}
+		case "unknown":
+			fmt.Fprintf(os.Stderr, "offshoot: warning: replacing %s@%s checkout, whose state could not be verified (no readable sidecar); any un-checkpointed changes in it are lost\n", db, branch)
 		}
 	}
-	if err := os.MkdirAll(filepath.Dir(path), 0o755); err != nil {
+	if err := os.MkdirAll(filepath.Dir(path), 0o700); err != nil {
 		return CheckoutResult{}, err
 	}
 	// Stale or missing: resolve the chain first, so an identical (or
@@ -452,6 +487,11 @@ var checkpointAfterQuiesceForTest func()
 type CheckpointOptions struct {
 	// Snapshot forces a full snapshot even when a segment would do.
 	Snapshot bool
+	// Force checkpoints a branch that has a live lease (a daemon session
+	// or `lease acquire` holds it) or a detached checkout (the branch was
+	// repointed since the checkout was materialized). Both are refused
+	// without it: see refuseIfHeld and CheckpointWith's detached check.
+	Force bool
 }
 
 // CheckpointResult is what CheckpointWith wrote.
@@ -514,12 +554,24 @@ func (w *Workspace) CheckpointWith(db, branch, name string, meta map[string]stri
 	if err != nil {
 		return CheckpointResult{}, err
 	}
+	if err := refuseIfHeld(db, branch, ref, "checkpoint", opts.Force); err != nil {
+		return CheckpointResult{}, err
+	}
 	if _, exists := ref.Checkpoints[name]; exists {
 		return CheckpointResult{}, fmt.Errorf("ops: checkpoint %q already exists on %s@%s", name, db, branch)
 	}
 	path := w.CheckoutPath(db, branch)
 	if _, err := os.Stat(path); err != nil {
-		return CheckpointResult{}, fmt.Errorf("ops: no checkout for %s@%s (run checkout first): %w", db, branch, err)
+		return CheckpointResult{}, fmt.Errorf("ops: no checkout for %s@%s (run 'offshoot checkout %s@%s' first)", db, branch, db, branch)
+	}
+	// A detached checkout embodies a lineage the branch no longer points
+	// at: a promote, rollback or compact repointed the ref but could not
+	// refresh this file (it was busy, or the process died in between).
+	// Checkpointing it would snapshot the OLD content onto the NEW lineage
+	// and silently undo that repoint, so refuse and name the ways out.
+	if rec, ok := readSidecar(path); ok && rec.Lineage != ref.Lineage && !opts.Force {
+		return CheckpointResult{}, fmt.Errorf("ops: checkout of %s@%s is detached: the branch was repointed (now at txid %d) after this checkout was materialized, so checkpointing it would revert that repoint; run 'offshoot checkout %s@%s' to refresh it (discarding its local edits), 'offshoot export' to keep them as a file, or pass --force to checkpoint it anyway",
+			db, branch, ref.HeadTXID, db, branch)
 	}
 	if err := quiesce(path); err != nil {
 		return CheckpointResult{}, err
@@ -829,22 +881,64 @@ func quiesce(path string) error {
 // treated as "nothing to warn about". ref is the same ref the caller already
 // fetched to decide the fork point, so this reuses it rather than issuing a
 // second (potentially inconsistent) GetRef.
-func (w *Workspace) warnIfUncheckpointed(db, branch string, ref store.Ref) {
+func (w *Workspace) warnIfUncheckpointed(db, branch string, ref store.Ref, action string) {
 	path := w.CheckoutPath(db, branch)
 	if _, err := os.Stat(path); err != nil {
 		return
 	}
 	if err := quiesce(path); err != nil {
-		fmt.Fprintf(os.Stderr, "offshoot: warning: checkout of %s@%s is busy; forking last committed state (txid %d)\n", db, branch, ref.HeadTXID)
+		fmt.Fprintf(os.Stderr, "offshoot: warning: checkout of %s@%s is busy; %s (txid %d)\n", db, branch, action, ref.HeadTXID)
 		return
 	}
 	state, _ := checkoutState(path, ref)
 	switch state {
 	case "modified":
-		fmt.Fprintf(os.Stderr, "offshoot: warning: checkout of %s@%s has un-checkpointed changes; forking last committed state (txid %d)\n", db, branch, ref.HeadTXID)
+		fmt.Fprintf(os.Stderr, "offshoot: warning: checkout of %s@%s has un-checkpointed changes; %s (txid %d) — run 'offshoot checkpoint' first to keep them\n", db, branch, action, ref.HeadTXID)
 	case "stale":
-		fmt.Fprintf(os.Stderr, "offshoot: warning: checkout of %s@%s is stale (branch was repointed since it was materialized); forking branch head (txid %d) — run 'offshoot checkout' to refresh\n", db, branch, ref.HeadTXID)
+		fmt.Fprintf(os.Stderr, "offshoot: warning: checkout of %s@%s is stale (branch was repointed since it was materialized); %s (txid %d) — run 'offshoot checkout' to refresh\n", db, branch, action, ref.HeadTXID)
 	}
+}
+
+// refuseIfHeld is the guard every at-rest ref mutation runs right after
+// reading the ref: it refuses a branch that is mid-destroy or mid-reap
+// (another process's CAS claim; never forceable) and, unless force, one
+// with a live lease. A live lease means a daemon session or a `lease
+// acquire` owns the branch right now; repointing or checkpointing under it
+// clears the lease, fences that session, and discards whatever it had not
+// flushed. Destroy applies the same rules in its own body. verb names the
+// operation in the message ("rollback", "promote onto", ...).
+func refuseIfHeld(db, branch string, ref store.Ref, verb string, force bool) error {
+	if ref.Deleting {
+		return fmt.Errorf("ops: %s@%s is being destroyed; cannot %s it", db, branch, verb)
+	}
+	if ref.Reaping {
+		return fmt.Errorf("ops: %s@%s is being reaped (its TTL expired); cannot %s it", db, branch, verb)
+	}
+	if !force && store.LeaseLive(ref, time.Now()) {
+		return fmt.Errorf("ops: %s@%s has a live lease held by %q until %s (an open daemon session, or 'offshoot lease acquire'); a %s now would fence that writer and discard its unflushed work — close the session first, or pass --force",
+			db, branch, ref.LeaseHolder, ref.LeaseExpiry, verb)
+	}
+	return nil
+}
+
+// errNoCheckpoint is the error for a checkpoint name that db@branch does
+// not carry. Checkpoints belong to one branch and are not inherited by
+// forks (a fork carries only "fork" at its fork point until it makes its
+// own), which is the single most common surprise behind this error, so the
+// message lists the branch's own checkpoints and names the way to start a
+// branch from a parent's checkpoint.
+func errNoCheckpoint(db, branch, name string, ref store.Ref) error {
+	names := make([]string, 0, len(ref.Checkpoints))
+	for n := range ref.Checkpoints {
+		names = append(names, n)
+	}
+	sort.Strings(names)
+	have := "none"
+	if len(names) > 0 {
+		have = strings.Join(names, ", ")
+	}
+	return fmt.Errorf("ops: no checkpoint %q on %s@%s (its checkpoints: %s; checkpoints belong to one branch — to start from a parent's checkpoint, fork it: offshoot fork %s@<parent> <new> --at %s)",
+		name, db, branch, have, db, name)
 }
 
 // copySnapshotIntoLineage materializes src's lineage at cp — resolving its
@@ -1137,6 +1231,15 @@ func (w *Workspace) tryFastForkCopy(members []store.ChainMember, cp store.Checkp
 // lineage is the grain, not per-checkpoint (see Checkpoint's own meta param
 // for that). Rejected (before any store I/O) if it exceeds the caps.
 func (w *Workspace) Fork(db, srcBranch, newBranch, at string, ttl time.Duration, meta map[string]string) (uint64, error) {
+	return w.forkWith(db, srcBranch, newBranch, at, ttl, meta, "forking last committed state")
+}
+
+// forkWith is Fork with the phrase the dirty-checkout warning uses for
+// what is about to happen to the source's un-checkpointed edits: a plain
+// fork leaves them in place, while a rollback or promote safety fork is
+// followed by a repoint that discards them, and the warning should say so
+// rather than talk about "forking" during a rollback.
+func (w *Workspace) forkWith(db, srcBranch, newBranch, at string, ttl time.Duration, meta map[string]string, dirtyAction string) (uint64, error) {
 	start := time.Now()
 	if ttl < 0 {
 		return 0, fmt.Errorf("ops: fork ttl must be zero (no TTL) or positive, got %s", ttl)
@@ -1155,11 +1258,11 @@ func (w *Workspace) Fork(db, srcBranch, newBranch, at string, ttl time.Duration,
 	if at != "" {
 		c, ok := src.Checkpoints[at]
 		if !ok {
-			return 0, fmt.Errorf("ops: no checkpoint %q on %s@%s", at, db, srcBranch)
+			return 0, errNoCheckpoint(db, srcBranch, at, src)
 		}
 		cp = c
 	} else {
-		w.warnIfUncheckpointed(db, srcBranch, src)
+		w.warnIfUncheckpointed(db, srcBranch, src, dirtyAction)
 	}
 	txid := cp.TXID
 	// Fork-time snapshot-floor decision on the fork point's fully-resolved
@@ -1192,6 +1295,9 @@ func (w *Workspace) Fork(db, srcBranch, newBranch, at string, ttl time.Duration,
 			w.bestEffortDelete(store.BaseKey(childLineage))
 		} else {
 			w.bestEffortDelete(store.SnapshotKey(childLineage, 1, txid))
+		}
+		if errors.Is(err, store.ErrCAS) {
+			return 0, fmt.Errorf("ops: branch %s@%s already exists (offshoot status lists branches)", db, newBranch)
 		}
 		return 0, fmt.Errorf("ops: fork %s@%s: %w", db, newBranch, err)
 	}
@@ -1284,6 +1390,11 @@ const RollbackBackupMetaKey = "offshoot.pre-rollback"
 // with the safety fork on at DefaultPromoteBackupTTL (reused as rollback's
 // default too — there is no separate DefaultRollbackBackupTTL).
 type RollbackOptions struct {
+	// Force rolls back a branch that has a live lease. Without it the
+	// rollback is refused, because repointing the ref clears the lease and
+	// fences the session holding it, discarding whatever that session had
+	// not flushed yet (see refuseIfHeld).
+	Force bool
 	// NoBackup skips the <branch>-pre-rollback safety fork entirely.
 	NoBackup bool
 	// BackupTTL is the safety fork's TTL; <= 0 means DefaultPromoteBackupTTL.
@@ -1302,6 +1413,12 @@ type RollbackResult struct {
 	Path   string
 	Backup string
 	Shared bool
+	// BackupIsTarget reports that the branch's head already sat at the
+	// target checkpoint, so the safety fork in Backup holds the same
+	// committed state the rollback landed on: the rollback discarded only
+	// un-checkpointed edits in the checkout, and "undo" has nothing to
+	// restore. The CLI words its output accordingly.
+	BackupIsTarget bool
 }
 
 // Rollback is RollbackWith with defaults: safety fork on, default TTL. Kept
@@ -1351,11 +1468,15 @@ func (w *Workspace) RollbackWith(db, branch, to string, opts RollbackOptions) (R
 	if err != nil {
 		return RollbackResult{}, err
 	}
+	if err := refuseIfHeld(db, branch, ref, "rollback", opts.Force); err != nil {
+		return RollbackResult{}, err
+	}
 	cp, ok := ref.Checkpoints[to]
 	if !ok {
-		return RollbackResult{}, fmt.Errorf("ops: no checkpoint %q on %s@%s", to, db, branch)
+		return RollbackResult{}, errNoCheckpoint(db, branch, to, ref)
 	}
 	txid := cp.TXID
+	backupIsTarget := ref.HeadTXID == txid
 
 	// The safety fork comes after the checkpoint lookup (a bad `to` fails
 	// before anything is minted) and before the new lineage is minted, so the branch's current head is durably reachable from its
@@ -1450,7 +1571,7 @@ func (w *Workspace) RollbackWith(db, branch, to string, opts RollbackOptions) (R
 				return err
 			}
 		}
-		if err := os.MkdirAll(filepath.Dir(path), 0o755); err != nil {
+		if err := os.MkdirAll(filepath.Dir(path), 0o700); err != nil {
 			return err
 		}
 		checksum, chain, err := w.refreshFromChain(db, next, path)
@@ -1472,7 +1593,7 @@ func (w *Workspace) RollbackWith(db, branch, to string, opts RollbackOptions) (R
 	if err := refresh(); err != nil {
 		return RollbackResult{}, fmt.Errorf("ops: branch repointed to checkpoint %q (txid %d), but the checkout could not be refreshed (run 'offshoot checkout' to re-materialize): %w", to, txid, err)
 	}
-	return RollbackResult{Path: path, Backup: backup, Shared: base != nil}, nil
+	return RollbackResult{Path: path, Backup: backup, Shared: base != nil, BackupIsTarget: backupIsTarget}, nil
 }
 
 // Promote repoints db@target at a NEW lineage seeded from db@source's head
@@ -1509,7 +1630,10 @@ const DefaultPromoteBackupTTL = 24 * time.Hour
 // PromoteOptions tunes PromoteWith. The zero value is a plain promote with
 // the safety fork on at DefaultPromoteBackupTTL.
 type PromoteOptions struct {
-	// Force overrides the protected-target refusal.
+	// Force overrides the protected-target refusal and the live-lease
+	// refusal on the target (see refuseIfHeld); a live lease on the
+	// SOURCE never blocks, since promote only reads the source's
+	// last-flushed head.
 	Force bool
 	// NoBackup skips the <target>-pre-promote safety fork entirely.
 	NoBackup bool
@@ -1583,7 +1707,8 @@ func (w *Workspace) safetyFork(db, branch, suffix, metaKey, verb string, ttl tim
 	default:
 		return "", err
 	}
-	if _, err := w.Fork(db, branch, name, "", ttl, map[string]string{metaKey: branch}); err != nil {
+	if _, err := w.forkWith(db, branch, name, "", ttl, map[string]string{metaKey: branch},
+		fmt.Sprintf("this %s discards them and keeps the last committed state as the safety fork", verb)); err != nil {
 		return "", fmt.Errorf("ops: %s: safety fork of %s@%s: %w", verb, db, branch, err)
 	}
 	return name, nil
@@ -1621,9 +1746,12 @@ func (w *Workspace) PromoteWith(db, source, target string, opts PromoteOptions) 
 	if err != nil {
 		return PromoteResult{}, err
 	}
-	w.warnIfUncheckpointed(db, source, src)
+	w.warnIfUncheckpointed(db, source, src, "promoting last committed state")
 	tgt, tgtEtag, err := w.Store.GetRef(db, target)
 	if err != nil {
+		return PromoteResult{}, err
+	}
+	if err := refuseIfHeld(db, target, tgt, "promote onto", force); err != nil {
 		return PromoteResult{}, err
 	}
 	if tgt.Protected && !force {
@@ -1737,6 +1865,19 @@ var compactBeforeCASForTest func()
 // a lineage per attempt. The checkout refresh that follows is best-effort
 // and reports partial success on failure, same as Promote.
 func (w *Workspace) Compact(db, branch string) (uint64, error) {
+	return w.CompactWith(db, branch, CompactOptions{})
+}
+
+// CompactOptions tunes CompactWith.
+type CompactOptions struct {
+	// Force compacts a branch that has a live lease; refused without it,
+	// since the repoint clears the lease and fences the session holding
+	// it (see refuseIfHeld).
+	Force bool
+}
+
+// CompactWith is Compact with options.
+func (w *Workspace) CompactWith(db, branch string, opts CompactOptions) (uint64, error) {
 	if err := store.ValidateName(db); err != nil {
 		return 0, err
 	}
@@ -1745,6 +1886,9 @@ func (w *Workspace) Compact(db, branch string) (uint64, error) {
 	}
 	ref, etag, err := w.Store.GetRef(db, branch)
 	if err != nil {
+		return 0, err
+	}
+	if err := refuseIfHeld(db, branch, ref, "compact", opts.Force); err != nil {
 		return 0, err
 	}
 	// The no-op decision consults the DURABLE base spine (base.json chain),

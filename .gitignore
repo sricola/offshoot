@@ -2,6 +2,9 @@
 *.db-wal
 *.db-shm
 /bin/
+/.offshoot/
+/reports/
+/research_notes/
 sdk/typescript/node_modules/
 sdk/typescript/dist/
 sdk/typescript/test-dist/
@@ -20,6 +23,8 @@ site/docs/
 site/sitemap.xml
 
 .superpowers/
+# Agent working notes (plans/specs) are scratch, never published docs.
+docs/superpowers/
 
 # Defensive: local credentials/config must never be committable.
 .env

@@ -73,9 +73,10 @@ exists at the SQL-semantics level.
 
 offshoot takes the opposite bet: keep **stock SQLite**, unmodified, and put
 the version control at the storage layer instead of the query engine. That
-means offshoot can't diff two branches row-by-row the way Dolt can (the
-escape hatch is `sqldiff` over two materialized checkouts — see "why no
-merge" below), but it also means every offshoot checkout is a plain `.db`
+means offshoot has no row-level version control in the query language —
+[`offshoot diff`](diff.md) compares two branches or checkpoints (row-level
+SQL via `sqldiff`, or a per-table `--summary` without it), but there is no
+merge (see "why no merge" below) — but it also means every offshoot checkout is a plain `.db`
 file any SQLite tool already understands, with SQLite's ecosystem, ORMs, and
 tooling working unmodified. If you need real row-level version control
 semantics in the query language, Dolt is built for that. If you need SQLite
@@ -98,16 +99,16 @@ or staying priced the way it is today.
 ## Why not just `cp`?
 
 For a laptop, `cp app.db app-backup.db` (or a filesystem/VM snapshot) is
-completely fine. This isn't a subtle point — offshoot's own design spec names
-the individual laptop user as explicitly **not** the target persona. If
-that's you, stop reading and go use `cp`.
+completely fine. This isn't a subtle point — the individual laptop user is
+explicitly **not** the target persona. If that's you, stop reading and go
+use `cp`.
 
 The pitch is for the case `cp` doesn't cover well: an engineer running N
 parallel agent attempts or test runs *server-side*, against real databases,
 who needs more than a copy of the bytes:
 
 - **Lineage** — a fork records where it came from and when, not just a blob.
-- **Content-addressed refs, CAS'd** — every branch pointer update is a
+- **Compare-and-swapped refs** — every branch pointer update is a
   conditional write, so concurrent forks/checkpoints/promotes on the same
   store don't race each other into a corrupt state the way parallel `cp`
   invocations against a shared destination could.
@@ -134,7 +135,7 @@ weights, diff a dataset revision against another).
 
 offshoot versions **live, writable SQLite databases** that an agent or test
 process opens and writes to with a stock SQL client while the daemon captures
-transactions continuously in the background. It's built for is fork-and-write
+transactions continuously in the background. It's built for fork-and-write
 workloads, not fork-and-diff-a-static-blob workloads. If what you're
 versioning is a static dataset someone occasionally updates, DVC-style tools
 are a better fit; if it's a database an agent is actively mutating right now,

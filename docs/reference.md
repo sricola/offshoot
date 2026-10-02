@@ -14,7 +14,13 @@ parallelism, golden-file assertions, CI — see
 
 ```
 offshoot [-store SPEC] <command> [args...]
+offshoot help [command]        # also --help, -h; `offshoot <command> --help` prints that command's entry
+offshoot version               # also --version
 ```
+
+`help`, `--help`, `-h` and `--version` never open the store, so they work
+in a directory with no store, and `offshoot <command> --help` prints that
+command's usage instead of running it with `--help` as a name.
 
 `-store SPEC` selects the store. It can appear anywhere in the argument
 list (it's extracted before the subcommand is parsed), so `offshoot create
@@ -33,8 +39,8 @@ variable, and falls back to `./.offshoot` if that's unset too.
 Any other URL scheme is refused with `unsupported store scheme`.
 
 Every store-touching command except `init` first attaches to the store
-(`offshoot version` and a bare `offshoot` usage print return before
-attaching): it opens the
+(`help`/`--help`, `version`/`--version` and a bare `offshoot` usage print
+return before attaching): it opens the
 backend and runs a **CAS (compare-and-swap) capability probe**. This runs on
 every invocation — a fresh CLI process re-pays it every time — and refuses
 to proceed if the store doesn't enforce conditional writes, rather than
@@ -60,13 +66,14 @@ file, IAM role).
 | `OFFSHOOT_STORE` | Default store spec when `-store` isn't passed |
 | `OFFSHOOT_CHECKOUTS` | Where checkouts are materialized, for a *remote* (`s3://`) store; local stores always keep checkouts under the store directory itself. Defaults to a per-store directory under the user cache dir, keyed by the store's resolved identity (endpoint/region/path-style included, not just the literal spec string) |
 | `OFFSHOOT_SOCKET` | Overrides the daemon socket path for `offshoot serve`, `offshoot session ...`, and `offshoot mcp`; if unset, all three derive the same default path from the store spec, so they agree without it |
-| `OFFSHOOT_TOKEN` | The Bearer token for `offshoot serve -http`, in place of `-token`; see [`-http ADDR`](#-http-addr--opt-in-http-listener-milestone-4-task-3) below |
+| `OFFSHOOT_TOKEN` | The Bearer token for `offshoot serve -http`, in place of `-token`; see [`-http ADDR`](#-http-addr--opt-in-http-listener) below |
 
 **Naming rules**, enforced on every database name, branch name, and
-checkpoint name: 1–128 characters, charset `[a-z0-9-_.]`, and never exactly
-`.` or `..` or containing `..` as a substring (those are directory-traversal
-segments once joined into a storage key). A bad name fails fast with `store:
-invalid name ...`.
+checkpoint name: 1–128 characters, charset `[a-z0-9-_.]`, never starting
+with `-` (it would read as a flag), and never exactly `.` or `..` or
+containing `..` as a substring (those are directory-traversal segments once
+joined into a storage key). A bad name fails fast with `store: invalid name
+...`.
 
 ---
 
@@ -96,11 +103,13 @@ offshoot create app --from existing.db
 
 Creates a new, empty database with a `main` branch at transaction id 1,
 protected by default (destroying or promoting onto `main` requires
-`--force`). With `--from file`, **imports** an existing SQLite file instead:
-the source is copied (including `-wal`/`-shm` if present), the copy is
-quiesced with a full WAL checkpoint, and *that* becomes the root snapshot —
-the source file itself is never modified or truncated. There is no mode that
-overwrites an existing user file.
+`--force`), and prints one confirmation line (`created app (branch
+main)`). With `--from file`, **imports** an existing SQLite file instead:
+the source is read under one read transaction with `VACUUM INTO` (so the
+copy is consistent even when another process is writing the source), the
+copy is quiesced with a full WAL checkpoint, and *that* becomes the root
+snapshot — the source file itself is never modified or truncated. There is
+no mode that overwrites an existing user file.
 
 **Errors:** refuses if `db` already exists (ref CAS conflict); `--from` with
 a source file that doesn't exist or isn't a valid SQLite file.
@@ -287,12 +296,13 @@ Ubuntu, `brew install sqldiff` on macOS — both verified, not guessed; see
 **Errors:** no such `db@branch` or checkpoint on either side; `sqldiff` not
 on PATH (default mode only — `--summary` never needs it).
 
-## `offshoot checkpoint <db>[@branch] <name> [--snapshot] [--meta k=v ...]`
+## `offshoot checkpoint <db>[@branch] <name> [--snapshot] [--meta k=v ...] [--force]`
 
 ```
 offshoot checkpoint app v1
 offshoot checkpoint app v1 --snapshot
 offshoot checkpoint app v1 --meta eval_run=42 --meta git_sha=abc123
+offshoot checkpoint app v1 --force
 ```
 
 Snapshots the *current checkout's* state (not just the ref) as a named
@@ -320,7 +330,7 @@ every checkpoint there is a snapshot. The diff still reads the
 whole checkout and the whole shadow — the saving is in what is uploaded
 and stored, not in local I/O. The daemon's `session flush` writes segments
 from its own capture engine instead (see [What a flush
-costs](../README.md#what-a-flush-costs) in the README).
+costs](operations.md#what-a-flush-costs) in the README).
 
 The output names what was written:
 
@@ -345,17 +355,33 @@ automatically. `--meta k=v` is repeatable and attaches a small string→string
 map to *this specific checkpoint* (e.g. an eval run id, a git SHA, an agent
 id) — capped at 32 keys, 64-byte keys, 512-byte values, enforced before
 anything is written; a rejected `--meta` leaves the branch untouched. This is
-branch/checkpoint-level metadata, not row-level provenance — see the design
-spec's metadata note.
+branch/checkpoint-level metadata, not row-level provenance.
 
 Children never inherit a parent's checkpoints — a fork's own history
 begins at its fork point (even a shared, copy-on-write fork's ref carries
 only its auto-created `fork` checkpoint), so a checkpoint made before the
 fork isn't addressable from the child; resolve it on the parent instead.
 
+**Refusals, and `--force`.** A checkpoint is refused when the branch has
+a **live lease** — an open daemon session, or `offshoot lease acquire` —
+because stamping the ref under a live writer would fence that session and
+discard whatever it had not flushed; close the session first, or pass
+`--force` to do exactly that (the lease is cleared, the epoch bumps, the
+session's next flush fails, and its unflushed writes never reach the
+store). It is also refused when the checkout is **detached** — its sidecar
+records a lineage the branch no longer points at, because the branch was
+repointed (`rollback`, `promote`, `compact`) after the checkout was
+materialized — since checkpointing it would silently revert that repoint;
+`offshoot checkout` refreshes it (discarding its local edits), `offshoot
+export` keeps them as a file, or `--force` checkpoints it anyway. A branch
+that is mid-`destroy` or mid-reap is refused outright; no flag overrides
+that. The same rules apply to `rollback`, `promote --onto` (the target
+only) and `compact`.
+
 **Errors:** checkpoint name already exists on this branch; no checkout
-exists yet (run `checkout` first); checkout is busy; `--meta` over a cap
-(key count, key length, or value length).
+exists yet (run `checkout` first); checkout is busy; live lease without
+`--force`; detached checkout without `--force`; branch mid-destroy or
+mid-reap; `--meta` over a cap (key count, key length, or value length).
 
 ## `offshoot fork <db>[@branch] <new-branch> [--at checkpoint] [--ttl duration] [--meta k=v ...]`
 
@@ -490,17 +516,22 @@ tool, so an agent can observe a branch's `protected` flag (via
 **Errors:** the branch is currently being reaped or destroyed ("too late to
 change its protection"); CAS races are retried internally.
 
-## `offshoot rollback <db>[@branch] --to <checkpoint> [--no-backup] [--backup-ttl DUR] [--materialize]`
+## `offshoot rollback <db>[@branch] --to <checkpoint> [--no-backup] [--backup-ttl DUR] [--materialize] [--force]`
 
 ```
 offshoot rollback app@attempt-1 --to fork
 offshoot rollback app@attempt-1 --to fork --materialize
+offshoot rollback app@attempt-1 --to fork --force
 ```
 
 Repoints the branch at a **new** lineage seeded from `checkpoint`'s state
 (internally, the same machinery as fork). Checkpoints at or before the
-target are kept; checkpoints after it are dropped. Any lease on the branch
-is cleared by the repoint, so it's immediately acquirable afterward.
+target are kept; checkpoints after it are dropped. A branch with a live
+lease (an open daemon session, or `lease acquire`) is refused unless
+`--force`, which clears the lease by the repoint and fences that session —
+its unflushed writes are lost (see [checkpoint](#offshoot-checkpoint-dbbranch-name---snapshot---meta-kv----force)'s
+refusal rules; a branch mid-destroy or mid-reap is never forceable).
+Afterwards the branch is immediately acquirable.
 
 **Shared by default (since v0.2.12).** The new lineage is a base pointer
 at the kept checkpoint in the old lineage — two small objects, no data
@@ -549,10 +580,12 @@ refresh that follows is best-effort — if it fails (e.g. the checkout is
 busy), the command reports a partial success: the branch *did* roll back,
 but the checkout needs a manual `offshoot checkout` to catch up.
 
-**Errors:** unknown checkpoint name; `<branch>-pre-rollback` exists but is
-not rollback's own safety fork (nothing is touched); the previous safety
-fork has a live lease (nothing is touched — close that session first, or
-`--no-backup`); lost a concurrent CAS race (retry).
+**Errors:** unknown checkpoint name; the branch has a live lease without
+`--force`, or is mid-destroy or mid-reap (nothing is touched);
+`<branch>-pre-rollback` exists but is not rollback's own safety fork
+(nothing is touched); the previous safety fork has a live lease (nothing
+is touched — close that session first, or `--no-backup`); lost a
+concurrent CAS race (retry).
 
 **Daemon/SDK parity.** The daemon's `rollback` op takes the same knobs as
 request fields — `no_backup` (bool), `backup_ttl` (a Go duration
@@ -613,15 +646,18 @@ know: the safety fork's base pointer keeps `target`'s old lineage alive
 until the fork is reaped or destroyed, so the old lineage's storage is
 reclaimed after the TTL, not at promote time — exactly the "base-pointing
 into a lineage meant to die pins it" trade-off [concepts](concepts.md)
-describes, here bounded by the TTL. `--no-backup` skips all of this. Promote never checks `target`'s lease at all — with
-or without `--force` — and any lease on `target` is cleared by the repoint
-(the same unconditional clearing rollback does; see above), so `target` is
-immediately acquirable afterward regardless of who held it. `target`'s
+describes, here bounded by the TTL. `--no-backup` skips all of this. A
+live lease on `target` (an open daemon session, or `lease acquire`) is
+refused unless `--force`, which clears it by the repoint and fences that
+session — its unflushed writes are lost; a `target` mid-destroy or
+mid-reap is refused outright. A lease on `source` never blocks a promote.
+Afterwards `target` is immediately acquirable. `target`'s
 checkout, if any, is refreshed after a busy probe — same best-effort
 semantics as rollback.
 
 **Errors:** `source == target`; `target` is protected without `--force`;
-`<target>-pre-promote` exists but is not promote's own safety fork (nothing
+`target` has a live lease without `--force`, or is mid-destroy or
+mid-reap; `<target>-pre-promote` exists but is not promote's own safety fork (nothing
 is touched); the previous safety fork has a live lease (nothing is
 touched — close that session first, or `--no-backup`); target checkout is
 busy (repoint still lands; checkout refresh is skipped and reported); lost
@@ -638,10 +674,11 @@ PromoteOptions)` (`materialize?: boolean`) expose the same options.
 `offshoot_promote` (MCP) takes no `materialize` argument: it shares unless
 the depth floor copies.
 
-## `offshoot compact <db>[@branch]`
+## `offshoot compact <db>[@branch] [--force]`
 
 ```
 offshoot compact app@attempt-1
+offshoot compact app@attempt-1 --force
 ```
 
 Turns a **shared** (copy-on-write) fork into a self-contained branch: its
@@ -683,8 +720,10 @@ last flush persisted), so compact materializes exactly that head. A
 concurrent flush from elsewhere that advances the head between the copy
 and the ref swap loses the CAS and returns a retry error.
 
-**Errors:** no such `db@branch`; branch has an open session on this daemon
-(close it first); lost a concurrent CAS race to a flush (retry).
+**Errors:** no such `db@branch`; branch has a live lease (an open session,
+or `lease acquire`) without `--force`, which fences that session and loses
+its unflushed writes; branch mid-destroy or mid-reap; lost a concurrent
+CAS race to a flush (retry).
 
 ## `offshoot destroy <db>[@branch] [--force]`
 
@@ -694,7 +733,8 @@ offshoot destroy app@attempt-1 --force
 ```
 
 Deletes the branch's ref and its local checkout files (`.db`, `-wal`,
-`-shm`, `.sum`, `.shadow`). Destroying a parent is always safe, instant, and allowed
+`-shm`, `.sum`, `.shadow`), and prints one confirmation line (`destroyed
+app@attempt-1`). Destroying a parent is always safe, instant, and allowed
 regardless of live children — a parent's destruction can never corrupt a
 child, whether that child is a shared (copy-on-write) fork or a
 materialized one. `--force` is required to destroy a protected branch
@@ -720,7 +760,7 @@ child.**
 checkout is busy (close connections first); the destroy lost a race to a
 concurrent `AcquireLease` on the same branch (retry — see below).
 
-### Claim-guarded delete (Milestone 4 Task 6b)
+### Claim-guarded delete
 
 Between checking a branch's lease and actually deleting its ref sits a
 window: a lease could be acquired in that gap and have its brand-new
@@ -801,13 +841,14 @@ Prints every branch across every database: its computed **state** (see
 below), its **storage class** (see below), head transaction id, named
 checkpoints, `protected` and `checked-out` flags (when applicable), and —
 for a branch with a TTL — the TTL itself and time remaining until it's
-reap-eligible (`remaining=expired` once past the deadline). TTL remaining is computed
+reap-eligible (`remaining=expired` once past the deadline), rounded to
+whole seconds. TTL remaining is computed
 from the later of the branch's last-touch time and its lease expiry,
 whichever is later — matching exactly what the janitor's reap logic uses,
 so `status` never disagrees with what will actually happen.
 
 After the branch listing, a final `ro-cache: N entries, B bytes used
-(budget: unlimited)` line (Milestone 4 Task 5) reports `checkouts-ro`'s
+(budget: unlimited)` line reports `checkouts-ro`'s
 current usage (`ops.Workspace.ROCacheUsage`, an at-rest read — no daemon
 required, exactly like the rest of this command). `-ro-cache-budget` is
 **display-only** here: it echoes back `serve -ro-cache-budget`'s own value
@@ -875,7 +916,7 @@ ordering matters for `active` vs. `dirty`/`detached`: a branch can be both
 leased AND locally modified/orphaned at the file level, and `active` wins
 the report.
 
-**`idle` is a deliberate addition, not in the original design spec.** The
+**`idle` is a deliberate addition to the original state taxonomy.** The
 spec's branch-state taxonomy (`active`/`pending`/`dirty`/`detached`/
 `error`) assumed a daemon was always running to layer a state over every
 branch. `offshoot status`'s CLI/at-rest mode has no daemon and no session
@@ -949,7 +990,9 @@ does not hold the process open — so the lease will simply expire unless
 something else renews it before then. It exists for inspection and for
 deliberately breaking/reclaiming a stuck lease (acquiring bumps the epoch,
 fencing out whatever previously held it), not for long-running write
-sessions — use `offshoot serve` + `session open` for that.
+sessions — use `offshoot serve` + `session open` for that. While the lease
+is live, the at-rest verbs (`checkpoint`, `rollback`, `promote --onto`,
+`compact`, `destroy`) refuse the branch unless `--force`.
 
 ## `offshoot lease release <db>[@branch]`
 
@@ -999,7 +1042,7 @@ on that timer, without the agent ever calling `session flush` itself. It
 bounds exposure — worst case, a daemon that dies loses at most one
 `-flush-every` interval's worth of committed-but-unflushed writes, instead
 of everything since the last manual flush. See [What a flush
-costs](../README.md#what-a-flush-costs) in the README for what a background
+costs](operations.md#what-a-flush-costs) in the README for what a background
 flush (and every session's mandatory first "settling" flush) actually cost.
 
 `-snapshot-every N` sets the full-snapshot cadence
@@ -1008,10 +1051,8 @@ opens (default `16`, unchanged if the flag is omitted; must be `>= 1` —
 there is no "unlimited"/"disabled" sentinel the way `-flush-every 0`
 disables auto-flush, since every flush must eventually snapshot).
 `Options.SnapshotEvery` has been configurable in the embeddable session
-library since Milestone 2; this flag is what exposes the same knob to a
-daemon-managed session, closing the gap the design spec's original
-taxonomy left open. See [What a flush
-costs](../README.md#what-a-flush-costs) in the README for the cost
+library; this flag exposes the same knob to a daemon-managed session. See [What a flush
+costs](operations.md#what-a-flush-costs) in the README for the cost
 trade-off this cadence controls: a **lower** N (more frequent snapshots)
 means cheaper, bounded reads (a chain never replays more than N-1
 segments past its snapshot) at the cost of shipping a full-database
@@ -1028,7 +1069,7 @@ store-attach failure; `-flush-every` given a negative duration;
 `-snapshot-every` given a value less than 1, or a non-integer;
 `-ro-cache-budget` given a negative value.
 
-### `-ro-cache-budget BYTES` — checkouts-ro disk budget (Milestone 4 Task 5)
+### `-ro-cache-budget BYTES` — checkouts-ro disk budget
 
 ```
 offshoot serve -ro-cache-budget 0            # unlimited (the default)
@@ -1153,7 +1194,7 @@ and self-heals into staying hot from then on.
 budget (see the read-only checkout section above) — a budget just
 automates what that manual cleanup would otherwise require doing by hand.
 
-### `-http ADDR` — opt-in HTTP listener (Milestone 4 Task 3)
+### `-http ADDR` — opt-in HTTP listener
 
 Off by default. `-http ADDR` (e.g. `127.0.0.1:8080`) starts an HTTP
 listener alongside the unix socket, exposing:
@@ -1169,7 +1210,7 @@ reference.
 | `POST` | `/rpc` | Bearer | The same `Request`/`Response` JSON the unix socket speaks, one op per POST (`Content-Type: application/json` required; body capped at 1MiB, oversized -> `413`). Two ops are refused over HTTP: `subscribe` (use `GET /events`; refused in-band as a normal `{"ok":false,...}` JSON response) and `export` — the one op that writes to an unconfined, client-chosen path on the daemon host, safe under the unix socket's same-host trust model but an arbitrary-file-write primitive for a network client, so `export` alone answers `400` pre-dispatch and stays socket-only |
 | `GET` | `/metrics` | Bearer | Prometheus text exposition of the locked `offshoot_*` metric set — see [docs/operations.md](operations.md#metrics) for the full name/type/label reference table |
 | `GET` | `/healthz` | **none** | `{"ok":true,"sessions":N}` — the one endpoint that needs no token, for liveness probes |
-| `GET` | `/events` | Bearer | Server-Sent Events: the daemon's event stream (Milestone 4 Task 4a — see [Eventing](#eventing-subscribe-op--get-events) below) |
+| `GET` | `/events` | Bearer | Server-Sent Events: the daemon's event stream (see [Eventing](#eventing-subscribe-op--get-events) below) |
 | `GET` | `/debug/pprof/*` | Bearer | `net/http/pprof`'s standard handlers (index, cmdline, profile, symbol, trace) |
 
 **Token:** `-token TOKEN` or `OFFSHOOT_TOKEN` sets it explicitly — an
@@ -1299,7 +1340,7 @@ sent on that same connection — the daemon stops reading it entirely.
 > pointing at `GET /events`), since an HTTP request/response cycle has no
 > way to switch modes mid-stream the way a raw socket connection can.
 
-**SDK helpers** (Milestone 4 Task 4b): both SDKs ship a thin `events()`
+**SDK helpers:** both SDKs ship a thin `events()`
 helper that does exactly this — opens its own fresh, dedicated socket
 connection (never the caller's own `Client`/`Session` connection), sends
 `subscribe`, reads the ack, and yields one parsed event per line:
@@ -1334,7 +1375,7 @@ alive across any proxy/load balancer/kubelet that kills silent streams — ordin
 automatically. Unlike the other `-http` routes, this handler manages its
 own per-connection write deadline (re-armed before every write, see
 "Stalled (still-connected) subscriber" above) rather than being bound by
-Task 3's `http.Server` `WriteTimeout` (90s, sized for
+the `http.Server` `WriteTimeout` (90s, sized for
 `/rpc`/`/metrics`/`/debug/pprof/*`, see above) — a live subscription is
 never hard-cut by that 90s bound, while a stalled one is still cleaned up
 promptly rather than left open indefinitely.

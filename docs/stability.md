@@ -25,17 +25,20 @@ criteria under which the format freezes at 1.0.
   `export` is a stock SQLite file — whatever happens to offshoot's storage
   format, the databases it manages are always extractable as plain `.db`
   files any SQLite tool reads. The stock-file invariant is the standing
-  floor under every format risk on this page.
+  floor under every format risk on this page — and the store itself is
+  readable without offshoot: refs are JSON and objects are LTX files the
+  upstream `ltx` CLI can apply ([recovering data without
+  offshoot](operations.md#recovering-data-without-offshoot)).
 
 ## The promise
 
 **Any storage-format break before 1.0 ships, in the same release, with
 either (a) an in-place migration, or (b) a documented
-`export` → `create --from` path.** "May change without a migration path"
-in the CHANGELOG describes the *license* semver gives a pre-1.0 project,
-not what a release will actually do to you: no offshoot release will leave
-data written by the previous release unreadable without also shipping, in
-that same release's notes, the exact steps that carry it forward.
+`export` → `create --from` path.** Semver gives a pre-1.0 project the
+license to break without one; this project does not use it: no offshoot
+release will leave data written by the previous release unreadable
+without also shipping, in that same release's notes, the exact steps that
+carry it forward.
 
 The `export` → `create --from` path is not hypothetical — both halves are
 shipped, tested code, and they round-trip today:
@@ -48,8 +51,9 @@ shipped, tested code, and they round-trip today:
   `ops.Workspace.Export` (`internal/ops/export.go`); CLI behavior pinned by
   `cmd/offshoot/export_test.go`.
 - **`offshoot create <db> --from file`** imports an existing SQLite file
-  into a fresh store: the source is copied (plus `-wal`/`-shm` if present),
-  the copy is quiesced with a full WAL checkpoint, and that becomes the new
+  into a fresh store: the source is read under one read transaction with
+  `VACUUM INTO` (consistent even from a live source), the copy is
+  quiesced with a full WAL checkpoint, and that becomes the new
   database's root snapshot — the source file is never modified.
   Implementation: `ops.Workspace.CreateFrom` (`internal/ops/ops.go`);
   source-untouched behavior pinned by

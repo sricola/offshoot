@@ -34,21 +34,24 @@ SQLite client opens. You have nine tools; the loop is four calls.
    "attempt-2@done", right: "main"}` (or against a golden checkpoint) — read
    the per-table added/removed/changed counts; use `table` + `full` to see
    the exact rows.
-6. **Promote the winner:** `offshoot_promote {database, source, target, force?}`
+6. **Promote the winner:** `offshoot_promote {database, source, target}`
    repoints `target` (often `main`) at `source`'s head. Protected targets
-   refuse without `force`; that refusal is confirmation you need, not a bug.
-   A protected branch cannot be forced through MCP unless the operator
-   started `offshoot mcp -allow-force`; ask the human, who can promote from
-   the CLI. The target's previous head is kept as `<target>-pre-promote` — the result
+   (`main` by default) refuse; that refusal is the confirmation step, not a
+   bug. Do not retry with `force: true` — this server refuses force too
+   unless the operator started it with `offshoot mcp -allow-force`. Instead
+   run `offshoot_diff` to show what would change, then ask the human to
+   promote from the CLI (`offshoot promote <db>@<source> --onto <target>
+   --force`). The target's previous head is kept as `<target>-pre-promote` — the result
    names it — so a promote is undone by promoting that fork back. That
    safety fork always carries a TTL (24h by default) and is one rolling
    slot per target, replaced by the next promote onto that target, so the
    undo window closes when either happens.
 7. **Clean up:** `offshoot_destroy` a failed attempt, or let its TTL expire.
    `offshoot_touch {database, branch, ttl?}` keeps a fork alive if a task
-   runs long. A protected branch (or one under a live lease) cannot be
-   destroyed with `force` through MCP unless the operator started
-   `offshoot mcp -allow-force`; ask the human, who can destroy from the CLI.
+   runs long. A protected branch (or one under a live lease) refuses, and
+   `force` is refused too unless the operator started
+   `offshoot mcp -allow-force` — do not retry with force; ask the human, who
+   can destroy from the CLI.
 
 ## Rules
 

@@ -19,7 +19,8 @@ plus the design spec) on the same machine the same day — the "before".
 
 **Reproduce:** `make bench-cow` (benchmarks live in
 `internal/ops/cow_bench_test.go`; the target's invocations are exactly the
-ones below). Latency numbers are the **median of 5 samples**
+ones below). SQLite 3.53.4, as bundled by `github.com/mattn/go-sqlite3`
+v1.14.52 (the version in `go.mod`), with the default 4096-byte page size. Latency numbers are the **median of 5 samples**
 (`-count=5 -benchtime=3x`, each sample the mean of 3 iterations); byte
 numbers are exact object-store accounting (sum of stored object sizes,
 diffed before/after — what an S3 backend would bill), identical across
@@ -242,8 +243,13 @@ from `make bench-cow` / `make bench`:
 
 ---
 
-Everything below this line was measured **before** copy-on-write existed
-and is preserved as published; the next section's version note scopes it.
+> **Older measurements.** Everything below this line was measured
+> **before** copy-on-write existed, on a different machine (Apple M4, Go
+> 1.26; the sections above used an Apple M5, Go 1.27), and is preserved
+> as published. The MinIO numbers below are no longer reproducible: MinIO
+> withdrew its community images, and `make bench-s3` now targets RustFS.
+
+The next section's version note scopes what still applies.
 
 Measured baselines for `ops.Workspace.Fork`, `Checkout`'s clean-skip fast
 path (Task 1 of Milestone 2), and `session.Open` — **before** and **after**
@@ -279,7 +285,7 @@ Benchmarks live in `internal/ops/fork_bench_test.go`. Run them with
 `make bench` (local store) or `make bench-s3` (real MinIO in Docker). The
 benchmark code itself is unchanged by Task 6a — same subtest names, same
 seeding, same `at=""` (fork at branch head, which runs `Fork`'s normal
-uncheckpointed-changes check; see "What's still O(size) after Task 6a"
+uncheckpointed-changes check; see "What's still O(size) after the fast-path fork"
 below) — so before/after numbers are a like-for-like comparison of the same
 call, not two different things being measured.
 
@@ -545,39 +551,37 @@ That is 2,310 forks in all (one per worker-step). The whole table takes
 
 **Machine:** as the header line below reports — darwin/arm64, Apple M5, macOS
 27.0, local APFS disk, local-directory store backend, no other load, no
-network, measured 2026-09-30. Raw stdout of `make bench-branchbench` with its
+network, measured 2026-10-02. Raw stdout of `make bench-branchbench` with its
 defaults (all five workflows, concurrency 8, 10 warehouses, 2h per-workflow
 cap), pasted verbatim, minus make's own echoed `go run` line and the
 per-workflow progress lines on stderr:
 
-darwin/arm64, Apple M5, 10 cores, Go 1.27.1, offshoot v0.2.11-15-g67cc6b1-dirty, measured 2026-09-30, seed 17 MiB, concurrency 8
+darwin/arm64, Apple M5, 10 cores, Go 1.27.1, offshoot v0.2.13-11-gf182bb4, measured 2026-10-02, seed 17 MiB, concurrency 8
 
 | Workflow | Steps | Wall | Branch overhead | Fork p50/p99 (d=1 → d=max) | Checkout p50/p99 (d=1 → d=max) | Checkpoint p50/p99 (d=1 → d=max) | Eval p50/p99 (d=1 → d=max) | Peak live | Store peak |
 |---|---|---|---|---|---|---|---|---|---|
-| simulation | 1000/1000 | 45.7 s | 60% | 40.3/63.7 → (d=1 is max) | 43.0/68.0 → (d=1 is max) | 102.6/150.6 → (d=1 is max) | 56.4/80.2 → (d=1 is max) | 8 | 650 MiB |
-| data_cleaning | 200/200 | 9.8 s | 40% | 39.1/77.0 → 27.9/47.8 | 40.1/426.1 → 32.2/172.4 | 63.6/85.8 → 62.6/100.4 | 50.3/107.8 → 66.9/115.4 | 200 | 8.3 GiB |
-| software_dev | 100/100 | 5.4 s | 48% | 35.5/38.7 → 23.0/43.6 | 225.3/225.6 → 34.8/118.7 | 54.0/87.6 → 55.3/81.4 | 15.6/50.6 → 13.3/86.8 | 84 | 3.8 GiB |
-| mcts | 1000/1000 | 41.9 s | 65% | 61.0/73.1 → 32.6/69.5 | 405.1/427.6 → 78.5/130.6 | 79.2/101.5 → 67.3/118.4 | 68.4/99.5 → 103.0/133.4 | 890 | 43.0 GiB |
-| failure_repro | 10/10 | 1.6 s | 47% | 14.4/16.7 → (d=1 is max) | 8.1/61.2 → (d=1 is max) | 47.4/49.0 → (d=1 is max) | 5.1/5.1 → (d=1 is max) | 1 | 82 MiB |
+| simulation | 1000/1000 | 46.7 s | 61% | 41.1/64.0 → (d=1 is max) | 46.7/81.8 → (d=1 is max) | 109.2/168.6 → (d=1 is max) | 53.9/79.0 → (d=1 is max) | 8 | 711 MiB |
+| data_cleaning | 200/200 | 9.7 s | 39% | 28.7/52.7 → 28.2/51.1 | 39.3/400.5 → 28.8/141.4 | 73.4/117.4 → 63.1/87.3 | 67.8/100.2 → 62.1/142.0 | 200 | 8.3 GiB |
+| software_dev | 100/100 | 5.2 s | 49% | 29.7/41.3 → 24.7/39.8 | 213.1/221.5 → 33.0/91.0 | 50.8/61.9 → 53.4/78.0 | 15.1/49.3 → 13.6/90.6 | 84 | 3.8 GiB |
+| mcts | 1000/1000 | 44.6 s | 67% | 53.9/61.9 → 35.3/58.6 | 392.4/412.7 → 81.9/541.0 | 82.9/117.3 → 64.6/118.3 | 71.3/98.3 → 101.7/148.4 | 890 | 30.7 GiB |
+| failure_repro | 10/10 | 1.7 s | 47% | 14.6/15.4 → (d=1 is max) | 8.2/63.3 → (d=1 is max) | 48.3/50.9 → (d=1 is max) | 5.1/5.3 → (d=1 is max) | 1 | 82 MiB |
 
 Latencies are milliseconds. p99 is the maximum sample wherever a cell has fewer than 100 samples at that depth, which is most of them — the per-workflow lines below give the counts. Branch overhead is fork+checkout+checkpoint+destroy time summed over workers, over wall x effective concurrency (min(-concurrency, T workers)). Peak live counts live forked branches, excluding the root.
 
-- `simulation` (flat star; T=1000, S=1, F_r=1000, F_i=0, D=1, C=1, γ=1.0, M_s=0, M_d=50, Q_v=1): max depth reached 1; 1 cross-branch query over 1 live branch (the root included) in 31 ms; all 1000 steps landed at d=1; store ended at 429 MiB of which 17 MiB is the seed; branch-management time 220.3 s summed over workers (4.8x wall at effective concurrency 8 of 8 requested); 0 CAS retries; store sizes approximate: 10 entries vanished or were unreadable during the size walks
-- `data_cleaning` (wide shallow; T=10, S=20, F_r=10, F_i=3, D=3, C=2, γ=0.0, M_s=1, M_d=1, Q_v=1): max depth reached 3; 2 cross-branch queries over 201 live branches (the root included) in 2.4 s; 17 steps landed at d=1 and 133 at d=3 (the sample counts behind those two p50/p99 pairs); store ended at 8.3 GiB of which 17 MiB is the seed; 7 forks fell back to the root after the tree filled; branch-management time 31.3 s summed over workers (3.2x wall at effective concurrency 8 of 8 requested); 0 CAS retries; store sizes approximate: 1 entries vanished or were unreadable during the size walks
-- `software_dev` (bushy; T=5, S=20, F_r=5, F_i=3, D=4, C=1, γ=0.1, M_s=1, M_d=1, Q_v=2): max depth reached 4; 1 cross-branch query over 84 live branches (the root included) in 745 ms; 5 steps landed at d=1 and 51 at d=4 (the sample counts behind those two p50/p99 pairs); store ended at 3.8 GiB of which 17 MiB is the seed; branch-management time 13.0 s summed over workers (2.4x wall at effective concurrency 5 of 8 requested); 0 CAS retries
-- `mcts` (deep narrow; T=10, S=100, F_r=10, F_i=10, D=25, C=0, γ=0.1, M_s=0, M_d=1, Q_v=1): max depth reached 25; no cross-branch queries (C=0); 10 steps landed at d=1 and 80 at d=25 (the sample counts behind those two p50/p99 pairs); store ended at 43.0 GiB of which 17 MiB is the seed; branch-management time 219.1 s summed over workers (5.2x wall at effective concurrency 8 of 8 requested); 0 CAS retries; store sizes approximate: 15 entries vanished or were unreadable during the size walks
-- `failure_repro` (flat, 1 worker; T=1, S=10, F_r=10, F_i=0, D=1, C=0, γ=1.0, M_s=5, M_d=45, Q_v=1): max depth reached 1; no cross-branch queries (C=0); all 10 steps landed at d=1; store ended at 82 MiB of which 17 MiB is the seed; branch-management time 776 ms summed over workers (0.5x wall at effective concurrency 1 of 8 requested); 0 CAS retries
+- `simulation` (flat star; T=1000, S=1, F_r=1000, F_i=0, D=1, C=1, γ=1.0, M_s=0, M_d=50, Q_v=1): max depth reached 1; 1 cross-branch query over 1 live branch (the root included) in 34 ms; all 1000 steps landed at d=1; store ended at 429 MiB of which 17 MiB is the seed; branch-management time 229.7 s summed over workers (4.9x wall at effective concurrency 8 of 8 requested); 0 CAS retries; store sizes approximate: 8 entries vanished or were unreadable during the size walks
+- `data_cleaning` (wide shallow; T=10, S=20, F_r=10, F_i=3, D=3, C=2, γ=0.0, M_s=1, M_d=1, Q_v=1): max depth reached 3; 2 cross-branch queries over 201 live branches (the root included) in 2.5 s; 18 steps landed at d=1 and 130 at d=3 (the sample counts behind those two p50/p99 pairs); store ended at 8.3 GiB of which 17 MiB is the seed; 8 forks fell back to the root after the tree filled; branch-management time 29.9 s summed over workers (3.1x wall at effective concurrency 8 of 8 requested); 0 CAS retries
+- `software_dev` (bushy; T=5, S=20, F_r=5, F_i=3, D=4, C=1, γ=0.1, M_s=1, M_d=1, Q_v=2): max depth reached 4; 1 cross-branch query over 84 live branches (the root included) in 710 ms; 5 steps landed at d=1 and 53 at d=4 (the sample counts behind those two p50/p99 pairs); store ended at 3.8 GiB of which 17 MiB is the seed; branch-management time 12.8 s summed over workers (2.4x wall at effective concurrency 5 of 8 requested); 0 CAS retries
+- `mcts` (deep narrow; T=10, S=100, F_r=10, F_i=10, D=25, C=0, γ=0.1, M_s=0, M_d=1, Q_v=1): max depth reached 25; no cross-branch queries (C=0); 10 steps landed at d=1 and 69 at d=25 (the sample counts behind those two p50/p99 pairs); store ended at 30.7 GiB of which 17 MiB is the seed; branch-management time 239.9 s summed over workers (5.4x wall at effective concurrency 8 of 8 requested); 0 CAS retries; store sizes approximate: 4 entries vanished or were unreadable during the size walks
+- `failure_repro` (flat, 1 worker; T=1, S=10, F_r=10, F_i=0, D=1, C=0, γ=1.0, M_s=5, M_d=45, Q_v=1): max depth reached 1; no cross-branch queries (C=0); all 10 steps landed at d=1; store ended at 82 MiB of which 17 MiB is the seed; branch-management time 780 ms summed over workers (0.5x wall at effective concurrency 1 of 8 requested); 0 CAS retries
 
-(`v0.2.11-15-g67cc6b1-dirty` is `git describe` for commit `67cc6b1`, before the v0.2.12
-tag; `-dirty` because this run was taken with the local-store
-`List` fix (see "What changed") applied but not yet committed; it was then
-committed unchanged as `d8f50dd`, and is the only Go source that differed
-from `67cc6b1`.)
+(`v0.2.13-11-gf182bb4` is `git describe` for the launch-hardening branch, eleven
+commits past the v0.2.13 tag, with a clean tree. An earlier version of this
+table came from a pre-release build with uncommitted changes; this one
+replaces it.)
 
-Every workflow completed every step: 2,310/2,310 worker-steps, 104.5 s of
-workflow wall time in total (1 min 49 s for the whole `make` invocation,
-including a seed build per workflow), no CAS retries, nothing aborted or
-timed out.
+Every workflow completed every step: 2,310/2,310 worker-steps, 107.9 s of
+workflow wall time in total (1 min 52 s for the whole run, including a seed
+build per workflow), no CAS retries, nothing aborted or timed out.
 
 **What changed in v0.2.12.** The before is the same target run at
 `97320cc` (the commit before this work) on the same machine the same day;
@@ -835,7 +839,7 @@ on a local copy-on-write SQLite store.
   storage during a run stays close to one seeded database's worth rather
   than growing with `b.N`. Every seeded database checkpoints cleanly, so its
   chain is always exactly one snapshot — the fast path's precondition (see
-  "Task 6a: what changed" below) holds for every iteration in this suite.
+  "The reflink / clonefile fork fast path: what changed" below) holds for every iteration in this suite.
 - `BenchmarkCheckoutCleanSkip` calls `Checkout` repeatedly against a checkout
   that never dirties between calls (the clean fast path performs no write),
   so every iteration measures the same "already correct, don't rebuild"
@@ -875,7 +879,7 @@ on a local copy-on-write SQLite store.
   support reflink/clonefile"). This is the "ext4-without-reflink" case
   referenced throughout: Task 6a's fast path still fires (one object copy
   instead of decode+re-encode), it just can't clone, so it falls back to
-  `reflink.CopyFile`'s plain-byte-copy path — see "Task 6a: what changed"
+  `reflink.CopyFile`'s plain-byte-copy path — see "The reflink / clonefile fork fast path: what changed"
   below for what that's still worth.
 - **S3 path:** `minio/minio:latest` in Docker on the same host (`make
   bench-s3` now runs RustFS instead, since MinIO's images were withdrawn;
@@ -887,7 +891,7 @@ on a local copy-on-write SQLite store.
   `store.S3.CopyObject` returned the `ErrCopyUnsupported` sentinel
   unconditionally in Task 6a; Task 6b (this update) replaces that with a
   real server-side `CopyObject` call (gated to objects at or under S3's
-  5GB single-request `CopyObject` limit — see "Task 6b: what changed"
+  5GB single-request `CopyObject` limit — see "The S3 server-side copy fork: what changed"
   below). All MinIO-local numbers throughout this section are exactly
   that: MinIO-local. They say nothing about a real AWS S3 endpoint's
   network latency, throughput, or server-side copy performance at scale —
@@ -897,7 +901,7 @@ on a local copy-on-write SQLite store.
   day, same machine. "After Task 6b" (S3 server-side copy) measured
   2026-08-06, same machine, separate section below.
 
-## Task 6a: what changed
+## The reflink / clonefile fork fast path: what changed
 
 `ops.Workspace.copySnapshotToNewLineage` (the primitive behind `Fork`,
 `Rollback`, and `Promote`) now checks, before doing anything else, whether
@@ -929,7 +933,7 @@ through to exactly the pre-6a materialize-and-re-encode path, unchanged
 (`internal/ops/gc_chain_test.go`'s `TestForkFastPathSkipsMultiMemberChains`
 covers this).
 
-## Task 6b: what changed
+## The S3 server-side copy fork: what changed
 
 `store.S3.CopyObject` (`internal/store/s3.go`) now issues a real
 server-side copy — S3's `CopyObject` API (a `PUT` carrying an
@@ -1104,7 +1108,7 @@ to have introduced. `CheckoutCleanSkip` and `SessionOpen` are, as before,
 close to the local numbers because their dominant cost never touches the
 backend at all — Task 6b doesn't change that either.
 
-### Task 6b: S3 server-side CopyObject (`make bench-s3`, MinIO in Docker, `-count=1`)
+### S3 server-side CopyObject (`make bench-s3`, MinIO in Docker, `-count=1`)
 
 | Benchmark | Size | ns/op, before Task 6b (=after 6a) | ns/op, after Task 6b | MB/s, before | MB/s, after |
 |---|---|---|---|---|---|
@@ -1120,8 +1124,8 @@ server-side copy means this process never downloads the source snapshot
 object, never re-encodes it, and never re-uploads it — MinIO copies the
 object on its own side of the wire, so the round trips this process pays
 for are the `HEAD` (size gate), the `CopyObject` request itself, one `List`
-call to verify the child's chain resolves after the copy (see "Task 6a: what
-changed" above — this is extra work the fast path pays that the slow path
+call to verify the child's chain resolves after the copy (see "The reflink /
+clonefile fork fast path: what changed" above — this is extra work the fast path pays that the slow path
 doesn't, not free), and the same `PutRef`/`GetRef` calls every fork makes
 regardless of path. It is
 NOT as fast as the local numbers (1.03s vs. ~198ms at 512MB): `Fork`'s
@@ -1185,7 +1189,7 @@ remaining time is dominated by `Fork`'s separate O(size)
 uncheckpointed-changes SHA-256 check, which does scale with size, not by
 the object copy itself.
 
-## What's still O(size) after Task 6a
+## What's still O(size) after the fast-path fork
 
 - **`Fork`'s uncheckpointed-changes check** (`warnIfUncheckpointed` →
   `checkoutState`, Task 1 machinery, not touched by Task 6a): every default
@@ -1232,7 +1236,7 @@ here only as the target this benchmark suite exists to check against, never
 as a claim about `ForkAtHead`'s own reported numbers, which also include
 Task 1's separate O(size) check.
 
-## Settling-flush cost (Task 2 controller decision)
+## Settling-flush cost
 
 > **Update (Milestone 2 follow-up, shipped):** the measurements below still
 > describe the upload's *size* accurately for the case where it happens, but

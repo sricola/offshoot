@@ -7,6 +7,7 @@ package ltxio
 import (
 	"encoding/binary"
 	"fmt"
+	"github.com/sricola/offshoot/internal/fsutil"
 	"io"
 	"os"
 	"path/filepath"
@@ -173,6 +174,7 @@ func finalizeDestination(tmp *os.File, tmpPath, dbPath string) error {
 	if err := os.Rename(tmpPath, dbPath); err != nil {
 		return err
 	}
+	fsutil.SyncDir(filepath.Dir(dbPath))
 	os.Remove(dbPath + "-wal")
 	os.Remove(dbPath + "-shm")
 	return nil

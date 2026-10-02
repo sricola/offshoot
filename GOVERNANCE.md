@@ -41,8 +41,9 @@ a version bump and a migration note is a bug, not a release.
 ## Path to additional maintainers
 
 There is no formal maintainer-nomination process yet because there's been no
-occasion for one — see ROADMAP.md's 90-day success metric of "3+
-non-author contributors" as the actual trigger. In practice: sustained,
+occasion for one — the project is still working through ROADMAP.md's
+Launch track, and the trigger is non-author contributors showing up, not a
+calendar date. In practice: sustained,
 trusted contribution (a track record of PRs in a given area, sound judgment
 in review discussions, showing up over time rather than a single large drop)
 is what gets someone offered commit access and a voice in design-sensitive

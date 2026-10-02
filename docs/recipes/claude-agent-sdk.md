@@ -7,7 +7,7 @@ at the end.
 
 **Every claim below is checked against what actually shipped** — the MCP
 tool descriptions, the daemon-mode reach documented in the README's
-[MCP section](../../README.md#mcp) and [docs/reference.md](../reference.md),
+[MCP section](../../README.md#for-ai-agents-mcp) and [docs/reference.md](../reference.md),
 and this repo's own `offshoot mcp` command. The hooks pattern in the second
 half is **illustrative**: it shows the shape of the wiring, but the exact
 hook-event JSON schema is Claude Code's surface, not offshoot's, and can
@@ -118,8 +118,8 @@ offshoot session close app -socket /tmp/o.sock
 ```
 
 Equivalently, open the session from the Python or TypeScript SDK instead of
-the CLI (see the README's [Python SDK](../../README.md#python-sdk) /
-[TypeScript SDK](../../README.md#typescript-sdk) sections) — anywhere a
+the CLI (see the README's [Python SDK](../../sdk/python/README.md) /
+[TypeScript SDK](../../sdk/typescript/README.md) sections) — anywhere a
 harness can hold a `Client.open(...)` call open for the duration of the
 agent's task works. The MCP tool calls don't know or care which one opened
 the session; they just check whether one is open.

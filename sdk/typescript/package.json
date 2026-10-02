@@ -9,11 +9,13 @@
   "exports": {
     ".": {
       "types": "./dist/client.d.ts",
-      "import": "./dist/client.js"
+      "import": "./dist/client.js",
+      "default": "./dist/client.js"
     },
     "./testkit": {
       "types": "./dist/testkit.d.ts",
-      "import": "./dist/testkit.js"
+      "import": "./dist/testkit.js",
+      "default": "./dist/testkit.js"
     }
   },
   "files": [

@@ -1705,3 +1705,129 @@ func TestStartReaperTicksAndStopsOnCancel(t *testing.T) {
 		t.Fatal("StartReaper's goroutine did not exit within 2s of ctx cancellation")
 	}
 }
+
+// TestProtectedRefusalNeverSaysUseForce: without -allow-force, an UNFORCED
+// promote onto / destroy of a protected branch must not hand the agent ops'
+// raw "use --force" advice — retrying with force:true would only be refused
+// again by refuseForceOnProtected, a guaranteed wasted round trip. Forced or
+// not, the refusal names -allow-force as the operator's lever, tells the
+// agent not to retry with force, and names the exact CLI command for the
+// human. With -allow-force, an unforced call still gets ops' own refusal
+// (force is honored there, so "use --force" is then true advice).
+func TestProtectedRefusalNeverSaysUseForce(t *testing.T) {
+	ts, w := newTools(t)
+	if r := call(t, ts, "offshoot_fork", map[string]any{
+		"database": "app", "new_branch": "attempt-1"}); r.IsError {
+		t.Fatalf("fork: %s", text(r))
+	}
+	if _, err := w.SetProtected("app", "attempt-1", true); err != nil {
+		t.Fatal(err)
+	}
+	for _, force := range []bool{false, true} {
+		pr := call(t, ts, "offshoot_promote", map[string]any{
+			"database": "app", "source": "attempt-1", "target": "main", "force": force})
+		if !pr.IsError {
+			t.Fatalf("promote onto protected main (force=%v) must be refused", force)
+		}
+		if got := text(pr); strings.Contains(got, "use --force") ||
+			!strings.Contains(got, "-allow-force") ||
+			!strings.Contains(got, "do not retry with force:true") ||
+			!strings.Contains(got, "`offshoot promote app@attempt-1 --onto main --force`") {
+			t.Fatalf("promote refusal (force=%v) must name -allow-force and the CLI command, never --force: %s", force, got)
+		}
+		dr := call(t, ts, "offshoot_destroy", map[string]any{
+			"database": "app", "branch": "attempt-1", "force": force})
+		if !dr.IsError {
+			t.Fatalf("destroy of protected attempt-1 (force=%v) must be refused", force)
+		}
+		if got := text(dr); strings.Contains(got, "use --force") ||
+			!strings.Contains(got, "-allow-force") ||
+			!strings.Contains(got, "do not retry with force:true") ||
+			!strings.Contains(got, "`offshoot destroy app@attempt-1 --force`") {
+			t.Fatalf("destroy refusal (force=%v) must name -allow-force and the CLI command, never --force: %s", force, got)
+		}
+	}
+	ts.SetAllowForce(true)
+	pr := call(t, ts, "offshoot_promote", map[string]any{
+		"database": "app", "source": "attempt-1", "target": "main"})
+	if !pr.IsError || !strings.Contains(text(pr), "use --force") {
+		t.Fatalf("with -allow-force an unforced promote keeps ops' own --force advice: %+v", pr)
+	}
+}
+
+// TestErrorsNameTheAgentsNextStep: the ops errors an agent most often hits
+// come back as the next tool call to make, not CLI advice — checkpoint on a
+// fork never checked out points at offshoot_checkout; fork onto a taken
+// name points at another new_branch or offshoot_destroy; a missing database
+// points at offshoot_list.
+func TestErrorsNameTheAgentsNextStep(t *testing.T) {
+	ts, _ := newTools(t)
+	if r := call(t, ts, "offshoot_fork", map[string]any{
+		"database": "app", "new_branch": "attempt-1"}); r.IsError {
+		t.Fatalf("fork: %s", text(r))
+	}
+	cp := call(t, ts, "offshoot_checkpoint", map[string]any{
+		"database": "app", "branch": "attempt-1", "name": "v1"})
+	if !cp.IsError || !strings.Contains(text(cp),
+		`no checkout for app@attempt-1 yet; call offshoot_checkout {database:"app", branch:"attempt-1"} first`) {
+		t.Fatalf("checkpoint before checkout must point at offshoot_checkout: %+v", cp)
+	}
+	fr := call(t, ts, "offshoot_fork", map[string]any{
+		"database": "app", "new_branch": "attempt-1"})
+	if !fr.IsError || !strings.Contains(text(fr),
+		"branch app@attempt-1 already exists; choose another new_branch, or offshoot_destroy it first.") {
+		t.Fatalf("fork onto a taken name must say what to do: %+v", fr)
+	}
+	for _, tc := range []struct {
+		tool string
+		args map[string]any
+	}{
+		{"offshoot_checkout", map[string]any{"database": "nope"}},
+		{"offshoot_fork", map[string]any{"database": "nope", "new_branch": "x"}},
+		{"offshoot_destroy", map[string]any{"database": "nope", "branch": "main"}},
+	} {
+		r := call(t, ts, tc.tool, tc.args)
+		if !r.IsError || !strings.Contains(text(r), `no database "nope"; call offshoot_list to see what exists`) {
+			t.Fatalf("%s on a missing database must point at offshoot_list: %+v", tc.tool, r)
+		}
+	}
+}
+
+// TestListReportsTTLAndExpiry: offshoot_list's rows carry `ttl` and an
+// RFC3339 `expires_at` for a TTL'd fork, and omit both for a branch with
+// no TTL (main), so an agent can see which forks are about to expire
+// without a per-branch touch.
+func TestListReportsTTLAndExpiry(t *testing.T) {
+	ts, _ := newTools(t, 2*time.Hour)
+	if r := call(t, ts, "offshoot_fork", map[string]any{
+		"database": "app", "new_branch": "attempt-1"}); r.IsError {
+		t.Fatalf("fork: %s", text(r))
+	}
+	lr := call(t, ts, "offshoot_list", map[string]any{})
+	if lr.IsError {
+		t.Fatalf("list: %s", text(lr))
+	}
+	rows, _ := lr.StructuredContent.(map[string]any)["branches"].([]map[string]any)
+	seen := map[string]map[string]any{}
+	for _, m := range rows {
+		seen[m["branch"].(string)] = m
+	}
+	if _, ok := seen["main"]["ttl"]; ok {
+		t.Fatalf("main has no TTL, so its row must omit ttl: %v", seen["main"])
+	}
+	if _, ok := seen["main"]["expires_at"]; ok {
+		t.Fatalf("main has no TTL, so its row must omit expires_at: %v", seen["main"])
+	}
+	att := seen["attempt-1"]
+	if att["ttl"] != "2h0m0s" {
+		t.Fatalf("attempt-1 ttl = %v, want 2h0m0s: %v", att["ttl"], att)
+	}
+	exp, _ := att["expires_at"].(string)
+	when, err := time.Parse(time.RFC3339, exp)
+	if err != nil {
+		t.Fatalf("attempt-1 expires_at %q is not RFC3339: %v", exp, err)
+	}
+	if until := time.Until(when); until < time.Hour || until > 3*time.Hour {
+		t.Fatalf("attempt-1 expires_at %s is not about 2h out", exp)
+	}
+}

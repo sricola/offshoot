@@ -38,6 +38,54 @@ If GitHub's reporting flow isn't available to you for some reason, email the
 maintainer directly (see the CODE_OF_CONDUCT.md contact section) with
 `[security]` in the subject.
 
+## Threat model: what is actually enforced
+
+The boundaries offshoot enforces today, and the ones it does not. Each
+claim names the code that implements it.
+
+**Local socket.** `offshoot serve` listens on a unix socket created `0600`
+under a `0700` cache directory (`internal/daemon/server.go`). Anyone who
+can open that socket is trusted as the daemon's own user: there is no
+per-request authentication, and a socket client's `path` field (`export`'s
+destination, `create`'s import source) is used as an ordinary server-side
+path that same-user caller could already read or write.
+
+**HTTP.** Off by default. `-http` binds loopback with no further
+acknowledgment; a non-loopback bind additionally requires
+`-http-allow-non-loopback` and an explicit operator token of at least 16
+characters (`-token`/`OFFSHOOT_TOKEN`). Every request but `GET /healthz`
+must carry `Authorization: Bearer <token>`, compared with
+`crypto/subtle.ConstantTimeCompare`; `export` and `create` with a path are
+refused over HTTP (`internal/daemon/http.go`). There is no TLS: a
+non-loopback bind belongs behind a trusted network boundary of your own.
+
+**Names and paths.** Database, branch and checkpoint names are 1–128
+characters of `[a-z0-9-_.]`, never starting with `-`, never `.` or `..`
+and never containing `..`, validated at the ops layer, at `PutRef` in the
+store, and at the MCP tool boundary (`store.ValidateName`). Every local
+path derived from a name goes through one containment check against the
+workspace root (`internal/ops/ops.go`), and the local store refuses keys
+that escape its directory.
+
+**File modes.** Store objects and writable checkouts are `0600`;
+read-only historical checkouts (`checkouts-ro`) are `0444`; the `.sum`
+sidecars beside a checkout hold metadata only (lineage id, txid, checksum)
+and are `0644`; directories are `0700`.
+
+**MCP.** `offshoot mcp` speaks stdio only — no network listener. Its
+`promote` and `destroy` tools honor protected branches and refuse an
+agent-supplied `force` against one unless the server was started with
+`-allow-force` (`internal/mcp/tools.go`).
+
+**Not protected against:**
+
+- Other local users on a shared host, beyond ordinary file permissions.
+- Anyone with write access to the store bucket or directory: a writer
+  there is fully trusted, and can replace refs and objects.
+- A hostile `PATH`: `offshoot diff` resolves `sqldiff` via `PATH`
+  (`internal/ops/diff.go`). offshoot never invokes `sqlite3` itself; the
+  `sqlite3` you run against a checkout is your own.
+
 ## What counts as a security issue
 
 offshoot is a durability tool — the failure modes that matter most are the

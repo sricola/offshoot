@@ -263,8 +263,12 @@ class Client:
         return cast(str, resp["checkout"])
 
     def fork(self, db: str, source: str, new: str, from_checkpoint: str | None = None,
-              ttl: _TTL = None, meta: dict[str, str] | None = None) -> int:
+              ttl: _TTL = None, meta: dict[str, str] | None = None, *,
+              at: str | None = None) -> int:
         """Branch `new` off db@source (at from_checkpoint, or source's head).
+
+        at is an alias for from_checkpoint, named like the CLI's `--at` and
+        the MCP tool's `at`; passing both with different values is an error.
 
         meta (None = no metadata) is a small string->string map describing
         the new branch's lineage (e.g. eval run id, git SHA, agent id),
@@ -273,6 +277,11 @@ class Client:
 
         Returns the fork point's txid.
         """
+        if at is not None:
+            if from_checkpoint is not None and from_checkpoint != at:
+                raise ValueError(f"fork: from_checkpoint={from_checkpoint!r} and at={at!r} "
+                                 "name different checkpoints; pass one of them")
+            from_checkpoint = at
         resp = self._call("fork", db=db, branch=source, name=new, ttl=_ttl_str(ttl),
                             meta=meta or None, **{"from": from_checkpoint or ""})
         return cast(int, resp.get("txid", 0))
@@ -556,6 +565,11 @@ class Session:
         resp = self._client._call("flush", db=self._db, branch=self._branch, name=name,
                                     meta=meta or None)
         return cast(int, resp.get("txid", 0))
+
+    def checkpoint(self, name: str, meta: dict[str, str] | None = None) -> int:
+        """Alias of :meth:`flush` with a required name: a named flush is
+        exactly `offshoot checkpoint` on a live session."""
+        return self.flush(name, meta)
 
     def close(self) -> None:
         """Close the session, releasing its lease."""

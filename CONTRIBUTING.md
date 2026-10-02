@@ -9,18 +9,35 @@ quickly.
 
 You need:
 
-- Go 1.26+
-- cgo (offshoot uses `github.com/mattn/go-sqlite3`, which is cgo-backed —
-  there's no pure-Go build)
-- the `sqlite3` CLI on `PATH` (the test suite shells out to it as a stock
-  foreign writer and for `.dump` equivalence checks)
+- Go 1.26+ with cgo enabled, which means a C compiler on `PATH` (offshoot
+  uses `github.com/mattn/go-sqlite3`, which is cgo-backed — there's no
+  pure-Go build). macOS: `xcode-select --install`; Debian/Ubuntu:
+  `apt-get install build-essential`.
+- The `sqlite3` **and** `sqldiff` CLIs on `PATH`. The test suite shells out
+  to `sqlite3` as a stock foreign writer and for `.dump` equivalence checks,
+  and `offshoot diff`'s default mode (and its tests) call `sqldiff`.
+  - macOS: `brew install sqlite sqldiff`, then
+    `export PATH="$(brew --prefix sqlite)/bin:$PATH"` — the `sqlite`
+    formula is keg-only, so brew does not link its `sqlite3` into `PATH`
+    for you (and the stock macOS image may not ship one at all).
+  - Debian/Ubuntu: `apt-get install sqlite3 sqlite3-tools` (`sqldiff` is in
+    `sqlite3-tools`).
 - Linux or macOS — there are no Windows code paths, and none are planned for
   v1
 
+Tests gated on `sqlite3`/`sqldiff` **skip** when the binary is missing
+locally, but **fail** when the `CI` environment variable is set (GitHub
+Actions sets it automatically; see `internal/testutil/require.go`). So a
+green `go test ./...` on a machine without `sqldiff` proves less than it
+looks like; run `CI=1 go test ./...` to turn those skips into failures and
+confirm your setup is complete.
+
 Optional, only needed for the SDK test tier:
 
-- Python 3.10+ as `python3` (Python SDK tests and tooling)
-- Node 20+ (TypeScript SDK tests)
+- Python 3.10+ as `python3` (Python SDK tests and tooling; macOS: `brew
+  install python@3.12`, Debian/Ubuntu: `apt-get install python3`)
+- Node 20+ (TypeScript SDK tests; macOS: `brew install node`, elsewhere
+  via [nodejs.org](https://nodejs.org/) or your package manager)
 
 Optional, only needed for the pytest fixture plugin's OWN test tier
 (`sdk/python/offshoot/pytest_plugin.py` — the `offshoot-db[pytest]` extra;
@@ -41,7 +58,7 @@ python3 -m venv .venv-langgraph
 
 ```
 go build -o offshoot ./cmd/offshoot
-go vet ./...
+make lint   # gofmt + go vet + staticcheck (staticcheck is advisory locally)
 ```
 
 ### Refreshing the hash-pinned CI requirements
@@ -110,8 +127,29 @@ behavior, which is what the whole compare-and-swap safety story rests on.
 
 ## Local CI
 
-`make ci-local` runs `.github/workflows/ci.yml`'s four jobs locally, in
-minutes instead of waiting on a runner:
+`.github/workflows/ci.yml` runs five jobs on every PR: `test` (ubuntu,
+gofmt + `go vet` + `go test ./... -race`), `cow-paths` (macOS), `metrics-lint`
+(promtool over the exposition format), `sdks` (both SDK suites plus the
+publish dry-run), and `s3-conformance` (RustFS in Docker). Prose-only
+changes (`docs/**`, `site/**`, `**.md`) skip ci.yml entirely by design;
+`.github/workflows/pages.yml` builds the docs site on those PRs instead, so
+a broken intra-doc link still fails the PR.
+
+`cow-paths` is the one macOS job: since v0.2.12 checkouts clone from a
+by-chain cache entry and at-rest checkpoints diff against a reflinked
+shadow, and those fast paths only run on a filesystem that can clone, which
+ubuntu's ext4 cannot — so that job runs just the packages holding those
+paths on APFS, and proves a clone works before trusting the result. The
+expensive tiers live in `.github/workflows/nightly.yml`: `torture` daily,
+`fuzz` daily, `macos-test` (the full `go test ./...` on macOS) weekly, and
+`real-provider-conformance` against AWS S3 daily (on `main`, when the
+`NIGHTLY_S3` repository variable is on). [docs/testing.md](docs/testing.md) explains what each of those
+proves.
+
+`make ci-local` mirrors the `test`, `s3-conformance` and `sdks` jobs
+locally through four targets, in minutes instead of waiting on a runner
+(`cow-paths` needs a real APFS runner and `metrics-lint` a pinned promtool;
+see "What it does NOT replicate" below):
 
 | Target | Mirrors | What it needs |
 |---|---|---|
@@ -120,7 +158,7 @@ minutes instead of waiting on a runner:
 | `make ci-local-s3` | the `s3-conformance` job | Docker (spins up RustFS at the digest ci.yml pins, runs `make test-s3`, always tears down) |
 | `make ci-local-sdks` | the `sdks` job | `python3`, Node 20+, and optionally `pip install build twine` for the `dry-run-sdks` step (skipped loudly, not silently, if absent) |
 
-`make ci-local` runs all four in sequence and prints a pass/fail-per-job
+`make ci-local` runs those four in sequence and prints a pass/fail-per-job
 summary table with timings; a single job is runnable alone too. See
 `scripts/ci-local.sh`'s header comment for the job-by-job detail.
 
@@ -202,9 +240,16 @@ architectures, creates a GitHub release, and publishes a `ghcr.io` Docker
 image. `workflow_dispatch` builds the same artifacts under a
 `dev-<short-sha>` name without tagging, for a smoke check before tagging.
 
-On each release, also bump the packaging surfaces: `Formula/offshoot.rb`'s
-`url` + `sha256`, and the version chip in
-`site/index.html`'s header (the one place the site states the number).
+Before tagging, bump every surface that states the number, in one PR:
+
+1. `CHANGELOG.md` — a `## [X.Y.Z] - YYYY-MM-DD` header above the entries
+2. `Formula/offshoot.rb`'s `url` + `sha256`
+3. `server.json`'s `"version"` (the MCP registry manifest)
+4. `docs/ci-recipes.md`'s `OFFSHOOT_VERSION: vX.Y.Z` pins
+5. the version chip in `site/index.html`'s header
+
+`scripts/check-version-surfaces.sh vX.Y.Z` fails loudly, naming each
+surface that disagrees with the tag, so run it before pushing the tag.
 
 ### SDK releases
 

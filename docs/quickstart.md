@@ -17,7 +17,7 @@ $ offshoot create demo
 
 `init` creates the store — a plain directory, `./.offshoot` by default —
 and `create` makes a database named `demo` with a `main` branch, protected
-by default. (`create` prints nothing on success.)
+by default (`create` confirms with one line).
 
 ## 2. Check out and seed it
 
@@ -139,7 +139,10 @@ repoint `main` at the experiment's head and ship it (`--force` because
   with the ordinary `sqlite3` client; offshoot never proxies your SQL.
 - **`checkpoint`** — you named durable states
   ([checkpoint](concepts.md#checkpoint)) you could later fork from, diff
-  against, or roll back to.
+  against, or roll back to. Checkpoints belong to one branch and are not
+  inherited by forks — `fork --at <name>` starts a fork from a parent's
+  checkpoint — and `promote` replaces the target's checkpoint list with a
+  single `promote` entry.
 - **`fork`** — you created an isolated branch that
   [shares its parent's storage copy-on-write](concepts.md#base-pointer-copy-on-write)
   via a base pointer: instant, near-zero bytes, fully isolated writes.

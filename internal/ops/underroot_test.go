@@ -34,8 +34,8 @@ func mustPanic(t *testing.T, label string, f func() string) {
 // roots.
 func TestUnderRootAcceptsEveryValidNameShape(t *testing.T) {
 	names := []string{
-		"a", "main", "z9", "0", "-", "_", ".a", "a.", "a.b.c", "my-db_1.v2",
-		"--x--", "__", strings.Repeat("a", 64),
+		"a", "main", "z9", "0", "_", ".a", "a.", "a.b.c", "my-db_1.v2",
+		"x--", "__", strings.Repeat("a", 64),
 	}
 	for _, n := range names {
 		if err := store.ValidateName(n); err != nil {

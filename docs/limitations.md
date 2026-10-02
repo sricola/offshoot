@@ -73,18 +73,35 @@ checkpointed, serialize at-rest checkpoints per branch, or fork per writer.
 
 **What:** the supported topology today is exactly one daemon (and its
 CLI) per store. Pointing daemons on two machines — or two daemons on one
-machine — at the same bucket or directory is not yet safe, even though
-each branch has only one leased writer.
+machine — at the same bucket or directory is not supported and has not
+been tested, even though each branch has only one leased writer.
 
 **Why:** the epoch-fencing scheme protects the live-session write path,
 but three pieces of groundwork for shared-store fleets haven't landed:
-the at-rest command paths (`checkpoint`, `rollback`, `promote`, `compact`
-run from a second machine) write without taking the branch lease; lease
+the at-rest verbs (`checkpoint`, `rollback`, `promote`, `compact`) still
+write without taking the branch lease — they refuse a live one instead
+(below), which is a same-host courtesy, not a cross-host protocol; lease
 holder identity is hostname+pid, which containers can collide; and lease
 expiry is judged against the claimant's wall clock, so large clock skew
 between machines could steal a live lease. Each is fixable — the fencing
 core is designed for this — and multi-daemon safety is the named first
 step of any future fleet work ([non-goals](../ROADMAP.md#non-goals-v1)).
+
+**The same-host rule (v0.2.14):** on the one supported host, the at-rest
+verbs `checkpoint`, `rollback`, `promote --onto`, and `compact` refuse a
+branch that has a live lease — an open daemon session, or `offshoot lease
+acquire` — unless `--force`, and refuse a branch that is mid-`destroy` or
+mid-reap outright (no flag overrides that). A lease on `promote`'s
+*source* never blocks; only the target's does. `--force` fences the
+session: the repoint or checkpoint clears the lease and bumps the epoch,
+the session's next flush fails rather than writing under a dead epoch,
+and whatever it had committed since its last flush — up to one
+`-flush-every` interval, default 30 s — never reaches the store.
+`checkpoint` also refuses a *detached* checkout (one whose sidecar
+lineage no longer matches the ref, because the branch was repointed after
+it was materialized) unless `--force`, since checkpointing it would
+silently revert the repoint. `destroy` already applied the same live-lease
+rule.
 
 **Instead:** shard by store, not by daemon: give each host its own store
 (the eval-harness per-worker pattern), and move state between them with
@@ -169,12 +186,21 @@ against a store that can't provide it — fail-closed, on every CLI
 invocation.
 
 **Verified providers, honestly labeled:** RustFS (conformance suite runs against real RustFS in CI on every PR; MinIO was verified through v0.2.9 and is no longer re-verified since its images were withdrawn) and AWS S3 (probe + conformance +
-multipart against a real us-east-1 bucket, 2026-08-13). **Google Cloud
-Storage is unsupported** — its S3-interop API has no conditional writes,
+multipart against a real us-east-1 bucket, nightly in CI since
+2026-09-25). **Google Cloud Storage is unsupported** — its S3-interop API has no conditional writes,
 so the probe refuses it outright
 ([why](faq.md#why-no-google-cloud-storage)). Other S3-compatible
 endpoints may work but aren't claimed until the conformance suite passes
 against them for real.
+
+**Assumed of the object store, not probed:** strong read-after-write and
+`LIST` consistency — offshoot reads a ref back after a compare-and-swap
+and lists a lineage prefix to resolve a chain, and an eventually
+consistent store could show a stale ref or an incomplete chain. AWS S3
+(since December 2020), RustFS and MinIO all provide this. The conditional
+multipart path (objects over 5 GiB) runs against the in-process fake S3 on
+every `go test` and against a real provider only on RustFS (every PR) and
+AWS (nightly).
 
 ## Durability advances on flush, and the window is explicit
 
@@ -195,21 +221,32 @@ tighter than the cadence, or lower `-flush-every`.
 
 ## Crash behavior: what's proven, and what isn't
 
-**What's proven:** the kill -9 torture harness runs a stock `sqlite3`
-writer and `SIGKILL`s it mid-write on roughly half of every round, while
-bouncing the capture engine mid-traffic every 10th round; the replica
-must converge to byte-identical dump output after every round. A real
+**What's proven:** the torture harness runs a stock `sqlite3` writer and
+`SIGKILL`s it mid-write in roughly half of every round, while bouncing
+the capture engine through its graceful shutdown every 10th round; the
+replica must converge to byte-identical dump output after every round. A
 300-second run is ~3,500 rounds with zero divergence, and it runs in CI
 on a nightly cadence ([the harness in full](testing.md#the-kill--9-torture-harness)).
 On daemon restart, a WAL/txid mismatch (e.g. the agent's autocheckpoint
 ran while the daemon was down) marks the checkout dirty and preserves the
-tail as an orphan fork rather than pretending continuity.
+tail as an orphan fork rather than pretending continuity. "Crash-tested"
+in these docs means the *writer's* crash.
 
-**What isn't:** the harness bounces the capture engine through its
-graceful-shutdown path — it does not `SIGKILL` the capturer process
-itself. That case is argued safe in the code's shutdown/resume comments
-but is not exercised by the harness, and this page says so because the
-testing page does.
+**What isn't:** the harness never `SIGKILL`s the daemon or the capturer
+process — it bounces the engine through its graceful-shutdown path. That
+case is argued safe in the code's shutdown/resume comments but is not
+exercised. A daemon that dies, however it dies, loses up to one
+`-flush-every` interval (default 30 s) of committed-but-unflushed writes
+([the window](#durability-advances-on-flush-and-the-window-is-explicit)).
+No power-loss test exists either: since v0.2.14 every rename into place
+(local store objects and refs, materialized checkouts, capture state) is
+followed by a directory `fsync(2)` (the plain call, not macOS's
+`F_FULLFSYNC` disk-cache flush, which costs tens of milliseconds per
+rename and is not needed to order a name behind an already-synced file),
+and `.sum` sidecars are written atomically but not synced — they are a
+cache that a reader re-derives by hashing — so a local store is
+*designed* to keep what was flushed across power loss, but that design is
+not torture-tested.
 
 ## Lease expiry is advisory; the fence is the guarantee
 
@@ -321,10 +358,22 @@ milliseconds don't):
   bearer-token auth; a non-loopback bind requires explicit
   acknowledgment plus an explicit token, and belongs behind a trusted
   network boundary ([threat model](operations.md#httpauth-threat-model)).
-- **No multi-node orchestration** — nodes sharing a bucket won't corrupt
-  each other (fencing guarantees that), but there's no placement,
-  failover, or routing, deliberately
+- **No multi-node orchestration** — and no multi-node anything: two
+  daemons on one store are unsupported
+  ([one daemon per store](#one-daemon-per-store)); placement, failover,
+  and routing are deliberately out of scope
   ([non-goals](../ROADMAP.md#non-goals-v1)).
+- **The local store's per-key lock is time-broken.** A local store
+  serializes writes to one key on a `.lock` file, and a lock older than
+  30 s is broken on the assumption its holder died; since v0.2.14 the lock
+  is held only around the compare and the rename (the object is streamed
+  to a temp file first), so a legitimate hold is milliseconds — but a
+  process paused for over 30 s inside that window can have its lock
+  broken.
+- **Never `export --force` over a database another process has open.**
+  `export` writes a temp file and renames it over the destination; a
+  process with the old file open keeps writing to the replaced inode, and
+  its uncheckpointed WAL writes are orphaned with it.
 - **No page-level dedupe** — copy-on-write shares whole objects between a
   fork and its own ancestors only, never across unrelated databases
   ([non-goals](../ROADMAP.md#non-goals-v1)).

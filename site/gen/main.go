@@ -111,6 +111,10 @@ func main() {
 		}
 	}
 
+	// Every docs/**/*.md must be a site page or explicitly allowlisted off
+	// the site (coverage.go) — a doc nobody wired into nav.go fails here.
+	reportDocsCoverage(root, bySrc)
+
 	md := goldmark.New(
 		goldmark.WithExtensions(
 			extension.GFM,

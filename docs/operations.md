@@ -143,7 +143,7 @@ paged-at-3am version — what each state means for *you*, right now.
 | `error` | A session is open and its `Err()` is non-nil — lease loss, a capture failure, a contract violation. **This is the state to alert on.** `session status` (or the daemon `status` op) names the actual error. | Daemon only |
 | `dirty` | No live lease; a checkout exists with un-checkpointed local edits (content hash differs from the ref, sidecar identity otherwise matches). Expected mid-workflow (someone's `sqlite3`'d the checkout by hand); unexpected on a branch you thought was fully flushed. | Both |
 | `detached` | No live lease; a checkout's sidecar-recorded lineage no longer matches the ref's current lineage — an orphan left behind by a `rollback`/`promote` whose best-effort checkout refresh didn't run (the checkout was busy at repoint time). Re-run `offshoot checkout` to fix it; the old checkout content isn't wrong, just stale relative to a branch that moved on. | Both |
-| `idle` | None of the above — nothing going on. **Not in the original design spec** (see reference.md's note); added because at-rest `offshoot status` has no daemon and needs a name for "quiet." | Both |
+| `idle` | None of the above — nothing going on. **A deliberate addition** to the original state taxonomy (see reference.md's note); added because at-rest `offshoot status` has no daemon and needs a name for "quiet." | Both |
 
 **Precedence, most to least specific:** `error` > `pending` > `active` >
 `dirty` > `detached` > `idle`. `error` and `pending` can never both apply to
@@ -248,7 +248,7 @@ eviction pass that can even name a `checkouts/` path, so a leased, currently
 open session's checkout survives even the most aggressive budget (`1`, which
 forces every `checkouts-ro` entry out) untouched. FD budgets beyond this are
 deliberately out of scope for this milestone — see
-[Deliberately out of scope](#deliberately-out-of-scope-in-m4) below.
+[Deliberately out of scope](#deliberately-out-of-scope) below.
 
 **The LRU clock is a `.last-used` touch-on-hit file, not the cache file's
 own mtime.** A cache file's mtime is set exactly once, by the materialize
@@ -358,7 +358,7 @@ exists. `offshoot status` does not take this shortcut; it always hashes.
 as of its last checkout or checkpoint. An at-rest `offshoot checkpoint`
 diffs the checkout against it and uploads a segment of the changed pages
 instead of a full snapshot when it can (the rule is in
-[reference.md](reference.md#offshoot-checkpoint-dbbranch-name---snapshot---meta-kv-)).
+[reference.md](reference.md#offshoot-checkpoint-dbbranch-name---snapshot---meta-kv----force)).
 It shares blocks with the checkout until pages diverge, so its real cost
 is the pages changed since the last checkpoint. `offshoot destroy` removes
 it; deleting it by hand just makes the next checkpoint a snapshot.
@@ -510,6 +510,81 @@ design. `POST /rpc` request bodies are capped at 1MiB
 (`http.MaxBytesReader`); an oversized body gets `413`, and the connection
 stays usable afterward.
 
+## What a flush costs
+
+A daemon flush writes only the pages that changed since the previous
+flush. Every sixteenth flush writes a full snapshot instead, so
+materializing a branch never replays an unbounded chain: a read applies
+one snapshot plus at most fifteen segments. `offshoot serve
+-snapshot-every N` tunes that cadence (default 16) — lower N means
+cheaper, more tightly bounded reads; higher N amortizes the full-snapshot
+upload across more flushes — see `offshoot serve`'s entry in
+[reference](reference.md) for the full trade-off. An idle
+session — nothing committed since the last successful flush — skips the
+tick entirely, so a quiet session pays nothing; cost scales with what the
+agent actually writes, not wall-clock time.
+
+A session whose checkout had to be (re)materialized at open pays one
+settling full-snapshot flush, once per session; a session reopened against
+a clean, current checkout uploads nothing at all for it. The measurement
+and the exact suppression condition:
+[benchmarks](benchmarks.md#settling-flush-cost)
+and `internal/session/session.go`'s `rebaseline` doc comment.
+
+The at-rest `offshoot checkpoint` has no capture engine, so it keeps its
+own record of what changed: a reflinked `.shadow` of the checkout as of
+the last checkpoint. It diffs against that and writes a segment of the
+changed pages when fewer than half changed and the chain is under the
+snapshot cadence, else a full snapshot (`--snapshot` forces one). The diff
+still reads the whole file locally, and on a filesystem that cannot clone
+(ext4, tmpfs) there is no shadow and every at-rest checkpoint is a full
+snapshot — there, if you checkpoint large databases in a loop, run a
+daemon.
+
+Forking is a different cost from flushing — usually no storage cost at
+all. `offshoot fork` shares the parent's already-durable objects through a
+base pointer: the child records where it forked from and writes new
+objects only as it diverges, so N forks of a G-byte database cost
+near-zero added store bytes rather than N×G, and reads stay bounded by
+construction. The asymmetry to know: **fork, `promote` and `rollback`
+share; `compact` materializes a full independent copy**, because cutting
+the base pointer is its purpose, and `--materialize` on `promote` or
+`rollback` asks for a copy too (measured numbers in
+[benchmarks](benchmarks.md)). Destroying
+a parent stays instant, but its bytes are reclaimed only once no surviving
+shared child still reads through them — `offshoot compact` cuts that cord
+on demand. The first shared fork bumps the store to layout version 2,
+which locks pre-copy-on-write binaries out of the whole store — the
+refusal is the protection. Full model:
+[reference](reference.md)'s `fork`/`compact`/`destroy`
+sections and
+[storage sharing](#storage-sharing-copy-on-write-forks);
+the storage-cost ledger, stated plainly:
+[FAQ](faq.md#storage-cost-honestly).
+
+## Resource behavior
+
+An open session's FD footprint is small and fixed. Disk is the sharper
+cost: `Checkout` reuses a checkout that's already clean and current at the
+branch's head instead of re-materializing it, so a daemon that keeps
+reopening the same untouched branch stays flat. A checkout that *does* get
+re-materialized (dirty, stale, or destroyed while an earlier descriptor
+still points at it) strands one descriptor — and the disk behind it — for
+the life of the daemon process; restarting the daemon reclaims everything.
+The tradeoff to know: a clean-and-current checkout is served straight from
+disk without consulting the store's chain. Full mechanics and caveats:
+[Budgets](#budgets) and
+[status](status.md)'s resource-behavior rows.
+
+**Read-only historical checkouts** (`offshoot checkout --at <checkpoint>
+--read-only`) live in a separate `checkouts-ro/` tree — one `chmod 0444`
+file per `(db, branch, checkpoint)`, no sidecar, no lease, no stranded
+descriptor. The same tree holds `~by-chain/`, the immutable entries every
+checkout is cloned from where the filesystem can clone. **It is safe to
+`rm -rf` the entire `checkouts-ro` directory at any time**; the next call
+rebuilds what it needs from the store. `offshoot export`'s output has the same
+zero-ongoing-relationship property, written wherever you pointed it.
+
 ## Tuning flags
 
 All five are `offshoot serve` flags; none are persisted, so a restarted
@@ -547,14 +622,13 @@ quiet session pays none of this regardless of how the two flags are tuned.
 Tightening `-flush-every` (more frequent flushes) without also raising
 `-snapshot-every` means paying that full-snapshot cost more often in
 wall-clock terms, not just more often per flush count; see [What a flush
-costs](../README.md#what-a-flush-costs) in the README and
+costs](#what-a-flush-costs) in the README and
 [docs/benchmarks.md](benchmarks.md) for the measured numbers behind this
 trade-off.
 
-## Deliberately out of scope (in M4)
+## Deliberately out of scope
 
-Considered for this milestone and explicitly declined, not simply not yet
-started:
+Considered and explicitly declined, not simply not yet started:
 
 - **Multi-node anything** — placement, failover, cross-node routing. See
   the top of this page and [ROADMAP.md](../ROADMAP.md#non-goals-v1).
@@ -575,6 +649,56 @@ started:
 
 See [docs/status.md](status.md) for the authoritative shipped/deferred
 matrix these bullets summarize.
+
+## Recovering data without offshoot
+
+Nothing offshoot stores needs offshoot to read back. Two of its outputs
+are stock SQLite already: every checkout under `checkouts/<db>/<branch>.db`
+and every `offshoot export` file open with plain `sqlite3`. The store
+itself is a flat key space of small JSON refs and LTX objects, and the
+pinned upstream `github.com/superfly/ltx` module ships a CLI that reads
+them:
+
+```
+go install github.com/superfly/ltx/cmd/ltx@v0.5.3   # the version in go.mod
+```
+
+**Layout** (a local store is a directory with these paths; an S3 store
+has the same keys under its prefix):
+
+| Key | What it is |
+|---|---|
+| `refs/<db>/<branch>` | The branch ref, one JSON object: `lineage`, `epoch`, `head_txid`, the checkpoint map (name → txid), TTL, lease, protected flag |
+| `data/<lineage>/<epoch>/snapshot-<txid>.ltx` | A full snapshot of the database at `<txid>` (16 hex digits, zero-padded) |
+| `data/<lineage>/<epoch>/segment-<max>-<min>.ltx` | A segment covering transactions `<min>`..`<max>` (same 16-hex form; note the max comes first in the key, so a listing sorts by end) |
+| `data/<lineage>/base.json` | Present only for a shared (copy-on-write) lineage: the parent lineage and txid it reads through below its own first object |
+
+**Rebuilding a branch by hand.** Read the ref for its `lineage` and
+`head_txid`. Within `data/<lineage>/`, pick the newest snapshot whose txid
+is at or below the head, then every segment after it up to the head, in
+txid order (a lineage can span more than one `<epoch>` directory; order by
+txid, not by epoch). Decode them into a database with the ltx CLI:
+
+```
+ltx verify data/<lineage>/<epoch>/snapshot-<txid>.ltx            # checksums
+ltx list   data/<lineage>/<epoch>/*.ltx                           # txid ranges per file
+ltx apply  -db out.db snapshot-<txid>.ltx segment-...ltx ...     # in txid order
+```
+
+`ltx dump` prints a file's header and page list for inspection. If the
+lineage has a `base.json`, its own objects start above the base txid:
+rebuild the parent lineage named in `base.json` up to that txid first
+(recursively — a base can itself point at a shared lineage), then apply
+this lineage's objects on top. A checkpoint is just a name for a txid in
+the ref, so any checkpoint is reachable the same way with its txid as the
+target.
+
+**One checksum caveat.** offshoot's rolling checksum (the value a ref and
+an object trailer carry) deliberately skips SQLite's lock page — the page
+at byte offset 1 GiB that SQLite never writes — while `ltx checksum`
+includes it. For a database over 1 GiB the two therefore disagree;
+`ltx apply` and `ltx verify` are unaffected, since they check each file's
+own embedded checksums, and the applied database is correct.
 
 ## See also
 

@@ -182,7 +182,8 @@ except ImportError as e:  # pragma: no cover - exercised only when the
     # fires), so this only matters for a stray direct import.
     raise ImportError(
         "offshoot.pytest_plugin requires pytest; install the extra: "
-        'pip install "offshoot-db[pytest]"'
+        'pip install "offshoot-db[pytest] @ '
+        'git+https://github.com/sricola/offshoot#subdirectory=sdk/python"'
     ) from e
 
 from .client import Client, OffshootError, Session, connect

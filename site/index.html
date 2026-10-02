@@ -3,11 +3,11 @@
 <head>
 <meta charset="utf-8">
 <meta name="viewport" content="width=device-width, initial-scale=1">
-<title>offshoot — branchable SQLite for AI agents</title>
+<title>offshoot — branch SQLite like git</title>
 <meta name="description" content="Branch SQLite like git: create, fork, checkpoint, rollback, promote. Stock SQLite files, your local disk or S3 bucket, one binary. Built for AI agents and eval harnesses.">
 <link rel="canonical" href="https://sricola.github.io/offshoot/">
 <meta property="og:title" content="offshoot — branch SQLite like git">
-<meta property="og:description" content="Copy-on-write forks, checkpoint/rollback/promote, kill-9-durable capture. Stock SQLite files on local disk or S3. Built for AI agents and eval harnesses.">
+<meta property="og:description" content="Copy-on-write forks, checkpoint/rollback/promote, crash-tested capture (writer kill -9). Stock SQLite files on local disk or S3. Built for AI agents and eval harnesses.">
 <meta property="og:type" content="website">
 <meta property="og:url" content="https://sricola.github.io/offshoot/">
 <meta property="og:image" content="https://sricola.github.io/offshoot/og.png">
@@ -15,7 +15,7 @@
 <meta property="og:image:height" content="630">
 <meta name="twitter:card" content="summary_large_image">
 <meta name="twitter:title" content="offshoot — branch SQLite like git">
-<meta name="twitter:description" content="Copy-on-write forks, checkpoint/rollback/promote, kill-9-durable capture. Stock SQLite files on local disk or S3. Built for AI agents and eval harnesses.">
+<meta name="twitter:description" content="Copy-on-write forks, checkpoint/rollback/promote, crash-tested capture (writer kill -9). Stock SQLite files on local disk or S3. Built for AI agents and eval harnesses.">
 <meta name="twitter:image" content="https://sricola.github.io/offshoot/og.png">
 <link rel="icon" href="data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 32 32'%3E%3Cpath d='M10 28V14M10 14v-4a4 4 0 0 1 4-4h0M10 14c0-4 3-7 8-7h4' stroke='%23a9cd7c' stroke-width='3.4' fill='none' stroke-linecap='round'/%3E%3Ccircle cx='10' cy='28' r='3' fill='%23a9cd7c'/%3E%3Ccircle cx='25' cy='7' r='3' fill='%23d9a05b'/%3E%3C/svg%3E">
 <script>(function(){var t=localStorage.getItem("theme");if(t==="dark"||t==="light")document.documentElement.dataset.theme=t})()</script>
@@ -294,10 +294,12 @@ footer .g{color:var(--accent)}
     incremental segments. A read applies one snapshot and at most fifteen segments
     (default cadence), checksum-verified member by member — a torn chain is a loud
     error, never a short read.</li>
-    <li><b>kill&nbsp;-9 durable</b> — one writer per branch, enforced by leases and epoch
-    fencing; every ref update is a compare-and-swap. Validated by a torture harness
-    that kill&nbsp;-9's a stock sqlite3 writer mid-write on roughly half of every
-    round and requires the replica to converge byte-identical, every round.</li>
+    <li><b>writer kill&nbsp;-9 tested</b> — one writer per branch, enforced by leases and epoch
+    fencing; every ref update is a compare-and-swap. A torture harness kill&nbsp;-9's a
+    stock sqlite3 writer mid-write in roughly half of every round and requires the
+    replica to converge byte-identical, every round. The daemon itself is bounced
+    gracefully, not killed, and a daemon that dies loses up to <code>-flush-every</code>
+    (30&nbsp;s) of unflushed writes.</li>
     <li><b>Stock everything</b> — a checkout is a real SQLite file — open it with plain
     <code>sqlite3</code>, no forked engine, no special VFS on the read path.
     Snapshots and refs live in a local directory or any S3-compatible bucket with
@@ -320,9 +322,9 @@ footer .g{color:var(--accent)}
     <div>
       <p class="label">mcp · the agent branches on its own</p>
       <pre><code><span class="p">$</span> claude mcp add offshoot -- offshoot mcp
-<span class="c"># seven tools: list, checkout, checkpoint,
-# fork, rollback, promote, destroy —
-# agent forks default to a 24h TTL</span></code></pre>
+<span class="c"># nine tools: list, checkout, checkpoint,
+# fork, rollback, promote, destroy, touch,
+# diff — agent forks default to a 24h TTL</span></code></pre>
     </div>
   </div>
   <p class="note">The daemon captures every committed transaction while your agent keeps
@@ -338,6 +340,7 @@ footer .g{color:var(--accent)}
   <h2>install</h2>
   <pre><code><span class="c"># homebrew</span>
 <span class="p">$</span> brew tap sricola/offshoot https://github.com/sricola/offshoot
+<span class="p">$</span> brew trust sricola/offshoot
 <span class="p">$</span> brew install offshoot
 
 <span class="c"># docker — images publish to ghcr on every tagged release; the store lives in /data</span>

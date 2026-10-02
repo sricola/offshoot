@@ -229,12 +229,12 @@ scoped and named as such below rather than silently dropped. See
 [docs/status.md](docs/status.md)'s Observability/Resource-behavior sections
 for the shipped-and-tested rows, [docs/operations.md](docs/operations.md)
 for the operator-facing reference this milestone's Task 8 wrote, and
-[docs/status.md](docs/status.md#standing-nag-user-gated-launch-items) for
+[docs/status.md](docs/status.md#not-yet-done) for
 what's left that no further engineering resolves.
 
 - ✅ **Prometheus `/metrics`**: capture lag, durable-through age per branch
   (open sessions only, by design — see
-  [docs/operations.md](docs/operations.md#deliberately-out-of-scope-in-m4)),
+  [docs/operations.md](docs/operations.md#deliberately-out-of-scope)),
   GC backlog, checkout cache usage, fork/checkpoint latencies. Sixteen
   `offshoot_*` metric families total, names locked as API as of the
   [0.1.3] tag (one free rename window, now closed) — see
@@ -404,13 +404,13 @@ gained an "At a glance" evidence table naming what's proven and what isn't;
 and the README's first screen now leads with install and a recording before
 the quickstart. None of this changes phase 4's gate: **Announce** is still
 blocked on phase 3's external user succeeding, not on further engineering —
-see [docs/status.md](docs/status.md#standing-nag-user-gated-launch-items)
-for the drafted Show HN copy and the corruption-bounty terms, both ready to
-go and waiting on that gate plus the maintainer's button-press.
+see [docs/status.md](docs/status.md#not-yet-done) for the remaining
+out-of-band items.
 
 ## Non-goals (v1)
 
-- **Multi-node orchestration.** Shared-bucket safety is guaranteed by fencing;
+- **Multi-node orchestration.** One daemon per store is the supported
+  topology ([why](docs/limitations.md#one-daemon-per-store));
   placement/failover/routing are the v2 arc. We don't use the word "cluster."
 - **Merge.** Forks are for pick-a-winner (`promote`), not three-way merge.
   The escape hatch is application-level reconciliation over two checkouts.
