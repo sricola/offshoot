@@ -13,6 +13,7 @@ import (
 	"strings"
 	"time"
 
+	"github.com/sricola/offshoot/internal/fsutil"
 	"github.com/sricola/offshoot/internal/reflink"
 )
 
@@ -169,6 +170,7 @@ func (l *Local) write(p string, data []byte) (etag string, err error) {
 		os.Remove(tmp)
 		return "", err
 	}
+	fsutil.SyncDir(dir)
 	return etag, nil
 }
 
@@ -196,43 +198,64 @@ func (l *Local) Put(key string, data []byte) error {
 // a second full-file pass to compute it after the fact. Like write(), it
 // records that etag on the temp file (etagAttr) before the rename.
 func (l *Local) writeReader(p string, r io.Reader, size int64) (etag string, err error) {
-	dir := filepath.Dir(p)
-	if err := os.MkdirAll(dir, 0o755); err != nil {
-		return "", err
-	}
-	f, err := os.CreateTemp(dir, filepath.Base(p)+".tmp-*")
+	tmp, etag, err := l.writeReaderTemp(p, r, size)
 	if err != nil {
 		return "", err
 	}
-	tmp := f.Name()
+	return etag, commitTemp(tmp, p)
+}
+
+// writeReaderTemp is writeReader's streaming half: the whole object is
+// streamed, hashed, stamped with its etag and fsynced into a uniquely named
+// temp file beside p, and the temp path is returned for commitTemp. Split
+// out so PutReaderIf can do the slow part (a multi-GB snapshot can take
+// longer than lock()'s 30 s stale-lock horizon) BEFORE it takes the
+// per-key lock, and hold the lock only around the compare and the rename.
+func (l *Local) writeReaderTemp(p string, r io.Reader, size int64) (tmp, etag string, err error) {
+	dir := filepath.Dir(p)
+	if err := os.MkdirAll(dir, 0o755); err != nil {
+		return "", "", err
+	}
+	f, err := os.CreateTemp(dir, filepath.Base(p)+".tmp-*")
+	if err != nil {
+		return "", "", err
+	}
+	tmp = f.Name()
 	h := sha256.New()
 	n, err := io.Copy(io.MultiWriter(f, h), r)
 	if err != nil {
 		f.Close()
 		os.Remove(tmp)
-		return "", err
+		return "", "", err
 	}
 	if n != size {
 		f.Close()
 		os.Remove(tmp)
-		return "", fmt.Errorf("store: streamed %d bytes for %s, want %d", n, p, size)
+		return "", "", fmt.Errorf("store: streamed %d bytes for %s, want %d", n, p, size)
 	}
 	etag = hex.EncodeToString(h.Sum(nil))
 	setEtagAttr(f, etag, n)
 	if err := f.Sync(); err != nil {
 		f.Close()
 		os.Remove(tmp)
-		return "", err
+		return "", "", err
 	}
 	if err := f.Close(); err != nil {
 		os.Remove(tmp)
-		return "", err
+		return "", "", err
 	}
+	return tmp, etag, nil
+}
+
+// commitTemp renames a fully written temp file into place at p and syncs
+// the directory so the rename survives power loss (see fsutil.SyncDir).
+func commitTemp(tmp, p string) error {
 	if err := os.Rename(tmp, p); err != nil {
 		os.Remove(tmp)
-		return "", err
+		return err
 	}
-	return etag, nil
+	fsutil.SyncDir(filepath.Dir(p))
+	return nil
 }
 
 // PutReader implements store.ReaderPutter's unconditional overwrite: same
@@ -266,31 +289,48 @@ func (l *Local) PutReaderIf(key string, r io.Reader, size int64, ifMatch string)
 	if err != nil {
 		return "", err
 	}
-	release, err := l.lock(p)
+	// Stream the object before taking the lock: lock() breaks a lock older
+	// than 30 s on the assumption its holder died, and a large snapshot
+	// can legitimately take longer than that to write. Holding the lock
+	// only for the compare and the rename keeps it in the millisecond
+	// range the stale-lock rule was designed for.
+	tmp, etag, err := l.writeReaderTemp(p, r, size)
 	if err != nil {
 		return "", err
 	}
+	release, err := l.lock(p)
+	if err != nil {
+		os.Remove(tmp)
+		return "", err
+	}
 	defer release()
+	fail := func(err error) (string, error) {
+		os.Remove(tmp)
+		return "", err
+	}
 
 	if ifMatch == "" {
 		if _, statErr := os.Stat(p); statErr == nil {
-			return "", fmt.Errorf("%w: key exists", ErrCAS)
+			return fail(fmt.Errorf("%w: key exists", ErrCAS))
 		} else if !os.IsNotExist(statErr) {
-			return "", statErr
+			return fail(statErr)
 		}
 	} else {
 		cur, readErr := os.ReadFile(p)
 		if os.IsNotExist(readErr) {
-			return "", fmt.Errorf("%w: key absent, expected etag %s", ErrCAS, ifMatch)
+			return fail(fmt.Errorf("%w: key absent, expected etag %s", ErrCAS, ifMatch))
 		}
 		if readErr != nil {
-			return "", readErr
+			return fail(readErr)
 		}
 		if etagOf(cur) != ifMatch {
-			return "", fmt.Errorf("%w: etag mismatch", ErrCAS)
+			return fail(fmt.Errorf("%w: etag mismatch", ErrCAS))
 		}
 	}
-	return l.writeReader(p, r, size)
+	if err := commitTemp(tmp, p); err != nil {
+		return "", err
+	}
+	return etag, nil
 }
 
 func (l *Local) lock(p string) (release func(), err error) {
@@ -480,6 +520,7 @@ func (l *Local) CopyObject(dst, src string) error {
 		os.Remove(tmp)
 		return err
 	}
+	fsutil.SyncDir(dir)
 	return nil
 }
 

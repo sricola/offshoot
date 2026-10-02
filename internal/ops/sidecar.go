@@ -12,6 +12,7 @@ import (
 	"time"
 
 	"github.com/sricola/offshoot/internal/dbfile"
+	"github.com/sricola/offshoot/internal/fsutil"
 	"github.com/sricola/offshoot/internal/ltxio"
 	"github.com/sricola/offshoot/internal/store"
 )
@@ -239,7 +240,7 @@ func stampSumWithFingerprint(path, hash, lineage string, epoch, txid, postApplyC
 	if err != nil {
 		return err
 	}
-	return os.WriteFile(path+".sum", data, 0o644)
+	return fsutil.WriteFileAtomic(path+".sum", data, 0o644)
 }
 
 // sumRecord is the on-disk shape of a checkout's .sum sidecar: a content hash
@@ -678,5 +679,5 @@ func setSidecarShadow(path string, on bool) error {
 	if err != nil {
 		return err
 	}
-	return os.WriteFile(path+".sum", data, 0o644)
+	return fsutil.WriteFileAtomic(path+".sum", data, 0o644)
 }

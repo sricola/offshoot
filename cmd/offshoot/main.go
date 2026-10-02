@@ -56,11 +56,13 @@ Usage:
                                      may omit the checkpoint for the
                                      branch's current head; the two sides
                                      may name the same db or different ones
-  offshoot checkpoint <db>[@branch] <name> [--snapshot] [--meta k=v ...]
+  offshoot checkpoint <db>[@branch] <name> [--snapshot] [--meta k=v ...] [--force]
                                      name the checkout's state: a segment of
                                      the pages changed since the last
                                      checkpoint when it can, else a full
-                                     snapshot (--snapshot forces one)
+                                     snapshot (--snapshot forces one);
+                                     refuses a branch with a live lease or a
+                                     detached checkout unless --force
   offshoot fork <db>[@branch] <new> [--at cp] [--ttl duration] [--meta k=v ...]
                                      branch from head or a checkpoint;
                                      --meta is repeatable (capped: 32 keys,
@@ -70,12 +72,14 @@ Usage:
   offshoot touch <db>[@branch] [--ttl duration|none]   reset a branch's activity clock, optionally (re)setting its TTL
   offshoot protect <db>[@branch]        refuse unforced destroy/promote-onto, never reap; MCP cannot force it without -allow-force
   offshoot unprotect <db>[@branch]      clear the protected flag
-  offshoot rollback <db>[@branch] --to <cp> [--no-backup] [--backup-ttl DUR] [--materialize]
-                                                          repoint a branch at a checkpoint; keeps the previous head as <branch>-pre-rollback
+  offshoot rollback <db>[@branch] --to <cp> [--force] [--no-backup] [--backup-ttl DUR] [--materialize]
+                                                          repoint a branch at a checkpoint; keeps the previous head as <branch>-pre-rollback;
+                                                          refuses a branch with a live lease (an open session) unless --force
   offshoot promote <db>@<src> --onto <target> [--force] [--no-backup] [--backup-ttl DUR] [--materialize]
                                                           repoint target at src's head; keeps target's old head as <target>-pre-promote;
                                                           both point at the kept history (shared) unless --materialize copies it
-  offshoot compact <db>[@branch]     make a shared fork self-contained (its
+  offshoot compact <db>[@branch] [--force]
+                                     make a shared fork self-contained (its
                                      ancestor's storage becomes reclaimable
                                      by gc); no-op if already self-contained
   offshoot destroy <db>[@branch] [--force]   delete a branch (requires --force for protected)
@@ -601,6 +605,7 @@ func run(args []string) error {
 		}
 	case "checkpoint":
 		snapshot, rest := extractBoolFlag(rest, "--snapshot")
+		force, rest := extractBoolFlag(rest, "--force")
 		meta, rest, err := extractMetaFlags(rest)
 		if err != nil {
 			return fmt.Errorf("usage: offshoot checkpoint <db>[@branch] <name> [--snapshot] [--meta k=v ...]: %w", err)
@@ -612,7 +617,7 @@ func run(args []string) error {
 		if err != nil {
 			return err
 		}
-		res, err := w.CheckpointWith(db, branch, rest[1], meta, ops.CheckpointOptions{Snapshot: snapshot})
+		res, err := w.CheckpointWith(db, branch, rest[1], meta, ops.CheckpointOptions{Snapshot: snapshot, Force: force})
 		if err != nil {
 			return err
 		}
@@ -714,11 +719,13 @@ func run(args []string) error {
 		fmt.Printf("unprotected %s@%s\n", db, branch)
 		return nil
 	case "rollback":
-		const usage = "usage: offshoot rollback <db>[@branch] --to <checkpoint> [--no-backup] [--backup-ttl DUR] [--materialize]"
+		const usage = "usage: offshoot rollback <db>[@branch] --to <checkpoint> [--force] [--no-backup] [--backup-ttl DUR] [--materialize]"
 		var opts ops.RollbackOptions
 		fs := rest[:0]
 		for i := 0; i < len(rest); i++ {
 			switch a := rest[i]; a {
+			case "--force":
+				opts.Force = true
 			case "--no-backup":
 				opts.NoBackup = true
 			case "--materialize":
@@ -816,14 +823,15 @@ func run(args []string) error {
 		}
 		return nil
 	case "compact":
+		force, rest := extractBoolFlag(rest, "--force")
 		if len(rest) != 1 {
-			return fmt.Errorf("usage: offshoot compact <db>[@branch]")
+			return fmt.Errorf("usage: offshoot compact <db>[@branch] [--force]")
 		}
 		db, branch, err := ops.ParseTarget(rest[0])
 		if err != nil {
 			return err
 		}
-		txid, err := w.Compact(db, branch)
+		txid, err := w.CompactWith(db, branch, ops.CompactOptions{Force: force})
 		if err != nil {
 			return err
 		}

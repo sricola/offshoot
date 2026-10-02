@@ -197,12 +197,16 @@ func TestRepointClearsLease(t *testing.T) {
 		if _, err := w.AcquireLease("app", "main", "holder-a", DefaultLeaseTTL); err != nil {
 			t.Fatal(err)
 		}
-		if _, err := w.Checkpoint("app", "main", "v1", nil); err != nil {
+		// The lease is live, so the at-rest verbs refuse without Force
+		// (refuseIfHeld); Force models the operator overriding that, which
+		// is the case this test is about: what the repoint then does to
+		// the lease it found.
+		if _, err := w.CheckpointWith("app", "main", "v1", nil, CheckpointOptions{Force: true}); err != nil {
 			t.Fatal(err)
 		}
 		// Roll back to the "init" checkpoint laid down by Create, which
 		// predates "v1" — a genuine repoint to an earlier state.
-		if _, err := w.Rollback("app", "main", "init"); err != nil {
+		if _, err := w.RollbackWith("app", "main", "init", RollbackOptions{Force: true}); err != nil {
 			t.Fatal(err)
 		}
 		ref, _, err := w.Store.GetRef("app", "main")
@@ -280,13 +284,15 @@ func TestFencedHolderLeaseOpsFailAfterReclaim(t *testing.T) {
 	if err := w.ReleaseLease(a); !errors.Is(err, store.ErrLeaseLost) {
 		t.Fatalf("fenced release: want ErrLeaseLost, got %v", err)
 	}
-	// Checkpoint itself is lease-unaware by design — it never checks
-	// LeaseHolder/LeaseExpiry — so it stays callable by anyone with a
-	// checkout regardless of fencing. It's the ref CAS underneath that
-	// protects it: a fenced writer's stale checkout still checkpoints
-	// successfully here because nothing about this call path consults the
-	// lease at all.
-	if _, err := w.Checkpoint("app", "main", "v1", nil); err != nil {
+	// writer-b's lease is live, so an at-rest checkpoint is refused unless
+	// forced (refuseIfHeld: it would fence writer-b and discard its
+	// unflushed work). Forced, it still goes through: the ref CAS
+	// underneath is what protects the branch, and nothing about fencing
+	// writer-a makes the branch unusable.
+	if _, err := w.Checkpoint("app", "main", "v1", nil); err == nil || !strings.Contains(err.Error(), "live lease") {
+		t.Fatalf("checkpoint under writer-b's live lease: got %v, want a live-lease refusal", err)
+	}
+	if _, err := w.CheckpointWith("app", "main", "v1", nil, CheckpointOptions{Force: true}); err != nil {
 		t.Fatalf("branch unusable after fencing: %v", err)
 	}
 }

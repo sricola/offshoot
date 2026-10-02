@@ -2,7 +2,9 @@ package capture
 
 import (
 	"encoding/json"
+	"github.com/sricola/offshoot/internal/fsutil"
 	"os"
+	"path/filepath"
 )
 
 // State is the resume checkpoint persisted to disk after every state
@@ -114,5 +116,9 @@ func SaveState(path string, s State) error {
 	if err := f.Close(); err != nil {
 		return err
 	}
-	return os.Rename(tmp, path)
+	if err := os.Rename(tmp, path); err != nil {
+		return err
+	}
+	fsutil.SyncDir(filepath.Dir(path))
+	return nil
 }
