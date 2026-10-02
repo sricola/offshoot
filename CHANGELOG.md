@@ -13,6 +13,17 @@ version if you depend on format stability.
 
 ## [Unreleased]
 
+Nothing yet.
+
+## [0.2.13] - 2026-10-02
+
+Hardening on top of v0.2.12's pointers-and-deltas release: concurrent
+at-rest checkpoints detected and recovered, cache-backed refreshes for
+rollback/promote/compact, a hardened LTX decoder found by new fuzz
+targets, hash- and digest-pinned CI, CodeQL, a local-store `Head` that no
+longer re-reads its object, and an HTTP `shutdown` response that can no
+longer be lost to the shutdown it triggers.
+
 ### Added
 
 - **`offshoot_checkpoint_overwrite_detected_total`.** Counts at-rest
