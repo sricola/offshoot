@@ -484,7 +484,7 @@ a real bucket you reuse), not the ephemeral temp store this fixture spins
 up for a single pytest invocation. `offshoot gc` (or a running daemon's
 janitor, `offshoot serve -reap-every`) is what actually reaps a TTL-expired
 branch — see the README's [TTLs and the reaping
-janitor](../README.md#ttls-and-the-reaping-janitor) section for exactly
+janitor](concepts.md#ttl) section for exactly
 when a branch becomes reap-eligible and what protects it until then.
 
 ## CI recipe: the daemon in CI
@@ -655,8 +655,8 @@ itself:
   that page's version note.)
 - **Session-open / settling-flush cost** (once per test, when
   `offshoot_fork()` opens its session): see the README's [What a flush
-  costs](../README.md#what-a-flush-costs) section, and specifically the
-  [settling-flush suppression](benchmarks.md#settling-flush-cost-task-2-controller-decision)
+  costs](operations.md#what-a-flush-costs) section, and specifically the
+  [settling-flush suppression](benchmarks.md#settling-flush-cost)
   measurement — a session opened against an already-clean, already-current
   checkout (the common shape right after a fresh fork) skips its mandatory
   first full-snapshot upload entirely.

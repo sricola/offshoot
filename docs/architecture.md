@@ -1,8 +1,7 @@
 # Architecture
 
-This is offshoot's design document, edited for contributors and adopters
-rather than for the internal review it was originally written for. It
-describes the **model** — what a branch, a fork, a lineage, a lease actually
+This is offshoot's design document, written for contributors and adopters.
+It describes the **model** — what a branch, a fork, a lineage, a lease actually
 are, and the invariants that make concurrent, storage-shared access safe.
 Where the model and the current implementation diverge (a feature described
 here that isn't built yet, or a guarantee not yet exercised by a real

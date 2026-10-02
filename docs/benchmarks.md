@@ -19,7 +19,8 @@ plus the design spec) on the same machine the same day — the "before".
 
 **Reproduce:** `make bench-cow` (benchmarks live in
 `internal/ops/cow_bench_test.go`; the target's invocations are exactly the
-ones below). Latency numbers are the **median of 5 samples**
+ones below). SQLite 3.53.4, as bundled by `github.com/mattn/go-sqlite3`
+v1.14.52 (the version in `go.mod`), with the default 4096-byte page size. Latency numbers are the **median of 5 samples**
 (`-count=5 -benchtime=3x`, each sample the mean of 3 iterations); byte
 numbers are exact object-store accounting (sum of stored object sizes,
 diffed before/after — what an S3 backend would bill), identical across
@@ -242,8 +243,13 @@ from `make bench-cow` / `make bench`:
 
 ---
 
-Everything below this line was measured **before** copy-on-write existed
-and is preserved as published; the next section's version note scopes it.
+> **Older measurements.** Everything below this line was measured
+> **before** copy-on-write existed, on a different machine (Apple M4, Go
+> 1.26; the sections above used an Apple M5, Go 1.27), and is preserved
+> as published. The MinIO numbers below are no longer reproducible: MinIO
+> withdrew its community images, and `make bench-s3` now targets RustFS.
+
+The next section's version note scopes what still applies.
 
 Measured baselines for `ops.Workspace.Fork`, `Checkout`'s clean-skip fast
 path (Task 1 of Milestone 2), and `session.Open` — **before** and **after**
@@ -279,7 +285,7 @@ Benchmarks live in `internal/ops/fork_bench_test.go`. Run them with
 `make bench` (local store) or `make bench-s3` (real MinIO in Docker). The
 benchmark code itself is unchanged by Task 6a — same subtest names, same
 seeding, same `at=""` (fork at branch head, which runs `Fork`'s normal
-uncheckpointed-changes check; see "What's still O(size) after Task 6a"
+uncheckpointed-changes check; see "What's still O(size) after the fast-path fork"
 below) — so before/after numbers are a like-for-like comparison of the same
 call, not two different things being measured.
 
@@ -550,7 +556,7 @@ defaults (all five workflows, concurrency 8, 10 warehouses, 2h per-workflow
 cap), pasted verbatim, minus make's own echoed `go run` line and the
 per-workflow progress lines on stderr:
 
-darwin/arm64, Apple M5, 10 cores, Go 1.27.1, offshoot v0.2.11-15-g67cc6b1-dirty, measured 2026-09-30, seed 17 MiB, concurrency 8
+darwin/arm64, Apple M5, 10 cores, Go 1.27.1, offshoot v0.2.11-15-g67cc6b1-dirty (a pre-release build with uncommitted changes — see the note below; not yet re-run on a clean tag), measured 2026-09-30, seed 17 MiB, concurrency 8
 
 | Workflow | Steps | Wall | Branch overhead | Fork p50/p99 (d=1 → d=max) | Checkout p50/p99 (d=1 → d=max) | Checkpoint p50/p99 (d=1 → d=max) | Eval p50/p99 (d=1 → d=max) | Peak live | Store peak |
 |---|---|---|---|---|---|---|---|---|---|
@@ -572,7 +578,8 @@ Latencies are milliseconds. p99 is the maximum sample wherever a cell has fewer 
 tag; `-dirty` because this run was taken with the local-store
 `List` fix (see "What changed") applied but not yet committed; it was then
 committed unchanged as `d8f50dd`, and is the only Go source that differed
-from `67cc6b1`.)
+from `67cc6b1`. This table should be re-run on a clean release tag; it has
+not been yet.)
 
 Every workflow completed every step: 2,310/2,310 worker-steps, 104.5 s of
 workflow wall time in total (1 min 49 s for the whole `make` invocation,
@@ -835,7 +842,7 @@ on a local copy-on-write SQLite store.
   storage during a run stays close to one seeded database's worth rather
   than growing with `b.N`. Every seeded database checkpoints cleanly, so its
   chain is always exactly one snapshot — the fast path's precondition (see
-  "Task 6a: what changed" below) holds for every iteration in this suite.
+  "The reflink / clonefile fork fast path: what changed" below) holds for every iteration in this suite.
 - `BenchmarkCheckoutCleanSkip` calls `Checkout` repeatedly against a checkout
   that never dirties between calls (the clean fast path performs no write),
   so every iteration measures the same "already correct, don't rebuild"
@@ -875,7 +882,7 @@ on a local copy-on-write SQLite store.
   support reflink/clonefile"). This is the "ext4-without-reflink" case
   referenced throughout: Task 6a's fast path still fires (one object copy
   instead of decode+re-encode), it just can't clone, so it falls back to
-  `reflink.CopyFile`'s plain-byte-copy path — see "Task 6a: what changed"
+  `reflink.CopyFile`'s plain-byte-copy path — see "The reflink / clonefile fork fast path: what changed"
   below for what that's still worth.
 - **S3 path:** `minio/minio:latest` in Docker on the same host (`make
   bench-s3` now runs RustFS instead, since MinIO's images were withdrawn;
@@ -887,7 +894,7 @@ on a local copy-on-write SQLite store.
   `store.S3.CopyObject` returned the `ErrCopyUnsupported` sentinel
   unconditionally in Task 6a; Task 6b (this update) replaces that with a
   real server-side `CopyObject` call (gated to objects at or under S3's
-  5GB single-request `CopyObject` limit — see "Task 6b: what changed"
+  5GB single-request `CopyObject` limit — see "The S3 server-side copy fork: what changed"
   below). All MinIO-local numbers throughout this section are exactly
   that: MinIO-local. They say nothing about a real AWS S3 endpoint's
   network latency, throughput, or server-side copy performance at scale —
@@ -897,7 +904,7 @@ on a local copy-on-write SQLite store.
   day, same machine. "After Task 6b" (S3 server-side copy) measured
   2026-08-06, same machine, separate section below.
 
-## Task 6a: what changed
+## The reflink / clonefile fork fast path: what changed
 
 `ops.Workspace.copySnapshotToNewLineage` (the primitive behind `Fork`,
 `Rollback`, and `Promote`) now checks, before doing anything else, whether
@@ -929,7 +936,7 @@ through to exactly the pre-6a materialize-and-re-encode path, unchanged
 (`internal/ops/gc_chain_test.go`'s `TestForkFastPathSkipsMultiMemberChains`
 covers this).
 
-## Task 6b: what changed
+## The S3 server-side copy fork: what changed
 
 `store.S3.CopyObject` (`internal/store/s3.go`) now issues a real
 server-side copy — S3's `CopyObject` API (a `PUT` carrying an
@@ -1104,7 +1111,7 @@ to have introduced. `CheckoutCleanSkip` and `SessionOpen` are, as before,
 close to the local numbers because their dominant cost never touches the
 backend at all — Task 6b doesn't change that either.
 
-### Task 6b: S3 server-side CopyObject (`make bench-s3`, MinIO in Docker, `-count=1`)
+### S3 server-side CopyObject (`make bench-s3`, MinIO in Docker, `-count=1`)
 
 | Benchmark | Size | ns/op, before Task 6b (=after 6a) | ns/op, after Task 6b | MB/s, before | MB/s, after |
 |---|---|---|---|---|---|
@@ -1120,8 +1127,8 @@ server-side copy means this process never downloads the source snapshot
 object, never re-encodes it, and never re-uploads it — MinIO copies the
 object on its own side of the wire, so the round trips this process pays
 for are the `HEAD` (size gate), the `CopyObject` request itself, one `List`
-call to verify the child's chain resolves after the copy (see "Task 6a: what
-changed" above — this is extra work the fast path pays that the slow path
+call to verify the child's chain resolves after the copy (see "The reflink /
+clonefile fork fast path: what changed" above — this is extra work the fast path pays that the slow path
 doesn't, not free), and the same `PutRef`/`GetRef` calls every fork makes
 regardless of path. It is
 NOT as fast as the local numbers (1.03s vs. ~198ms at 512MB): `Fork`'s
@@ -1185,7 +1192,7 @@ remaining time is dominated by `Fork`'s separate O(size)
 uncheckpointed-changes SHA-256 check, which does scale with size, not by
 the object copy itself.
 
-## What's still O(size) after Task 6a
+## What's still O(size) after the fast-path fork
 
 - **`Fork`'s uncheckpointed-changes check** (`warnIfUncheckpointed` →
   `checkoutState`, Task 1 machinery, not touched by Task 6a): every default
@@ -1232,7 +1239,7 @@ here only as the target this benchmark suite exists to check against, never
 as a claim about `ForkAtHead`'s own reported numbers, which also include
 Task 1's separate O(size) check.
 
-## Settling-flush cost (Task 2 controller decision)
+## Settling-flush cost
 
 > **Update (Milestone 2 follow-up, shipped):** the measurements below still
 > describe the upload's *size* accurately for the case where it happens, but

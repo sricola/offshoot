@@ -8,8 +8,12 @@ once it reaches 1.0. Before 1.0, minor versions may include breaking changes.
 
 **Format stability:** offshoot is pre-1.0. The on-disk/on-bucket storage
 format (refs, checkpoints, segments, leases) may change in a
-backward-incompatible way before 1.0 without a migration path. Pin an exact
-version if you depend on format stability.
+backward-incompatible way in a minor release before 1.0; patch releases do
+not break it. Any such break ships in the same release with either an
+in-place migration or a documented `export` → `create --from` path, and an
+older binary refuses a newer store's layout outright rather than guessing.
+Pin an exact version if you depend on format stability. The full contract:
+[docs/stability.md](docs/stability.md).
 
 ## [Unreleased]
 

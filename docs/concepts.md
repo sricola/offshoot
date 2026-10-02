@@ -1,7 +1,11 @@
-# Core concepts
+# Core concepts (glossary)
 
 The vocabulary offshoot's commands, docs, and error messages all share —
-each term defined once, with the model it belongs to. The deeper design
+each term defined once, with the model it belongs to. Other pages may say
+`checkpoint` "snapshots the checkout" in the everyday sense; on this page
+**snapshot** is reserved for one kind of stored object (a full encoding),
+and a checkpoint is a *name* for a transaction id, written as either a
+snapshot or a segment. The deeper design
 document behind this page is [Architecture](architecture.md); the exact
 flag-by-flag behavior of every command named here is the
 [CLI reference](reference.md).
@@ -65,7 +69,10 @@ app v1` — unique per branch. It's the unit you fork from (`fork --at v1`),
 roll back to (`rollback --to v1`), export, or diff against. Children never
 inherit a parent's checkpoints: a fork's own history begins at its fork
 point with an auto-created `fork` checkpoint, so pre-fork states are
-resolved on the parent instead.
+resolved on the parent instead (`fork --at <name>` starts a child from a
+parent's checkpoint). `promote` replaces the target's checkpoint list with
+a single `promote` entry; `rollback` keeps the checkpoints at or before
+its target and drops the later ones.
 
 ### Checkout (the working copy)
 
