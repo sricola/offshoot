@@ -47,6 +47,15 @@ updates:
     groups:
       ts-sdk-dev:
         patterns: ["*"]
+    # Majors of the compiler and the Node type definitions are taken by
+    # hand: TypeScript 7 changed module/type resolution enough to break the
+    # build outright (PR #71), and @types/node's major should track the
+    # oldest Node the SDK supports (engines: >=20), not the newest release.
+    ignore:
+      - dependency-name: typescript
+        update-types: ["version-update:semver-major"]
+      - dependency-name: "@types/node"
+        update-types: ["version-update:semver-major"]
 
   # The hash-pinned Python locks CI installs with --require-hashes
   # (requirements/*.txt, compiled from the .in beside each). A bump PR here
