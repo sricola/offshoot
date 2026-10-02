@@ -80,7 +80,7 @@ func FormatTTLRemaining(ref store.Ref, now time.Time) string {
 	if now.After(deadline) {
 		return "expired"
 	}
-	return deadline.Sub(now).String()
+	return deadline.Sub(now).Round(time.Second).String()
 }
 
 // parseRefTime parses an RFC3339Nano ref timestamp field (TouchedAt or

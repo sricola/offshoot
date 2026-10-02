@@ -27,9 +27,10 @@ import (
 // (e.g. v0.1.0); local `go build`/`go run` leave it at "dev".
 var version = "dev"
 
-const usage = `offshoot — branch SQLite like git (local mode)
+const usage = `offshoot — branch SQLite like git
 
 Usage:
+  offshoot help [command]            print this usage, or one command's entry (also --help, -h)
   offshoot init                      create a store in ./.offshoot
   offshoot create <db> [--from f]    new database (branch main), or import file f
   offshoot checkout <db>[@branch]    materialize a working copy; prints its path
@@ -150,7 +151,7 @@ Usage:
   offshoot session close <db>[@branch] [-socket PATH]     close a session, releasing its lease
   offshoot session shutdown [-socket PATH]                ask the daemon to shut down gracefully
   offshoot session dbs [-socket PATH]                     list every database this store has
-  offshoot version                   print the offshoot version and Go runtime info
+  offshoot version                   print the offshoot version and Go runtime info (also --version)
 
   -socket PATH on a session subcommand must match the -socket PATH (if any)
   given to the serve that's running, or OFFSHOOT_SOCKET; otherwise it is
@@ -170,14 +171,76 @@ func storeSpec(args []string) (string, []string) {
 	}
 	out := args[:0]
 	for i := 0; i < len(args); i++ {
-		if args[i] == "-store" && i+1 < len(args) {
-			spec = args[i+1]
-			i++
-			continue
+		if v, inline, ok := flagMatch(args[i], "-store"); ok {
+			if inline {
+				spec = v
+				continue
+			}
+			if i+1 < len(args) {
+				spec = args[i+1]
+				i++
+				continue
+			}
 		}
 		out = append(out, args[i])
 	}
 	return spec, out
+}
+
+// flagMatch reports whether arg spells the flag name, in either dash form
+// (`-store` and `--store` are the same flag; the usage text shows one
+// canonical spelling per flag, but a user who types the other should not
+// be told it is a database name) and with an optional inline `=value`.
+// inline reports whether a value was attached that way.
+func flagMatch(arg, name string) (value string, inline, ok bool) {
+	bare := strings.TrimLeft(name, "-")
+	for _, form := range []string{"-" + bare, "--" + bare} {
+		if arg == form {
+			return "", false, true
+		}
+		if strings.HasPrefix(arg, form+"=") {
+			return arg[len(form)+1:], true, true
+		}
+	}
+	return "", false, false
+}
+
+// isHelpArg reports whether arg asks for usage: `help`, `--help` or `-h`.
+func isHelpArg(arg string) bool {
+	return arg == "help" || arg == "--help" || arg == "-h"
+}
+
+// commandUsage is the usage entry for one command: the lines of the usage
+// text from that command's first `offshoot <cmd>` line up to the next
+// command's. Falls back to the whole usage when cmd has no entry.
+func commandUsage(cmd string) string {
+	lines := strings.Split(usage, "\n")
+	var out []string
+	in := false
+	for _, l := range lines {
+		isEntry := strings.HasPrefix(l, "  offshoot ")
+		if isEntry {
+			fields := strings.Fields(l)
+			if len(fields) >= 2 && fields[1] == cmd {
+				in = true
+				out = append(out, l)
+				continue
+			}
+			if in {
+				break
+			}
+		}
+		if in {
+			if strings.TrimSpace(l) == "" {
+				break
+			}
+			out = append(out, l)
+		}
+	}
+	if len(out) == 0 {
+		return usage
+	}
+	return "Usage:\n" + strings.Join(out, "\n") + "\n"
 }
 
 // socketOverride extracts a "-socket PATH" flag from args (in any position),
@@ -199,7 +262,11 @@ func socketOverride(args []string) (string, []string, error) {
 	sock := ""
 	out := args[:0]
 	for i := 0; i < len(args); i++ {
-		if args[i] == "-socket" {
+		if v, inline, ok := flagMatch(args[i], "-socket"); ok {
+			if inline {
+				sock = v
+				continue
+			}
 			if i+1 >= len(args) {
 				return "", nil, fmt.Errorf("-socket requires a PATH argument")
 			}
@@ -219,7 +286,11 @@ func socketOverride(args []string) (string, []string, error) {
 func extractFlag(args []string, name string) (value string, rest []string, ok bool, err error) {
 	out := args[:0]
 	for i := 0; i < len(args); i++ {
-		if args[i] == name {
+		if v, inline, matched := flagMatch(args[i], name); matched {
+			if inline {
+				value, ok = v, true
+				continue
+			}
 			if i+1 >= len(args) {
 				return "", nil, false, fmt.Errorf("%s requires a value", name)
 			}
@@ -251,7 +322,7 @@ func extractBoolFlag(args []string, name string) (bool, []string) {
 	found := false
 	out := args[:0]
 	for _, a := range args {
-		if a == name {
+		if _, inline, matched := flagMatch(a, name); matched && !inline {
 			found = true
 			continue
 		}
@@ -269,11 +340,15 @@ func extractMetaFlags(args []string) (map[string]string, []string, error) {
 	var meta map[string]string
 	out := args[:0]
 	for i := 0; i < len(args); i++ {
-		if args[i] == "--meta" {
-			if i+1 >= len(args) {
-				return nil, nil, fmt.Errorf("--meta requires a k=v argument")
+		if v, inline, matched := flagMatch(args[i], "--meta"); matched {
+			kv := v
+			if !inline {
+				if i+1 >= len(args) {
+					return nil, nil, fmt.Errorf("--meta requires a k=v argument")
+				}
+				kv = args[i+1]
+				i++
 			}
-			kv := args[i+1]
 			eq := strings.IndexByte(kv, '=')
 			if eq < 0 {
 				return nil, nil, fmt.Errorf("--meta %q: want k=v", kv)
@@ -282,7 +357,6 @@ func extractMetaFlags(args []string) (map[string]string, []string, error) {
 				meta = map[string]string{}
 			}
 			meta[kv[:eq]] = kv[eq+1:]
-			i++
 			continue
 		}
 		out = append(out, args[i])
@@ -296,7 +370,18 @@ func parseTTLFlag(raw string) (time.Duration, error) {
 	if raw == "none" {
 		return 0, nil
 	}
-	return time.ParseDuration(raw)
+	return parseDurationFlag("--ttl", raw)
+}
+
+// parseDurationFlag parses a duration-valued flag and, on failure, names
+// the flag and the value in the error with examples of the accepted form,
+// instead of time.ParseDuration's bare `time: invalid duration "x"`.
+func parseDurationFlag(flag, raw string) (time.Duration, error) {
+	d, err := time.ParseDuration(raw)
+	if err != nil {
+		return 0, fmt.Errorf("%s %q: not a duration (examples: 30m, 2h, 24h)", flag, raw)
+	}
+	return d, nil
 }
 
 // parseForkTTLFlag turns fork's --ttl flag into a duration. Unlike
@@ -309,7 +394,7 @@ func parseForkTTLFlag(raw string) (time.Duration, error) {
 	if raw == "none" {
 		return 0, fmt.Errorf(`fork has no "none" concept; omit --ttl for no TTL`)
 	}
-	d, err := time.ParseDuration(raw)
+	d, err := parseDurationFlag("--ttl", raw)
 	if err != nil {
 		return 0, err
 	}
@@ -442,6 +527,27 @@ func run(args []string) error {
 	}
 	cmd, rest := args[0], args[1:]
 
+	// Help and version never touch the store: `offshoot --help` must work
+	// in a directory with no store, and `offshoot <cmd> --help` must print
+	// that command's entry instead of running it with "--help" as a name
+	// (which once created a database called "--help" and, for gc, ran GC).
+	switch {
+	case isHelpArg(cmd) && len(rest) == 0:
+		fmt.Print(usage)
+		return nil
+	case isHelpArg(cmd):
+		fmt.Print(commandUsage(rest[0]))
+		return nil
+	case cmd == "--version" || cmd == "-v" || cmd == "-V":
+		cmd, rest = "version", nil
+	}
+	for _, a := range rest {
+		if isHelpArg(a) {
+			fmt.Print(commandUsage(cmd))
+			return nil
+		}
+	}
+
 	if cmd == "init" {
 		_, err := ops.Init(spec)
 		if err == nil {
@@ -470,15 +576,26 @@ func run(args []string) error {
 
 	w, err := ops.Open(spec)
 	if err != nil {
-		return fmt.Errorf("open store %s: %w (run 'offshoot init'?)", spec, err)
+		if errors.Is(err, store.ErrNotFound) {
+			return fmt.Errorf("no store at %s (run 'offshoot init' there, or pass -store)", spec)
+		}
+		return fmt.Errorf("open store %s: %w", spec, err)
 	}
 	switch cmd {
 	case "create":
 		switch {
 		case len(rest) == 1:
-			return w.Create(rest[0])
+			if err := w.Create(rest[0]); err != nil {
+				return err
+			}
+			fmt.Printf("created %s (branch main)\n", rest[0])
+			return nil
 		case len(rest) == 3 && rest[1] == "--from":
-			return w.CreateFrom(rest[0], rest[2])
+			if err := w.CreateFrom(rest[0], rest[2]); err != nil {
+				return err
+			}
+			fmt.Printf("created %s (branch main, imported from %s)\n", rest[0], rest[2])
+			return nil
 		default:
 			return fmt.Errorf("usage: offshoot create <db> [--from file]")
 		}
@@ -638,8 +755,17 @@ func run(args []string) error {
 			if ttl <= 0 {
 				ttl = ops.DefaultPromoteBackupTTL
 			}
-			fmt.Printf("kept the previous %s@%s head as %s@%s (expires in %s; undo with: offshoot promote %s@%s --onto %s --force)\n",
-				db, branch, db, res.Backup, ttl, db, res.Backup, branch)
+			if res.BackupIsTarget {
+				// The head already sat at the target checkpoint, so the
+				// safety fork holds the same committed state; the only thing
+				// this rollback changed is the checkout itself. Say so rather
+				// than offering an undo that would restore nothing.
+				fmt.Printf("kept the previous %s@%s head as %s@%s (expires in %s) — it is the same committed state as %q; only un-checkpointed edits to the checkout were discarded\n",
+					db, branch, db, res.Backup, ttl, fs[2])
+			} else {
+				fmt.Printf("kept the previous %s@%s head as %s@%s (expires in %s; undo with: offshoot promote %s@%s --onto %s --force)\n",
+					db, branch, db, res.Backup, ttl, db, res.Backup, branch)
+			}
 		}
 		return nil
 	case "promote":
@@ -790,11 +916,15 @@ func run(args []string) error {
 		if err != nil {
 			return err
 		}
-		return w.Destroy(db, branch, force)
+		if err := w.Destroy(db, branch, force); err != nil {
+			return err
+		}
+		fmt.Printf("destroyed %s@%s\n", db, branch)
+		return nil
 	case "gc":
 		grace := time.Hour
 		if len(rest) == 2 && rest[0] == "--grace" {
-			d, err := time.ParseDuration(rest[1])
+			d, err := parseDurationFlag("--grace", rest[1])
 			if err != nil {
 				return err
 			}
@@ -1280,7 +1410,7 @@ func run(args []string) error {
 			return fmt.Errorf("unknown session subcommand %q", sub)
 		}
 	default:
-		return fmt.Errorf("unknown command %q\n%s", cmd, usage)
+		return fmt.Errorf("unknown command %q (run 'offshoot help')", cmd)
 	}
 }
 

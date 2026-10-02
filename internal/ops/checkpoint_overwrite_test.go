@@ -436,7 +436,7 @@ func assertDistrustedStamp(t *testing.T, w *Workspace, path string, ref store.Re
 	if state, sum := checkoutState(path, ref); state != "modified" || sum != 0 {
 		t.Fatalf("checkoutState = %q %016x, want modified 0", state, sum)
 	}
-	if out := captureStderr(t, func() { w.warnIfUncheckpointed("app", "main", ref) }); !strings.Contains(out, "un-checkpointed changes") {
+	if out := captureStderr(t, func() { w.warnIfUncheckpointed("app", "main", ref, "forking last committed state") }); !strings.Contains(out, "un-checkpointed changes") {
 		t.Fatalf("a fork would not warn; stderr %q", out)
 	}
 }

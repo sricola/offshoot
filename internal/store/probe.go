@@ -25,7 +25,15 @@ func ProbeCAS(b Backend) error {
 		return fmt.Errorf("store: probe: generate key: %w", err)
 	}
 	key := "probe/cas-" + hex.EncodeToString(buf)
+	created := false
 	defer func() {
+		// Nothing to clean up (and nothing to warn about) when the first
+		// put itself failed: that is the "store unreachable or
+		// misconfigured" case, where a cleanup warning only buries the
+		// real error.
+		if !created {
+			return
+		}
 		if err := b.Delete(key); err != nil {
 			fmt.Fprintf(os.Stderr, "offshoot: warning: probe cleanup failed for key %s; safe to delete manually\n", key)
 		}
@@ -36,6 +44,7 @@ func ProbeCAS(b Backend) error {
 	if err != nil {
 		return fmt.Errorf("store: probe create-only put failed: %w", err)
 	}
+	created = true
 
 	// A second create-only put must be rejected AND must not modify content.
 	second := []byte("offshoot-probe-2")

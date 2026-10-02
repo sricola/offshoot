@@ -189,6 +189,12 @@ func NewS3(ctx context.Context, cfg S3Config) (*S3, error) {
 	if err != nil {
 		return nil, fmt.Errorf("store: load aws config: %w", err)
 	}
+	if awsCfg.Region == "" {
+		// The SDK would otherwise fail much later, inside the first request,
+		// with "Invalid region: region was not a valid DNS name" buried in
+		// an operation error. Say plainly what is missing and where it goes.
+		return nil, errors.New("store: no AWS region configured for this bucket: set OFFSHOOT_S3_REGION (or AWS_REGION), or OFFSHOOT_S3_ENDPOINT for an S3-compatible endpoint")
+	}
 	cl := s3.NewFromConfig(awsCfg, func(o *s3.Options) {
 		if cfg.Endpoint != "" {
 			o.BaseEndpoint = aws.String(cfg.Endpoint)

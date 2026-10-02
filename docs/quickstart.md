@@ -17,7 +17,7 @@ $ offshoot create demo
 
 `init` creates the store — a plain directory, `./.offshoot` by default —
 and `create` makes a database named `demo` with a `main` branch, protected
-by default. (`create` prints nothing on success.)
+by default (`create` confirms with one line).
 
 ## 2. Check out and seed it
 

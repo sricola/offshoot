@@ -39,13 +39,27 @@ func Running(socketPath string) bool {
 	return true
 }
 
+// noDaemonError is Call's error when nothing is listening on the socket.
+// Its message names the socket and the fix; Unwrap exposes the dial error.
+type noDaemonError struct {
+	socket string
+	cause  error
+}
+
+func (e *noDaemonError) Error() string {
+	return fmt.Sprintf("daemon: no daemon is running at %s; start one with `offshoot serve`", e.socket)
+}
+
+func (e *noDaemonError) Unwrap() error { return e.cause }
+
 // Call sends one request to the daemon and returns its response.
 func Call(socketPath string, req Request) (Response, error) {
 	c, err := net.DialTimeout("unix", socketPath, 2*time.Second)
 	if err != nil {
-		return Response{}, fmt.Errorf(
-			"daemon: no daemon is running at %s; start one with `offshoot serve`: %w",
-			socketPath, err)
+		// The dial error itself ("connect: no such file or directory") adds
+		// nothing a user can act on beyond the socket path; keep it out of
+		// the message but wrap it so callers can still inspect it.
+		return Response{}, &noDaemonError{socket: socketPath, cause: err}
 	}
 	defer c.Close()
 	if err := json.NewEncoder(c).Encode(req); err != nil {

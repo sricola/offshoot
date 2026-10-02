@@ -19,6 +19,7 @@ import (
 	"net/url"
 	"os"
 	"path/filepath"
+	"sort"
 	"strings"
 	"sync/atomic"
 	"time"
@@ -105,6 +106,9 @@ func Init(spec string) (*Workspace, error) {
 	}
 	s := &store.Store{B: b}
 	if err := s.InitManifest(); err != nil {
+		if errors.Is(err, store.ErrCAS) {
+			return nil, fmt.Errorf("store already initialized at %s", spec)
+		}
 		return nil, err
 	}
 	root, err := checkoutRoot(spec)
@@ -171,6 +175,9 @@ func ParseTarget(s string) (string, string, error) {
 	case 2:
 		branch = parts[1]
 	default:
+		return "", "", fmt.Errorf("ops: invalid target %q (want db or db@branch)", s)
+	}
+	if db == "" || branch == "" {
 		return "", "", fmt.Errorf("ops: invalid target %q (want db or db@branch)", s)
 	}
 	if err := store.ValidateName(db); err != nil {
@@ -278,6 +285,9 @@ func (w *Workspace) createFromQuiesced(db, quiescedPath string) error {
 		// Freshly-minted lineage no rival can reference: safe to delete the
 		// orphaned snapshot (mirrors Fork's cleanup on the same failure).
 		w.bestEffortDelete(store.SnapshotKey(lineage, 1, 1))
+		if errors.Is(err, store.ErrCAS) {
+			return fmt.Errorf("ops: database %q already exists (offshoot status lists databases)", db)
+		}
 		return fmt.Errorf("ops: create %s: %w", db, err)
 	}
 	return nil
@@ -301,16 +311,16 @@ func (w *Workspace) CreateFrom(db, srcPath string) error {
 			if suffix != "" && os.IsNotExist(err) {
 				continue
 			}
-			return err
+			return fmt.Errorf("ops: import %s: %w", srcPath+suffix, err)
 		}
 	}
 	conn, err := sql.Open("sqlite3", cp)
 	if err != nil {
-		return err
+		return fmt.Errorf("ops: import %s: %w", srcPath, err)
 	}
 	if _, err := conn.Exec("PRAGMA wal_checkpoint(TRUNCATE)"); err != nil {
 		conn.Close()
-		return err
+		return fmt.Errorf("ops: import %s: not a usable SQLite database: %w", srcPath, err)
 	}
 	conn.Close()
 	return w.createFromQuiesced(db, cp)
@@ -519,7 +529,7 @@ func (w *Workspace) CheckpointWith(db, branch, name string, meta map[string]stri
 	}
 	path := w.CheckoutPath(db, branch)
 	if _, err := os.Stat(path); err != nil {
-		return CheckpointResult{}, fmt.Errorf("ops: no checkout for %s@%s (run checkout first): %w", db, branch, err)
+		return CheckpointResult{}, fmt.Errorf("ops: no checkout for %s@%s (run 'offshoot checkout %s@%s' first)", db, branch, db, branch)
 	}
 	if err := quiesce(path); err != nil {
 		return CheckpointResult{}, err
@@ -829,22 +839,42 @@ func quiesce(path string) error {
 // treated as "nothing to warn about". ref is the same ref the caller already
 // fetched to decide the fork point, so this reuses it rather than issuing a
 // second (potentially inconsistent) GetRef.
-func (w *Workspace) warnIfUncheckpointed(db, branch string, ref store.Ref) {
+func (w *Workspace) warnIfUncheckpointed(db, branch string, ref store.Ref, action string) {
 	path := w.CheckoutPath(db, branch)
 	if _, err := os.Stat(path); err != nil {
 		return
 	}
 	if err := quiesce(path); err != nil {
-		fmt.Fprintf(os.Stderr, "offshoot: warning: checkout of %s@%s is busy; forking last committed state (txid %d)\n", db, branch, ref.HeadTXID)
+		fmt.Fprintf(os.Stderr, "offshoot: warning: checkout of %s@%s is busy; %s (txid %d)\n", db, branch, action, ref.HeadTXID)
 		return
 	}
 	state, _ := checkoutState(path, ref)
 	switch state {
 	case "modified":
-		fmt.Fprintf(os.Stderr, "offshoot: warning: checkout of %s@%s has un-checkpointed changes; forking last committed state (txid %d)\n", db, branch, ref.HeadTXID)
+		fmt.Fprintf(os.Stderr, "offshoot: warning: checkout of %s@%s has un-checkpointed changes; %s (txid %d) — run 'offshoot checkpoint' first to keep them\n", db, branch, action, ref.HeadTXID)
 	case "stale":
-		fmt.Fprintf(os.Stderr, "offshoot: warning: checkout of %s@%s is stale (branch was repointed since it was materialized); forking branch head (txid %d) — run 'offshoot checkout' to refresh\n", db, branch, ref.HeadTXID)
+		fmt.Fprintf(os.Stderr, "offshoot: warning: checkout of %s@%s is stale (branch was repointed since it was materialized); %s (txid %d) — run 'offshoot checkout' to refresh\n", db, branch, action, ref.HeadTXID)
 	}
+}
+
+// errNoCheckpoint is the error for a checkpoint name that db@branch does
+// not carry. Checkpoints belong to one branch and are not inherited by
+// forks (a fork carries only "fork" at its fork point until it makes its
+// own), which is the single most common surprise behind this error, so the
+// message lists the branch's own checkpoints and names the way to start a
+// branch from a parent's checkpoint.
+func errNoCheckpoint(db, branch, name string, ref store.Ref) error {
+	names := make([]string, 0, len(ref.Checkpoints))
+	for n := range ref.Checkpoints {
+		names = append(names, n)
+	}
+	sort.Strings(names)
+	have := "none"
+	if len(names) > 0 {
+		have = strings.Join(names, ", ")
+	}
+	return fmt.Errorf("ops: no checkpoint %q on %s@%s (its checkpoints: %s; checkpoints belong to one branch — to start from a parent's checkpoint, fork it: offshoot fork %s@<parent> <new> --at %s)",
+		name, db, branch, have, db, name)
 }
 
 // copySnapshotIntoLineage materializes src's lineage at cp — resolving its
@@ -1155,11 +1185,11 @@ func (w *Workspace) Fork(db, srcBranch, newBranch, at string, ttl time.Duration,
 	if at != "" {
 		c, ok := src.Checkpoints[at]
 		if !ok {
-			return 0, fmt.Errorf("ops: no checkpoint %q on %s@%s", at, db, srcBranch)
+			return 0, errNoCheckpoint(db, srcBranch, at, src)
 		}
 		cp = c
 	} else {
-		w.warnIfUncheckpointed(db, srcBranch, src)
+		w.warnIfUncheckpointed(db, srcBranch, src, "forking last committed state")
 	}
 	txid := cp.TXID
 	// Fork-time snapshot-floor decision on the fork point's fully-resolved
@@ -1192,6 +1222,9 @@ func (w *Workspace) Fork(db, srcBranch, newBranch, at string, ttl time.Duration,
 			w.bestEffortDelete(store.BaseKey(childLineage))
 		} else {
 			w.bestEffortDelete(store.SnapshotKey(childLineage, 1, txid))
+		}
+		if errors.Is(err, store.ErrCAS) {
+			return 0, fmt.Errorf("ops: branch %s@%s already exists (offshoot status lists branches)", db, newBranch)
 		}
 		return 0, fmt.Errorf("ops: fork %s@%s: %w", db, newBranch, err)
 	}
@@ -1302,6 +1335,12 @@ type RollbackResult struct {
 	Path   string
 	Backup string
 	Shared bool
+	// BackupIsTarget reports that the branch's head already sat at the
+	// target checkpoint, so the safety fork in Backup holds the same
+	// committed state the rollback landed on: the rollback discarded only
+	// un-checkpointed edits in the checkout, and "undo" has nothing to
+	// restore. The CLI words its output accordingly.
+	BackupIsTarget bool
 }
 
 // Rollback is RollbackWith with defaults: safety fork on, default TTL. Kept
@@ -1353,9 +1392,10 @@ func (w *Workspace) RollbackWith(db, branch, to string, opts RollbackOptions) (R
 	}
 	cp, ok := ref.Checkpoints[to]
 	if !ok {
-		return RollbackResult{}, fmt.Errorf("ops: no checkpoint %q on %s@%s", to, db, branch)
+		return RollbackResult{}, errNoCheckpoint(db, branch, to, ref)
 	}
 	txid := cp.TXID
+	backupIsTarget := ref.HeadTXID == txid
 
 	// The safety fork comes after the checkpoint lookup (a bad `to` fails
 	// before anything is minted) and before the new lineage is minted, so the branch's current head is durably reachable from its
@@ -1472,7 +1512,7 @@ func (w *Workspace) RollbackWith(db, branch, to string, opts RollbackOptions) (R
 	if err := refresh(); err != nil {
 		return RollbackResult{}, fmt.Errorf("ops: branch repointed to checkpoint %q (txid %d), but the checkout could not be refreshed (run 'offshoot checkout' to re-materialize): %w", to, txid, err)
 	}
-	return RollbackResult{Path: path, Backup: backup, Shared: base != nil}, nil
+	return RollbackResult{Path: path, Backup: backup, Shared: base != nil, BackupIsTarget: backupIsTarget}, nil
 }
 
 // Promote repoints db@target at a NEW lineage seeded from db@source's head
@@ -1621,7 +1661,7 @@ func (w *Workspace) PromoteWith(db, source, target string, opts PromoteOptions) 
 	if err != nil {
 		return PromoteResult{}, err
 	}
-	w.warnIfUncheckpointed(db, source, src)
+	w.warnIfUncheckpointed(db, source, src, "promoting last committed state")
 	tgt, tgtEtag, err := w.Store.GetRef(db, target)
 	if err != nil {
 		return PromoteResult{}, err
