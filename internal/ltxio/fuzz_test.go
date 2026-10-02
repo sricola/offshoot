@@ -343,6 +343,8 @@ func FuzzApplySegments(f *testing.F) {
 			t.Fatalf("malformed segment (outcome %d) was accepted", outcome)
 		case outcome == recipeUncarried && !errors.Is(err, ErrUncarriedGrowth):
 			t.Fatalf("segment growing past its pages refused for another reason: %v", err)
+		case outcome == recipeCommitTooLarge && !errors.Is(err, ErrCommitTooLarge):
+			t.Fatalf("segment with Commit > maxCommit refused for another reason: %v", err)
 		default:
 			requireNoLeftovers(t, sdir)
 		}
@@ -353,10 +355,11 @@ func FuzzApplySegments(f *testing.F) {
 type recipeOutcome int
 
 const (
-	recipeValid     recipeOutcome = iota // apply succeeds and matches the model
-	recipeBadPre                         // corrupted pre-apply checksum: any error
-	recipeUncarried                      // grows past its pages: ErrUncarriedGrowth
-	recipeBadPost                        // corrupted post-apply checksum: any error
+	recipeValid          recipeOutcome = iota // apply succeeds and matches the model
+	recipeBadPre                              // corrupted pre-apply checksum: any error
+	recipeUncarried                           // grows past its pages: ErrUncarriedGrowth
+	recipeBadPost                             // corrupted post-apply checksum: any error
+	recipeCommitTooLarge                      // Commit > maxCommit: ErrCommitTooLarge, before any page is read
 )
 
 // maxRecipePages bounds a recipe's page count, and with it the model's
@@ -372,8 +375,12 @@ const maxRecipePages = 64
 // data[1]; each following byte pair is (page selector, fill byte), at most
 // maxRecipePages of them. A wild commit is almost always a growth the
 // segment does not carry (the Commit = 2^30 shape that used to hang
-// applySegments), which must be refused with ErrUncarriedGrowth. Returns a
-// nil segment for a recipe the encoder itself refuses.
+// applySegments), which must be refused with ErrUncarriedGrowth — unless
+// it exceeds maxCommit, where the frame guard refuses the header before
+// a page is read (ErrCommitTooLarge; the nightly fuzz crasher
+// 194c81dae26a92f2, Commit = 0xFFFFFFFF, found this oracle expecting the
+// growth error for a header the guard correctly never lets that far).
+// Returns a nil segment for a recipe the encoder itself refuses.
 func structuredSegment(base []byte, pageSize uint32, startSum uint64, data []byte) (seg, want []byte, wantSum uint64, outcome recipeOutcome) {
 	if len(data) < 2 {
 		return nil, nil, 0, 0
@@ -415,6 +422,8 @@ func structuredSegment(base []byte, pageSize uint32, startSum uint64, data []byt
 	}
 
 	switch {
+	case commit > maxCommit:
+		outcome = recipeCommitTooLarge
 	case data[0]&2 != 0:
 		outcome = recipeBadPre
 	case checkGrowth(commit, basePages, lockPgno, carried) != nil:

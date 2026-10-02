@@ -2,6 +2,7 @@ package ltxio
 
 import (
 	"encoding/binary"
+	"errors"
 	"fmt"
 	"io"
 
@@ -13,6 +14,11 @@ import (
 // value PRAGMA max_page_count accepts): an LTX header declaring more pages
 // than SQLite can address is not a database this package will materialize.
 const maxCommit = 0xFFFFFFFE
+
+// ErrCommitTooLarge reports an LTX header whose Commit exceeds maxCommit.
+// Exported, like ErrUncarriedGrowth, so a caller (and FuzzApplySegments's
+// oracle) can tell this refusal from a decode error.
+var ErrCommitTooLarge = errors.New("header Commit exceeds SQLite's maximum page count")
 
 // frameGuard sits between an LTX object's bytes (downloaded from an object
 // store, so untrusted until the trailer's CRC64 verifies at Close) and the
@@ -127,7 +133,7 @@ func (g *frameGuard) step() {
 			return
 		}
 		if hdr.Commit > maxCommit {
-			g.fail("header Commit %d exceeds SQLite's maximum page count %d", hdr.Commit, uint32(maxCommit))
+			g.fail("%w: Commit %d, maximum %d", ErrCommitTooLarge, hdr.Commit, uint32(maxCommit))
 			return
 		}
 		g.pageSize = hdr.PageSize
