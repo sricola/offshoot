@@ -22,7 +22,9 @@
     "dist",
     "README.md"
   ],
-  "engines": { "node": ">=20" },
+  "engines": {
+    "node": ">=20"
+  },
   "repository": {
     "type": "git",
     "url": "git+https://github.com/sricola/offshoot.git",
@@ -50,7 +52,7 @@
     "test": "tsc && node --test test-dist/test/*.test.js"
   },
   "devDependencies": {
-    "typescript": "^5.5.0",
-    "@types/node": "^20.0.0"
+    "@types/node": "^22.20.5",
+    "typescript": "^5.5.0"
   }
 }
