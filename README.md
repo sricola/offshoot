@@ -298,8 +298,8 @@ conditional-write probe pass against it for real:
   self-contained on demand.
 - A **checkout** is the materialized file; a sidecar records which state
   it embodies, so a clean checkout is reused without re-materializing.
-  Where the filesystem can clone (APFS in CI; btrfs and XFS reflinks are
-  supported but not exercised by CI), checkouts are cloned from a cache.
+  Where the filesystem can clone (APFS, and XFS or btrfs with reflinks;
+  both are exercised in CI), checkouts are cloned from a cache.
 - The **daemon** reads the checkout's WAL frames to capture transactions,
   keeps a replica, and flushes segments under its lease's epoch.
 - Every store carries a **layout version**; an older binary refuses a

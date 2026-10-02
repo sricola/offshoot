@@ -118,6 +118,13 @@ depends on — CAS behavior, create-only puts, list/delete edge cases:
   `internal/store/s3_integration_test.go`). RustFS replaced MinIO here in
   v0.2.10 after MinIO withdrew its community images and binaries; it
   passes the identical suite, multipart preconditions included.
+- **Linux reflink**: the copy-on-write fast paths (by-chain clones,
+  checkpoint shadows, segment checkpoints) skip on a filesystem that cannot
+  clone, and `ubuntu-latest`'s root filesystem cannot. `nightly.yml`'s
+  `linux-reflink` job mounts a loopback XFS image made with `reflink=1`,
+  points `TMPDIR` at it, fails if the clone probe skips, and runs the same
+  test set `cow-paths` runs on APFS — so Linux `FICLONE` (XFS, btrfs) is
+  exercised daily, not only argued to work.
 - **Real cloud providers**: the nightly workflow has a credentialed
   real-provider job (`.github/workflows/nightly.yml`,
   `real-provider-conformance`, gated on the `NIGHTLY_S3` repo variable —

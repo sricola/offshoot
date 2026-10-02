@@ -27,6 +27,9 @@ Pin an exact version if you depend on format stability. The full contract:
 
 ### Added
 
+- A nightly `linux-reflink` CI job runs the copy-on-write tests on a
+  loopback XFS filesystem with reflinks, so the Linux `FICLONE` clone path
+  (btrfs, XFS) is exercised and not only APFS.
 - `TestTortureCapturerKill`: a second torture harness that runs the capture
   engine in a child process, `SIGKILL`s it mid-traffic every round, restarts
   it on the same state and replica, and requires the replica to equal the
