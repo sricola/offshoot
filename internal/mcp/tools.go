@@ -298,7 +298,7 @@ func agentNextStep(err error, db string) error {
 	}
 	if errors.Is(err, store.ErrNotFound) && strings.Contains(err.Error(), "no database \"") {
 		return fmt.Errorf("no database %q; call offshoot_list to see what exists (databases are created "+
-			"with the CLI: offshoot create <name>).", db)
+			"with the CLI: offshoot create <name>)", db)
 	}
 	return err
 }
