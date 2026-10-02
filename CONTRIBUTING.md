@@ -249,7 +249,11 @@ Before tagging, bump every surface that states the number, in one PR:
 5. the version chip in `site/index.html`'s header
 
 `scripts/check-version-surfaces.sh vX.Y.Z` fails loudly, naming each
-surface that disagrees with the tag, so run it before pushing the tag.
+surface that disagrees with the tag, so run it before pushing the tag;
+release.yml runs it too before signing anything. The Formula is the one
+surface bumped *after* the tag (its sha256 is of the tarball GitHub serves
+for the tag), so it is checked separately once that commit lands:
+`scripts/check-version-surfaces.sh --with-formula vX.Y.Z`.
 
 ### SDK releases
 

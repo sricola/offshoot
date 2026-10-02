@@ -9,8 +9,8 @@
 #
 #   server.json            "version": "X.Y.Z"
 #   docs/ci-recipes.md     every OFFSHOOT_VERSION: pin names vX.Y.Z
-#   Formula/offshoot.rb    url names .../tags/vX.Y.Z.tar.gz
 #   CHANGELOG.md           a "## [X.Y.Z] - YYYY-MM-DD" header exists
+#   Formula/offshoot.rb    url names .../tags/vX.Y.Z.tar.gz  (--with-formula only)
 #
 # and exits non-zero naming every surface that disagrees. Run it before
 # pushing a tag (CONTRIBUTING.md, "Binary releases") and from release.yml
@@ -18,10 +18,20 @@
 #
 #   scripts/check-version-surfaces.sh v0.2.13
 #
+# The Formula is checked only with --with-formula: its sha256 is of the
+# source tarball GitHub serves for the tag, so by design it is bumped in a
+# commit AFTER the tag exists (CONTRIBUTING.md), and a tag-time check of it
+# would always fail. Use --with-formula after that bump to confirm it.
+#
 set -euo pipefail
 
+with_formula=0
+if [ "${1:-}" = "--with-formula" ]; then
+  with_formula=1
+  shift
+fi
 if [ $# -ne 1 ]; then
-  echo "usage: $0 vX.Y.Z" >&2
+  echo "usage: $0 [--with-formula] vX.Y.Z" >&2
   exit 2
 fi
 tag="$1"
@@ -51,8 +61,8 @@ elif [ "$pins" != "$tag" ]; then
   bad "docs/ci-recipes.md pins OFFSHOOT_VERSION $(echo "$pins" | tr '\n' ' ')— want $tag only"
 fi
 
-# Formula/offshoot.rb: the url names the release tarball.
-if ! grep -q "url \"https://github.com/[^\"]*/archive/refs/tags/${tag}.tar.gz\"" Formula/offshoot.rb; then
+# Formula/offshoot.rb: the url names the release tarball (post-tag bump).
+if [ "$with_formula" -eq 1 ] && ! grep -q "url \"https://github.com/[^\"]*/archive/refs/tags/${tag}.tar.gz\"" Formula/offshoot.rb; then
   bad "Formula/offshoot.rb url does not name refs/tags/${tag}.tar.gz: $(grep -m1 '^  url ' Formula/offshoot.rb || echo missing)"
 fi
 
@@ -65,4 +75,8 @@ if [ "$fail" -ne 0 ]; then
   echo "version-surfaces: $tag disagrees with the tree; fix the surfaces above and retag" >&2
   exit 1
 fi
-echo "version-surfaces: server.json, docs/ci-recipes.md, Formula/offshoot.rb and CHANGELOG.md all name $tag"
+if [ "$with_formula" -eq 1 ]; then
+  echo "version-surfaces: server.json, docs/ci-recipes.md, CHANGELOG.md and Formula/offshoot.rb all name $tag"
+else
+  echo "version-surfaces: server.json, docs/ci-recipes.md and CHANGELOG.md all name $tag (Formula not checked: bumped after the tag)"
+fi

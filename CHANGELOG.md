@@ -17,6 +17,10 @@ Pin an exact version if you depend on format stability. The full contract:
 
 ## [Unreleased]
 
+Nothing yet.
+
+## [0.2.14] - 2026-10-02
+
 Launch hardening. Every change below came out of a read-everything,
 run-everything review ahead of the first public announcement; the
 correctness items were reproduced before they were fixed.
