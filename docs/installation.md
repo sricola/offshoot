@@ -37,17 +37,17 @@ Every tagged release is signed and attested by the release workflow itself
 
 ```sh
 # 1. SLSA build provenance (GitHub attestation store; needs gh >= 2.49)
-gh attestation verify offshoot_v0.2.12_linux_amd64.tar.gz --repo sricola/offshoot
+gh attestation verify offshoot_v0.2.13_linux_amd64.tar.gz --repo sricola/offshoot
 
 # 2. cosign keyless signature, pinned to this repo's release workflow identity
 cosign verify-blob \
-  --bundle offshoot_v0.2.12_linux_amd64.tar.gz.sigstore.json \
+  --bundle offshoot_v0.2.13_linux_amd64.tar.gz.sigstore.json \
   --certificate-identity-regexp '^https://github.com/sricola/offshoot/\.github/workflows/release\.yml@refs/' \
   --certificate-oidc-issuer https://token.actions.githubusercontent.com \
-  offshoot_v0.2.12_linux_amd64.tar.gz
+  offshoot_v0.2.13_linux_amd64.tar.gz
 
 # 3. the plain checksum, as before
-shasum -a 256 -c offshoot_v0.2.12_linux_amd64.tar.gz.sha256
+shasum -a 256 -c offshoot_v0.2.13_linux_amd64.tar.gz.sha256
 ```
 
 For a numbered release, pin the check tighter with
