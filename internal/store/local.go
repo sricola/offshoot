@@ -26,7 +26,11 @@ type Local struct {
 }
 
 func NewLocal(root string) (*Local, error) {
-	if err := os.MkdirAll(root, 0o755); err != nil {
+	// 0700 throughout: objects are 0600 already, and a 0755 directory let
+	// any other local user list database and branch names. MkdirAll never
+	// tightens an existing directory, so a store created by an earlier
+	// version keeps its mode until chmod'ed by hand (see SECURITY.md).
+	if err := os.MkdirAll(root, 0o700); err != nil {
 		return nil, err
 	}
 	return &Local{root: root}, nil
@@ -142,7 +146,7 @@ func (l *Local) GetReader(key string) (io.ReadCloser, string, error) {
 // lands with its etag attached and Head need not re-read it.
 func (l *Local) write(p string, data []byte) (etag string, err error) {
 	dir := filepath.Dir(p)
-	if err := os.MkdirAll(dir, 0o755); err != nil {
+	if err := os.MkdirAll(dir, 0o700); err != nil {
 		return "", err
 	}
 	f, err := os.CreateTemp(dir, filepath.Base(p)+".tmp-*")
@@ -213,7 +217,7 @@ func (l *Local) writeReader(p string, r io.Reader, size int64) (etag string, err
 // per-key lock, and hold the lock only around the compare and the rename.
 func (l *Local) writeReaderTemp(p string, r io.Reader, size int64) (tmp, etag string, err error) {
 	dir := filepath.Dir(p)
-	if err := os.MkdirAll(dir, 0o755); err != nil {
+	if err := os.MkdirAll(dir, 0o700); err != nil {
 		return "", "", err
 	}
 	f, err := os.CreateTemp(dir, filepath.Base(p)+".tmp-*")
@@ -335,7 +339,7 @@ func (l *Local) PutReaderIf(key string, r io.Reader, size int64, ifMatch string)
 
 func (l *Local) lock(p string) (release func(), err error) {
 	lockPath := p + ".lock"
-	if err := os.MkdirAll(filepath.Dir(p), 0o755); err != nil {
+	if err := os.MkdirAll(filepath.Dir(p), 0o700); err != nil {
 		return nil, err
 	}
 	deadline := time.Now().Add(5 * time.Second)
@@ -502,7 +506,7 @@ func (l *Local) CopyObject(dst, src string) error {
 		return err
 	}
 	dir := filepath.Dir(dstPath)
-	if err := os.MkdirAll(dir, 0o755); err != nil {
+	if err := os.MkdirAll(dir, 0o700); err != nil {
 		return err
 	}
 	tmp, err := tempName(dir, filepath.Base(dstPath))

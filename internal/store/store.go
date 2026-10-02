@@ -1042,6 +1042,12 @@ func (s *Store) ListRefs() (map[string][]string, error) {
 		if len(parts) != 3 {
 			continue
 		}
+		// Defense in depth: every name offshoot writes passed ValidateName,
+		// so one that does not was put in the bucket by something else.
+		// Skip it rather than hand it to a path builder or a reaper.
+		if ValidateName(parts[1]) != nil || ValidateName(parts[2]) != nil {
+			continue
+		}
 		m[parts[1]] = append(m[parts[1]], parts[2])
 	}
 	for db := range m {

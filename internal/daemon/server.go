@@ -249,6 +249,12 @@ func (s *Server) Serve() error {
 	}
 }
 
+// maxSocketConnBytes bounds the request bytes one unix-socket connection
+// may send over its lifetime. Clients open a connection per request (see
+// daemon.Call), and the largest legitimate request is a few KiB of JSON;
+// 16 MiB leaves room for any future batch shape while still bounding memory.
+const maxSocketConnBytes = 16 << 20
+
 func (s *Server) handle(c net.Conn) {
 	s.connMu.Lock()
 	s.conns[c] = struct{}{}
@@ -259,12 +265,15 @@ func (s *Server) handle(c net.Conn) {
 		s.connMu.Unlock()
 		c.Close()
 	}()
-	dec := json.NewDecoder(c)
+	// Same-user callers only reach this socket, so the cap is against a
+	// runaway client, not an attacker; it mirrors HTTP's maxRPCBodyBytes
+	// so neither surface will buffer an unbounded request.
+	dec := json.NewDecoder(io.LimitReader(c, maxSocketConnBytes))
 	enc := json.NewEncoder(c)
 	for {
 		req, err := decodeRequest(dec)
 		if err != nil {
-			return // client hung up or sent garbage
+			return // client hung up, sent garbage, or exceeded the connection cap
 		}
 		// "subscribe" (Milestone 4 Task 4a) is handle()'s SECOND special-
 		// cased op, alongside "shutdown" below: like shutdown, it cannot be

@@ -22,7 +22,7 @@ test:
 lint:
 	gofmt -l . | tee /dev/stderr | (! read)
 	go vet ./...
-	go run honnef.co/go/tools/cmd/staticcheck@latest ./... || echo "staticcheck failed or unavailable (non-blocking)"
+	go run honnef.co/go/tools/cmd/staticcheck@v0.8.1 ./... || echo "staticcheck failed or unavailable (non-blocking)"
 test-torture:
 	go test ./internal/capture -tags=torture -run TestTorture -count=1 -timeout 30m -v
 
@@ -218,7 +218,7 @@ ci-local-sdks:
 # go-licenses itself and consult per-dependency license URLs) and used by
 # release.yml's collect job so a release always ships an up-to-date bundle.
 third-party-licenses:
-	go run github.com/google/go-licenses@latest report ./... > THIRD_PARTY_LICENSES.csv
+	go run github.com/google/go-licenses@v1.6.0 report ./... > THIRD_PARTY_LICENSES.csv
 
 check-plugin:
 	./scripts/check-plugin.sh

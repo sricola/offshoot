@@ -406,7 +406,7 @@ func (w *Workspace) CheckoutProven(db, branch string) (CheckoutResult, error) {
 			fmt.Fprintf(os.Stderr, "offshoot: warning: replacing %s@%s checkout, whose state could not be verified (no readable sidecar); any un-checkpointed changes in it are lost\n", db, branch)
 		}
 	}
-	if err := os.MkdirAll(filepath.Dir(path), 0o755); err != nil {
+	if err := os.MkdirAll(filepath.Dir(path), 0o700); err != nil {
 		return CheckoutResult{}, err
 	}
 	// Stale or missing: resolve the chain first, so an identical (or
@@ -1562,7 +1562,7 @@ func (w *Workspace) RollbackWith(db, branch, to string, opts RollbackOptions) (R
 				return err
 			}
 		}
-		if err := os.MkdirAll(filepath.Dir(path), 0o755); err != nil {
+		if err := os.MkdirAll(filepath.Dir(path), 0o700); err != nil {
 			return err
 		}
 		checksum, chain, err := w.refreshFromChain(db, next, path)

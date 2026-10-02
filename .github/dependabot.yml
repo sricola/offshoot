@@ -37,3 +37,25 @@ updates:
     groups:
       docker-images:
         patterns: ["*"]
+
+  # The TypeScript SDK's dev dependencies (typescript, @types/node) via its
+  # package-lock.json; the SDK has no runtime dependencies.
+  - package-ecosystem: npm
+    directory: /sdk/typescript
+    schedule:
+      interval: weekly
+    groups:
+      ts-sdk-dev:
+        patterns: ["*"]
+
+  # The hash-pinned Python locks CI installs with --require-hashes
+  # (requirements/*.txt, compiled from the .in beside each). A bump PR here
+  # must keep every hash; CONTRIBUTING.md documents the uv regenerate
+  # command if a PR arrives without them.
+  - package-ecosystem: pip
+    directory: /requirements
+    schedule:
+      interval: weekly
+    groups:
+      python-ci-locks:
+        patterns: ["*"]

@@ -6,8 +6,10 @@ import (
 	"errors"
 	"fmt"
 	"io"
+	"net"
 	"net/http"
 	"net/url"
+	"os"
 	"sort"
 	"strings"
 	"sync/atomic"
@@ -189,6 +191,11 @@ func NewS3(ctx context.Context, cfg S3Config) (*S3, error) {
 	if err != nil {
 		return nil, fmt.Errorf("store: load aws config: %w", err)
 	}
+	if ep := cfg.Endpoint; strings.HasPrefix(ep, "http://") {
+		if u, perr := url.Parse(ep); perr == nil && !isLoopbackHost(u.Hostname()) {
+			fmt.Fprintf(os.Stderr, "offshoot: warning: OFFSHOOT_S3_ENDPOINT %s is plain HTTP to a non-loopback host; credentials and data travel unencrypted\n", ep)
+		}
+	}
 	if awsCfg.Region == "" {
 		// The SDK would otherwise fail much later, inside the first request,
 		// with "Invalid region: region was not a valid DNS name" buried in
@@ -205,6 +212,16 @@ func NewS3(ctx context.Context, cfg S3Config) (*S3, error) {
 	})
 	prefix := strings.Trim(cfg.Prefix, "/")
 	return &S3{cl: cl, bucket: cfg.Bucket, prefix: prefix}, nil
+}
+
+// isLoopbackHost reports whether host names the local machine: localhost,
+// a loopback IP, or empty (the SDK then defaults to the AWS endpoint).
+func isLoopbackHost(host string) bool {
+	if host == "" || host == "localhost" {
+		return true
+	}
+	ip := net.ParseIP(host)
+	return ip != nil && ip.IsLoopback()
 }
 
 // full maps a backend key to a bucket key.
