@@ -50,7 +50,7 @@
     "test": "tsc && node --test test-dist/test/*.test.js"
   },
   "devDependencies": {
-    "typescript": "^5.5.0",
-    "@types/node": "^20.0.0"
+    "typescript": "^7.0.2",
+    "@types/node": "^26.6.3"
   }
 }
