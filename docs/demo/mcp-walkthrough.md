@@ -86,7 +86,7 @@ wrong.
 
 ```
 $ offshoot -store $STORE init
-initialized store at /var/folders/r1/h4z43zsj7vlb62zwtkxhgc400000gn/T/tmp.zJMmwgQiKG/store
+initialized store at /var/folders/r1/h4z43zsj7vlb62zwtkxhgc400000gn/T/tmp.KhbG8NHTCq/store
 
 $ offshoot -store $STORE create shop
 
@@ -105,7 +105,7 @@ description tells it to ("Call this first to orient yourself").*
 
 ```json
 → {"jsonrpc":"2.0","id":1,"method":"initialize","params":{"protocolVersion":"2024-11-05","capabilities":{},"clientInfo":{"name":"claude-code","version":"1"}}}
-← {"jsonrpc":"2.0","id":1,"result":{"protocolVersion":"2025-11-25","capabilities":{"tools":{}},"serverInfo":{"name":"offshoot","version":"0.1.0"}}}
+← {"jsonrpc":"2.0","id":1,"result":{"protocolVersion":"2025-11-25","capabilities":{"tools":{}},"serverInfo":{"name":"offshoot","version":"dev"}}}
 
 → {"jsonrpc":"2.0","method":"notifications/initialized"}
    (a notification — no response, per JSON-RPC 2.0 and confirmed by
@@ -124,7 +124,7 @@ paraphrase:
       "tools": [
         {
           "name": "offshoot_list",
-          "description": "List every database and branch offshoot is tracking, with each branch's head transaction id, named checkpoints, and whether it is protected. Call this first to orient yourself: to see what databases exist, what branches an attempt could fork from, or which checkpoints are available to roll back to or fork from.",
+          "description": "List every database and branch offshoot is tracking, with each branch's head transaction id, named checkpoints, whether it is protected, and, for TTL'd forks, when each expires. Call this first to orient yourself: to see what databases exist, what branches an attempt could fork from, or which checkpoints are available to roll back to or fork from.",
           "inputSchema": {
             "properties": {},
             "type": "object"
@@ -165,7 +165,7 @@ paraphrase:
         },
         {
           "name": "offshoot_checkpoint",
-          "description": "Name the current state of a branch's checkout so it can be returned to later. Call this after a batch of changes you might want to keep or roll back to individually — e.g. after a migration step succeeds, or before starting a riskier change on the same branch. If a daemon session is open on this branch, this is a live flush (cheap, only the diff since the last checkpoint, no pause in writes); otherwise it's an at-rest checkpoint of the checkout file: a segment of the pages changed since the last checkpoint when it can, else a full snapshot (the result's `kind` says which). `branch` defaults to \"main\" if omitted. Optional `meta` (string->string, at most 32 keys) tags the result with your run id, git SHA, or agent name for later lookup.",
+          "description": "Name the current state of a branch's checkout so it can be returned to later. Call this after a batch of changes you might want to keep or roll back to individually — e.g. after a migration step succeeds, or before starting a riskier change on the same branch. If a daemon session is open on this branch, this is a live flush (cheap, only the diff since the last checkpoint, no pause in writes); otherwise it's an at-rest checkpoint of the checkout file: a segment of the pages changed since the last checkpoint when it can, else a full snapshot (the result's `kind` says which). `branch` defaults to \"main\" if omitted. Optional `meta` (string->string, at most 32 keys) tags the result with your run id, git SHA, or agent name for later lookup. At rest (no daemon session), the branch must have been materialized with offshoot_checkout first.",
           "inputSchema": {
             "properties": {
               "branch": {
@@ -201,7 +201,7 @@ paraphrase:
         },
         {
           "name": "offshoot_fork",
-          "description": "Create an isolated copy of a database branch before attempting risky or destructive work (schema migrations, bulk deletes, experiments). Fork storage starts with two small metadata objects, regardless of database size. Forking a named checkpoint does not read database contents; the default at-head fork checks the checkout for uncheckpointed changes, proving it clean from its fingerprint (size, mtime, SQLite change counter) and hashing the checkout only when that does not match. Prefer forking over backing up by hand. Forks from the branch's current head by default, or from a named checkpoint via `at`. If a daemon session is open on the source branch, its unflushed writes are flushed first, so the fork always includes everything written so far. `branch` (the source) defaults to \"main\" if omitted. Forked branches expire 24h0m0s after their last activity by default, unless promoted or touched; pass `ttl:\"none\"` to keep one indefinitely, or `ttl` as a Go duration string (e.g. \"2h\") to override. TTL reaping only happens while a janitor is running (`offshoot serve`); a daemonless setup sweeps expired branches only when `offshoot gc` is run. Optional `meta` (string->string, at most 32 keys) tags the result with your run id, git SHA, or agent name for later lookup.",
+          "description": "Create an isolated copy of a database branch before attempting risky or destructive work (schema migrations, bulk deletes, experiments). Fork storage starts with two small metadata objects, regardless of database size. Forking a named checkpoint does not read database contents; the default at-head fork checks the checkout for uncheckpointed changes, proving it clean from its fingerprint (size, mtime, SQLite change counter) and hashing the checkout only when that does not match. Prefer forking over backing up by hand. Forks from the branch's current head by default, or from a named checkpoint via `at`. If a daemon session is open on the source branch, its unflushed writes are flushed first, so the fork always includes everything written so far. `branch` (the source) defaults to \"main\" if omitted. Forked branches expire 24h after their last activity by default, unless promoted or touched; pass `ttl:\"none\"` to keep one indefinitely, or `ttl` as a Go duration string (e.g. \"2h\") to override. TTL reaping only happens while a janitor is running (`offshoot serve`); a daemonless setup sweeps expired branches only when `offshoot gc` is run. Optional `meta` (string->string, at most 32 keys) tags the result with your run id, git SHA, or agent name for later lookup.",
           "inputSchema": {
             "properties": {
               "at": {
@@ -274,7 +274,7 @@ paraphrase:
         },
         {
           "name": "offshoot_promote",
-          "description": "Ship a winning attempt: repoint the target branch (often `main`) at the source branch's current head, which resets the target's checkpoint history to just the new promote checkpoint. The target's previous head is kept first as a shared safety fork named `<target>-pre-promote` (TTL'd, at least 24h; one per target, replaced by the next promote), so a promote is undone by promoting that fork back onto the target. Call this once you've validated a forked attempt and are ready to make it the branch of record. Protected branches (main is protected by default) refuse promotion. `force` is honored only when the server was started with -allow-force; otherwise a protected target refuses and the answer is to ask the human to promote from the CLI, or work on a fork. A protected branch's own safety fork (`<branch>-pre-rollback`/`<branch>-pre-promote`) cannot be a target without -allow-force either, even though the fork itself is never protected — promoting onto it would repoint (destroy) the undo point it exists to preserve. If a daemon session is open on the TARGET branch, the call is refused instead of proceeding — `force` does not override this — since promoting repoints the target's storage out from under a session the daemon still believes it owns; close the session first (e.g. `offshoot session close`) and retry. An open session on the SOURCE does not block the call, but the promoted state is the source's last-flushed/checkpointed head, not any write still unflushed in that live session — flush or checkpoint the source first if you need its very latest state promoted.",
+          "description": "Protected branches (main by default) refuse this; force is also refused unless the operator started the server with -allow-force, so never retry with force — ask the human. Ship a winning attempt: repoint the target branch (often `main`) at the source branch's current head, which resets the target's checkpoint history to just the new promote checkpoint. The target's previous head is kept first as a shared safety fork named `<target>-pre-promote` (TTL'd, at least 24h; one per target, replaced by the next promote), so a promote is undone by promoting that fork back onto the target. Call this once you've validated a forked attempt and are ready to make it the branch of record. Protected branches (main is protected by default) refuse promotion. `force` is honored only when the server was started with -allow-force; otherwise a protected target refuses and the answer is to ask the human to promote from the CLI, or work on a fork. A protected branch's own safety fork (`<branch>-pre-rollback`/`<branch>-pre-promote`) cannot be a target without -allow-force either, even though the fork itself is never protected — promoting onto it would repoint (destroy) the undo point it exists to preserve. If a daemon session is open on the TARGET branch, the call is refused instead of proceeding — `force` does not override this — since promoting repoints the target's storage out from under a session the daemon still believes it owns; close the session first (e.g. `offshoot session close`) and retry. An open session on the SOURCE does not block the call, but the promoted state is the source's last-flushed/checkpointed head, not any write still unflushed in that live session — flush or checkpoint the source first if you need its very latest state promoted.",
           "inputSchema": {
             "properties": {
               "database": {
@@ -307,7 +307,7 @@ paraphrase:
         },
         {
           "name": "offshoot_destroy",
-          "description": "Permanently discard a branch and its checkout. Call this to clean up a failed or abandoned attempt once you're done with it. `force` is honored only when the server was started with -allow-force; otherwise a protected branch or a live lease refuses and the answer is to ask the human to destroy from the CLI, or work on a fork. If a daemon session is open on this branch, the call is refused instead of proceeding — `force` does not override this — since destroy deletes the branch's storage out from under a session the daemon still believes it owns; close the session first (e.g. `offshoot session close`) and retry.",
+          "description": "Protected branches (main by default) refuse this; force is also refused unless the operator started the server with -allow-force, so never retry with force — ask the human. Permanently discard a branch and its checkout. Call this to clean up a failed or abandoned attempt once you're done with it. `force` is honored only when the server was started with -allow-force; otherwise a protected branch or a live lease refuses and the answer is to ask the human to destroy from the CLI, or work on a fork. If a daemon session is open on this branch, the call is refused instead of proceeding — `force` does not override this — since destroy deletes the branch's storage out from under a session the daemon still believes it owns; close the session first (e.g. `offshoot session close`) and retry.",
           "inputSchema": {
             "properties": {
               "branch": {
@@ -447,7 +447,7 @@ completion in the same session, not a throwaway experiment to let expire.*
 
 ```json
 → {"jsonrpc":"2.0","id":5,"method":"tools/call","params":{"name":"offshoot_checkout","arguments":{"database":"shop","branch":"migration-attempt"}}}
-← {"jsonrpc":"2.0","id":5,"result":{"content":[{"type":"text","text":"checked out shop@migration-attempt at /var/folders/r1/h4z43zsj7vlb62zwtkxhgc400000gn/T/tmp.zJMmwgQiKG/store/checkouts/shop/migration-attempt.db\nthis checkout is not yet checkpointed: nothing written here can be rolled back to or forked from until you call offshoot_checkpoint"}],"structuredContent":{"branch":"migration-attempt","database":"shop","live":false,"path":"/var/folders/r1/h4z43zsj7vlb62zwtkxhgc400000gn/T/tmp.zJMmwgQiKG/store/checkouts/shop/migration-attempt.db"}}}
+← {"jsonrpc":"2.0","id":5,"result":{"content":[{"type":"text","text":"checked out shop@migration-attempt at /var/folders/r1/h4z43zsj7vlb62zwtkxhgc400000gn/T/tmp.KhbG8NHTCq/store/checkouts/shop/migration-attempt.db\nthis checkout is not yet checkpointed: nothing written here can be rolled back to or forked from until you call offshoot_checkpoint"}],"structuredContent":{"branch":"migration-attempt","database":"shop","live":false,"path":"/var/folders/r1/h4z43zsj7vlb62zwtkxhgc400000gn/T/tmp.KhbG8NHTCq/store/checkouts/shop/migration-attempt.db"}}}
 ```
 
 The response text itself is the nudge: nothing here can be rolled back to
@@ -487,7 +487,7 @@ hand-patch the bad migration:*
 
 ```json
 → {"jsonrpc":"2.0","id":7,"method":"tools/call","params":{"name":"offshoot_rollback","arguments":{"database":"shop","branch":"migration-attempt","to":"pre-migration"}}}
-← {"jsonrpc":"2.0","id":7,"result":{"content":[{"type":"text","text":"rolled back shop@migration-attempt to checkpoint \"pre-migration\"; the previous head is kept as shop@migration-attempt-pre-rollback (undo: offshoot_promote it back onto migration-attempt); checkout at /var/folders/r1/h4z43zsj7vlb62zwtkxhgc400000gn/T/tmp.zJMmwgQiKG/store/checkouts/shop/migration-attempt.db"}],"structuredContent":{"backup":"migration-attempt-pre-rollback","branch":"migration-attempt","database":"shop","path":"/var/folders/r1/h4z43zsj7vlb62zwtkxhgc400000gn/T/tmp.zJMmwgQiKG/store/checkouts/shop/migration-attempt.db","to":"pre-migration"}}}
+← {"jsonrpc":"2.0","id":7,"result":{"content":[{"type":"text","text":"rolled back shop@migration-attempt to checkpoint \"pre-migration\"; the previous head is kept as shop@migration-attempt-pre-rollback (undo: offshoot_promote it back onto migration-attempt); checkout at /var/folders/r1/h4z43zsj7vlb62zwtkxhgc400000gn/T/tmp.KhbG8NHTCq/store/checkouts/shop/migration-attempt.db"}],"structuredContent":{"backup":"migration-attempt-pre-rollback","branch":"migration-attempt","database":"shop","path":"/var/folders/r1/h4z43zsj7vlb62zwtkxhgc400000gn/T/tmp.KhbG8NHTCq/store/checkouts/shop/migration-attempt.db","to":"pre-migration"}}}
 ```
 
 The bad attempt isn't just discarded, either: rollback keeps the head it
@@ -523,7 +523,7 @@ Tests are green. The agent checkpoints the now-validated state:
 
 ```json
 → {"jsonrpc":"2.0","id":9,"method":"tools/call","params":{"name":"offshoot_promote","arguments":{"database":"shop","source":"migration-attempt","target":"main"}}}
-← {"jsonrpc":"2.0","id":9,"result":{"content":[{"type":"text","text":"ops: shop@main is protected; use --force"}],"isError":true}}
+← {"jsonrpc":"2.0","id":9,"result":{"content":[{"type":"text","text":"shop@main is protected. This MCP server does not honor force (operator flag: offshoot mcp -allow-force), so do not retry with force:true. Ask the human to run `offshoot promote shop@migration-attempt --onto main --force`, or keep working on the fork."}],"isError":true}}
 ```
 
 This refusal is real, not staged narration — `main` is protected by default,
@@ -589,7 +589,7 @@ up without needing the human at all.
 
 ```json
 → {"jsonrpc":"2.0","id":12,"method":"tools/call","params":{"name":"offshoot_list","arguments":{}}}
-← {"jsonrpc":"2.0","id":12,"result":{"content":[{"type":"text","text":"shop@main head=4 checkpoints=[promote] protected=true checked_out=true\nshop@main-pre-promote head=2 checkpoints=[fork] protected=false checked_out=false\nshop@migration-attempt-pre-rollback head=3 checkpoints=[fork] protected=false checked_out=false\n"}],"structuredContent":{"branches":[{"branch":"main","checked_out":true,"checkpoints":["promote"],"database":"shop","head_txid":4,"protected":true},{"branch":"main-pre-promote","checked_out":false,"checkpoints":["fork"],"database":"shop","head_txid":2,"protected":false},{"branch":"migration-attempt-pre-rollback","checked_out":false,"checkpoints":["fork"],"database":"shop","head_txid":3,"protected":false}]}}}
+← {"jsonrpc":"2.0","id":12,"result":{"content":[{"type":"text","text":"shop@main head=4 checkpoints=[promote] protected=true checked_out=true\nshop@main-pre-promote head=2 checkpoints=[fork] protected=false checked_out=false ttl=24h0m0s expires_at=2026-10-03T10:02:53Z\nshop@migration-attempt-pre-rollback head=3 checkpoints=[fork] protected=false checked_out=false ttl=24h0m0s expires_at=2026-10-03T10:02:53Z\n"}],"structuredContent":{"branches":[{"branch":"main","checked_out":true,"checkpoints":["promote"],"database":"shop","head_txid":4,"protected":true},{"branch":"main-pre-promote","checked_out":false,"checkpoints":["fork"],"database":"shop","expires_at":"2026-10-03T10:02:53Z","head_txid":2,"protected":false,"ttl":"24h0m0s"},{"branch":"migration-attempt-pre-rollback","checked_out":false,"checkpoints":["fork"],"database":"shop","expires_at":"2026-10-03T10:02:53Z","head_txid":3,"protected":false,"ttl":"24h0m0s"}]}}}
 ```
 
 Three branches survive, and each is a safety net from somewhere earlier in
