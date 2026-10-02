@@ -32,6 +32,14 @@ version if you depend on format stability.
 
 ### Changed
 
+- **Local store `Head` no longer re-reads the object.** Every object the
+  local backend writes carries its content etag as an extended attribute
+  (`user.offshoot.etag`), set on the temp file before the rename so it
+  lands with the object. `Head`, which every at-rest checkpoint calls on
+  the object it just committed, answers from a stat and that attribute
+  instead of a second full read and hash of the snapshot; objects written
+  by earlier versions, and filesystems without user xattrs, fall back to
+  hashing as before.
 - **Rollback, promote and compact refresh the checkout through the by-chain
   cache,** like `checkout`: an identical or prefix-sharing file is cloned
   instead of decoded from the store.

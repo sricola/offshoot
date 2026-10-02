@@ -57,12 +57,20 @@ const drainNowBudget = 30 * time.Second
 // the ref still names our holder, epoch, lineage and untouched head, so
 // within one TTL a CAS loss can only be a writer that left our holder,
 // epoch, lineage and head untouched (our own heartbeat proving the lease is
-// alive, or metadata such as touch/protect); a flush that cannot land a single PutRef between its own
-// renewals for a whole TTL is a pathological storm, and only then does it
-// surface "lost a race". In production (TTL 30 s, heartbeat 10 s) eight
-// losses already take longer than a TTL, so the count term is what binds
-// and nothing changes there. The budget never changes what a flush commits,
-// only how long it keeps reapplying an unchanged head advance.
+// alive, or metadata such as touch/protect); a flush that cannot land a
+// single PutRef between its own renewals for a whole TTL is a pathological
+// storm, and only then does it surface "lost a race".
+//
+// Which term binds depends on how fast a retry cycle is. The two are ORed,
+// so the budget is the LONGER of the two horizons. In production (TTL 30 s,
+// heartbeat 10 s) a cycle is one GetRef, one PutRef and a pause of at most
+// flushCASRetryPauseMax, so eight losses are spent in about a second and
+// the TTL term governs: under a sustained storm a flush keeps retrying,
+// with flushMu held (a concurrent Close or drain waits behind it), for up
+// to one lease TTL before it reports the loss, where it used to give up
+// after eight attempts. Before the storm the first retry lands, as it
+// always did; the budget never changes what a flush commits, only how long
+// it keeps reapplying an unchanged head advance.
 const (
 	flushCASMinAttempts  = 8
 	flushCASMinLeaseTTLs = 1
