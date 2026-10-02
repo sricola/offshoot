@@ -61,6 +61,22 @@ The pinned upstream decoder would accept some of these, at the cost of
 allocations of up to 4 GiB or zero-filled pages. No object this project
 ever wrote is affected.
 
+### Fixed
+
+- **A `shutdown` request over HTTP could get `EOF` instead of its
+  response.** The handler wrote the response and then triggered shutdown,
+  but Go's `net/http` only hands a handler's buffered response to the
+  connection when the handler returns, so when the shutdown goroutine
+  closed the server first the client saw EOF before a single byte. The
+  handler now flushes before it triggers shutdown. Seen as a recurring
+  `internal/daemon` CI failure on loaded Linux runners.
+- **Three timing-sensitive tests** (`internal/capture`'s resume Apply-count
+  test and `internal/daemon`'s auto-flush and status tests) raced the
+  engine's startup rebase, split one write into two autocommit
+  transactions that an auto-flush could separate, or observed a transient
+  injected failure through a window shorter than a descheduled test
+  goroutine; each now waits on the state it asserts about.
+
 ## [0.2.12] - 2026-09-30
 
 Pointers and deltas, not copies: the operations that used to copy a whole

@@ -1070,7 +1070,16 @@ func TestServeFlushesAutomaticallyWithoutAnExplicitFlushOp(t *testing.T) {
 	deadline := time.Now().Add(10 * time.Second)
 	settled := pollDurable(t, sock, "app", "main", deadline, func(d uint64) bool { return d > 0 })
 
-	sqliteExec(t, open.Checkout, "CREATE TABLE t (v); INSERT INTO t VALUES (1);")
+	// One transaction, deliberately: the sqlite3 CLI runs "CREATE TABLE ...;
+	// INSERT ...;" as two autocommit transactions, and with FlushEvery at
+	// 100 ms an auto-flush can land between them. The poll below is then
+	// satisfied by the CREATE's flush alone, and "close" (which never
+	// flushes; it only joins a flush already in flight) discards the
+	// INSERT, so the fresh checkout has the table with 0 rows — the exact
+	// failure this test hit on a loaded Linux runner (2026-10-01, PR #65's
+	// run) and reproduces every time locally with 250 ms between the two
+	// statements. A single commit cannot be split by a flush.
+	sqliteExec(t, open.Checkout, "BEGIN; CREATE TABLE t (v); INSERT INTO t VALUES (1); COMMIT;")
 
 	deadline = time.Now().Add(10 * time.Second)
 	pollDurable(t, sock, "app", "main", deadline, func(d uint64) bool { return d > settled })
@@ -1195,13 +1204,24 @@ func TestStatusReportsDurableAgeFlushErrorAndCaptureLag(t *testing.T) {
 		t.Fatalf("CaptureLag must never be negative: %+v", settled)
 	}
 
-	fp.arm(2)
+	// Fail every auto-flush until this test has SEEN the failure, then
+	// disarm. A fixed count (this used to arm 2) is a window, not a state:
+	// at FlushEvery 60 ms two failures and the recovering third flush all
+	// finish within ~200 ms, and a test goroutine descheduled that long on
+	// a loaded runner polls only after FlushError has already been cleared,
+	// then waits out the deadline on a state that will never recur — the
+	// exact failure this test hit on a loaded Linux runner (2026-10-01,
+	// PR #65's run: DurableAge 10s, FlushError empty) and reproduces every
+	// time locally with a 400 ms pause here. Arming "until observed" keeps
+	// the state observable for as long as the observer needs.
+	fp.arm(1 << 30)
 	sqliteExec(t, open.Checkout, "INSERT INTO t VALUES (2);")
 
 	deadline = time.Now().Add(10 * time.Second)
 	failed := pollStatus(t, sock, "app", "main", deadline, func(in SessionInfo) bool {
 		return in.FlushError != ""
 	})
+	fp.arm(0) // recover: the next auto-flush succeeds and clears FlushError
 	if !strings.Contains(failed.FlushError, "injected") {
 		t.Fatalf("FlushError = %q, want it to mention the injected failure", failed.FlushError)
 	}

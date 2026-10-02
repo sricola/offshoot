@@ -1253,13 +1253,15 @@ func (s *Server) Shutdown(ctx context.Context) error {
 	// (http.Server.Shutdown would wait out in-flight handlers, which this
 	// daemon does not need — see below). This is safe for a request that is
 	// ITSELF the "shutdown" op arriving over HTTP: the HTTP rpc handler
-	// writes and flushes that request's response, on its own connection,
-	// strictly BEFORE it ever triggers this Shutdown call (see http.go's
-	// handleRPC, the HTTP analog of handle's own respond-then-shutdown
-	// ordering fix) — by the time Close() runs here, those bytes are
-	// already past the handler and into the kernel's send buffer, so
-	// Close() tearing down the connection immediately afterward cannot
-	// erase a response that was already written. Any OTHER HTTP request
+	// writes AND explicitly flushes that request's response, on its own
+	// connection, strictly BEFORE it ever triggers this Shutdown call (see
+	// http.go's handleRPC, the HTTP analog of handle's own
+	// respond-then-shutdown ordering fix; the explicit Flush matters
+	// because net/http otherwise only flushes when the handler returns,
+	// which is after the trigger) — by the time Close() runs here, those
+	// bytes are already past the handler and into the kernel's send
+	// buffer, so Close() tearing down the connection immediately afterward
+	// cannot erase a response that was already written. Any OTHER HTTP request
 	// truly in flight when an unrelated Shutdown (e.g. SIGINT) fires simply
 	// sees its connection close — no panic, no hang; dispatch()'s own
 	// per-op s.closing checks (opOpen, etc.) already make a request that

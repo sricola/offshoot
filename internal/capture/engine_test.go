@@ -61,6 +61,30 @@ func startEngine(t *testing.T, dbPath string) (*Engine, *replay.Replica, context
 }
 
 // waitEqual polls until the replica's dump matches the (quiesced) source.
+// waitRebased blocks until e has completed n startup rebases (Rebased() ==
+// n) or deadline passes. A fresh engine rebases once at startup: checkpoint
+// TRUNCATE, snapshot copy, Sink.Rebase, then a fresh reader bound at the
+// post-snapshot WAL position, and only then does rebased increment. A write
+// that lands BEFORE that bind is folded into the snapshot and never reaches
+// Sink.Apply, so a test that counts Apply calls for a write must wait here
+// first: issuing the write right after Run starts is a race the engine
+// legitimately wins by including the row in its snapshot (0 Apply calls,
+// replica still equal to the source), which is exactly how
+// TestEngineResumeAppliesNothingBeforeNewWrite failed on a loaded Linux
+// runner (2026-10-01, run 36818434074) and 63 of 160 times locally under
+// CPU load. WaitReady is not enough for this: it returns before the
+// startup rebase finishes (see the ready field's doc comment).
+func waitRebased(t *testing.T, e *Engine, n int, deadline time.Duration) {
+	t.Helper()
+	end := time.Now().Add(deadline)
+	for e.Rebased() < n {
+		if time.Now().After(end) {
+			t.Fatalf("engine did not complete %d startup rebase(s) within %v (rebased=%d)", n, deadline, e.Rebased())
+		}
+		time.Sleep(5 * time.Millisecond)
+	}
+}
+
 func waitEqual(t *testing.T, src string, rep *replay.Replica, deadline time.Duration) {
 	t.Helper()
 	end := time.Now().Add(deadline)
@@ -792,6 +816,10 @@ func TestEngineResumeAppliesNothingBeforeNewWrite(t *testing.T) {
 	ctx1, cancel1 := context.WithCancel(context.Background())
 	done1 := make(chan error, 1)
 	go func() { done1 <- e1.Run(ctx1) }()
+	// The one write must land AFTER session 1's startup rebase has bound
+	// its reader, or it is folded into the snapshot instead of reaching
+	// Apply and the count below reads 0 — see waitRebased.
+	waitRebased(t, e1, 1, 10*time.Second)
 	if out, err := exec.Command("sqlite3", src,
 		"PRAGMA busy_timeout=5000; INSERT INTO t (v) VALUES (randomblob(64));").CombinedOutput(); err != nil {
 		t.Fatalf("%v: %s", err, out)
@@ -1052,9 +1080,11 @@ func TestDrainNowCapturesPendingTransaction(t *testing.T) {
 	defer func() { cancel(); <-done }()
 
 	// Let the engine's initial rebase (checkpoint + snapshot + reader bind)
-	// finish before writing — same ordering every other test in this file
-	// relies on.
-	time.Sleep(300 * time.Millisecond)
+	// finish before writing, by observing it rather than sleeping: a write
+	// that lands before the bind is folded into the snapshot and never
+	// reaches Apply, which the count below would read as a lost
+	// transaction (see waitRebased).
+	waitRebased(t, e, 1, 10*time.Second)
 
 	if out, err := exec.Command("sqlite3", src,
 		"PRAGMA busy_timeout=5000; INSERT INTO t (v) VALUES (randomblob(64));").CombinedOutput(); err != nil {

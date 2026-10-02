@@ -808,6 +808,72 @@ func TestHTTPShutdownResponseIsNotChunkedAndReadAllUnmarshalsCleanly(t *testing.
 	}
 }
 
+// TestHTTPShutdownResponseSurvivesCloseBeforeHandlerReturn pins the fix for
+// the `Post ...: EOF` flake TestHTTPShutdownResponseIsNotChunkedAndReadAllUnmarshalsCleanly
+// hit on loaded Linux runners (2026-10-01, runs 36817109171, 36818434074 and
+// PR #65's): handleRPC wrote the "shutdown" response and then spawned
+// Shutdown, but net/http only hands a handler's buffered response bytes to
+// the connection when the handler RETURNS (finishRequest flushes the
+// per-response and per-conn bufio.Writers), so whenever the Shutdown
+// goroutine reached http.Server.Close() before that return, the connection
+// closed with the whole response still in the buffer and the client saw
+// EOF before a single byte. The handler now flushes explicitly before it
+// triggers Shutdown. This test forces the losing interleaving with
+// httpShutdownAfterTriggerDelay (the handler parks after spawning Shutdown,
+// so Close() always runs before the handler returns) rather than relying
+// on scheduling luck: without the flush it fails every run with EOF, with
+// it the full response arrives.
+func TestHTTPShutdownResponseSurvivesCloseBeforeHandlerReturn(t *testing.T) {
+	_, _, base, token := newHTTPServer(t)
+
+	// The test returns as soon as the response arrives, which by design is
+	// while the handler is still parked in this hook; handlerDone lets the
+	// deferred reset wait for the handler to leave the hook first, so the
+	// reset never races the handler's read of the variable.
+	handlerDone := make(chan struct{})
+	park := func() {
+		time.Sleep(300 * time.Millisecond)
+		close(handlerDone)
+	}
+	httpShutdownAfterTriggerDelay.Store(&park)
+	defer func() {
+		<-handlerDone
+		httpShutdownAfterTriggerDelay.Store(nil)
+	}()
+
+	body, err := json.Marshal(Request{Op: "shutdown"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	req, err := http.NewRequest(http.MethodPost, base+"/rpc", bytes.NewReader(body))
+	if err != nil {
+		t.Fatal(err)
+	}
+	req.Header.Set("Content-Type", "application/json")
+	req.Header.Set("Authorization", "Bearer "+token)
+	client := &http.Client{Transport: &http.Transport{DisableKeepAlives: true}}
+	resp, err := client.Do(req)
+	if err != nil {
+		t.Fatalf("shutdown POST while the handler is parked after triggering Shutdown: %v "+
+			"(EOF here means Close() tore the connection down with the response still buffered)", err)
+	}
+	defer resp.Body.Close()
+	if resp.ContentLength < 0 {
+		t.Fatalf("response ContentLength = %d, want >= 0", resp.ContentLength)
+	}
+	raw, err := io.ReadAll(resp.Body)
+	if err != nil {
+		t.Fatalf("io.ReadAll(resp.Body) = %v", err)
+	}
+	var out Response
+	if err := json.Unmarshal(raw, &out); err != nil {
+		t.Fatalf("json.Unmarshal(%q) = %v", raw, err)
+	}
+	if !out.OK {
+		t.Fatalf("shutdown response = %+v, want OK", out)
+	}
+}
+
 // TestHTTPShutdownRespondsBeforeClosingRequestingConn is the HTTP analog of
 // server_test.go's TestShutdownRespondsBeforeClosingRequestingConn: an
 // op=shutdown request's own response must be fully written before
