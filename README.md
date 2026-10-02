@@ -317,10 +317,16 @@ Longer: [core concepts (glossary)](docs/concepts.md), [architecture](docs/archit
   unreferenced object, because the ref update is always last; a fenced
   writer cannot advance a ref; fuzzing covers the decoder, the sidecar
   and the wire protocol.
+- **Also proven by test, nightly:** the capture engine itself survives
+  `SIGKILL`. A second harness runs the capturer in a child process, kills
+  it with `SIGKILL` mid-traffic every round, restarts it on the same state
+  and replica, and requires the replica to match the source after a
+  graceful drain; every restart after a kill takes the rebase path, and
+  none has diverged.
 - **Designed for, not torture-tested:** every rename into place is
   followed by a directory fsync, so a flushed state on a local store is
-  meant to survive power loss, not only process death. The daemon itself
-  is never `SIGKILL`ed by the harness; its graceful restart is tested.
+  meant to survive power loss, not only process death. No harness cuts
+  power.
 - **Explicitly at risk:** committed-but-unflushed writes in a daemon
   session, bounded by `-flush-every`. Two at-rest `checkpoint` commands on
   one branch at the same moment are detected and recovered but remain an

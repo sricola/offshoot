@@ -222,12 +222,14 @@ releases before v0.2.11 carry checksums only.
 
 ## What is not proven here
 
-- **The capturer process itself is never `SIGKILL`ed.** The torture
-  harness bounces the capture engine through its graceful-shutdown path
-  on every 10th round, not a hard kill of the capturer process itself;
-  that case is argued safe in `internal/capture/engine.go`'s
-  shutdown/resume doc comments but is not exercised by this harness. What
-  the harness proves is that the *writer's* crash is safe. A daemon that
+- **Power loss.** `TestTortureCapturerKill` (`internal/capture/torture_capturer_test.go`,
+  build tag `torture`, part of `make test-torture` and the nightly
+  `torture` job) runs the capture engine in a child process, `SIGKILL`s it
+  mid-traffic every round, restarts it on the same state directory and
+  replica, and requires the replica's `.dump` to equal the source's after
+  a graceful drain — so the capturer's own crash is exercised, not only
+  argued. What no harness does is cut power: the kernel is trusted to
+  write back what a killed process had issued. A daemon that
   dies — however it dies — loses up to one `-flush-every` interval
   (default 30 s) of committed-but-unflushed writes
   ([limitations](limitations.md#durability-advances-on-flush-and-the-window-is-explicit)).

@@ -232,10 +232,15 @@ ran while the daemon was down) marks the checkout dirty and preserves the
 tail as an orphan fork rather than pretending continuity. "Crash-tested"
 in these docs means the *writer's* crash.
 
-**What isn't:** the harness never `SIGKILL`s the daemon or the capturer
-process — it bounces the engine through its graceful-shutdown path. That
-case is argued safe in the code's shutdown/resume comments but is not
-exercised. A daemon that dies, however it dies, loses up to one
+**The capturer's own crash is tested too** (since v0.2.15's harness,
+`TestTortureCapturerKill`): the capture engine runs in a child process
+that is `SIGKILL`ed mid-traffic every round and restarted on the same
+state directory and replica; the replica must match the source after a
+graceful drain. Every restart after a kill takes the rebase path (a kill
+leaves no verified-clean checkpoint to resume from), and none has
+diverged. **What isn't:** power loss — no harness cuts power, so the
+kernel's write-back of what the killed process issued is assumed. A
+daemon that dies, however it dies, loses up to one
 `-flush-every` interval (default 30 s) of committed-but-unflushed writes
 ([the window](#durability-advances-on-flush-and-the-window-is-explicit)).
 No power-loss test exists either: since v0.2.14 every rename into place
