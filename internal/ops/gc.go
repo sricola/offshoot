@@ -519,6 +519,25 @@ func (w *Workspace) GC(grace time.Duration) (tombstoned, deleted int, err error)
 		}
 	}
 
+	// Everything phase 2 removes from `stones` — swept keys, stones whose
+	// object is already gone, rescued (re-referenced) stones, legacy
+	// lineage-keyed stones — is persisted at the end as a prune of exactly
+	// those keys against the store's CURRENT list, by CAS (pruneTombstones).
+	// loadedKeys is the reference point for "removed by this pass".
+	loadedKeys := make([]string, 0, len(stones))
+	for k := range stones {
+		loadedKeys = append(loadedKeys, k)
+	}
+	removedByThisPass := func() []string {
+		var removed []string
+		for _, k := range loadedKeys {
+			if _, still := stones[k]; !still {
+				removed = append(removed, k)
+			}
+		}
+		return removed
+	}
+
 	// Phase 2: sweep stones older than grace that are STILL unreachable
 	// under a re-mark (recomputed lazily, once, when the first grace-eligible
 	// stone is found — a fork or flush could have re-referenced an object
@@ -657,26 +676,71 @@ func (w *Workspace) GC(grace time.Duration) (tombstoned, deleted int, err error)
 			// made: the succeeded keys' stones are pruned and persisted, the
 			// failed keys keep their (original-timestamp) stones for a later
 			// pass. The same clobber-safety argument as the Put below applies.
-			data, _ := json.Marshal(stones)
-			if perr := w.Store.B.Put(tombstoneKey, data); perr != nil {
+			if perr := w.pruneTombstones(removedByThisPass()); perr != nil {
 				return tombstoned, deleted, errors.Join(derr, perr)
 			}
 			return tombstoned, deleted, derr
 		}
 	}
-	// Persist the pruned stone list. This is an unconditional Put, not a
-	// CAS: it can clobber phase-1 additions from a concurrent GC run that
-	// landed after we loaded `stones` above. That's safe in only one
-	// direction — the clobbered object isn't lost, it just isn't tombstoned
-	// yet; the next GC run's phase 1 re-derives it from reachableObjects and
-	// the data/ listing and re-marks it with a fresh timestamp, at worst
-	// delaying its eventual sweep by one grace period. It can never cause a
-	// live or still-within-grace object to be deleted early.
-	data, _ := json.Marshal(stones)
-	if err := w.Store.B.Put(tombstoneKey, data); err != nil {
+	if gcBeforePruneForTest != nil {
+		gcBeforePruneForTest() // test-only: a concurrent pass writes between our load and our prune
+	}
+	// Persist this pass's removals by CAS against the CURRENT list. An
+	// unconditional write of our in-memory `stones` would clobber whatever
+	// a concurrent GC or janitor pass wrote since we loaded it: phase-1
+	// additions (merely delaying their sweep) but also prunes, resurrecting
+	// a stone with its old timestamp for a key the other pass already
+	// deleted — and a fork in flight could recreate that key under a stale,
+	// already expired stone. Pruning exactly our removals by CAS loses
+	// neither.
+	if err := w.pruneTombstones(removedByThisPass()); err != nil {
 		return tombstoned, deleted, err
 	}
 	return tombstoned, deleted, nil
+}
+
+// gcBeforePruneForTest, when non-nil, runs between GC's sweep and its final
+// tombstone prune: the window a concurrent GC or janitor pass races. Nil in
+// production; test-only, process-global, restore via t.Cleanup.
+var gcBeforePruneForTest func()
+
+// pruneTombstones removes keys from the stored tombstone list by
+// compare-and-swap: reload the list with its etag, drop exactly keys, write
+// it back conditionally, and on a conflict reload and apply the same prune
+// again. A bounded retry: every loser re-reads the winner's list, so the
+// only way to keep losing is a storm of concurrent GC passes, which the
+// janitor's single-flight schedule does not produce.
+func (w *Workspace) pruneTombstones(keys []string) error {
+	if len(keys) == 0 {
+		return nil
+	}
+	var lastErr error
+	for attempt := 0; attempt < 8; attempt++ {
+		cur, etag, err := w.loadTombstones()
+		if err != nil {
+			return err
+		}
+		changed := false
+		for _, k := range keys {
+			if _, ok := cur[k]; ok {
+				delete(cur, k)
+				changed = true
+			}
+		}
+		if !changed {
+			return nil // another pass already pruned them
+		}
+		data, _ := json.Marshal(cur)
+		_, err = w.Store.B.PutIf(tombstoneKey, data, etag)
+		if err == nil {
+			return nil
+		}
+		if !errors.Is(err, store.ErrCAS) {
+			return err
+		}
+		lastErr = err
+	}
+	return fmt.Errorf("ops: gc tombstone prune lost %d races: %w", 8, lastErr)
 }
 
 // sweepDelete is GC phase 2's delete step: remove keys via the backend's
