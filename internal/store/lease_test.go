@@ -5,6 +5,7 @@ import (
 	"fmt"
 	"io"
 	"os"
+	"reflect"
 	"strings"
 	"sync"
 	"testing"
@@ -391,5 +392,55 @@ func TestRenewAfterExpiryButBeforeReclaimStillWorks(t *testing.T) {
 	}
 	if l2.Epoch != l.Epoch {
 		t.Errorf("renew bumped the epoch: %d -> %d", l.Epoch, l2.Epoch)
+	}
+}
+
+// TestAcquireLeaseRefReturnsTheWrittenRef: AcquireLeaseRef hands back the
+// exact ref its acquire wrote and that write's etag, so a caller can plan
+// from the revision its lease is part of and compare-and-swap against it
+// without a second GetRef.
+func TestAcquireLeaseRefReturnsTheWrittenRef(t *testing.T) {
+	s := newStore(t)
+	seedBranch(t, s)
+	now := time.Date(2026, 8, 1, 12, 0, 0, 0, time.UTC)
+	l, got, etag, err := s.AcquireLeaseRef("app", "main", "checkpoint:h/1/0123abcd", time.Minute, now)
+	if err != nil {
+		t.Fatal(err)
+	}
+	stored, storedEtag, err := s.GetRef("app", "main")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !reflect.DeepEqual(got, stored) {
+		t.Fatalf("returned ref\n %+v\nstored ref\n %+v", got, stored)
+	}
+	if etag != storedEtag {
+		t.Fatalf("returned etag %q, stored etag %q", etag, storedEtag)
+	}
+	if got.Epoch != 2 || l.Epoch != got.Epoch || got.LeaseHolder != l.Holder {
+		t.Fatalf("lease %+v does not match the returned ref %+v", l, got)
+	}
+	// The etag is the write's own: a compare-and-swap against it lands.
+	got.Protected = true
+	if _, err := s.PutRef("app", "main", got, etag); err != nil {
+		t.Fatalf("PutRef against the returned etag: %v", err)
+	}
+}
+
+// TestAcquireLeaseRefRefusesALiveLease: AcquireLeaseRef refuses exactly
+// what AcquireLease refuses, and returns no ref with the refusal.
+func TestAcquireLeaseRefRefusesALiveLease(t *testing.T) {
+	s := newStore(t)
+	seedBranch(t, s)
+	now := time.Date(2026, 8, 1, 12, 0, 0, 0, time.UTC)
+	if _, err := s.AcquireLease("app", "main", "daemon-a", time.Minute, now); err != nil {
+		t.Fatal(err)
+	}
+	_, ref, etag, err := s.AcquireLeaseRef("app", "main", "checkpoint:h/1/0123abcd", time.Minute, now)
+	if !errors.Is(err, ErrLeaseHeld) {
+		t.Fatalf("want ErrLeaseHeld, got %v", err)
+	}
+	if !reflect.DeepEqual(ref, Ref{}) || etag != "" {
+		t.Fatalf("a refused acquire returned ref %+v etag %q", ref, etag)
 	}
 }

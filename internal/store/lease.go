@@ -78,7 +78,19 @@ func LeaseLive(ref Ref, now time.Time) bool {
 	return ok && ref.LeaseHolder != "" && now.Before(exp)
 }
 
-// AcquireLease claims db@branch for holder until now+ttl.
+// AcquireLease claims db@branch for holder until now+ttl. It is
+// AcquireLeaseRef without the ref and etag; see AcquireLeaseRef for the
+// rules.
+func (s *Store) AcquireLease(db, branch, holder string, ttl time.Duration, now time.Time) (Lease, error) {
+	l, _, _, err := s.AcquireLeaseRef(db, branch, holder, ttl, now)
+	return l, err
+}
+
+// AcquireLeaseRef claims db@branch for holder until now+ttl, and returns
+// with the lease the exact ref its acquire wrote and that write's etag. A
+// caller that plans from the ref (ops.CheckpointWith) then builds on the
+// revision its lease is part of, rather than on a second GetRef that a
+// concurrent writer could already have moved.
 //
 // A ref with an active reap claim (Reaping=true) or an active Destroy claim
 // (Deleting=true, Milestone 4 Task 6b) refuses outright — see ErrReaping/
@@ -103,19 +115,19 @@ func LeaseLive(ref Ref, now time.Time) bool {
 // an error wrapping BOTH ErrLeaseHeld and ErrCAS: a caller that only checks
 // ErrLeaseHeld still sees "someone else holds it," while a caller that
 // wants the low-level detail can still find ErrCAS via errors.Is.
-func (s *Store) AcquireLease(db, branch, holder string, ttl time.Duration, now time.Time) (Lease, error) {
+func (s *Store) AcquireLeaseRef(db, branch, holder string, ttl time.Duration, now time.Time) (Lease, Ref, string, error) {
 	if holder == "" {
-		return Lease{}, errors.New("store: lease holder must be named")
+		return Lease{}, Ref{}, "", errors.New("store: lease holder must be named")
 	}
 	ref, etag, err := s.GetRef(db, branch)
 	if err != nil {
-		return Lease{}, err
+		return Lease{}, Ref{}, "", err
 	}
 	if ref.Reaping {
-		return Lease{}, fmt.Errorf("%w: %s@%s; retry shortly", ErrReaping, db, branch)
+		return Lease{}, Ref{}, "", fmt.Errorf("%w: %s@%s; retry shortly", ErrReaping, db, branch)
 	}
 	if ref.Deleting {
-		return Lease{}, fmt.Errorf("%w: %s@%s; retry shortly", ErrDeleting, db, branch)
+		return Lease{}, Ref{}, "", fmt.Errorf("%w: %s@%s; retry shortly", ErrDeleting, db, branch)
 	}
 	_, parseOK := parseExpiry(ref.LeaseExpiry)
 	if ref.LeaseExpiry != "" && !parseOK {
@@ -125,7 +137,7 @@ func (s *Store) AcquireLease(db, branch, holder string, ttl time.Duration, now t
 	}
 	live := LeaseLive(ref, now)
 	if live && ref.LeaseHolder != holder {
-		return Lease{}, fmt.Errorf("%w by %q until %s",
+		return Lease{}, Ref{}, "", fmt.Errorf("%w by %q until %s",
 			ErrLeaseHeld, ref.LeaseHolder, ref.LeaseExpiry)
 	}
 
@@ -139,14 +151,21 @@ func (s *Store) AcquireLease(db, branch, holder string, ttl time.Duration, now t
 	// self-renew (see doc comment above).
 	ref.LeaseHolder = holder
 	ref.LeaseExpiry = expiry.Format(time.RFC3339Nano)
-	if _, err := s.PutRef(db, branch, ref, etag); err != nil {
+	written, err := s.PutRef(db, branch, ref, etag)
+	if err != nil {
 		if errors.Is(err, ErrCAS) {
-			return Lease{}, fmt.Errorf("%w: lost an acquisition race on %s@%s: %w",
+			return Lease{}, Ref{}, "", fmt.Errorf("%w: lost an acquisition race on %s@%s: %w",
 				ErrLeaseHeld, db, branch, err)
 		}
-		return Lease{}, fmt.Errorf("store: acquire lease on %s@%s: %w", db, branch, err)
+		return Lease{}, Ref{}, "", fmt.Errorf("store: acquire lease on %s@%s: %w", db, branch, err)
 	}
-	return Lease{DB: db, Branch: branch, Holder: holder, Epoch: ref.Epoch, Expiry: expiry}, nil
+	// PutRef normalizes a copy before encoding it; apply the same here so
+	// the returned ref is what a GetRef now decodes.
+	ref.Schema = RefSchema
+	if ref.HeadEpoch == 0 {
+		ref.HeadEpoch = ref.Epoch
+	}
+	return Lease{DB: db, Branch: branch, Holder: holder, Epoch: ref.Epoch, Expiry: expiry}, ref, written, nil
 }
 
 // RenewLease extends the caller's own lease without touching the epoch.
