@@ -1384,7 +1384,17 @@ func run(args []string) error {
 			defer cancel()
 			return srv.Shutdown(ctx)
 		case err := <-errc:
-			return err
+			if err != nil {
+				return err
+			}
+			// Serve returns nil only once a Shutdown has begun, which here
+			// means the shutdown op (socket or HTTP) started one on a
+			// goroutine of its own. Returning now would exit the process
+			// while that Shutdown is still closing sessions and releasing
+			// their leases, so wait for it, bounded like the signal path.
+			ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
+			defer cancel()
+			return srv.WaitShutdown(ctx)
 		}
 	case "session":
 		sock, rest, err := socketOverride(rest)
