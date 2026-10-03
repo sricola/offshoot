@@ -79,7 +79,7 @@ func (w *Workspace) Destroy(db, branch string, force bool) error {
 			// catch.
 			w.unwindDeletingClaim(db, branch)
 			if errors.Is(err, errCheckoutReplaced) {
-				return retryLostRace("destroy", db, branch, err)
+				return retryHint("destroy", db, branch, err)
 			}
 			return fmt.Errorf("ops: checkout in use; close connections before destroy: %w", err)
 		}

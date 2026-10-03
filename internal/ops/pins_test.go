@@ -7,6 +7,7 @@ import (
 	"os/exec"
 	"path/filepath"
 	"strings"
+	"sync"
 	"testing"
 
 	"github.com/sricola/offshoot/internal/dbfile"
@@ -313,6 +314,159 @@ func TestQuiesceRaceErrorsSayRetry(t *testing.T) {
 				}
 			})
 		}
+	}
+}
+
+// holdBusy makes path's checkout busy the way a live app does: a reader
+// holds a snapshot while a write lands after it, so quiesce's TRUNCATE
+// checkpoint cannot finish (see TestBranchStateBusyCheckoutIsDirty). The
+// returned func closes both connections; cleanup closes them too.
+func holdBusy(t *testing.T, path string) (closeConns func()) {
+	t.Helper()
+	var dbs []*sql.DB
+	var once sync.Once
+	closeConns = func() {
+		once.Do(func() {
+			for _, db := range dbs {
+				db.Close()
+			}
+		})
+	}
+	t.Cleanup(closeConns)
+	for _, stmt := range []string{
+		"BEGIN; SELECT count(*) FROM sqlite_master;",
+		"CREATE TABLE busy (v); INSERT INTO busy VALUES (1);",
+	} {
+		db, err := sql.Open("sqlite3", path+"?_busy_timeout=3000")
+		if err != nil {
+			t.Fatal(err)
+		}
+		dbs = append(dbs, db)
+		db.SetMaxOpenConns(1)
+		if _, err := db.Exec(stmt); err != nil {
+			t.Fatal(err)
+		}
+	}
+	return closeConns
+}
+
+// TestQuiesceBusyErrorsSayRetryOnlyBeforeACommit: a checkout another
+// connection keeps busy fails quiesce with errQuiesceBusy, whatever the
+// caller. Checkout, checkpoint and destroy have committed nothing, so they
+// say to close connections and retry (destroy: before destroying), and
+// doing that works. Promote, rollback and compact find it busy in the
+// refresh after their repoint has committed, which is the common case: no
+// busy check refuses them first. They say the operation stands and name
+// 'offshoot checkout <db>@<branch>' after closing the connections, and
+// never "retry": a second promote or rollback would move its rolling
+// safety fork onto the repointed head, leaving the original head on no
+// branch. Following their hint brings the checkout back to idle.
+func TestQuiesceBusyErrorsSayRetryOnlyBeforeACommit(t *testing.T) {
+	for _, op := range []struct {
+		name   string
+		branch string
+		// arm installs a hook that calls busy once the op has committed
+		// (or is about to, with nothing left to refuse it); nil makes the
+		// checkout busy before the op starts.
+		arm  func(t *testing.T, busy func())
+		run  func(t *testing.T, w *Workspace) error
+		hint string // the pre-commit op's next step; "" for a committed one
+	}{
+		{"checkout", "f", nil, func(t *testing.T, w *Workspace) error {
+			_, err := w.Checkout("app", "f")
+			return err
+		}, "close connections and retry"},
+		{"checkpoint", "f", nil, func(t *testing.T, w *Workspace) error {
+			_, err := w.Checkpoint("app", "f", "cp", nil)
+			return err
+		}, "close connections and retry"},
+		{"destroy", "f", nil, func(t *testing.T, w *Workspace) error {
+			return w.Destroy("app", "f", false)
+		}, "close connections before destroy"},
+		{"promote", "main", func(t *testing.T, busy func()) {
+			ObservePromote = func(bool) { busy() }
+			t.Cleanup(func() { ObservePromote = nil })
+		}, func(t *testing.T, w *Workspace) error {
+			res, err := w.PromoteWith("app", "f", "main", PromoteOptions{Force: true})
+			if err != nil && res.Backup == "" {
+				t.Errorf("the committed promote's result does not name its safety fork: %+v", res)
+			}
+			return err
+		}, ""},
+		{"rollback", "main", func(t *testing.T, busy func()) {
+			ObserveRollback = func(bool) { busy() }
+			t.Cleanup(func() { ObserveRollback = nil })
+		}, func(t *testing.T, w *Workspace) error {
+			_, err := w.Rollback("app", "main", "init")
+			return err
+		}, ""},
+		{"compact", "f", func(t *testing.T, busy func()) {
+			compactBeforeCASForTest = busy
+			t.Cleanup(func() { compactBeforeCASForTest = nil })
+		}, func(t *testing.T, w *Workspace) error {
+			_, err := w.Compact("app", "f")
+			return err
+		}, ""},
+	} {
+		t.Run(op.name, func(t *testing.T) {
+			// Each busy quiesce waits out its 3s busy timeout. The hooks
+			// above are distinct package variables, one per subtest, and
+			// no other test runs alongside these.
+			t.Parallel()
+			w := newWS(t)
+			if err := w.Create("app"); err != nil {
+				t.Fatal(err)
+			}
+			if _, err := w.Fork("app", "main", "f", "", 0, nil); err != nil {
+				t.Fatal(err)
+			}
+			path, err := w.Checkout("app", op.branch)
+			if err != nil {
+				t.Fatal(err)
+			}
+			var closeConns func()
+			busy := func() {
+				if closeConns == nil {
+					closeConns = holdBusy(t, path)
+				}
+			}
+			if op.arm == nil {
+				busy()
+			} else {
+				op.arm(t, busy)
+			}
+			err = op.run(t, w)
+			if closeConns == nil {
+				t.Fatalf("%s never reached its busy point (err = %v)", op.name, err)
+			}
+			if !errors.Is(err, errQuiesceBusy) {
+				t.Fatalf("%s = %v, want errQuiesceBusy", op.name, err)
+			}
+			msg := err.Error()
+			closeConns()
+			if op.hint != "" {
+				if !strings.Contains(msg, op.hint) {
+					t.Fatalf("%s = %q: nothing committed, want %q", op.name, msg, op.hint)
+				}
+				if err := op.run(t, w); err != nil {
+					t.Fatalf("%s after closing the connections = %v", op.name, err)
+				}
+				return
+			}
+			if strings.Contains(msg, "retry") {
+				t.Fatalf("%s = %q: it committed, so a retry is wrong", op.name, msg)
+			}
+			next := "offshoot checkout app@" + op.branch
+			if !strings.Contains(msg, "close its connections") || !strings.Contains(msg, next) {
+				t.Fatalf("%s = %q: want 'close its connections' and the %q next step", op.name, msg, next)
+			}
+			if _, err := w.Checkout("app", op.branch); err != nil {
+				t.Fatalf("the named next step, checkout, = %v", err)
+			}
+			if state, err := w.BranchState("app", op.branch); err != nil || state != "idle" {
+				t.Fatalf("state after the named checkout = %q, %v; want idle", state, err)
+			}
+		})
 	}
 }
 

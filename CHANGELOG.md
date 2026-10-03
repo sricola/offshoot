@@ -65,6 +65,17 @@ Pin an exact version if you depend on format stability. The full contract:
   operation stands and names `offshoot checkout`, with no retry hint:
   retrying a promote or rollback would replace its safety fork with the
   already-repointed head.
+- **A rollback, promote or compact that found its checkout busy said to
+  retry it.** A busy checkout does not stop the repoint, so the refresh
+  after it fails whenever an app holds a read transaction on the checkout
+  while a write lands, and that error ended `close connections and
+  retry`. Retrying a promote or rollback replaced its safety fork
+  (`<target>-pre-promote`, `<branch>-pre-rollback`) with the
+  already-repointed head, which can leave the original head on no branch
+  for GC to reclaim. The error now says the operation stands and to close
+  the checkout's connections, then run `offshoot checkout <db>@<branch>`.
+  `checkout` and `checkpoint` still say `close connections and retry`,
+  and `destroy` still says to close them before destroying.
 - **`create --from` a path containing `?` imported an empty database.**
   The import opened `<path>?_busy_timeout=5000`, and go-sqlite3 cut the
   name at the first `?`: `create imp --from '/dir/q?x.db'` created an

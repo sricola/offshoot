@@ -397,7 +397,7 @@ func (w *Workspace) CheckoutProven(db, branch string) (CheckoutResult, error) {
 	path := w.CheckoutPath(db, branch)
 	if _, err := os.Stat(path); err == nil {
 		if err := quiesce(path); err != nil {
-			return CheckoutResult{}, retryLostRace("checkout", db, branch, err)
+			return CheckoutResult{}, retryHint("checkout", db, branch, err)
 		}
 		// checkoutState compares the sidecar's recorded (lineage, epoch,
 		// txid) against ref.Lineage/ref.HeadEpoch/ref.HeadTXID — the CURRENT
@@ -606,7 +606,7 @@ func (w *Workspace) CheckpointWith(db, branch, name string, meta map[string]stri
 			db, branch, ref.HeadTXID, db, branch)
 	}
 	if err := quiesce(path); err != nil {
-		return CheckpointResult{}, retryLostRace("checkpoint", db, branch, err)
+		return CheckpointResult{}, retryHint("checkpoint", db, branch, err)
 	}
 	// The checkout's fingerprint right after quiesce, before the encode:
 	// stampCheckpoint compares it with the file it stamps, so a write
@@ -881,12 +881,14 @@ func checkpointKindAt(ref store.Ref, txid uint64) string {
 // instant" apart from "this file can't be quiesced for some other reason"
 // checks errors.Is against this sentinel — see ops.BranchStateAt, which
 // treats a busy checkout as itself evidence of un-checkpointed activity
-// ("dirty") rather than an absence of evidence ("idle"). The wrapped message
-// text is unchanged from before this sentinel existed, so every existing
-// caller that only logs/propagates quiesce's error (Checkpoint,
-// CheckoutProven, Rollback's refresh, Promote's refresh,
-// warnIfUncheckpointed) sees byte-identical output.
-var errQuiesceBusy = errors.New("ops: database is busy (live writer or reader); close connections and retry")
+// ("dirty") rather than an absence of evidence ("idle"). Like
+// errCheckoutReplaced, its text names no next step, because the right one
+// depends on what the caller has committed: checkout and checkpoint add
+// "close connections and retry" (retryHint) and destroy says to close them
+// before destroying, while the promote, rollback and compact refreshes,
+// which run after their repoint has committed, say to close them and then
+// run 'offshoot checkout' (refreshFailed, and rollback's own wrap).
+var errQuiesceBusy = errors.New("ops: database is busy (live writer or reader)")
 
 // errCheckoutReplaced is quiesce's error when the checkout was renamed over
 // or removed while quiesce was opening it: another operation re-materialized
@@ -895,29 +897,40 @@ var errQuiesceBusy = errors.New("ops: database is busy (live writer or reader); 
 // wraps the underlying error (dbfile.ErrReplaced, or the open's or stat's
 // own). Its text carries no retry hint, because not every caller can
 // retry: an operation that has committed nothing yet adds one
-// (retryLostRace), while the promote, rollback and compact refreshes run
-// after their repoint has committed (refreshLostRace, and rollback's own
+// (retryHint), while the promote, rollback and compact refreshes run
+// after their repoint has committed (refreshFailed, and rollback's own
 // wrap). Retrying a promote or rollback then would move its rolling safety
 // fork onto the repointed head, leaving the original head on no branch.
+// errQuiesceBusy carries no hint for the same reason.
 var errCheckoutReplaced = errors.New("ops: the checkout was replaced or removed while it was being opened")
 
-// retryLostRace wraps a quiesce error that lost a race with another
-// operation on the checkout (errCheckoutReplaced) in a retry hint, for a
-// caller that has committed nothing yet, so retrying it is safe: verb
-// names that operation. Any other error is returned unchanged.
-func retryLostRace(verb, db, branch string, err error) error {
-	if errors.Is(err, errCheckoutReplaced) {
+// retryHint adds the retry hint to a quiesce error, for a caller that has
+// committed nothing yet, so retrying it is safe: verb names that
+// operation. A checkout that lost a race with another operation
+// (errCheckoutReplaced) can be retried at once, and a busy one
+// (errQuiesceBusy) once its connections close. Any other error is
+// returned unchanged.
+func retryHint(verb, db, branch string, err error) error {
+	switch {
+	case errors.Is(err, errCheckoutReplaced):
 		return fmt.Errorf("ops: %s %s@%s lost a race with another operation (retry): %w", verb, db, branch, err)
+	case errors.Is(err, errQuiesceBusy):
+		return fmt.Errorf("%w; close connections and retry", err)
 	}
 	return err
 }
 
-// refreshLostRace is the error for a refresh after a committed repoint
-// (promote, compact) whose quiesce lost a race (errCheckoutReplaced): the
-// operation stands, so it names 'offshoot checkout', and never the
-// operation itself, as the next step. done says what committed
-// ("promoted", "compacted").
-func refreshLostRace(done, path, db, branch string, err error) error {
+// refreshFailed is the error for a refresh after a committed repoint
+// (promote, compact) whose quiesce failed: the operation stands, so it
+// names 'offshoot checkout', and never the operation itself, as the next
+// step, after closing the checkout's connections when it was busy
+// (errQuiesceBusy). Only a busy checkout is called "in use": one that lost
+// a race (errCheckoutReplaced) or failed to open is not. done says what
+// committed ("promoted", "compacted").
+func refreshFailed(done, path, db, branch string, err error) error {
+	if errors.Is(err, errQuiesceBusy) {
+		return fmt.Errorf("ops: %s, but checkout %s is in use and was NOT refreshed; close its connections, then run 'offshoot checkout %s@%s' to refresh it: %w", done, path, db, branch, err)
+	}
 	return fmt.Errorf("ops: %s, but checkout %s was NOT refreshed; run 'offshoot checkout %s@%s' to refresh it: %w", done, path, db, branch, err)
 }
 
@@ -1699,7 +1712,14 @@ func (w *Workspace) RollbackWith(db, branch, to string, opts RollbackOptions) (R
 		ObserveRollback(base != nil)
 	}
 	if err := refresh(); err != nil {
-		return RollbackResult{}, fmt.Errorf("ops: branch repointed to checkpoint %q (txid %d), but the checkout could not be refreshed (run 'offshoot checkout' to re-materialize): %w", to, txid, err)
+		// The rollback stands: the next step is a checkout, never a second
+		// rollback (see errCheckoutReplaced), after closing the checkout's
+		// connections when it was busy.
+		next := fmt.Sprintf("run 'offshoot checkout %s@%s' to re-materialize", db, branch)
+		if errors.Is(err, errQuiesceBusy) {
+			next = "it is in use: close its connections, then " + next
+		}
+		return RollbackResult{}, fmt.Errorf("ops: branch repointed to checkpoint %q (txid %d), but the checkout could not be refreshed (%s): %w", to, txid, next, err)
 	}
 	return RollbackResult{Path: path, Backup: backup, Shared: base != nil, BackupIsTarget: backupIsTarget}, nil
 }
@@ -1916,10 +1936,7 @@ func (w *Workspace) PromoteWith(db, source, target string, opts PromoteOptions) 
 	path := w.CheckoutPath(db, target)
 	if _, err := os.Stat(path); err == nil {
 		if err := quiesce(path); err != nil {
-			if errors.Is(err, errCheckoutReplaced) {
-				return result, refreshLostRace("promoted", path, db, target, err)
-			}
-			return result, fmt.Errorf("ops: promoted, but checkout %s is in use and was NOT refreshed: %w", path, err)
+			return result, refreshFailed("promoted", path, db, target, err)
 		}
 		checksum, chain, err := w.refreshFromChain(db, next, path)
 		if err != nil {
@@ -2077,10 +2094,7 @@ func (w *Workspace) CompactWith(db, branch string, opts CompactOptions) (uint64,
 	path := w.CheckoutPath(db, branch)
 	if _, err := os.Stat(path); err == nil {
 		if err := quiesce(path); err != nil {
-			if errors.Is(err, errCheckoutReplaced) {
-				return txid, refreshLostRace("compacted", path, db, branch, err)
-			}
-			return txid, fmt.Errorf("ops: compacted, but checkout %s is in use and was NOT refreshed: %w", path, err)
+			return txid, refreshFailed("compacted", path, db, branch, err)
 		}
 		checksum, chain, err := w.refreshFromChain(db, next, path)
 		if err != nil {

@@ -186,7 +186,7 @@ state still wins, but a warning is printed to stderr first since those edits
 are about to be overwritten.
 
 **Errors:** no such `db@branch`; checkout is busy (a live connection is
-holding it) — closes connections and retry; another operation replaced or
+holding it) — close connections and retry; another operation replaced or
 removed the checkout while it was being opened (retry).
 
 ### Read-only historical checkout: `--at <checkpoint> --read-only [--force]`
@@ -581,9 +581,10 @@ The ref repoint (a CAS write) is the point of no return; the local checkout
 refresh that follows is best-effort — if it fails (e.g. the checkout is
 busy, or another operation replaced or removed it during the refresh), the
 command reports a partial success: the branch *did* roll back, but the
-checkout needs a manual `offshoot checkout` to catch up. Do not retry the
-rollback: a second one would replace the safety fork with the
-already-rolled-back head.
+checkout needs a manual `offshoot checkout <db>@<branch>` to catch up, which
+the error names (a busy checkout's error says to close its connections
+first). Do not retry the rollback: a second one would replace the safety
+fork with the already-rolled-back head.
 
 **Errors:** unknown checkpoint name; the branch has a live lease without
 `--force`, or is mid-destroy or mid-reap (nothing is touched);
@@ -665,11 +666,12 @@ semantics as rollback.
 mid-reap; `<target>-pre-promote` exists but is not promote's own safety fork (nothing
 is touched); the previous safety fork has a live lease (nothing is
 touched — close that session first, or `--no-backup`); target checkout is
-busy (repoint still lands; checkout refresh is skipped and reported); another
-operation replaced or removed the target checkout during that refresh (the
-promote stands: refresh it with `offshoot checkout`, not by retrying the
-promote, which would replace the safety fork with the promoted head); lost
-a concurrent CAS race (retry).
+busy, or another operation replaced or removed it, during the refresh after
+the repoint (the promote stands; the refresh is skipped and reported: close
+the checkout's connections if it was busy, then refresh it with
+`offshoot checkout <db>@<target>`, not by retrying the promote, which would
+replace the safety fork with the promoted head); lost a concurrent CAS race
+(retry).
 
 **Daemon/SDK parity.** The daemon's `promote` op takes the same knobs as
 request fields — `no_backup` (bool), `backup_ttl` (a Go duration
@@ -733,7 +735,8 @@ or `lease acquire`) without `--force`, which fences that session and loses
 its unflushed writes; branch mid-destroy or mid-reap; lost a concurrent
 CAS race to a flush (retry). After the repoint, a checkout that is busy,
 or that another operation replaced or removed during the refresh, is not
-refreshed; the compact stands and reports it (run `offshoot checkout`).
+refreshed; the compact stands and reports it (close the checkout's
+connections if it was busy, then run `offshoot checkout <db>@<branch>`).
 
 ## `offshoot destroy <db>[@branch] [--force]`
 
