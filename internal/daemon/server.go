@@ -755,6 +755,10 @@ func (s *Server) sessionCount() int {
 	return n
 }
 
+// opClose closes db@branch's session through closeSlot, so the branch stays
+// claimed, as a closing marker, until Close has released its lease. A close
+// of a branch that is already closing waits for that close, under the same
+// closeWaitBudget as an open, and returns its result.
 func (s *Server) opClose(req Request) Response {
 	branch := req.Branch
 	if branch == "" {
@@ -763,9 +767,27 @@ func (s *Server) opClose(req Request) Response {
 	k := key(req.DB, branch)
 	s.mu.Lock()
 	sl, ok := s.sessions[k]
-	if !ok || sl.isReserved() || sl.isClosing() {
+	if !ok || sl.isReserved() {
 		s.mu.Unlock()
 		return errResp(fmt.Errorf("daemon: %s is not open", k))
+	}
+	if sl.isClosing() {
+		s.mu.Unlock()
+		// A duplicate or retried close (a client killed mid-close that
+		// reconnects, or two clients on one branch) waits for the close in
+		// progress and answers with its result, rather than "not open"
+		// while the lease is still held.
+		deadline := time.Now().Add(closeWaitBudget)
+		if closeWaitEntered != nil {
+			closeWaitEntered(k, deadline) // test hook; nil (a no-op) in production
+		}
+		if !waitClosed(sl.done, deadline) {
+			return errResp(fmt.Errorf("daemon: %s is still closing; retry", k))
+		}
+		if sl.err != nil {
+			return errResp(sl.err)
+		}
+		return Response{OK: true}
 	}
 	m := s.markClosingLocked(k, sl)
 	s.mu.Unlock()

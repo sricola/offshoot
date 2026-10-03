@@ -1,12 +1,16 @@
 package daemon
 
 import (
+	"encoding/json"
+	"errors"
+	"strings"
 	"sync"
 	"sync/atomic"
 	"testing"
 	"time"
 
 	"github.com/sricola/offshoot/internal/session"
+	"github.com/sricola/offshoot/internal/store"
 )
 
 // within waits up to 10 s for ch, failing the test if nothing arrives. It
@@ -269,4 +273,109 @@ func TestConcurrentReopensDuringCloseOpenOnce(t *testing.T) {
 	if ok != 1 {
 		t.Fatalf("%d reopens succeeded, want exactly 1", ok)
 	}
+}
+
+// failReleases fails the next n lease-release writes: ref writes that leave
+// no lease holder. Nothing else a daemon session writes after its open does
+// that, so only Session.Close's release attempts hit it. Install it as
+// w.Store.B before the daemon opens any session, and arm it later.
+type failReleases struct {
+	store.Backend
+	n atomic.Int64
+}
+
+func (f *failReleases) arm(n int64) { f.n.Store(n) }
+
+func (f *failReleases) PutIf(key string, data []byte, ifMatch string) (string, error) {
+	if strings.HasPrefix(key, "refs/") && !carriesLease(data) {
+		for {
+			cur := f.n.Load()
+			if cur <= 0 {
+				break
+			}
+			if f.n.CompareAndSwap(cur, cur-1) {
+				return "", errors.New("test: injected release failure")
+			}
+		}
+	}
+	return f.Backend.PutIf(key, data, ifMatch)
+}
+
+func carriesLease(ref []byte) bool {
+	var r struct {
+		LeaseHolder string `json:"lease_holder"`
+	}
+	return json.Unmarshal(ref, &r) == nil && r.LeaseHolder != ""
+}
+
+func TestCloseOnClosingSlotWaits(t *testing.T) {
+	t.Run("returns the first close's result", func(t *testing.T) {
+		srv, _ := newServer(t)
+		sock := srv.SocketPath()
+		waits := watchCloseWaits(t)
+		closed, release := closingSession(t, sock, "app", "main")
+
+		again := goCall(sock, Request{Op: "close", DB: "app", Branch: "main"})
+		select {
+		case <-waits:
+		case r := <-again:
+			release()
+			t.Fatalf("a second close returned %+v while the first was still running", r)
+		case <-time.After(10 * time.Second):
+			t.Fatal("the second close neither waited nor returned")
+		}
+		release()
+		if r := within(t, closed, "the first close"); !r.OK {
+			t.Fatalf("first close = %+v", r)
+		}
+		if r := within(t, again, "the second close"); !r.OK {
+			t.Fatalf("second close = %+v, want the first close's OK", r)
+		}
+	})
+
+	t.Run("returns the first close's error and frees the slot", func(t *testing.T) {
+		srv, w := newServer(t)
+		sock := srv.SocketPath()
+		fr := &failReleases{Backend: w.Store.B}
+		w.Store.B = fr // before any session exists
+		waits := watchCloseWaits(t)
+		closed, release := closingSession(t, sock, "app", "main")
+		fr.arm(3) // every attempt Close's release makes
+
+		again := goCall(sock, Request{Op: "close", DB: "app", Branch: "main"})
+		within(t, waits, "the second close to wait")
+		release()
+		first := within(t, closed, "the first close")
+		second := within(t, again, "the second close")
+		if first.OK || !strings.Contains(first.Error, "injected release failure") {
+			t.Fatalf("first close = %+v, want the injected release failure", first)
+		}
+		if second.OK || second.Error != first.Error {
+			t.Fatalf("second close = %+v, want the first close's error %q", second, first.Error)
+		}
+		if sl := slotAt(srv, "app@main"); sl != nil {
+			t.Fatalf("a failed close left the slot %+v", sl)
+		}
+		// The daemon has let go of the branch even though the release failed:
+		// its map no longer refuses an open. (Under this daemon's one holder,
+		// AcquireLease renews the unreleased lease in place.)
+		if r := call(t, sock, Request{Op: "open", DB: "app", Branch: "main"}); !r.OK {
+			t.Fatalf("open after a failed close = %+v", r)
+		}
+	})
+
+	t.Run("budget", func(t *testing.T) {
+		shrinkCloseWait(t, 200*time.Millisecond)
+		srv, _ := newServer(t)
+		sock := srv.SocketPath()
+		closed, release := closingSession(t, sock, "app", "main")
+		if r := call(t, sock, Request{Op: "close", DB: "app", Branch: "main"}); r.OK || r.Error != "daemon: app@main is still closing; retry" {
+			t.Fatalf("second close = %+v, want the still-closing refusal", r)
+		}
+		release()
+		within(t, closed, "the first close")
+		if r := call(t, sock, Request{Op: "close", DB: "app", Branch: "main"}); r.OK || r.Error != "daemon: app@main is not open" {
+			t.Fatalf("close after the close = %+v, want is not open", r)
+		}
+	})
 }
