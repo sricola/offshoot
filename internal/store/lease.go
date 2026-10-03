@@ -116,12 +116,30 @@ func (s *Store) AcquireLease(db, branch, holder string, ttl time.Duration, now t
 // ErrLeaseHeld still sees "someone else holds it," while a caller that
 // wants the low-level detail can still find ErrCAS via errors.Is.
 func (s *Store) AcquireLeaseRef(db, branch, holder string, ttl time.Duration, now time.Time) (Lease, Ref, string, error) {
+	return s.AcquireLeaseRefIf(db, branch, holder, ttl, now, nil)
+}
+
+// AcquireLeaseRefIf is AcquireLeaseRef with a caller's check run on the ref
+// it reads, before any of its own refusals and before its write: an error
+// from check is returned as is, and nothing is written. The ref the acquire
+// then writes is the one check passed plus the lease, so a caller that
+// refuses on the ref's content (ops.CheckpointWith's live-lease, name and
+// detached-checkout checks) needs no read of its own before the acquire,
+// and no second check after it: a writer that moves the ref in between
+// fails the acquire's compare-and-swap instead. A nil check is
+// AcquireLeaseRef.
+func (s *Store) AcquireLeaseRefIf(db, branch, holder string, ttl time.Duration, now time.Time, check func(Ref) error) (Lease, Ref, string, error) {
 	if holder == "" {
 		return Lease{}, Ref{}, "", errors.New("store: lease holder must be named")
 	}
 	ref, etag, err := s.GetRef(db, branch)
 	if err != nil {
 		return Lease{}, Ref{}, "", err
+	}
+	if check != nil {
+		if err := check(ref); err != nil {
+			return Lease{}, Ref{}, "", err
+		}
 	}
 	if ref.Reaping {
 		return Lease{}, Ref{}, "", fmt.Errorf("%w: %s@%s; retry shortly", ErrReaping, db, branch)
@@ -169,6 +187,16 @@ func (s *Store) AcquireLeaseRef(db, branch, holder string, ttl time.Duration, no
 }
 
 // RenewLease extends the caller's own lease without touching the epoch.
+//
+// A branch with a destroy or reap claim (Deleting, Reaping) is not renewed:
+// RenewLease writes nothing and returns ErrDeleting or ErrReaping, which a
+// renewer retries on its next tick like any transient error. A renewal
+// written over the claim would move the etag Destroy's conditional delete
+// compares against, failing that destroy (it unwinds its claim and the
+// holder carries on), and nothing the holder could do under a claim needs
+// the extra lease time: the claim either ends with the branch (the next
+// renewal finds ErrNotFound) or is unwound, and the lease has two missed
+// renewals of slack.
 func (s *Store) RenewLease(l Lease, ttl time.Duration, now time.Time) (Lease, error) {
 	ref, etag, err := s.GetRef(l.DB, l.Branch)
 	if err != nil {
@@ -177,6 +205,12 @@ func (s *Store) RenewLease(l Lease, ttl time.Duration, now time.Time) (Lease, er
 	if ref.LeaseHolder != l.Holder || ref.Epoch != l.Epoch {
 		return Lease{}, fmt.Errorf("%w: %s@%s now held by %q at epoch %d",
 			ErrLeaseLost, l.DB, l.Branch, ref.LeaseHolder, ref.Epoch)
+	}
+	if ref.Deleting {
+		return Lease{}, fmt.Errorf("%w: %s@%s; not renewing over the claim", ErrDeleting, l.DB, l.Branch)
+	}
+	if ref.Reaping {
+		return Lease{}, fmt.Errorf("%w: %s@%s; not renewing over the claim", ErrReaping, l.DB, l.Branch)
 	}
 	expiry := now.Add(ttl).UTC()
 	ref.LeaseExpiry = expiry.Format(time.RFC3339Nano)
