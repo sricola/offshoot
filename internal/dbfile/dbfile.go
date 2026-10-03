@@ -47,6 +47,9 @@
 //     ErrReplaced if the path no longer names the held inode. Every
 //     materialization renames a fresh inode over the path, so an inode
 //     never reappears there, and Hold, Conn, then Verify is sufficient.
+//     The open never creates the file (NoCreateDSN, or a mode=ro URI), so
+//     a path removed after the Hold fails to open rather than coming back
+//     as an empty database.
 //
 // Closing a descriptor whose inode nothing pins is safe by construction:
 // no read is using it and no in-process SQLite connection is open on that
@@ -381,7 +384,10 @@ var HoldHookForTest func(path string)
 // Verify(path, ino). If the path was renamed over in between, that
 // connection is on a file this pin does not cover. Every materialization
 // renames a fresh inode over the path, so an inode never reappears there,
-// and Hold, Conn, then Verify is sufficient.
+// and Hold, Conn, then Verify is sufficient. Open with NoCreateDSN (or a
+// mode=ro URI): Hold fails on a path that is already missing, and an open
+// that cannot create keeps one removed after the Hold from coming back
+// empty.
 //
 // Hold opens no descriptor. It touches path's cached descriptor, if that
 // still names the held inode, for Evict's least-recently-used order. release
@@ -429,6 +435,36 @@ func Verify(path string, ino Inode) error {
 		return fmt.Errorf("%w: %s", ErrReplaced, path)
 	}
 	return nil
+}
+
+// NoCreateDSN returns a go-sqlite3 data source name that opens path
+// read-write but never creates it, followed by params (go-sqlite3's own
+// _-prefixed options, which SQLite ignores). Every held open uses it.
+// SQLite's default open creates a missing file, so a checkout removed
+// between Hold's stat and the lazy connection would come back as an empty
+// database at its path, which Verify could then only report, not undo.
+//
+// The form is a SQLite URI filename with mode=rw, which governs only the
+// main database file (-wal and -shm are created as usual, and a
+// write-protected file still falls back to a read-only open). The path is
+// escaped so the URI names exactly that file: '?' and '#' would end it, '%'
+// would start an escape, and a leading "//" would read as an authority.
+func NoCreateDSN(path, params string) string {
+	var b strings.Builder
+	b.WriteString("file:")
+	for i := 0; i < len(path); i++ {
+		c := path[i]
+		if c == '%' || c == '?' || c == '#' || (i == 1 && c == '/' && path[0] == '/') {
+			fmt.Fprintf(&b, "%%%02X", c)
+			continue
+		}
+		b.WriteByte(c)
+	}
+	b.WriteString("?mode=rw")
+	if params != "" {
+		b.WriteString("&" + params)
+	}
+	return b.String()
 }
 
 // EvictStranded closes every orphaned descriptor whose inode nothing pins

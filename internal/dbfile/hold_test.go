@@ -112,3 +112,75 @@ func TestHoldTouchesTheCachedEntry(t *testing.T) {
 		t.Fatal("Hold did not touch the cached entry for Evict's LRU order")
 	}
 }
+
+// TestNoCreateDSN: a held open must neither create a missing file (a
+// checkout removed between Hold's stat and the lazy connection would come
+// back empty) nor misread a path that URI syntax gives meaning to.
+func TestNoCreateDSN(t *testing.T) {
+	ctx := context.Background()
+	open := func(t *testing.T, path string) (*sql.DB, *sql.Conn, error) {
+		t.Helper()
+		db, err := sql.Open("sqlite3", NoCreateDSN(path, "_busy_timeout=1000&_journal_mode=WAL"))
+		if err != nil {
+			t.Fatal(err)
+		}
+		conn, err := db.Conn(ctx)
+		if err != nil {
+			db.Close()
+			return nil, nil, err
+		}
+		return db, conn, nil
+	}
+	names := func(t *testing.T, dir string) []string {
+		t.Helper()
+		es, err := os.ReadDir(dir)
+		if err != nil {
+			t.Fatal(err)
+		}
+		var out []string
+		for _, e := range es {
+			out = append(out, e.Name())
+		}
+		return out
+	}
+
+	t.Run("missing file is not created", func(t *testing.T) {
+		dir := t.TempDir()
+		if _, _, err := open(t, filepath.Join(dir, "gone.db")); err == nil {
+			t.Fatal("opening a missing file succeeded")
+		}
+		if got := names(t, dir); len(got) != 0 {
+			t.Fatalf("files created by a failed open: %q", got)
+		}
+	})
+
+	t.Run("URI-significant characters name the file itself", func(t *testing.T) {
+		dir := t.TempDir()
+		path := filepath.Join(dir, "a b#c?d%41e.db")
+		writeFile(t, path, "") // an empty file is an empty database
+		db, conn, err := open(t, path)
+		if err != nil {
+			t.Fatal(err)
+		}
+		var mode string
+		if err := conn.QueryRowContext(ctx, "PRAGMA journal_mode").Scan(&mode); err != nil {
+			t.Fatal(err)
+		}
+		if _, err := conn.ExecContext(ctx, "CREATE TABLE t (v)"); err != nil {
+			t.Fatal(err)
+		}
+		conn.Close()
+		db.Close()
+		if mode != "wal" {
+			t.Fatalf("journal_mode = %q, want wal: go-sqlite3's own parameters were lost", mode)
+		}
+		for _, n := range names(t, dir) {
+			if n != "a b#c?d%41e.db" && n != "a b#c?d%41e.db-wal" && n != "a b#c?d%41e.db-shm" {
+				t.Fatalf("the open touched another file: %q", n)
+			}
+		}
+		if fi, err := os.Stat(path); err != nil || fi.Size() == 0 {
+			t.Fatalf("nothing was written to %s (size %v, err %v)", path, fi, err)
+		}
+	})
+}
