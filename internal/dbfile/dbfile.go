@@ -86,10 +86,10 @@
 // which ReadStats().StrandedPinned (offshoot_dbfile_stranded_pinned)
 // reports.
 //
-// Every close happens with the registry lock held. Releasing it between the
-// "unpinned" check and the close would let a Hold, its sql.Open and that
-// connection's first lock land in between, and the close would then drop
-// that lock.
+// Every close goes through closeLocked, with the registry lock held.
+// Releasing it between the "unpinned" check and the close would let a Hold,
+// its sql.Open and that connection's first lock land in between, and the
+// close would then drop that lock.
 //
 // Follow-ups, in order of how much they buy:
 //
@@ -554,9 +554,7 @@ func closeOrphans(in func(string) bool) int {
 				kept = append(kept, e)
 				continue
 			}
-			// Closed under mu, deliberately: see the package doc's
-			// "Orphans and eviction".
-			e.f.Close()
+			closeLocked(e)
 			n++
 		}
 		if len(kept) == 0 {
@@ -568,6 +566,19 @@ func closeOrphans(in func(string) bool) int {
 	evictedStranded += uint64(n)
 	return n
 }
+
+// closeLocked closes a descriptor the registry has just dropped. Every
+// close goes through here, and mu must be held: see the package doc's
+// "Orphans and eviction". closeHookForTest lets a test check the lock at
+// the moment of each close.
+func closeLocked(e *entry) {
+	if closeHookForTest != nil {
+		closeHookForTest()
+	}
+	e.f.Close()
+}
+
+var closeHookForTest func()
 
 // sweep orphans every cached descriptor whose path is gone or names another
 // inode now. The stats run outside mu so a slow filesystem never stalls
@@ -674,7 +685,7 @@ func evict(keep int, in func(string) bool) int {
 			continue
 		}
 		delete(live, e.path)
-		e.f.Close() // under mu: see the package doc's "Orphans and eviction"
+		closeLocked(e)
 		n++
 	}
 	evictedBudget += uint64(n)

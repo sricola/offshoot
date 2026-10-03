@@ -2,6 +2,9 @@ package dbfile
 
 import (
 	"fmt"
+	"go/ast"
+	"go/parser"
+	"go/token"
 	"io"
 	"os"
 	"path/filepath"
@@ -94,6 +97,79 @@ func TestEvictRacesHandle(t *testing.T) {
 	for _, e := range Entries() {
 		if in(e.Path) {
 			t.Errorf("still registered after a final eviction with nothing pinned: %+v", e)
+		}
+	}
+}
+
+// TestEveryCloseHoldsTheRegistryLock checks the package doc's rule that
+// every close happens with mu held. TestEvictRacesHandle cannot see a
+// violation: its holds open no connection. A close made after releasing mu
+// could land after a Hold, its sql.Open and that connection's first lock,
+// and drop the lock. Every close goes through closeLocked (the source check
+// below), and at each one TryLock must fail because the closer holds mu.
+// Nothing else in this binary runs concurrently with it.
+func TestEveryCloseHoldsTheRegistryLock(t *testing.T) {
+	dir := t.TempDir()
+	in := under(dir)
+	a, b := filepath.Join(dir, "a.db"), filepath.Join(dir, "b.db")
+	for _, p := range []string{a, b} {
+		writeFile(t, p, "x")
+		s, err := Reader(p)
+		if err != nil {
+			t.Fatal(err)
+		}
+		s.Close()
+	}
+	replaceFile(t, a, "y") // the next sweep orphans a's descriptor
+	var closes, unlocked int
+	closeHookForTest = func() {
+		closes++
+		if mu.TryLock() {
+			unlocked++
+			mu.Unlock()
+		}
+	}
+	t.Cleanup(func() { closeHookForTest = nil })
+	evictStranded(in) // closeOrphans closes a's old descriptor
+	evict(0, in)      // evict closes b's
+	if closes != 2 {
+		t.Fatalf("closes seen = %d, want 2 (an orphan and a cached descriptor)", closes)
+	}
+	if unlocked != 0 {
+		t.Fatalf("%d descriptor(s) closed without the registry lock held", unlocked)
+	}
+
+	files, err := filepath.Glob("*.go")
+	if err != nil {
+		t.Fatal(err)
+	}
+	fset := token.NewFileSet()
+	for _, name := range files {
+		if strings.HasSuffix(name, "_test.go") {
+			continue
+		}
+		f, err := parser.ParseFile(fset, name, nil, parser.SkipObjectResolution)
+		if err != nil {
+			t.Fatal(err)
+		}
+		for _, d := range f.Decls {
+			fd, ok := d.(*ast.FuncDecl)
+			if !ok || fd.Name.Name == "closeLocked" {
+				continue
+			}
+			ast.Inspect(fd, func(n ast.Node) bool {
+				call, ok := n.(*ast.CallExpr)
+				if !ok {
+					return true
+				}
+				if sel, ok := call.Fun.(*ast.SelectorExpr); ok && sel.Sel.Name == "Close" {
+					if x, ok := sel.X.(*ast.SelectorExpr); ok && x.Sel.Name == "f" {
+						t.Errorf("%s: %s closes a registry descriptor directly; go through closeLocked",
+							fset.Position(call.Pos()), fd.Name.Name)
+					}
+				}
+				return true
+			})
 		}
 	}
 }
