@@ -1425,12 +1425,12 @@ func (s *Server) opDiff(req Request) Response {
 	return Response{OK: true, Diff: res}
 }
 
-// Shutdown stops the janitor, stops accepting, refuses any further opens,
-// waits out every open already in flight, closes every live session and
-// waits out every close already running (so no lease is orphaned), closes
-// every live connection (so no handle goroutine outlives it), and removes
-// the socket. A second call waits for the first, bounded by its own ctx, and
-// returns the first call's result.
+// Shutdown stops the janitor, stops accepting and removes the socket,
+// refuses any further opens, waits out every open already in flight, closes
+// every live session and waits out every close already running (so no
+// lease is orphaned), and closes every live connection (so no handle
+// goroutine outlives it). A second call waits for the first, bounded by its
+// own ctx, and returns the first call's result.
 //
 // Ordering here is load-bearing:
 //
@@ -1528,6 +1528,10 @@ func (s *Server) shutdown(ctx context.Context) error {
 	// sequence that follows.
 	close(s.janitorStop)
 
+	// Closing the listener also removes the socket file: a UnixListener from
+	// net.Listen unlinks its path on Close. This is the only place Shutdown
+	// removes it, before any session starts closing; see the end of this
+	// function for why it must not be removed again later.
 	s.ln.Close()
 
 	// Close every live connection so a handle goroutine blocked in Decode
@@ -1643,8 +1647,10 @@ func (s *Server) shutdown(ctx context.Context) error {
 			firstErr = c.m.err
 		}
 	}
-	if err := os.Remove(s.sock); err != nil && !os.IsNotExist(err) && firstErr == nil {
-		firstErr = err
-	}
+	// No os.Remove(s.sock) here: closing the listener removed it already.
+	// The shutdown op is acknowledged before this runs, so the socket path
+	// may by now belong to the next `serve` an operator started on it while
+	// these sessions were closing, and removing it would leave that daemon
+	// running with no way to reach it.
 	return firstErr
 }

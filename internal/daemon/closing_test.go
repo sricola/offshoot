@@ -6,6 +6,7 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"net"
 	"strings"
 	"sync"
 	"sync/atomic"
@@ -690,6 +691,43 @@ func TestSecondShutdownWaitsForTheFirst(t *testing.T) {
 	}
 	if ref.LeaseHolder != "" {
 		t.Fatalf("lease still held by %q", ref.LeaseHolder)
+	}
+}
+
+// TestShutdownLeavesTheNextDaemonsSocketAlone: `session shutdown` returns as
+// soon as the daemon acknowledges it, and closing the listener removes the
+// socket file at once, so an operator can start the next `serve` on the
+// same path while this daemon is still closing sessions. Shutdown used to
+// end by removing the socket path again. Once serve stayed up until every
+// close had finished, that removed the next daemon's socket and left it
+// running with no way to reach it.
+func TestShutdownLeavesTheNextDaemonsSocketAlone(t *testing.T) {
+	srv, _ := newServer(t)
+	sock := srv.SocketPath()
+	if r := call(t, sock, Request{Op: "open", DB: "app", Branch: "main"}); !r.OK {
+		t.Fatalf("open = %+v", r)
+	}
+	entered, release := holdNextClose(t)
+	if r := call(t, sock, Request{Op: "shutdown"}); !r.OK {
+		t.Fatalf("shutdown op = %+v", r)
+	}
+	// Sessions start closing only after the listener has closed, so by now
+	// the path is free.
+	within(t, entered, "Shutdown to reach the session's release")
+	next, err := net.Listen("unix", sock)
+	if err != nil {
+		release()
+		t.Fatalf("listening on the socket path while the old daemon closes its sessions: %v", err)
+	}
+	defer next.Close()
+	release()
+	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+	defer cancel()
+	if err := srv.WaitShutdown(ctx); err != nil {
+		t.Fatalf("WaitShutdown = %v", err)
+	}
+	if !Running(sock) {
+		t.Fatal("the old daemon's shutdown removed the socket the next daemon is listening on")
 	}
 }
 

@@ -1693,10 +1693,18 @@ offshoot session shutdown
 
 Asks the daemon to shut down gracefully (equivalent to sending it
 `SIGINT`/`SIGTERM`): releases every lease, closes every session (waiting for
-closes already in progress), removes the socket. The process exits only
-after every lease is released, bounded by 30 s like the signal path; a
+closes already in progress), removes the socket. The daemon process exits
+only after every lease is released, bounded by 30 s like the signal path; a
 signal that arrives while the shutdown is still closing sessions waits for
 it too.
+
+The command itself returns as soon as the daemon accepts the request, before
+those closes finish. The daemon stops listening and removes its socket right
+away and never touches the socket path again, so a new `offshoot serve` on
+the same socket can start at once. Until the old process has released a
+branch's lease, the new daemon's `open` of that branch fails because the
+branch is leased. A script that needs every lease released first should
+wait for the old `serve` process to exit.
 
 ## `offshoot session dbs [-socket PATH]`
 

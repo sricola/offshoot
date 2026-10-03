@@ -101,7 +101,11 @@ Pin an exact version if you depend on format stability. The full contract:
   was not waited for at all, and a signal arriving during a `shutdown`
   ended the process at once. The daemon now exits only after every session
   has closed and released its lease, bounded by the same 30 s as
-  `SIGINT`/`SIGTERM`.
+  `SIGINT`/`SIGTERM`. The command still returns as soon as the daemon
+  accepts it, and the daemon removes its socket at once and leaves the path
+  alone after that, so a new `serve` on the same socket can start while the
+  old process finishes; wait for that process to exit if every lease must
+  be released first.
 - **A slow close could let the session's lease lapse.** Closing stopped
   renewing the lease before the capture engine's shutdown, the checkout
   hash, the sidecar stamp and the shadow refresh, which at default settings
