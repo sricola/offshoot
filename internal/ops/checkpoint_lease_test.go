@@ -2237,9 +2237,10 @@ func (b *countRefGets) DeleteIf(key, ifMatch string) error {
 // TestRenewalsLeaveADestroyClaimAlone: `destroy --force` claims the ref and
 // quiesces the checkout before its conditional delete, which compares
 // against the claim's etag. A checkpoint renewing its lease meanwhile reads
-// the claim and does not write over it, so the delete goes through however
-// many renewals fall inside the quiesce, and the checkpoint then fails on
-// the destroyed branch.
+// the claim and, while more than half the lease is left, does not write
+// over it, so the delete goes through however many renewals fall inside a
+// quiesce that short (here three, with nearly all of a 2 s lease left), and
+// the checkpoint then fails on the destroyed branch.
 func TestRenewalsLeaveADestroyClaimAlone(t *testing.T) {
 	w := newWS(t)
 	seedDB(t, w, "app", 1<<16)

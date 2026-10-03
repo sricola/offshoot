@@ -194,10 +194,11 @@ func TestRenewalEndsWhenBranchDestroyed(t *testing.T) {
 // between its claim and its delete leaves the claim until the janitor
 // finds it 30 s old, longer than a session's lease. The session's renewals
 // leave the claim alone while the lease has more than half its TTL left
-// and then renew over it, so the lease stays live for as long as the claim
-// stands; once the claim is cleared, another writer is still refused and
-// the session is not fenced. (A destroy that is still running is done with
-// the claim well inside the first half of a default 30 s lease.)
+// and then renew over it, so with its renewals going through the lease
+// stays live for as long as the claim stands; once the claim is cleared,
+// another writer is still refused and the session is not fenced. (A
+// destroy that is still running is done with the claim well inside the
+// first half of a default 30 s lease.)
 func TestRenewalKeepsTheLeaseUnderAStrandedDestroyClaim(t *testing.T) {
 	testutil.RequireSQLite3(t)
 	w := newWS(t)

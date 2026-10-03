@@ -552,13 +552,13 @@ func TestRenewLeaseLeavesAClaimAlone(t *testing.T) {
 
 // TestRenewLeaseKeepsALiveLeaseUnderADestroyClaim: a destroy claim stops
 // renewals only while the lease has more than half its TTL left. Past
-// that, a renewal writes over the claim, leaving it set, so the lease
-// never lapses under it: a claim a killed destroy stranded stands until
-// ops.ClearStaleDeleteClaims finds it 30 s old, by which time a 30 s lease
-// that no renewal had extended would always have expired, and the first
-// acquirer after the clear would fence the holder. A reap claim still
-// stops every renewal: it lands only on a branch whose lease expired a
-// whole branch TTL ago.
+// that, a renewal writes over the claim, leaving it set, so the claim does
+// not lapse a lease whose renewals go through: a claim a killed destroy
+// stranded stands until ops.ClearStaleDeleteClaims finds it 30 s old, by
+// which time a 30 s lease that no renewal had extended would always have
+// expired, and the first acquirer after the clear would fence the holder.
+// A reap claim still stops every renewal: it lands only on a branch whose
+// lease expired a whole branch TTL ago.
 func TestRenewLeaseKeepsALiveLeaseUnderADestroyClaim(t *testing.T) {
 	s := newStore(t)
 	seedBranch(t, s)
@@ -628,5 +628,195 @@ func TestRenewLeaseKeepsALiveLeaseUnderADestroyClaim(t *testing.T) {
 	}
 	if _, got, err := s.GetRef("app", "main"); err != nil || got != claimEtag {
 		t.Fatalf("a renewal moved the reap claim's etag (%v)", err)
+	}
+}
+
+// TestRenewLeaseRetriesACompareAndSwapLostToAnotherWrite: a renewal whose
+// write loses its compare-and-swap to another write of the ref (the
+// holder's own flush, a touch, a TTL change, the janitor clearing a claim)
+// re-reads the ref and renews on it while the lease is still the caller's,
+// instead of costing the holder a renewal. Under a destroy claim that
+// matters most: at the default ttl/3 cadence only every other renewal
+// writes over the claim, with ttl/3 left, so the next one would come with
+// none left. The retry runs every check again on the ref it re-reads: a
+// lease taken meanwhile is ErrLeaseLost, and a reap claim, or a destroy
+// claim with more than half the lease left, is still left alone.
+func TestRenewLeaseRetriesACompareAndSwapLostToAnotherWrite(t *testing.T) {
+	ttl := 30 * time.Second
+	t0 := time.Date(2026, 8, 1, 12, 0, 0, 0, time.UTC)
+	claimedAt := t0.Add(time.Second).Format(time.RFC3339Nano)
+	touchedAt := t0.Add(15 * time.Second).Format(time.RFC3339Nano)
+	touch := func(r *Ref) { r.TouchedAt = touchedAt }
+	for _, tc := range []struct {
+		name  string
+		claim bool          // a destroy claim stands when the renewal reads
+		at    time.Duration // when the renewal runs, after the acquire at t0
+		race  func(*Ref)    // the write that lands between its read and its write
+		want  error         // nil: renewed until t0+at+ttl, on the raced ref
+	}{
+		{"touch", false, 10 * time.Second, touch, nil},
+		{"touch under a destroy claim", true, 20 * time.Second, touch, nil},
+		{"janitor clearing the claim", true, 20 * time.Second, func(r *Ref) { r.Deleting, r.DeletingAt = false, "" }, nil},
+		{"reclaim by another holder", false, 40 * time.Second, func(r *Ref) { r.Epoch++; r.LeaseHolder = "daemon-b" }, ErrLeaseLost},
+		{"reap claim", false, 10 * time.Second, func(r *Ref) { r.Reaping = true }, ErrReaping},
+		{"destroy claim with more than half left", false, 10 * time.Second, func(r *Ref) { r.Deleting, r.DeletingAt = true, claimedAt }, ErrDeleting},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			base := newStore(t)
+			seedBranch(t, base)
+			l, err := base.AcquireLease("app", "main", "daemon-a", ttl, t0)
+			if err != nil {
+				t.Fatal(err)
+			}
+			if tc.claim {
+				ref, etag, err := base.GetRef("app", "main")
+				if err != nil {
+					t.Fatal(err)
+				}
+				ref.Deleting, ref.DeletingAt = true, claimedAt
+				if _, err := base.PutRef("app", "main", ref, etag); err != nil {
+					t.Fatal(err)
+				}
+			}
+			var raced Ref
+			var racedEtag string
+			rb := &racingBackend{Backend: base.B, key: RefKey("app", "main")}
+			rb.racer = func() {
+				ref, etag, err := base.GetRef("app", "main")
+				if err != nil {
+					t.Fatal(err)
+				}
+				tc.race(&ref)
+				if racedEtag, err = base.PutRef("app", "main", ref, etag); err != nil {
+					t.Fatal(err)
+				}
+				raced = ref
+			}
+			next, err := (&Store{B: rb}).RenewLease(l, ttl, t0.Add(tc.at))
+			got, gotEtag, gerr := base.GetRef("app", "main")
+			if gerr != nil {
+				t.Fatal(gerr)
+			}
+			if tc.want != nil {
+				if !errors.Is(err, tc.want) {
+					t.Fatalf("renewal that lost its compare-and-swap to a %s: %v, want %v", tc.name, err, tc.want)
+				}
+				if gotEtag != racedEtag {
+					t.Fatalf("a refused renewal wrote over the %s", tc.name)
+				}
+				return
+			}
+			if err != nil {
+				t.Fatalf("renewal that lost its compare-and-swap to a %s: %v, want it renewed on a re-read", tc.name, err)
+			}
+			want := t0.Add(tc.at + ttl)
+			if !next.Expiry.Equal(want) || next.Epoch != l.Epoch || next.Holder != l.Holder {
+				t.Fatalf("renewed lease %+v, want %s's epoch %d until %s", next, l.Holder, l.Epoch, want)
+			}
+			raced.LeaseExpiry = want.Format(time.RFC3339Nano)
+			if !reflect.DeepEqual(got, raced) {
+				t.Fatalf("after the retried renewal the ref is\n %+v\nwant the raced ref with the new expiry\n %+v", got, raced)
+			}
+		})
+	}
+}
+
+// landedRefPutReportsCAS writes the first put of key through and then
+// answers it with a lost compare-and-swap, as an S3 SDK retry of a put
+// whose first attempt landed answers 412 against that attempt. It counts
+// the puts of key.
+type landedRefPutReportsCAS struct {
+	Backend
+	key  string
+	puts int
+}
+
+func (b *landedRefPutReportsCAS) PutIf(key string, data []byte, ifMatch string) (string, error) {
+	if key != b.key {
+		return b.Backend.PutIf(key, data, ifMatch)
+	}
+	b.puts++
+	etag, err := b.Backend.PutIf(key, data, ifMatch)
+	if err == nil && b.puts == 1 {
+		return "", fmt.Errorf("%w: 412 Precondition Failed", ErrCAS)
+	}
+	return etag, err
+}
+
+// TestRenewLeaseRecognisesItsOwnLandedWrite: a renewal whose write landed
+// but reported a lost compare-and-swap finds its own expiry on the re-read
+// and reports the renewal, without writing again. Under a destroy claim
+// the re-read lease has more than half its TTL left again, which must not
+// read as a refusal.
+func TestRenewLeaseRecognisesItsOwnLandedWrite(t *testing.T) {
+	ttl := 30 * time.Second
+	t0 := time.Date(2026, 8, 1, 12, 0, 0, 0, time.UTC)
+	for _, claim := range []bool{false, true} {
+		t.Run(fmt.Sprintf("claim=%v", claim), func(t *testing.T) {
+			base := newStore(t)
+			seedBranch(t, base)
+			l, err := base.AcquireLease("app", "main", "daemon-a", ttl, t0)
+			if err != nil {
+				t.Fatal(err)
+			}
+			if claim {
+				ref, etag, err := base.GetRef("app", "main")
+				if err != nil {
+					t.Fatal(err)
+				}
+				ref.Deleting, ref.DeletingAt = true, t0.Add(time.Second).Format(time.RFC3339Nano)
+				if _, err := base.PutRef("app", "main", ref, etag); err != nil {
+					t.Fatal(err)
+				}
+			}
+			b := &landedRefPutReportsCAS{Backend: base.B, key: RefKey("app", "main")}
+			next, err := (&Store{B: b}).RenewLease(l, ttl, t0.Add(20*time.Second))
+			want := t0.Add(20*time.Second + ttl)
+			if err != nil || !next.Expiry.Equal(want) {
+				t.Fatalf("renewal whose write landed behind a lost compare-and-swap: %+v, %v; want it renewed until %s", next, err, want)
+			}
+			if b.puts != 1 {
+				t.Fatalf("the renewal put the ref %d times, want once", b.puts)
+			}
+			if got, _, err := base.GetRef("app", "main"); err != nil || got.LeaseExpiry != want.Format(time.RFC3339Nano) || got.Deleting != claim {
+				t.Fatalf("ref after the renewal: deleting %v, expiry %s (%v); want deleting %v until %s", got.Deleting, got.LeaseExpiry, err, claim, want)
+			}
+		})
+	}
+}
+
+// refPutsLoseCAS answers every put of key with a lost compare-and-swap,
+// writing nothing, and counts them.
+type refPutsLoseCAS struct {
+	Backend
+	key  string
+	puts int
+}
+
+func (b *refPutsLoseCAS) PutIf(key string, data []byte, ifMatch string) (string, error) {
+	if key != b.key {
+		return b.Backend.PutIf(key, data, ifMatch)
+	}
+	b.puts++
+	return "", fmt.Errorf("%w: 412 Precondition Failed", ErrCAS)
+}
+
+// TestRenewLeaseGivesUpAfterBoundedCompareAndSwapLosses: the retry is
+// bounded, so a renewal that loses every compare-and-swap ends with ErrCAS
+// after renewLeaseAttempts puts and the renewer tries on its next tick.
+func TestRenewLeaseGivesUpAfterBoundedCompareAndSwapLosses(t *testing.T) {
+	base := newStore(t)
+	seedBranch(t, base)
+	t0 := time.Date(2026, 8, 1, 12, 0, 0, 0, time.UTC)
+	l, err := base.AcquireLease("app", "main", "daemon-a", time.Minute, t0)
+	if err != nil {
+		t.Fatal(err)
+	}
+	b := &refPutsLoseCAS{Backend: base.B, key: RefKey("app", "main")}
+	if _, err := (&Store{B: b}).RenewLease(l, time.Minute, t0.Add(20*time.Second)); !errors.Is(err, ErrCAS) {
+		t.Fatalf("renewal that lost every compare-and-swap: %v, want ErrCAS", err)
+	}
+	if b.puts != renewLeaseAttempts {
+		t.Fatalf("the renewal put the ref %d times, want %d", b.puts, renewLeaseAttempts)
 	}
 }

@@ -826,8 +826,14 @@ while the lease has more than half its TTL left (at the default cadence,
 the first that does normally comes 10 s or more after the claim), so
 they do not fail the destroy's conditional delete. Past that, a renewal
 writes over the claim and leaves it set, so a destroy that was killed
-after its claim cannot let the holder's lease lapse before the janitor
-clears the claim (30 s or more after it was made).
+after its claim does not let the holder's lease lapse before the janitor
+clears the claim (30 s or more after it was made). Leaving a running
+destroy alone costs one renewal of slack: under the claim only every
+other renewal writes, so two in a row that fail with a store error let
+the lease lapse, where without a claim it takes three. A renewal that
+loses a compare-and-swap to another write of the ref (a flush, a
+`touch`) re-reads the ref and tries again, so such a write does not cost
+the holder a renewal.
 
 **Under copy-on-write, "destroyed" and "reclaimed" are different events.**
 Destroying a branch removes its ref immediately, but if any surviving

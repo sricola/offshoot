@@ -48,7 +48,7 @@ func (o CheckpointOptions) leaseTTL() time.Duration {
 
 // renewEvery is RenewEvery, or a third of ttl when it is not set: the
 // interval a daemon session renews at, which leaves the lease two missed
-// renewals of slack.
+// renewals of slack (one under a destroy claim; see store.RenewLease).
 func (o CheckpointOptions) renewEvery(ttl time.Duration) time.Duration {
 	if o.RenewEvery > 0 {
 		return o.RenewEvery
@@ -245,13 +245,16 @@ var errCheckpointRenewStopped = errors.New("ops: checkpoint lease renewals stopp
 // (internal/session/renew.go): a renewal that finds the lease gone
 // (ErrLeaseLost) or the branch destroyed (ErrNotFound) is terminal and
 // cancels ctx with that error as its cause; any other error is retried on
-// the next tick, since the lease outlives two missed renewals. That
-// includes RenewLease's unretried ErrCAS against a concurrent touch, and
-// its refusal to renew over a reap claim, or over a destroy claim while
-// more than half the lease is left (ErrReaping, ErrDeleting), which leaves
-// the claim's etag for Destroy's conditional delete; past half the lease,
-// a renewal writes over a destroy claim, so the lease does not lapse under
-// one a killed destroy left (see store.RenewLease).
+// the next tick. That includes a store error, an ErrCAS that outlasted
+// RenewLease's own re-reads, and its refusal to renew over a reap claim,
+// or over a destroy claim while more than half the lease is left
+// (ErrReaping, ErrDeleting), which leaves the claim's etag for Destroy's
+// conditional delete. Past half the lease a renewal writes over a destroy
+// claim, so a claim a killed destroy left does not lapse a lease whose
+// renewals go through. Without a claim the lease outlives two missed
+// renewals; under a destroy claim, where only every other renewal writes
+// over it, one missed renewal leaves the next with nothing to spare and
+// two let it lapse (see store.RenewLease).
 type checkpointRenewer struct {
 	ctx    context.Context
 	cancel context.CancelCauseFunc

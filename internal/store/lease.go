@@ -186,7 +186,23 @@ func (s *Store) AcquireLeaseRefIf(db, branch, holder string, ttl time.Duration, 
 	return Lease{DB: db, Branch: branch, Holder: holder, Epoch: ref.Epoch, Expiry: expiry}, ref, written, nil
 }
 
+// renewLeaseAttempts bounds RenewLease's read-modify-write of the ref. A
+// renewal that loses its compare-and-swap to another write (the holder's
+// own flush, a touch, a TTL change, the janitor clearing a claim) re-reads
+// the ref and tries again while the lease is still the caller's; the
+// bound only ends a run of losses, after which the renewer tries on its
+// next tick.
+const renewLeaseAttempts = 4
+
 // RenewLease extends the caller's own lease without touching the epoch.
+//
+// A write that loses its compare-and-swap is retried on a re-read of the
+// ref, up to renewLeaseAttempts writes in all, with every check below run
+// again on the ref it re-reads: a lease that is no longer the caller's is
+// ErrLeaseLost, and a claim is treated as below. A re-read that already
+// carries the expiry this call wrote means an earlier write landed though
+// it reported the loss (an S3 SDK retry answering 412 to its own first
+// attempt), and the renewal is reported without another write.
 //
 // A branch with a destroy claim (Deleting) is not renewed while the lease
 // has more than half of ttl left: RenewLease writes nothing and returns
@@ -199,40 +215,55 @@ func (s *Store) AcquireLeaseRefIf(db, branch, holder string, ttl time.Duration, 
 // ttl/3 or more after it landed.
 //
 // Once half of ttl or less is left, the renewal writes over the claim and
-// leaves it set, so a live lease never lapses under it. A claim that a
-// killed or crashed destroy stranded stands until ops.ClearStaleDeleteClaims
-// finds it 30 s old, by which time a default 30 s lease that no renewal had
-// extended would always have expired: an unforced destroy would find no
-// live lease while the claim stood, and the first acquirer after the clear
-// would reclaim the branch and fence the holder.
+// leaves it set, because a claim that a killed or crashed destroy stranded
+// stands until ops.ClearStaleDeleteClaims finds it 30 s old, by which time
+// a default 30 s lease that no renewal had extended would always have
+// expired: an unforced destroy would find no live lease while the claim
+// stood, and the first acquirer after the clear would reclaim the branch
+// and fence the holder. The skip still costs one renewal of slack. At the
+// default cadence only every other renewal under a destroy claim writes,
+// with ttl/3 left, so a renewal that fails with a store error (a lost
+// compare-and-swap is retried, above) leaves the next with nothing to
+// spare, and two in a row let the lease lapse; without a claim, two leave
+// nothing to spare and three let it lapse.
 //
 // A branch with a reap claim (Reaping) is never renewed (ErrReaping): Reap
 // claims only a branch whose lease expired a whole branch TTL ago, so no
 // live lease can lapse under that claim.
 func (s *Store) RenewLease(l Lease, ttl time.Duration, now time.Time) (Lease, error) {
-	ref, etag, err := s.GetRef(l.DB, l.Branch)
-	if err != nil {
-		return Lease{}, err
-	}
-	if ref.LeaseHolder != l.Holder || ref.Epoch != l.Epoch {
-		return Lease{}, fmt.Errorf("%w: %s@%s now held by %q at epoch %d",
-			ErrLeaseLost, l.DB, l.Branch, ref.LeaseHolder, ref.Epoch)
-	}
-	if ref.Reaping {
-		return Lease{}, fmt.Errorf("%w: %s@%s; not renewing over the claim", ErrReaping, l.DB, l.Branch)
-	}
-	if ref.Deleting {
-		if exp, ok := parseExpiry(ref.LeaseExpiry); ok && exp.Sub(now) > ttl/2 {
-			return Lease{}, fmt.Errorf("%w: %s@%s; not renewing over the claim while more than half the lease is left", ErrDeleting, l.DB, l.Branch)
+	expiry := now.Add(ttl).UTC()
+	stamp := expiry.Format(time.RFC3339Nano)
+	for attempt := 1; ; attempt++ {
+		ref, etag, err := s.GetRef(l.DB, l.Branch)
+		if err != nil {
+			return Lease{}, err
+		}
+		if ref.LeaseHolder != l.Holder || ref.Epoch != l.Epoch {
+			return Lease{}, fmt.Errorf("%w: %s@%s now held by %q at epoch %d",
+				ErrLeaseLost, l.DB, l.Branch, ref.LeaseHolder, ref.Epoch)
+		}
+		if attempt > 1 && ref.LeaseExpiry == stamp {
+			l.Expiry = expiry
+			return l, nil
+		}
+		if ref.Reaping {
+			return Lease{}, fmt.Errorf("%w: %s@%s; not renewing over the claim", ErrReaping, l.DB, l.Branch)
+		}
+		if ref.Deleting {
+			if exp, ok := parseExpiry(ref.LeaseExpiry); ok && exp.Sub(now) > ttl/2 {
+				return Lease{}, fmt.Errorf("%w: %s@%s; not renewing over the claim while more than half the lease is left", ErrDeleting, l.DB, l.Branch)
+			}
+		}
+		ref.LeaseExpiry = stamp
+		_, err = s.PutRef(l.DB, l.Branch, ref, etag)
+		if err == nil {
+			l.Expiry = expiry
+			return l, nil
+		}
+		if !errors.Is(err, ErrCAS) || attempt == renewLeaseAttempts {
+			return Lease{}, fmt.Errorf("store: renew lease on %s@%s: %w", l.DB, l.Branch, err)
 		}
 	}
-	expiry := now.Add(ttl).UTC()
-	ref.LeaseExpiry = expiry.Format(time.RFC3339Nano)
-	if _, err := s.PutRef(l.DB, l.Branch, ref, etag); err != nil {
-		return Lease{}, fmt.Errorf("store: renew lease on %s@%s: %w", l.DB, l.Branch, err)
-	}
-	l.Expiry = expiry
-	return l, nil
 }
 
 // ReleaseLease clears the caller's lease. The epoch is left alone: a clean
