@@ -17,6 +17,23 @@ Pin an exact version if you depend on format stability. The full contract:
 
 ## [Unreleased]
 
+### Fixed
+
+- **A `checkpoint` could stamp its checkout trusted for content it never
+  encoded.** The stamp trusted the encode's checksum whenever the
+  checkout's fingerprint (size, mtime, change counter) still matched the
+  one taken right after quiesce. Checkouts are WAL mode, where SQLite can
+  leave the change counter untouched across commits, so size and mtime
+  alone carried that match; on a filesystem with 1 s mtime resolution a
+  foreign same-size write landing in the same tick as the quiesce left the
+  fingerprint identical with the content changed, and the sidecar then
+  read "clean" (and the shadow was refreshed) for bytes the store does not
+  hold. The stamp now applies the same 1 s racily-clean margin that
+  `checkout` already applies to its fingerprint fast path: when the encode
+  fingerprint's mtime is younger than the margin, the live database is
+  checksummed instead, which costs one pass over the file and cannot be
+  fooled by the tick.
+
 ### Changed
 
 - **Etags are normalized before the post-checkpoint compare.** After
