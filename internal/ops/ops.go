@@ -25,6 +25,7 @@ import (
 	"time"
 
 	_ "github.com/mattn/go-sqlite3"
+	"github.com/sricola/offshoot/internal/dbfile"
 	"github.com/sricola/offshoot/internal/ltxio"
 	"github.com/sricola/offshoot/internal/store"
 )
@@ -309,19 +310,8 @@ func (w *Workspace) CreateFrom(db, srcPath string) error {
 	}
 	defer os.RemoveAll(dir)
 	cp := filepath.Join(dir, "import.db")
-	// VACUUM INTO reads the source under one read transaction, so the copy
-	// is a consistent committed state even when another process is writing
-	// to the source (a byte copy of a live file could tear across pages and
-	// import as a well-formed snapshot of garbage); it honours the source's
-	// WAL without touching it. The source itself is never written.
-	src, err := sql.Open("sqlite3", srcPath+"?_busy_timeout=5000")
-	if err != nil {
-		return fmt.Errorf("ops: import %s: %w", srcPath, err)
-	}
-	_, err = src.Exec("VACUUM INTO ?", cp)
-	src.Close()
-	if err != nil {
-		return fmt.Errorf("ops: import %s: not a usable SQLite database: %w", srcPath, err)
+	if err := vacuumImportSource(srcPath, cp); err != nil {
+		return err
 	}
 	// Normalize the copy the way Create builds a fresh database: WAL mode
 	// in the header, then quiesced, so every checkout materialized from it
@@ -336,6 +326,42 @@ func (w *Workspace) CreateFrom(db, srcPath string) error {
 	}
 	conn.Close()
 	return w.createFromQuiesced(db, cp)
+}
+
+// vacuumImportSource copies srcPath's committed state into dst with VACUUM
+// INTO, never writing the source. The source is pinned like any checkout
+// (see quiesce): the daemon's create op imports whatever absolute path its
+// client names, which can be a checkout this same process caches and has a
+// capture engine on.
+func vacuumImportSource(srcPath, dst string) error {
+	release, ino, err := dbfile.Hold(srcPath)
+	if err != nil {
+		return fmt.Errorf("ops: import %s: %w", srcPath, err)
+	}
+	defer release()
+	src, err := sql.Open("sqlite3", dbfile.NoCreateDSN(srcPath, "_busy_timeout=5000"))
+	if err != nil {
+		return fmt.Errorf("ops: import %s: %w", srcPath, err)
+	}
+	defer src.Close()
+	ctx := context.Background()
+	conn, err := src.Conn(ctx)
+	if err != nil {
+		return fmt.Errorf("ops: import %s: not a usable SQLite database: %w", srcPath, err)
+	}
+	defer conn.Close()
+	if err := dbfile.Verify(srcPath, ino); err != nil {
+		return fmt.Errorf("ops: import %s: %w", srcPath, err)
+	}
+	// VACUUM INTO reads the source under one read transaction, so the copy
+	// is a consistent committed state even when another process is writing
+	// to the source (a byte copy of a live file could tear across pages and
+	// import as a well-formed snapshot of garbage); it honours the source's
+	// WAL without touching it. The source itself is never written.
+	if _, err := conn.ExecContext(ctx, "VACUUM INTO ?", dst); err != nil {
+		return fmt.Errorf("ops: import %s: not a usable SQLite database: %w", srcPath, err)
+	}
+	return nil
 }
 
 // Checkout materializes db@branch's head snapshot to its fixed path. If a
@@ -864,15 +890,37 @@ var errQuiesceBusy = errors.New("ops: database is busy (live writer or reader); 
 const quiesceBusyTimeoutMS = 3000
 
 // quiesce checkpoints the WAL fully, failing cleanly on a busy database (see
-// errQuiesceBusy).
+// errQuiesceBusy). Its connection takes locks on the checkout's inode, and
+// in the daemon it runs concurrently with dbfile's evictions (branches,
+// checkout, the rollback and promote refreshes, fork's warning, and reap and
+// destroy on every janitor tick), so it pins that inode first (see
+// internal/dbfile's Pins): the release is deferred before the database's
+// Close so it runs after the connection is gone, and Verify proves the
+// lazily opened connection is on the held inode. A path that does not exist
+// fails at the Hold, and one removed after it fails the open
+// (dbfile.NoCreateDSN), instead of either being created empty by SQLite.
 func quiesce(path string) error {
-	conn, err := sql.Open("sqlite3", fmt.Sprintf("%s?_busy_timeout=%d", path, quiesceBusyTimeoutMS))
+	release, ino, err := dbfile.Hold(path)
 	if err != nil {
 		return err
 	}
+	defer release()
+	db, err := sql.Open("sqlite3", dbfile.NoCreateDSN(path, fmt.Sprintf("_busy_timeout=%d", quiesceBusyTimeoutMS)))
+	if err != nil {
+		return err
+	}
+	defer db.Close()
+	ctx := context.Background()
+	conn, err := db.Conn(ctx)
+	if err != nil {
+		return fmt.Errorf("ops: checkpoint: %w", err)
+	}
 	defer conn.Close()
+	if err := dbfile.Verify(path, ino); err != nil {
+		return err
+	}
 	var busy, logN, ckptN int
-	if err := conn.QueryRow("PRAGMA wal_checkpoint(TRUNCATE)").Scan(&busy, &logN, &ckptN); err != nil {
+	if err := conn.QueryRowContext(ctx, "PRAGMA wal_checkpoint(TRUNCATE)").Scan(&busy, &logN, &ckptN); err != nil {
 		return fmt.Errorf("ops: checkpoint: %w", err)
 	}
 	if busy != 0 {
