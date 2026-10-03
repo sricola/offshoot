@@ -26,6 +26,15 @@ ENV CGO_ENABLED=1
 RUN go build -trimpath -ldflags "-s -w -X main.version=${VERSION}" \
     -o /out/offshoot ./cmd/offshoot
 
+# Update policy for this stage: the base image is pinned by digest and
+# Dependabot (.github/dependabot.yml, docker) bumps that digest weekly;
+# that bump, built and signed by release.yml, is the only path by which
+# OS security updates reach the published image. There is deliberately no
+# `apt-get upgrade` here: an unpinned upgrade would make the image depend
+# on whatever Debian served at build time, so two builds of one tag could
+# differ and the SLSA provenance would name a base digest the image no
+# longer matches. If a base-image CVE needs to ship before Dependabot's
+# next run, bump the digest by hand and cut a release.
 FROM debian:bookworm-slim@sha256:3783cc01769c7b2b1b83a5c5ad96c815348e28ed7da68e2e3687004faa906251 AS runtime
 
 # sqlite3-tools carries sqldiff, which `offshoot diff` shells out to —
