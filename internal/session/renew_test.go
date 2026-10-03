@@ -189,3 +189,67 @@ func TestRenewalEndsWhenBranchDestroyed(t *testing.T) {
 		t.Fatalf("want an error mentioning the branch no longer exists, got: %v", err)
 	}
 }
+
+// TestRenewalKeepsTheLeaseUnderAStrandedDestroyClaim: a destroy killed
+// between its claim and its delete leaves the claim until the janitor
+// finds it 30 s old, longer than a session's lease. The session's renewals
+// leave the claim alone while the lease has more than half its TTL left
+// and then renew over it, so the lease stays live for as long as the claim
+// stands; once the claim is cleared, another writer is still refused and
+// the session is not fenced. (A destroy that is still running is done with
+// the claim well inside the first half of a default 30 s lease.)
+func TestRenewalKeepsTheLeaseUnderAStrandedDestroyClaim(t *testing.T) {
+	testutil.RequireSQLite3(t)
+	w := newWS(t)
+	if err := w.Create("app"); err != nil {
+		t.Fatal(err)
+	}
+	ttl := 3 * time.Second
+	s, err := Open(context.Background(), Options{
+		WS: w, DB: "app", Branch: "main", LeaseTTL: ttl, RenewEvery: ttl / 3,
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer s.Close()
+	var claimed store.Ref
+	for i := 0; ; i++ {
+		ref, etag, err := w.Store.GetRef("app", "main")
+		if err != nil {
+			t.Fatal(err)
+		}
+		ref.Deleting, ref.DeletingAt = true, time.Now().UTC().Format(time.RFC3339Nano)
+		if _, err = w.Store.PutRef("app", "main", ref, etag); err == nil {
+			claimed = ref
+			break
+		}
+		if !errors.Is(err, store.ErrCAS) || i == 20 {
+			t.Fatal(err)
+		}
+	}
+	// Past a whole TTL since the claim, the lease has been live at every
+	// look and a renewal has written over the claim.
+	since := time.Now()
+	waitFor(t, 4*ttl, "a renewal over the claim, a TTL after it landed", func() bool {
+		ref, _, err := w.Store.GetRef("app", "main")
+		if err != nil {
+			t.Fatal(err)
+		}
+		if !ref.Deleting || ref.DeletingAt != claimed.DeletingAt {
+			t.Fatalf("the claim changed under the session: deleting %v at %q", ref.Deleting, ref.DeletingAt)
+		}
+		if !store.LeaseLive(ref, time.Now()) {
+			t.Fatalf("the session's lease lapsed under the claim (expiry %s)", ref.LeaseExpiry)
+		}
+		return ref.LeaseExpiry != claimed.LeaseExpiry && time.Since(since) > ttl
+	})
+	if cleared, err := w.ClearStaleDeleteClaims(time.Now().Add(time.Minute)); err != nil || len(cleared) != 1 {
+		t.Fatalf("ClearStaleDeleteClaims = %v, %v; want app@main cleared", cleared, err)
+	}
+	if _, err := w.AcquireLease("app", "main", "other-writer", ops.DefaultLeaseTTL); !errors.Is(err, store.ErrLeaseHeld) {
+		t.Fatalf("acquire once the stranded claim is cleared: %v, want ErrLeaseHeld", err)
+	}
+	if _, err := s.Flush("", nil); err != nil || s.Err() != nil {
+		t.Fatalf("the session after the claim cleared: flush %v, err %v", err, s.Err())
+	}
+}

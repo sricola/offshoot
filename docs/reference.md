@@ -821,8 +821,13 @@ whether a renewal finds the branch gone or the head write finds the
 destroy's claim; it deletes its own object and leaves the claim alone
 (unless a head write it had already sent may still land, in which case
 it keeps the object and reports that it may have committed). Lease
-renewals, a checkpoint's or a session's, do not write over the claim, so
-they cannot fail the destroy's conditional delete.
+renewals, a checkpoint's or a session's, do not write over the claim
+while the lease has more than half its TTL left (at the default cadence,
+the first that does normally comes 10 s or more after the claim), so
+they do not fail the destroy's conditional delete. Past that, a renewal
+writes over the claim and leaves it set, so a destroy that was killed
+after its claim cannot let the holder's lease lapse before the janitor
+clears the claim (30 s or more after it was made).
 
 **Under copy-on-write, "destroyed" and "reclaimed" are different events.**
 Destroying a branch removes its ref immediately, but if any surviving

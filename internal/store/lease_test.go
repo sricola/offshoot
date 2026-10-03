@@ -504,8 +504,9 @@ func TestAcquireLeaseRefIfChecksTheRefItWrites(t *testing.T) {
 	}
 }
 
-// TestRenewLeaseLeavesAClaimAlone: a renewal of a branch with a destroy or
-// reap claim writes nothing and returns ErrDeleting or ErrReaping, so the
+// TestRenewLeaseLeavesAClaimAlone: a renewal of a branch with a destroy
+// claim, while the lease has more than half its TTL left, or with a reap
+// claim, writes nothing and returns ErrDeleting or ErrReaping, so the
 // claim's etag, which Destroy's conditional delete compares against, does
 // not move. A lease that is no longer ours is still ErrLeaseLost.
 func TestRenewLeaseLeavesAClaimAlone(t *testing.T) {
@@ -546,5 +547,86 @@ func TestRenewLeaseLeavesAClaimAlone(t *testing.T) {
 				t.Fatalf("renewal of a lease that is not ours under a claim: %v, want ErrLeaseLost", err)
 			}
 		})
+	}
+}
+
+// TestRenewLeaseKeepsALiveLeaseUnderADestroyClaim: a destroy claim stops
+// renewals only while the lease has more than half its TTL left. Past
+// that, a renewal writes over the claim, leaving it set, so the lease
+// never lapses under it: a claim a killed destroy stranded stands until
+// ops.ClearStaleDeleteClaims finds it 30 s old, by which time a 30 s lease
+// that no renewal had extended would always have expired, and the first
+// acquirer after the clear would fence the holder. A reap claim still
+// stops every renewal: it lands only on a branch whose lease expired a
+// whole branch TTL ago.
+func TestRenewLeaseKeepsALiveLeaseUnderADestroyClaim(t *testing.T) {
+	s := newStore(t)
+	seedBranch(t, s)
+	ttl := 30 * time.Second
+	t0 := time.Date(2026, 8, 1, 12, 0, 0, 0, time.UTC)
+	l, err := s.AcquireLease("app", "main", "daemon-a", ttl, t0)
+	if err != nil {
+		t.Fatal(err)
+	}
+	ref, etag, err := s.GetRef("app", "main")
+	if err != nil {
+		t.Fatal(err)
+	}
+	claimedAt := t0.Add(time.Second).Format(time.RFC3339Nano)
+	ref.Deleting, ref.DeletingAt = true, claimedAt
+	claimEtag, err := s.PutRef("app", "main", ref, etag)
+	if err != nil {
+		t.Fatal(err)
+	}
+	// 20 s of 30 left: the destroy may still be running, so the renewal
+	// leaves its etag alone.
+	if _, err := s.RenewLease(l, ttl, t0.Add(10*time.Second)); !errors.Is(err, ErrDeleting) {
+		t.Fatalf("renewal with 20 s of a 30 s lease left under a destroy claim: %v, want ErrDeleting", err)
+	}
+	if _, got, err := s.GetRef("app", "main"); err != nil || got != claimEtag {
+		t.Fatalf("a renewal with more than half the lease left moved the claim's etag (%v)", err)
+	}
+	// 10 s left: renewed over the claim, which stays as it was.
+	next, err := s.RenewLease(l, ttl, t0.Add(20*time.Second))
+	if err != nil {
+		t.Fatalf("renewal with 10 s of a 30 s lease left under a destroy claim: %v, want it renewed", err)
+	}
+	want := t0.Add(50 * time.Second)
+	if !next.Expiry.Equal(want) || next.Epoch != l.Epoch || next.Holder != l.Holder {
+		t.Fatalf("renewed lease %+v, want %s's epoch %d until %s", next, l.Holder, l.Epoch, want)
+	}
+	got, _, err := s.GetRef("app", "main")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !got.Deleting || got.DeletingAt != claimedAt || got.LeaseHolder != l.Holder || got.Epoch != l.Epoch ||
+		got.LeaseExpiry != want.Format(time.RFC3339Nano) {
+		t.Fatalf("after a renewal over the claim: deleting %v at %q, holder %q epoch %d until %s; want the claim as it was and the lease until %s",
+			got.Deleting, got.DeletingAt, got.LeaseHolder, got.Epoch, got.LeaseExpiry, want)
+	}
+	if !LeaseLive(got, t0.Add(31*time.Second)) {
+		t.Fatal("the lease is not live when a stranded claim first becomes clearable")
+	}
+
+	// A reap claim stops renewals however little of the lease is left.
+	s = newStore(t)
+	seedBranch(t, s)
+	if l, err = s.AcquireLease("app", "main", "daemon-a", ttl, t0); err != nil {
+		t.Fatal(err)
+	}
+	if ref, etag, err = s.GetRef("app", "main"); err != nil {
+		t.Fatal(err)
+	}
+	ref.Reaping = true
+	if claimEtag, err = s.PutRef("app", "main", ref, etag); err != nil {
+		t.Fatal(err)
+	}
+	for _, at := range []time.Duration{20 * time.Second, time.Hour} {
+		if _, err := s.RenewLease(l, ttl, t0.Add(at)); !errors.Is(err, ErrReaping) {
+			t.Fatalf("renewal %s after the acquire under a reap claim: %v, want ErrReaping", at, err)
+		}
+	}
+	if _, got, err := s.GetRef("app", "main"); err != nil || got != claimEtag {
+		t.Fatalf("a renewal moved the reap claim's etag (%v)", err)
 	}
 }

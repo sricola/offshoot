@@ -69,12 +69,21 @@ Pin an exact version if you depend on format stability. The full contract:
   win, instead of a `--force` the tool does not accept; Go callers test it
   with `errors.Is(err, ops.ErrDetachedCheckout)`. The plugin skill tells
   agents to retry a refusal that names a `checkpoint:` holder.
-- **A lease renewal no longer writes over a destroy or reap claim.** A
-  session's or checkpoint's renewal that lands between `destroy --force`'s
-  claim and its conditional delete used to move the etag that delete
-  compares against, so the destroy failed and unwound; now the renewal is
-  skipped (`store: branch is being deleted`, retried on the next tick, with
-  the lease's two missed renewals of slack) and the destroy goes through.
+- **A lease renewal no longer writes over a reap claim, or over a destroy
+  claim while more than half the lease is left.** A session's or
+  checkpoint's renewal that lands between `destroy --force`'s claim and its
+  conditional delete used to move the etag that delete compares against,
+  so the destroy failed and unwound; now the renewal is skipped (`store:
+  branch is being deleted`, retried on the next tick) and the destroy goes
+  through. At the default cadence the first renewal that writes over the
+  claim normally comes 10 s or more after it, well past a running
+  destroy's quiesce (3 s at most). Once half the lease or less is left,
+  the renewal writes over the claim and leaves it set, so a live lease
+  never lapses under it: a claim stranded by a killed or crashed destroy
+  stands until the janitor finds it 30 s old, and a 30 s lease that no
+  renewal had extended would by then have expired, letting an unforced
+  `destroy` through while the claim stood and the first acquirer after
+  the clear fence the session.
 - **A checkpoint can now fail after it has started, in two new ways, and
   can end without knowing whether it committed.** If its lease ends while
   it runs (a forced repoint, `offshoot lease release`, `destroy --force`,

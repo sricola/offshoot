@@ -244,11 +244,14 @@ var errCheckpointRenewStopped = errors.New("ops: checkpoint lease renewals stopp
 // quiesces, encodes and uploads, the way a session's renewLoop does
 // (internal/session/renew.go): a renewal that finds the lease gone
 // (ErrLeaseLost) or the branch destroyed (ErrNotFound) is terminal and
-// cancels ctx with that error as its cause; any other error, including
-// RenewLease's unretried ErrCAS against a concurrent touch and its refusal
-// to renew over a destroy or reap claim (ErrDeleting, ErrReaping, which
-// leaves the claim's etag for Destroy's conditional delete), is retried on
-// the next tick, since the lease outlives two missed renewals.
+// cancels ctx with that error as its cause; any other error is retried on
+// the next tick, since the lease outlives two missed renewals. That
+// includes RenewLease's unretried ErrCAS against a concurrent touch, and
+// its refusal to renew over a reap claim, or over a destroy claim while
+// more than half the lease is left (ErrReaping, ErrDeleting), which leaves
+// the claim's etag for Destroy's conditional delete; past half the lease,
+// a renewal writes over a destroy claim, so the lease does not lapse under
+// one a killed destroy left (see store.RenewLease).
 type checkpointRenewer struct {
 	ctx    context.Context
 	cancel context.CancelCauseFunc

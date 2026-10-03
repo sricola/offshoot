@@ -306,3 +306,65 @@ func indexOf(xs []string, want string) int {
 	}
 	return -1
 }
+
+// TestRenewingHolderSurvivesAStrandedDestroyClaim: a `destroy --force`
+// killed in its quiesce leaves its claim on a branch a session holds, and
+// ClearStaleDeleteClaims clears it only once it is staleDeletingClaimAfter
+// (30 s) old, longer than the session's 30 s lease. The session's
+// renewals, replayed here on their own clock every TTL/3, write over the
+// claim once the lease is past half its TTL, so the lease is live for the
+// whole time the claim stands: status says active, an unforced destroy is
+// refused, and once the janitor clears the claim another writer is still
+// refused and the holder's next renewal goes through. Skipping every
+// renewal under the claim instead lets the lease lapse 30 s after the last
+// one, and the first acquirer after the clear fences the session.
+func TestRenewingHolderSurvivesAStrandedDestroyClaim(t *testing.T) {
+	w := newWS(t)
+	if err := w.Create("app"); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := w.Fork("app", "main", "work", "", 0, nil); err != nil {
+		t.Fatal(err)
+	}
+	ttl, every := DefaultLeaseTTL, DefaultLeaseTTL/3
+	// The session took the lease 40 s ago; the destroy claimed the branch a
+	// second later and was killed.
+	start := time.Now().Add(-40 * time.Second)
+	l, err := w.Store.AcquireLease("app", "work", "daemon-a", ttl, start)
+	if err != nil {
+		t.Fatal(err)
+	}
+	ref, etag, err := w.Store.GetRef("app", "work")
+	if err != nil {
+		t.Fatal(err)
+	}
+	ref.Deleting, ref.DeletingAt = true, start.Add(time.Second).UTC().Format(time.RFC3339Nano)
+	if _, err := w.Store.PutRef("app", "work", ref, etag); err != nil {
+		t.Fatal(err)
+	}
+	for i := 1; i <= 3; i++ {
+		next, err := w.Store.RenewLease(l, ttl, start.Add(time.Duration(i)*every))
+		switch {
+		case err == nil:
+			l = next
+		case !errors.Is(err, store.ErrDeleting):
+			t.Fatalf("renewal %d under the claim: %v", i, err)
+		}
+	}
+	if state, err := w.BranchState("app", "work"); err != nil || state != "active" {
+		t.Fatalf("branch state under a stranded claim, its holder renewing: %q, %v; want active", state, err)
+	}
+	if err := w.Destroy("app", "work", false); !errors.Is(err, store.ErrLeaseHeld) {
+		t.Fatalf("unforced destroy under a stranded claim, its holder renewing: %v, want a live-lease refusal", err)
+	}
+	cleared, err := w.ClearStaleDeleteClaims(time.Now())
+	if err != nil || len(cleared) != 1 || cleared[0] != "app@work" {
+		t.Fatalf("ClearStaleDeleteClaims = %v, %v; want [app@work]", cleared, err)
+	}
+	if _, err := w.Store.AcquireLease("app", "work", "checkpoint:other/1/0123abcd", ttl, time.Now()); !errors.Is(err, store.ErrLeaseHeld) {
+		t.Fatalf("acquire right after the stale claim was cleared: %v, want ErrLeaseHeld", err)
+	}
+	if _, err := w.Store.RenewLease(l, ttl, time.Now()); err != nil {
+		t.Fatalf("the holder's first renewal after the clear: %v", err)
+	}
+}

@@ -849,12 +849,12 @@ func waitFor(t *testing.T, what string, cond func() bool) {
 }
 
 // destroyForce runs `destroy --force`, retrying when a lease renewal lands
-// between its read and its claim and so wins the claim's compare-and-swap
-// (a renewal no longer writes over a claim once it has landed). The
-// backend must offer the conditional delete (store.ConditionalDeleter), as
-// Local does: through a test wrapper that hides it, Destroy falls back to
-// a plain Delete, which a renewal already past its checks can undo,
-// bringing the branch back still leased.
+// between its read and its claim and so wins the claim's compare-and-swap,
+// or, past half the lease, writes over the claim before the conditional
+// delete (store.RenewLease). The backend must offer the conditional delete
+// (store.ConditionalDeleter), as Local does: through a test wrapper that
+// hides it, Destroy falls back to a plain Delete, which a renewal already
+// past its checks can undo, bringing the branch back still leased.
 func destroyForce(t *testing.T, w *Workspace, db, branch string) {
 	t.Helper()
 	if _, ok := w.Store.B.(store.ConditionalDeleter); !ok {
