@@ -104,7 +104,7 @@ func TestOpBranchesReportsErrorForFencedSession(t *testing.T) {
 	}
 
 	srv.mu.Lock()
-	srv.sessions[key("app", "main")] = sess
+	srv.sessions[key("app", "main")] = &slot{sess: sess}
 	srv.mu.Unlock()
 
 	resp := call(t, sock, Request{Op: "branches", DB: "app"})
