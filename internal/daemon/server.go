@@ -5,6 +5,8 @@ package daemon
 
 import (
 	"context"
+	"crypto/rand"
+	"encoding/hex"
 	"encoding/json"
 	"errors"
 	"fmt"
@@ -30,13 +32,17 @@ type Server struct {
 	sock string
 
 	mu sync.Mutex
-	// sessions maps "db@branch" to its Session. While an open is in
-	// progress the key is present with a nil value: a reservation that
-	// claims the slot before the (slow, unlocked) session.Open call runs,
-	// so no concurrent request can observe the key as free and start a
-	// second Open for the same branch. See opOpen's comment for why this
-	// replaces a check-then-open-then-recheck pattern.
-	sessions map[string]*session.Session
+	// sessions maps "db@branch" to its slot. A slot is reserved while an
+	// open is in flight (no session yet: it claims the key before the slow,
+	// unlocked session.Open runs, so no concurrent request can observe the
+	// key as free and start a second Open for the same branch — see opOpen),
+	// open once it holds the session, and closing from the moment closeSlot
+	// takes it over until that session's Close has returned. The closing
+	// state keeps the branch claimed through the whole close. Freeing the
+	// key any earlier let an open take the lease the closing session still
+	// held — same holder, so AcquireLease renewed it in place under the same
+	// epoch — and then lose it to that session's release.
+	sessions map[string]*slot
 	closing  bool
 	// flushEvery is passed as Options.FlushEvery to every session opOpen
 	// opens, so every session this daemon serves gets the same background-
@@ -76,10 +82,21 @@ type Server struct {
 	// moment a slot is reserved, Done() happens once that call's bookkeeping
 	// has fully resolved (map updated and, if it self-closed, the session
 	// actually closed). Shutdown sets closing and waits on openWG before it
-	// ever reads or drains the sessions map, so it can never observe (or
-	// wipe) a reservation that a still-running opOpen believes it owns. See
-	// opOpen and Shutdown.
+	// ever reads or marks the sessions map, so it can never observe (or
+	// pass over) a reservation that a still-running opOpen believes it owns. See
+	// opOpen and Shutdown. An opOpen waiting on a closing slot is not
+	// counted until it reserves one: the wait happens before the
+	// reservation, and the closing check that guards every Add runs again
+	// after it.
 	openWG sync.WaitGroup
+	// shutdownDone is closed, and shutdownErr set just before, when the
+	// one Shutdown that set closing returns, on every return path. A second
+	// Shutdown and WaitShutdown wait on it. The shutdown op runs Shutdown on
+	// a goroutine of its own, and serve's Serve returns as soon as the
+	// listener closes; without this, the process could exit while sessions
+	// were still closing and their leases were still held.
+	shutdownDone chan struct{}
+	shutdownErr  error
 
 	connMu sync.Mutex
 	conns  map[net.Conn]struct{} // live accepted connections; Shutdown closes them all
@@ -101,7 +118,8 @@ type Server struct {
 	// events is this daemon's in-memory event bus (Milestone 4 Task 4a) —
 	// always non-nil once NewServer returns. Fed from the session
 	// transition callback (wireEvents, composed alongside metrics'
-	// observer) and the janitor (janitorTick's "reaped" publish); drained
+	// observer), the janitor (janitorTick's "reaped" publish) and the
+	// daemon's own closes (sessionClosedEvent's session_closed); drained
 	// by the unix socket "subscribe" op (streamEvents) and HTTP `GET
 	// /events` (handleEvents). See events.go.
 	events *eventBus
@@ -144,6 +162,97 @@ const DefaultFDBudget = 64
 
 func key(db, branch string) string { return db + "@" + branch }
 
+// slot is what s.sessions holds for one db@branch. sess is nil while an
+// open is in flight (reserved). id is the session id opOpen minted for
+// sess (newSessionID) and returned to its client; opClose compares a
+// close's Request.SessionID against it. done is non-nil only on a closing
+// marker: closeSlot closes it, under s.mu, after recording err and
+// deleting the key, so a waiter that sees done closed knows this daemon has
+// let go of the branch. err is written before done closes and read only
+// after.
+type slot struct {
+	sess *session.Session
+	id   string
+	done chan struct{}
+	err  error
+}
+
+func (sl *slot) isReserved() bool { return sl.sess == nil }
+func (sl *slot) isClosing() bool  { return sl.done != nil }
+func (sl *slot) isOpen() bool     { return sl.sess != nil && sl.done == nil }
+
+// markClosingLocked replaces k's open slot with a closing marker holding
+// the same session and a fresh done, and returns the marker. The caller
+// holds s.mu and has checked sl.isOpen(). Every daemon close takes this
+// step first (opClose, Shutdown), so from here until closeSlot frees the
+// key, nothing in this daemon can treat the branch as free.
+func (s *Server) markClosingLocked(k string, sl *slot) *slot {
+	m := &slot{sess: sl.sess, id: sl.id, done: make(chan struct{})}
+	s.sessions[k] = m
+	return m
+}
+
+// closeSlot closes marker m's session with s.mu released — Close is slow,
+// and never takes s.mu, so nothing here can deadlock against it — then, in
+// one s.mu section run from a defer so it happens however Close ends,
+// records the result, deletes k only if it still holds m, publishes
+// session_closed and closes m.done. Waiters (opOpen, a duplicate opClose,
+// Shutdown) wait on done, never while holding s.mu.
+func (s *Server) closeSlot(k string, m *slot) (err error) {
+	defer func() {
+		ev := sessionClosedEvent(m.sess, err) // takes the session's lock, so before s.mu
+		s.mu.Lock()
+		m.err = err
+		if s.sessions[k] == m {
+			delete(s.sessions, k)
+		}
+		// Published after the key is free, so a client acting on it is not
+		// refused as closing, and before done closes and s.mu is released,
+		// so it reaches subscribers ahead of anything a waiter or a fresh
+		// open of k does next. Published after the unlock, a reopen could
+		// reserve k and publish its session_opened first, and a subscriber
+		// tracking the branch from the stream would then mark the new
+		// session closed. publish never blocks, and the bus's lock is a
+		// leaf: nothing holding it takes s.mu.
+		s.events.publish(ev)
+		close(m.done)
+		s.mu.Unlock()
+	}()
+	return m.sess.Close()
+}
+
+// closeWaitBudget bounds how long an open, or a duplicate close, waits for
+// a close in progress on the same branch. It has its own rationale and is
+// deliberately shorter than a slow but healthy close: Close can wait on
+// flushMu behind an in-flight flush (a drain of up to 30 s, then ref
+// retries of up to a lease TTL), and then runs its own drain, the engine's
+// shutdown, a full-file hash, the sidecar stamp, the shadow refresh and the
+// release. The timeout error says retry. 15 s plus a typical open stays well
+// inside HTTP's 90 s WriteTimeout, which has to cover the wait and
+// session.Open together. A var so tests can shrink it.
+var closeWaitBudget = 15 * time.Second
+
+// waitClosed waits for done until deadline and reports whether it closed
+// first. Never call it holding s.mu: closeSlot needs s.mu to close done.
+// A done that has already closed wins even when the deadline has passed
+// too, which a bare select would decide at random: the close is over, so
+// there is nothing left to time out on.
+func waitClosed(done <-chan struct{}, deadline time.Time) bool {
+	select {
+	case <-done:
+		return true
+	default:
+	}
+	t := time.NewTimer(time.Until(deadline))
+	defer t.Stop()
+	select {
+	case <-done:
+		return true
+	case <-t.C:
+		return false
+	}
+}
+
 func NewServer(ws *ops.Workspace, socketPath string) (*Server, error) {
 	if err := os.Remove(socketPath); err != nil && !os.IsNotExist(err) {
 		return nil, err
@@ -173,12 +282,13 @@ func NewServer(ws *ops.Workspace, socketPath string) (*Server, error) {
 		return nil, err
 	}
 	srv := &Server{ws: ws, ln: ln, sock: socketPath,
-		sessions:    map[string]*session.Session{},
-		conns:       map[net.Conn]struct{}{},
-		janitorStop: make(chan struct{}),
-		metrics:     newMetrics(),
-		events:      newEventBus(),
-		fdBudget:    DefaultFDBudget,
+		sessions:     map[string]*slot{},
+		conns:        map[net.Conn]struct{}{},
+		janitorStop:  make(chan struct{}),
+		shutdownDone: make(chan struct{}),
+		metrics:      newMetrics(),
+		events:       newEventBus(),
+		fdBudget:     DefaultFDBudget,
 	}
 	// Wired here, at construction, before Serve can ever accept a
 	// connection or StartJanitor can ever tick — see wireHooks/OnTransition/
@@ -434,14 +544,31 @@ func errResp(err error) Response { return Response{Error: err.Error()} }
 // internal/store/lease.go), so the second Open's AcquireLease call can
 // succeed too instead of failing fast.
 //
-// This function avoids the race by reserving the map slot (writing a nil
-// value under s.mu) before releasing the lock and calling session.Open. A
-// concurrent opOpen for the same key then sees the key already present and
-// is refused immediately, with no second session.Open ever starting for
-// that branch. The lock is not held across session.Open itself (which does
-// real I/O — materializing a checkout — and can be slow), so unrelated keys'
-// opens/flushes/status/close calls are not blocked while one open is in
-// flight.
+// This function avoids the race by reserving the map slot (writing a
+// reserved slot under s.mu) before releasing the lock and calling
+// session.Open. A concurrent opOpen for the same key then sees the key
+// already present and is refused immediately, with no second session.Open
+// ever starting for that branch. The lock is not held across session.Open
+// itself (which does real I/O — materializing a checkout — and can be
+// slow), so unrelated keys' opens/flushes/status/close calls are not
+// blocked while one open is in flight.
+//
+// A close in progress keeps the slot too: closeSlot holds it, as a closing
+// marker, until the session's Close has released its lease. An open here
+// then waits on the marker's done and retries the reservation from the
+// top. It waits rather than refuses because the callers that reach this —
+// two clients on one branch, a client killed mid-close that reconnects, a
+// supervisor reopening whatever status stopped listing — want the reopen
+// to succeed. One deadline, closeWaitBudget from entry, bounds every wait
+// the loop makes; past it the open fails with "still closing; retry". The
+// wait never holds s.mu, re-checks s.closing after done fires, and is not
+// counted in s.openWG until it reserves, so Shutdown's invariant that no
+// reservation is made after closing is set still holds.
+//
+// dispatch passes no request context, so an open whose client has gone
+// away still opens a session nobody receives. That was already true of a
+// slow session.Open; the wait widens the window by at most
+// closeWaitBudget. Recorded, not fixed.
 //
 // This same reservation is also what Shutdown must not clobber. opOpen
 // checks s.closing (under s.mu) before it reserves anything, so once
@@ -457,16 +584,33 @@ func (s *Server) opOpen(req Request) Response {
 	}
 	k := key(req.DB, branch)
 
+	deadline := time.Now().Add(closeWaitBudget)
+
 	s.mu.Lock()
-	if s.closing {
+	for {
+		if s.closing {
+			s.mu.Unlock()
+			return errResp(fmt.Errorf("daemon: shutting down"))
+		}
+		sl, exists := s.sessions[k]
+		if !exists {
+			break
+		}
+		if !sl.isClosing() {
+			s.mu.Unlock()
+			return errResp(fmt.Errorf("daemon: %s is already open here", k))
+		}
+		done := sl.done
 		s.mu.Unlock()
-		return errResp(fmt.Errorf("daemon: shutting down"))
+		if closeWaitEntered != nil {
+			closeWaitEntered(k, deadline) // test hook; nil (a no-op) in production
+		}
+		if !waitClosed(done, deadline) {
+			return errResp(fmt.Errorf("daemon: %s is still closing; retry", k))
+		}
+		s.mu.Lock()
 	}
-	if _, exists := s.sessions[k]; exists {
-		s.mu.Unlock()
-		return errResp(fmt.Errorf("daemon: %s is already open here", k))
-	}
-	s.sessions[k] = nil // reserve the slot
+	s.sessions[k] = &slot{} // reserve the slot
 	s.openWG.Add(1)
 	flushEvery := s.flushEvery
 	snapshotEvery := s.snapshotEvery
@@ -491,21 +635,36 @@ func (s *Server) opOpen(req Request) Response {
 	if s.closing {
 		// Shutdown started while this open was in flight and is, right now,
 		// blocked on s.openWG waiting for exactly this call to resolve
-		// before it drains the map. Don't leave the newly-acquired lease
+		// before it marks the map's slots. Don't leave the newly-acquired lease
 		// orphaned: self-close, and only mark this open done (openWG.Done)
 		// once that close has actually completed, so Shutdown cannot return
 		// — and cannot decide there is nothing left to close — until the
 		// lease this open just took is released.
 		delete(s.sessions, k)
 		s.mu.Unlock()
-		sess.Close()
+		cerr := sess.Close()
+		s.events.publish(sessionClosedEvent(sess, cerr))
 		s.openWG.Done()
 		return errResp(fmt.Errorf("daemon: shutting down"))
 	}
-	s.sessions[k] = sess
+	sl := &slot{sess: sess, id: newSessionID()}
+	s.sessions[k] = sl
 	s.openWG.Done()
 	s.mu.Unlock()
-	return Response{OK: true, Checkout: sess.CheckoutPath()}
+	return Response{OK: true, Checkout: sess.CheckoutPath(), SessionID: sl.id}
+}
+
+// newSessionID mints the id opOpen returns for a session and a close
+// sends back to name it: 128 random bits, so no two sessions share one, in
+// this daemon or any other. The session's lease cannot name it. Daemon
+// sessions share one holder, so a reopen after a close whose release failed
+// renews that lease in place and keeps its epoch. And rollback, promote and
+// compact restart a branch's epoch, as does destroying it and creating it
+// again, so the next open gets an epoch an earlier session already had.
+func newSessionID() string {
+	var b [16]byte
+	rand.Read(b[:]) // never returns an error: it crashes the program instead
+	return hex.EncodeToString(b[:])
 }
 
 // openDelay, when non-nil, is invoked by opOpen after it reserves a slot and
@@ -515,20 +674,31 @@ func (s *Server) opOpen(req Request) Response {
 // (the default) is a no-op and imposes no cost in production.
 var openDelay func()
 
+// closeWaitEntered, when non-nil, is called by opOpen, opClose and Shutdown
+// as each starts waiting on a closing slot, with that wait's deadline
+// (Shutdown passes its ctx's, or the zero time). Tests use it to know a
+// waiter is parked before they let the close finish. Nil in production.
+var closeWaitEntered func(key string, deadline time.Time)
+
 // lookup returns the live session for db@branch, or an error if it is not
-// open (including if an open is still in flight — a reserved-but-nil slot
-// counts as not yet open).
+// open (including if an open is still in flight — a reserved slot counts as
+// not yet open), and a closing one is refused as closing: its Close has
+// set closed, or is about to, so a flush would fail with session.ErrClosed
+// anyway.
 func (s *Server) lookup(db, branch string) (*session.Session, error) {
 	if branch == "" {
 		branch = "main"
 	}
 	s.mu.Lock()
 	defer s.mu.Unlock()
-	sess, ok := s.sessions[key(db, branch)]
-	if !ok || sess == nil {
+	sl, ok := s.sessions[key(db, branch)]
+	switch {
+	case !ok || sl.isReserved():
 		return nil, fmt.Errorf("daemon: %s is not open", key(db, branch))
+	case sl.isClosing():
+		return nil, fmt.Errorf("daemon: %s is closing", key(db, branch))
 	}
-	return sess, nil
+	return sl.sess, nil
 }
 
 // opFlush ships the session's current state, optionally as a named
@@ -573,32 +743,46 @@ func (s *Server) opFlush(req Request) Response {
 // staleness any status endpoint already has the instant its answer is sent
 // over the wire — not a new correctness gap this introduces.
 //
+// A session that is closing is listed with state closing until its Close
+// returns. Status used to drop it the moment the close started, which told
+// a supervisor the branch was free while its lease was still held.
+//
 // The response also carries dbfile_descriptors, the
 // offshoot_dbfile_descriptors gauge read at the same moment, so a client
 // without a metrics scrape can watch the descriptor count -fd-budget bounds.
 func (s *Server) opStatus() Response {
+	type listed struct {
+		sess    *session.Session
+		closing bool
+	}
 	s.mu.Lock()
 	keys := make([]string, 0, len(s.sessions))
-	for k, sess := range s.sessions {
-		if sess == nil {
+	for k, sl := range s.sessions {
+		if sl.isReserved() {
 			continue // open still in flight; nothing to report yet
 		}
 		keys = append(keys, k)
 	}
 	sort.Strings(keys)
-	sessList := make([]*session.Session, 0, len(keys))
+	list := make([]listed, 0, len(keys))
 	for _, k := range keys {
-		sessList = append(sessList, s.sessions[k])
+		sl := s.sessions[k]
+		list = append(list, listed{sl.sess, sl.isClosing()})
 	}
 	s.mu.Unlock()
 
-	infos := make([]SessionInfo, 0, len(sessList))
-	for _, sess := range sessList {
+	infos := make([]SessionInfo, 0, len(list))
+	for _, l := range list {
+		sess := l.sess
 		info := SessionInfo{
 			DB: sess.DB(), Branch: sess.Branch(), Checkout: sess.CheckoutPath(),
 			Holder: sess.Lease().Holder, Epoch: sess.Lease().Epoch,
+			State:       SessionStateOpen,
 			DurableTXID: sess.DurableTXID(),
 			CaptureLag:  sess.CaptureLag(),
+		}
+		if l.closing {
+			info.State = SessionStateClosing
 		}
 		if t, _, ok := sess.LastFlush(); ok {
 			info.LastFlushAt = t.Format(time.RFC3339)
@@ -616,21 +800,34 @@ func (s *Server) opStatus() Response {
 	return Response{OK: true, Sessions: infos, DBFileDescriptors: &n}
 }
 
-// sessionCount returns the number of FULLY OPEN sessions (a reserved-but-
-// nil in-flight-open slot does not count, matching opStatus's own
-// treatment) — backs GET /healthz's `sessions` field.
+// sessionCount returns the number of OPEN sessions: a reserved slot (open in
+// flight) and a closing one do not count — backs GET /healthz's `sessions`
+// field.
 func (s *Server) sessionCount() int {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	n := 0
-	for _, sess := range s.sessions {
-		if sess != nil {
+	for _, sl := range s.sessions {
+		if sl.isOpen() {
 			n++
 		}
 	}
 	return n
 }
 
+// opClose closes db@branch's session through closeSlot, so the branch stays
+// claimed, as a closing marker, until Close has released its lease. A close
+// of a branch that is already closing waits for that close, under the same
+// closeWaitBudget as an open, and returns its result.
+//
+// A close that carries req.SessionID acts only on that session, open or
+// closing; any other slot, or none, answers "session <id> on <k> is not
+// open" at once. Without it, a close retried after its session had finished
+// closing (a client that gave up waiting for the answer, or whose close
+// returned a failed release) closed whatever session had been opened on the
+// branch since, and that session's writes since its last flush were never
+// shipped. A close with no session id, from an older client or the CLI,
+// still closes whatever session is open on the branch.
 func (s *Server) opClose(req Request) Response {
 	branch := req.Branch
 	if branch == "" {
@@ -638,15 +835,35 @@ func (s *Server) opClose(req Request) Response {
 	}
 	k := key(req.DB, branch)
 	s.mu.Lock()
-	sess, ok := s.sessions[k]
-	if ok && sess != nil {
-		delete(s.sessions, k)
-	}
-	s.mu.Unlock()
-	if !ok || sess == nil {
+	sl, ok := s.sessions[k]
+	if !ok || sl.isReserved() || (req.SessionID != "" && sl.id != req.SessionID) {
+		s.mu.Unlock()
+		if req.SessionID != "" {
+			return errResp(fmt.Errorf("daemon: session %s on %s is not open", req.SessionID, k))
+		}
 		return errResp(fmt.Errorf("daemon: %s is not open", k))
 	}
-	if err := sess.Close(); err != nil {
+	if sl.isClosing() {
+		s.mu.Unlock()
+		// A duplicate or retried close (a client killed mid-close that
+		// reconnects, or two clients on one branch) waits for the close in
+		// progress and answers with its result, rather than "not open"
+		// while the lease is still held.
+		deadline := time.Now().Add(closeWaitBudget)
+		if closeWaitEntered != nil {
+			closeWaitEntered(k, deadline) // test hook; nil (a no-op) in production
+		}
+		if !waitClosed(sl.done, deadline) {
+			return errResp(fmt.Errorf("daemon: %s is still closing; retry", k))
+		}
+		if sl.err != nil {
+			return errResp(sl.err)
+		}
+		return Response{OK: true}
+	}
+	m := s.markClosingLocked(k, sl)
+	s.mu.Unlock()
+	if err := s.closeSlot(k, m); err != nil {
 		return errResp(err)
 	}
 	return Response{OK: true}
@@ -659,7 +876,7 @@ type sessionState int
 const (
 	// sessionAbsent: no entry — nothing here has any claim on this branch.
 	sessionAbsent sessionState = iota
-	// sessionReserved: the key is present but the value is nil — opOpen has
+	// sessionReserved: the key holds a slot with no session yet — opOpen has
 	// reserved the slot and is still inside its (slow, unlocked)
 	// session.Open call materializing the checkout. There is no live
 	// *session.Session to hand out yet, but the branch is very much
@@ -668,10 +885,24 @@ const (
 	sessionReserved
 	// sessionOpen: a live session is open here.
 	sessionOpen
+	// sessionClosing: closeSlot has taken the session over and its Close
+	// has not returned. Capture is stopping or has stopped, but the lease
+	// is still held and renewed until the release, and the checkout is
+	// still the old engine's. Nothing that would touch the branch may run; the close
+	// ends on its own, so every refusal says to retry rather than to close
+	// the session.
+	sessionClosing
 )
 
-// lookupSessionState returns the current sessionState for db@branch and, iff
-// that state is sessionOpen, the live *session.Session (nil otherwise). It
+// errClosing is the refusal for an op that needs db@branch while its
+// session is closing. It names a wait, not an action: the close releases
+// the branch within seconds.
+func errClosing(k string) error {
+	return fmt.Errorf("daemon: %s is closing; retry when the close finishes", k)
+}
+
+// lookupSessionState returns the current sessionState for db@branch and,
+// for sessionOpen and sessionClosing, the session (nil otherwise). It
 // does not default branch to "main" — callers that want that default apply
 // it themselves before calling, exactly as opOpen/lookup/opClose already do;
 // opPromote deliberately does NOT default its target, so it must not be
@@ -679,14 +910,17 @@ const (
 func (s *Server) lookupSessionState(db, branch string) (sessionState, *session.Session) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
-	sess, ok := s.sessions[key(db, branch)]
+	sl, ok := s.sessions[key(db, branch)]
 	if !ok {
 		return sessionAbsent, nil
 	}
-	if sess == nil {
+	if sl.isReserved() {
 		return sessionReserved, nil
 	}
-	return sessionOpen, sess
+	if sl.isClosing() {
+		return sessionClosing, sl.sess
+	}
+	return sessionOpen, sl.sess
 }
 
 // branchState computes db@branch's full state for opBranches: this is the
@@ -694,21 +928,25 @@ func (s *Server) lookupSessionState(db, branch string) (sessionState, *session.S
 // computes everything derivable from ref+sidecar alone (active/dirty/
 // detached/idle); only a daemon knows its own in-memory session map, so
 // only a daemon can additionally say "pending" (a slot is reserved, mid-
-// Open) or "error" (an open session's Err() has gone non-nil). ref is the
-// caller's already-fetched GetRef (opBranches always has one in hand) so
-// this never issues a second store read of its own.
+// Open), "closing" (a close is in progress: the slot is still claimed and
+// the lease still held until the release) or "error" (an open session's
+// Err() has gone non-nil). ref is the caller's already-fetched GetRef
+// (opBranches always has one in hand) so this never issues a second store
+// read of its own.
 //
-// Precedence: error and pending are session-derived and, when either
-// applies, win outright over whatever ops.BranchStateAt would have said —
-// see BranchStateAt's doc comment for the full six-state precedence list.
-// The two can never both apply to the SAME db@branch at once: s.sessions
-// holds at most one entry per key, either a nil (reserved) or non-nil
-// (open) value, never both — so this is a simple switch, not a priority
-// comparison between the two. An OPEN, HEALTHY session needs no daemon-side
+// Precedence: closing, error and pending are session-derived and, when one
+// applies, wins outright over whatever ops.BranchStateAt would have said —
+// see BranchStateAt's doc comment for the full precedence list. A fenced
+// session that is being closed matches both closing and error; closing wins
+// because it is the more actionable answer (wait, then reopen). Pending
+// never applies together with either: s.sessions holds one slot per key,
+// reserved, open or closing. An OPEN, HEALTHY session needs no daemon-side
 // casing at all: its own live lease is exactly what already makes
 // ops.BranchStateAt itself report "active".
 func (s *Server) branchState(db, branch string, ref store.Ref) string {
 	switch state, sess := s.lookupSessionState(db, branch); state {
+	case sessionClosing:
+		return "closing"
 	case sessionOpen:
 		if sess.Err() != nil {
 			return "error"
@@ -727,8 +965,15 @@ func (s *Server) branchState(db, branch string, ref store.Ref) string {
 // reservation as "not open" here would let a rollback/promote/checkout race
 // session.Open's unlocked materialize step and corrupt the same on-disk
 // file two ways at once (see lookupSessionState's sessionReserved case).
+// A closing session is refused too, with errClosing: its engine may still
+// be folding the WAL on the checkout, and its lease is held until the
+// release. Telling the caller to close it would be wrong; the close is
+// already running.
 func (s *Server) refuseIfClaimed(db, branch string) error {
-	if st, _ := s.lookupSessionState(db, branch); st != sessionAbsent {
+	switch st, _ := s.lookupSessionState(db, branch); st {
+	case sessionClosing:
+		return errClosing(key(db, branch))
+	case sessionReserved, sessionOpen:
 		return fmt.Errorf("daemon: %s is open here; close the session first", key(db, branch))
 	}
 	return nil
@@ -740,8 +985,11 @@ func (s *Server) refuseIfClaimed(db, branch string) error {
 // to flush, and proceeding at-rest would race that in-flight session.Open
 // the same way refuseIfClaimed's callers must not), it refuses with the
 // same "close the session first"-class error rather than silently falling
-// through to an at-rest fork/promote. If absent, it does nothing and the
-// caller proceeds at-rest.
+// through to an at-rest fork/promote. A closing source is refused the same
+// way, with errClosing: Close does not flush, and a flush may still be
+// queued on flushMu ahead of it, so proceeding at rest could miss writes
+// the session captured. If absent, it does nothing and the caller proceeds
+// at-rest.
 func (s *Server) flushIfOpen(db, branch, opName string) error {
 	switch st, sess := s.lookupSessionState(db, branch); st {
 	case sessionOpen:
@@ -750,6 +998,8 @@ func (s *Server) flushIfOpen(db, branch, opName string) error {
 		}
 	case sessionReserved:
 		return fmt.Errorf("daemon: %s is open here; close the session first", key(db, branch))
+	case sessionClosing:
+		return errClosing(key(db, branch))
 	}
 	return nil
 }
@@ -1215,10 +1465,12 @@ func (s *Server) opDiff(req Request) Response {
 	return Response{OK: true, Diff: res}
 }
 
-// Shutdown stops the janitor, stops accepting, refuses any further opens,
-// waits out every open already in flight, closes every live session (so no
-// lease is orphaned) and every live connection (so no handle goroutine
-// outlives it), and removes the socket. It is safe to call twice.
+// Shutdown stops the janitor, stops accepting and removes the socket,
+// refuses any further opens, waits out every open already in flight, closes
+// every live session and waits out every close already running (so no
+// lease is orphaned), and closes every live connection (so no handle
+// goroutine outlives it). A second call waits for the first, bounded by its
+// own ctx, and returns the first call's result.
 //
 // Ordering here is load-bearing:
 //
@@ -1248,21 +1500,64 @@ func (s *Server) opDiff(req Request) Response {
 //     finished before closing was set, or observed closing not yet set) or a
 //     fully released reservation (open failed, or it observed closing set
 //     and self-closed the session it had just opened) — so the map, once
-//     locked again, contains exactly what Shutdown must close and nothing an
-//     in-flight open could still be about to touch. Without this wait,
-//     draining the map here could delete another goroutine's in-flight nil
-//     reservation out from under it, and a second opOpen for the same branch
-//     could then reuse the now-free key and start a second, concurrent
-//     session.Open against the same checkout file.
+//     locked again, contains exactly what Shutdown must close or wait on
+//     and nothing an in-flight open could still be about to touch. Without this wait,
+//     marking the map's slots here would pass over an in-flight
+//     reservation, and Shutdown could return while that open was still
+//     taking its lease, or self-closing the session it had just opened,
+//     with nothing waiting for the release.
+//  4. Under s.mu, Shutdown turns every open slot into a closing marker
+//     (markClosingLocked, the step opClose takes) and collects the marker of
+//     every closing slot, including closes opClose started before closing
+//     was set, which the old drain never saw because their keys were
+//     already gone. With s.mu released, it closes the sessions it marked
+//     (closeSlot, one at a time) and waits on every marker's done, bounded
+//     by ctx. It never calls Close on a slot that is already closing:
+//     Session.Close returns nil at once the second time, so that would wait
+//     for nothing. A concurrent opClose of a slot Shutdown is closing waits
+//     on the same done.
+//  5. Shutdown records its result and closes shutdownDone on every return
+//     path (Shutdown wraps shutdown for that). serve waits on it through
+//     WaitShutdown when the shutdown op ends Serve, and a second Shutdown
+//     (a signal racing the op) waits on it too, so the process exits only
+//     after every lease is released.
 func (s *Server) Shutdown(ctx context.Context) error {
 	s.mu.Lock()
 	if s.closing {
 		s.mu.Unlock()
-		return nil
+		return s.WaitShutdown(ctx)
 	}
 	s.closing = true
 	s.mu.Unlock()
 
+	err := s.shutdown(ctx)
+	s.shutdownErr = err
+	close(s.shutdownDone)
+	return err
+}
+
+// WaitShutdown blocks until the Shutdown that set closing has returned, or
+// ctx ends, and returns that Shutdown's result. serve calls it when Serve
+// returns nil, which happens only once a Shutdown has begun (the shutdown
+// op, over the socket or HTTP), so the process exits only after that
+// Shutdown has closed every session and released its lease.
+func (s *Server) WaitShutdown(ctx context.Context) error {
+	select {
+	case <-s.shutdownDone:
+		return s.shutdownErr
+	case <-ctx.Done():
+		return fmt.Errorf("daemon: shutdown: timed out waiting for shutdown to finish: %w", ctx.Err())
+	}
+}
+
+// closeWait pairs a closing marker with its key, for Shutdown.
+type closeWait struct {
+	key string
+	m   *slot
+}
+
+// shutdown is Shutdown's body once closing is set; see Shutdown's doc.
+func (s *Server) shutdown(ctx context.Context) error {
 	// Signal the janitor to stop now — cheap and non-blocking, so it starts
 	// winding down immediately. The actual wait for it to finish (which can
 	// block for as long as its in-flight Reap/GC cycle takes) happens below,
@@ -1273,6 +1568,10 @@ func (s *Server) Shutdown(ctx context.Context) error {
 	// sequence that follows.
 	close(s.janitorStop)
 
+	// Closing the listener also removes the socket file: a UnixListener from
+	// net.Listen unlinks its path on Close. This is the only place Shutdown
+	// removes it, before any session starts closing; see the end of this
+	// function for why it must not be removed again later.
 	s.ln.Close()
 
 	// Close every live connection so a handle goroutine blocked in Decode
@@ -1323,8 +1622,8 @@ func (s *Server) Shutdown(ctx context.Context) error {
 	select {
 	case <-janitorWait:
 	case <-ctx.Done():
-		// Note: closing stays true, so a later call to Shutdown will no-op
-		// rather than retry a stop that never completed.
+		// Note: closing stays true, so a later call to Shutdown returns this
+		// same error rather than retry a stop that never completed.
 		return fmt.Errorf("daemon: shutdown: timed out waiting for the janitor: %w", ctx.Err())
 	}
 
@@ -1336,43 +1635,62 @@ func (s *Server) Shutdown(ctx context.Context) error {
 	select {
 	case <-openWait:
 	case <-ctx.Done():
-		// Note: closing stays true, so a later call to Shutdown will no-op
-		// (see the check above) rather than retry the drain that never ran.
-		// A caller that times out here should treat the daemon as stuck, not
-		// cleanly stopped.
+		// Note: closing stays true, so a later call to Shutdown returns this
+		// same error rather than retry the closes that never ran. A caller
+		// that times out here should treat the daemon as stuck, not cleanly
+		// stopped.
 		return fmt.Errorf("daemon: shutdown: timed out waiting for in-flight opens: %w", ctx.Err())
 	}
 
 	s.mu.Lock()
-	sessions := make([]*session.Session, 0, len(s.sessions))
-	for k, sess := range s.sessions {
-		if sess != nil {
-			sessions = append(sessions, sess)
+	var waits, mine []closeWait
+	for k, sl := range s.sessions {
+		switch {
+		case sl.isClosing():
+			waits = append(waits, closeWait{k, sl})
+		case sl.isOpen():
+			m := s.markClosingLocked(k, sl)
+			waits = append(waits, closeWait{k, m})
+			mine = append(mine, closeWait{k, m})
 		}
-		delete(s.sessions, k)
+		// No reserved slot can be left here: closing was set before the
+		// openWG wait above, and every reservation made before it resolved.
 	}
 	s.mu.Unlock()
 
-	closeDone := make(chan error, 1)
 	go func() {
-		var firstErr error
-		for _, sess := range sessions {
-			if err := sess.Close(); err != nil && firstErr == nil {
-				firstErr = err
-			}
+		for _, c := range mine {
+			s.closeSlot(c.key, c.m) // its result lands in c.m.err
 		}
-		closeDone <- firstErr
 	}()
 
-	var firstErr error
+	allClosed := make(chan struct{})
+	go func() {
+		defer close(allClosed)
+		dl, _ := ctx.Deadline()
+		for _, c := range waits {
+			if closeWaitEntered != nil {
+				closeWaitEntered(c.key, dl) // test hook; nil (a no-op) in production
+			}
+			<-c.m.done
+		}
+	}()
 	select {
-	case firstErr = <-closeDone:
+	case <-allClosed:
 	case <-ctx.Done():
 		return fmt.Errorf("daemon: shutdown: timed out closing sessions: %w", ctx.Err())
 	}
 
-	if err := os.Remove(s.sock); err != nil && !os.IsNotExist(err) && firstErr == nil {
-		firstErr = err
+	var firstErr error
+	for _, c := range waits {
+		if c.m.err != nil && firstErr == nil {
+			firstErr = c.m.err
+		}
 	}
+	// No os.Remove(s.sock) here: closing the listener removed it already.
+	// The shutdown op is acknowledged before this runs, so the socket path
+	// may by now belong to the next `serve` an operator started on it while
+	// these sessions were closing, and removing it would leave that daemon
+	// running with no way to reach it.
 	return firstErr
 }

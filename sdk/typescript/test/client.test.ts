@@ -375,6 +375,20 @@ test("daemonStatus: dbfile_descriptors is passed through when present", async ()
   assert.equal(st.dbfile_descriptors, 0);
 });
 
+test("status: session state is passed through, and absent from an older daemon", async () => {
+  const client = Object.create(Client.prototype) as Client;
+  (client as unknown as { _call: Client["_call"] })._call = async () => ({
+    ok: true,
+    sessions: [
+      { db: "app", branch: "main", checkout: "/c", holder: "h/1", epoch: 2, durable_txid: 1, state: "closing" },
+      { db: "app", branch: "b", checkout: "/d", holder: "h/1", epoch: 1, durable_txid: 1 },
+    ],
+  });
+  const sessions = await client.status();
+  assert.equal(sessions[0].state, "closing");
+  assert.equal(sessions[1].state, undefined);
+});
+
 test("branches: state is passed through when present", async () => {
   const client = Object.create(Client.prototype) as Client;
   (client as unknown as { _call: Client["_call"] })._call = async () => ({
@@ -401,6 +415,26 @@ test("rollback and promote send the materialize wire field", async () => {
     ["rollback", false], ["rollback", true],
     ["promote", false], ["promote", true],
   ]);
+});
+
+test("session close sends back the session id its open returned, and none to an older daemon", async () => {
+  const sid = "0123456789abcdef0123456789abcdef";
+  for (const [openResp, want] of [
+    [{ ok: true, checkout: "/c", session_id: sid }, sid],
+    [{ ok: true, checkout: "/c" }, undefined], // an older daemon sends no session_id
+  ] as const) {
+    const client = Object.create(Client.prototype) as Client;
+    const sent: Array<[string, Record<string, unknown>]> = [];
+    (client as unknown as { _call: (op: string, fields: Record<string, unknown>) => Promise<unknown> })._call =
+      async (op, fields) => {
+        sent.push([op, fields]);
+        return op === "open" ? openResp : { ok: true };
+      };
+    await (await client.open("app")).close();
+    const [op, fields] = sent[sent.length - 1];
+    assert.equal(op, "close");
+    assert.equal(fields.session_id, want);
+  }
 });
 
 test("errors are loud", async (t: TestContext) => {
@@ -435,7 +469,7 @@ test("rollback, promote, status", async (t: TestContext) => {
     await c.create("rp");
     const s = await c.open("rp");
     const sessions = await c.status();
-    assert.ok(sessions.some((st) => st.db === "rp" && st.branch === "main"));
+    assert.ok(sessions.some((st) => st.db === "rp" && st.branch === "main" && st.state === "open"));
 
     sqlite3(s.path, "CREATE TABLE t (v TEXT);");
     const cp1 = await s.flush("cp1");
@@ -467,6 +501,48 @@ test("rollback, promote, status", async (t: TestContext) => {
     assert.ok(!names.has("main-pre-promote"));
   } finally {
     await c.close();
+  }
+});
+
+test("a stale session close leaves another client's reopened session open", async (t: TestContext) => {
+  if (!canRun) {
+    t.skip("go and/or sqlite3 not on PATH");
+    return;
+  }
+  // The rollback case reopens the branch at the closed session's lease
+  // epoch, so only the session id tells the two sessions apart.
+  for (const [db, rollback] of [
+    ["stale", false],
+    ["stalerb", true],
+  ] as const) {
+    const a = await connect(fixture!.sock);
+    const b = await connect(fixture!.sock);
+    try {
+      await a.create(db);
+      const first = await a.open(db);
+      await first.close();
+      if (rollback) await b.rollback(db, "main", "init", { noBackup: true });
+      const second = await b.open(db);
+      try {
+        await assert.rejects(
+          () => first.close(),
+          (err: unknown) => {
+            assert.ok(err instanceof OffshootError);
+            assert.match(err.message, new RegExp(`session [0-9a-f]{32} on ${db}@main is not open`));
+            return true;
+          },
+        );
+        const mine = (await b.status()).filter((st) => st.db === db && st.branch === "main");
+        assert.equal(mine.length, 1);
+        assert.equal(mine[0].state, "open");
+        await second.flush(); // rejects if the stale close had closed it
+      } finally {
+        await second.close();
+      }
+    } finally {
+      await a.close();
+      await b.close();
+    }
   }
 });
 

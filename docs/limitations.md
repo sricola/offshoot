@@ -375,13 +375,20 @@ milliseconds don't):
   to a temp file first), so a legitimate hold is milliseconds — but a
   process paused for over 30 s inside that window can have its lock
   broken.
-- **Wait for `close` to return before reopening the same branch.** The
-  daemon frees a session's slot before its close finishes, and its at-rest
-  `checkout`, `rollback`, `promote` and `compact` check for an open session
-  without reserving the branch. An `open` of that branch landing in either
-  window can be fenced soon after (the closing session's lease release
-  clears the new one's lease), or fail at once because the checkout was
-  replaced under its capture engine ([status](status.md#daemon-and-durability)).
+- **Wait for an at-rest `checkout`, `rollback`, `promote` or `compact` to
+  return before opening the same branch in the daemon.** Those daemon ops
+  check for an open session without reserving the branch, so an `open`
+  landing while one runs can fail at once, because the checkout was
+  replaced under its capture engine
+  ([status](status.md#daemon-and-durability)). A `close` in progress needs
+  no such care: an `open` waits for it.
+- **Retry a `close` with its session's `session_id`.** `offshoot session
+  close`, and a daemon `close` that sends no `session_id`, close whatever
+  session is open on the branch, so one retried after the first close has
+  finished closes a session opened since. A `close` that sends the
+  `session_id` its `open` returned closes only that session; the SDKs'
+  `Session.close()` sends it
+  ([details](reference.md#offshoot-session-close-dbbranch--socket-path)).
 - **Never `export --force` over a database another process has open.**
   `export` writes a temp file and renames it over the destination; a
   process with the old file open keeps writing to the replaced inode, and

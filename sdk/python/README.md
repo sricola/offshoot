@@ -190,10 +190,13 @@ be forked, rolled back, promoted, and TTL-reaped.
 
 ## Daemon status
 
-`Client.status()` lists the open sessions. `Client.daemon_status()` returns
-the same list plus `dbfile_descriptors`: how many checkout descriptors the
-daemon holds open (see `offshoot serve -fd-budget`), or `None` when the
-daemon is older than the field and does not report it.
+`Client.status()` lists the daemon's sessions, open or closing. Each
+carries a `state`, `"open"` or `"closing"`; a closing session stays listed
+until its close has released the lease (an older daemon sends no `state`,
+which means open). `Client.daemon_status()` returns the same list plus
+`dbfile_descriptors`: how many checkout descriptors the daemon holds open
+(see `offshoot serve -fd-budget`), or `None` when the daemon is older than
+the field and does not report it.
 
 ## Links
 

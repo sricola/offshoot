@@ -110,6 +110,15 @@ class TestDaemonStatusWireCompat(unittest.TestCase):
         ).daemon_status()
         self.assertEqual(st.dbfile_descriptors, 0)
 
+    def test_status_passes_session_state_through(self):
+        sessions = self._client_with_response({"ok": True, "sessions": [
+            {"db": "app", "branch": "main", "state": "closing"},
+            {"db": "app", "branch": "b"},
+        ]}).status()
+        self.assertEqual(sessions[0]["state"], "closing")
+        # An older daemon sends no state; callers read that as "open".
+        self.assertEqual(sessions[1].get("state", "open"), "open")
+
 
 class TestCreateFromPathResolution(unittest.TestCase):
     """Pure-logic tests for Client.create's from_path handling; no daemon
@@ -354,6 +363,36 @@ class TestEventsDecodePath(unittest.TestCase):
         gen.close()  # must not raise
 
 
+class TestSessionCloseSessionID(unittest.TestCase):
+    """Session.close sends back the session id its open returned, so the
+    daemon can refuse a close of a session that has already closed. No
+    daemon needed; _call is captured as in TestCreateFromPathResolution."""
+
+    def _client_capturing_call(self, open_resp):
+        client = offshoot.Client.__new__(offshoot.Client)
+        calls = []
+
+        def _call(op, **fields):
+            calls.append((op, fields))
+            return open_resp if op == "open" else {"ok": True}
+        client._call = _call
+        return client, calls
+
+    def test_close_sends_the_open_session_id(self):
+        sid = "0123456789abcdef0123456789abcdef"
+        client, calls = self._client_capturing_call({"ok": True, "checkout": "/c", "session_id": sid})
+        client.open("app").close()
+        self.assertEqual(calls[-1], ("close", {"db": "app", "branch": "main", "session_id": sid}))
+
+    def test_close_sends_no_session_id_to_an_older_daemon(self):
+        # An older daemon's open carries no session_id; _call drops a None field.
+        client, calls = self._client_capturing_call({"ok": True, "checkout": "/c"})
+        client.open("app").close()
+        op, fields = calls[-1]
+        self.assertEqual(op, "close")
+        self.assertIsNone(fields.get("session_id"))
+
+
 class TestClient(unittest.TestCase):
     @classmethod
     def setUpClass(cls):
@@ -415,8 +454,9 @@ class TestClient(unittest.TestCase):
         with offshoot.connect(self.d.sock) as c:
             c.create("rp")
             s = c.open("rp")
-            self.assertTrue(
-                any(st["db"] == "rp" and st["branch"] == "main" for st in c.status()))
+            mine = [st for st in c.status() if st["db"] == "rp" and st["branch"] == "main"]
+            self.assertEqual(len(mine), 1)
+            self.assertEqual(mine[0]["state"], "open")
 
             db = sqlite3.connect(s.path)
             db.execute("CREATE TABLE t (v TEXT)")
@@ -452,6 +492,31 @@ class TestClient(unittest.TestCase):
             c.destroy("rp", "main-pre-promote")
             c.promote("rp", "feature", "main", force=True, backup=False)
             self.assertNotIn("main-pre-promote", {b.branch for b in c.branches("rp")})
+
+    def test_stale_session_close_leaves_a_reopened_session_open(self):
+        # A Session closed twice, with another client's open of the branch
+        # in between, must not close that client's session. The rollback
+        # case reopens the branch at the closed session's lease epoch, so
+        # only the session id tells the two sessions apart.
+        for db, rollback in (("stale", False), ("stalerb", True)):
+            with self.subTest(rollback=rollback), \
+                    offshoot.connect(self.d.sock) as a, offshoot.connect(self.d.sock) as b:
+                a.create(db)
+                first = a.open(db)
+                first.close()
+                if rollback:
+                    b.rollback(db, "main", "init", backup=False)
+                second = b.open(db)
+                try:
+                    with self.assertRaises(OffshootError) as cm:
+                        first.close()
+                    self.assertRegex(str(cm.exception), rf"session [0-9a-f]{{32}} on {db}@main is not open")
+                    mine = [st for st in b.status() if st["db"] == db and st["branch"] == "main"]
+                    self.assertEqual(len(mine), 1)
+                    self.assertEqual(mine[0]["state"], "open")
+                    second.flush()  # raises if the stale close had closed it
+                finally:
+                    second.close()
 
     def test_daemon_status_reports_descriptors(self):
         with offshoot.connect(self.d.sock) as c:

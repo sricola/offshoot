@@ -83,6 +83,58 @@ Pin an exact version if you depend on format stability. The full contract:
   of an import source or a checkout now escape `?`, `#` and `%`, so the
   path names exactly that file. `quiesce` and the capture engine get the
   same fix for a store root containing those characters.
+- **Reopening a branch while its session was still closing shared the
+  closing session's lease.** `session close` freed the branch in the daemon
+  before the close had finished, so an `open` of the same branch from
+  another client — a client killed mid-close that reconnected, or a
+  supervisor reopening whatever `status` stopped listing — started a second
+  session under the same lease holder and epoch. The closing session's
+  release then cleared that lease, so the new session was fenced at its next
+  renewal, and until then the branch looked unleased: a rollback, promote,
+  compact or at-rest checkpoint could run under it. A closing session now
+  keeps its branch until the close has released the lease. An `open` waits
+  up to 15 s for it and then takes a fresh epoch, or fails with
+  `daemon: <db>@<branch> is still closing; retry`. If the close failed to
+  release the lease, the reopen still renews that lease in place under the
+  same holder and epoch; that ends once each daemon session has a lease
+  holder of its own.
+- **A close retried after its session had closed could close another
+  client's session.** A `close` named only `db@branch`. A client that
+  retried its close after the branch had been reopened closed the reopened
+  session: its lease was released under it, its next flush failed with
+  `is not open`, and its writes since its last flush were never shipped.
+  The usual ways to get there are a client that gave up waiting for its
+  close's answer, and a close that raised because its lease release failed
+  (the session is closed all the same). The daemon's `open` now returns a
+  `session_id`, 128 random bits minted for that session, and a `close` that
+  sends it back closes only that session; once that session has closed, it
+  fails with `daemon: session <id> on <db>@<branch> is not open`. The
+  Python and TypeScript SDKs' `Session.close()` send it. `offshoot session
+  close`, and any client that sends no `session_id`, still closes whatever
+  session is open on the branch.
+- **`offshoot session shutdown` could exit before every lease was
+  released.** The process exited as soon as the daemon stopped listening,
+  while sessions were still closing; a close another client had started
+  was not waited for at all, and a signal arriving during a `shutdown`
+  ended the process at once. The daemon now exits only after every session
+  has closed and released its lease, bounded by the same 30 s as
+  `SIGINT`/`SIGTERM`. The command still returns as soon as the daemon
+  accepts it, and the daemon removes its socket at once and leaves the path
+  alone after that, so a new `serve` on the same socket can start while the
+  old process finishes; wait for that process to exit if every lease must
+  be released first.
+- **A slow close could let the session's lease lapse.** Closing stopped
+  renewing the lease before the capture engine's shutdown, the checkout
+  hash, the sidecar stamp and the shadow refresh, which at default settings
+  left 20 to 30 s. A close that ran longer let another writer take the
+  branch while the old engine still owned the checkout. The lease is now
+  renewed until the moment it is released.
+- **One failed lease release on close left the branch leased until the
+  lease expired.** A release that lost its compare-and-swap to a concurrent
+  `touch` or `protect`, or hit a transient store error, was not retried, so
+  other writers saw the branch held for up to 30 s. Close now retries it up
+  to three times; a release that landed but reported an error counts as
+  released.
 
 ### Changed
 
@@ -102,6 +154,27 @@ Pin an exact version if you depend on format stability. The full contract:
   open held it`, and closing and reopening the session recovers. A test
   fails on any new `sql.Open` in the tree until it is classified, and on a
   pinned one whose release could run before its connection closes.
+- **A closing session holds its branch, and the daemon says so.** While a
+  session is closing, `branches` reports the new state `closing` (it
+  outranks `error`), `status` keeps listing the session with
+  `state: "closing"`, and a duplicate `close` waits for the first and
+  returns its result instead of saying `is not open`. Flush refuses with
+  `daemon: <db>@<branch> is closing`; fork, promote, rollback, compact,
+  checkout and destroy refuse with `daemon: <db>@<branch> is closing; retry
+  when the close finishes`. MCP's `offshoot_checkout` and
+  `offshoot_checkpoint` refuse with "closing; retry in a few seconds"
+  instead of falling back to at rest, and rollback, promote and destroy say
+  to retry instead of to close the session.
+- **`session_closed` fires once the branch is free.** It used to fire from
+  inside the close; it now fires after the daemon has let go of the branch,
+  so acting on it never meets a `closing` refusal, and always before the
+  `session_opened` of a reopen of the same branch. It and `fenced` carry the
+  session's `holder` and `epoch`. These match it to the session's
+  `session_opened`, except after a close whose lease release failed: a
+  reopen then keeps the same pair (see Fixed).
+- **`/healthz` and `offshoot_sessions_open` count open sessions only**; a
+  closing session is not counted, and reports no
+  `offshoot_capture_lag_bytes` or `offshoot_durable_age_seconds`.
 
 ### Added
 
@@ -119,6 +192,13 @@ Pin an exact version if you depend on format stability. The full contract:
   `Client.daemon_status()` and TypeScript `client.daemonStatus()` return the
   open sessions plus that count (`None` / `undefined` from an older daemon
   that does not report it); `status()` is unchanged.
+- **`session_id` on the daemon `open` response and `close` request** (see
+  Fixed). Both are additive: a close without one closes by branch as
+  before, and the SDKs send none when an older daemon's `open` returns none.
+- **`SessionInfo.state`** (`open` or `closing`) in the daemon `status` op.
+  `offshoot session status` prints `state=`, TypeScript `SessionInfo` has
+  `state?`, and Python's `status()` dicts carry it. An older daemon sends
+  none, which means open.
 
 ## [0.2.16] - 2026-10-03
 

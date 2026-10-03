@@ -36,10 +36,10 @@ type BranchStatus struct {
 	// State is this branch's computed state — see BranchStateAt's doc
 	// comment for the full taxonomy and precedence. Always one of active,
 	// dirty, detached, or idle here: Status() has no session map to consult
-	// (it is the CLI/at-rest entry point), so pending/error — the two
-	// session-derived states only a daemon can see — never appear in this
-	// field. A daemon's own "branches" op (internal/daemon/server.go's
-	// BranchInfo.State) layers those two on top of this same computation.
+	// (it is the CLI/at-rest entry point), so pending/closing/error — the
+	// three session-derived states only a daemon can see — never appear in
+	// this field. A daemon's own "branches" op (internal/daemon/server.go's
+	// BranchInfo.State) layers those three on top of this same computation.
 	State string
 }
 
@@ -108,18 +108,22 @@ func parseRefTime(s string) (time.Time, bool) {
 // comes from durable truth alone (the ref plus the checkout's .sum
 // sidecar), which is exactly what ops has to work with in CLI/at-rest mode,
 // with no daemon and no in-memory session map. A daemon knows more: which
-// db@branch keys have a session slot reserved (mid-Open) or a live session
-// whose Err() has gone non-nil. Those two states — pending and error — are
-// NOT computable here, and BranchStateAt never returns them; the daemon
-// layers them on top of this function's verdict itself (see
-// internal/daemon/server.go's branchState), rather than this package
-// growing a session-awareness it fundamentally cannot have (ops has no
-// daemon dependency, and must not gain one just to report state).
+// db@branch keys have a session slot reserved (mid-Open), a session it is
+// closing, or a live session whose Err() has gone non-nil. Those three
+// states — pending, closing and error — are NOT computable here, and
+// BranchStateAt never returns them; the daemon layers them on top of this
+// function's verdict itself (see internal/daemon/server.go's branchState),
+// rather than this package growing a session-awareness it fundamentally
+// cannot have (ops has no daemon dependency, and must not gain one just to
+// report state).
 //
 // Full precedence, most to least specific (the daemon-only states are
 // listed for completeness; BranchStateAt itself only ever returns the last
 // four):
 //
+//   - "closing" (daemon only): this daemon is closing the branch's session;
+//     its lease is held until the close releases it. Outranks error: a
+//     fenced session being closed reads closing, the more actionable answer.
 //   - "error" (daemon only): a session is open for this branch and its
 //     Err() is non-nil — lease loss, a capture failure, any terminal
 //     session failure.

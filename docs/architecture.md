@@ -442,8 +442,8 @@ or capture path must preserve:
 
 ## Observability and resource limits
 
-Shipped: `offshoot status` reports a six-state branch taxonomy
-(`active`/`pending`/`error`/`dirty`/`detached`/`idle`) and a per-branch
+Shipped: `offshoot status` reports a seven-state branch taxonomy
+(`active`/`pending`/`closing`/`error`/`dirty`/`detached`/`idle`) and a per-branch
 storage class (`shared`/`materialized`); the daemon exposes a Prometheus
 `/metrics` endpoint (capture lag, durable-through age per open session, GC
 counters and backlog, fork/flush/checkpoint latencies, ro-cache usage) and
