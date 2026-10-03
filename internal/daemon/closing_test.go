@@ -1,6 +1,7 @@
 package daemon
 
 import (
+	"context"
 	"encoding/json"
 	"errors"
 	"fmt"
@@ -539,5 +540,199 @@ func TestSessionClosedEventFollowsSlotRelease(t *testing.T) {
 	}
 	if r := within(t, closed, "the close"); !r.OK {
 		t.Fatalf("close = %+v", r)
+	}
+}
+
+// TestShutdownDuringClose: a close opClose started is invisible to the old
+// drain (the key was already gone), so Shutdown returned and the process
+// could exit before that close released its lease. The close is driven by
+// a direct srv.opClose, because Shutdown closes every connection.
+func TestShutdownDuringClose(t *testing.T) {
+	srv, w := newServer(t)
+	sock := srv.SocketPath()
+	if r := call(t, sock, Request{Op: "open", DB: "app", Branch: "main"}); !r.OK {
+		t.Fatalf("open = %+v", r)
+	}
+	events, unsubscribe := srv.events.subscribe(64)
+	defer unsubscribe()
+	entered, release := holdNextClose(t)
+	waits := watchCloseWaits(t)
+	closed := make(chan Response, 1)
+	go func() { closed <- srv.opClose(Request{Op: "close", DB: "app", Branch: "main"}) }()
+	within(t, entered, "the close to reach the release hook")
+
+	shut := make(chan error, 1)
+	go func() {
+		ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+		defer cancel()
+		shut <- srv.Shutdown(ctx)
+	}()
+	select {
+	case <-waits:
+		// Shutdown is waiting on the close opClose started.
+	case err := <-shut:
+		release()
+		t.Fatalf("Shutdown returned (%v) while a close was still in progress", err)
+	case <-time.After(10 * time.Second):
+		t.Fatal("Shutdown neither waited on the close nor returned")
+	}
+	release()
+	if r := within(t, closed, "the close"); !r.OK {
+		t.Fatalf("close = %+v", r)
+	}
+	if err := within(t, shut, "Shutdown"); err != nil {
+		t.Fatalf("shutdown = %v", err)
+	}
+	ref, _, err := w.Store.GetRef("app", "main")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if ref.LeaseHolder != "" {
+		t.Fatalf("Shutdown returned with the lease still held by %q", ref.LeaseHolder)
+	}
+	n := 0
+	for drained := false; !drained; {
+		select {
+		case ev := <-events:
+			if ev.Type == "session_closed" && ev.DB == "app" && ev.Branch == "main" {
+				n++
+			}
+		default:
+			drained = true
+		}
+	}
+	if n != 1 {
+		t.Fatalf("session_closed published %d times, want once: Shutdown must not close a closing session again", n)
+	}
+}
+
+// TestShutdownOpWaitsForSessions: the shutdown op runs Shutdown on a
+// goroutine of its own, and WaitShutdown is what serve waits on. It must
+// not return until every session has closed and released its lease.
+func TestShutdownOpWaitsForSessions(t *testing.T) {
+	srv, w := newServer(t)
+	sock := srv.SocketPath()
+	if _, err := w.Fork("app", "main", "b", "", 0, nil); err != nil {
+		t.Fatal(err)
+	}
+	for _, b := range []string{"main", "b"} {
+		if r := call(t, sock, Request{Op: "open", DB: "app", Branch: b}); !r.OK {
+			t.Fatalf("open %s = %+v", b, r)
+		}
+	}
+	entered, release := holdNextClose(t)
+	if r := call(t, sock, Request{Op: "shutdown"}); !r.OK {
+		t.Fatalf("shutdown op = %+v", r)
+	}
+	waited := make(chan error, 1)
+	go func() {
+		ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+		defer cancel()
+		waited <- srv.WaitShutdown(ctx)
+	}()
+	within(t, entered, "Shutdown to reach a session's release")
+	select {
+	case err := <-waited:
+		release()
+		t.Fatalf("WaitShutdown returned (%v) while a session was still closing", err)
+	default:
+	}
+	release()
+	if err := within(t, waited, "WaitShutdown"); err != nil {
+		t.Fatalf("WaitShutdown = %v", err)
+	}
+	for _, b := range []string{"main", "b"} {
+		ref, _, err := w.Store.GetRef("app", b)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if ref.LeaseHolder != "" {
+			t.Fatalf("app@%s still leased by %q after WaitShutdown", b, ref.LeaseHolder)
+		}
+	}
+}
+
+// TestSecondShutdownWaitsForTheFirst: a signal arriving while the shutdown
+// op's Shutdown is closing sessions calls Shutdown again. That call used to
+// return nil at once, so serve exited before the leases were released.
+func TestSecondShutdownWaitsForTheFirst(t *testing.T) {
+	srv, w := newServer(t)
+	sock := srv.SocketPath()
+	if r := call(t, sock, Request{Op: "open", DB: "app", Branch: "main"}); !r.OK {
+		t.Fatalf("open = %+v", r)
+	}
+	entered, release := holdNextClose(t)
+	first := make(chan error, 1)
+	go func() {
+		ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+		defer cancel()
+		first <- srv.Shutdown(ctx)
+	}()
+	within(t, entered, "the first Shutdown to reach the session's release")
+
+	short, cancel := context.WithTimeout(context.Background(), 50*time.Millisecond)
+	defer cancel()
+	if err := srv.Shutdown(short); !errors.Is(err, context.DeadlineExceeded) {
+		t.Fatalf("second Shutdown during the first = %v, want it to wait and time out on its own ctx", err)
+	}
+	release()
+	firstErr := within(t, first, "the first Shutdown")
+	ctx, cancel2 := context.WithTimeout(context.Background(), 10*time.Second)
+	defer cancel2()
+	if err := srv.Shutdown(ctx); err != firstErr {
+		t.Fatalf("a later Shutdown = %v, want the first's result %v", err, firstErr)
+	}
+	ref, _, err := w.Store.GetRef("app", "main")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if ref.LeaseHolder != "" {
+		t.Fatalf("lease still held by %q", ref.LeaseHolder)
+	}
+}
+
+// TestReopenWaitingWhenShutdownBeginsIsRefused: an open waiting on a close
+// when Shutdown starts must not reserve after closing is set, and Shutdown
+// must not wait on it (it is not counted in openWG). Direct calls are used
+// because Shutdown closes every connection.
+func TestReopenWaitingWhenShutdownBeginsIsRefused(t *testing.T) {
+	srv, w := newServer(t)
+	sock := srv.SocketPath()
+	if r := call(t, sock, Request{Op: "open", DB: "app", Branch: "main"}); !r.OK {
+		t.Fatalf("open = %+v", r)
+	}
+	entered, release := holdNextClose(t)
+	waits := watchCloseWaits(t)
+	closed := make(chan Response, 1)
+	go func() { closed <- srv.opClose(Request{Op: "close", DB: "app", Branch: "main"}) }()
+	within(t, entered, "the close to reach the release hook")
+	reopened := make(chan Response, 1)
+	go func() { reopened <- srv.opOpen(Request{Op: "open", DB: "app", Branch: "main"}) }()
+	within(t, waits, "the reopen to wait")
+	shut := make(chan error, 1)
+	go func() {
+		ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+		defer cancel()
+		shut <- srv.Shutdown(ctx)
+	}()
+	within(t, waits, "Shutdown to wait on the same close")
+	release()
+
+	within(t, closed, "the close")
+	if r := within(t, reopened, "the reopen"); r.OK || r.Error != "daemon: shutting down" {
+		t.Fatalf("reopen = %+v, want daemon: shutting down", r)
+	}
+	if err := within(t, shut, "Shutdown"); err != nil {
+		t.Fatalf("shutdown = %v", err)
+	}
+	if sl := slotAt(srv, "app@main"); sl != nil {
+		t.Fatalf("slot left after shutdown: %+v", sl)
+	}
+	ref, _, err := w.Store.GetRef("app", "main")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if ref.LeaseHolder != "" {
+		t.Fatalf("lease still held by %q", ref.LeaseHolder)
 	}
 }

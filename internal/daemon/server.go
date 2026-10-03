@@ -80,13 +80,21 @@ type Server struct {
 	// moment a slot is reserved, Done() happens once that call's bookkeeping
 	// has fully resolved (map updated and, if it self-closed, the session
 	// actually closed). Shutdown sets closing and waits on openWG before it
-	// ever reads or drains the sessions map, so it can never observe (or
-	// wipe) a reservation that a still-running opOpen believes it owns. See
+	// ever reads or marks the sessions map, so it can never observe (or
+	// pass over) a reservation that a still-running opOpen believes it owns. See
 	// opOpen and Shutdown. An opOpen waiting on a closing slot is not
 	// counted until it reserves one: the wait happens before the
 	// reservation, and the closing check that guards every Add runs again
 	// after it.
 	openWG sync.WaitGroup
+	// shutdownDone is closed, and shutdownErr set just before, when the
+	// one Shutdown that set closing returns, on every return path. A second
+	// Shutdown and WaitShutdown wait on it. The shutdown op runs Shutdown on
+	// a goroutine of its own, and serve's Serve returns as soon as the
+	// listener closes; without this, the process could exit while sessions
+	// were still closing and their leases were still held.
+	shutdownDone chan struct{}
+	shutdownErr  error
 
 	connMu sync.Mutex
 	conns  map[net.Conn]struct{} // live accepted connections; Shutdown closes them all
@@ -260,12 +268,13 @@ func NewServer(ws *ops.Workspace, socketPath string) (*Server, error) {
 		return nil, err
 	}
 	srv := &Server{ws: ws, ln: ln, sock: socketPath,
-		sessions:    map[string]*slot{},
-		conns:       map[net.Conn]struct{}{},
-		janitorStop: make(chan struct{}),
-		metrics:     newMetrics(),
-		events:      newEventBus(),
-		fdBudget:    DefaultFDBudget,
+		sessions:     map[string]*slot{},
+		conns:        map[net.Conn]struct{}{},
+		janitorStop:  make(chan struct{}),
+		shutdownDone: make(chan struct{}),
+		metrics:      newMetrics(),
+		events:       newEventBus(),
+		fdBudget:     DefaultFDBudget,
 	}
 	// Wired here, at construction, before Serve can ever accept a
 	// connection or StartJanitor can ever tick — see wireHooks/OnTransition/
@@ -612,7 +621,7 @@ func (s *Server) opOpen(req Request) Response {
 	if s.closing {
 		// Shutdown started while this open was in flight and is, right now,
 		// blocked on s.openWG waiting for exactly this call to resolve
-		// before it drains the map. Don't leave the newly-acquired lease
+		// before it marks the map's slots. Don't leave the newly-acquired lease
 		// orphaned: self-close, and only mark this open done (openWG.Done)
 		// once that close has actually completed, so Shutdown cannot return
 		// — and cannot decide there is nothing left to close — until the
@@ -1399,9 +1408,11 @@ func (s *Server) opDiff(req Request) Response {
 }
 
 // Shutdown stops the janitor, stops accepting, refuses any further opens,
-// waits out every open already in flight, closes every live session (so no
-// lease is orphaned) and every live connection (so no handle goroutine
-// outlives it), and removes the socket. It is safe to call twice.
+// waits out every open already in flight, closes every live session and
+// waits out every close already running (so no lease is orphaned), closes
+// every live connection (so no handle goroutine outlives it), and removes
+// the socket. A second call waits for the first, bounded by its own ctx, and
+// returns the first call's result.
 //
 // Ordering here is load-bearing:
 //
@@ -1431,21 +1442,64 @@ func (s *Server) opDiff(req Request) Response {
 //     finished before closing was set, or observed closing not yet set) or a
 //     fully released reservation (open failed, or it observed closing set
 //     and self-closed the session it had just opened) — so the map, once
-//     locked again, contains exactly what Shutdown must close and nothing an
-//     in-flight open could still be about to touch. Without this wait,
-//     draining the map here could delete another goroutine's in-flight
-//     reservation out from under it, and a second opOpen for the same branch
-//     could then reuse the now-free key and start a second, concurrent
-//     session.Open against the same checkout file.
+//     locked again, contains exactly what Shutdown must close or wait on
+//     and nothing an in-flight open could still be about to touch. Without this wait,
+//     marking the map's slots here would pass over an in-flight
+//     reservation, and Shutdown could return while that open was still
+//     taking its lease, or self-closing the session it had just opened,
+//     with nothing waiting for the release.
+//  4. Under s.mu, Shutdown turns every open slot into a closing marker
+//     (markClosingLocked, the step opClose takes) and collects the marker of
+//     every closing slot, including closes opClose started before closing
+//     was set, which the old drain never saw because their keys were
+//     already gone. With s.mu released, it closes the sessions it marked
+//     (closeSlot, one at a time) and waits on every marker's done, bounded
+//     by ctx. It never calls Close on a slot that is already closing:
+//     Session.Close returns nil at once the second time, so that would wait
+//     for nothing. A concurrent opClose of a slot Shutdown is closing waits
+//     on the same done.
+//  5. Shutdown records its result and closes shutdownDone on every return
+//     path (Shutdown wraps shutdown for that). serve waits on it through
+//     WaitShutdown when the shutdown op ends Serve, and a second Shutdown
+//     (a signal racing the op) waits on it too, so the process exits only
+//     after every lease is released.
 func (s *Server) Shutdown(ctx context.Context) error {
 	s.mu.Lock()
 	if s.closing {
 		s.mu.Unlock()
-		return nil
+		return s.WaitShutdown(ctx)
 	}
 	s.closing = true
 	s.mu.Unlock()
 
+	err := s.shutdown(ctx)
+	s.shutdownErr = err
+	close(s.shutdownDone)
+	return err
+}
+
+// WaitShutdown blocks until the Shutdown that set closing has returned, or
+// ctx ends, and returns that Shutdown's result. serve calls it when Serve
+// returns nil, which happens only once a Shutdown has begun (the shutdown
+// op, over the socket or HTTP), so the process exits only after that
+// Shutdown has closed every session and released its lease.
+func (s *Server) WaitShutdown(ctx context.Context) error {
+	select {
+	case <-s.shutdownDone:
+		return s.shutdownErr
+	case <-ctx.Done():
+		return fmt.Errorf("daemon: shutdown: timed out waiting for shutdown to finish: %w", ctx.Err())
+	}
+}
+
+// closeWait pairs a closing marker with its key, for Shutdown.
+type closeWait struct {
+	key string
+	m   *slot
+}
+
+// shutdown is Shutdown's body once closing is set; see Shutdown's doc.
+func (s *Server) shutdown(ctx context.Context) error {
 	// Signal the janitor to stop now — cheap and non-blocking, so it starts
 	// winding down immediately. The actual wait for it to finish (which can
 	// block for as long as its in-flight Reap/GC cycle takes) happens below,
@@ -1506,8 +1560,8 @@ func (s *Server) Shutdown(ctx context.Context) error {
 	select {
 	case <-janitorWait:
 	case <-ctx.Done():
-		// Note: closing stays true, so a later call to Shutdown will no-op
-		// rather than retry a stop that never completed.
+		// Note: closing stays true, so a later call to Shutdown returns this
+		// same error rather than retry a stop that never completed.
 		return fmt.Errorf("daemon: shutdown: timed out waiting for the janitor: %w", ctx.Err())
 	}
 
@@ -1519,48 +1573,58 @@ func (s *Server) Shutdown(ctx context.Context) error {
 	select {
 	case <-openWait:
 	case <-ctx.Done():
-		// Note: closing stays true, so a later call to Shutdown will no-op
-		// (see the check above) rather than retry the drain that never ran.
-		// A caller that times out here should treat the daemon as stuck, not
-		// cleanly stopped.
+		// Note: closing stays true, so a later call to Shutdown returns this
+		// same error rather than retry the closes that never ran. A caller
+		// that times out here should treat the daemon as stuck, not cleanly
+		// stopped.
 		return fmt.Errorf("daemon: shutdown: timed out waiting for in-flight opens: %w", ctx.Err())
 	}
 
 	s.mu.Lock()
-	type marked struct {
-		key string
-		m   *slot
-	}
-	var mine []marked
+	var waits, mine []closeWait
 	for k, sl := range s.sessions {
-		// Only open slots are closed here, through the same marker and
-		// closeSlot opClose uses. A closing slot belongs to the close that
-		// marked it: Session.Close returns nil at once the second time, so
-		// closing it again would wait for nothing.
-		if sl.isOpen() {
-			mine = append(mine, marked{k, s.markClosingLocked(k, sl)})
+		switch {
+		case sl.isClosing():
+			waits = append(waits, closeWait{k, sl})
+		case sl.isOpen():
+			m := s.markClosingLocked(k, sl)
+			waits = append(waits, closeWait{k, m})
+			mine = append(mine, closeWait{k, m})
 		}
+		// No reserved slot can be left here: closing was set before the
+		// openWG wait above, and every reservation made before it resolved.
 	}
 	s.mu.Unlock()
 
-	closeDone := make(chan error, 1)
 	go func() {
-		var firstErr error
 		for _, c := range mine {
-			if err := s.closeSlot(c.key, c.m); err != nil && firstErr == nil {
-				firstErr = err
-			}
+			s.closeSlot(c.key, c.m) // its result lands in c.m.err
 		}
-		closeDone <- firstErr
 	}()
 
-	var firstErr error
+	allClosed := make(chan struct{})
+	go func() {
+		defer close(allClosed)
+		dl, _ := ctx.Deadline()
+		for _, c := range waits {
+			if closeWaitEntered != nil {
+				closeWaitEntered(c.key, dl) // test hook; nil (a no-op) in production
+			}
+			<-c.m.done
+		}
+	}()
 	select {
-	case firstErr = <-closeDone:
+	case <-allClosed:
 	case <-ctx.Done():
 		return fmt.Errorf("daemon: shutdown: timed out closing sessions: %w", ctx.Err())
 	}
 
+	var firstErr error
+	for _, c := range waits {
+		if c.m.err != nil && firstErr == nil {
+			firstErr = c.m.err
+		}
+	}
 	if err := os.Remove(s.sock); err != nil && !os.IsNotExist(err) && firstErr == nil {
 		firstErr = err
 	}
