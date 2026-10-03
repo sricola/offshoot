@@ -17,6 +17,11 @@ import (
 // Losing the lease is terminal: the session's epoch is dead, so anything it
 // wrote afterwards would land in a fenced prefix — it must stop rather than
 // keep serving.
+//
+// It runs on its own context (renewCancel), not the capture engine's, so
+// Close can keep the lease live through the engine's shutdown and the
+// sidecar stamp and stop renewal immediately before the release; fail
+// cancels both contexts, so a failed session stops renewing as before.
 func (s *Session) renewLoop(ctx context.Context, every, ttl time.Duration) {
 	defer close(s.renewDone)
 	t := time.NewTicker(every)

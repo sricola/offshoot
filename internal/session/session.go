@@ -127,7 +127,13 @@ type Session struct {
 	checkoutPath string
 	replica      *replay.Replica
 
-	cancel context.CancelFunc
+	// cancel stops the capture engine and flushLoop; renewCancel stops
+	// renewLoop. They are separate so Close can shut capture down first and
+	// keep the lease renewed through the engine shutdown, the hash, the
+	// sidecar stamp and the shadow refresh, stopping renewal only just
+	// before it releases the lease. fail cancels both.
+	cancel      context.CancelFunc
+	renewCancel context.CancelFunc
 	// engDone is closed exactly once, by the single goroutine that runs the
 	// capture engine, after Run returns and any failure has been recorded via
 	// fail(). It carries no value (a value-carrying channel here would be a
@@ -140,20 +146,22 @@ type Session struct {
 	captured *capture.Engine
 
 	// renewDone mirrors engDone: closed exactly once, by renewLoop itself
-	// after its loop exits (ctx cancelled, or a terminal renewal failure
-	// called fail(), which itself cancels ctx). Close joins this before
-	// releasing the lease so a straggler renewal — one that had already
-	// fired its ticker case in the same instant Close cancelled ctx — cannot
-	// run after the lease is released, observe the resulting holder
-	// mismatch, and mark a cleanly-closed session as fenced. See Close's
-	// comment for the required shutdown order.
+	// after its loop exits (renewCancel called, or a terminal renewal
+	// failure called fail(), which itself calls renewCancel). Close joins
+	// it last, after the capture joins and the sidecar stamp and immediately
+	// before releasing the lease, so a straggler renewal — one that had
+	// already fired its ticker case in the same instant Close called
+	// renewCancel — cannot run after the lease is released, observe the
+	// resulting holder mismatch, and mark a cleanly-closed session as
+	// fenced. See Close's comment for the required shutdown order.
 	renewDone chan struct{}
 
 	// flushDone mirrors renewDone, for flushLoop: nil if Options.FlushEvery
 	// was 0 (no loop was ever started, so there is nothing to join), else
-	// closed exactly once by flushLoop itself after its loop exits (ctx
-	// cancelled). Close joins this, alongside engDone/renewDone, before it
-	// proceeds to release the lease and remove the scratch dir.
+	// closed exactly once by flushLoop itself after its loop exits (cancel
+	// called: flushLoop runs on the capture context, not renewal's). Close
+	// joins it right after engDone, as part of stopping capture, well before
+	// it joins renewDone, releases the lease and removes the scratch dir.
 	flushDone chan struct{}
 
 	// replicaMu serializes writes to the replica file (capture's Rebase and
@@ -484,7 +492,8 @@ func Open(ctx context.Context, o Options) (*Session, error) {
 	}
 
 	cctx, cancel := context.WithCancel(ctx)
-	s.cancel = cancel
+	rctx, renewCancel := context.WithCancel(ctx)
+	s.cancel, s.renewCancel = cancel, renewCancel
 	s.captured = capture.NewEngine(capture.Options{
 		DBPath: checkoutRes.Path, StateDir: dir, Sink: replicaSink{s},
 	})
@@ -519,6 +528,7 @@ func Open(ctx context.Context, o Options) (*Session, error) {
 		s.replicaMu.Unlock()
 		if rerr != nil {
 			cancel()
+			renewCancel() // renewLoop has not started; this only frees rctx
 			<-s.engDone
 			relErr := o.WS.ReleaseLease(lease)
 			cleanup()
@@ -531,7 +541,7 @@ func Open(ctx context.Context, o Options) (*Session, error) {
 		}
 	}
 
-	go s.renewLoop(cctx, o.RenewEvery, o.LeaseTTL)
+	go s.renewLoop(rctx, o.RenewEvery, o.LeaseTTL)
 
 	if o.FlushEvery > 0 {
 		s.flushDone = make(chan struct{})
@@ -574,6 +584,7 @@ func (s *Session) fail(err error) {
 		s.logTransition("fenced", "cause", err.Error())
 	}
 	s.cancel()
+	s.renewCancel()
 }
 
 // logTransition writes one structured, key=value line to stderr for a
@@ -809,16 +820,33 @@ func (s *Session) flushLoop(ctx context.Context, every time.Duration) {
 // directory. See Close and flushMu's doc comment.
 var ErrClosed = errors.New("session: closed")
 
+// CloseReleaseHook, when non-nil, is invoked by Close after the capture
+// engine has shut down and the sidecar has been stamped, immediately before
+// Close stops lease renewal and releases the lease. It exists for tests that
+// hold a close in progress: to prove the lease stays live while Close runs,
+// and to exercise what the daemon does alongside a close (a reopen's wait, a
+// duplicate close, Shutdown). Nil (the default) is a no-op and imposes no
+// cost in production.
+var CloseReleaseHook func()
+
 // Close stops capture, releases the lease, and removes the scratch dir. It is
-// safe to call twice.
+// safe to call twice; the second call returns nil at once, without waiting
+// for the first to finish.
 //
-// Shutdown order matters: cancel the context, join the capture goroutine,
-// THEN join the renewal goroutine, THEN release the lease, THEN remove the
-// scratch dir. Joining renewLoop before ReleaseLease is what closes the race
-// where a renewal tick fires in the same instant Close cancels ctx: without
-// the join, that straggler could run after the lease is released, see the
-// holder cleared out from under it, and call fail(ErrFenced) — marking a
-// cleanly-closed session as fenced even though nothing actually went wrong.
+// Shutdown order matters: cancel capture (the engine and flushLoop) and
+// join both, stamp the sidecar, THEN stop and join the renewal goroutine,
+// THEN release the lease, THEN remove the scratch dir. Renewal runs until
+// just before the release because everything ahead of it can be slow — the
+// engine's shutdown checkpoints and hashes the whole checkout, and the stamp
+// refreshes the shadow, a full copy without reflink — while at default
+// settings only 20 to 30 s of lease remain when renewal stops. A close that
+// outlasted them let the lease lapse while the old engine still owned the
+// checkout, and a writer outside the daemon could take the branch. Joining
+// renewLoop before ReleaseLease still closes the race where a renewal tick
+// fires in the same instant renewal is cancelled: without the join, that
+// straggler could run after the lease is released, see the holder cleared
+// out from under it, and call fail(ErrFenced) — marking a cleanly-closed
+// session as fenced even though nothing actually went wrong.
 //
 // Removing the scratch dir is additionally serialized against flushMu: Flush
 // holds flushMu for its whole body, including the point where it reads the
@@ -840,7 +868,6 @@ func (s *Session) Close() error {
 		return nil
 	}
 	s.closed = true
-	lease := s.lease
 	s.mu.Unlock()
 
 	// Sidecar refresh on clean close (M2 follow-up, ledgered), split around
@@ -851,7 +878,6 @@ func (s *Session) Close() error {
 
 	s.cancel()
 	<-s.engDone
-	<-s.renewDone
 	if s.flushDone != nil {
 		<-s.flushDone
 	}
@@ -859,6 +885,16 @@ func (s *Session) Close() error {
 	if refresh {
 		s.commitSidecarRefresh()
 	}
+
+	if CloseReleaseHook != nil {
+		CloseReleaseHook() // test hook; nil (a no-op) in production
+	}
+
+	// Read the lease only once renewal has been joined, so it carries the
+	// last renewed expiry; holder and epoch never change.
+	s.renewCancel()
+	<-s.renewDone
+	lease := s.Lease()
 
 	var relErr error
 	if err := s.ws.ReleaseLease(lease); err != nil && !errors.Is(err, store.ErrLeaseLost) {
