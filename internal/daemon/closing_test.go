@@ -786,6 +786,62 @@ func TestSecondShutdownWaitsForTheFirst(t *testing.T) {
 	}
 }
 
+// TestShutdownReturnsAFailedRelease: Shutdown's result is what serve exits
+// with after the shutdown op (through WaitShutdown), and what a later
+// Shutdown returns. A close whose release failed every attempt must show up
+// in it, whether Shutdown closed that session itself or waited on a close
+// opClose had started. Otherwise serve exits 0 and nothing tells the
+// operator the branch stays leased for up to a TTL.
+func TestShutdownReturnsAFailedRelease(t *testing.T) {
+	check := func(t *testing.T, srv *Server, got error) {
+		t.Helper()
+		if got == nil || !strings.Contains(got.Error(), "injected release failure") {
+			t.Fatalf("Shutdown = %v, want the injected release failure", got)
+		}
+		ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+		defer cancel()
+		if again := srv.Shutdown(ctx); again != got {
+			t.Fatalf("a later Shutdown = %v, want the first's result %v", again, got)
+		}
+	}
+
+	t.Run("a session Shutdown closes", func(t *testing.T) {
+		srv, w := newServer(t)
+		sock := srv.SocketPath()
+		fr := &failReleases{Backend: w.Store.B}
+		w.Store.B = fr // before any session exists
+		if r := call(t, sock, Request{Op: "open", DB: "app", Branch: "main"}); !r.OK {
+			t.Fatalf("open = %+v", r)
+		}
+		fr.arm(3) // every attempt Close's release makes
+		if r := call(t, sock, Request{Op: "shutdown"}); !r.OK {
+			t.Fatalf("shutdown op = %+v", r)
+		}
+		ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+		defer cancel()
+		check(t, srv, srv.WaitShutdown(ctx))
+	})
+
+	t.Run("a close opClose started", func(t *testing.T) {
+		srv, w := newServer(t)
+		fr := &failReleases{Backend: w.Store.B}
+		w.Store.B = fr
+		closed, release := closingSession(t, srv.SocketPath(), "app", "main")
+		fr.arm(3)
+		waits := watchCloseWaits(t)
+		shut := make(chan error, 1)
+		go func() {
+			ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+			defer cancel()
+			shut <- srv.Shutdown(ctx)
+		}()
+		within(t, waits, "Shutdown to wait on the close opClose started")
+		release()
+		within(t, closed, "the close") // Shutdown closed its connection; only the server side matters
+		check(t, srv, within(t, shut, "Shutdown"))
+	})
+}
+
 // TestShutdownLeavesTheNextDaemonsSocketAlone: `session shutdown` returns as
 // soon as the daemon acknowledges it, and closing the listener removes the
 // socket file at once, so an operator can start the next `serve` on the
