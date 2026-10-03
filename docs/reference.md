@@ -1655,13 +1655,13 @@ has no `--meta` flag).
 offshoot session status
 ```
 
-Lists every session currently open on this daemon: `db@branch`, `state=open`
-or `state=closing` (the status op's `SessionInfo.state`; a closing session is
-listed until its close has released the lease; an older daemon sends no
-`state`, which means open), durable transaction id, epoch, lease holder,
-checkout path, and — if the session has hit an error (e.g. fenced by a lost
-lease, or a contract violation) — that error inline. This is per-session
-detail; for the computed branch-state taxonomy
+Lists every session this daemon holds, open or closing: `db@branch`,
+`state=open` or `state=closing` (the status op's `SessionInfo.state`; a
+closing session is listed until its close has released the lease; an older
+daemon sends no `state`, which means open), durable transaction id, epoch,
+lease holder, checkout path, and — if the session has hit an error (e.g.
+fenced by a lost lease, or a contract violation) — that error inline. This
+is per-session detail; for the computed branch-state taxonomy
 (`active`/`pending`/`closing`/`error`/`dirty`/`detached`/`idle`) across
 EVERY branch of a db — including ones with no session open at all — see
 [Branch states](#branch-states) above and the daemon `branches` op (SDK
