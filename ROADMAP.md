@@ -358,11 +358,11 @@ open wart (its own spec said "N materialized forks cost up to N×G").
   - Normalize etags across providers before comparing them (strip quotes
     and a weak `W/` prefix), so an S3-compatible provider that reformats
     the etag between `PUT` and `HEAD` costs no needless `GET`.
-  - A Local `Head` that does not re-hash the whole object (for example a
-    cached digest keyed by size and mtime): today it reads the file to
-    compute the etag `PutIf` returned.
-  - A Dependabot `pip` entry for `requirements/`, so the hash-pinned CI
-    locks get update PRs like the Go modules and Actions do.
+  - ✅ A Local `Head` that does not re-hash the whole object: since v0.2.13
+    the local backend records each object's etag in a `user.offshoot.etag`
+    xattr at write time, so `Head` answers from it.
+  - ✅ A Dependabot `pip` entry for `requirements/` (v0.2.14), so the
+    hash-pinned CI locks get update PRs like the Go modules and Actions do.
   - Commit a 64 KiB-page, incompressible ltx v0.5.1 fixture beside the
     4 KiB ones, so the pinned frame shape is tested at the largest page
     size and at the LZ4 worst-case block.
@@ -371,9 +371,11 @@ open wart (its own spec said "N materialized forks cost up to N×G").
     filesystem in WAL mode a foreign same-size write inside the quiesce
     tick could otherwise be stamped trusted; fall back to
     `ChecksumDatabase` when the mtime is younger than the margin.
-  - Decide whether the runtime image should `apt-get upgrade` at build
-    time or rely solely on Dependabot's weekly base-image digest bumps for
-    security updates; the Dockerfile comment documents the current choice.
+  - ✅ Runtime image updates: decided and written down in the Dockerfile.
+    The base image stays digest-pinned with Dependabot's weekly bumps as
+    the only update path; no `apt-get upgrade` at build time, because an
+    unpinned upgrade would make the image non-reproducible and silently
+    diverge from the digest the SLSA provenance names.
 
 ## Launch track (parallel to v0.1–v0.3)
 

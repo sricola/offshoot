@@ -10,7 +10,8 @@ names the code or workflow that backs it.
 
 | Claim | Evidence | Where it runs |
 |---|---|---|
-| A `kill -9`'d writer never corrupts the replica | `TestTortureWriterKill`: ~3,500 rounds, the writer `SIGKILL`ed in roughly half of them, dump-identical every round (the capturer is bounced gracefully, never killed) | nightly Linux, weekly macOS (`nightly.yml`) |
+| A `kill -9`'d writer never corrupts the replica | `TestTortureWriterKill`: ~3,500 rounds, the writer `SIGKILL`ed in roughly half of them, dump-identical every round (this harness bounces the capturer gracefully; the next row kills it) | nightly Linux, weekly macOS (`nightly.yml`) |
+| A `kill -9`'d capturer never diverges the replica | `TestTortureCapturerKill`: the capture engine runs in a child process that is `SIGKILL`ed mid-traffic every round and restarted on the same state and replica; 722 rounds and 722 kills in a two-minute local run, dump-identical after every restart | nightly Linux (`nightly.yml`, `torture` job) |
 | One writer per lineage, always | lease epochs + create-only puts + CAS on every ref; CAS probe refuses stores without it | every `go test`, RustFS on every PR, AWS nightly |
 | Storage backends behave identically | `storetest.RunConformance` | local + fake S3 every run; real RustFS every PR; real AWS nightly since 2026-09-25 |
 | Parsers of untrusted bytes fail closed, never panic | five Go native fuzz targets (`make fuzz`) | seed corpora every `go test`; 60 s per target nightly (`nightly.yml`) |
@@ -70,11 +71,11 @@ other docs link here rather than restating it. Beyond CI,
 [CONTRIBUTING.md](../CONTRIBUTING.md) requires a torture run — named in
 the PR description — for any change touching the capture or flush paths.
 
-What the harness deliberately does *not* prove: it bounces the capturer
-through its graceful-shutdown path, not a `SIGKILL` of the capturer
-process itself (that case is argued safe in `internal/capture/engine.go`'s
-shutdown/resume doc comments but is not exercised by this harness — the
-test's own comments say so, and so does this page).
+This harness bounces the capturer through its graceful-shutdown path; it
+never `SIGKILL`s the capturer process itself. That case has its own
+harness, `TestTortureCapturerKill`, described under
+[What is not proven here](#what-is-not-proven-here): the engine runs in a
+child process that is killed mid-traffic every round.
 
 ## Fencing and CAS, in two paragraphs
 
