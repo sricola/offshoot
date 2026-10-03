@@ -167,9 +167,14 @@ func TestQuiesceDoesNotCreateAMissingCheckout(t *testing.T) {
 }
 
 // TestQuiesceRaceErrorsSayRetry: a checkout replaced or removed while
-// quiesce opens it lost a race with another operation. The error says so
-// and that a retry works, and destroy does not call the checkout busy or in
-// use.
+// quiesce opens it lost a race with another operation, and no caller calls
+// such a checkout busy or in use. Only an operation that has committed
+// nothing yet (checkout, checkpoint, destroy, and session open through
+// checkout) says "(retry)", and retrying it works. Promote, rollback and
+// compact refresh the checkout after their repoint has committed, so they
+// say so and name 'offshoot checkout' instead: retrying a promote or
+// rollback would move its rolling safety fork onto the already-repointed
+// head, leaving the original head on no branch.
 func TestQuiesceRaceErrorsSayRetry(t *testing.T) {
 	for _, tc := range []struct {
 		name  string
@@ -202,38 +207,112 @@ func TestQuiesceRaceErrorsSayRetry(t *testing.T) {
 			if !errors.Is(err, errCheckoutReplaced) || (tc.cause != nil && !errors.Is(err, tc.cause)) {
 				t.Fatalf("quiesce = %v, want errCheckoutReplaced", err)
 			}
-			if msg := err.Error(); !strings.Contains(msg, "(retry)") || strings.Contains(msg, "checkpoint") {
-				t.Fatalf("quiesce = %q: want a retry hint and no 'checkpoint' label", msg)
+			if msg := err.Error(); strings.Contains(msg, "retry") || strings.Contains(msg, "checkpoint") {
+				t.Fatalf("quiesce = %q: its callers add any retry hint, and it is no checkpoint", msg)
 			}
 		})
-		t.Run(tc.name+"/destroy", func(t *testing.T) {
-			w := newWS(t)
-			if err := w.Create("app"); err != nil {
-				t.Fatal(err)
-			}
-			if _, err := w.Fork("app", "main", "f", "", 0, nil); err != nil {
-				t.Fatal(err)
-			}
-			path, err := w.Checkout("app", "f")
-			if err != nil {
-				t.Fatal(err)
-			}
-			abs, _ := filepath.Abs(path)
-			raced := false
-			setHoldHook(t, func(p string) {
-				if p == abs && !raced {
-					raced = true
-					tc.race(t, path)
+
+		// Each op races the first Hold on the branch's checkout after arm
+		// runs; a nil arm arms it before the op starts.
+		for _, op := range []struct {
+			name      string
+			branch    string
+			committed bool // the op has repointed the branch when it refreshes
+			arm       func(t *testing.T, w *Workspace, arm func())
+			run       func(t *testing.T, w *Workspace) error
+		}{
+			{"checkout", "f", false, nil, func(t *testing.T, w *Workspace) error {
+				_, err := w.Checkout("app", "f")
+				return err
+			}},
+			{"checkpoint", "f", false, nil, func(t *testing.T, w *Workspace) error {
+				_, err := w.Checkpoint("app", "f", "cp", nil)
+				return err
+			}},
+			{"destroy", "f", false, nil, func(t *testing.T, w *Workspace) error {
+				return w.Destroy("app", "f", false)
+			}},
+			{"promote", "main", true, func(t *testing.T, w *Workspace, arm func()) {
+				ObservePromote = func(bool) { arm() }
+				t.Cleanup(func() { ObservePromote = nil })
+			}, func(t *testing.T, w *Workspace) error {
+				res, err := w.PromoteWith("app", "f", "main", PromoteOptions{Force: true})
+				if err != nil && res.Backup == "" {
+					t.Errorf("the committed promote's result does not name its safety fork: %+v", res)
+				}
+				return err
+			}},
+			{"rollback", "main", true, func(t *testing.T, w *Workspace, arm func()) {
+				ObserveRollback = func(bool) { arm() }
+				t.Cleanup(func() { ObserveRollback = nil })
+			}, func(t *testing.T, w *Workspace) error {
+				_, err := w.Rollback("app", "main", "init")
+				return err
+			}},
+			{"compact", "f", true, func(t *testing.T, w *Workspace, arm func()) {
+				compactBeforeCASForTest = arm
+				t.Cleanup(func() { compactBeforeCASForTest = nil })
+			}, func(t *testing.T, w *Workspace) error {
+				_, err := w.Compact("app", "f")
+				return err
+			}},
+		} {
+			t.Run(tc.name+"/"+op.name, func(t *testing.T) {
+				w := newWS(t)
+				if err := w.Create("app"); err != nil {
+					t.Fatal(err)
+				}
+				if _, err := w.Fork("app", "main", "f", "", 0, nil); err != nil {
+					t.Fatal(err)
+				}
+				path, err := w.Checkout("app", op.branch)
+				if err != nil {
+					t.Fatal(err)
+				}
+				abs, _ := filepath.Abs(path)
+				armed, raced := op.arm == nil, false
+				if op.arm != nil {
+					op.arm(t, w, func() { armed = true })
+				}
+				setHoldHook(t, func(p string) {
+					if p == abs && armed && !raced {
+						raced = true
+						tc.race(t, path)
+					}
+				})
+				err = op.run(t, w)
+				if !raced {
+					t.Fatalf("%s never held its checkout after arming (err = %v)", op.name, err)
+				}
+				if !errors.Is(err, errCheckoutReplaced) {
+					t.Fatalf("%s = %v, want errCheckoutReplaced", op.name, err)
+				}
+				msg := err.Error()
+				if strings.Contains(msg, "in use") || strings.Contains(msg, "busy") {
+					t.Fatalf("%s = %q: a replaced checkout is neither busy nor in use", op.name, msg)
+				}
+				if !op.committed {
+					if !strings.Contains(msg, "(retry)") {
+						t.Fatalf("%s = %q: nothing committed, want a retry hint", op.name, msg)
+					}
+					err := op.run(t, w)
+					if op.name == "checkpoint" && tc.name == "removed" {
+						if err == nil || !strings.Contains(err.Error(), "no checkout") {
+							t.Fatalf("retried checkpoint of a removed checkout = %v, want 'no checkout'", err)
+						}
+					} else if err != nil {
+						t.Fatalf("retried %s = %v", op.name, err)
+					}
+					return
+				}
+				if strings.Contains(msg, "retry") {
+					t.Fatalf("%s = %q: it committed, so a retry is wrong", op.name, msg)
+				}
+				if !strings.Contains(msg, "offshoot checkout") {
+					t.Fatalf("%s = %q: want the 'offshoot checkout' next step", op.name, msg)
 				}
 			})
-			err = w.Destroy("app", "f", false)
-			if !errors.Is(err, errCheckoutReplaced) || strings.Contains(err.Error(), "in use") {
-				t.Fatalf("Destroy = %v, want errCheckoutReplaced and no 'in use'", err)
-			}
-			if err := w.Destroy("app", "f", false); err != nil {
-				t.Fatalf("retried Destroy = %v", err)
-			}
-		})
+		}
 	}
 }
 

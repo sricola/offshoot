@@ -101,9 +101,11 @@
 //     first, until at most keep remain (serve -fd-budget).
 //
 // A pinned orphan stays open: it means a session or a read outlived its
-// file. For a while that is normal. If it persists, it is a pin leak,
-// which ReadStats().StrandedPinned (offshoot_dbfile_stranded_pinned)
-// reports.
+// file. So does an orphan whose path a Hold is active on, whatever its
+// inode: a session open across two re-materializations of its checkout
+// keeps the middle file's descriptor. For a while that is normal. If it
+// persists, it is a pin leak, which ReadStats().StrandedPinned
+// (offshoot_dbfile_stranded_pinned) reports, counting both.
 //
 // A close is decided under the registry lock: nothing pins the inode and no
 // Hold is active on the path, so the entry is dropped from the registry and
@@ -176,12 +178,22 @@
 //     engine's hashSrc doc comment) and retires this package entirely.
 //
 // Until then, this package is the single chokepoint: raw reads of a live
-// SQLite database file go through here, or they are a bug. Two raw opens of
-// a checkout are not routed through here, and are kept away from in-process
-// connections instead: ops.CheckpointWith's snapshot encode, which only the
-// CLI and offshoot mcp reach and which the daemon must never call (see its
-// doc comment), and reflink.Clone, which opens and closes its source on
-// Linux, so a checkout is cloned only through Section.CloneTo.
+// SQLite database file go through here, or they are a bug. Two exceptions
+// are known:
+//
+//   - reflink.Clone opens and closes its source on Linux, so a checkout is
+//     cloned only through Section.CloneTo, never through reflink.Clone.
+//   - ops.CheckpointWith raw-opens and closes the checkout in three places:
+//     its snapshot encode (ltxio.EncodeSnapshot), its segment diff
+//     (diffPages) and its stamp's checksum (ltxio.ChecksumDatabase). Only
+//     the CLI and offshoot mcp call it, and the daemon must never (see its
+//     doc comment), so no session's capture engine shares its process. That
+//     is the only containment. In offshoot mcp, the reaper goroutine runs
+//     beside tool calls, so a TTL fork reaped while it is being checkpointed
+//     has destroy's quiesce connection open on the checkout, and any of
+//     those closes drops that connection's locks. This predates the
+//     package and is left in place: the connection only folds the WAL of a
+//     branch that is being destroyed.
 //
 // # What is NOT covered
 //
@@ -403,6 +415,7 @@ type EntryInfo struct {
 	Inode  Inode
 	Orphan bool // its path was renamed over or removed
 	Pins   int  // pins on its inode
+	Held   int  // active Holds on its path, which keep it open whatever its inode
 }
 
 // Entries lists every descriptor this package holds, sorted by path with a
@@ -412,11 +425,11 @@ func Entries() []EntryInfo {
 	defer mu.Unlock()
 	var out []EntryInfo
 	for _, e := range live {
-		out = append(out, EntryInfo{Path: e.path, Inode: e.ino, Pins: pins[e.ino]})
+		out = append(out, EntryInfo{Path: e.path, Inode: e.ino, Pins: pins[e.ino], Held: held[e.path]})
 	}
 	for _, es := range orphans {
 		for _, e := range es {
-			out = append(out, EntryInfo{Path: e.path, Inode: e.ino, Orphan: true, Pins: pins[e.ino]})
+			out = append(out, EntryInfo{Path: e.path, Inode: e.ino, Orphan: true, Pins: pins[e.ino], Held: held[e.path]})
 		}
 	}
 	sort.Slice(out, func(i, j int) bool {
@@ -714,7 +727,7 @@ type Stats struct {
 	Orphaned        int    // descriptors whose path was renamed over or removed
 	Unidentified    int    // opened but never identified; never closable (expected 0)
 	Pins            int    // outstanding pins, summed over inodes
-	StrandedPinned  int    // orphans whose inode is still pinned
+	StrandedPinned  int    // orphans kept open: their inode is pinned, or a Hold is active on their path
 	EvictedStranded uint64 // orphans closed, ever
 	EvictedBudget   uint64 // cached descriptors closed by Evict, ever
 }
@@ -734,8 +747,10 @@ func ReadStats() Stats {
 	}
 	for ino, es := range orphans {
 		s.Orphaned += len(es)
-		if pins[ino] > 0 {
-			s.StrandedPinned += len(es)
+		for _, e := range es {
+			if pins[ino] > 0 || held[e.path] > 0 {
+				s.StrandedPinned++
+			}
 		}
 	}
 	for _, n := range pins {

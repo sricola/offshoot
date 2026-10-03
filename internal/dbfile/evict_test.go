@@ -32,7 +32,7 @@ func strandedPinnedUnder(dir string) int {
 	in := under(dir)
 	n := 0
 	for _, e := range Entries() {
-		if e.Orphan && e.Pins > 0 && in(e.Path) {
+		if e.Orphan && (e.Pins > 0 || e.Held > 0) && in(e.Path) {
 			n++
 		}
 	}
@@ -129,6 +129,61 @@ func TestPinnedOrphanIsReportedNotClosed(t *testing.T) {
 	if n := evictStranded(under(dir)); n != 1 {
 		t.Fatalf("after Close: evictStranded = %d, want 1", n)
 	}
+}
+
+// TestOrphanKeptByAHeldPathIsReported: while a Hold is active on a path,
+// nothing cached under it is closed, whatever inode it names (see the
+// package doc's Pins). So a path re-materialized twice under one Hold (a
+// session open across both, with a read caching the middle file) keeps an
+// orphan open on an inode nothing pins. It must be reported with the
+// pinned ones, in ReadStats and Entries, or its descriptor and the
+// unlinked file's disk would show up only in the aggregate count.
+func TestOrphanKeptByAHeldPathIsReported(t *testing.T) {
+	dir := t.TempDir()
+	in := under(dir)
+	path := filepath.Join(dir, "c.db")
+	writeFile(t, path, "a")
+	release, _, err := Hold(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer release()
+	replaceFile(t, path, "x")
+	s, err := Reader(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	s.Close()
+	e := lookupLive(t, path)
+	before := ReadStats().StrandedPinned
+	replaceFile(t, path, "y")
+	if n := evictStranded(in); n != 0 {
+		t.Fatalf("evictStranded closed %d descriptor(s) under a held path", n)
+	}
+	if !isOrphan(e) || !isOpen(e) || pinsOf(e.ino) != 0 {
+		t.Fatal("precondition: want the middle file's descriptor an open, unpinned orphan")
+	}
+	abs, _ := filepath.Abs(path)
+	var info *EntryInfo
+	for _, ei := range Entries() {
+		if ei.Path == abs && ei.Orphan && ei.Inode == e.ino {
+			info = &ei
+		}
+	}
+	if info == nil || info.Held != 1 {
+		t.Fatalf("Entries() = %+v for the kept orphan, want Held 1", info)
+	}
+	if n := strandedPinnedUnder(dir); n != 1 {
+		t.Fatalf("stranded and kept open under the test dir = %d, want 1", n)
+	}
+	if d := ReadStats().StrandedPinned - before; d != 1 {
+		t.Fatalf("ReadStats().StrandedPinned rose by %d for the held path's orphan, want 1", d)
+	}
+	release()
+	if n := evictStranded(in); n != 1 {
+		t.Fatalf("evictStranded after release = %d, want 1", n)
+	}
+	assertClosed(t, e)
 }
 
 func TestReadStatsCountsDescriptors(t *testing.T) {

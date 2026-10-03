@@ -397,7 +397,7 @@ func (w *Workspace) CheckoutProven(db, branch string) (CheckoutResult, error) {
 	path := w.CheckoutPath(db, branch)
 	if _, err := os.Stat(path); err == nil {
 		if err := quiesce(path); err != nil {
-			return CheckoutResult{}, err
+			return CheckoutResult{}, retryLostRace("checkout", db, branch, err)
 		}
 		// checkoutState compares the sidecar's recorded (lineage, epoch,
 		// txid) against ref.Lineage/ref.HeadEpoch/ref.HeadTXID — the CURRENT
@@ -548,15 +548,20 @@ func (w *Workspace) Checkpoint(db, branch, name string, meta map[string]string) 
 // the object goes up with the same create-only put and ref CAS, and the
 // sidecar and shadow are refreshed after the CAS.
 //
-// NOT SAFE against a live in-process session's checkout: it raw-opens (and
-// closes) the checkout path to encode it, and that close drops every
-// SQLite lock this process holds on it — the POSIX (process, inode)
-// lock-drop hazard, see internal/dbfile. Today only the CLI (cmd/offshoot)
-// and MCP (internal/mcp) reach this, both of which are separate processes
-// from the daemon that runs sessions, so no in-process session can be
-// holding that checkout. The daemon conspicuously has no checkpoint op; if
-// one is ever added it MUST NOT call this directly — route the snapshot
-// through the session's own engine, or through dbfile.
+// NOT SAFE against a live in-process connection on the checkout: it
+// raw-opens (and closes) the checkout path to encode it (snapshot), to diff
+// it against the shadow (segment, diffPages) and to checksum it for the
+// stamp (stampCheckpoint), and each close drops every SQLite lock this
+// process holds on it — the POSIX (process, inode) lock-drop hazard, see
+// internal/dbfile. Today only the CLI (cmd/offshoot) and MCP
+// (internal/mcp) reach this, both of which are separate processes from the
+// daemon that runs sessions, so no in-process session can be holding that
+// checkout. In offshoot mcp the reaper goroutine still can: a TTL fork
+// reaped mid-checkpoint has Destroy's quiesce connection open on it, whose
+// locks these closes drop (a known, narrow hazard: see internal/dbfile's
+// package doc). The daemon conspicuously has no checkpoint op; if one is
+// ever added it MUST NOT call this directly — route the snapshot through
+// the session's own engine, or through dbfile.
 //
 // meta (nil = none) is a small string->string map describing this specific
 // checkpoint (e.g. eval run id, git SHA, agent id), capped by ValidateMeta
@@ -601,7 +606,7 @@ func (w *Workspace) CheckpointWith(db, branch, name string, meta map[string]stri
 			db, branch, ref.HeadTXID, db, branch)
 	}
 	if err := quiesce(path); err != nil {
-		return CheckpointResult{}, err
+		return CheckpointResult{}, retryLostRace("checkpoint", db, branch, err)
 	}
 	// The checkout's fingerprint right after quiesce, before the encode:
 	// stampCheckpoint compares it with the file it stamps, so a write
@@ -886,10 +891,35 @@ var errQuiesceBusy = errors.New("ops: database is busy (live writer or reader); 
 // errCheckoutReplaced is quiesce's error when the checkout was renamed over
 // or removed while quiesce was opening it: another operation re-materialized
 // or destroyed it in that window (see dbfile.Hold). Nothing is wrong with
-// whatever the path names now, so the caller can retry, and it is neither
-// "busy" nor "in use". It wraps the underlying error (dbfile.ErrReplaced,
-// or the open's or stat's own).
-var errCheckoutReplaced = errors.New("ops: the checkout was replaced or removed while it was being opened (retry)")
+// whatever the path names now, and it is neither "busy" nor "in use". It
+// wraps the underlying error (dbfile.ErrReplaced, or the open's or stat's
+// own). Its text carries no retry hint, because not every caller can
+// retry: an operation that has committed nothing yet adds one
+// (retryLostRace), while the promote, rollback and compact refreshes run
+// after their repoint has committed (refreshLostRace, and rollback's own
+// wrap). Retrying a promote or rollback then would move its rolling safety
+// fork onto the repointed head, leaving the original head on no branch.
+var errCheckoutReplaced = errors.New("ops: the checkout was replaced or removed while it was being opened")
+
+// retryLostRace wraps a quiesce error that lost a race with another
+// operation on the checkout (errCheckoutReplaced) in a retry hint, for a
+// caller that has committed nothing yet, so retrying it is safe: verb
+// names that operation. Any other error is returned unchanged.
+func retryLostRace(verb, db, branch string, err error) error {
+	if errors.Is(err, errCheckoutReplaced) {
+		return fmt.Errorf("ops: %s %s@%s lost a race with another operation (retry): %w", verb, db, branch, err)
+	}
+	return err
+}
+
+// refreshLostRace is the error for a refresh after a committed repoint
+// (promote, compact) whose quiesce lost a race (errCheckoutReplaced): the
+// operation stands, so it names 'offshoot checkout', and never the
+// operation itself, as the next step. done says what committed
+// ("promoted", "compacted").
+func refreshLostRace(done, path, db, branch string, err error) error {
+	return fmt.Errorf("ops: %s, but checkout %s was NOT refreshed; run 'offshoot checkout %s@%s' to refresh it: %w", done, path, db, branch, err)
+}
 
 // quiesceBusyTimeoutMS is the SQLite busy timeout (milliseconds) quiesce
 // opens with. Deliberately DIFFERENT from the capture engine's 5000ms
@@ -1886,6 +1916,9 @@ func (w *Workspace) PromoteWith(db, source, target string, opts PromoteOptions) 
 	path := w.CheckoutPath(db, target)
 	if _, err := os.Stat(path); err == nil {
 		if err := quiesce(path); err != nil {
+			if errors.Is(err, errCheckoutReplaced) {
+				return result, refreshLostRace("promoted", path, db, target, err)
+			}
 			return result, fmt.Errorf("ops: promoted, but checkout %s is in use and was NOT refreshed: %w", path, err)
 		}
 		checksum, chain, err := w.refreshFromChain(db, next, path)
@@ -2044,6 +2077,9 @@ func (w *Workspace) CompactWith(db, branch string, opts CompactOptions) (uint64,
 	path := w.CheckoutPath(db, branch)
 	if _, err := os.Stat(path); err == nil {
 		if err := quiesce(path); err != nil {
+			if errors.Is(err, errCheckoutReplaced) {
+				return txid, refreshLostRace("compacted", path, db, branch, err)
+			}
 			return txid, fmt.Errorf("ops: compacted, but checkout %s is in use and was NOT refreshed: %w", path, err)
 		}
 		checksum, chain, err := w.refreshFromChain(db, next, path)

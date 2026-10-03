@@ -186,7 +186,8 @@ state still wins, but a warning is printed to stderr first since those edits
 are about to be overwritten.
 
 **Errors:** no such `db@branch`; checkout is busy (a live connection is
-holding it) — closes connections and retry.
+holding it) — closes connections and retry; another operation replaced or
+removed the checkout while it was being opened (retry).
 
 ### Read-only historical checkout: `--at <checkpoint> --read-only [--force]`
 
@@ -379,8 +380,9 @@ that. The same rules apply to `rollback`, `promote --onto` (the target
 only) and `compact`.
 
 **Errors:** checkpoint name already exists on this branch; no checkout
-exists yet (run `checkout` first); checkout is busy; live lease without
-`--force`; detached checkout without `--force`; branch mid-destroy or
+exists yet (run `checkout` first); checkout is busy; another operation
+replaced or removed the checkout while it was being opened (retry); live
+lease without `--force`; detached checkout without `--force`; branch mid-destroy or
 mid-reap; `--meta` over a cap (key count, key length, or value length).
 
 ## `offshoot fork <db>[@branch] <new-branch> [--at checkpoint] [--ttl duration] [--meta k=v ...]`
@@ -577,8 +579,11 @@ skips minting the safety fork entirely.
 
 The ref repoint (a CAS write) is the point of no return; the local checkout
 refresh that follows is best-effort — if it fails (e.g. the checkout is
-busy), the command reports a partial success: the branch *did* roll back,
-but the checkout needs a manual `offshoot checkout` to catch up.
+busy, or another operation replaced or removed it during the refresh), the
+command reports a partial success: the branch *did* roll back, but the
+checkout needs a manual `offshoot checkout` to catch up. Do not retry the
+rollback: a second one would replace the safety fork with the
+already-rolled-back head.
 
 **Errors:** unknown checkpoint name; the branch has a live lease without
 `--force`, or is mid-destroy or mid-reap (nothing is touched);
@@ -660,7 +665,10 @@ semantics as rollback.
 mid-reap; `<target>-pre-promote` exists but is not promote's own safety fork (nothing
 is touched); the previous safety fork has a live lease (nothing is
 touched — close that session first, or `--no-backup`); target checkout is
-busy (repoint still lands; checkout refresh is skipped and reported); lost
+busy (repoint still lands; checkout refresh is skipped and reported); another
+operation replaced or removed the target checkout during that refresh (the
+promote stands: refresh it with `offshoot checkout`, not by retrying the
+promote, which would replace the safety fork with the promoted head); lost
 a concurrent CAS race (retry).
 
 **Daemon/SDK parity.** The daemon's `promote` op takes the same knobs as
@@ -723,7 +731,9 @@ and the ref swap loses the CAS and returns a retry error.
 **Errors:** no such `db@branch`; branch has a live lease (an open session,
 or `lease acquire`) without `--force`, which fences that session and loses
 its unflushed writes; branch mid-destroy or mid-reap; lost a concurrent
-CAS race to a flush (retry).
+CAS race to a flush (retry). After the repoint, a checkout that is busy,
+or that another operation replaced or removed during the refresh, is not
+refreshed; the compact stands and reports it (run `offshoot checkout`).
 
 ## `offshoot destroy <db>[@branch] [--force]`
 
@@ -757,8 +767,10 @@ point) are reclaimed on the normal GC schedule right away. In short:
 child.**
 
 **Errors:** protected without `--force`; live lease without `--force`;
-checkout is busy (close connections first); the destroy lost a race to a
-concurrent `AcquireLease` on the same branch (retry — see below).
+checkout is busy (close connections first); another operation replaced or
+removed the checkout while destroy was opening it (retry); the destroy
+lost a race to a concurrent `AcquireLease` on the same branch (retry — see
+below).
 
 ### Claim-guarded delete
 
@@ -1230,7 +1242,8 @@ by another process until it restarts.
 
 Metrics: `offshoot_dbfile_descriptors` (cached plus stranded),
 `offshoot_dbfile_pins`, `offshoot_dbfile_stranded_pinned` (stranded but
-still pinned: brief while a session or read outlives its file, a pin leak
+still pinned, by a read or connection on the file or a connection on its
+path: brief while a session or read outlives its file, a pin leak
 if it stays non-zero across passes, logged as `offshoot: janitor:
 dbfile: ...`) and `offshoot_dbfile_evicted_total{reason}` (`stranded` or
 `budget`). The daemon `status` op reports the descriptor count as

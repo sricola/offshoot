@@ -13,16 +13,16 @@ import (
 const pinnedStrandsNamed = 3
 
 // pinnedStrandsMessage is the janitor's line for stranded descriptors it had
-// to leave open because something still pins them, or "" when there are
-// none. Loud like the gc line: a session or read still open on a checkout
-// that was removed or replaced (outside offshoot, say) is ordinary and keeps
-// the file's disk until it closes, while one that outlives every session
-// and read is a pin leak. Naming the paths is what lets an operator tell
-// the two apart.
+// to leave open because something still pins them (their inode, or their
+// path through an active Hold), or "" when there are none. Loud like the gc
+// line: a session or read still open on a checkout that was removed or
+// replaced (outside offshoot, say) is ordinary and keeps the file's disk
+// until it closes, while one that outlives every session and read is a pin
+// leak. Naming the paths is what lets an operator tell the two apart.
 func pinnedStrandsMessage() string {
 	var paths []string
 	for _, e := range dbfile.Entries() {
-		if e.Orphan && e.Pins > 0 {
+		if e.Orphan && (e.Pins > 0 || e.Held > 0) {
 			paths = append(paths, e.Path)
 		}
 	}

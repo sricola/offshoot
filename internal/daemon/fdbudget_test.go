@@ -277,6 +277,45 @@ func TestJanitorBudgetZeroIsUnlimited(t *testing.T) {
 	}
 }
 
+// TestPinnedStrandsMessageNamesHeldPaths: an orphan kept open only because
+// a Hold is active on its path (a session's engine open across two
+// re-materializations of its checkout) is a stranded descriptor the janitor
+// leaves open, so its line names it like a pinned one.
+func TestPinnedStrandsMessageNamesHeldPaths(t *testing.T) {
+	dir := t.TempDir()
+	p := filepath.Join(dir, "c.db")
+	replace := func(content string) {
+		tmp := p + ".tmp"
+		if err := os.WriteFile(tmp, []byte(content), 0o600); err != nil {
+			t.Fatal(err)
+		}
+		if err := os.Rename(tmp, p); err != nil {
+			t.Fatal(err)
+		}
+	}
+	replace("a")
+	release, _, err := dbfile.Hold(p)
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() {
+		release()
+		dbfile.EvictUnder(dir)
+	})
+	replace("x")
+	s, err := dbfile.Reader(p)
+	if err != nil {
+		t.Fatal(err)
+	}
+	s.Close()
+	replace("y")
+	dbfile.EvictStranded()
+	abs, _ := filepath.Abs(p)
+	if msg := pinnedStrandsMessage(); !strings.Contains(msg, abs) {
+		t.Fatalf("janitor line %q does not name the held path's stranded descriptor %s", msg, abs)
+	}
+}
+
 // TestStatusReportsDescriptors: the status op carries dbfile's descriptor
 // count, and only status does. dbfile is process-wide, so a bare ">= 1"
 // would pass on descriptors earlier tests left behind; instead the count

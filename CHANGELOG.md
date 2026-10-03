@@ -56,11 +56,15 @@ Pin an exact version if you depend on format stability. The full contract:
   so a checkout removed between a caller's check and the open (a `destroy`
   or reap racing `branches`, or an engine started on a checkout that had
   just been removed) left an empty database at its path. Those opens now
-  never create the file. `quiesce` (behind `checkout`, `destroy`,
-  `branches` and the refreshes) reports a checkout removed or renamed over
-  while it was opening it as `ops: the checkout was replaced or removed
-  while it was being opened (retry)`, and `destroy` no longer calls such a
-  checkout "in use".
+  never create the file. A `checkout`, `checkpoint` or `destroy` (and a
+  session `open`, through its checkout) that loses this race to another
+  operation fails with `ops: <op> <db>@<branch> lost a race with another
+  operation (retry): ops: the checkout was replaced or removed while it
+  was being opened`, and none calls such a checkout "in use". A rollback,
+  promote or compact whose post-repoint refresh loses it says the
+  operation stands and names `offshoot checkout`, with no retry hint:
+  retrying a promote or rollback would replace its safety fork with the
+  already-repointed head.
 - **`create --from` a path containing `?` imported an empty database.**
   The import opened `<path>?_busy_timeout=5000`, and go-sqlite3 cut the
   name at the first `?`: `create imp --from '/dir/q?x.db'` created an
@@ -80,7 +84,7 @@ Pin an exact version if you depend on format stability. The full contract:
   path is closed, whatever file the path names by then. If the path is
   renamed over or removed between the pin and the open, the open is
   refused rather than left working on a file that is no longer the
-  checkout: `quiesce` fails with a retryable error (see Fixed), and
+  checkout: the operation fails with a lost-race error (see Fixed), and
   `create --from` fails the import. A session's capture engine that loses
   this race still opens and then fails at once: the branch shows state
   `error` with `capture stopped: dbfile: path was replaced while a SQLite
@@ -95,8 +99,10 @@ Pin an exact version if you depend on format stability. The full contract:
   closes the least recently used until `N` remain, never one an open
   session or an in-flight read pins.
 - **Four metrics:** `offshoot_dbfile_descriptors`, `offshoot_dbfile_pins`,
-  `offshoot_dbfile_stranded_pinned` (non-zero across janitor passes means a
-  pin leak, which the janitor also logs) and
+  `offshoot_dbfile_stranded_pinned` (stranded descriptors kept open by a
+  pin on their file or a connection's hold on their path; non-zero across
+  janitor passes means a pin leak, which the janitor also logs, naming the
+  paths) and
   `offshoot_dbfile_evicted_total{reason="stranded"|"budget"}`.
 - **The daemon `status` op reports `dbfile_descriptors`.** Python
   `Client.daemon_status()` and TypeScript `client.daemonStatus()` return the

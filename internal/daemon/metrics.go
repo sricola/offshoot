@@ -192,7 +192,7 @@ func newMetrics() *Metrics {
 		DBFilePins: r.NewGauge("offshoot_dbfile_pins",
 			"Outstanding pins on checkout inodes: one per open capture engine or in-process SQLite open, one per in-flight raw read. Read at scrape time."),
 		DBFileStrandedPinned: r.NewGauge("offshoot_dbfile_stranded_pinned",
-			"Stranded descriptors whose inode is still pinned. Non-zero briefly while a session or read outlives its file; non-zero across janitor passes is a pin leak."),
+			"Stranded descriptors still pinned (their inode, or their path by an open SQLite connection's hold). Non-zero briefly while a session or read outlives its file; non-zero across janitor passes is a pin leak."),
 		DBFileEvictedTotal: r.NewCounterVec("offshoot_dbfile_evicted_total",
 			"Descriptors internal/dbfile closed, by reason: stranded (its checkout was renamed over or removed) or budget (least recently used past -fd-budget).",
 			"reason"),

@@ -151,11 +151,13 @@ Usage:
                                              -reap-every runs a background reap (TTL expiry,
                                              plus self-healing any stranded delete claim) on
                                              this cadence for as long as this process is up
-                                             (default 60s; 0/none disables it) — it defers
-                                             entirely to a running offshoot serve daemon's own
+                                             (default 60s; 0/none disables it) — the reap
+                                             defers to a running offshoot serve daemon's own
                                              janitor when one is reachable (never a second
-                                             writer against the same store), and runs no GC
-                                             either way; a manual offshoot gc or offshoot serve
+                                             writer against the same store); each tick, daemon
+                                             or not, also closes this process's descriptors on
+                                             checkouts renamed over or removed; it runs no GC
+                                             either way: a manual offshoot gc or offshoot serve
                                              remains how disk is actually reclaimed
   offshoot session open <db>[@branch] [-socket PATH]      open a session; prints the checkout path
   offshoot session flush <db>[@branch] [name] [-socket PATH]   flush to a durable snapshot; prints the txid
