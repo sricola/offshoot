@@ -1713,8 +1713,14 @@ with `session_id`, it fails with `is not open`.
 
 **Errors:** `db@branch` is not open here (it was never opened, or its close
 has finished); with `session_id`, that session is neither open nor closing
-here; the session closed but its lease release failed (the lease lapses at
-its expiry, or `offshoot lease release` frees it now).
+here; the session closed but its lease release failed. In that last case
+the lease lapses at its expiry unless the branch is reopened first: a
+reopen by this daemon renews that lease in place (see `session open`
+above), and the reopened session holds it from then on. Do not free it with
+`offshoot lease release`. That command releases whatever lease the branch
+carries without asking who holds it, so once the branch has been reopened
+it releases the reopened session's lease: that session is fenced, and its
+writes since its last flush are never shipped.
 
 ## `offshoot session shutdown [-socket PATH]`
 

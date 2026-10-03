@@ -370,14 +370,34 @@ func TestCloseOnClosingSlotWaits(t *testing.T) {
 		// its map no longer refuses an open. Under this daemon's one holder,
 		// AcquireLease renews the unreleased lease in place, so the reopen
 		// keeps the closed session's holder and epoch, as reference.md's
-		// `session open` and events table say. Per-session holders will make
-		// this open wait out the lease instead; update those docs then.
+		// `session open` and events table say. That is also why its `session
+		// close` errors warn against `offshoot lease release` here: the lease
+		// it would free is now the reopened session's. Per-session holders
+		// will make this open wait out the lease instead; update those docs
+		// then.
 		if r := call(t, sock, Request{Op: "open", DB: "app", Branch: "main"}); !r.OK {
 			t.Fatalf("open after a failed close = %+v", r)
 		}
-		if cur := getStatus(t, sock, "app", "main"); cur.Holder != old.LeaseHolder || cur.Epoch != old.Epoch {
+		cur := getStatus(t, sock, "app", "main")
+		if cur.Holder != old.LeaseHolder || cur.Epoch != old.Epoch {
 			t.Fatalf("reopen after a failed release is %q@%d, want the closed session's %q@%d renewed in place",
 				cur.Holder, cur.Epoch, old.LeaseHolder, old.Epoch)
+		}
+		// `offshoot lease release` frees the lease this listing reports for
+		// the branch, and that is now the reopened session's live lease.
+		leases, err := w.Leases()
+		if err != nil {
+			t.Fatal(err)
+		}
+		var listed []ops.LeaseInfo
+		for _, l := range leases {
+			if l.DB == "app" && l.Branch == "main" {
+				listed = append(listed, l)
+			}
+		}
+		if len(listed) != 1 || listed[0].Expired || listed[0].Holder != cur.Holder || listed[0].Epoch != cur.Epoch {
+			t.Fatalf("leases on app@main after the reopen = %+v, want only the reopened session's live %q@%d",
+				listed, cur.Holder, cur.Epoch)
 		}
 	})
 
