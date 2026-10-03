@@ -1,5 +1,6 @@
-// Package dbfile hands out read-only descriptors on SQLite database files
-// that are opened at most once per process and, deliberately, NEVER closed.
+// Package dbfile hands out read-only descriptors on SQLite database files,
+// cached one per path, and closes a descriptor only when nothing in this
+// process can be relying on the locks of the inode it names.
 //
 // # Why this package exists
 //
@@ -25,44 +26,63 @@
 // the session.
 //
 // Reading a database file's raw bytes therefore cannot be done with an
-// ordinary os.Open/defer Close. It must be done through a descriptor that
-// outlives every SQLite connection that could possibly be co-resident with
-// it — which, since this package cannot know what else the process has open
-// or when it will close, means a descriptor that is never closed at all.
+// ordinary os.Open/defer Close. It must go through a descriptor whose close
+// is ordered against every SQLite connection in this process that could
+// hold locks on the same inode. This package is that ordering.
 //
-// # What this costs
+// # Pins
 //
-// This is the unattractive half of the trade and it is worse than "one fd per
-// distinct database file". Retention scales with SESSION OPENS and with
-// checkout deletions — both of which are ordinary runtime events, not rare
-// user-initiated ones. Do not reason about it as bounded by the number of
-// distinct checkouts.
+// A pin is a count on an inode (device and inode number, never a path:
+// locks belong to the inode, and two paths can name one). Two kinds of
+// caller take one:
 //
-// Two ways a descriptor becomes stranded, i.e. retained for the life of the
-// process while referring to an inode nothing can reach any more. A stranded
-// descriptor pins not just a file descriptor but the unlinked inode's disk —
-// a FULL COPY of that database — until the process exits:
+//   - Reader returns a Section over the cached descriptor, pinned until the
+//     caller closes it, so a read in progress never has its descriptor
+//     closed under it.
+//   - Hold is taken by every in-process SQLite open of a file this package
+//     may cache, BEFORE sql.Open, and released only AFTER the connection is
+//     closed: defer the release first, so it runs last on every return
+//     path. database/sql opens lazily, so the caller takes its first real
+//     connection (db.Conn) and then calls Verify, which fails with
+//     ErrReplaced if the path no longer names the held inode. Every
+//     materialization renames a fresh inode over the path, so an inode
+//     never reappears there, and Hold, Conn, then Verify is sufficient.
 //
-//   - Re-materialization. ops.Checkout materializes unconditionally, and
-//     ltxio.Materialize writes a temp file and os.Renames it over the
-//     checkout path. So every session.Open gives that path a brand-new inode
-//     and strands the descriptor for the previous one. Measured: 2 stranded
-//     descriptors after 5 session open/close cycles on a SINGLE branch.
+// Closing a descriptor whose inode nothing pins is safe by construction:
+// no read is using it and no in-process SQLite connection is open on that
+// inode, so the close has no locks to drop. That premise holds only while
+// every in-process SQLite open takes a Hold. sites_test.go fails on any
+// sql.Open, sql.OpenDB or go-sqlite3 driver use that is not on its reviewed
+// list. Another process's connections are unaffected: POSIX locks are per
+// process.
 //
-//   - Deletion. The janitor's automatic reap, and Destroy, os.Remove the
-//     checkout path (see ops/gc.go). handle() stats the path before it gets
-//     as far as revalidating the cached descriptor, so once the path is gone
-//     it returns early on ENOENT and the map entry is never revisited — the
-//     descriptor, and the deleted database's disk, linger for the life of the
-//     process with nothing that can ever reclaim them.
+// # Orphans and eviction
 //
-// This is accepted deliberately, because the alternative is not a smaller
-// leak but silent data loss: closing at the wrong moment unlocks a live
-// capture engine and loses every subsequent write, with no error anywhere.
-// A bounded-but-real disk cost is the better failure mode. It is a genuine
-// cost, though, not a rounding error, and it should not stay this way.
+// A cached descriptor is orphaned when its path is renamed over (every
+// checkout re-materialization, and every by-chain cache build's stage
+// file) or removed (destroy, reap, cache eviction). Reader notices this
+// when next asked for that path, and EvictStranded re-checks every cached
+// path, because a deleted checkout is never asked for again. Until closed,
+// an orphan pins the unlinked inode's disk: a full copy of the database.
 //
-// Tracked follow-ups, in order of how much they buy:
+//   - EvictStranded closes every unpinned orphan. ops calls it after every
+//     materialization and every destroy, and the daemon's janitor calls it
+//     every tick, which also catches what pruning the read-only cache
+//     strands.
+//   - Evict(keep) closes unpinned cached descriptors, least recently used
+//     first, until at most keep remain (serve -fd-budget).
+//
+// A pinned orphan stays open: it means a session or a read outlived its
+// file. For a while that is normal. If it persists, it is a pin leak,
+// which ReadStats().StrandedPinned (offshoot_dbfile_stranded_pinned)
+// reports.
+//
+// Every close happens with the registry lock held. Releasing it between the
+// "unpinned" check and the close would let a Hold, its sql.Open and that
+// connection's first lock land in between, and the close would then drop
+// that lock.
+//
+// Follow-ups, in order of how much they buy:
 //
 //   - MITIGATED for real now, including the daemon's default config:
 //     ops.Checkout skips materialization when checkoutState reports the
@@ -107,19 +127,16 @@
 //     mid-session rebase-on-divergence (its replica's provenance is no
 //     longer a straight line back to the checkout Open seeded it from — see
 //     Session.singleStartupRebase) does not refresh the sidecar, so that one
-//     reopen still pays the full re-materialize-and-strand cost above.
-//     Outside those cases, the daemon's default config now stays flat on
-//     reopen the same way at-rest/CLI reopen already did. One accepted,
+//     reopen still pays a full re-materialize (and orphans the old
+//     descriptor until EvictStranded closes it). Outside those cases, the
+//     daemon's default config now stays flat on reopen the same way
+//     at-rest/CLI reopen already did. One accepted,
 //     ledgered tradeoff of the clean-skip mechanism itself (not new here,
 //     just now reachable via this path too): a clean-and-current checkout
 //     is served without ever consulting the object store's chain, so a
 //     chain corrupted after the sidecar was stamped goes undetected until
 //     something else forces a re-materialize — see docs/status.md's
 //     "Clean-and-current checkout served without chain validation" row.
-//   - Reclaim map entries for paths that no longer exist, so deletion stops
-//     being permanent. (Closing the stranded descriptor is the part that
-//     needs care: it is only safe once nothing in the process can still hold
-//     SQLite locks on that inode.)
 //   - Remove the need to read these files raw at all — snapshots through
 //     SQLite's online backup API, fingerprints through a cumulative checksum
 //     the writer maintains. That is Plan 2's direction (see the capture
@@ -177,7 +194,7 @@ var (
 	pins = map[Inode]int{}
 	// unidentified holds descriptors whose inode could not be read right
 	// after opening. With no inode they cannot be checked against pins, so
-	// they are never closed. Expected to stay empty.
+	// nothing closes them. Expected to stay empty.
 	unidentified []*os.File
 	clock        uint64 // LRU clock, advanced by touchLocked
 	// Cumulative closes, for metrics: orphans closed by EvictStranded and
