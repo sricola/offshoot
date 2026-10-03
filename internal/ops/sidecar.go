@@ -129,6 +129,7 @@ func stampFingerprint(path string) (fingerprint, error) {
 	if err != nil {
 		return fingerprint{}, err
 	}
+	defer r.Close()
 	var header [28]byte
 	n, err := r.ReadAt(header[:], 0)
 	if err != nil && !errors.Is(err, io.EOF) {
@@ -617,6 +618,7 @@ func fileSum(path string) (string, error) {
 	if err != nil {
 		return "", err
 	}
+	defer r.Close()
 	h := sha256.New()
 	if _, err := io.Copy(h, r); err != nil {
 		return "", err

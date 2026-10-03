@@ -1761,7 +1761,7 @@ func (e *Engine) checkpoint(ctx context.Context, mode string) (log int, err erro
 // See dbfile's package comment; TestEngineResumesCleanly and
 // TestEngineResumeAppliesNothingBeforeNewWrite are the regression tests
 // (both hold a foreign connection open across an engine bounce).
-func (e *Engine) srcReader() (*io.SectionReader, error) {
+func (e *Engine) srcReader() (*dbfile.Section, error) {
 	return dbfile.Reader(e.o.DBPath)
 }
 
@@ -1784,6 +1784,7 @@ func (e *Engine) hashSrc() (string, error) {
 	if err != nil {
 		return "", err
 	}
+	defer r.Close()
 	h := sha256.New()
 	if _, err := io.Copy(h, r); err != nil {
 		return "", err
@@ -1801,6 +1802,7 @@ func (e *Engine) copySrc(to string) error {
 	if err != nil {
 		return err
 	}
+	defer r.Close()
 	out, err := os.Create(to)
 	if err != nil {
 		return err

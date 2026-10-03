@@ -144,79 +144,197 @@ import (
 	"io"
 	"os"
 	"path/filepath"
+	"sort"
 	"sync"
 )
 
+// Inode identifies a file independently of any path naming it.
+type Inode struct{ Dev, Ino uint64 }
+
+// entry is one descriptor this package holds. path, f and ino never change
+// once created; lastUse is guarded by mu.
+type entry struct {
+	path    string // absolute path it was opened at
+	f       *os.File
+	ino     Inode
+	lastUse uint64
+}
+
 var (
-	mu      sync.Mutex
-	handles = map[string]*os.File{}
+	mu sync.Mutex
+	// live holds one descriptor per absolute path, on the inode that path
+	// named when the descriptor was opened.
+	live = map[string]*entry{}
+	// orphans holds descriptors whose path has since been renamed over or
+	// removed, by inode. They stay referenced until closed explicitly: a
+	// dropped *os.File is closed by its finalizer at the next GC, whether or
+	// not anything still relies on its inode's locks.
+	orphans = map[Inode][]*entry{}
+	// pins counts open Sections and Holds per inode.
+	pins = map[Inode]int{}
+	// unidentified holds descriptors whose inode could not be read right
+	// after opening. With no inode they cannot be checked against pins, so
+	// they are never closed. Expected to stay empty.
+	unidentified []*os.File
+	clock        uint64 // LRU clock, advanced by touchLocked
 )
 
-// Reader returns a reader over the whole current contents of the SQLite
-// database file at path, backed by a descriptor this package keeps open for
-// the life of the process (see the package doc for why it is never closed).
+// Section is a pinned reader over one database file. It reads through
+// ReadAt with its own cursor, so concurrent Sections over one file never
+// disturb each other or the shared descriptor's offset. Its length is the
+// file's size when Reader returned it.
+type Section struct {
+	*io.SectionReader
+	ino  Inode
+	once sync.Once
+}
+
+// Close unpins the file. It never closes the descriptor (see the package
+// doc), and calling it more than once is harmless.
+func (s *Section) Close() error {
+	s.once.Do(func() { unpin(s.ino) })
+	return nil
+}
+
+// Reader returns a pinned reader over the whole current contents of the
+// SQLite database file at path, backed by this package's cached descriptor
+// for path. The caller must Close it: until then nothing can close the
+// descriptor under it. To observe a later extension of the file, call
+// Reader again.
 //
-// The returned *io.SectionReader is safe to use while other callers hold
-// readers on the same file: it carries its own cursor and addresses the file
-// through ReadAt, so it never disturbs — and is never disturbed by — the
-// shared descriptor's own file offset. It is a snapshot of the file's length
-// at the moment of this call; callers wanting to observe a subsequent
-// extension must call Reader again.
-//
-// A missing file is reported as an ordinary error (os.IsNotExist applies);
-// no descriptor is cached for it.
-func Reader(path string) (*io.SectionReader, error) {
-	f, size, err := handle(path)
+// A missing file is reported as an ordinary error (os.IsNotExist applies),
+// and a descriptor cached for that path is orphaned, not closed.
+func Reader(path string) (*Section, error) {
+	abs, err := filepath.Abs(path)
 	if err != nil {
 		return nil, err
 	}
-	return io.NewSectionReader(f, 0, size), nil
-}
-
-// handle returns the process-wide descriptor for path, opening it on first
-// use, and its current size.
-//
-// The cached descriptor is validated against the path on every call rather
-// than trusted indefinitely: a checkout that has been re-materialized
-// (write-temp-then-rename) leaves the cached descriptor pointing at the old,
-// now-unlinked inode, and hashing that would silently answer a question
-// about a file that no longer exists. On a mismatch the stale entry is
-// dropped and a fresh descriptor opened — but the stale one is still not
-// closed, because some SQLite connection in this process may hold locks on
-// that old inode and closing is exactly what must never happen.
-func handle(path string) (*os.File, int64, error) {
-	abs, err := filepath.Abs(path)
-	if err != nil {
-		return nil, 0, err
-	}
-	// Stat the path (not the descriptor) first, so a cached descriptor can be
+	// Stat the path, not the descriptor, so a cached descriptor can be
 	// checked for still naming the same inode.
-	want, err := os.Stat(abs)
-	if err != nil {
-		return nil, 0, err
-	}
+	want, statErr := os.Stat(abs)
 
 	mu.Lock()
 	defer mu.Unlock()
-
-	if f, ok := handles[abs]; ok {
-		if have, err := f.Stat(); err == nil && os.SameFile(have, want) {
-			return f, have.Size(), nil
+	if statErr != nil {
+		if os.IsNotExist(statErr) {
+			orphanLocked(abs)
 		}
-		// Different inode at the same path now. Drop the mapping; never close.
-		delete(handles, abs)
+		return nil, statErr
 	}
+	wantIno, err := inodeOf(want)
+	if err != nil {
+		return nil, err
+	}
+	e := live[abs]
+	if e != nil && e.ino != wantIno {
+		// Re-materialized: the path names a new inode now. Hashing the old
+		// one would answer a question about a file that no longer exists,
+		// and closing it is unsafe while anything pins its inode.
+		orphanLocked(abs)
+		e = nil
+	}
+	if e == nil {
+		if e, err = openLocked(abs); err != nil {
+			return nil, err
+		}
+	}
+	fi, err := e.f.Stat()
+	if err != nil {
+		return nil, err
+	}
+	pins[e.ino]++
+	touchLocked(e)
+	return &Section{SectionReader: io.NewSectionReader(e.f, 0, fi.Size()), ino: e.ino}, nil
+}
 
+// openLocked opens abs and caches it. The inode comes from the opened
+// descriptor, not the caller's earlier stat: a rename landing in between can
+// then only make the entry look stale to the next sweep, never let it borrow
+// another inode's pins.
+func openLocked(abs string) (*entry, error) {
 	f, err := os.Open(abs)
 	if err != nil {
-		return nil, 0, err
+		return nil, err
 	}
-	// Cache before anything else can fail, so a later error cannot strand an
-	// uncached descriptor that we are also not allowed to close.
-	handles[abs] = f
 	fi, err := f.Stat()
-	if err != nil {
-		return nil, 0, err
+	if err == nil {
+		var ino Inode
+		if ino, err = inodeOf(fi); err == nil {
+			e := &entry{path: abs, f: f, ino: ino}
+			live[abs] = e
+			return e, nil
+		}
 	}
-	return f, fi.Size(), nil
+	unidentified = append(unidentified, f)
+	return nil, err
+}
+
+// orphanLocked moves abs's cached descriptor, if any, to the orphan set.
+func orphanLocked(abs string) {
+	if e := live[abs]; e != nil {
+		delete(live, abs)
+		orphans[e.ino] = append(orphans[e.ino], e)
+	}
+}
+
+func touchLocked(e *entry) {
+	clock++
+	e.lastUse = clock
+}
+
+func unpin(ino Inode) {
+	mu.Lock()
+	defer mu.Unlock()
+	if pins[ino] <= 1 {
+		delete(pins, ino)
+	} else {
+		pins[ino]--
+	}
+}
+
+// PinsAt reports how many pins cover the inode path names right now. For
+// tests and diagnostics.
+func PinsAt(path string) (int, error) {
+	fi, err := os.Stat(path)
+	if err != nil {
+		return 0, err
+	}
+	ino, err := inodeOf(fi)
+	if err != nil {
+		return 0, err
+	}
+	mu.Lock()
+	defer mu.Unlock()
+	return pins[ino], nil
+}
+
+// EntryInfo describes one descriptor this package holds.
+type EntryInfo struct {
+	Path   string
+	Inode  Inode
+	Orphan bool // its path was renamed over or removed
+	Pins   int  // pins on its inode
+}
+
+// Entries lists every descriptor this package holds, sorted by path with a
+// path's live entry before its orphans. For tests and diagnostics.
+func Entries() []EntryInfo {
+	mu.Lock()
+	defer mu.Unlock()
+	var out []EntryInfo
+	for _, e := range live {
+		out = append(out, EntryInfo{Path: e.path, Inode: e.ino, Pins: pins[e.ino]})
+	}
+	for _, es := range orphans {
+		for _, e := range es {
+			out = append(out, EntryInfo{Path: e.path, Inode: e.ino, Orphan: true, Pins: pins[e.ino]})
+		}
+	}
+	sort.Slice(out, func(i, j int) bool {
+		if out[i].Path != out[j].Path {
+			return out[i].Path < out[j].Path
+		}
+		return !out[i].Orphan && out[j].Orphan
+	})
+	return out
 }
