@@ -111,9 +111,15 @@ jobs:
         with:
           persist-credentials: false
 
+      # Fuzzing runs on the newest Go minor, not go.mod's 1.26.0 floor (ci.yml
+      # keeps testing the floor). Go 1.26's fuzz coordinator can report
+      # "context deadline exceeded" as the test's failure when -fuzztime
+      # expires while a worker is mid-input (go.dev/issue/75804, fixed in
+      # 1.27.0); the 2026-10-03 run failed FuzzDecodeSnapshot that way with no
+      # crasher.
       - uses: actions/setup-go@b7ad1dad31e06c5925ef5d2fc7ad053ef454303e # v7.0.0
         with:
-          go-version-file: go.mod
+          go-version: '1.27.x'
 
       # Same loop as `make fuzz` (30s there). -fuzzminimizetime caps how
       # long each new corpus entry is minimized, which otherwise eats most
