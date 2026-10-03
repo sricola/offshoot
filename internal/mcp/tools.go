@@ -10,6 +10,7 @@ import (
 	"time"
 
 	"github.com/sricola/offshoot/internal/daemon"
+	"github.com/sricola/offshoot/internal/dbfile"
 	"github.com/sricola/offshoot/internal/ops"
 	"github.com/sricola/offshoot/internal/store"
 )
@@ -1517,7 +1518,17 @@ func (t *OffshootTools) diff(args json.RawMessage) (ToolResult, error) {
 // (mirroring ops.Workspace.Reap's own firstErr pattern), but reaped is
 // still whatever Reap actually destroyed even when ClearStaleDeleteClaims
 // (or Reap itself) errors afterward.
+//
+// First, skipped or not, it closes this process's stranded checkout
+// descriptors (dbfile.EvictStranded), the janitor's full sweep. This
+// process's own operations reclaim the strands they make, but only by
+// re-checking the paths they touched, so a checkout another process
+// destroyed, reaped or re-materialized (a CLI `destroy`, `gc` or `checkout`,
+// or the daemon) would otherwise keep its unlinked file's disk until this
+// process exits. The descriptors are this process's own whoever reaps the
+// store, so a running daemon does not make the sweep redundant.
 func (t *OffshootTools) reapOnce(now time.Time) (reaped []string, skipped bool, err error) {
+	dbfile.EvictStranded()
 	if _, up := t.daemonStatus(); up {
 		return nil, true, nil
 	}
@@ -1547,10 +1558,11 @@ func (t *OffshootTools) reapOnce(now time.Time) (reaped []string, skipped bool, 
 // the `offshoot mcp -reap-every` fallback for a store with no `offshoot
 // serve` daemon running, so a TTL set via offshoot_fork's `ttl` argument
 // (or -default-ttl) is eventually enforced even when nothing else is
-// reaping this store. every <= 0 disables the reaper entirely (no
-// goroutine started), matching StartJanitor's own contract for the same
-// shape of flag (see cmd/offshoot/main.go's -reap-every for `offshoot mcp`
-// and `offshoot serve`).
+// reaping this store. Every tick also closes this process's stranded
+// checkout descriptors, daemon or not (see reapOnce). every <= 0 disables
+// the reaper entirely (no goroutine started), matching StartJanitor's own
+// contract for the same shape of flag (see cmd/offshoot/main.go's
+// -reap-every for `offshoot mcp` and `offshoot serve`).
 //
 // Deliberately does NOT run GC: unlike the daemon's janitor, this reaper
 // has no operator-supplied grace period to run GC safely against (GC needs
