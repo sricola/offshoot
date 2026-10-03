@@ -391,11 +391,14 @@ func syncCounter(c *metrics.Counter, total uint64) {
 // daemon also needs — building gauge values while holding it would
 // serialize every concurrent open/flush/status/close behind however long a
 // scrape's per-session I/O takes.
+//
+// Closing sessions are left out, matching sessionCount: their capture has
+// stopped.
 func (s *Server) collectSessionGauges() {
 	s.mu.Lock()
 	keys := make([]string, 0, len(s.sessions))
 	for k, sl := range s.sessions {
-		if !sl.isReserved() {
+		if sl.isOpen() {
 			keys = append(keys, k)
 		}
 	}

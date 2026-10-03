@@ -200,12 +200,13 @@ type BranchInfo struct {
 	// the field is wire-additive, so an old client that never reads the key
 	// decodes exactly as before (copy-on-write Task 7).
 	Shared bool `json:"shared"`
-	// State is this branch's computed state: "active", "pending", "error",
-	// "dirty", "detached", or "idle" — see ops.BranchStateAt's doc comment
-	// for the full taxonomy and precedence, and Server.branchState for how
-	// this daemon layers its session-map-derived pending/error on top of
-	// ops's lease/sidecar-derived active/dirty/detached/idle. Deliberately
-	// no `omitempty`: exactly one of these six names always applies to a
+	// State is this branch's computed state: "active", "pending",
+	// "closing", "error", "dirty", "detached", or "idle" — see
+	// ops.BranchStateAt's doc comment for the full taxonomy and precedence,
+	// and Server.branchState for how this daemon layers its
+	// session-map-derived pending/closing/error on top of ops's
+	// lease/sidecar-derived active/dirty/detached/idle. Deliberately no
+	// `omitempty`: exactly one of these seven names always applies to a
 	// branch, so an absent field would never mean anything ("state
 	// unknown") a client should have to handle — a pre-this-field client
 	// simply doesn't read the key, and its JSON decoding is unaffected
@@ -223,14 +224,25 @@ type CheckpointInfo struct {
 	CreatedAt string `json:"created_at,omitempty"`
 }
 
-// SessionInfo describes one session open in the daemon, as returned by the
-// "status" op.
+// SessionInfo.State values.
+const (
+	SessionStateOpen    = "open"
+	SessionStateClosing = "closing"
+)
+
+// SessionInfo describes one session the daemon holds, open or closing, as
+// returned by the "status" op.
 type SessionInfo struct {
-	DB          string `json:"db"`
-	Branch      string `json:"branch"`
-	Checkout    string `json:"checkout"`
-	Holder      string `json:"holder"`
-	Epoch       uint64 `json:"epoch"`
+	DB       string `json:"db"`
+	Branch   string `json:"branch"`
+	Checkout string `json:"checkout"`
+	Holder   string `json:"holder"`
+	Epoch    uint64 `json:"epoch"`
+	// State is "open", or "closing" from the moment the daemon starts
+	// closing the session until its Close has released the lease; a closing
+	// session stays listed until then. Always set by this daemon. Additive:
+	// a client reads an absent value, from an older daemon, as "open".
+	State       string `json:"state"`
 	DurableTXID uint64 `json:"durable_txid"`
 	// DurableAge is how long it has been since the most recent successful
 	// flush (manual or automatic), rendered via time.Duration.String() at

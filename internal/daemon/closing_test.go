@@ -1,6 +1,7 @@
 package daemon
 
 import (
+	"bytes"
 	"context"
 	"encoding/json"
 	"errors"
@@ -11,6 +12,7 @@ import (
 	"testing"
 	"time"
 
+	"github.com/sricola/offshoot/internal/ops"
 	"github.com/sricola/offshoot/internal/session"
 	"github.com/sricola/offshoot/internal/store"
 )
@@ -734,5 +736,112 @@ func TestReopenWaitingWhenShutdownBeginsIsRefused(t *testing.T) {
 	}
 	if ref.LeaseHolder != "" {
 		t.Fatalf("lease still held by %q", ref.LeaseHolder)
+	}
+}
+
+func TestBranchesReportsClosing(t *testing.T) {
+	t.Run("held close", func(t *testing.T) {
+		srv, _ := newServer(t)
+		sock := srv.SocketPath()
+		closed, release := closingSession(t, sock, "app", "main")
+		resp := call(t, sock, Request{Op: "branches", DB: "app"})
+		release()
+		within(t, closed, "the close")
+		if br := branchInfo(t, resp, "main"); br.State != "closing" {
+			t.Fatalf("state = %q, want closing", br.State)
+		}
+	})
+
+	t.Run("closing outranks error", func(t *testing.T) {
+		srv, w := newServer(t)
+		sock := srv.SocketPath()
+		sess, err := session.Open(context.Background(), session.Options{
+			WS: w, DB: "app", Branch: "main", Holder: "session-a", LeaseTTL: time.Nanosecond,
+		})
+		if err != nil {
+			t.Fatal(err)
+		}
+		t.Cleanup(func() { sess.Close() })
+		if _, err := w.AcquireLease("app", "main", "thief", ops.DefaultLeaseTTL); err != nil {
+			t.Fatal(err)
+		}
+		if _, err := sess.Flush("", nil); err == nil || sess.Err() == nil {
+			t.Fatalf("session must be fenced: flush err %v, Err %v", err, sess.Err())
+		}
+		m := &slot{sess: sess, done: make(chan struct{})}
+		srv.mu.Lock()
+		srv.sessions[key("app", "main")] = m
+		srv.mu.Unlock()
+		t.Cleanup(func() { // runs before newServer's Shutdown
+			srv.mu.Lock()
+			delete(srv.sessions, key("app", "main"))
+			srv.mu.Unlock()
+			close(m.done)
+		})
+		if br := branchInfo(t, call(t, sock, Request{Op: "branches", DB: "app"}), "main"); br.State != "closing" {
+			t.Fatalf("state = %q, want closing over error", br.State)
+		}
+	})
+}
+
+func TestStatusReportsClosing(t *testing.T) {
+	srv, w := newServer(t)
+	sock := srv.SocketPath()
+	if _, err := w.Fork("app", "main", "b", "", 0, nil); err != nil {
+		t.Fatal(err)
+	}
+	if r := call(t, sock, Request{Op: "open", DB: "app", Branch: "b"}); !r.OK {
+		t.Fatalf("open b = %+v", r)
+	}
+	closed, release := closingSession(t, sock, "app", "main")
+	mainInfo := getStatus(t, sock, "app", "main")
+	bInfo := getStatus(t, sock, "app", "b")
+	release()
+	within(t, closed, "the close")
+	if mainInfo.State != SessionStateClosing || mainInfo.Holder == "" {
+		t.Fatalf("closing session = %+v, want state closing with its holder", mainInfo)
+	}
+	if bInfo.State != SessionStateOpen {
+		t.Fatalf("open session = %+v, want state open", bInfo)
+	}
+}
+
+func TestSessionCountAndGaugesExcludeClosing(t *testing.T) {
+	srv, w := newServer(t)
+	sock := srv.SocketPath()
+	if _, err := w.Fork("app", "main", "b", "", 0, nil); err != nil {
+		t.Fatal(err)
+	}
+	if r := call(t, sock, Request{Op: "open", DB: "app", Branch: "b"}); !r.OK {
+		t.Fatalf("open b = %+v", r)
+	}
+	closed, release := closingSession(t, sock, "app", "main")
+	n := srv.sessionCount()
+	var buf bytes.Buffer
+	werr := srv.WritePrometheus(&buf)
+	release()
+	within(t, closed, "the close")
+	if werr != nil {
+		t.Fatal(werr)
+	}
+	if n != 1 {
+		t.Fatalf("sessionCount = %d with one open and one closing, want 1", n)
+	}
+	out := buf.String()
+	if !strings.Contains(out, "offshoot_sessions_open 1\n") {
+		t.Fatalf("want offshoot_sessions_open 1:\n%s", out)
+	}
+	sawB := false
+	for _, line := range strings.Split(out, "\n") {
+		if !strings.HasPrefix(line, "offshoot_capture_lag_bytes{") {
+			continue
+		}
+		if strings.Contains(line, `branch="main"`) {
+			t.Fatalf("capture lag reported for the closing session: %s", line)
+		}
+		sawB = sawB || strings.Contains(line, `branch="b"`)
+	}
+	if !sawB {
+		t.Fatalf("no capture lag for the open session:\n%s", out)
 	}
 }

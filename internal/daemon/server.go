@@ -715,10 +715,18 @@ func (s *Server) opFlush(req Request) Response {
 // staleness any status endpoint already has the instant its answer is sent
 // over the wire — not a new correctness gap this introduces.
 //
+// A session that is closing is listed with state closing until its Close
+// returns. Status used to drop it the moment the close started, which told
+// a supervisor the branch was free while its lease was still held.
+//
 // The response also carries dbfile_descriptors, the
 // offshoot_dbfile_descriptors gauge read at the same moment, so a client
 // without a metrics scrape can watch the descriptor count -fd-budget bounds.
 func (s *Server) opStatus() Response {
+	type listed struct {
+		sess    *session.Session
+		closing bool
+	}
 	s.mu.Lock()
 	keys := make([]string, 0, len(s.sessions))
 	for k, sl := range s.sessions {
@@ -728,19 +736,25 @@ func (s *Server) opStatus() Response {
 		keys = append(keys, k)
 	}
 	sort.Strings(keys)
-	sessList := make([]*session.Session, 0, len(keys))
+	list := make([]listed, 0, len(keys))
 	for _, k := range keys {
-		sessList = append(sessList, s.sessions[k].sess)
+		sl := s.sessions[k]
+		list = append(list, listed{sl.sess, sl.isClosing()})
 	}
 	s.mu.Unlock()
 
-	infos := make([]SessionInfo, 0, len(sessList))
-	for _, sess := range sessList {
+	infos := make([]SessionInfo, 0, len(list))
+	for _, l := range list {
+		sess := l.sess
 		info := SessionInfo{
 			DB: sess.DB(), Branch: sess.Branch(), Checkout: sess.CheckoutPath(),
 			Holder: sess.Lease().Holder, Epoch: sess.Lease().Epoch,
+			State:       SessionStateOpen,
 			DurableTXID: sess.DurableTXID(),
 			CaptureLag:  sess.CaptureLag(),
+		}
+		if l.closing {
+			info.State = SessionStateClosing
 		}
 		if t, _, ok := sess.LastFlush(); ok {
 			info.LastFlushAt = t.Format(time.RFC3339)
@@ -758,15 +772,15 @@ func (s *Server) opStatus() Response {
 	return Response{OK: true, Sessions: infos, DBFileDescriptors: &n}
 }
 
-// sessionCount returns the number of FULLY OPEN sessions (a reserved
-// in-flight-open slot does not count, matching opStatus's own treatment) —
-// backs GET /healthz's `sessions` field.
+// sessionCount returns the number of OPEN sessions: a reserved slot (open in
+// flight) and a closing one do not count — backs GET /healthz's `sessions`
+// field.
 func (s *Server) sessionCount() int {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	n := 0
 	for _, sl := range s.sessions {
-		if !sl.isReserved() {
+		if sl.isOpen() {
 			n++
 		}
 	}
@@ -874,21 +888,25 @@ func (s *Server) lookupSessionState(db, branch string) (sessionState, *session.S
 // computes everything derivable from ref+sidecar alone (active/dirty/
 // detached/idle); only a daemon knows its own in-memory session map, so
 // only a daemon can additionally say "pending" (a slot is reserved, mid-
-// Open) or "error" (an open session's Err() has gone non-nil). ref is the
-// caller's already-fetched GetRef (opBranches always has one in hand) so
-// this never issues a second store read of its own.
+// Open), "closing" (a close is in progress: the slot is still claimed and
+// the lease still held until the release) or "error" (an open session's
+// Err() has gone non-nil). ref is the caller's already-fetched GetRef
+// (opBranches always has one in hand) so this never issues a second store
+// read of its own.
 //
-// Precedence: error and pending are session-derived and, when either
-// applies, win outright over whatever ops.BranchStateAt would have said —
-// see BranchStateAt's doc comment for the full six-state precedence list.
-// The two can never both apply to the SAME db@branch at once: s.sessions
-// holds at most one slot per key, either reserved or open, never both —
-// so this is a simple switch, not a priority
-// comparison between the two. An OPEN, HEALTHY session needs no daemon-side
+// Precedence: closing, error and pending are session-derived and, when one
+// applies, wins outright over whatever ops.BranchStateAt would have said —
+// see BranchStateAt's doc comment for the full precedence list. A fenced
+// session that is being closed matches both closing and error; closing wins
+// because it is the more actionable answer (wait, then reopen). Pending
+// never applies together with either: s.sessions holds one slot per key,
+// reserved, open or closing. An OPEN, HEALTHY session needs no daemon-side
 // casing at all: its own live lease is exactly what already makes
 // ops.BranchStateAt itself report "active".
 func (s *Server) branchState(db, branch string, ref store.Ref) string {
 	switch state, sess := s.lookupSessionState(db, branch); state {
+	case sessionClosing:
+		return "closing"
 	case sessionOpen:
 		if sess.Err() != nil {
 			return "error"
