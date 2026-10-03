@@ -579,7 +579,11 @@ func (w *Workspace) CheckpointWith(db, branch, name string, meta map[string]stri
 	// The checkout's fingerprint right after quiesce, before the encode:
 	// stampCheckpoint compares it with the file it stamps, so a write
 	// landing between the encode and the stamp cannot get our checksum
-	// attributed to bytes we never encoded.
+	// attributed to bytes we never encoded. encodeNS is the wall clock
+	// read just BEFORE that stat (the same anchoring sandwichedSum uses
+	// for StampedNS): stampCheckpoint trusts the comparison only when the
+	// fingerprint's mtime is a racily-clean margin older than this instant.
+	encodeNS := time.Now().UnixNano()
 	fpEncode, fpEncodeErr := stampFingerprint(path)
 	if checkpointAfterQuiesceForTest != nil {
 		checkpointAfterQuiesceForTest()
@@ -742,7 +746,7 @@ func (w *Workspace) CheckpointWith(db, branch, name string, meta map[string]stri
 	if (!headKnown || headSum != checksum) && ObserveCheckpointOverwrite != nil {
 		ObserveCheckpointOverwrite()
 	}
-	trusted, err := stampCheckpoint(path, ref.Lineage, ref.HeadEpoch, txid, headSum, headKnown, checksum, fpEncode, fpEncodeErr == nil)
+	trusted, err := stampCheckpoint(path, ref.Lineage, ref.HeadEpoch, txid, headSum, headKnown, checksum, fpEncode, encodeNS, fpEncodeErr == nil)
 	if err != nil {
 		return CheckpointResult{}, fmt.Errorf("ops: checkpoint %q committed (txid %d), but the checkout fingerprint could not be refreshed: %w", name, txid, err)
 	}
