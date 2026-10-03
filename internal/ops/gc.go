@@ -78,6 +78,9 @@ func (w *Workspace) Destroy(db, branch string, force bool) error {
 			// ClearStaleDeleteClaims's age-based self-heal to eventually
 			// catch.
 			w.unwindDeletingClaim(db, branch)
+			if errors.Is(err, errCheckoutReplaced) {
+				return fmt.Errorf("ops: destroy %s@%s: %w", db, branch, err)
+			}
 			return fmt.Errorf("ops: checkout in use; close connections before destroy: %w", err)
 		}
 	}

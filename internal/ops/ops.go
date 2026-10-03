@@ -883,6 +883,14 @@ func checkpointKindAt(ref store.Ref, txid uint64) string {
 // warnIfUncheckpointed) sees byte-identical output.
 var errQuiesceBusy = errors.New("ops: database is busy (live writer or reader); close connections and retry")
 
+// errCheckoutReplaced is quiesce's error when the checkout was renamed over
+// or removed while quiesce was opening it: another operation re-materialized
+// or destroyed it in that window (see dbfile.Hold). Nothing is wrong with
+// whatever the path names now, so the caller can retry, and it is neither
+// "busy" nor "in use". It wraps the underlying error (dbfile.ErrReplaced,
+// or the open's or stat's own).
+var errCheckoutReplaced = errors.New("ops: the checkout was replaced or removed while it was being opened (retry)")
+
 // quiesceBusyTimeoutMS is the SQLite busy timeout (milliseconds) quiesce
 // opens with. Deliberately DIFFERENT from the capture engine's 5000ms
 // (internal/capture/engine.go's captureBusyTimeoutMS): quiesce fails
@@ -900,9 +908,15 @@ const quiesceBusyTimeoutMS = 3000
 // lazily opened connection is on the held inode. A path that does not exist
 // fails at the Hold, and one removed after it fails the open
 // (dbfile.NoCreateDSN), instead of either being created empty by SQLite.
+// Every caller stats the checkout first, so a path missing at the Hold, or
+// replaced or removed before Verify, lost a race with another operation:
+// all of those return errCheckoutReplaced.
 func quiesce(path string) error {
 	release, ino, err := dbfile.Hold(path)
 	if err != nil {
+		if os.IsNotExist(err) {
+			return fmt.Errorf("%w: %w", errCheckoutReplaced, err)
+		}
 		return err
 	}
 	defer release()
@@ -914,11 +928,15 @@ func quiesce(path string) error {
 	ctx := context.Background()
 	conn, err := db.Conn(ctx)
 	if err != nil {
-		return fmt.Errorf("ops: checkpoint: %w", err)
+		// NoCreateDSN fails the open of a path removed after the Hold.
+		if _, serr := os.Stat(path); os.IsNotExist(serr) {
+			return fmt.Errorf("%w: %w", errCheckoutReplaced, err)
+		}
+		return fmt.Errorf("ops: open %s: %w", path, err)
 	}
 	defer conn.Close()
 	if err := dbfile.Verify(path, ino); err != nil {
-		return err
+		return fmt.Errorf("%w: %w", errCheckoutReplaced, err)
 	}
 	var busy, logN, ckptN int
 	if err := conn.QueryRowContext(ctx, "PRAGMA wal_checkpoint(TRUNCATE)").Scan(&busy, &logN, &ckptN); err != nil {
@@ -943,6 +961,10 @@ func (w *Workspace) warnIfUncheckpointed(db, branch string, ref store.Ref, actio
 		return
 	}
 	if err := quiesce(path); err != nil {
+		if errors.Is(err, errCheckoutReplaced) {
+			fmt.Fprintf(os.Stderr, "offshoot: warning: checkout of %s@%s changed while it was being checked; %s (txid %d)\n", db, branch, action, ref.HeadTXID)
+			return
+		}
 		fmt.Fprintf(os.Stderr, "offshoot: warning: checkout of %s@%s is busy; %s (txid %d)\n", db, branch, action, ref.HeadTXID)
 		return
 	}

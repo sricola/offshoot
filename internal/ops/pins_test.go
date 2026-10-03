@@ -166,6 +166,77 @@ func TestQuiesceDoesNotCreateAMissingCheckout(t *testing.T) {
 	})
 }
 
+// TestQuiesceRaceErrorsSayRetry: a checkout replaced or removed while
+// quiesce opens it lost a race with another operation. The error says so
+// and that a retry works, and destroy does not call the checkout busy or in
+// use.
+func TestQuiesceRaceErrorsSayRetry(t *testing.T) {
+	for _, tc := range []struct {
+		name  string
+		race  func(t *testing.T, path string)
+		cause error // also wrapped, when not nil
+	}{
+		{"replaced", func(t *testing.T, path string) {
+			tmp := path + ".tmp"
+			newWALFile(t, tmp)
+			if err := os.Rename(tmp, path); err != nil {
+				t.Error(err)
+			}
+		}, dbfile.ErrReplaced},
+		{"removed", func(t *testing.T, path string) {
+			if err := os.Remove(path); err != nil {
+				t.Error(err)
+			}
+		}, nil},
+	} {
+		t.Run(tc.name+"/quiesce", func(t *testing.T) {
+			path := filepath.Join(t.TempDir(), "c.db")
+			newWALFile(t, path)
+			abs, _ := filepath.Abs(path)
+			setHoldHook(t, func(p string) {
+				if p == abs {
+					tc.race(t, path)
+				}
+			})
+			err := quiesce(path)
+			if !errors.Is(err, errCheckoutReplaced) || (tc.cause != nil && !errors.Is(err, tc.cause)) {
+				t.Fatalf("quiesce = %v, want errCheckoutReplaced", err)
+			}
+			if msg := err.Error(); !strings.Contains(msg, "(retry)") || strings.Contains(msg, "checkpoint") {
+				t.Fatalf("quiesce = %q: want a retry hint and no 'checkpoint' label", msg)
+			}
+		})
+		t.Run(tc.name+"/destroy", func(t *testing.T) {
+			w := newWS(t)
+			if err := w.Create("app"); err != nil {
+				t.Fatal(err)
+			}
+			if _, err := w.Fork("app", "main", "f", "", 0, nil); err != nil {
+				t.Fatal(err)
+			}
+			path, err := w.Checkout("app", "f")
+			if err != nil {
+				t.Fatal(err)
+			}
+			abs, _ := filepath.Abs(path)
+			raced := false
+			setHoldHook(t, func(p string) {
+				if p == abs && !raced {
+					raced = true
+					tc.race(t, path)
+				}
+			})
+			err = w.Destroy("app", "f", false)
+			if !errors.Is(err, errCheckoutReplaced) || strings.Contains(err.Error(), "in use") {
+				t.Fatalf("Destroy = %v, want errCheckoutReplaced and no 'in use'", err)
+			}
+			if err := w.Destroy("app", "f", false); err != nil {
+				t.Fatalf("retried Destroy = %v", err)
+			}
+		})
+	}
+}
+
 // TestCreateFromHoldsItsImportSource: the daemon's create op imports any
 // absolute path, including a checkout of this same daemon, so the source
 // read is pinned like any checkout open, for the connection's whole life.
