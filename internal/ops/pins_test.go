@@ -6,7 +6,6 @@ import (
 	"os"
 	"os/exec"
 	"path/filepath"
-	"slices"
 	"strings"
 	"testing"
 
@@ -34,25 +33,74 @@ func setHoldHook(t *testing.T, f func(path string)) {
 	t.Cleanup(func() { dbfile.HoldHookForTest = nil })
 }
 
+// watchHeldOpen checks the one held open of path an operation makes,
+// through dbfile's test hooks, at the two edges of the pin's job. At
+// Verify, with the open's connection up, the pin must still be in place
+// and an eviction under path's directory must close nothing, though an
+// unpinned descriptor on the inode is cached there; a closed descriptor
+// would drop the connection's locks. At release, the connection must
+// already be closed: SQLite unlinks a WAL database's -wal when its last
+// connection closes, so a -wal still there means the pin is being dropped
+// under a live connection (a release deferred after the Close, or called
+// early). The returned func reports how many Verifies and releases of path
+// the hooks saw.
+func watchHeldOpen(t *testing.T, path string) (seen func() (verifies, releases int)) {
+	t.Helper()
+	abs, _ := filepath.Abs(path)
+	// The unpinned descriptor a checkout's stamp leaves behind.
+	s, err := dbfile.Reader(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	s.Close()
+	var verifies, releases int
+	dbfile.VerifyHookForTest = func(p string) {
+		if p != abs {
+			return
+		}
+		verifies++
+		if n, _ := dbfile.PinsAt(p); n != 1 {
+			t.Errorf("pins on %s with its connection open = %d, want 1", p, n)
+		}
+		if n := dbfile.EvictUnder(filepath.Dir(p)); n != 0 {
+			t.Errorf("an eviction with the connection open closed %d descriptor(s)", n)
+		}
+	}
+	dbfile.ReleaseHookForTest = func(p string) {
+		if p != abs {
+			return
+		}
+		releases++
+		if _, err := os.Stat(p + "-wal"); !os.IsNotExist(err) {
+			t.Errorf("the pin on %s was released with its connection still open (-wal stat: %v)", p, err)
+		}
+	}
+	t.Cleanup(func() {
+		dbfile.VerifyHookForTest = nil
+		dbfile.ReleaseHookForTest = nil
+	})
+	return func() (int, int) { return verifies, releases }
+}
+
+// TestQuiesceHoldsTheCheckout: quiesce's pin covers its connection from
+// open to close, so a janitor eviction running alongside branches,
+// checkout, rollback, reap or destroy cannot drop its locks partway
+// through the TRUNCATE checkpoint.
 func TestQuiesceHoldsTheCheckout(t *testing.T) {
 	path := filepath.Join(t.TempDir(), "c.db")
 	newWALFile(t, path)
-	abs, _ := filepath.Abs(path)
-	var seen []int
-	setHoldHook(t, func(p string) {
-		if p == abs {
-			n, _ := dbfile.PinsAt(p)
-			seen = append(seen, n)
-		}
-	})
+	seen := watchHeldOpen(t, path)
 	if err := quiesce(path); err != nil {
 		t.Fatal(err)
 	}
-	if len(seen) != 1 || seen[0] != 1 {
-		t.Fatalf("holds seen during quiesce = %v, want exactly one, pinned", seen)
+	if v, r := seen(); v != 1 || r != 1 {
+		t.Fatalf("quiesce verified %d and released %d hold(s) on the checkout, want 1 and 1", v, r)
 	}
 	if n, _ := dbfile.PinsAt(path); n != 0 {
 		t.Fatalf("pins after quiesce = %d, want 0", n)
+	}
+	if live, _ := descriptorsAt(t, path); !live {
+		t.Fatal("the cached descriptor on the checkout was closed while quiesce held it")
 	}
 }
 
@@ -120,22 +168,23 @@ func TestQuiesceDoesNotCreateAMissingCheckout(t *testing.T) {
 
 // TestCreateFromHoldsItsImportSource: the daemon's create op imports any
 // absolute path, including a checkout of this same daemon, so the source
-// read is pinned like any checkout open.
+// read is pinned like any checkout open, for the connection's whole life.
 func TestCreateFromHoldsItsImportSource(t *testing.T) {
 	w := newWS(t)
 	src := filepath.Join(t.TempDir(), "import.db")
 	newWALFile(t, src)
-	abs, _ := filepath.Abs(src)
-	var held []string
-	setHoldHook(t, func(p string) { held = append(held, p) })
+	seen := watchHeldOpen(t, src)
 	if err := w.CreateFrom("imp", src); err != nil {
 		t.Fatal(err)
 	}
-	if !slices.Contains(held, abs) {
-		t.Fatalf("holds = %v, want one on the import source %s", held, abs)
+	if v, r := seen(); v != 1 || r != 1 {
+		t.Fatalf("the import verified %d and released %d hold(s) on its source, want 1 and 1", v, r)
 	}
 	if n, _ := dbfile.PinsAt(src); n != 0 {
 		t.Fatalf("pins on the source after import = %d", n)
+	}
+	if live, _ := descriptorsAt(t, src); !live {
+		t.Fatal("the cached descriptor on the import source was closed while the import held it")
 	}
 }
 

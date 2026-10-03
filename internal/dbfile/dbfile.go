@@ -56,7 +56,8 @@
 // inode, so the close has no locks to drop. That premise holds only while
 // every in-process SQLite open takes a Hold. sites_test.go fails on any
 // sql.Open, sql.OpenDB or go-sqlite3 driver use that is not on its reviewed
-// list. Another process's connections are unaffected: POSIX locks are per
+// list, and on a pinned one that does not defer its release before the
+// open. Another process's connections are unaffected: POSIX locks are per
 // process.
 //
 // # Orphans and eviction
@@ -381,6 +382,21 @@ var ErrReplaced = errors.New("dbfile: path was replaced while a SQLite open held
 // process-global; set it and restore nil with t.Cleanup.
 var HoldHookForTest func(path string)
 
+// VerifyHookForTest, when non-nil, runs inside Verify with the absolute
+// path once the held open's first connection is known to be on the held
+// inode: the one moment a test can see that connection open, where it
+// checks that the pin is still in place. Test-only and process-global, like
+// HoldHookForTest.
+var VerifyHookForTest func(path string)
+
+// ReleaseHookForTest, when non-nil, runs with the held absolute path the
+// first time a Hold's release is called, just before the pin is dropped:
+// where a test checks that the connection the Hold guards is already
+// closed. A pin that is in place at Verify and dropped only after the close
+// covers the connection's whole life, since the Hold came before sql.Open.
+// Test-only and process-global, like HoldHookForTest.
+var ReleaseHookForTest func(path string)
+
 // Hold pins the inode path names now, on behalf of an in-process SQLite open
 // of that file. Take it BEFORE sql.Open, and release it only AFTER every
 // connection from that open is closed: defer release() before deferring the
@@ -416,7 +432,14 @@ func Hold(path string) (release func(), ino Inode, err error) {
 	}
 	mu.Unlock()
 	var once sync.Once
-	release = func() { once.Do(func() { unpin(ino) }) }
+	release = func() {
+		once.Do(func() {
+			if ReleaseHookForTest != nil {
+				ReleaseHookForTest(abs)
+			}
+			unpin(ino)
+		})
+	}
 	if HoldHookForTest != nil {
 		HoldHookForTest(abs)
 	}
@@ -438,6 +461,11 @@ func Verify(path string, ino Inode) error {
 	}
 	if got != ino {
 		return fmt.Errorf("%w: %s", ErrReplaced, path)
+	}
+	if VerifyHookForTest != nil {
+		if abs, err := filepath.Abs(path); err == nil {
+			VerifyHookForTest(abs)
+		}
 	}
 	return nil
 }

@@ -57,8 +57,9 @@ var attachSites = map[siteKey]bool{{"internal/ops", "DiffSummary"}: true}
 
 const classificationRule = `Every in-process SQLite open must be classified in internal/dbfile/sites_test.go:
   pinned: it can open a file dbfile may cache (any checkout, or any path a client names).
-    Call release, ino, err := dbfile.Hold(path) BEFORE sql.Open; defer release() before the
-    database's Close so it runs last; open with dbfile.NoCreateDSN (or a mode=ro URI) so a path
+    Call release, ino, err := dbfile.Hold(path) BEFORE sql.Open; defer release() before sql.Open
+    too, so it runs after the database's Close on every return path, and call it nowhere else;
+    open with dbfile.NoCreateDSN (or a mode=ro URI) so a path
     removed after the Hold is not created empty; take the first connection with db.Conn; then
     require dbfile.Verify(path, ino). Closing any descriptor on an inode drops every POSIX lock
     this process holds there, and dbfile closes cached descriptors whenever nothing pins their
@@ -71,7 +72,14 @@ hold nor drop this one's.`
 
 var attachRE = regexp.MustCompile(`(?i)\battach\s+(database\s+)?[?'":@$]`)
 
-type siteUse struct{ opens, holds, verifies, attaches []token.Pos }
+// siteUse records what one declaration does. releaseDefers are `defer r()`
+// statements and releaseCalls every other use of r, where r is bound to the
+// release a dbfile.Hold in the same declaration returned; unboundHolds are
+// Holds whose release is not bound to a name at all.
+type siteUse struct {
+	opens, holds, verifies, attaches          []token.Pos
+	releaseDefers, releaseCalls, unboundHolds []token.Pos
+}
 
 type scanResult struct {
 	fset  *token.FileSet
@@ -148,10 +156,49 @@ func (r *scanResult) file(dir, path string) error {
 		}
 		names[local] = p
 	}
+	isHold := func(e ast.Expr) bool {
+		sel, ok := e.(*ast.SelectorExpr)
+		if !ok {
+			return false
+		}
+		x, ok := sel.X.(*ast.Ident)
+		return ok && names[x.Name] == dbfilePkg && sel.Sel.Name == "Hold"
+	}
 	for _, decl := range f.Decls {
 		k := siteKey{dir, declName(decl)}
+		// The names this declaration binds a Hold's release to, so the walk
+		// below can tell how the release is used: the defer order is what
+		// keeps the pin in place until the connection is closed.
+		releases := map[string]bool{}
+		binders := map[*ast.Ident]bool{}
+		bound := map[token.Pos]bool{}
+		ast.Inspect(decl, func(n ast.Node) bool {
+			as, ok := n.(*ast.AssignStmt)
+			if !ok || len(as.Rhs) != 1 {
+				return true
+			}
+			call, ok := as.Rhs[0].(*ast.CallExpr)
+			if !ok || !isHold(call.Fun) {
+				return true
+			}
+			if id, ok := as.Lhs[0].(*ast.Ident); ok && id.Name != "_" {
+				releases[id.Name] = true
+				binders[id] = true
+				bound[call.Fun.Pos()] = true
+			}
+			return true
+		})
 		ast.Inspect(decl, func(n ast.Node) bool {
 			switch n := n.(type) {
+			case *ast.DeferStmt:
+				if id, ok := n.Call.Fun.(*ast.Ident); ok && releases[id.Name] && len(n.Call.Args) == 0 {
+					r.use(k).releaseDefers = append(r.use(k).releaseDefers, n.Pos())
+					return false
+				}
+			case *ast.Ident:
+				if releases[n.Name] && !binders[n] {
+					r.use(k).releaseCalls = append(r.use(k).releaseCalls, n.Pos())
+				}
 			case *ast.SelectorExpr:
 				x, ok := n.X.(*ast.Ident)
 				if !ok {
@@ -168,6 +215,9 @@ func (r *scanResult) file(dir, path string) error {
 						r.fset.Position(n.Pos()), n.Sel.Name, k.dir, k.fn, classificationRule))
 				case p == dbfilePkg && n.Sel.Name == "Hold":
 					r.use(k).holds = append(r.use(k).holds, n.Pos())
+					if !bound[n.Pos()] {
+						r.use(k).unboundHolds = append(r.use(k).unboundHolds, n.Pos())
+					}
 				case p == dbfilePkg && n.Sel.Name == "Verify":
 					r.use(k).verifies = append(r.use(k).verifies, n.Pos())
 				}
@@ -248,6 +298,26 @@ func check(r *scanResult, want map[siteKey]siteClass, attach map[siteKey]bool) [
 			problems = append(problems, fmt.Sprintf("%s: %s %s is classified pinned but never calls dbfile.Verify after opening\n%s",
 				r.fset.Position(first), k.dir, k.fn, classificationRule))
 		}
+		// A defer registered before sql.Open runs after every defer
+		// registered later, which includes any deferred Close of what that
+		// open returned. A release run any other way can drop the pin while
+		// the connection still holds its locks.
+		if len(u.unboundHolds) > 0 {
+			problems = append(problems, fmt.Sprintf("%s: %s %s is classified pinned but discards its dbfile.Hold's release\n%s",
+				r.fset.Position(u.unboundHolds[0]), k.dir, k.fn, classificationRule))
+		}
+		deferred := false
+		for _, d := range u.releaseDefers {
+			deferred = deferred || d < first
+		}
+		if !deferred {
+			problems = append(problems, fmt.Sprintf("%s: %s %s is classified pinned but does not defer its dbfile.Hold's release before its first sql.Open\n%s",
+				r.fset.Position(first), k.dir, k.fn, classificationRule))
+		}
+		if len(u.releaseCalls) > 0 {
+			problems = append(problems, fmt.Sprintf("%s: %s %s is classified pinned but uses its dbfile.Hold's release other than in that defer\n%s",
+				r.fset.Position(u.releaseCalls[0]), k.dir, k.fn, classificationRule))
+		}
 	}
 	for k := range want {
 		if u := r.sites[k]; u == nil || len(u.opens) == 0 {
@@ -326,21 +396,66 @@ func lateHold(p string) {
 func attach(db *sql.DB) { db.Exec("ATTACH DATABASE ? AS x", "f") }
 
 var _ = sq.SQLiteDriver{}
+
+func good(p string) {
+	release, ino, err := dbfile.Hold(p)
+	if err != nil {
+		return
+	}
+	defer release()
+	db, _ := sql.Open("sqlite3", p)
+	defer db.Close()
+	dbfile.Verify(p, ino)
+}
+
+func earlyRelease(p string) {
+	r, ino, _ := dbfile.Hold(p)
+	r()
+	db, _ := sql.Open("sqlite3", p)
+	defer db.Close()
+	dbfile.Verify(p, ino)
+}
+
+func lateDefer(p string) {
+	r, ino, _ := dbfile.Hold(p)
+	db, _ := sql.Open("sqlite3", p)
+	defer db.Close()
+	defer r()
+	dbfile.Verify(p, ino)
+}
+
+func discarded(p string) {
+	_, ino, _ := dbfile.Hold(p)
+	db, _ := sql.Open("sqlite3", p)
+	defer db.Close()
+	dbfile.Verify(p, ino)
+}
 `)
 	r, err := scan(root)
 	if err != nil {
 		t.Fatal(err)
 	}
-	got := strings.Join(check(r, map[siteKey]siteClass{{"pkg", "lateHold"}: pinned}, nil), "\n---\n")
+	classes := map[siteKey]siteClass{}
+	for _, fn := range []string{"lateHold", "good", "earlyRelease", "lateDefer", "discarded"} {
+		classes[siteKey{"pkg", fn}] = pinned
+	}
+	got := strings.Join(check(r, classes, nil), "\n---\n")
 	for _, want := range []string{
 		"unclassified SQLite open in pkg leak",
 		"pkg lateHold is classified pinned but does not call dbfile.Hold before its first sql.Open",
 		"pkg lateHold is classified pinned but never calls dbfile.Verify",
 		"SQL ATTACH in pkg attach",
 		"go-sqlite3's SQLiteDriver",
+		"pkg earlyRelease is classified pinned but does not defer its dbfile.Hold's release before its first sql.Open",
+		"pkg earlyRelease is classified pinned but uses its dbfile.Hold's release other than in that defer",
+		"pkg lateDefer is classified pinned but does not defer its dbfile.Hold's release before its first sql.Open",
+		"pkg discarded is classified pinned but discards its dbfile.Hold's release",
 	} {
 		if !strings.Contains(got, want) {
 			t.Errorf("guardrail output lacks %q:\n%s", want, got)
 		}
+	}
+	if strings.Contains(got, "pkg good ") {
+		t.Errorf("guardrail flags a correctly held open:\n%s", got)
 	}
 }
