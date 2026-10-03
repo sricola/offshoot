@@ -283,8 +283,10 @@ func sessionEventType(event string) (typ string, ok bool) {
 // finds the branch free; one acting on the session's own "closed"
 // transition would be refused by every path that refuses a closing
 // branch. holder and epoch let a subscriber match the close to its
-// session_opened. It takes the session's own lock to read the lease, so
-// closeSlot builds it before taking s.mu.
+// session_opened, except after a close whose release failed: until each
+// session has its own holder, a reopen renews that lease in place and its
+// session_opened repeats the pair. It takes the session's own lock to read
+// the lease, so closeSlot builds it before taking s.mu.
 func sessionClosedEvent(sess *session.Session, err error) Event {
 	l := sess.Lease()
 	detail := map[string]any{"holder": l.Holder, "epoch": l.Epoch}

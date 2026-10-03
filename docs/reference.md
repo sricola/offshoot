@@ -1360,6 +1360,13 @@ sees events published *after* it subscribes.
 | `evicted` | The janitor evicts a `checkouts-ro` entry over `-ro-cache-budget` | `checkpoint`, `bytes` (a by-chain entry reports branch `~by-chain` and its chain ID as `checkpoint`) |
 | `dropped_slow_consumer` | Sent to a subscriber being dropped (see below), never to anyone else | *(none)* |
 
+`holder` and `epoch` match a `session_closed` or `fenced` to its session's
+`session_opened`, with one exception until each daemon session has a lease
+holder of its own: when a close fails to release its lease, a reopen of the
+branch by the same daemon renews that lease in place, so its
+`session_opened` carries the same `holder` and `epoch` as the
+`session_closed` (with `error`) just before it.
+
 **Slow-subscriber drop:** publishing never blocks the daemon (a session
 transition or the janitor). A subscriber whose bounded buffer (64 events)
 is full when an event is published is dropped immediately: removed from
@@ -1612,7 +1619,10 @@ resolved socket). `branch` defaults to `main`.
 
 If a session on the branch is closing (another client's `close`, or one a
 killed client left running), `open` waits up to 15 s for that close to
-finish, then opens with a fresh lease epoch.
+finish, then opens with a fresh lease epoch. The one exception: if that
+close failed to release its lease, the daemon renews the lease in place,
+and the new session keeps the closed one's holder and epoch. That lasts
+until each daemon session has a lease holder of its own.
 
 **Errors:** the branch is already open by this daemon; the branch is still
 closing after 15 s (`daemon: <db>@<branch> is still closing; retry`); the

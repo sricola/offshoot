@@ -793,13 +793,15 @@ export class Client {
     }
   }
 
-  /** List every session open in the daemon. */
+  /** List every session the daemon holds, open or closing; check each
+   * one's `state` before acting on it. */
   async status(): Promise<SessionInfo[]> {
     const resp = await this._call("status");
     return resp.sessions ?? [];
   }
 
-  /** The open sessions plus daemon-wide resource counts. */
+  /** The daemon's sessions, open or closing (check each one's `state`, as
+   * for {@link Client.status}), plus daemon-wide resource counts. */
   async daemonStatus(): Promise<DaemonStatus> {
     const resp = await this._call("status");
     const st: DaemonStatus = { sessions: resp.sessions ?? [] };

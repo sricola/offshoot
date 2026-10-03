@@ -347,6 +347,10 @@ func TestCloseOnClosingSlotWaits(t *testing.T) {
 		waits := watchCloseWaits(t)
 		closed, release := closingSession(t, sock, "app", "main")
 		fr.arm(3) // every attempt Close's release makes
+		old, _, err := w.Store.GetRef("app", "main")
+		if err != nil {
+			t.Fatal(err)
+		}
 
 		again := goCall(sock, Request{Op: "close", DB: "app", Branch: "main"})
 		within(t, waits, "the second close to wait")
@@ -363,10 +367,17 @@ func TestCloseOnClosingSlotWaits(t *testing.T) {
 			t.Fatalf("a failed close left the slot %+v", sl)
 		}
 		// The daemon has let go of the branch even though the release failed:
-		// its map no longer refuses an open. (Under this daemon's one holder,
-		// AcquireLease renews the unreleased lease in place.)
+		// its map no longer refuses an open. Under this daemon's one holder,
+		// AcquireLease renews the unreleased lease in place, so the reopen
+		// keeps the closed session's holder and epoch, as reference.md's
+		// `session open` and events table say. Per-session holders will make
+		// this open wait out the lease instead; update those docs then.
 		if r := call(t, sock, Request{Op: "open", DB: "app", Branch: "main"}); !r.OK {
 			t.Fatalf("open after a failed close = %+v", r)
+		}
+		if cur := getStatus(t, sock, "app", "main"); cur.Holder != old.LeaseHolder || cur.Epoch != old.Epoch {
+			t.Fatalf("reopen after a failed release is %q@%d, want the closed session's %q@%d renewed in place",
+				cur.Holder, cur.Epoch, old.LeaseHolder, old.Epoch)
 		}
 	})
 

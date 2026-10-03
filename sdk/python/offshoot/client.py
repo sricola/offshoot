@@ -158,8 +158,9 @@ class Event:
 
 @dataclass
 class DaemonStatus:
-    """:meth:`Client.daemon_status`'s result: the open sessions (the same raw
-    dicts :meth:`Client.status` returns) plus daemon-wide resource counts.
+    """:meth:`Client.daemon_status`'s result: the daemon's sessions, open or
+    closing (the same raw dicts :meth:`Client.status` returns; check each
+    one's ``state``), plus daemon-wide resource counts.
 
     ``dbfile_descriptors`` is how many checkout descriptors the daemon holds
     open, cached plus stranded: the ``offshoot_dbfile_descriptors`` gauge.
@@ -559,7 +560,7 @@ class Client:
             sock.close()
 
     def status(self) -> list[dict[str, Any]]:
-        """List every session open in the daemon, as raw dicts.
+        """List every session the daemon holds, open or closing, as raw dicts.
 
         Each dict carries ``state``: ``"open"``, or ``"closing"`` while the
         daemon is closing the session (it stays listed until the close has
@@ -570,7 +571,8 @@ class Client:
         return cast(list[dict[str, Any]], resp.get("sessions", []))
 
     def daemon_status(self) -> DaemonStatus:
-        """The open sessions plus daemon-wide resource counts."""
+        """The daemon's sessions, open or closing (check each one's
+        ``state``, as for :meth:`status`), plus daemon-wide resource counts."""
         resp = self._call("status")
         n = resp.get("dbfile_descriptors")
         return DaemonStatus(

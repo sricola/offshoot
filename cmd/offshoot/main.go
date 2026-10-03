@@ -161,7 +161,8 @@ Usage:
                                              remains how disk is actually reclaimed
   offshoot session open <db>[@branch] [-socket PATH]      open a session; prints the checkout path
   offshoot session flush <db>[@branch] [name] [-socket PATH]   flush to a durable snapshot; prints the txid
-  offshoot session status [-socket PATH]                  list open sessions and their durable txid
+  offshoot session status [-socket PATH]                  list sessions, open or closing (state=),
+                                                          and their durable txid
   offshoot session close <db>[@branch] [-socket PATH]     close a session, releasing its lease
   offshoot session shutdown [-socket PATH]                ask the daemon to shut down gracefully
   offshoot session dbs [-socket PATH]                     list every database this store has

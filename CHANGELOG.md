@@ -94,7 +94,10 @@ Pin an exact version if you depend on format stability. The full contract:
   compact or at-rest checkpoint could run under it. A closing session now
   keeps its branch until the close has released the lease. An `open` waits
   up to 15 s for it and then takes a fresh epoch, or fails with
-  `daemon: <db>@<branch> is still closing; retry`.
+  `daemon: <db>@<branch> is still closing; retry`. If the close failed to
+  release the lease, the reopen still renews that lease in place under the
+  same holder and epoch; that ends once each daemon session has a lease
+  holder of its own.
 - **`offshoot session shutdown` could exit before every lease was
   released.** The process exited as soon as the daemon stopped listening,
   while sessions were still closing; a close another client had started
@@ -152,7 +155,9 @@ Pin an exact version if you depend on format stability. The full contract:
   inside the close; it now fires after the daemon has let go of the branch,
   so acting on it never meets a `closing` refusal, and always before the
   `session_opened` of a reopen of the same branch. It and `fenced` carry the
-  session's `holder` and `epoch`.
+  session's `holder` and `epoch`. These match it to the session's
+  `session_opened`, except after a close whose lease release failed: a
+  reopen then keeps the same pair (see Fixed).
 - **`/healthz` and `offshoot_sessions_open` count open sessions only**; a
   closing session is not counted, and reports no
   `offshoot_capture_lag_bytes` or `offshoot_durable_age_seconds`.
