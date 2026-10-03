@@ -5,6 +5,7 @@ import (
 	"sort"
 	"time"
 
+	"github.com/sricola/offshoot/internal/dbfile"
 	"github.com/sricola/offshoot/internal/metrics"
 	"github.com/sricola/offshoot/internal/ops"
 	"github.com/sricola/offshoot/internal/session"
@@ -28,7 +29,9 @@ import (
 // started with -reap-every 0, which disables the janitor entirely), which
 // is itself informative: "no usage observed yet" for a gauge that updates
 // once per pass, not continuously (see janitorTick's doc comment for the
-// resulting between-passes staleness).
+// resulting between-passes staleness). The four offshoot_dbfile_* families
+// (internal/dbfile's descriptor registry, the FD budget) are the opposite:
+// read at scrape time by collectDBFile, never set by the janitor.
 type Metrics struct {
 	Registry *metrics.Registry
 
@@ -91,6 +94,16 @@ type Metrics struct {
 	ROCacheBytes          *metrics.Gauge
 	ROCacheEvictionsTotal *metrics.Counter
 
+	// DBFile*: internal/dbfile's descriptor registry, read at scrape time
+	// (collectDBFile) because dbfile is process-wide and ops closes stranded
+	// descriptors outside the janitor too. The counter mirrors dbfile's
+	// cumulative totals, so every Server in a process reports the same
+	// process-wide numbers; production runs one.
+	DBFileDescriptors    *metrics.Gauge
+	DBFilePins           *metrics.Gauge
+	DBFileStrandedPinned *metrics.Gauge
+	DBFileEvictedTotal   *metrics.CounterVec // {reason} stranded|budget
+
 	JanitorRunsTotal *metrics.CounterVec // {result}
 }
 
@@ -98,7 +111,7 @@ type Metrics struct {
 // registered (see Metrics's doc comment), and pre-populates every metric
 // whose label set is a small, fixed, enumerable set of values (flush_total's
 // result x kind, fork_total's path, fork_mode_total's mode,
-// janitor_runs_total's result) so those
+// janitor_runs_total's result, dbfile_evicted_total's reason) so those
 // combinations expose a real "0" sample from the very first scrape rather
 // than being entirely absent until their first occurrence — a rate() query
 // over a combination that has genuinely never happened reads as 0, not "no
@@ -174,6 +187,16 @@ func newMetrics() *Metrics {
 		ROCacheEvictionsTotal: r.NewCounter("offshoot_ro_cache_evictions_total",
 			"Read-only checkout cache entries evicted by the janitor's LRU pass under -ro-cache-budget."),
 
+		DBFileDescriptors: r.NewGauge("offshoot_dbfile_descriptors",
+			"Checkout descriptors internal/dbfile holds open: cached plus stranded (path renamed over or removed). Read at scrape time."),
+		DBFilePins: r.NewGauge("offshoot_dbfile_pins",
+			"Outstanding pins on checkout inodes: one per open capture engine or in-process SQLite open, one per in-flight raw read. Read at scrape time."),
+		DBFileStrandedPinned: r.NewGauge("offshoot_dbfile_stranded_pinned",
+			"Stranded descriptors whose inode is still pinned. Non-zero briefly while a session or read outlives its file; non-zero across janitor passes is a pin leak."),
+		DBFileEvictedTotal: r.NewCounterVec("offshoot_dbfile_evicted_total",
+			"Descriptors internal/dbfile closed, by reason: stranded (its checkout was renamed over or removed) or budget (least recently used past -fd-budget).",
+			"reason"),
+
 		JanitorRunsTotal: r.NewCounterVec("offshoot_janitor_runs_total",
 			"Janitor loop ticks, by result.", "result"),
 	}
@@ -193,6 +216,9 @@ func newMetrics() *Metrics {
 		m.ForkModeTotal.WithLabelValues(mode)
 		m.RollbackTotal.WithLabelValues(mode)
 		m.PromoteTotal.WithLabelValues(mode)
+	}
+	for _, reason := range []string{"stranded", "budget"} {
+		m.DBFileEvictedTotal.WithLabelValues(reason)
 	}
 	return m
 }
@@ -308,7 +334,8 @@ func (m *Metrics) observeCheckpointOverwrite() {
 // wireHooks assigns this daemon's process-wide instrumentation hooks
 // (ops.ObserveFork, ops.ObserveCheckpoint, ops.ObserveCheckpointOverwrite,
 // ops.ObserveRollback, ops.ObservePromote, session.OnTransition) to close
-// over m, and registers m's scrape-time session-gauge collector against srv.
+// over m, and registers m's scrape-time collectors: the session gauges
+// against srv, and the dbfile registry's (collectDBFile).
 // Called once, from NewServer, before Serve starts accepting connections —
 // see OnTransition/ObserveFork's own doc comments for why a single,
 // process-wide assignment (rather than something scoped per-Server) is the
@@ -322,6 +349,28 @@ func (m *Metrics) wireHooks(srv *Server) {
 	ops.ObservePromote = m.observePromote
 	session.OnTransition = m.observeFlushTransition
 	m.Registry.Collect(srv.collectSessionGauges)
+	m.Registry.Collect(m.collectDBFile)
+}
+
+// collectDBFile is the Collect callback behind the offshoot_dbfile_*
+// families: a point-in-time read of internal/dbfile's registry, the same
+// scrape-time shape as collectSessionGauges.
+func (m *Metrics) collectDBFile() {
+	st := dbfile.ReadStats()
+	m.DBFileDescriptors.Set(float64(st.Descriptors()))
+	m.DBFilePins.Set(float64(st.Pins))
+	m.DBFileStrandedPinned.Set(float64(st.StrandedPinned))
+	syncCounter(m.DBFileEvictedTotal.WithLabelValues("stranded"), st.EvictedStranded)
+	syncCounter(m.DBFileEvictedTotal.WithLabelValues("budget"), st.EvictedBudget)
+}
+
+// syncCounter raises c to total, a cumulative count kept elsewhere.
+// Collectors run serialized per registry (Registry.WritePrometheus's
+// scrapeMu), so no two calls race on c.
+func syncCounter(c *metrics.Counter, total uint64) {
+	if d := float64(total) - c.Value(); d > 0 {
+		c.Add(d)
+	}
 }
 
 // collectSessionGauges is the Collect callback backing

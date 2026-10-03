@@ -54,6 +54,13 @@ type Server struct {
 	// flushEvery's own single-writer-before-Serve contract; cmd/offshoot's
 	// `serve` command sets it from -ro-cache-budget (default 0).
 	roCacheBudget int64
+	// fdBudget is serve -fd-budget: how many cached checkout descriptors
+	// janitorTick lets dbfile keep (dbfile.Evict), after closing stranded
+	// ones. <= 0 means unlimited: no budget pass at all, though stranded
+	// reclaim still runs. Defaults to DefaultFDBudget in NewServer. Set via
+	// SetFDBudget before Serve, mirroring roCacheBudget's
+	// single-writer-before-Serve contract.
+	fdBudget int
 	// snapshotEvery is passed as Options.SnapshotEvery to every session
 	// opOpen opens (Milestone 4 Task 6a). 0 (the zero value, matching
 	// session.Options' own default) means "let the session library apply
@@ -129,6 +136,11 @@ type Server struct {
 	httpLog io.Writer
 }
 
+// DefaultFDBudget is serve -fd-budget's default: comfortably above a
+// typical daemon's open sessions plus the at-rest checkouts it touches
+// between janitor passes, and far below any descriptor limit.
+const DefaultFDBudget = 64
+
 func key(db, branch string) string { return db + "@" + branch }
 
 func NewServer(ws *ops.Workspace, socketPath string) (*Server, error) {
@@ -165,6 +177,7 @@ func NewServer(ws *ops.Workspace, socketPath string) (*Server, error) {
 		janitorStop: make(chan struct{}),
 		metrics:     newMetrics(),
 		events:      newEventBus(),
+		fdBudget:    DefaultFDBudget,
 	}
 	// Wired here, at construction, before Serve can ever accept a
 	// connection or StartJanitor can ever tick — see wireHooks/OnTransition/
@@ -210,6 +223,17 @@ func (s *Server) SetFlushEvery(d time.Duration) {
 func (s *Server) SetROCacheBudget(bytes int64) {
 	s.mu.Lock()
 	s.roCacheBudget = bytes
+	s.mu.Unlock()
+}
+
+// SetFDBudget sets how many cached checkout descriptors the janitor lets
+// internal/dbfile keep, from the next tick on. n <= 0 means unlimited.
+// Call before Serve starts accepting connections, mirroring
+// SetROCacheBudget. A descriptor an open session or an in-flight read pins
+// is never closed, whatever the budget.
+func (s *Server) SetFDBudget(n int) {
+	s.mu.Lock()
+	s.fdBudget = n
 	s.mu.Unlock()
 }
 

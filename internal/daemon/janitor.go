@@ -4,6 +4,8 @@ import (
 	"fmt"
 	"os"
 	"time"
+
+	"github.com/sricola/offshoot/internal/dbfile"
 )
 
 // StartJanitor reaps expired branches and runs GC every interval until
@@ -51,19 +53,23 @@ func (s *Server) StartJanitor(every, grace time.Duration) {
 	}()
 }
 
-// janitorTick runs one reap+GC+ro-cache+stale-delete-claim pass and updates every
-// janitor-sourced metric (offshoot_reap_total, offshoot_gc_tombstoned_total,
-// offshoot_gc_deleted_total, offshoot_gc_errors_total, offshoot_gc_backlog,
-// offshoot_ro_cache_bytes, offshoot_ro_cache_evictions_total,
-// offshoot_janitor_runs_total{result})
+// janitorTick runs one reap+GC+ro-cache+stale-delete-claim+dbfile pass and
+// updates every janitor-sourced metric (offshoot_reap_total,
+// offshoot_gc_tombstoned_total, offshoot_gc_deleted_total,
+// offshoot_gc_errors_total, offshoot_gc_backlog, offshoot_ro_cache_bytes,
+// offshoot_ro_cache_evictions_total, offshoot_janitor_runs_total{result})
 // from its results — split out of StartJanitor's ticker loop so a test can
 // drive exactly one tick deterministically instead of waiting on a real
-// ticker. Reap/GC results are counted even when they also return an error:
-// both ops.Workspace.Reap and ops.Workspace.GC keep processing everything
-// they can and report a partial result alongside the first error they hit
-// (see their own doc comments), so len(reaped)/tombstoned/deleted are real
-// work actually done, not discarded just because something else in the same
-// pass failed. ops.Workspace.EvictROCache follows the identical convention
+// ticker. The dbfile pass's own families (offshoot_dbfile_descriptors,
+// offshoot_dbfile_pins, offshoot_dbfile_stranded_pinned,
+// offshoot_dbfile_evicted_total{reason}) are not set here: they are read at
+// scrape time (Metrics.collectDBFile), because ops closes stranded
+// descriptors outside this tick too. Reap/GC results are counted even when
+// they also return an error: both ops.Workspace.Reap and ops.Workspace.GC
+// keep processing everything they can and report a partial result
+// alongside the first error they hit (see their own doc comments), so
+// len(reaped)/tombstoned/deleted are real work actually done, not discarded
+// just because something else in the same pass failed. ops.Workspace.EvictROCache follows the identical convention
 // (see its own doc comment) for the same reason.
 // offshoot_janitor_runs_total{result} is "error" if ANY step failed, "ok"
 // only if all fully succeeded — a single counter per tick, not one per
@@ -169,6 +175,30 @@ func (s *Server) janitorTick(grace time.Duration) {
 			"checkpoint": e.Checkpoint,
 			"bytes":      e.Bytes,
 		}))
+	}
+
+	// dbfile descriptor pass, after the ro-cache pass so the descriptors its
+	// evictions strand are closed this tick: close stranded descriptors
+	// (their checkout was renamed over or removed, so each still holds a
+	// full unlinked copy of a database on disk), then hold the cached ones
+	// to -fd-budget. Neither step can fail, and neither can close a
+	// descriptor an open session's engine or an in-flight read pins. The
+	// full EvictStranded, not ops' path-scoped one, is what finds files
+	// removed by anything other than a materialize, prune or destroy.
+	// Counts reach the metrics at scrape time (collectDBFile), including
+	// closes ops made outside this tick.
+	s.mu.Lock()
+	fdBudget := s.fdBudget
+	s.mu.Unlock()
+	dbfile.EvictStranded()
+	if fdBudget > 0 {
+		dbfile.Evict(fdBudget)
+	}
+	if st := dbfile.ReadStats(); st.StrandedPinned > 0 {
+		// Loud like the gc line above: a session or read outliving its file
+		// is ordinary for a moment, but one this line keeps naming across
+		// ticks is a pin leak.
+		fmt.Fprintf(os.Stderr, "offshoot: janitor: dbfile: %d stranded descriptor(s) still pinned; a count that persists across passes is a pin leak\n", st.StrandedPinned)
 	}
 
 	result := "ok"
