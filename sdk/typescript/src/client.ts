@@ -40,7 +40,7 @@ export interface CheckpointInfo {
  * code should prefer `checkpoints_v2`.
  *
  * `state` is this branch's computed state — one of `"active"`, `"pending"`,
- * `"error"`, `"dirty"`, `"detached"`, or `"idle"`; see
+ * `"closing"`, `"error"`, `"dirty"`, `"detached"`, or `"idle"`; see
  * `internal/ops/status.go`'s `BranchStateAt` for the full taxonomy and
  * precedence. `""` against a pre-Milestone-4 daemon that never sends this
  * field at all (wire-additive: an old daemon still answers every other
@@ -83,15 +83,30 @@ export interface OffshootEvent {
   detail?: Record<string, unknown>;
 }
 
-/** One session open in the daemon, as returned by {@link Client.status}. */
+/** One session the daemon holds, open or closing, as returned by
+ * {@link Client.status}. */
 export interface SessionInfo {
   db: string;
   branch: string;
   checkout: string;
   holder: string;
   epoch: number;
+  /** `"open"`, or `"closing"` while the daemon is closing the session (it
+   * stays listed until the close has released the lease). Absent from a
+   * daemon older than the field; read that as `"open"`. */
+  state?: string;
   durable_txid: number;
   error?: string;
+}
+
+/** Daemon-wide status, as returned by {@link Client.daemonStatus}. */
+export interface DaemonStatus {
+  sessions: SessionInfo[];
+  /** Checkout descriptors the daemon holds open, cached plus stranded: the
+   * `offshoot_dbfile_descriptors` gauge. `offshoot serve -fd-budget` bounds
+   * the cached part. Absent when the daemon does not report it (one older
+   * than this SDK), so an unknown count never reads as zero. */
+  dbfile_descriptors?: number;
 }
 
 /** Options for {@link Client.fork}. */
@@ -323,6 +338,10 @@ interface RawSessionInfo {
   checkout: string;
   holder: string;
   epoch: number;
+  /** `"open"`, or `"closing"` while the daemon is closing the session (it
+   * stays listed until the close has released the lease). Absent from a
+   * daemon older than the field; read that as `"open"`. */
+  state?: string;
   durable_txid: number;
   error?: string;
 }
@@ -339,10 +358,12 @@ interface RawResponse {
   error?: string;
   checkout?: string;
   txid?: number;
+  session_id?: string;
   sessions?: RawSessionInfo[];
   branches?: RawBranchInfo[];
   databases?: string[];
   diff?: DiffResult;
+  dbfile_descriptors?: number;
 }
 
 /** @internal The subscribe op's one-line ack, read off the socket before
@@ -469,14 +490,16 @@ export class Client {
     });
   }
 
-  /** Open a live session on db@branch; returns its Session. */
+  /** Open a live session on db@branch; returns its Session. If a session on
+   * the branch is closing, the daemon waits up to 15 s for it, then fails
+   * with "still closing; retry". */
   async open(db: string, branch = "main"): Promise<Session> {
     const resp = await this._call("open", { db, branch });
     // "open" always populates checkout on an ok:true response — see
     // protocol.go's Response.Checkout — same non-defaulted assumption this
     // line always made back when resp was `any`, now spelled out as a
     // non-null assertion instead of an implicit one.
-    return new Session(this, resp.checkout!, db, branch);
+    return new Session(this, resp.checkout!, db, branch, resp.session_id);
   }
 
   /** Materialize db@branch's head snapshot at rest; returns its path. */
@@ -771,10 +794,22 @@ export class Client {
     }
   }
 
-  /** List every session open in the daemon. */
+  /** List every session the daemon holds, open or closing; check each
+   * one's `state` before acting on it. */
   async status(): Promise<SessionInfo[]> {
     const resp = await this._call("status");
     return resp.sessions ?? [];
+  }
+
+  /** The daemon's sessions, open or closing (check each one's `state`, as
+   * for {@link Client.status}), plus daemon-wide resource counts. */
+  async daemonStatus(): Promise<DaemonStatus> {
+    const resp = await this._call("status");
+    const st: DaemonStatus = { sessions: resp.sessions ?? [] };
+    if (resp.dbfile_descriptors !== undefined) {
+      st.dbfile_descriptors = resp.dbfile_descriptors;
+    }
+    return st;
   }
 
   /** Close the connection to the daemon. */
@@ -791,6 +826,10 @@ export class Session {
     public readonly path: string,
     private readonly db: string,
     private readonly branch: string,
+    /** The id the daemon's open minted for this session (undefined from a
+     * daemon too old to send one): {@link Session.close} sends it back so it
+     * can only ever close this session. */
+    private readonly sessionId?: string,
   ) {}
 
   /** Flush the checkout to a durable snapshot; returns its txid. */
@@ -805,8 +844,16 @@ export class Session {
     return this.flush(name, opts);
   }
 
-  /** Close the session, releasing its lease. */
+  /** Close the session, releasing its lease. If another close of it is in
+   * progress, waits for that one and returns its result.
+   *
+   * It closes only this session: it sends the id the daemon's open returned
+   * for it. Once this session has closed, another call fails with "session
+   * <id> on <db>@<branch> is not open", even if the branch has been opened
+   * again since. That includes a close that rejected because the lease
+   * release failed: the session is closed all the same. (A daemon too old to
+   * return the id closes whatever session is open on the branch.) */
   async close(): Promise<void> {
-    await this.client._call("close", { db: this.db, branch: this.branch });
+    await this.client._call("close", { db: this.db, branch: this.branch, session_id: this.sessionId });
   }
 }

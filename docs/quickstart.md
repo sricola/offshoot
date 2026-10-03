@@ -161,5 +161,5 @@ repoint `main` at the experiment's head and ship it (`--force` because
   `claude mcp add` away.
 - **Continuous capture while an agent writes** (no quiesce, incremental
   flushes): the daemon — see
-  [`offshoot serve`](reference.md#offshoot-serve--socket-path--reap-every-duration--gc-grace-duration--flush-every-duration--snapshot-every-n--ro-cache-budget-bytes--http-addr--token-token--http-allow-non-loopback)
+  [`offshoot serve`](reference.md#offshoot-serve--socket-path--reap-every-duration--gc-grace-duration--flush-every-duration--snapshot-every-n--ro-cache-budget-bytes--fd-budget-n--http-addr--token-token--http-allow-non-loopback)
   in the reference.

@@ -114,6 +114,15 @@ type Request struct {
 	Table    string `json:"table,omitempty"`
 	Full     bool   `json:"full,omitempty"`
 	MaxBytes int    `json:"max_bytes,omitempty"`
+
+	// SessionID (close only) names the session to close: the session_id
+	// its open returned (Response.SessionID). A close that carries it acts
+	// only on that session, open or closing. Once that session's close has
+	// finished, a retry fails with "session <id> on <db>@<branch> is not
+	// open", whoever has opened the branch since and whatever lease epoch
+	// they hold. Empty (absent, as from an older client or the CLI) closes
+	// whatever session is open on the branch.
+	SessionID string `json:"session_id,omitempty"`
 }
 
 // Response is the daemon's reply to a single Request.
@@ -122,6 +131,14 @@ type Response struct {
 	Error    string `json:"error,omitempty"`
 	Checkout string `json:"checkout,omitempty"`
 	TXID     uint64 `json:"txid,omitempty"`
+	// SessionID (open only) identifies the new session: 128 random bits
+	// the daemon mints for each open, so no two sessions share one. Send it
+	// back as Request.SessionID on close so the close can only ever close
+	// this session. The lease epoch cannot do that: a reopen after a close
+	// whose release failed keeps it, and the first open after a rollback,
+	// promote or compact of the branch, or after it is destroyed and
+	// created again, gets an epoch an earlier session already had.
+	SessionID string `json:"session_id,omitempty"`
 	// Backup (promote and rollback) names the safety fork that kept the
 	// previous head — the target's for promote (ops.PromoteResult.Backup),
 	// the branch's for rollback (ops.RollbackResult.Backup); empty when
@@ -141,6 +158,11 @@ type Response struct {
 	// path (see opDiff's doc comment for why that's what makes it safe on
 	// the HTTP surface while export is not).
 	Diff *DiffResult `json:"diff,omitempty"`
+	// DBFileDescriptors ("status" only) is how many checkout descriptors
+	// this daemon's internal/dbfile holds open, cached plus stranded: the
+	// offshoot_dbfile_descriptors gauge. A pointer so that 0 is still
+	// present on a status response, while every other op omits the key.
+	DBFileDescriptors *int `json:"dbfile_descriptors,omitempty"`
 }
 
 // DiffResult is the "diff" op's wire result: a content-aware per-table
@@ -195,12 +217,13 @@ type BranchInfo struct {
 	// the field is wire-additive, so an old client that never reads the key
 	// decodes exactly as before (copy-on-write Task 7).
 	Shared bool `json:"shared"`
-	// State is this branch's computed state: "active", "pending", "error",
-	// "dirty", "detached", or "idle" — see ops.BranchStateAt's doc comment
-	// for the full taxonomy and precedence, and Server.branchState for how
-	// this daemon layers its session-map-derived pending/error on top of
-	// ops's lease/sidecar-derived active/dirty/detached/idle. Deliberately
-	// no `omitempty`: exactly one of these six names always applies to a
+	// State is this branch's computed state: "active", "pending",
+	// "closing", "error", "dirty", "detached", or "idle" — see
+	// ops.BranchStateAt's doc comment for the full taxonomy and precedence,
+	// and Server.branchState for how this daemon layers its
+	// session-map-derived pending/closing/error on top of ops's
+	// lease/sidecar-derived active/dirty/detached/idle. Deliberately no
+	// `omitempty`: exactly one of these seven names always applies to a
 	// branch, so an absent field would never mean anything ("state
 	// unknown") a client should have to handle — a pre-this-field client
 	// simply doesn't read the key, and its JSON decoding is unaffected
@@ -218,14 +241,25 @@ type CheckpointInfo struct {
 	CreatedAt string `json:"created_at,omitempty"`
 }
 
-// SessionInfo describes one session open in the daemon, as returned by the
-// "status" op.
+// SessionInfo.State values.
+const (
+	SessionStateOpen    = "open"
+	SessionStateClosing = "closing"
+)
+
+// SessionInfo describes one session the daemon holds, open or closing, as
+// returned by the "status" op.
 type SessionInfo struct {
-	DB          string `json:"db"`
-	Branch      string `json:"branch"`
-	Checkout    string `json:"checkout"`
-	Holder      string `json:"holder"`
-	Epoch       uint64 `json:"epoch"`
+	DB       string `json:"db"`
+	Branch   string `json:"branch"`
+	Checkout string `json:"checkout"`
+	Holder   string `json:"holder"`
+	Epoch    uint64 `json:"epoch"`
+	// State is "open", or "closing" from the moment the daemon starts
+	// closing the session until its Close has released the lease; a closing
+	// session stays listed until then. Always set by this daemon. Additive:
+	// a client reads an absent value, from an older daemon, as "open".
+	State       string `json:"state"`
 	DurableTXID uint64 `json:"durable_txid"`
 	// DurableAge is how long it has been since the most recent successful
 	// flush (manual or automatic), rendered via time.Duration.String() at

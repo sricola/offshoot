@@ -394,6 +394,20 @@ milliseconds don't):
   on the claim. The 30 s is judged on each host's clock, so it also
   assumes the hosts sharing a store agree on the time: a claim stamped
   more than a minute ahead of a host's clock counts as abandoned there.
+- **Wait for an at-rest `checkout`, `rollback`, `promote` or `compact` to
+  return before opening the same branch in the daemon.** Those daemon ops
+  check for an open session without reserving the branch, so an `open`
+  landing while one runs can fail at once, because the checkout was
+  replaced under its capture engine
+  ([status](status.md#daemon-and-durability)). A `close` in progress needs
+  no such care: an `open` waits for it.
+- **Retry a `close` with its session's `session_id`.** `offshoot session
+  close`, and a daemon `close` that sends no `session_id`, close whatever
+  session is open on the branch, so one retried after the first close has
+  finished closes a session opened since. A `close` that sends the
+  `session_id` its `open` returned closes only that session; the SDKs'
+  `Session.close()` sends it
+  ([details](reference.md#offshoot-session-close-dbbranch--socket-path)).
 - **Never `export --force` over a database another process has open.**
   `export` writes a temp file and renames it over the destination; a
   process with the old file open keeps writing to the replaced inode, and

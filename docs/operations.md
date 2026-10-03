@@ -44,8 +44,8 @@ build a dashboard against a name not in this table.
 | Metric | Type | Labels | Meaning |
 |---|---|---|---|
 | `offshoot_build_info` | gauge | `version` | Always `1`; the `version` label identifies the running build (`"dev"` outside a released binary). |
-| `offshoot_sessions_open` | gauge | — | Number of sessions currently open in this daemon. |
-| `offshoot_capture_lag_bytes` | gauge | `db`, `branch` | WAL bytes committed by writers but not yet applied to the replica. **Open sessions only** — a branch with no live session reports nothing (not zero — absent). |
+| `offshoot_sessions_open` | gauge | — | Number of sessions currently open in this daemon; a session that is closing is not counted. |
+| `offshoot_capture_lag_bytes` | gauge | `db`, `branch` | WAL bytes committed by writers but not yet applied to the replica. **Open sessions only** — a branch with no live session, or whose session is closing, reports nothing (not zero — absent). |
 | `offshoot_durable_age_seconds` | gauge | `db`, `branch` | Seconds since that session's last successful flush. **Open sessions only**, same absence-not-zero rule. |
 | `offshoot_flush_total` | counter | `result` (`ok`/`error`), `kind` (`auto`/`manual`) | Session flushes, by outcome and whether it was `serve -flush-every`'s timer or an explicit `flush` call. All four combinations are pre-registered at `0` from daemon start, so a `rate()` over a combination that's never happened reads `0`, not "no data." |
 | `offshoot_flush_duration_seconds` | histogram | — | Flush latency, fixed buckets (see [Histogram buckets](#histogram-buckets) below). |
@@ -63,6 +63,10 @@ build a dashboard against a name not in this table.
 | `offshoot_gc_errors_total` | counter | — | Janitor GC passes that returned an error. GC **fails closed** — an incomplete reachability mark deletes nothing — so a persistently increasing value means garbage is accumulating unreclaimed; the paired `offshoot: janitor: gc:` stderr line carries the cause. |
 | `offshoot_ro_cache_bytes` | gauge | — | Bytes currently used by `checkouts-ro` (the read-only checkpoint cache). Updated **once per janitor pass**, not continuously — see [Budgets](#budgets) below for what that staleness window means in practice. |
 | `offshoot_ro_cache_evictions_total` | counter | — | `checkouts-ro` entries evicted by the janitor's LRU pass under `-ro-cache-budget`. Zero forever on a daemon started with the default (unlimited) budget. |
+| `offshoot_dbfile_descriptors` | gauge | — | Checkout descriptors the daemon holds open: cached plus stranded (a checkout renamed over or removed). Read at scrape time. `-fd-budget` bounds the cached part; see [Resource behavior](#resource-behavior). |
+| `offshoot_dbfile_pins` | gauge | — | Outstanding pins on checkout files: one per open session's capture engine or other in-process SQLite open, one per raw read in progress. A pinned descriptor is never closed. Read at scrape time. |
+| `offshoot_dbfile_stranded_pinned` | gauge | — | Stranded descriptors that are still pinned: their file, or their path by an open SQLite connection (a session open while its checkout is re-materialized twice keeps the middle file's descriptor). Non-zero for a moment while a session or read outlives its file; non-zero across janitor passes is a pin leak, which the janitor also logs (`offshoot: janitor: dbfile:`). Read at scrape time. |
+| `offshoot_dbfile_evicted_total` | counter | `reason` (`stranded`/`budget`) | Descriptors closed, by reason: `stranded` (reclaimed after the checkout was renamed over or removed) or `budget` (least recently used past `-fd-budget`). Both values pre-registered at `0`. Process-wide, so closes made right after a checkout, prune or destroy count too, not only the janitor's. |
 | `offshoot_janitor_runs_total` | counter | `result` (`ok`/`error`) | Janitor loop ticks, by whether the tick completed cleanly. Both values pre-registered at `0`; stays entirely at `0` if `-reap-every 0` disabled the janitor. |
 
 ### Histogram buckets
@@ -110,17 +114,22 @@ $ curl -s -H "Authorization: Bearer verify-token-123" http://127.0.0.1:18080/met
 # TYPE offshoot_gc_errors_total counter
 # TYPE offshoot_ro_cache_bytes gauge
 # TYPE offshoot_ro_cache_evictions_total counter
+# TYPE offshoot_dbfile_descriptors gauge
+# TYPE offshoot_dbfile_pins gauge
+# TYPE offshoot_dbfile_stranded_pinned gauge
+# TYPE offshoot_dbfile_evicted_total counter
 # TYPE offshoot_janitor_runs_total counter
 ```
 
-Twenty-one `# TYPE` lines, matching the twenty-one rows in the table above exactly
+Twenty-five `# TYPE` lines, matching the twenty-five rows in the table above exactly
 — that grep is the whole verification: run it yourself against a running
 daemon any time this table is in doubt.
 
 ### Grafana dashboard
 
-A ready-to-import dashboard covering nineteen of the twenty-one families
-above (all but `offshoot_rollback_total` and `offshoot_promote_total`) ships
+A ready-to-import dashboard covering nineteen of the twenty-five families
+above (all but `offshoot_rollback_total`, `offshoot_promote_total` and the
+four `offshoot_dbfile_*` families) ships
 as [docs/grafana-dashboard.json](grafana-dashboard.json) — flush
 rate/latency, the shared-vs-materialized fork split, at-rest checkpoint
 latency and detected overwrites, GC (with `offshoot_gc_errors_total`
@@ -130,7 +139,7 @@ Prometheus datasource when prompted.
 
 ## Branch states
 
-Every branch is in exactly one of six computed states — nothing about state
+Every branch is in exactly one of seven computed states — nothing about state
 is persisted anywhere; `offshoot status` and the daemon `branches` op
 recompute it fresh on every call. Full mechanics, cost, and edge cases are
 in [docs/reference.md](reference.md#branch-states); this table is the
@@ -141,18 +150,20 @@ paged-at-3am version — what each state means for *you*, right now.
 | `active` | Someone holds a live lease and is (or was recently) writing. Normal for any branch in active use. | Both CLI/at-rest and daemon |
 | `pending` | This daemon has a session slot reserved and is mid-`open` — not yet live, but spoken for. If a branch sits here for more than a few seconds, `open` is stuck (slow store attach, a wedged lock) — investigate that daemon, not the branch. | Daemon only |
 | `error` | A session is open and its `Err()` is non-nil — lease loss, a capture failure, a contract violation. **This is the state to alert on.** `session status` (or the daemon `status` op) names the actual error. | Daemon only |
+| `closing` | A session here is closing: capture has stopped and the lease is released when the close finishes. `open` waits for it (up to 15 s); rollback, promote, compact, checkout and destroy refuse with "retry". A branch that stays here more than a few seconds is a slow close (a long flush ahead of it, or a slow store) — check the daemon's log. | Daemon only |
 | `dirty` | No live lease; a checkout exists with un-checkpointed local edits (content hash differs from the ref, sidecar identity otherwise matches). Expected mid-workflow (someone's `sqlite3`'d the checkout by hand); unexpected on a branch you thought was fully flushed. | Both |
 | `detached` | No live lease; a checkout's sidecar-recorded lineage no longer matches the ref's current lineage — an orphan left behind by a `rollback`/`promote` whose best-effort checkout refresh didn't run (the checkout was busy at repoint time). Re-run `offshoot checkout` to fix it; the old checkout content isn't wrong, just stale relative to a branch that moved on. | Both |
 | `idle` | None of the above — nothing going on. **A deliberate addition** to the original state taxonomy (see reference.md's note); added because at-rest `offshoot status` has no daemon and needs a name for "quiet." | Both |
 
-**Precedence, most to least specific:** `error` > `pending` > `active` >
-`dirty` > `detached` > `idle`. `error` and `pending` can never both apply to
-one branch (a daemon's session map holds at most one entry per `db@branch`).
-The precedence that actually bites in practice is `active` over
-`dirty`/`detached`: a branch can be both leased and locally modified at the
-file level, and the lease wins the report — don't read `active` as "nothing
-else to worry about here," it just means the lease question was answered
-first.
+**Precedence, most to least specific:** `closing` > `error` > `pending` >
+`active` > `dirty` > `detached` > `idle`. `pending` never applies together
+with `closing` or `error` (a daemon's session map holds one entry per
+`db@branch`). A fenced session that is being closed reads `closing`, not
+`error`: wait for the close, then reopen. The precedence that actually
+bites in practice is `active` over `dirty`/`detached`: a branch can be both
+leased and locally modified at the file level, and the lease wins the
+report — don't read `active` as "nothing else to worry about here," it just
+means the lease question was answered first.
 
 **Cost note for operators:** determining `dirty` requires a real WAL
 checkpoint plus a full SHA-256 hash of the checkout, per branch, on every
@@ -175,7 +186,7 @@ branch or, if its deadline has moved since, clears the claim. Until then
 `open`, `touch`, `lease acquire` and `checkpoint` refuse it as being
 reaped. The failed destroy cannot clear the reap claim itself: it cannot
 tell it from one whose reaper is still on its way to its delete. None of
-the six states above surface either claim:
+the seven states above surface either claim:
 they're computed purely from the ref's lease and the checkout's sidecar,
 which a Destroy/Reap claim doesn't touch, so `status`/`branches` reads that
 same branch as `idle` (or `active`, if it still carries a lease at that
@@ -203,7 +214,7 @@ section is the operational summary.
 | `flushed` | A flush succeeds (manual or the `-flush-every` timer) |
 | `flush_failed` | A flush fails |
 | `fenced` | A session is fenced out by a lease it no longer holds |
-| `session_closed` | A session closes |
+| `session_closed` | A session's close has finished and the daemon has let go of the branch: acting on it never meets a `closing` refusal, and it arrives before a reopen's `session_opened` |
 | `reaped` | The janitor destroys a TTL-expired branch |
 | `evicted` | The janitor evicts a `checkouts-ro` entry over `-ro-cache-budget` |
 | `dropped_slow_consumer` | Sent to a subscriber right before it's dropped — never to anyone else |
@@ -256,9 +267,8 @@ from (see [below](#the-by-chain-cache-and-the-checkout-sidecars)). **`checkouts/
 tree) is never evicted, by construction** — there is no code path in the
 eviction pass that can even name a `checkouts/` path, so a leased, currently
 open session's checkout survives even the most aggressive budget (`1`, which
-forces every `checkouts-ro` entry out) untouched. FD budgets beyond this are
-deliberately out of scope for this milestone — see
-[Deliberately out of scope](#deliberately-out-of-scope) below.
+forces every `checkouts-ro` entry out) untouched. Descriptors have their
+own budget, `serve -fd-budget`; see [Resource behavior](#resource-behavior).
 
 **The LRU clock is a `.last-used` touch-on-hit file, not the cache file's
 own mtime.** A cache file's mtime is set exactly once, by the materialize
@@ -576,22 +586,45 @@ the storage-cost ledger, stated plainly:
 
 ## Resource behavior
 
-An open session's FD footprint is small and fixed. Disk is the sharper
-cost: `Checkout` reuses a checkout that's already clean and current at the
-branch's head instead of re-materializing it, so a daemon that keeps
-reopening the same untouched branch stays flat. A checkout that *does* get
-re-materialized (dirty, stale, or destroyed while an earlier descriptor
-still points at it) strands one descriptor — and the disk behind it — for
-the life of the daemon process; restarting the daemon reclaims everything.
-The tradeoff to know: a clean-and-current checkout is served straight from
-disk without consulting the store's chain. Full mechanics and caveats:
-[Budgets](#budgets) and
-[status](status.md)'s resource-behavior rows.
+**Descriptors.** offshoot reads checkout files raw (to fingerprint and
+snapshot them) through descriptors it caches, one per checkout path. An
+open session pins its checkout's descriptor for as long as it is open:
+the session's capture engine holds SQLite locks on that file, and closing
+any descriptor on it would drop them. A checkout that gets re-materialized
+(dirty, stale, or refreshed by rollback, promote or compact) or deleted
+(destroy, reap) strands its old descriptor, and with it the unlinked
+file's disk: a full copy of the database. So does a `~by-chain/` entry
+the by-chain bound prunes. offshoot closes a stranded descriptor as soon
+as nothing pins it. A process closes the ones it strands itself right
+after the materialize, by-chain prune or destroy that stranded them. A
+checkout another process removes or replaces (a CLI `destroy`, `gc` or
+`checkout` against the store a daemon or `offshoot mcp` is serving) is
+found only by a full sweep: the daemon's janitor runs one every pass, and
+`offshoot mcp` on every `-reap-every` tick (default `60s`). With
+`-reap-every 0`, either process keeps those until it restarts.
+`serve -fd-budget N` (default `64`, `0` unlimited) bounds the rest:
+each janitor pass closes cached descriptors least recently used first
+until `N` remain, never one an open session or an in-flight read pins,
+so a daemon with more open sessions than `N` keeps one per session. The
+budget counts every file the cache holds, `checkouts-ro/<db>/~by-chain/`
+entries included, and nothing else (not sockets, not WAL readers).
+`offshoot_dbfile_descriptors` and the daemon `status` op's
+`dbfile_descriptors` report the total. A session whose checkout another
+request re-materializes or removes in the instant its capture engine
+opens it fails at once (state `error`, `capture stopped: dbfile: path was
+replaced while a SQLite open held it`); close and reopen it.
+
+**Disk.** `Checkout` reuses a checkout that's already clean and current at
+the branch's head instead of re-materializing it, so a daemon that keeps
+reopening the same untouched branch stays flat. The tradeoff to know: a
+clean-and-current checkout is served straight from disk without
+consulting the store's chain. Full mechanics and caveats:
+[Budgets](#budgets) and [status](status.md)'s resource-behavior rows.
 
 **Read-only historical checkouts** (`offshoot checkout --at <checkpoint>
 --read-only`) live in a separate `checkouts-ro/` tree — one `chmod 0444`
-file per `(db, branch, checkpoint)`, no sidecar, no lease, no stranded
-descriptor. The same tree holds `~by-chain/`, the immutable entries every
+file per `(db, branch, checkpoint)`, no sidecar, no lease, nothing a
+session pins. The same tree holds `~by-chain/`, the immutable entries every
 checkout is cloned from where the filesystem can clone. **It is safe to
 `rm -rf` the entire `checkouts-ro` directory at any time**; the next call
 rebuilds what it needs from the store. `offshoot export`'s output has the same
@@ -599,7 +632,7 @@ zero-ongoing-relationship property, written wherever you pointed it.
 
 ## Tuning flags
 
-All five are `offshoot serve` flags; none are persisted, so a restarted
+All six are `offshoot serve` flags; none are persisted, so a restarted
 daemon needs them passed again (or scripted the same way every time —
 there's no config file).
 
@@ -607,9 +640,10 @@ there's no config file).
 |---|---|---|
 | `-flush-every DURATION` | `30s` (`0` disables) | How much committed-but-unflushed work is ever at risk: a daemon that dies loses at most one interval's worth of writes. Lower = tighter bound on data loss, more frequent background upload traffic. `0` returns to "durability only advances on explicit `flush`," this project's original behavior. |
 | `-snapshot-every N` | `16` (must be `>= 1`) | How many segments a read replays past the last snapshot before it's capped by a fresh full upload. Lower N = cheaper, more tightly bounded reads, at the cost of a full-database upload more often; higher N amortizes upload cost across more flushes at the cost of longer per-read replay. See [docs/benchmarks.md](benchmarks.md) for the measured trade-off at the default of 16, and the flush-cost interaction below. |
-| `-reap-every DURATION` | `1m` (`0` disables the janitor entirely) | How often the janitor sweeps for TTL-expired branches, runs GC, and (if a budget is set) evicts over-budget `checkouts-ro` entries. `0` doesn't just slow this down — it turns the whole janitor loop off; `offshoot gc` remains available on demand. Every metric this page's [Budgets](#budgets)/GC rows describe as "once per pass" is gated on this same interval. |
+| `-reap-every DURATION` | `1m` (`0` disables the janitor entirely) | How often the janitor sweeps for TTL-expired branches, runs GC, (if a budget is set) evicts over-budget `checkouts-ro` entries, closes stranded checkout descriptors, and holds the rest to `-fd-budget`. `0` doesn't just slow this down — it turns the whole janitor loop off; `offshoot gc` remains available on demand. Every metric this page's [Budgets](#budgets)/GC rows describe as "once per pass" is gated on this same interval. |
 | `-gc-grace DURATION` | `15m` | How long a tombstoned (unreachable) storage object sits before it's actually deleted. `0` makes it eligible on the very next `-reap-every` tick after tombstoning, rather than disabling GC. An object re-referenced during the grace window (e.g. by a fork racing GC) is left alone. |
 | `-ro-cache-budget BYTES` | `0` (unlimited) | See [Budgets](#budgets) above in full; accepts a bare byte count or a `K`/`M`/`G`/`T` power-of-1024 suffix. |
+| `-fd-budget N` | `64` (`0` = unlimited) | How many checkout descriptors stay cached between janitor passes. Lower means fewer open descriptors, at the cost of reopening a file the next time it is fingerprinted or snapshotted. A descriptor pinned by an open session or an in-flight read is never closed. See [Resource behavior](#resource-behavior). |
 
 **`-snapshot-every` is a per-process tuning knob, not a persisted store
 setting.** It also sets this daemon's fork-time snapshot-floor bound (the
@@ -652,10 +686,6 @@ Considered and explicitly declined, not simply not yet started:
   (`capture_lag_bytes`/`durable_age_seconds` stay open-sessions-only). A
   `dbs`-scoped scrape option for at-rest branches is a future addition, not
   built here.
-- **FD budgets beyond the documented dbfile retention story** — the
-  descriptors `internal/dbfile` holds are deliberately unclosable by
-  design (see that package's doc comment); an idle-checkout eviction budget
-  on top of that is future work, not built this milestone.
 - **Metrics push/remote-write** — `/metrics` is pull-only; no push gateway
   integration.
 

@@ -59,7 +59,8 @@ class Branch:
     existed; new code should prefer ``checkpoints_v2``.
 
     ``state`` is this branch's computed state — one of ``"active"``,
-    ``"pending"``, ``"error"``, ``"dirty"``, ``"detached"``, or ``"idle"``;
+    ``"pending"``, ``"closing"``, ``"error"``, ``"dirty"``, ``"detached"``,
+    or ``"idle"``;
     see ``internal/ops/status.go``'s ``BranchStateAt`` for the full
     taxonomy and precedence. Defaults to ``""`` against a pre-Milestone-4
     daemon that never sends this field at all (wire-additive: an old daemon
@@ -153,6 +154,23 @@ class Event:
     db: str = ""
     branch: str = ""
     detail: dict[str, Any] = field(default_factory=dict)
+
+
+@dataclass
+class DaemonStatus:
+    """:meth:`Client.daemon_status`'s result: the daemon's sessions, open or
+    closing (the same raw dicts :meth:`Client.status` returns; check each
+    one's ``state``), plus daemon-wide resource counts.
+
+    ``dbfile_descriptors`` is how many checkout descriptors the daemon holds
+    open, cached plus stranded: the ``offshoot_dbfile_descriptors`` gauge.
+    ``offshoot serve -fd-budget`` bounds the cached part. It is ``None``
+    when the daemon does not report it (one older than this SDK), so an
+    unknown count never reads as zero.
+    """
+
+    sessions: list[dict[str, Any]]
+    dbfile_descriptors: int | None = None
 
 
 def _ttl_str(ttl: _TTL) -> str:
@@ -253,9 +271,14 @@ class Client:
         self._call("create", db=db, path=os.path.abspath(os.fspath(from_path)))
 
     def open(self, db: str, branch: str = "main") -> "Session":
-        """Open a live session on db@branch; returns its Session."""
+        """Open a live session on db@branch; returns its Session.
+
+        If a session on the branch is closing, the daemon waits up to 15 s
+        for the close to finish; after that the call fails with "still
+        closing; retry".
+        """
         resp = self._call("open", db=db, branch=branch)
-        return Session(self, resp["checkout"], db, branch)
+        return Session(self, resp["checkout"], db, branch, session_id=resp.get("session_id"))
 
     def checkout(self, db: str, branch: str) -> str:
         """Materialize db@branch's head snapshot at rest; returns its path."""
@@ -537,9 +560,25 @@ class Client:
             sock.close()
 
     def status(self) -> list[dict[str, Any]]:
-        """List every session open in the daemon, as raw dicts."""
+        """List every session the daemon holds, open or closing, as raw dicts.
+
+        Each dict carries ``state``: ``"open"``, or ``"closing"`` while the
+        daemon is closing the session (it stays listed until the close has
+        released the lease). A daemon older than the field sends no
+        ``state``; read that as ``"open"``.
+        """
         resp = self._call("status")
         return cast(list[dict[str, Any]], resp.get("sessions", []))
+
+    def daemon_status(self) -> DaemonStatus:
+        """The daemon's sessions, open or closing (check each one's
+        ``state``, as for :meth:`status`), plus daemon-wide resource counts."""
+        resp = self._call("status")
+        n = resp.get("dbfile_descriptors")
+        return DaemonStatus(
+            sessions=cast(list[dict[str, Any]], resp.get("sessions", [])),
+            dbfile_descriptors=None if n is None else int(n),
+        )
 
     def close(self) -> None:
         """Close the connection to the daemon."""
@@ -550,8 +589,13 @@ class Client:
 class Session:
     """A live daemon session: a lease plus a checkout under continuous capture."""
 
-    def __init__(self, client: Client, path: str, db: str, branch: str):
+    def __init__(self, client: Client, path: str, db: str, branch: str,
+                 session_id: str | None = None):
         self._client, self.path, self._db, self._branch = client, path, db, branch
+        # The id the daemon's open minted for this session (None from a
+        # daemon too old to send one): close() sends it back so it can only
+        # ever close this session.
+        self._session_id = session_id
 
     def flush(self, name: str = "", meta: dict[str, str] | None = None) -> int:
         """Flush the checkout to a durable snapshot; returns its txid.
@@ -572,5 +616,16 @@ class Session:
         return self.flush(name, meta)
 
     def close(self) -> None:
-        """Close the session, releasing its lease."""
-        self._client._call("close", db=self._db, branch=self._branch)
+        """Close the session, releasing its lease. If another close of it is
+        already in progress, waits for that one and returns its result.
+
+        It closes only this session: it sends the id the daemon's open
+        returned for it. Once this session has closed, another call fails
+        with "session <id> on <db>@<branch> is not open", even if the
+        branch has been opened again since. That includes a close that
+        raised because the lease release failed: the session is closed all
+        the same. (A daemon too old to return the id closes whatever session
+        is open on the branch.)
+        """
+        self._client._call("close", db=self._db, branch=self._branch,
+                           session_id=self._session_id)

@@ -112,6 +112,9 @@ func (w *Workspace) Destroy(db, branch string, force bool) error {
 			// ClearStaleDeleteClaims's age-based self-heal to eventually
 			// catch.
 			w.unwindDeletingClaim(db, branch, ref.DeletingAt)
+			if errors.Is(err, errCheckoutReplaced) {
+				return retryHint("destroy", db, branch, err)
+			}
 			return fmt.Errorf("ops: checkout in use; close connections before destroy: %w", err)
 		}
 	}
@@ -145,6 +148,9 @@ func (w *Workspace) Destroy(db, branch string, force bool) error {
 				db, branch, p, err)
 		}
 	}
+	// The removed checkout's cached descriptor would otherwise keep the
+	// deleted database's disk until the process exits.
+	reclaimStranded(path)
 	return nil
 }
 

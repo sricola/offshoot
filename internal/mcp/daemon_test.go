@@ -7,11 +7,14 @@ import (
 	"path/filepath"
 	"strconv"
 	"strings"
+	"sync"
+	"sync/atomic"
 	"testing"
 	"time"
 
 	"github.com/sricola/offshoot/internal/daemon"
 	"github.com/sricola/offshoot/internal/ops"
+	"github.com/sricola/offshoot/internal/session"
 	"github.com/sricola/offshoot/internal/testutil"
 )
 
@@ -551,5 +554,137 @@ func TestReapOnceSkipsWhenDaemonIsUp(t *testing.T) {
 	}
 	if _, _, err := w.Store.GetRef("app", "attempt-1"); err != nil {
 		t.Fatalf("app@attempt-1 must survive a skipped reapOnce, GetRef err = %v", err)
+	}
+}
+
+// TestSkippedReapOnceStillReclaimsDescriptors: the daemon owns reaping the
+// store, but not this process's descriptors, so a skipped tick still runs
+// the full stranded sweep (see TestReapOnceReclaimsDescriptorsStrandedElsewhere).
+func TestSkippedReapOnceStillReclaimsDescriptors(t *testing.T) {
+	ts, w, _ := newDaemonTools(t)
+	path := strandByAnotherProcess(t, w, "app", "main")
+	if _, skipped, err := ts.reapOnce(time.Now()); err != nil || !skipped {
+		t.Fatalf("reapOnce = skipped %v, err %v; want a skip", skipped, err)
+	}
+	if n := cachedDescriptorsAt(t, path); n != 0 {
+		t.Fatalf("%d descriptor(s) still held on a checkout another process removed", n)
+	}
+}
+
+// holdNextDaemonClose parks the next Session.Close in this process's daemon
+// after its engine has shut down and before it releases the lease, until
+// release is called. Later closes pass through. Call it after
+// newDaemonTools: cleanups run last-registered first, so the held close is
+// released before the daemon's Shutdown waits on it.
+func holdNextDaemonClose(t *testing.T) (entered <-chan struct{}, release func()) {
+	t.Helper()
+	ent, rel := make(chan struct{}), make(chan struct{})
+	var taken atomic.Bool
+	session.CloseReleaseHook = func() {
+		if taken.CompareAndSwap(false, true) {
+			close(ent)
+			<-rel
+		}
+	}
+	var once sync.Once
+	release = func() { once.Do(func() { close(rel) }) }
+	t.Cleanup(func() {
+		release()
+		session.CloseReleaseHook = nil
+	})
+	return ent, release
+}
+
+// closingDaemonSession opens db@branch on the daemon at sock, starts
+// closing it, and returns once that close is held. closed delivers the
+// close call's transport error after release.
+func closingDaemonSession(t *testing.T, sock, db, branch string) (closed <-chan error, release func()) {
+	t.Helper()
+	openSession(t, sock, db, branch)
+	entered, release := holdNextDaemonClose(t)
+	ch := make(chan error, 1)
+	go func() {
+		_, err := daemon.Call(sock, daemon.Request{Op: "close", DB: db, Branch: branch})
+		ch <- err
+	}()
+	select {
+	case <-entered:
+	case <-time.After(10 * time.Second):
+		t.Fatal("the close never reached the release hook")
+	}
+	return ch, release
+}
+
+// TestHealthySessionExcludesClosing: a closing session's capture is shutting
+// down, so it is not trustworthy for live capture, but it is still the
+// daemon's claim on the branch. A session from a daemon older than
+// SessionInfo.State carries no state, which means open.
+func TestHealthySessionExcludesClosing(t *testing.T) {
+	resp := daemon.Response{OK: true, Sessions: []daemon.SessionInfo{
+		{DB: "app", Branch: "main", State: daemon.SessionStateClosing},
+		{DB: "app", Branch: "old"}, // an older daemon sends no state: open
+	}}
+	if _, ok := healthySession(resp, "app", "main"); ok {
+		t.Fatal("a closing session must not be healthy")
+	}
+	if _, ok := findSession(resp, "app", "main"); !ok {
+		t.Fatal("a closing session is still found")
+	}
+	if _, ok := healthySession(resp, "app", "old"); !ok {
+		t.Fatal("a session with no state (older daemon) reads as open")
+	}
+}
+
+// TestCheckoutRefusesClosingSession: offshoot_checkout must neither hand out
+// the live path of a session whose capture is shutting down nor fall back to
+// an at-rest checkout, which would re-materialize the file under the closing
+// engine. It refuses and says to retry.
+func TestCheckoutRefusesClosingSession(t *testing.T) {
+	ts, _, sock := newDaemonTools(t)
+	closed, release := closingDaemonSession(t, sock, "app", "main")
+	r := call(t, ts, "offshoot_checkout", map[string]any{"database": "app"})
+	release()
+	<-closed
+	if !r.IsError || !strings.Contains(text(r), "is closing; retry in a few seconds") {
+		t.Fatalf("checkout during a close = %s, want the closing refusal", text(r))
+	}
+}
+
+// TestCheckpointRefusesClosingSession: offshoot_checkpoint must not route to
+// a flush that will fail, nor fall through to an at-rest checkpoint that
+// races the close for the checkout and the lease.
+func TestCheckpointRefusesClosingSession(t *testing.T) {
+	ts, w, sock := newDaemonTools(t)
+	closed, release := closingDaemonSession(t, sock, "app", "main")
+	r := call(t, ts, "offshoot_checkpoint", map[string]any{"database": "app", "name": "v1"})
+	release()
+	<-closed
+	if !r.IsError || !strings.Contains(text(r), "is closing; retry in a few seconds") {
+		t.Fatalf("checkpoint during a close = %s, want the closing refusal", text(r))
+	}
+	ref, _, err := w.Store.GetRef("app", "main")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, ok := ref.Checkpoints["v1"]; ok {
+		t.Fatal("checkpoint fell through to an at-rest checkpoint during the close")
+	}
+}
+
+// TestRollbackRefusesClosingSession: rollback (like promote and destroy)
+// still refuses a closing session, but must not tell the agent to close a
+// session whose close is already running.
+func TestRollbackRefusesClosingSession(t *testing.T) {
+	ts, w, sock := newDaemonTools(t)
+	if _, err := w.Fork("app", "main", "attempt-1", "", 0, nil); err != nil {
+		t.Fatal(err)
+	}
+	closed, release := closingDaemonSession(t, sock, "app", "attempt-1")
+	r := call(t, ts, "offshoot_rollback", map[string]any{"database": "app", "branch": "attempt-1", "to": "fork"})
+	release()
+	<-closed
+	got := text(r)
+	if !r.IsError || !strings.Contains(got, "is closing; retry rolling it back in a few seconds") || strings.Contains(got, "close it before") {
+		t.Fatalf("rollback during a close = %s, want the closing refusal", got)
 	}
 }

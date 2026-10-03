@@ -51,6 +51,16 @@ func TestUncarriedGrowthFailsTheSession(t *testing.T) {
 			t.Fatalf("%v: %s", err, out)
 		}
 		waitFor(t, 10*time.Second, "the session to fail", func() bool { return s.Err() != nil })
+		// Renewal runs on a context of its own, so only fail's renewCancel
+		// stops it after the engine fails; s.cancel alone would leave a dead
+		// session renewing its lease, and refusing every other writer, until
+		// someone closed it. Checked before the deferred Close, which would
+		// stop renewal anyway.
+		select {
+		case <-s.renewDone:
+		case <-time.After(10 * time.Second):
+			t.Fatal("renewLoop still running after the engine failed the session")
+		}
 	})
 	if !injected.Load() {
 		t.Fatal("the hook never saw a transaction")

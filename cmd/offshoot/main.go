@@ -98,7 +98,7 @@ Usage:
   offshoot lease acquire <db>[@branch] [--ttl 30s]   claim or renew a lease
   offshoot lease release <db>[@branch]      release a lease
   offshoot serve [-socket PATH] [-reap-every d] [-gc-grace d] [-flush-every d]
-                 [-snapshot-every N] [-ro-cache-budget BYTES] [-http ADDR] [-token TOKEN] [-http-allow-non-loopback]
+                 [-snapshot-every N] [-ro-cache-budget BYTES] [-fd-budget N] [-http ADDR] [-token TOKEN] [-http-allow-non-loopback]
                                              run the daemon until SIGINT/SIGTERM;
                                              -flush-every ships every open session's
                                              work on a cadence even if it's never
@@ -116,6 +116,12 @@ Usage:
                                              is bytes, or use a K/M/G/T suffix
                                              (power-of-1024); checkouts/ (writable,
                                              leased) is never evicted
+                                             -fd-budget N bounds the checkout
+                                             descriptors kept open (default 64;
+                                             0 = unlimited); the janitor closes
+                                             the least recently used on the
+                                             -reap-every cadence, never one an
+                                             open session or in-flight read pins
                                              -http ADDR (e.g. 127.0.0.1:8080) additionally
                                              starts an HTTP listener (POST /rpc, GET
                                              /metrics, GET /healthz, GET /debug/pprof/*,
@@ -146,15 +152,18 @@ Usage:
                                              -reap-every runs a background reap (TTL expiry,
                                              plus self-healing any stranded delete claim) on
                                              this cadence for as long as this process is up
-                                             (default 60s; 0/none disables it) — it defers
-                                             entirely to a running offshoot serve daemon's own
+                                             (default 60s; 0/none disables it) — the reap
+                                             defers to a running offshoot serve daemon's own
                                              janitor when one is reachable (never a second
-                                             writer against the same store), and runs no GC
-                                             either way; a manual offshoot gc or offshoot serve
+                                             writer against the same store); each tick, daemon
+                                             or not, also closes this process's descriptors on
+                                             checkouts renamed over or removed; it runs no GC
+                                             either way: a manual offshoot gc or offshoot serve
                                              remains how disk is actually reclaimed
   offshoot session open <db>[@branch] [-socket PATH]      open a session; prints the checkout path
   offshoot session flush <db>[@branch] [name] [-socket PATH]   flush to a durable snapshot; prints the txid
-  offshoot session status [-socket PATH]                  list open sessions and their durable txid
+  offshoot session status [-socket PATH]                  list sessions, open or closing (state=),
+                                                          and their durable txid
   offshoot session close <db>[@branch] [-socket PATH]     close a session, releasing its lease
   offshoot session shutdown [-socket PATH]                ask the daemon to shut down gracefully
   offshoot session dbs [-socket PATH]                     list every database this store has
@@ -517,6 +526,27 @@ func parseByteSize(raw string) (int64, error) {
 		return 0, fmt.Errorf("%q: size too large", raw)
 	}
 	return n * mult, nil
+}
+
+// fdBudgetFlag extracts serve's -fd-budget from args. Only an absent flag
+// means daemon.DefaultFDBudget: a given 0 stays 0, which the janitor reads
+// as unlimited, so it must not fall back to the default the way an empty
+// -ro-cache-budget does.
+func fdBudgetFlag(args []string) (n int, rest []string, err error) {
+	raw, rest, given, err := extractFlag(args, "-fd-budget")
+	if err != nil {
+		return 0, nil, err
+	}
+	if !given {
+		return daemon.DefaultFDBudget, rest, nil
+	}
+	if n, err = strconv.Atoi(raw); err != nil {
+		return 0, nil, fmt.Errorf("-fd-budget: %w", err)
+	}
+	if n < 0 {
+		return 0, nil, fmt.Errorf("-fd-budget %d must be >= 0 (0 means unlimited)", n)
+	}
+	return n, rest, nil
 }
 
 func main() {
@@ -1153,7 +1183,7 @@ func run(args []string) error {
 		return srv.Serve(ctx)
 	case "serve":
 		const serveUsage = "usage: offshoot serve [-socket PATH] [-reap-every DURATION] [-gc-grace DURATION] " +
-			"[-flush-every DURATION] [-snapshot-every N] [-ro-cache-budget BYTES] [-http ADDR] [-token TOKEN | -token-file PATH] [-http-allow-non-loopback]"
+			"[-flush-every DURATION] [-snapshot-every N] [-ro-cache-budget BYTES] [-fd-budget N] [-http ADDR] [-token TOKEN | -token-file PATH] [-http-allow-non-loopback]"
 		sock, rest, err := socketOverride(rest)
 		if err != nil {
 			return fmt.Errorf("%s: %w", serveUsage, err)
@@ -1218,6 +1248,10 @@ func run(args []string) error {
 		roCacheBudget, err := parseByteSize(roCacheBudgetStr)
 		if err != nil {
 			return fmt.Errorf("-ro-cache-budget: %w", err)
+		}
+		fdBudget, rest, err := fdBudgetFlag(rest)
+		if err != nil {
+			return err
 		}
 		httpAddr, rest, _, err := extractFlag(rest, "-http")
 		if err != nil {
@@ -1327,6 +1361,9 @@ func run(args []string) error {
 		// janitor still computes and reports checkouts-ro usage every pass,
 		// it just never evicts. See SetROCacheBudget's doc comment.
 		srv.SetROCacheBudget(roCacheBudget)
+		// 0 means unlimited (no budget pass); stranded descriptors are
+		// reclaimed either way. See SetFDBudget's doc comment.
+		srv.SetFDBudget(fdBudget)
 		if httpAddr != "" {
 			if err := srv.StartHTTP(daemon.HTTPConfig{
 				Addr:             httpAddr,
@@ -1349,7 +1386,17 @@ func run(args []string) error {
 			defer cancel()
 			return srv.Shutdown(ctx)
 		case err := <-errc:
-			return err
+			if err != nil {
+				return err
+			}
+			// Serve returns nil only once a Shutdown has begun, which here
+			// means the shutdown op (socket or HTTP) started one on a
+			// goroutine of its own. Returning now would exit the process
+			// while that Shutdown is still closing sessions and releasing
+			// their leases, so wait for it, bounded like the signal path.
+			ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
+			defer cancel()
+			return srv.WaitShutdown(ctx)
 		}
 	case "session":
 		sock, rest, err := socketOverride(rest)
@@ -1406,21 +1453,7 @@ func run(args []string) error {
 				return err
 			}
 			for _, in := range resp.Sessions {
-				line := fmt.Sprintf("%s@%s durable=%d epoch=%d holder=%s checkout=%s lag=%d",
-					in.DB, in.Branch, in.DurableTXID, in.Epoch, in.Holder, in.Checkout, in.CaptureLag)
-				if in.LastFlushAt != "" {
-					line += " last_flush=" + in.LastFlushAt
-				}
-				if in.DurableAge != "" {
-					line += " age=" + in.DurableAge
-				}
-				if in.FlushError != "" {
-					line += " flush_error=" + in.FlushError
-				}
-				if in.Error != "" {
-					line += " ERROR=" + in.Error
-				}
-				fmt.Println(line)
+				fmt.Println(sessionStatusLine(in))
 			}
 			return nil
 		case "close":
@@ -1448,6 +1481,32 @@ func run(args []string) error {
 	default:
 		return fmt.Errorf("unknown command %q (run 'offshoot help')", cmd)
 	}
+}
+
+// sessionStatusLine is one `session status` line. state comes first after
+// the target because it says whether the rest still describes a live
+// session: a closing one is listed until its close has released the lease.
+// An older daemon sends no state, which means open.
+func sessionStatusLine(in daemon.SessionInfo) string {
+	state := in.State
+	if state == "" {
+		state = daemon.SessionStateOpen
+	}
+	line := fmt.Sprintf("%s@%s state=%s durable=%d epoch=%d holder=%s checkout=%s lag=%d",
+		in.DB, in.Branch, state, in.DurableTXID, in.Epoch, in.Holder, in.Checkout, in.CaptureLag)
+	if in.LastFlushAt != "" {
+		line += " last_flush=" + in.LastFlushAt
+	}
+	if in.DurableAge != "" {
+		line += " age=" + in.DurableAge
+	}
+	if in.FlushError != "" {
+		line += " flush_error=" + in.FlushError
+	}
+	if in.Error != "" {
+		line += " ERROR=" + in.Error
+	}
+	return line
 }
 
 // storageMode is rollback's and promote's output tag for the new lineage:

@@ -10,6 +10,7 @@ import (
 	"time"
 
 	"github.com/sricola/offshoot/internal/daemon"
+	"github.com/sricola/offshoot/internal/dbfile"
 	"github.com/sricola/offshoot/internal/ops"
 	"github.com/sricola/offshoot/internal/store"
 )
@@ -144,38 +145,57 @@ func findSession(resp daemon.Response, db, branch string) (info daemon.SessionIn
 // findSession is not enough: handing an agent that session's checkout path
 // as "live" (checkout) or routing a checkpoint through it (checkpoint)
 // would promise continuous capture from a session that has actually
-// stopped.
+// stopped. A closing session is excluded too: its capture is shutting
+// down, so its checkout is no longer captured, and a flush through it
+// fails. A session from a daemon older than SessionInfo.State carries no
+// state, which means open.
 func healthySession(resp daemon.Response, db, branch string) (info daemon.SessionInfo, ok bool) {
 	info, ok = findSession(resp, db, branch)
-	if !ok || info.Error != "" {
+	if !ok || info.Error != "" || info.State == daemon.SessionStateClosing {
 		return daemon.SessionInfo{}, false
 	}
 	return info, true
+}
+
+// closingResult refuses a tool call on a branch whose daemon session is
+// closing. The close releases the branch within seconds, so the agent's
+// next step is the same call again; falling back to an at-rest call now
+// would race the close for the checkout and the lease.
+func closingResult(info daemon.SessionInfo, db, branch string) ToolResult {
+	return ErrorResult("a daemon session (holder %q) on %s@%s is closing; retry in a few seconds", info.Holder, db, branch)
 }
 
 // openSession reports the daemon's SessionInfo for db@branch if the daemon
 // is reachable and has a HEALTHY session open there (see healthySession);
 // ok=false covers every other case — daemon unreachable, no session at
 // all, or a session that's fenced/unhealthy — uniformly, per this
-// package's at-rest-fallback contract. checkpoint uses this directly, since
-// falling back to an at-rest checkpoint is always safe here regardless of
-// why (ops.Workspace.Checkpoint's raw open/close only risks a live
-// in-process session, and MCP and the daemon are always separate
+// package's at-rest-fallback contract. closing reports a session there
+// that is closing; the caller refuses with closingResult rather than
+// falling back to at rest, since an at-rest call would race the close for
+// the checkout and the lease. checkpoint uses this directly, since
+// falling back to an at-rest checkpoint is otherwise always safe here
+// regardless of why (ops.Workspace.Checkpoint's raw open/close only risks
+// a live in-process session, and MCP and the daemon are always separate
 // processes — see Checkpoint's own doc comment); checkout needs the raw
 // (error-included) lookup too, to explain a fenced-session fallback, so it
 // calls daemonStatus/findSession/healthySession itself instead of this.
-func (t *OffshootTools) openSession(db, branch string) (info daemon.SessionInfo, ok bool) {
+func (t *OffshootTools) openSession(db, branch string) (info daemon.SessionInfo, closing, ok bool) {
 	resp, up := t.daemonStatus()
 	if !up {
-		return daemon.SessionInfo{}, false
+		return daemon.SessionInfo{}, false, false
 	}
-	return healthySession(resp, db, branch)
+	if info, found := findSession(resp, db, branch); found && info.State == daemon.SessionStateClosing {
+		return info, true, false
+	}
+	info, ok = healthySession(resp, db, branch)
+	return info, false, ok
 }
 
 // refuseIfSessionOpen refuses opName on db@branch (ok=true, with a
 // ToolResult naming the session) if the daemon has ANY session entry for
-// that branch — healthy or fenced — in its "status" response; ok=false
-// (proceed at rest) if the daemon isn't reachable or has no such entry.
+// that branch — healthy, fenced or closing — in its "status" response;
+// ok=false (proceed at rest) if the daemon isn't reachable or has no such
+// entry.
 //
 // This mirrors internal/daemon's own refuseIfClaimed guard (server.go),
 // which the daemon already enforces against ITS OWN client for exactly
@@ -190,10 +210,14 @@ func (t *OffshootTools) openSession(db, branch string) (info daemon.SessionInfo,
 //
 // A session still "reserved" (an in-flight daemon "open" not yet resolved
 // into a live session) is invisible here: the daemon's "status" op only
-// reports fully-open (or since-fenced) sessions, never a bare reservation
-// (see opStatus) — narrower than the daemon's own in-process
+// reports sessions it holds (open, since-fenced or closing), never a bare
+// reservation (see opStatus) — narrower than the daemon's own in-process
 // refuseIfClaimed, and a gap this package shares with any other
 // out-of-band store client.
+//
+// A closing session is refused too, but the refusal says to retry, since
+// its close is already running: telling the agent to close it would be
+// wrong, and the branch is free within seconds.
 func (t *OffshootTools) refuseIfSessionOpen(db, branch, opName string) (ToolResult, bool) {
 	resp, up := t.daemonStatus()
 	if !up {
@@ -202,6 +226,10 @@ func (t *OffshootTools) refuseIfSessionOpen(db, branch, opName string) (ToolResu
 	info, found := findSession(resp, db, branch)
 	if !found {
 		return ToolResult{}, false
+	}
+	if info.State == daemon.SessionStateClosing {
+		return ErrorResult("a daemon session (holder %q) on %s@%s is closing; retry %s in a few seconds",
+			info.Holder, db, branch, opName), true
 	}
 	if info.Error != "" {
 		return ErrorResult("a daemon session (holder %q) is open on %s@%s but unhealthy (%s); "+
@@ -798,7 +826,10 @@ type checkoutArgs struct {
 // promise a durability guarantee that session can no longer keep. That case
 // falls to the same at-rest materialization as "no session," but the
 // response says why, naming the session's error, rather than silently
-// looking identical to "no daemon at all."
+// looking identical to "no daemon at all." A session that is closing gets
+// neither: its capture is shutting down, and an at-rest materialization
+// now could replace the checkout under the closing engine, so this
+// refuses with closingResult and the agent retries once the close ends.
 //
 // Detection is per call, never cached (daemonStatus), and this issues at
 // most one status round trip for the whole call — both the live-session
@@ -819,6 +850,9 @@ func (t *OffshootTools) checkout(args json.RawMessage) (ToolResult, error) {
 
 	resp, up := t.daemonStatus()
 	if up {
+		if info, found := findSession(resp, a.Database, branch); found && info.State == daemon.SessionStateClosing {
+			return closingResult(info, a.Database, branch), nil
+		}
 		if info, ok := healthySession(resp, a.Database, branch); ok {
 			msg := fmt.Sprintf("%s@%s has an open daemon session; its live checkout is %s",
 				a.Database, branch, info.Checkout)
@@ -868,7 +902,9 @@ type checkpointArgs struct {
 // (ops.Workspace.Checkpoint's raw open/close of the checkout file is unsafe
 // against a live in-process session — this path never reaches it while one
 // is open). No open session falls back to that at-rest snapshot exactly as
-// before.
+// before. A closing session refuses instead (closingResult): its flush
+// would fail, and an at-rest checkpoint would quiesce the checkout while
+// the closing engine still holds it and the lease is still live.
 func (t *OffshootTools) checkpoint(args json.RawMessage) (ToolResult, error) {
 	var a checkpointArgs
 	if err := json.Unmarshal(args, &a); err != nil {
@@ -882,7 +918,11 @@ func (t *OffshootTools) checkpoint(args json.RawMessage) (ToolResult, error) {
 		namedArg("name", a.Name)); bad {
 		return r, nil
 	}
-	if _, ok := t.openSession(a.Database, branch); ok {
+	info, closing, ok := t.openSession(a.Database, branch)
+	if closing {
+		return closingResult(info, a.Database, branch), nil
+	}
+	if ok {
 		resp, err := daemon.Call(t.socket, daemon.Request{Op: "flush", DB: a.Database, Branch: branch, Name: a.Name, Meta: a.Meta})
 		if err != nil {
 			return ErrorResult("%v", agentNextStep(err, a.Database)), nil
@@ -1550,7 +1590,17 @@ func (t *OffshootTools) diff(args json.RawMessage) (ToolResult, error) {
 // (mirroring ops.Workspace.Reap's own firstErr pattern), but reaped is
 // still whatever Reap actually destroyed even when ClearStaleDeleteClaims
 // (or Reap itself) errors afterward.
+//
+// First, skipped or not, it closes this process's stranded checkout
+// descriptors (dbfile.EvictStranded), the janitor's full sweep. This
+// process's own operations reclaim the strands they make, but only by
+// re-checking the paths they touched, so a checkout another process
+// destroyed, reaped or re-materialized (a CLI `destroy`, `gc` or `checkout`,
+// or the daemon) would otherwise keep its unlinked file's disk until this
+// process exits. The descriptors are this process's own whoever reaps the
+// store, so a running daemon does not make the sweep redundant.
 func (t *OffshootTools) reapOnce(now time.Time) (reaped []string, skipped bool, err error) {
+	dbfile.EvictStranded()
 	if _, up := t.daemonStatus(); up {
 		return nil, true, nil
 	}
@@ -1580,10 +1630,11 @@ func (t *OffshootTools) reapOnce(now time.Time) (reaped []string, skipped bool, 
 // the `offshoot mcp -reap-every` fallback for a store with no `offshoot
 // serve` daemon running, so a TTL set via offshoot_fork's `ttl` argument
 // (or -default-ttl) is eventually enforced even when nothing else is
-// reaping this store. every <= 0 disables the reaper entirely (no
-// goroutine started), matching StartJanitor's own contract for the same
-// shape of flag (see cmd/offshoot/main.go's -reap-every for `offshoot mcp`
-// and `offshoot serve`).
+// reaping this store. Every tick also closes this process's stranded
+// checkout descriptors, daemon or not (see reapOnce). every <= 0 disables
+// the reaper entirely (no goroutine started), matching StartJanitor's own
+// contract for the same shape of flag (see cmd/offshoot/main.go's
+// -reap-every for `offshoot mcp` and `offshoot serve`).
 //
 // Deliberately does NOT run GC: unlike the daemon's janitor, this reaper
 // has no operator-supplied grace period to run GC safely against (GC needs

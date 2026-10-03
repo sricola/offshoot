@@ -122,12 +122,13 @@ class DaemonFixture {
  * -- best effort, not load-bearing on every CI runner).
  *
  * Deliberately filtered to TYPE "unix" rather than a raw total fd count:
- * internal/dbfile's checkout file descriptors are DELIBERATELY NEVER
- * closed for the life of the daemon (see docs/status.md's Resource
- * behavior table) -- opening a session over the course of a test
- * legitimately grows the daemon's REG-file fd count by design, which
- * would make a raw total-fd-count comparison spuriously fail regardless
- * of whether events()'s dedicated socket itself leaked. Counting only
+ * internal/dbfile caches checkout file descriptors and closes them only
+ * once nothing pins them, on its own schedule (janitor passes under
+ * serve -fd-budget; see docs/status.md's Resource behavior table) --
+ * opening a session over the course of a test legitimately grows the
+ * daemon's REG-file fd count by design, which would make a raw
+ * total-fd-count comparison spuriously fail regardless of whether
+ * events()'s dedicated socket itself leaked. Counting only
  * "unix" rows isolates exactly the resource events()'s dedicated
  * connection actually holds.
  */
@@ -355,6 +356,39 @@ test('branches: state defaults to "" when an older daemon omits it (wire-compat)
   assert.equal(branches[0].state, "");
 });
 
+test("daemonStatus: dbfile_descriptors is absent, not 0, when an older daemon omits it", async () => {
+  const client = Object.create(Client.prototype) as Client;
+  (client as unknown as { _call: Client["_call"] })._call = async () => ({ ok: true, sessions: [] });
+  const st = await client.daemonStatus();
+  assert.equal(st.dbfile_descriptors, undefined);
+  assert.ok(!("dbfile_descriptors" in st));
+});
+
+test("daemonStatus: dbfile_descriptors is passed through when present", async () => {
+  const client = Object.create(Client.prototype) as Client;
+  (client as unknown as { _call: Client["_call"] })._call = async () => ({
+    ok: true,
+    sessions: [],
+    dbfile_descriptors: 0,
+  });
+  const st = await client.daemonStatus();
+  assert.equal(st.dbfile_descriptors, 0);
+});
+
+test("status: session state is passed through, and absent from an older daemon", async () => {
+  const client = Object.create(Client.prototype) as Client;
+  (client as unknown as { _call: Client["_call"] })._call = async () => ({
+    ok: true,
+    sessions: [
+      { db: "app", branch: "main", checkout: "/c", holder: "h/1", epoch: 2, durable_txid: 1, state: "closing" },
+      { db: "app", branch: "b", checkout: "/d", holder: "h/1", epoch: 1, durable_txid: 1 },
+    ],
+  });
+  const sessions = await client.status();
+  assert.equal(sessions[0].state, "closing");
+  assert.equal(sessions[1].state, undefined);
+});
+
 test("branches: state is passed through when present", async () => {
   const client = Object.create(Client.prototype) as Client;
   (client as unknown as { _call: Client["_call"] })._call = async () => ({
@@ -381,6 +415,26 @@ test("rollback and promote send the materialize wire field", async () => {
     ["rollback", false], ["rollback", true],
     ["promote", false], ["promote", true],
   ]);
+});
+
+test("session close sends back the session id its open returned, and none to an older daemon", async () => {
+  const sid = "0123456789abcdef0123456789abcdef";
+  for (const [openResp, want] of [
+    [{ ok: true, checkout: "/c", session_id: sid }, sid],
+    [{ ok: true, checkout: "/c" }, undefined], // an older daemon sends no session_id
+  ] as const) {
+    const client = Object.create(Client.prototype) as Client;
+    const sent: Array<[string, Record<string, unknown>]> = [];
+    (client as unknown as { _call: (op: string, fields: Record<string, unknown>) => Promise<unknown> })._call =
+      async (op, fields) => {
+        sent.push([op, fields]);
+        return op === "open" ? openResp : { ok: true };
+      };
+    await (await client.open("app")).close();
+    const [op, fields] = sent[sent.length - 1];
+    assert.equal(op, "close");
+    assert.equal(fields.session_id, want);
+  }
 });
 
 test("errors are loud", async (t: TestContext) => {
@@ -415,7 +469,7 @@ test("rollback, promote, status", async (t: TestContext) => {
     await c.create("rp");
     const s = await c.open("rp");
     const sessions = await c.status();
-    assert.ok(sessions.some((st) => st.db === "rp" && st.branch === "main"));
+    assert.ok(sessions.some((st) => st.db === "rp" && st.branch === "main" && st.state === "open"));
 
     sqlite3(s.path, "CREATE TABLE t (v TEXT);");
     const cp1 = await s.flush("cp1");
@@ -445,6 +499,69 @@ test("rollback, promote, status", async (t: TestContext) => {
     await c.promote("rp", "feature", "main", { force: true, noBackup: true });
     names = new Map((await c.branches("rp")).map((b) => [b.branch, b]));
     assert.ok(!names.has("main-pre-promote"));
+  } finally {
+    await c.close();
+  }
+});
+
+test("a stale session close leaves another client's reopened session open", async (t: TestContext) => {
+  if (!canRun) {
+    t.skip("go and/or sqlite3 not on PATH");
+    return;
+  }
+  // The rollback case reopens the branch at the closed session's lease
+  // epoch, so only the session id tells the two sessions apart.
+  for (const [db, rollback] of [
+    ["stale", false],
+    ["stalerb", true],
+  ] as const) {
+    const a = await connect(fixture!.sock);
+    const b = await connect(fixture!.sock);
+    try {
+      await a.create(db);
+      const first = await a.open(db);
+      await first.close();
+      if (rollback) await b.rollback(db, "main", "init", { noBackup: true });
+      const second = await b.open(db);
+      try {
+        await assert.rejects(
+          () => first.close(),
+          (err: unknown) => {
+            assert.ok(err instanceof OffshootError);
+            assert.match(err.message, new RegExp(`session [0-9a-f]{32} on ${db}@main is not open`));
+            return true;
+          },
+        );
+        const mine = (await b.status()).filter((st) => st.db === db && st.branch === "main");
+        assert.equal(mine.length, 1);
+        assert.equal(mine[0].state, "open");
+        await second.flush(); // rejects if the stale close had closed it
+      } finally {
+        await second.close();
+      }
+    } finally {
+      await a.close();
+      await b.close();
+    }
+  }
+});
+
+test("daemonStatus reports dbfile descriptors", async (t: TestContext) => {
+  if (!canRun) {
+    t.skip("go and/or sqlite3 not on PATH");
+    return;
+  }
+  const c = await connect(fixture!.sock);
+  try {
+    await c.create("ds");
+    const s = await c.open("ds");
+    try {
+      const st = await c.daemonStatus();
+      assert.ok(st.sessions.some((x) => x.db === "ds" && x.branch === "main"));
+      assert.ok(st.dbfile_descriptors !== undefined && st.dbfile_descriptors >= 1);
+    } finally {
+      await s.close();
+    }
   } finally {
     await c.close();
   }

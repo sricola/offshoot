@@ -81,6 +81,13 @@ func CopyFile(dst, src string) (cloned bool, err error) {
 // vanished" (e.g. a concurrent cache eviction) distinguishable from "this
 // filesystem cannot clone". dst must not exist (create-only, as CopyFile),
 // and is fsynced before a successful return, as CopyFile's clone path is.
+//
+// On Linux, Clone opens src and closes it again (FICLONE takes descriptors),
+// even on a filesystem that then refuses the clone. Closing a descriptor
+// releases every POSIX lock this process holds on the file, so never Clone a
+// file an in-process SQLite connection may have open, such as a checkout:
+// use CloneFrom with a descriptor that stays open (internal/dbfile's
+// Section.CloneTo).
 func Clone(dst, src string) error {
 	if _, err := os.Stat(src); err != nil {
 		return err
@@ -88,6 +95,25 @@ func Clone(dst, src string) error {
 	if forceUnsupportedForTest || !cloneFile(dst, src) {
 		return ErrUnsupported
 	}
+	return syncClone(dst)
+}
+
+// CloneFrom is Clone from an open file: it makes dst a copy-on-write clone
+// of src's file, or returns ErrUnsupported without creating dst. It opens
+// and closes no descriptor on src's file (FICLONE on Linux,
+// fclonefileat(2) on darwin), and leaves src open, so it is safe on a file
+// whose POSIX locks something in this process relies on, provided src's own
+// descriptor outlives every such lock (see Clone). dst must not exist, and
+// is fsynced before a successful return.
+func CloneFrom(dst string, src *os.File) error {
+	if forceUnsupportedForTest || !cloneFileFrom(dst, src) {
+		return ErrUnsupported
+	}
+	return syncClone(dst)
+}
+
+// syncClone fsyncs a fresh clone at dst, removing it if that fails.
+func syncClone(dst string) error {
 	if err := syncFile(dst); err != nil {
 		os.Remove(dst)
 		return err

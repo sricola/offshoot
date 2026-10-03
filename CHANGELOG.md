@@ -19,6 +19,122 @@ Pin an exact version if you depend on format stability. The full contract:
 
 ### Fixed
 
+- **A re-materialized checkout's old descriptor could be closed by the
+  garbage collector.** When `internal/dbfile` found a checkout path naming
+  a new inode, it dropped its only reference to the descriptor for the old
+  one, and Go's `*os.File` finalizer closed it at some later GC. Closing
+  any descriptor releases every POSIX lock this process holds on that
+  inode, so a capture engine or `quiesce` still on the old file could lose
+  its SHARED lock with no error. The old descriptor is now kept, and closed
+  only explicitly, once nothing pins its inode.
+- **A long-lived process kept a full copy of every deleted checkout on
+  disk.** Each `destroy` or reap of a checked-out branch, and on a cloning
+  filesystem each by-chain cache build and prune, stranded a descriptor on
+  a file nothing would ever ask for again, holding the unlinked file's
+  disk for the life of the daemon or `offshoot mcp` process. Those
+  descriptors are now closed as soon as nothing pins them: right after the
+  destroy, reap, build or prune that strands them in the same process, and
+  by a full sweep on every janitor tick and every `offshoot mcp`
+  `-reap-every` tick, which also finds checkouts another process removed.
+  A process run with `-reap-every 0` keeps descriptors another process
+  stranded until it restarts.
+- **On Linux, refreshing a checkout's shadow could drop a running
+  session's SQLite lock.** After a `checkout`, a rollback, promote or
+  compact refresh, and a session's clean close, offshoot clones the
+  checkout to its `.shadow` for the next segment checkpoint. On Linux that
+  clone opened and closed the checkout, even on ext4 where the clone then
+  fails, and closing any descriptor releases every POSIX lock the process
+  holds on the file. If another request had opened a session on that
+  checkout by then (an `open` right after a `close` of the same branch, or
+  racing an at-rest `checkout`), its capture engine lost its SHARED lock
+  with no error, so a foreign writer's close-time checkpoint could later
+  fold and unlink the WAL under it. The clone now goes through offshoot's
+  own pinned descriptor and opens nothing on the checkout. macOS was not
+  affected: clonefile(2) takes paths.
+- **A checkout removed while `quiesce` or a capture engine was opening it
+  came back as an empty database.** SQLite creates a missing file on open,
+  so a checkout removed between a caller's check and the open (a `destroy`
+  or reap racing `branches`, or an engine started on a checkout that had
+  just been removed) left an empty database at its path. Those opens now
+  never create the file. A `checkout`, `checkpoint` or `destroy` (and a
+  session `open`, through its checkout) that loses this race to another
+  operation fails with `ops: <op> <db>@<branch> lost a race with another
+  operation (retry): ops: the checkout was replaced or removed while it
+  was being opened`, and none calls such a checkout "in use". A rollback,
+  promote or compact whose post-repoint refresh loses it says the
+  operation stands and names `offshoot checkout`, with no retry hint:
+  retrying a promote or rollback would replace its safety fork with the
+  already-repointed head.
+- **A rollback, promote or compact that found its checkout busy said to
+  retry it.** A busy checkout does not stop the repoint, so the refresh
+  after it fails whenever an app holds a read transaction on the checkout
+  while a write lands, and that error ended `close connections and
+  retry`. Retrying a promote or rollback replaced its safety fork
+  (`<target>-pre-promote`, `<branch>-pre-rollback`) with the
+  already-repointed head, which can leave the original head on no branch
+  for GC to reclaim. The error now says the operation stands and to close
+  the checkout's connections, then run `offshoot checkout <db>@<branch>`.
+  `checkout` and `checkpoint` still say `close connections and retry`,
+  and `destroy` still says to close them before destroying.
+- **`create --from` a path containing `?` imported an empty database.**
+  The import opened `<path>?_busy_timeout=5000`, and go-sqlite3 cut the
+  name at the first `?`: `create imp --from '/dir/q?x.db'` created an
+  empty `/dir/q` and imported that, with no error. In-process SQLite opens
+  of an import source or a checkout now escape `?`, `#` and `%`, so the
+  path names exactly that file. `quiesce` and the capture engine get the
+  same fix for a store root containing those characters.
+- **Reopening a branch while its session was still closing shared the
+  closing session's lease.** `session close` freed the branch in the daemon
+  before the close had finished, so an `open` of the same branch from
+  another client — a client killed mid-close that reconnected, or a
+  supervisor reopening whatever `status` stopped listing — started a second
+  session under the same lease holder and epoch. The closing session's
+  release then cleared that lease, so the new session was fenced at its next
+  renewal, and until then the branch looked unleased: a rollback, promote,
+  compact or at-rest checkpoint could run under it. A closing session now
+  keeps its branch until the close has released the lease. An `open` waits
+  up to 15 s for it and then takes a fresh epoch, or fails with
+  `daemon: <db>@<branch> is still closing; retry`. If the close failed to
+  release the lease, the reopen still renews that lease in place under the
+  same holder and epoch; that ends once each daemon session has a lease
+  holder of its own.
+- **A close retried after its session had closed could close another
+  client's session.** A `close` named only `db@branch`. A client that
+  retried its close after the branch had been reopened closed the reopened
+  session: its lease was released under it, its next flush failed with
+  `is not open`, and its writes since its last flush were never shipped.
+  The usual ways to get there are a client that gave up waiting for its
+  close's answer, and a close that raised because its lease release failed
+  (the session is closed all the same). The daemon's `open` now returns a
+  `session_id`, 128 random bits minted for that session, and a `close` that
+  sends it back closes only that session; once that session has closed, it
+  fails with `daemon: session <id> on <db>@<branch> is not open`. The
+  Python and TypeScript SDKs' `Session.close()` send it. `offshoot session
+  close`, and any client that sends no `session_id`, still closes whatever
+  session is open on the branch.
+- **`offshoot session shutdown` could exit before every lease was
+  released.** The process exited as soon as the daemon stopped listening,
+  while sessions were still closing; a close another client had started
+  was not waited for at all, and a signal arriving during a `shutdown`
+  ended the process at once. The daemon now exits only after every session
+  has closed and released its lease, bounded by the same 30 s as
+  `SIGINT`/`SIGTERM`. The command still returns as soon as the daemon
+  accepts it, and the daemon removes its socket at once and leaves the path
+  alone after that, so a new `serve` on the same socket can start while the
+  old process finishes; wait for that process to exit if every lease must
+  be released first.
+- **A slow close could let the session's lease lapse.** Closing stopped
+  renewing the lease before the capture engine's shutdown, the checkout
+  hash, the sidecar stamp and the shadow refresh, which at default settings
+  left 20 to 30 s. A close that ran longer let another writer take the
+  branch while the old engine still owned the checkout. The lease is now
+  renewed until the moment it is released.
+- **One failed lease release on close left the branch leased until the
+  lease expired.** A release that lost its compare-and-swap to a concurrent
+  `touch` or `protect`, or hit a transient store error, was not retried, so
+  other writers saw the branch held for up to 30 s. Close now retries it up
+  to three times; a release that landed but reported an error counts as
+  released.
 - **`destroy --force` on a local store failed when the lease holder renewed
   between the destroy's claim and its delete.** A lease renewal, a daemon
   session's or (new in this release) an at-rest checkpoint's, writes over
@@ -85,7 +201,10 @@ Pin an exact version if you depend on format stability. The full contract:
   session is untouched, and the message says to close the session and
   retry, or, if the holder is gone (a killed daemon, a `lease acquire`
   nobody will release), to free the lease with `offshoot lease release
-  <db>@<branch>`. `--force` still checkpoints a detached checkout.
+  <db>@<branch>`. A lease left by a `session close` whose release failed
+  is not one to free that way: it lapses at its expiry, and once the
+  branch is reopened it is the new session's (see the close fixes above).
+  `--force` still checkpoints a detached checkout.
 - **Two at-rest checkpoints on one branch could still leave the head on the
   wrong content.** v0.2.13 made two racers survivable by checking, after
   the winner's ref write, whether the store still held its content. Two
@@ -100,24 +219,64 @@ Pin an exact version if you depend on format stability. The full contract:
 
 ### Changed
 
+- **Every in-process SQLite open of a checkout pins the file first.** The
+  capture engine, `quiesce` (behind `checkout`, `checkpoint`, `branches`,
+  rollback, promote and compact, `fork`'s uncheckpointed-changes warning,
+  `destroy` and reap) and `create`'s read of an imported file pin the file
+  and its path before opening it and release them only after the
+  connection closes. Until then no descriptor offshoot caches under that
+  path is closed, whatever file the path names by then. If the path is
+  renamed over or removed between the pin and the open, the open is
+  refused rather than left working on a file that is no longer the
+  checkout: the operation fails with a lost-race error (see Fixed), and
+  `create --from` fails the import. A session's capture engine that loses
+  this race still opens and then fails at once: the branch shows state
+  `error` with `capture stopped: dbfile: path was replaced while a SQLite
+  open held it`, and closing and reopening the session recovers. A test
+  fails on any new `sql.Open` in the tree until it is classified, and on a
+  pinned one whose release could run before its connection closes.
+- **A closing session holds its branch, and the daemon says so.** While a
+  session is closing, `branches` reports the new state `closing` (it
+  outranks `error`), `status` keeps listing the session with
+  `state: "closing"`, and a duplicate `close` waits for the first and
+  returns its result instead of saying `is not open`. Flush refuses with
+  `daemon: <db>@<branch> is closing`; fork, promote, rollback, compact,
+  checkout and destroy refuse with `daemon: <db>@<branch> is closing; retry
+  when the close finishes`. MCP's `offshoot_checkout` and
+  `offshoot_checkpoint` refuse with "closing; retry in a few seconds"
+  instead of falling back to at rest, and rollback, promote and destroy say
+  to retry instead of to close the session.
+- **`session_closed` fires once the branch is free.** It used to fire from
+  inside the close; it now fires after the daemon has let go of the branch,
+  so acting on it never meets a `closing` refusal, and always before the
+  `session_opened` of a reopen of the same branch. It and `fenced` carry the
+  session's `holder` and `epoch`. These match it to the session's
+  `session_opened`, except after a close whose lease release failed: a
+  reopen then keeps the same pair (see Fixed).
+- **`/healthz` and `offshoot_sessions_open` count open sessions only**; a
+  closing session is not counted, and reports no
+  `offshoot_capture_lag_bytes` or `offshoot_durable_age_seconds`.
 - **A second `offshoot checkpoint` on a branch is refused while the first
   runs**, with `has a live lease held by "checkpoint:<host>/<pid>/<nonce>"
   ... (another checkpoint is in progress)` and the advice to retry when it
-  finishes, instead of racing it. So is a session open on the branch (the
-  daemon's `open`, both SDKs) and an unforced `rollback`, `promote
+  finishes, instead of racing it. So is an unforced `rollback`, `promote
   --onto`, `compact` or `destroy`, each of which also says to retry when
   the checkpoint finishes, in a few seconds (a checkpoint's lease lapses on
   its own 30 s after its process dies, so none suggests closing a session
   or `lease release`); forced, a repoint clears the checkpoint's lease, and
   the checkpoint fails without committing and deletes its object. Every
   at-rest live-lease refusal now satisfies `errors.Is(err,
-  store.ErrLeaseHeld)`.
+  store.ErrLeaseHeld)`. A session open on the branch (the daemon's `open`,
+  both SDKs) fails at once with `store: branch lease is held by
+  "checkpoint:..."`; it does not wait, as it does for a session that is
+  closing, so retry it once the checkpoint finishes.
 - **Live-lease refusals no longer offer a `--force` the caller does not
   have.** MCP's `offshoot_rollback` (which has no `force`), and
   `offshoot_promote` and `offshoot_destroy` on a server without
   `-allow-force`, drop ops' `--force` advice: under a checkpoint's lease
-  they say to retry, and under any other lease `offshoot_promote` now names
-  the human's CLI command, as `offshoot_destroy` already did. The daemon's
+  they say to retry, as they do for a daemon session that is closing
+  (above), and under any other lease `offshoot_promote` now names the
+  human's CLI command, as `offshoot_destroy` already did. The daemon's
   `rollback` and `compact` ops (and so both SDKs' `rollback` and
   `compact`), which take no force, drop it too. `offshoot_checkpoint`'s
   refusal of a detached checkout names `offshoot_checkout` to refresh it,
@@ -208,6 +367,27 @@ Pin an exact version if you depend on format stability. The full contract:
 
 ### Added
 
+- **`offshoot serve -fd-budget N`** (default `64`, `0` unlimited) bounds
+  the checkout descriptors the daemon keeps cached. Each janitor tick
+  closes the least recently used until `N` remain, never one an open
+  session or an in-flight read pins.
+- **Four metrics:** `offshoot_dbfile_descriptors`, `offshoot_dbfile_pins`,
+  `offshoot_dbfile_stranded_pinned` (stranded descriptors kept open by a
+  pin on their file or a connection's hold on their path; non-zero across
+  janitor passes means a pin leak, which the janitor also logs, naming the
+  paths) and
+  `offshoot_dbfile_evicted_total{reason="stranded"|"budget"}`.
+- **The daemon `status` op reports `dbfile_descriptors`.** Python
+  `Client.daemon_status()` and TypeScript `client.daemonStatus()` return the
+  open sessions plus that count (`None` / `undefined` from an older daemon
+  that does not report it); `status()` is unchanged.
+- **`session_id` on the daemon `open` response and `close` request** (see
+  Fixed). Both are additive: a close without one closes by branch as
+  before, and the SDKs send none when an older daemon's `open` returns none.
+- **`SessionInfo.state`** (`open` or `closing`) in the daemon `status` op.
+  `offshoot session status` prints `state=`, TypeScript `SessionInfo` has
+  `state?`, and Python's `status()` dicts carry it. An older daemon sends
+  none, which means open.
 - While an at-rest checkpoint runs, the branch shows as leased: `offshoot
   status` reports `state=active`, and `offshoot lease list`, the daemon's
   `branches` op and both SDKs' `Branch.lease_holder` name

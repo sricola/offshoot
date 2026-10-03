@@ -23,13 +23,25 @@ import (
 // paths. If the clone does not succeed, any dst file this call created is
 // removed before returning, so the plain-copy fallback's own O_EXCL create
 // still sees an absent path rather than tripping over a leftover empty file.
+//
+// It opens src and closes it again, before the ioctl can fail: see Clone's
+// doc comment for why that rules it out on a checkout (cloneFileFrom).
 func cloneFile(dst, src string) bool {
 	in, err := os.Open(src)
 	if err != nil {
 		return false
 	}
 	defer in.Close()
+	return cloneFileFrom(dst, in)
+}
 
+// cloneFileFrom is cloneFile from an already open source, which it neither
+// closes nor duplicates: the only descriptor it opens and closes is dst's.
+func cloneFileFrom(dst string, src *os.File) bool {
+	rc, err := src.SyscallConn()
+	if err != nil {
+		return false
+	}
 	out, err := os.OpenFile(dst, os.O_CREATE|os.O_EXCL|os.O_WRONLY, 0o600)
 	if err != nil {
 		return false
@@ -42,7 +54,10 @@ func cloneFile(dst, src string) bool {
 		}
 	}()
 
-	if err := unix.IoctlFileClone(int(out.Fd()), int(in.Fd())); err != nil {
+	var cloneErr error
+	if err := rc.Control(func(fd uintptr) {
+		cloneErr = unix.IoctlFileClone(int(out.Fd()), int(fd))
+	}); err != nil || cloneErr != nil {
 		return false
 	}
 	cloned = true

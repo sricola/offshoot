@@ -118,7 +118,7 @@ of work, leak branches forever, or take the slow path by default.*
 - **3am observability, first half.** `status` gains durable-through age,
   last-flush time, and capture lag; structured logs on every branch state
   transition with cause. (The full metrics endpoint shipped in Milestone 4.)
-- **Resource behavior documented.** Budgets shipped in Milestone 4 (ro-cache disk budget; FD budget still deferred), but the current
+- **Resource behavior documented.** Budgets shipped in Milestone 4 (ro-cache disk budget; the FD budget followed as `serve -fd-budget`), but the current
   per-session disk/FD costs and failure modes go in the docs now.
 - **Promote keeps its own undo.** *(Added after launch, from the first
   external design question — [discussion
@@ -258,11 +258,14 @@ what's left that no further engineering resolves.
   structurally. The **FD budget with LRU eviction of cold read-only
   materializations did not ship this milestone** — consciously narrowed at
   Task 8 dispatch time, not discovered as a gap late:
-  `internal/dbfile`'s file descriptors are deliberately unclosable by that
-  package's own design (a stray-close lock hazard the design deliberately
-  avoids), which makes "evict a cold session's FD" a real design problem
-  needing its own pass, not a variant of the ro-cache budget's shape. See
-  [docs/status.md](docs/status.md)'s FD-budget row. **Follow-up, not yet
+  `internal/dbfile`'s file descriptors were then deliberately unclosable by
+  that package's own design (a stray-close lock hazard the design
+  deliberately avoids), which made "evict a cold session's FD" a real design
+  problem needing its own pass, not a variant of the ro-cache budget's
+  shape. See [docs/status.md](docs/status.md)'s FD-budget row. It shipped
+  afterwards as `serve -fd-budget`, on a pin registry that lets
+  `internal/dbfile` close a descriptor only when nothing in the process
+  relies on its inode's locks. **Follow-up, not yet
   scoped:** `destroy`/GC never clean up a branch's `checkouts-ro` entries —
   they linger until LRU eviction claims them, which never happens at the
   default `-ro-cache-budget 0` (unlimited). Safe today (every entry is an

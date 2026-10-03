@@ -218,7 +218,9 @@ The rules, exactly as shipped:
   ([the design reasoning](status.md#integration-surface)).
 - **With a session open on the branch:** `offshoot_checkpoint` flushes
   live through the daemon and `offshoot_checkout` returns the session's
-  live checkout path.
+  live checkout path. While that session is closing, both refuse with
+  "closing; retry in a few seconds" instead of falling back to at rest:
+  retry the same call.
 - **`offshoot_fork` rides the daemon whenever one is reachable** —
   session or not (an open source session is flushed first, so unflushed
   writes land in the child; the fork uses the daemon's `-snapshot-every`
@@ -230,9 +232,11 @@ The rules, exactly as shipped:
   this particular refusal — whenever the daemon has any session open on
   the affected branch, because all three repoint or delete a ref out from
   under a session the daemon still owns. Close the session first and
-  retry. `offshoot_promote`'s `source` is the one exception: an open
-  session there doesn't block, but what gets promoted is the source's
-  last-flushed head, not its unflushed writes.
+  retry. A session that is closing refuses them too, with "closing; retry"
+  in place of "close it": its close is already running, so wait a few
+  seconds and call again. `offshoot_promote`'s `source` is the one
+  exception: an open session there doesn't block, but what gets promoted
+  is the source's last-flushed head, not its unflushed writes.
 
 Full flag-level detail: [`offshoot mcp`](reference.md#offshoot-mcp) in the
 reference.

@@ -8,6 +8,7 @@ import (
 	"sort"
 	"strings"
 
+	"github.com/sricola/offshoot/internal/dbfile"
 	"github.com/sricola/offshoot/internal/ltxio"
 	"github.com/sricola/offshoot/internal/reflink"
 	"github.com/sricola/offshoot/internal/store"
@@ -98,10 +99,13 @@ func mkdirPrivate(dirs ...string) error {
 // concurrently is harmless either way, since a clone of it that loses the
 // race falls through to rebuilding (see materializeFromChain).
 func (w *Workspace) pruneByChain(db string, max int) {
-	entries, err := byChainEntries(db, filepath.Join(w.roCacheRoot(), db, byChainDir))
+	entries, err := byChainEntries(db, w.byChainDir(db))
 	if err != nil || len(entries) <= max {
 		return
 	}
+	// It runs after the materialize whose reclaim has already happened, so
+	// it reclaims the entries it removes itself.
+	defer reclaimStranded(w.byChainDir(db))
 	sort.Slice(entries, func(i, j int) bool {
 		if !entries[i].LastUsed.Equal(entries[j].LastUsed) {
 			return entries[i].LastUsed.Before(entries[j].LastUsed)
@@ -116,6 +120,26 @@ func (w *Workspace) pruneByChain(db string, max int) {
 		os.Remove(e.Path + lastUsedSuffix)
 	}
 }
+
+// byChainDir is db's by-chain area: its entries, their sidecars, and the
+// stage and probe files of builds in progress.
+func (w *Workspace) byChainDir(db string) string {
+	return filepath.Join(w.roCacheRoot(), db, byChainDir)
+}
+
+// reclaimStranded closes the dbfile descriptors this process can no longer
+// reach by path, re-checking only paths (files or directories) and closing
+// any other orphan nothing pins any more. Each materialization renames a
+// new inode over its target, a by-chain build renames its stage file away,
+// and a prune or destroy removes files, so each one would otherwise leave a
+// descriptor holding a full unlinked copy of a database on disk. Anything
+// still pinned (an engine or a read on the old inode) waits for a later
+// pass. It runs where a strand is made, not just on the daemon's janitor
+// tick, because a long-lived process may have no janitor: offshoot mcp
+// reaps and checks out on its own, and serve -reap-every 0 runs none. It is
+// scoped (dbfile.EvictStrandedAt) because it runs on every checkout, and a
+// full re-check would stat every checkout this process has cached.
+func reclaimStranded(paths ...string) { dbfile.EvictStrandedAt(paths...) }
 
 // chainPlacement is what materializeFromChain wrote at its destination.
 type chainPlacement struct {
@@ -154,6 +178,8 @@ type chainPlacement struct {
 // checkout wants 0600 like a materialized temp file; a checkouts-ro file
 // keeps 0444, inside 0700 directories).
 func (w *Workspace) materializeFromChain(db, lineage string, members []store.ChainMember, dst string, mode os.FileMode) (chainPlacement, error) {
+	// dst is renamed over, and a by-chain build renames its stage file away.
+	defer reclaimStranded(dst, w.byChainDir(db))
 	id := chainID(members)
 	if entry, rec, ok := w.byChainEntry(db, id); ok {
 		if err := cloneIntoPlace(entry, dst, mode); err == nil {

@@ -65,7 +65,9 @@ SQLite client opens. You have nine tools; the loop is four calls.
 - Read results: `structuredContent` carries `txid`, `path`, `ttl`, `backup`
   for you to reuse; the text is the same information for the human.
 - If a tool says a daemon session is open on a branch, close it first
-  (`offshoot session close`) rather than forcing.
+  (`offshoot session close`) rather than forcing. If it says the session
+  is closing ("closing; retry"), do not close it: wait a few seconds and
+  call the same tool again.
 - Work in the fork's checkout path, not `main`'s, while experimenting.
 
 ## Rules-file snippet for the project's AGENTS.md or CLAUDE.md

@@ -15,6 +15,7 @@ import (
 	"testing"
 	"time"
 
+	"github.com/sricola/offshoot/internal/dbfile"
 	"github.com/sricola/offshoot/internal/ops"
 	"github.com/sricola/offshoot/internal/store"
 	"github.com/sricola/offshoot/internal/testutil"
@@ -1574,6 +1575,59 @@ func TestDiffToolComparesAttemptsContentAware(t *testing.T) {
 		if _, has := r.StructuredContent.(map[string]any)["full"]; !has {
 			t.Fatal("full must be present in structuredContent when requested")
 		}
+	}
+}
+
+// cachedDescriptorsAt counts the descriptors dbfile holds for path, live or
+// stranded.
+func cachedDescriptorsAt(t *testing.T, path string) int {
+	t.Helper()
+	abs, err := filepath.Abs(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	n := 0
+	for _, e := range dbfile.Entries() {
+		if e.Path == abs {
+			n++
+		}
+	}
+	return n
+}
+
+// strandByAnotherProcess caches a descriptor on db@branch's checkout in this
+// process, then removes the checkout the way a CLI `destroy` in another
+// process does: behind this process's back, so none of its own reclaim
+// passes is told about the path.
+func strandByAnotherProcess(t *testing.T, w *ops.Workspace, db, branch string) string {
+	t.Helper()
+	path, err := w.Checkout(db, branch)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if cachedDescriptorsAt(t, path) == 0 {
+		t.Fatalf("precondition: Checkout cached no descriptor on %s", path)
+	}
+	if err := os.Remove(path); err != nil {
+		t.Fatal(err)
+	}
+	return path
+}
+
+// TestReapOnceReclaimsDescriptorsStrandedElsewhere: offshoot mcp has no
+// janitor, and its own reclaim passes re-check only the paths its own
+// operations touched, so a checkout another process destroyed would keep
+// its unlinked file's disk until the editor restarted. Each reaper tick runs
+// the full sweep instead, whether or not a daemon is up: the descriptors are
+// this process's own, whoever reaps the store.
+func TestReapOnceReclaimsDescriptorsStrandedElsewhere(t *testing.T) {
+	ts, w := newTools(t)
+	path := strandByAnotherProcess(t, w, "app", "main")
+	if _, _, err := ts.reapOnce(time.Now()); err != nil {
+		t.Fatalf("reapOnce: %v", err)
+	}
+	if n := cachedDescriptorsAt(t, path); n != 0 {
+		t.Fatalf("%d descriptor(s) still held on a checkout another process removed", n)
 	}
 }
 

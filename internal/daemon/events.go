@@ -39,8 +39,10 @@ const eventSchemaVersion = 1
 // by the ONE shared encodeEvent function below.
 //
 // Type is one of: "session_opened", "flushed", "flush_failed", "fenced",
-// "session_closed" (all five sourced from the existing session
-// transition-callback call site — see sessionEventType), "reaped" (sourced
+// "session_closed" (the first four sourced from the session
+// transition-callback call site — see sessionEventType; session_closed
+// published by the daemon once the closed session's slot is gone — see
+// sessionClosedEvent), "reaped" (sourced
 // from the janitor's Reap pass — see Server.janitorTick), "evicted"
 // (Milestone 4 Task 5: sourced from the janitor's ro-cache LRU eviction
 // pass — see janitorTick's EvictROCache call; detail carries "checkpoint"
@@ -254,9 +256,11 @@ func (b *eventBus) subscriberCount() int {
 // sessionEventType maps a session.OnTransition event name (Milestone 2's
 // logTransition strings — "opened", "flushed", "flush-failed", "fenced",
 // "closed", "sidecar-refresh-skipped") to this bus's versioned Event.Type,
-// or ok=false for a transition this schema has no event for
-// ("sidecar-refresh-skipped": an internal bookkeeping detail, not one of
-// T4a's six locked source types).
+// or ok=false for a transition this source does not publish:
+// "sidecar-refresh-skipped" (internal bookkeeping), and "closed", which
+// fires inside Session.Close while the daemon still holds the branch's
+// closing marker. The daemon publishes session_closed itself once the
+// marker is gone (sessionClosedEvent).
 func sessionEventType(event string) (typ string, ok bool) {
 	switch event {
 	case "opened":
@@ -267,11 +271,31 @@ func sessionEventType(event string) (typ string, ok bool) {
 		return "flush_failed", true
 	case "fenced":
 		return "fenced", true
-	case "closed":
-		return "session_closed", true
 	default:
 		return "", false
 	}
+}
+
+// sessionClosedEvent builds session_closed for sess, which this daemon
+// publishes once it has let go of the branch: closeSlot in the same s.mu
+// section that deletes the closing marker, and opOpen's shutdown
+// self-close after its Close returns. A client acting on the event then
+// finds the branch free; one acting on the session's own "closed"
+// transition would be refused by every path that refuses a closing
+// branch. holder and epoch name the session's lease, not the session: a
+// reopen after a close whose release failed renews that lease in place and
+// repeats the pair, and rollback, promote, compact and a re-created branch
+// restart the epoch. Published before any reopen's session_opened, it
+// belongs to the latest session_opened of its branch. It takes the
+// session's own lock to read the lease, so closeSlot builds it before
+// taking s.mu.
+func sessionClosedEvent(sess *session.Session, err error) Event {
+	l := sess.Lease()
+	detail := map[string]any{"holder": l.Holder, "epoch": l.Epoch}
+	if err != nil {
+		detail["error"] = err.Error()
+	}
+	return newEvent("session_closed", sess.DB(), sess.Branch(), detail)
 }
 
 // kvToDetail converts session.OnTransition's flat key/value slice (see
