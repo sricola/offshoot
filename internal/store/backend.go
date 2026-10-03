@@ -134,7 +134,9 @@ type ReaderPutter interface {
 // and size without returning its bytes (S3: one HeadObject request). The
 // etag is the same string Get and PutIf return for that content on the same
 // backend, so a caller can compare a Head against the etag its own PutIf
-// returned to learn whether the object was replaced since. A missing key is
+// returned to learn whether the object was replaced since (through
+// NormalizeETag, which forgives a provider that quotes, weakens or re-cases
+// the string differently between the two). A missing key is
 // ErrNotFound. Read-only. Like the capabilities above it is discovered by
 // type assertion; Store.Head falls back to Get for a backend without it.
 type Header interface {
