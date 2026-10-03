@@ -179,6 +179,9 @@ var (
 	// they are never closed. Expected to stay empty.
 	unidentified []*os.File
 	clock        uint64 // LRU clock, advanced by touchLocked
+	// Cumulative closes, for metrics: orphans closed by EvictStranded and
+	// cached descriptors closed by Evict.
+	evictedStranded, evictedBudget uint64
 )
 
 // Section is a pinned reader over one database file. It reads through
@@ -408,4 +411,109 @@ func Verify(path string, ino Inode) error {
 		return fmt.Errorf("%w: %s", ErrReplaced, path)
 	}
 	return nil
+}
+
+// EvictStranded closes every orphaned descriptor whose inode nothing pins
+// and reports how many it closed. It first re-checks every cached path:
+// a deleted checkout is never asked for again, so Reader alone would never
+// notice it is gone.
+func EvictStranded() int { return evictStranded(nil) }
+
+func evictStranded(in func(string) bool) int {
+	sweep(in)
+	mu.Lock()
+	defer mu.Unlock()
+	n := 0
+	for ino, es := range orphans {
+		if pins[ino] > 0 {
+			continue // a pinned orphan is a session or read outliving its file; see ReadStats
+		}
+		kept := es[:0]
+		for _, e := range es {
+			if in != nil && !in(e.path) {
+				kept = append(kept, e)
+				continue
+			}
+			// Closed under mu, deliberately: see the package doc's
+			// "Orphans and eviction".
+			e.f.Close()
+			n++
+		}
+		if len(kept) == 0 {
+			delete(orphans, ino)
+		} else {
+			orphans[ino] = kept
+		}
+	}
+	evictedStranded += uint64(n)
+	return n
+}
+
+// sweep orphans every cached descriptor whose path is gone or names another
+// inode now. The stats run outside mu so a slow filesystem never stalls
+// readers. A path cannot come to name a stale entry's inode again: that
+// inode stays allocated while the descriptor is open, and nothing in
+// offshoot ever renames an old checkout file back into place.
+func sweep(in func(string) bool) {
+	mu.Lock()
+	cands := make([]*entry, 0, len(live))
+	for _, e := range live {
+		if in == nil || in(e.path) {
+			cands = append(cands, e)
+		}
+	}
+	mu.Unlock()
+	for _, e := range cands {
+		fi, err := os.Stat(e.path)
+		stale := os.IsNotExist(err)
+		if err == nil {
+			if ino, ierr := inodeOf(fi); ierr == nil && ino != e.ino {
+				stale = true
+			}
+		}
+		if !stale {
+			continue
+		}
+		mu.Lock()
+		if live[e.path] == e {
+			orphanLocked(e.path)
+		}
+		mu.Unlock()
+	}
+}
+
+// Stats is a point-in-time view of the registry, for metrics and tests.
+type Stats struct {
+	Cached          int    // live descriptors, one per path: what Evict bounds
+	Orphaned        int    // descriptors whose path was renamed over or removed
+	Unidentified    int    // opened but never identified; never closable (expected 0)
+	Pins            int    // outstanding pins, summed over inodes
+	StrandedPinned  int    // orphans whose inode is still pinned
+	EvictedStranded uint64 // orphans closed, ever
+	EvictedBudget   uint64 // cached descriptors closed by Evict, ever
+}
+
+// Descriptors is every descriptor this package holds open.
+func (s Stats) Descriptors() int { return s.Cached + s.Orphaned + s.Unidentified }
+
+// ReadStats returns the registry's current counts.
+func ReadStats() Stats {
+	mu.Lock()
+	defer mu.Unlock()
+	s := Stats{
+		Cached:          len(live),
+		Unidentified:    len(unidentified),
+		EvictedStranded: evictedStranded,
+		EvictedBudget:   evictedBudget,
+	}
+	for ino, es := range orphans {
+		s.Orphaned += len(es)
+		if pins[ino] > 0 {
+			s.StrandedPinned += len(es)
+		}
+	}
+	for _, n := range pins {
+		s.Pins += n
+	}
+	return s
 }
