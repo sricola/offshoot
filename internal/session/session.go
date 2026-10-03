@@ -569,6 +569,7 @@ func (s *Session) fail(err error) {
 	if first {
 		s.err = err
 	}
+	lease := s.lease
 	s.mu.Unlock()
 	if first {
 		// "fenced" names this session's one terminal-failure transition,
@@ -580,8 +581,9 @@ func (s *Session) fail(err error) {
 		// returning non-nil. Logged once, matching the "if s.err == nil"
 		// gate above exactly, so a session that fails twice (e.g. a second
 		// caller racing to report the same underlying failure) reports the
-		// transition exactly once, not once per caller.
-		s.logTransition("fenced", "cause", err.Error())
+		// transition exactly once, not once per caller. holder and epoch
+		// let a subscriber match it to the session's "opened".
+		s.logTransition("fenced", "cause", err.Error(), "holder", lease.Holder, "epoch", lease.Epoch)
 	}
 	s.cancel()
 	s.renewCancel()
@@ -902,10 +904,11 @@ func (s *Session) Close() error {
 		os.RemoveAll(s.dir)
 		s.flushMu.Unlock()
 	}
+	// holder and epoch let a subscriber match the close to its "opened".
 	if relErr != nil {
-		s.logTransition("closed", "error", relErr.Error())
+		s.logTransition("closed", "holder", lease.Holder, "epoch", lease.Epoch, "error", relErr.Error())
 	} else {
-		s.logTransition("closed")
+		s.logTransition("closed", "holder", lease.Holder, "epoch", lease.Epoch)
 	}
 	return relErr
 }

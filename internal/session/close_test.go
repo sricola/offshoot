@@ -6,6 +6,7 @@ import (
 	"errors"
 	"fmt"
 	"strings"
+	"sync"
 	"sync/atomic"
 	"testing"
 	"time"
@@ -211,4 +212,70 @@ func TestCloseRetriesRelease(t *testing.T) {
 			}
 		})
 	}
+}
+
+func transitionKV(kv []any, key string) (any, bool) {
+	for i := 0; i+1 < len(kv); i += 2 {
+		if kv[i] == key {
+			return kv[i+1], true
+		}
+	}
+	return nil, false
+}
+
+// TestClosedAndFencedTransitionsCarryHolderAndEpoch: once holders are per
+// session, a subscriber matches a close or a fencing to its session_opened
+// by holder and epoch, so both transitions carry them.
+func TestClosedAndFencedTransitionsCarryHolderAndEpoch(t *testing.T) {
+	testutil.RequireSQLite3(t)
+	w := newWS(t)
+	if err := w.Create("app"); err != nil {
+		t.Fatal(err)
+	}
+	var mu sync.Mutex
+	got := map[string][]any{}
+	prev := OnTransition
+	OnTransition = func(db, branch, event string, kv []any) {
+		mu.Lock()
+		got[event] = kv
+		mu.Unlock()
+	}
+	defer func() { OnTransition = prev }()
+	check := func(event, holder string, epoch uint64) {
+		t.Helper()
+		mu.Lock()
+		kv := got[event]
+		mu.Unlock()
+		if h, _ := transitionKV(kv, "holder"); h != holder {
+			t.Fatalf("%s holder = %v, want %q (kv %v)", event, h, holder, kv)
+		}
+		if e, _ := transitionKV(kv, "epoch"); e != epoch {
+			t.Fatalf("%s epoch = %v, want %d (kv %v)", event, e, epoch, kv)
+		}
+	}
+
+	s, err := Open(context.Background(), Options{WS: w, DB: "app", Branch: "main", Holder: "kv-a"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	epoch := s.Lease().Epoch
+	if err := s.Close(); err != nil {
+		t.Fatal(err)
+	}
+	check("closed", "kv-a", epoch)
+
+	f, err := Open(context.Background(), Options{WS: w, DB: "app", Branch: "main",
+		Holder: "kv-b", LeaseTTL: time.Nanosecond})
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer f.Close()
+	fepoch := f.Lease().Epoch
+	if _, err := w.AcquireLease("app", "main", "thief", ops.DefaultLeaseTTL); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := f.Flush("", nil); err == nil {
+		t.Fatal("Flush after fencing must fail")
+	}
+	check("fenced", "kv-b", fepoch)
 }
