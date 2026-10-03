@@ -105,6 +105,7 @@ func TestReaderPreservesSQLiteLocks(t *testing.T) {
 				if _, err := io.Copy(io.Discard, r); err != nil {
 					t.Fatal(err)
 				}
+				r.Close()
 			}
 		}) {
 			t.Fatal("dbfile.Reader dropped the SQLite connection's read lock: " +
@@ -129,10 +130,9 @@ func TestReaderPreservesSQLiteLocks(t *testing.T) {
 }
 
 // TestReaderFollowsAReplacedFile pins the revalidation behaviour: because the
-// descriptor is cached for the life of the process and never closed, a path
-// that is replaced by a different inode — how checkouts are re-materialized,
-// write-temp-then-rename — must not keep answering from the old, unlinked
-// file.
+// descriptor for a path is cached, a path that is replaced by a different
+// inode — how checkouts are re-materialized, write-temp-then-rename — must
+// not keep answering from the old, unlinked file.
 func TestReaderFollowsAReplacedFile(t *testing.T) {
 	dir := t.TempDir()
 	path := filepath.Join(dir, "x.db")
@@ -144,6 +144,7 @@ func TestReaderFollowsAReplacedFile(t *testing.T) {
 		t.Fatal(err)
 	}
 	got, _ := io.ReadAll(r)
+	r.Close()
 	if string(got) != "first" {
 		t.Fatalf("got %q, want %q", got, "first")
 	}
@@ -161,6 +162,7 @@ func TestReaderFollowsAReplacedFile(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
+	defer r.Close()
 	got, _ = io.ReadAll(r)
 	if string(got) != "second-and-longer" {
 		t.Fatalf("stale descriptor: got %q, want %q", got, "second-and-longer")
@@ -180,6 +182,7 @@ func TestReaderSeesGrowth(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
+	defer early.Close()
 	if err := os.WriteFile(path, []byte("aaaabbbb"), 0o644); err != nil {
 		t.Fatal(err)
 	}
@@ -190,6 +193,7 @@ func TestReaderSeesGrowth(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
+	defer late.Close()
 	if got, _ := io.ReadAll(late); string(got) != "aaaabbbb" {
 		t.Fatalf("later reader did not see the extended file: got %q", got)
 	}

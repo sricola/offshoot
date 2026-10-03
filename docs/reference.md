@@ -186,7 +186,8 @@ state still wins, but a warning is printed to stderr first since those edits
 are about to be overwritten.
 
 **Errors:** no such `db@branch`; checkout is busy (a live connection is
-holding it) — closes connections and retry.
+holding it) — close connections and retry; another operation replaced or
+removed the checkout while it was being opened (retry).
 
 ### Read-only historical checkout: `--at <checkpoint> --read-only [--force]`
 
@@ -379,8 +380,9 @@ that. The same rules apply to `rollback`, `promote --onto` (the target
 only) and `compact`.
 
 **Errors:** checkpoint name already exists on this branch; no checkout
-exists yet (run `checkout` first); checkout is busy; live lease without
-`--force`; detached checkout without `--force`; branch mid-destroy or
+exists yet (run `checkout` first); checkout is busy; another operation
+replaced or removed the checkout while it was being opened (retry); live
+lease without `--force`; detached checkout without `--force`; branch mid-destroy or
 mid-reap; `--meta` over a cap (key count, key length, or value length).
 
 ## `offshoot fork <db>[@branch] <new-branch> [--at checkpoint] [--ttl duration] [--meta k=v ...]`
@@ -577,8 +579,12 @@ skips minting the safety fork entirely.
 
 The ref repoint (a CAS write) is the point of no return; the local checkout
 refresh that follows is best-effort — if it fails (e.g. the checkout is
-busy), the command reports a partial success: the branch *did* roll back,
-but the checkout needs a manual `offshoot checkout` to catch up.
+busy, or another operation replaced or removed it during the refresh), the
+command reports a partial success: the branch *did* roll back, but the
+checkout needs a manual `offshoot checkout <db>@<branch>` to catch up, which
+the error names (a busy checkout's error says to close its connections
+first). Do not retry the rollback: a second one would replace the safety
+fork with the already-rolled-back head.
 
 **Errors:** unknown checkpoint name; the branch has a live lease without
 `--force`, or is mid-destroy or mid-reap (nothing is touched);
@@ -660,8 +666,12 @@ semantics as rollback.
 mid-reap; `<target>-pre-promote` exists but is not promote's own safety fork (nothing
 is touched); the previous safety fork has a live lease (nothing is
 touched — close that session first, or `--no-backup`); target checkout is
-busy (repoint still lands; checkout refresh is skipped and reported); lost
-a concurrent CAS race (retry).
+busy, or another operation replaced or removed it, during the refresh after
+the repoint (the promote stands; the refresh is skipped and reported: close
+the checkout's connections if it was busy, then refresh it with
+`offshoot checkout <db>@<target>`, not by retrying the promote, which would
+replace the safety fork with the promoted head); lost a concurrent CAS race
+(retry).
 
 **Daemon/SDK parity.** The daemon's `promote` op takes the same knobs as
 request fields — `no_backup` (bool), `backup_ttl` (a Go duration
@@ -723,7 +733,10 @@ and the ref swap loses the CAS and returns a retry error.
 **Errors:** no such `db@branch`; branch has a live lease (an open session,
 or `lease acquire`) without `--force`, which fences that session and loses
 its unflushed writes; branch mid-destroy or mid-reap; lost a concurrent
-CAS race to a flush (retry).
+CAS race to a flush (retry). After the repoint, a checkout that is busy,
+or that another operation replaced or removed during the refresh, is not
+refreshed; the compact stands and reports it (close the checkout's
+connections if it was busy, then run `offshoot checkout <db>@<branch>`).
 
 ## `offshoot destroy <db>[@branch] [--force]`
 
@@ -757,8 +770,10 @@ point) are reclaimed on the normal GC schedule right away. In short:
 child.**
 
 **Errors:** protected without `--force`; live lease without `--force`;
-checkout is busy (close connections first); the destroy lost a race to a
-concurrent `AcquireLease` on the same branch (retry — see below).
+checkout is busy (close connections first); another operation replaced or
+removed the checkout while destroy was opening it (retry); the destroy
+lost a race to a concurrent `AcquireLease` on the same branch (retry — see
+below).
 
 ### Claim-guarded delete
 
@@ -1005,7 +1020,7 @@ Releases the branch's current lease (looked up first via the same listing
 
 **Errors:** no lease currently held on that branch.
 
-## `offshoot serve [-socket PATH] [-reap-every DURATION] [-gc-grace DURATION] [-flush-every DURATION] [-snapshot-every N] [-ro-cache-budget BYTES] [-http ADDR] [-token TOKEN] [-http-allow-non-loopback]`
+## `offshoot serve [-socket PATH] [-reap-every DURATION] [-gc-grace DURATION] [-flush-every DURATION] [-snapshot-every N] [-ro-cache-budget BYTES] [-fd-budget N] [-http ADDR] [-token TOKEN] [-http-allow-non-loopback]`
 
 ```
 offshoot serve
@@ -1067,7 +1082,8 @@ default of 16.
 **Errors:** socket path already in use by another listener; underlying
 store-attach failure; `-flush-every` given a negative duration;
 `-snapshot-every` given a value less than 1, or a non-integer;
-`-ro-cache-budget` given a negative value.
+`-ro-cache-budget` given a negative value; `-fd-budget` given a negative
+or non-integer value.
 
 ### `-ro-cache-budget BYTES` — checkouts-ro disk budget
 
@@ -1193,6 +1209,48 @@ and self-heals into staying hot from then on.
 `checkouts-ro` remains safe to `rm -rf` at any time regardless of the
 budget (see the read-only checkout section above) — a budget just
 automates what that manual cleanup would otherwise require doing by hand.
+
+### `-fd-budget N` — cached checkout descriptors
+
+```
+offshoot serve -fd-budget 64     # the default
+offshoot serve -fd-budget 0      # unlimited
+```
+
+The daemon reads checkout files raw, to fingerprint and snapshot them,
+through descriptors it caches, one per checkout path. `-fd-budget N`
+bounds how many it keeps: each janitor pass (on the `-reap-every`
+cadence) closes cached descriptors least recently used first until `N`
+remain. It bounds cached checkout descriptors, not the process's total
+(sockets, WAL readers and store files are not counted), and it counts
+every file the cache holds, `checkouts-ro/<db>/~by-chain/` entries
+included. A descriptor pinned by an open session or an in-flight read is
+never closed: the session's capture engine holds SQLite locks on its
+checkout, and closing any descriptor on that file would drop them. So a
+daemon with more open sessions than `N` keeps one per session. `0` means
+unlimited, matching `-ro-cache-budget`; `-reap-every 0` turns the janitor,
+and with it this bound, off.
+
+Separately, whatever the budget: a descriptor whose checkout was renamed
+over (re-materialized) or deleted is stranded, holding the unlinked file's
+disk, and is closed as soon as nothing pins it. When this process made the
+strand, that happens right after the checkout, rollback, promote or
+compact refresh, by-chain prune, destroy or reap that made it. A checkout
+another process removed or replaced (a CLI `destroy`, `gc` or `checkout`
+against the same store) is found only by the full sweep every janitor
+pass runs. `offshoot mcp` reclaims its own strands the same way and runs
+the full sweep on every `-reap-every` tick, daemon or not. With
+`-reap-every 0`, the daemon or `offshoot mcp` keeps descriptors stranded
+by another process until it restarts.
+
+Metrics: `offshoot_dbfile_descriptors` (cached plus stranded),
+`offshoot_dbfile_pins`, `offshoot_dbfile_stranded_pinned` (stranded but
+still pinned, by a read or connection on the file or a connection on its
+path: brief while a session or read outlives its file, a pin leak
+if it stays non-zero across passes, logged as `offshoot: janitor:
+dbfile: ...`) and `offshoot_dbfile_evicted_total{reason}` (`stranded` or
+`budget`). The daemon `status` op reports the descriptor count as
+`dbfile_descriptors` (SDK `daemon_status()` / `daemonStatus()`).
 
 ### `-http ADDR` — opt-in HTTP listener
 
@@ -1441,7 +1499,9 @@ socket, the MCP process defers to it entirely and logs once that it's
 skipping its own pass — never a second writer racing the daemon's own
 janitor against the same store. Either way, `-reap-every` runs **no GC**:
 reclaiming a reaped branch's storage still needs `offshoot gc` (by hand) or
-a running `offshoot serve` daemon.
+a running `offshoot serve` daemon. Each tick, daemon or not, also closes
+this process's descriptors on checkouts that were renamed over or removed
+(see `serve -fd-budget`), including ones another process removed.
 
 **Annotations.** Every tool's `tools/list` entry carries an explicit
 `annotations` object — `readOnlyHint`, `destructiveHint`, `idempotentHint`,
@@ -1724,10 +1784,9 @@ CI patterns that mix the two surfaces (CLI seeding + SDK sessions), see
 ## What's not here
 
 See [docs/status.md](status.md) for the full implemented/deferred matrix
-and links to the roadmap milestones tracking each — e.g. the FD budget
-with idle-checkout eviction, still not yet implemented as of this page's
-last update. See also [docs/stability.md](stability.md) for what pre-1.0
-means for the commands above (and the `export` → `create --from` format
-escape hatch), [docs/testing.md](testing.md) for how this surface is
-tested, and [docs/ci-recipes.md](ci-recipes.md) for ready-made GitHub
-Actions workflows built from these commands.
+and links to the roadmap milestones tracking each. See also
+[docs/stability.md](stability.md) for what pre-1.0 means for the commands
+above (and the `export` → `create --from` format escape hatch),
+[docs/testing.md](testing.md) for how this surface is tested, and
+[docs/ci-recipes.md](ci-recipes.md) for ready-made GitHub Actions
+workflows built from these commands.

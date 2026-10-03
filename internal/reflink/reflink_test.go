@@ -236,3 +236,61 @@ func TestCloneMissingSrcIsNotUnsupported(t *testing.T) {
 		t.Fatalf("Clone of a missing src = %v, want a non-ErrUnsupported error", err)
 	}
 }
+
+// TestCloneFromLeavesSourceOpen: CloneFrom clones through the caller's
+// descriptor and never closes it, the property that makes it safe on a
+// file whose POSIX locks this process relies on (see Clone).
+func TestCloneFromLeavesSourceOpen(t *testing.T) {
+	dir := t.TempDir()
+	srcPath, want := writeSrc(t, dir, "src", 1<<20+5)
+	src, err := os.Open(srcPath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer src.Close()
+	dst := filepath.Join(dir, "dst")
+	err = CloneFrom(dst, src)
+	if _, statErr := src.Stat(); statErr != nil {
+		t.Fatalf("CloneFrom closed its source descriptor: %v", statErr)
+	}
+	if errors.Is(err, ErrUnsupported) {
+		if _, statErr := os.Stat(dst); !os.IsNotExist(statErr) {
+			t.Fatalf("unsupported clone left dst behind: %v", statErr)
+		}
+		t.Skip("temp filesystem does not support reflink/clonefile")
+	}
+	if err != nil {
+		t.Fatal(err)
+	}
+	got, err := os.ReadFile(dst)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !bytes.Equal(got, want) {
+		t.Fatal("cloned content mismatch")
+	}
+	if err := CloneFrom(dst, src); !errors.Is(err, ErrUnsupported) {
+		t.Fatalf("CloneFrom onto an existing dst = %v, want ErrUnsupported (create-only)", err)
+	}
+}
+
+func TestCloneFromForcedUnsupported(t *testing.T) {
+	orig := forceUnsupportedForTest
+	forceUnsupportedForTest = true
+	defer func() { forceUnsupportedForTest = orig }()
+
+	dir := t.TempDir()
+	srcPath, _ := writeSrc(t, dir, "src", 100)
+	src, err := os.Open(srcPath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer src.Close()
+	dst := filepath.Join(dir, "dst")
+	if err := CloneFrom(dst, src); !errors.Is(err, ErrUnsupported) {
+		t.Fatalf("CloneFrom = %v, want ErrUnsupported", err)
+	}
+	if _, err := os.Stat(dst); !os.IsNotExist(err) {
+		t.Fatalf("forced-unsupported CloneFrom created dst: %v", err)
+	}
+}

@@ -89,6 +89,28 @@ class TestBranchesWireCompat(unittest.TestCase):
         self.assertEqual(branches[0].state, "active")
 
 
+class TestDaemonStatusWireCompat(unittest.TestCase):
+    """Client.daemon_status()'s response parsing, no daemon needed (see
+    TestBranchesWireCompat for the pattern)."""
+
+    def _client_with_response(self, resp: dict) -> offshoot.Client:
+        client = offshoot.Client.__new__(offshoot.Client)
+        client._call = lambda op, **fields: resp
+        return client
+
+    def test_missing_descriptor_count_is_none_not_zero(self):
+        # A daemon older than dbfile_descriptors sends no such key. Reading
+        # that as 0 would report a healthy "no descriptors" for an unknown.
+        st = self._client_with_response({"ok": True, "sessions": []}).daemon_status()
+        self.assertIsNone(st.dbfile_descriptors)
+
+    def test_present_descriptor_count_is_passed_through(self):
+        st = self._client_with_response(
+            {"ok": True, "sessions": [], "dbfile_descriptors": 0}
+        ).daemon_status()
+        self.assertEqual(st.dbfile_descriptors, 0)
+
+
 class TestCreateFromPathResolution(unittest.TestCase):
     """Pure-logic tests for Client.create's from_path handling; no daemon
     needed -- Client.__new__ skips __init__ (which opens a real socket) and
@@ -431,6 +453,22 @@ class TestClient(unittest.TestCase):
             c.promote("rp", "feature", "main", force=True, backup=False)
             self.assertNotIn("main-pre-promote", {b.branch for b in c.branches("rp")})
 
+    def test_daemon_status_reports_descriptors(self):
+        with offshoot.connect(self.d.sock) as c:
+            c.create("ds")
+            s = c.open("ds")
+            try:
+                st = c.daemon_status()
+                self.assertIsInstance(st, offshoot.DaemonStatus)
+                self.assertTrue(any(x["db"] == "ds" and x["branch"] == "main" for x in st.sessions))
+                self.assertIsNotNone(st.dbfile_descriptors)
+                self.assertGreaterEqual(st.dbfile_descriptors or 0, 1)
+                # status() is unchanged: still the bare session list. Not
+                # compared to st.sessions, whose lag/age fields move between calls.
+                self.assertIsInstance(c.status(), list)
+            finally:
+                s.close()
+
     def test_dbs_lists_every_database_sorted(self):
         with offshoot.connect(self.d.sock) as c:
             c.create("dbs-zeta")
@@ -683,13 +721,13 @@ class TestClient(unittest.TestCase):
         effort, not load-bearing on every CI runner).
 
         Deliberately filtered to TYPE "unix" rather than a raw total fd
-        count: internal/dbfile's checkout file descriptors are DELIBERATELY
-        NEVER closed for the life of the daemon (see docs/status.md's
-        Resource behavior table) -- opening a session over the course of
-        this test legitimately grows the daemon's REG-file fd count by
-        design, which would make a raw total-fd-count comparison spuriously
-        fail regardless of whether events()'s dedicated socket itself
-        leaked. Counting only "unix" rows isolates exactly the resource
+        count: internal/dbfile caches checkout file descriptors and closes
+        them only once nothing pins them, on its own schedule (janitor
+        passes under serve -fd-budget; see docs/status.md's Resource
+        behavior table) -- opening a session over the course of this test
+        legitimately grows the daemon's REG-file fd count by design, which
+        would make a raw total-fd-count comparison spuriously fail
+        regardless of whether events()'s dedicated socket itself leaked. Counting only "unix" rows isolates exactly the resource
         events()'s dedicated connection actually holds.
         """
         if not shutil.which("lsof"):

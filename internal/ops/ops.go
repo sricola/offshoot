@@ -25,6 +25,7 @@ import (
 	"time"
 
 	_ "github.com/mattn/go-sqlite3"
+	"github.com/sricola/offshoot/internal/dbfile"
 	"github.com/sricola/offshoot/internal/ltxio"
 	"github.com/sricola/offshoot/internal/store"
 )
@@ -309,19 +310,8 @@ func (w *Workspace) CreateFrom(db, srcPath string) error {
 	}
 	defer os.RemoveAll(dir)
 	cp := filepath.Join(dir, "import.db")
-	// VACUUM INTO reads the source under one read transaction, so the copy
-	// is a consistent committed state even when another process is writing
-	// to the source (a byte copy of a live file could tear across pages and
-	// import as a well-formed snapshot of garbage); it honours the source's
-	// WAL without touching it. The source itself is never written.
-	src, err := sql.Open("sqlite3", srcPath+"?_busy_timeout=5000")
-	if err != nil {
-		return fmt.Errorf("ops: import %s: %w", srcPath, err)
-	}
-	_, err = src.Exec("VACUUM INTO ?", cp)
-	src.Close()
-	if err != nil {
-		return fmt.Errorf("ops: import %s: not a usable SQLite database: %w", srcPath, err)
+	if err := vacuumImportSource(srcPath, cp); err != nil {
+		return err
 	}
 	// Normalize the copy the way Create builds a fresh database: WAL mode
 	// in the header, then quiesced, so every checkout materialized from it
@@ -336,6 +326,42 @@ func (w *Workspace) CreateFrom(db, srcPath string) error {
 	}
 	conn.Close()
 	return w.createFromQuiesced(db, cp)
+}
+
+// vacuumImportSource copies srcPath's committed state into dst with VACUUM
+// INTO, never writing the source. The source is pinned like any checkout
+// (see quiesce): the daemon's create op imports whatever absolute path its
+// client names, which can be a checkout this same process caches and has a
+// capture engine on.
+func vacuumImportSource(srcPath, dst string) error {
+	release, ino, err := dbfile.Hold(srcPath)
+	if err != nil {
+		return fmt.Errorf("ops: import %s: %w", srcPath, err)
+	}
+	defer release()
+	src, err := sql.Open("sqlite3", dbfile.NoCreateDSN(srcPath, "_busy_timeout=5000"))
+	if err != nil {
+		return fmt.Errorf("ops: import %s: %w", srcPath, err)
+	}
+	defer src.Close()
+	ctx := context.Background()
+	conn, err := src.Conn(ctx)
+	if err != nil {
+		return fmt.Errorf("ops: import %s: not a usable SQLite database: %w", srcPath, err)
+	}
+	defer conn.Close()
+	if err := dbfile.Verify(srcPath, ino); err != nil {
+		return fmt.Errorf("ops: import %s: %w", srcPath, err)
+	}
+	// VACUUM INTO reads the source under one read transaction, so the copy
+	// is a consistent committed state even when another process is writing
+	// to the source (a byte copy of a live file could tear across pages and
+	// import as a well-formed snapshot of garbage); it honours the source's
+	// WAL without touching it. The source itself is never written.
+	if _, err := conn.ExecContext(ctx, "VACUUM INTO ?", dst); err != nil {
+		return fmt.Errorf("ops: import %s: not a usable SQLite database: %w", srcPath, err)
+	}
+	return nil
 }
 
 // Checkout materializes db@branch's head snapshot to its fixed path. If a
@@ -371,7 +397,7 @@ func (w *Workspace) CheckoutProven(db, branch string) (CheckoutResult, error) {
 	path := w.CheckoutPath(db, branch)
 	if _, err := os.Stat(path); err == nil {
 		if err := quiesce(path); err != nil {
-			return CheckoutResult{}, err
+			return CheckoutResult{}, retryHint("checkout", db, branch, err)
 		}
 		// checkoutState compares the sidecar's recorded (lineage, epoch,
 		// txid) against ref.Lineage/ref.HeadEpoch/ref.HeadTXID — the CURRENT
@@ -383,8 +409,9 @@ func (w *Workspace) CheckoutProven(db, branch string) (CheckoutResult, error) {
 		// (a fenced writer's orphan vs. the live object), so lineage+txid
 		// alone would not prove identity. A clean, current checkout needs no
 		// re-materialization: return it as-is rather than paying the
-		// temp+rename cost (and, via materializeAt->dbfile, stranding
-		// another descriptor) to rebuild bytes that are already correct.
+		// temp+rename cost (and orphaning the cached descriptor on the old
+		// inode until reclaimStranded closes it) to rebuild bytes that are
+		// already correct.
 		state, postApplyChecksum := checkoutState(path, ref)
 		switch state {
 		case "clean":
@@ -521,15 +548,20 @@ func (w *Workspace) Checkpoint(db, branch, name string, meta map[string]string) 
 // the object goes up with the same create-only put and ref CAS, and the
 // sidecar and shadow are refreshed after the CAS.
 //
-// NOT SAFE against a live in-process session's checkout: it raw-opens (and
-// closes) the checkout path to encode it, and that close drops every
-// SQLite lock this process holds on it — the POSIX (process, inode)
-// lock-drop hazard, see internal/dbfile. Today only the CLI (cmd/offshoot)
-// and MCP (internal/mcp) reach this, both of which are separate processes
-// from the daemon that runs sessions, so no in-process session can be
-// holding that checkout. The daemon conspicuously has no checkpoint op; if
-// one is ever added it MUST NOT call this directly — route the snapshot
-// through the session's own engine, or through dbfile.
+// NOT SAFE against a live in-process connection on the checkout: it
+// raw-opens (and closes) the checkout path to encode it (snapshot), to diff
+// it against the shadow (segment, diffPages) and to checksum it for the
+// stamp (stampCheckpoint), and each close drops every SQLite lock this
+// process holds on it — the POSIX (process, inode) lock-drop hazard, see
+// internal/dbfile. Today only the CLI (cmd/offshoot) and MCP
+// (internal/mcp) reach this, both of which are separate processes from the
+// daemon that runs sessions, so no in-process session can be holding that
+// checkout. In offshoot mcp the reaper goroutine still can: a TTL fork
+// reaped mid-checkpoint has Destroy's quiesce connection open on it, whose
+// locks these closes drop (a known, narrow hazard: see internal/dbfile's
+// package doc). The daemon conspicuously has no checkpoint op; if one is
+// ever added it MUST NOT call this directly — route the snapshot through
+// the session's own engine, or through dbfile.
 //
 // meta (nil = none) is a small string->string map describing this specific
 // checkpoint (e.g. eval run id, git SHA, agent id), capped by ValidateMeta
@@ -574,7 +606,7 @@ func (w *Workspace) CheckpointWith(db, branch, name string, meta map[string]stri
 			db, branch, ref.HeadTXID, db, branch)
 	}
 	if err := quiesce(path); err != nil {
-		return CheckpointResult{}, err
+		return CheckpointResult{}, retryHint("checkpoint", db, branch, err)
 	}
 	// The checkout's fingerprint right after quiesce, before the encode:
 	// stampCheckpoint compares it with the file it stamps, so a write
@@ -849,12 +881,58 @@ func checkpointKindAt(ref store.Ref, txid uint64) string {
 // instant" apart from "this file can't be quiesced for some other reason"
 // checks errors.Is against this sentinel — see ops.BranchStateAt, which
 // treats a busy checkout as itself evidence of un-checkpointed activity
-// ("dirty") rather than an absence of evidence ("idle"). The wrapped message
-// text is unchanged from before this sentinel existed, so every existing
-// caller that only logs/propagates quiesce's error (Checkpoint,
-// CheckoutProven, Rollback's refresh, Promote's refresh,
-// warnIfUncheckpointed) sees byte-identical output.
-var errQuiesceBusy = errors.New("ops: database is busy (live writer or reader); close connections and retry")
+// ("dirty") rather than an absence of evidence ("idle"). Like
+// errCheckoutReplaced, its text names no next step, because the right one
+// depends on what the caller has committed: checkout and checkpoint add
+// "close connections and retry" (retryHint) and destroy says to close them
+// before destroying, while the promote, rollback and compact refreshes,
+// which run after their repoint has committed, say to close them and then
+// run 'offshoot checkout' (refreshFailed, and rollback's own wrap).
+var errQuiesceBusy = errors.New("ops: database is busy (live writer or reader)")
+
+// errCheckoutReplaced is quiesce's error when the checkout was renamed over
+// or removed while quiesce was opening it: another operation re-materialized
+// or destroyed it in that window (see dbfile.Hold). Nothing is wrong with
+// whatever the path names now, and it is neither "busy" nor "in use". It
+// wraps the underlying error (dbfile.ErrReplaced, or the open's or stat's
+// own). Its text carries no retry hint, because not every caller can
+// retry: an operation that has committed nothing yet adds one
+// (retryHint), while the promote, rollback and compact refreshes run
+// after their repoint has committed (refreshFailed, and rollback's own
+// wrap). Retrying a promote or rollback then would move its rolling safety
+// fork onto the repointed head, leaving the original head on no branch.
+// errQuiesceBusy carries no hint for the same reason.
+var errCheckoutReplaced = errors.New("ops: the checkout was replaced or removed while it was being opened")
+
+// retryHint adds the retry hint to a quiesce error, for a caller that has
+// committed nothing yet, so retrying it is safe: verb names that
+// operation. A checkout that lost a race with another operation
+// (errCheckoutReplaced) can be retried at once, and a busy one
+// (errQuiesceBusy) once its connections close. Any other error is
+// returned unchanged.
+func retryHint(verb, db, branch string, err error) error {
+	switch {
+	case errors.Is(err, errCheckoutReplaced):
+		return fmt.Errorf("ops: %s %s@%s lost a race with another operation (retry): %w", verb, db, branch, err)
+	case errors.Is(err, errQuiesceBusy):
+		return fmt.Errorf("%w; close connections and retry", err)
+	}
+	return err
+}
+
+// refreshFailed is the error for a refresh after a committed repoint
+// (promote, compact) whose quiesce failed: the operation stands, so it
+// names 'offshoot checkout', and never the operation itself, as the next
+// step, after closing the checkout's connections when it was busy
+// (errQuiesceBusy). Only a busy checkout is called "in use": one that lost
+// a race (errCheckoutReplaced) or failed to open is not. done says what
+// committed ("promoted", "compacted").
+func refreshFailed(done, path, db, branch string, err error) error {
+	if errors.Is(err, errQuiesceBusy) {
+		return fmt.Errorf("ops: %s, but checkout %s is in use and was NOT refreshed; close its connections, then run 'offshoot checkout %s@%s' to refresh it: %w", done, path, db, branch, err)
+	}
+	return fmt.Errorf("ops: %s, but checkout %s was NOT refreshed; run 'offshoot checkout %s@%s' to refresh it: %w", done, path, db, branch, err)
+}
 
 // quiesceBusyTimeoutMS is the SQLite busy timeout (milliseconds) quiesce
 // opens with. Deliberately DIFFERENT from the capture engine's 5000ms
@@ -864,15 +942,47 @@ var errQuiesceBusy = errors.New("ops: database is busy (live writer or reader); 
 const quiesceBusyTimeoutMS = 3000
 
 // quiesce checkpoints the WAL fully, failing cleanly on a busy database (see
-// errQuiesceBusy).
+// errQuiesceBusy). Its connection takes locks on the checkout's inode, and
+// in the daemon it runs concurrently with dbfile's evictions (branches,
+// checkout, the rollback and promote refreshes, fork's warning, and reap and
+// destroy on every janitor tick), so it pins that inode first (see
+// internal/dbfile's Pins): the release is deferred before the database's
+// Close so it runs after the connection is gone, and Verify proves the
+// lazily opened connection is on the held inode. A path that does not exist
+// fails at the Hold, and one removed after it fails the open
+// (dbfile.NoCreateDSN), instead of either being created empty by SQLite.
+// Every caller stats the checkout first, so a path missing at the Hold, or
+// replaced or removed before Verify, lost a race with another operation:
+// all of those return errCheckoutReplaced.
 func quiesce(path string) error {
-	conn, err := sql.Open("sqlite3", fmt.Sprintf("%s?_busy_timeout=%d", path, quiesceBusyTimeoutMS))
+	release, ino, err := dbfile.Hold(path)
+	if err != nil {
+		if os.IsNotExist(err) {
+			return fmt.Errorf("%w: %w", errCheckoutReplaced, err)
+		}
+		return err
+	}
+	defer release()
+	db, err := sql.Open("sqlite3", dbfile.NoCreateDSN(path, fmt.Sprintf("_busy_timeout=%d", quiesceBusyTimeoutMS)))
 	if err != nil {
 		return err
 	}
+	defer db.Close()
+	ctx := context.Background()
+	conn, err := db.Conn(ctx)
+	if err != nil {
+		// NoCreateDSN fails the open of a path removed after the Hold.
+		if _, serr := os.Stat(path); os.IsNotExist(serr) {
+			return fmt.Errorf("%w: %w", errCheckoutReplaced, err)
+		}
+		return fmt.Errorf("ops: open %s: %w", path, err)
+	}
 	defer conn.Close()
+	if err := dbfile.Verify(path, ino); err != nil {
+		return fmt.Errorf("%w: %w", errCheckoutReplaced, err)
+	}
 	var busy, logN, ckptN int
-	if err := conn.QueryRow("PRAGMA wal_checkpoint(TRUNCATE)").Scan(&busy, &logN, &ckptN); err != nil {
+	if err := conn.QueryRowContext(ctx, "PRAGMA wal_checkpoint(TRUNCATE)").Scan(&busy, &logN, &ckptN); err != nil {
 		return fmt.Errorf("ops: checkpoint: %w", err)
 	}
 	if busy != 0 {
@@ -894,6 +1004,10 @@ func (w *Workspace) warnIfUncheckpointed(db, branch string, ref store.Ref, actio
 		return
 	}
 	if err := quiesce(path); err != nil {
+		if errors.Is(err, errCheckoutReplaced) {
+			fmt.Fprintf(os.Stderr, "offshoot: warning: checkout of %s@%s changed while it was being checked; %s (txid %d)\n", db, branch, action, ref.HeadTXID)
+			return
+		}
 		fmt.Fprintf(os.Stderr, "offshoot: warning: checkout of %s@%s is busy; %s (txid %d)\n", db, branch, action, ref.HeadTXID)
 		return
 	}
@@ -1598,7 +1712,14 @@ func (w *Workspace) RollbackWith(db, branch, to string, opts RollbackOptions) (R
 		ObserveRollback(base != nil)
 	}
 	if err := refresh(); err != nil {
-		return RollbackResult{}, fmt.Errorf("ops: branch repointed to checkpoint %q (txid %d), but the checkout could not be refreshed (run 'offshoot checkout' to re-materialize): %w", to, txid, err)
+		// The rollback stands: the next step is a checkout, never a second
+		// rollback (see errCheckoutReplaced), after closing the checkout's
+		// connections when it was busy.
+		next := fmt.Sprintf("run 'offshoot checkout %s@%s' to re-materialize", db, branch)
+		if errors.Is(err, errQuiesceBusy) {
+			next = "it is in use: close its connections, then " + next
+		}
+		return RollbackResult{}, fmt.Errorf("ops: branch repointed to checkpoint %q (txid %d), but the checkout could not be refreshed (%s): %w", to, txid, next, err)
 	}
 	return RollbackResult{Path: path, Backup: backup, Shared: base != nil, BackupIsTarget: backupIsTarget}, nil
 }
@@ -1815,7 +1936,7 @@ func (w *Workspace) PromoteWith(db, source, target string, opts PromoteOptions) 
 	path := w.CheckoutPath(db, target)
 	if _, err := os.Stat(path); err == nil {
 		if err := quiesce(path); err != nil {
-			return result, fmt.Errorf("ops: promoted, but checkout %s is in use and was NOT refreshed: %w", path, err)
+			return result, refreshFailed("promoted", path, db, target, err)
 		}
 		checksum, chain, err := w.refreshFromChain(db, next, path)
 		if err != nil {
@@ -1973,7 +2094,7 @@ func (w *Workspace) CompactWith(db, branch string, opts CompactOptions) (uint64,
 	path := w.CheckoutPath(db, branch)
 	if _, err := os.Stat(path); err == nil {
 		if err := quiesce(path); err != nil {
-			return txid, fmt.Errorf("ops: compacted, but checkout %s is in use and was NOT refreshed: %w", path, err)
+			return txid, refreshFailed("compacted", path, db, branch, err)
 		}
 		checksum, chain, err := w.refreshFromChain(db, next, path)
 		if err != nil {

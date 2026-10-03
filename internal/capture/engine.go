@@ -521,12 +521,29 @@ func (e *Engine) Run(ctx context.Context) error {
 	var err error
 	// NOTE: this function deliberately opens NO descriptor of its own on the
 	// main database file, and in particular closes none at teardown. Raw
-	// reads of that file go through internal/dbfile, whose descriptors are
-	// never closed — see copySrc/hashSrc below and dbfile's package comment
-	// for the POSIX (process, inode) lock semantics that make an engine-owned
-	// descriptor unsafe no matter how carefully its close is ordered.
-	e.db, err = sql.Open("sqlite3",
-		fmt.Sprintf("%s?_busy_timeout=%d&_journal_mode=WAL", e.o.DBPath, captureBusyTimeoutMS))
+	// reads of that file go through internal/dbfile (see copySrc/hashSrc
+	// below and dbfile's package comment for the POSIX (process, inode) lock
+	// semantics that make an engine-owned descriptor unsafe no matter how
+	// carefully its close is ordered).
+	//
+	// The engine's connection holds POSIX locks on the checkout's inode for
+	// its whole life, and closing ANY descriptor on that inode in this
+	// process would drop them. dbfile closes a cached descriptor only while
+	// nothing pins its inode, so the engine pins it before sql.Open and
+	// releases it only after e.conn and e.db are closed: release is deferred
+	// first so it runs last, on every return path below. The engine keeps
+	// exactly one connection, e.conn. Anything that ever takes a second one
+	// from e.db must close it before Run returns, or the release would leave
+	// that connection's locks unprotected. The open never creates the file
+	// (dbfile.NoCreateDSN): a checkout removed after the hold fails here
+	// instead of coming back as an empty database.
+	release, ino, err := dbfile.Hold(e.o.DBPath)
+	if err != nil {
+		return err
+	}
+	defer release()
+	e.db, err = sql.Open("sqlite3", dbfile.NoCreateDSN(e.o.DBPath,
+		fmt.Sprintf("_busy_timeout=%d&_journal_mode=WAL", captureBusyTimeoutMS)))
 	if err != nil {
 		return err
 	}
@@ -539,6 +556,11 @@ func (e *Engine) Run(ctx context.Context) error {
 		return err
 	}
 	defer e.conn.Close()
+	// database/sql opened lazily, so only now is the file SQLite opened
+	// known: it must be the inode the hold pinned.
+	if err := dbfile.Verify(e.o.DBPath, ino); err != nil {
+		return err
+	}
 	if _, err := e.conn.ExecContext(ctx, "PRAGMA wal_autocheckpoint=0"); err != nil {
 		if ctx.Err() != nil {
 			return nil
@@ -1756,12 +1778,13 @@ func (e *Engine) checkpoint(ctx context.Context, mode string) (log int, err erro
 // checkout, or an application connection a caller is holding open across
 // this engine's lifetime. An engine-scoped descriptor is therefore safe only
 // if this engine is the last thing in the process touching that file, which
-// is precisely what an engine cannot know. dbfile's descriptors are never
-// closed at all, which is the only formulation that is unconditionally safe.
-// See dbfile's package comment; TestEngineResumesCleanly and
+// is precisely what an engine cannot know. dbfile closes a descriptor only
+// while no pin covers its inode, and this engine's own Hold (see Run) covers
+// it for as long as the engine's connection is open. See dbfile's package
+// comment; TestEngineResumesCleanly and
 // TestEngineResumeAppliesNothingBeforeNewWrite are the regression tests
 // (both hold a foreign connection open across an engine bounce).
-func (e *Engine) srcReader() (*io.SectionReader, error) {
+func (e *Engine) srcReader() (*dbfile.Section, error) {
 	return dbfile.Reader(e.o.DBPath)
 }
 
@@ -1784,6 +1807,7 @@ func (e *Engine) hashSrc() (string, error) {
 	if err != nil {
 		return "", err
 	}
+	defer r.Close()
 	h := sha256.New()
 	if _, err := io.Copy(h, r); err != nil {
 		return "", err
@@ -1801,6 +1825,7 @@ func (e *Engine) copySrc(to string) error {
 	if err != nil {
 		return err
 	}
+	defer r.Close()
 	out, err := os.Create(to)
 	if err != nil {
 		return err

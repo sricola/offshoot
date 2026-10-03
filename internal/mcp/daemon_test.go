@@ -553,3 +553,17 @@ func TestReapOnceSkipsWhenDaemonIsUp(t *testing.T) {
 		t.Fatalf("app@attempt-1 must survive a skipped reapOnce, GetRef err = %v", err)
 	}
 }
+
+// TestSkippedReapOnceStillReclaimsDescriptors: the daemon owns reaping the
+// store, but not this process's descriptors, so a skipped tick still runs
+// the full stranded sweep (see TestReapOnceReclaimsDescriptorsStrandedElsewhere).
+func TestSkippedReapOnceStillReclaimsDescriptors(t *testing.T) {
+	ts, w, _ := newDaemonTools(t)
+	path := strandByAnotherProcess(t, w, "app", "main")
+	if _, skipped, err := ts.reapOnce(time.Now()); err != nil || !skipped {
+		t.Fatalf("reapOnce = skipped %v, err %v; want a skip", skipped, err)
+	}
+	if n := cachedDescriptorsAt(t, path); n != 0 {
+		t.Fatalf("%d descriptor(s) still held on a checkout another process removed", n)
+	}
+}

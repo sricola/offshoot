@@ -193,8 +193,8 @@ func sqlite3UnlinksWALOnExit(t *testing.T) bool {
 // process — is covered by TestEngineResumesCleanly and
 // TestEngineResumeAppliesNothingBeforeNewWrite, both of which hold a foreign
 // connection open across an engine bounce. Those two are the reason the
-// descriptor is owned by dbfile and never closed at all, rather than owned by
-// the engine and closed last.
+// descriptor is owned by dbfile, which closes it only once no pin covers the
+// inode, rather than owned by the engine and closed last.
 //
 // Written as a WAL-survival assertion rather than a lock-introspection one
 // because that is the observable consequence that actually breaks capture.

@@ -155,6 +155,22 @@ class Event:
     detail: dict[str, Any] = field(default_factory=dict)
 
 
+@dataclass
+class DaemonStatus:
+    """:meth:`Client.daemon_status`'s result: the open sessions (the same raw
+    dicts :meth:`Client.status` returns) plus daemon-wide resource counts.
+
+    ``dbfile_descriptors`` is how many checkout descriptors the daemon holds
+    open, cached plus stranded: the ``offshoot_dbfile_descriptors`` gauge.
+    ``offshoot serve -fd-budget`` bounds the cached part. It is ``None``
+    when the daemon does not report it (one older than this SDK), so an
+    unknown count never reads as zero.
+    """
+
+    sessions: list[dict[str, Any]]
+    dbfile_descriptors: int | None = None
+
+
 def _ttl_str(ttl: _TTL) -> str:
     """Render a Python TTL value into the wire's Go-duration-string form.
 
@@ -540,6 +556,15 @@ class Client:
         """List every session open in the daemon, as raw dicts."""
         resp = self._call("status")
         return cast(list[dict[str, Any]], resp.get("sessions", []))
+
+    def daemon_status(self) -> DaemonStatus:
+        """The open sessions plus daemon-wide resource counts."""
+        resp = self._call("status")
+        n = resp.get("dbfile_descriptors")
+        return DaemonStatus(
+            sessions=cast(list[dict[str, Any]], resp.get("sessions", [])),
+            dbfile_descriptors=None if n is None else int(n),
+        )
 
     def close(self) -> None:
         """Close the connection to the daemon."""

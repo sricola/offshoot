@@ -188,6 +188,13 @@ inverse — a `BaseCheckpointSaver` that puts LangGraph's **own thread
 state** in an offshoot-managed SQLite database, so threads themselves can
 be forked, rolled back, promoted, and TTL-reaped.
 
+## Daemon status
+
+`Client.status()` lists the open sessions. `Client.daemon_status()` returns
+the same list plus `dbfile_descriptors`: how many checkout descriptors the
+daemon holds open (see `offshoot serve -fd-budget`), or `None` when the
+daemon is older than the field and does not report it.
+
 ## Links
 
 - [Full docs, CLI reference, architecture](https://github.com/sricola/offshoot)

@@ -12,6 +12,7 @@ import (
 	"sync/atomic"
 	"time"
 
+	"github.com/sricola/offshoot/internal/dbfile"
 	"github.com/sricola/offshoot/internal/ops"
 	"github.com/sricola/offshoot/internal/store"
 )
@@ -145,11 +146,33 @@ func (r *runner) step(wIdx, sIdx int, cur *node, rng *rand.Rand) (*node, error) 
 // database/sql. The handle is closed before the caller checkpoints (a
 // checkpoint must be able to quiesce the file).
 func (r *runner) stepSQL(path string, depth int, rng *rand.Rand) error {
-	db, err := sql.Open("sqlite3", path)
+	// No engine and no eviction run here, so this pin costs nothing. It
+	// keeps branchbench inside the guardrail's rule (internal/dbfile's
+	// sites_test.go) like every other in-process open of a checkout.
+	release, ino, err := dbfile.Hold(path)
+	if err != nil {
+		return err
+	}
+	defer release()
+	db, err := sql.Open("sqlite3", dbfile.NoCreateDSN(path, ""))
 	if err != nil {
 		return err
 	}
 	db.SetMaxOpenConns(1)
+	// The pool's only connection: verify it opened the held inode, then hand
+	// it back (closing a *sql.Conn returns it to the pool) for the
+	// statements below.
+	conn, err := db.Conn(context.Background())
+	if err != nil {
+		db.Close()
+		return err
+	}
+	if err := dbfile.Verify(path, ino); err != nil {
+		conn.Close()
+		db.Close()
+		return err
+	}
+	conn.Close()
 	if _, err := db.Exec(`PRAGMA synchronous=OFF`); err != nil {
 		db.Close()
 		return err
@@ -200,24 +223,45 @@ func (r *runner) crossBranch() (time.Duration, int, error) {
 			if err != nil {
 				return time.Since(start), len(branches), fmt.Errorf("cross-branch checkout %s: %w", b, err)
 			}
-			db, err := sql.Open("sqlite3", "file:"+path+"?mode=ro")
+			sum, err := sumOrderLines(path)
 			if err != nil {
-				return time.Since(start), len(branches), err
-			}
-			db.SetMaxOpenConns(1)
-			var sum sql.NullFloat64
-			if err := db.QueryRow(`SELECT SUM(ol_amount) FROM order_line`).Scan(&sum); err != nil {
-				db.Close()
 				return time.Since(start), len(branches), fmt.Errorf("cross-branch query %s: %w", b, err)
 			}
-			total += sum.Float64
-			if err := db.Close(); err != nil {
-				return time.Since(start), len(branches), err
-			}
+			total += sum
 		}
 		_ = total // aggregated in the driver, as in BranchBench
 	}
 	return time.Since(start), len(branches), nil
+}
+
+// sumOrderLines is one cross-branch query: SUM(ol_amount) over the checkout
+// at path, read-only. mode=ro still takes SQLite's SHARED lock (only
+// immutable=1 skips locking), so the open is pinned like any other.
+func sumOrderLines(path string) (float64, error) {
+	release, ino, err := dbfile.Hold(path)
+	if err != nil {
+		return 0, err
+	}
+	defer release()
+	db, err := sql.Open("sqlite3", "file:"+path+"?mode=ro")
+	if err != nil {
+		return 0, err
+	}
+	defer db.Close()
+	ctx := context.Background()
+	conn, err := db.Conn(ctx)
+	if err != nil {
+		return 0, err
+	}
+	defer conn.Close()
+	if err := dbfile.Verify(path, ino); err != nil {
+		return 0, err
+	}
+	var sum sql.NullFloat64
+	if err := conn.QueryRowContext(ctx, `SELECT SUM(ol_amount) FROM order_line`).Scan(&sum); err != nil {
+		return 0, err
+	}
+	return sum.Float64, nil
 }
 
 // storeSampleEvery is how often the store directory is walked while a
