@@ -38,27 +38,43 @@
 //
 //   - Reader returns a Section over the cached descriptor, pinned until the
 //     caller closes it, so a read in progress never has its descriptor
-//     closed under it.
+//     closed under it. Section.CloneTo makes a copy-on-write clone through
+//     that same descriptor, for a caller that would otherwise open the file
+//     to clone it.
 //   - Hold is taken by every in-process SQLite open of a file this package
 //     may cache, BEFORE sql.Open, and released only AFTER the connection is
 //     closed: defer the release first, so it runs last on every return
-//     path. database/sql opens lazily, so the caller takes its first real
-//     connection (db.Conn) and then calls Verify, which fails with
-//     ErrReplaced if the path no longer names the held inode. Every
-//     materialization renames a fresh inode over the path, so an inode
-//     never reappears there, and Hold, Conn, then Verify is sufficient.
-//     The open never creates the file (NoCreateDSN, or a mode=ro URI), so
-//     a path removed after the Hold fails to open rather than coming back
+//     path. The open never creates the file (NoCreateDSN, or a mode=ro URI),
+//     so a path removed after the Hold fails to open rather than coming back
 //     as an empty database.
 //
-// Closing a descriptor whose inode nothing pins is safe by construction:
-// no read is using it and no in-process SQLite connection is open on that
-// inode, so the close has no locks to drop. That premise holds only while
-// every in-process SQLite open takes a Hold. sites_test.go fails on any
-// sql.Open, sql.OpenDB or go-sqlite3 driver use that is not on its reviewed
-// list, and on a pinned one that does not defer its release before the
-// open. Another process's connections are unaffected: POSIX locks are per
-// process.
+// A Hold covers its path as well as its inode, because the pin alone cannot
+// cover the connection. database/sql connects lazily, and the connect itself
+// takes SHARED: go-sqlite3 runs a schema-reading PRAGMA on every new
+// connection, and a WAL-mode connection keeps that lock for its whole life.
+// A re-materialize that renames a fresh inode over the path between the Hold
+// and the connect leaves the connection locking an inode the pin does not
+// cover, before the caller can check anything. A lock dropped there is not
+// one connection's problem either: SQLite tracks lock state per inode for
+// the whole process, so the next connection here on that inode takes SHARED
+// by bumping a count, with no fcntl, and then runs unlocked however
+// carefully it was pinned and verified. Every inode the held open can land
+// on is one its path named while the Hold was active, so while any Hold on a
+// path is active, nothing cached under that path is closed, whatever inode
+// it names. Verify, called right after the first real connection (db.Conn),
+// then tells the caller whether that connection is on the file the path
+// names now (ErrReplaced if not): a file renamed over is no longer the
+// checkout, and working on it would be wrong even though it is now safe.
+//
+// Closing a descriptor is safe when nothing pins its inode and no Hold is
+// active on its path: no read is using it and no in-process SQLite
+// connection is open on that inode, so the close has no locks to drop. That
+// premise holds only while every in-process SQLite open takes a Hold, and
+// while no checkout inode has a second name (offshoot never hard-links one).
+// sites_test.go fails on any sql.Open, sql.OpenDB or go-sqlite3 driver use
+// that is not on its reviewed list, and on a pinned one that does not defer
+// its release before the open. Another process's connections are
+// unaffected: POSIX locks are per process.
 //
 // # Orphans and eviction
 //
@@ -75,9 +91,12 @@
 //   - EvictStrandedAt re-checks only the paths its caller names, then
 //     closes every unpinned orphan the same way. ops calls it after every
 //     materialization, by-chain prune and destroy, where those strands are
-//     made, so a process with no janitor (offshoot mcp, serve -reap-every
-//     0) reclaims them too, at a cost that does not grow with the number of
-//     cached checkouts.
+//     made, so a process with no janitor reclaims the strands it makes
+//     itself, at a cost that does not grow with the number of cached
+//     checkouts. A checkout another process removes or replaces is found
+//     only by the full EvictStranded: offshoot mcp's reaper runs it on
+//     every tick too, and serve -reap-every 0 keeps such descriptors until
+//     restart.
 //   - Evict(keep) closes unpinned cached descriptors, least recently used
 //     first, until at most keep remain (serve -fd-budget).
 //
@@ -86,10 +105,15 @@
 // which ReadStats().StrandedPinned (offshoot_dbfile_stranded_pinned)
 // reports.
 //
-// Every close goes through closeLocked, with the registry lock held.
-// Releasing it between the "unpinned" check and the close would let a Hold,
-// its sql.Open and that connection's first lock land in between, and the
-// close would then drop that lock.
+// A close is decided under the registry lock: nothing pins the inode and no
+// Hold is active on the path, so the entry is dropped from the registry and
+// its path and inode are marked closing. The close itself then runs with the
+// lock released (closeMarked): the last close of an unlinked file frees its
+// blocks inside close(2), tens of milliseconds per GiB, and every Reader,
+// Hold and release in the process takes that lock. A Hold waits for every
+// close in flight on its path or inode before it returns, so no connection
+// it guards can take a lock on that inode while such a close is running,
+// and a close decided after the Hold skips its path and inode.
 //
 // Follow-ups, in order of how much they buy:
 //
@@ -152,7 +176,12 @@
 //     engine's hashSrc doc comment) and retires this package entirely.
 //
 // Until then, this package is the single chokepoint: raw reads of a live
-// SQLite database file go through here, or they are a bug.
+// SQLite database file go through here, or they are a bug. Two raw opens of
+// a checkout are not routed through here, and are kept away from in-process
+// connections instead: ops.CheckpointWith's snapshot encode, which only the
+// CLI and offshoot mcp reach and which the daemon must never call (see its
+// doc comment), and reflink.Clone, which opens and closes its source on
+// Linux, so a checkout is cloned only through Section.CloneTo.
 //
 // # What is NOT covered
 //
@@ -175,6 +204,8 @@ import (
 	"sort"
 	"strings"
 	"sync"
+
+	"github.com/sricola/offshoot/internal/reflink"
 )
 
 // Inode identifies a file independently of any path naming it.
@@ -201,6 +232,17 @@ var (
 	orphans = map[Inode][]*entry{}
 	// pins counts open Sections and Holds per inode.
 	pins = map[Inode]int{}
+	// held counts active Holds per absolute path. While a path is held,
+	// nothing cached under it is closed, whatever inode it names (see the
+	// package doc's Pins).
+	held = map[string]int{}
+	// closingPath and closingIno count closes in flight: descriptors already
+	// dropped from the registry and decided closable, whose Close has not
+	// returned yet. Hold waits for both to clear on its path and inode, and
+	// closeDone is broadcast each time one does.
+	closingPath = map[string]int{}
+	closingIno  = map[Inode]int{}
+	closeDone   = sync.NewCond(&mu)
 	// unidentified holds descriptors whose inode could not be read right
 	// after opening. With no inode they cannot be checked against pins, so
 	// nothing closes them. Expected to stay empty.
@@ -217,6 +259,7 @@ var (
 // file's size when Reader returned it.
 type Section struct {
 	*io.SectionReader
+	f    *os.File
 	ino  Inode
 	once sync.Once
 }
@@ -227,6 +270,14 @@ func (s *Section) Close() error {
 	s.once.Do(func() { unpin(s.ino) })
 	return nil
 }
+
+// CloneTo makes dst a copy-on-write clone of the file, through the pinned
+// descriptor (reflink.CloneFrom), or returns reflink.ErrUnsupported without
+// creating dst. Use it, never reflink.Clone, to clone a file an in-process
+// SQLite connection may have open: Clone opens and closes its own
+// descriptor on the file on Linux, and that close drops the connection's
+// locks. Call it before Close.
+func (s *Section) CloneTo(dst string) error { return reflink.CloneFrom(dst, s.f) }
 
 // Reader returns a pinned reader over the whole current contents of the
 // SQLite database file at path, backed by this package's cached descriptor
@@ -276,7 +327,7 @@ func Reader(path string) (*Section, error) {
 	}
 	pins[e.ino]++
 	touchLocked(e)
-	return &Section{SectionReader: io.NewSectionReader(e.f, 0, fi.Size()), ino: e.ino}, nil
+	return &Section{SectionReader: io.NewSectionReader(e.f, 0, fi.Size()), f: e.f, ino: e.ino}, nil
 }
 
 // openLocked opens abs and caches it. The inode comes from the opened
@@ -317,10 +368,16 @@ func touchLocked(e *entry) {
 func unpin(ino Inode) {
 	mu.Lock()
 	defer mu.Unlock()
-	if pins[ino] <= 1 {
-		delete(pins, ino)
+	decLocked(pins, ino)
+}
+
+// decLocked decrements m[k], deleting the key at zero so the maps stay as
+// small as what is actually pinned, held or closing.
+func decLocked[K comparable](m map[K]int, k K) {
+	if m[k] <= 1 {
+		delete(m, k)
 	} else {
-		pins[ino]--
+		m[k]--
 	}
 }
 
@@ -397,22 +454,23 @@ var VerifyHookForTest func(path string)
 // Test-only and process-global, like HoldHookForTest.
 var ReleaseHookForTest func(path string)
 
-// Hold pins the inode path names now, on behalf of an in-process SQLite open
-// of that file. Take it BEFORE sql.Open, and release it only AFTER every
-// connection from that open is closed: defer release() before deferring the
-// database's Close, so it runs last on every return path. database/sql opens
-// lazily, so once the first real connection exists (db.Conn), call
-// Verify(path, ino). If the path was renamed over in between, that
-// connection is on a file this pin does not cover. Every materialization
-// renames a fresh inode over the path, so an inode never reappears there,
-// and Hold, Conn, then Verify is sufficient. Open with NoCreateDSN (or a
-// mode=ro URI): Hold fails on a path that is already missing, and an open
-// that cannot create keeps one removed after the Hold from coming back
-// empty.
+// Hold pins the inode path names now, and the path itself, on behalf of an
+// in-process SQLite open of that file. Take it BEFORE sql.Open, and release
+// it only AFTER every connection from that open is closed: defer release()
+// before deferring the database's Close, so it runs last on every return
+// path. Until then nothing this package caches under path is closed,
+// whatever inode it names, so the connection's locks are safe even if a
+// re-materialize lands before database/sql's lazy connect (see the package
+// doc's Pins). Once the first real connection exists (db.Conn), call
+// Verify(path, ino): ErrReplaced means the connection is on a file the path
+// no longer names. Open with NoCreateDSN (or a mode=ro URI): Hold fails on a
+// path that is already missing, and an open that cannot create keeps one
+// removed after the Hold from coming back empty.
 //
-// Hold opens no descriptor. It touches path's cached descriptor, if that
-// still names the held inode, for Evict's least-recently-used order. release
-// is safe to call more than once.
+// Hold opens no descriptor. Before it returns, it waits for any close of a
+// descriptor under path or on the inode that is still in flight. It touches
+// path's cached descriptor, if that still names the held inode, for Evict's
+// least-recently-used order. release is safe to call more than once.
 func Hold(path string) (release func(), ino Inode, err error) {
 	abs, err := filepath.Abs(path)
 	if err != nil {
@@ -426,6 +484,14 @@ func Hold(path string) (release func(), ino Inode, err error) {
 		return nil, Inode{}, err
 	}
 	mu.Lock()
+	// A close decided before this Hold may still be running. The connection
+	// this Hold guards must not take its first lock until it is done, or the
+	// close would drop that lock. Closes decided from here on skip the path
+	// and the inode.
+	for closingPath[abs] > 0 || closingIno[ino] > 0 {
+		closeDone.Wait()
+	}
+	held[abs]++
 	pins[ino]++
 	if e := live[abs]; e != nil && e.ino == ino {
 		touchLocked(e)
@@ -437,7 +503,10 @@ func Hold(path string) (release func(), ino Inode, err error) {
 			if ReleaseHookForTest != nil {
 				ReleaseHookForTest(abs)
 			}
-			unpin(ino)
+			mu.Lock()
+			decLocked(held, abs)
+			decLocked(pins, ino)
+			mu.Unlock()
 		})
 	}
 	if HoldHookForTest != nil {
@@ -450,6 +519,13 @@ func Hold(path string) (release func(), ino Inode, err error) {
 // Call it right after the held open's first real connection (db.Conn): on
 // ErrReplaced, close the connection, release the hold and return the error.
 // A path that is gone wraps both ErrReplaced and the stat error.
+//
+// It compares inode numbers, and Hold keeps no descriptor on the held inode.
+// On a filesystem that hands a freed inode number straight to a new file,
+// two re-materializations between the Hold and Verify could therefore let
+// Verify pass for a connection on the file renamed in between. The Hold's
+// path still keeps that connection's locks safe; only Verify's "this is the
+// file the path names" answer can be wrong, and only in that double race.
 func Verify(path string, ino Inode) error {
 	fi, err := os.Stat(path)
 	if err != nil {
@@ -513,8 +589,9 @@ func EvictStranded() int { return evictStranded(nil) }
 // every unpinned orphan, wherever it is: closing one needs no stat, and an
 // orphan that was still pinned when its own path was reclaimed (a session
 // outliving a re-materialize) is closed by whichever pass comes next. ops
-// calls it where it makes strands; the daemon's janitor runs the full
-// EvictStranded, which also catches paths removed by anything else.
+// calls it where it makes strands; the daemon's janitor and offshoot mcp's
+// reaper run the full EvictStranded, which also catches paths removed by
+// anything else, another process included.
 func EvictStrandedAt(paths ...string) int {
 	var roots []string
 	for _, p := range paths {
@@ -538,24 +615,23 @@ func evictStranded(in func(string) bool) int {
 	return closeOrphans(in)
 }
 
-// closeOrphans closes the unpinned orphans whose path in accepts (every one
-// when in is nil) and reports how many.
+// closeOrphans closes the orphans whose path in accepts (every one when in
+// is nil), unless their inode is pinned or their path held, and reports how
+// many.
 func closeOrphans(in func(string) bool) int {
 	mu.Lock()
-	defer mu.Unlock()
-	n := 0
+	var victims []*entry
 	for ino, es := range orphans {
 		if pins[ino] > 0 {
 			continue // a pinned orphan is a session or read outliving its file; see ReadStats
 		}
 		kept := es[:0]
 		for _, e := range es {
-			if in != nil && !in(e.path) {
+			if (in != nil && !in(e.path)) || held[e.path] > 0 {
 				kept = append(kept, e)
 				continue
 			}
-			closeLocked(e)
-			n++
+			victims = append(victims, e)
 		}
 		if len(kept) == 0 {
 			delete(orphans, ino)
@@ -563,22 +639,41 @@ func closeOrphans(in func(string) bool) int {
 			orphans[ino] = kept
 		}
 	}
-	evictedStranded += uint64(n)
-	return n
+	evictedStranded += uint64(len(victims))
+	markClosingLocked(victims)
+	mu.Unlock()
+	closeMarked(victims)
+	return len(victims)
 }
 
-// closeLocked closes a descriptor the registry has just dropped. Every
-// close goes through here, and mu must be held: see the package doc's
-// "Orphans and eviction". closeHookForTest lets a test check the lock at
-// the moment of each close.
-func closeLocked(e *entry) {
-	if closeHookForTest != nil {
-		closeHookForTest()
+// markClosingLocked marks each of es, already dropped from the registry, as
+// closing, so a Hold on its path or inode waits for closeMarked.
+func markClosingLocked(es []*entry) {
+	for _, e := range es {
+		closingPath[e.path]++
+		closingIno[e.ino]++
 	}
-	e.f.Close()
 }
 
-var closeHookForTest func()
+// closeMarked closes descriptors markClosingLocked marked, with mu NOT held
+// (see the package doc's "Orphans and eviction"), clearing each mark once
+// its close returns. Every close of a registry descriptor goes through here.
+// closeHookForTest runs just before each close.
+func closeMarked(es []*entry) {
+	for _, e := range es {
+		if closeHookForTest != nil {
+			closeHookForTest(e)
+		}
+		e.f.Close()
+		mu.Lock()
+		decLocked(closingPath, e.path)
+		decLocked(closingIno, e.ino)
+		closeDone.Broadcast()
+		mu.Unlock()
+	}
+}
+
+var closeHookForTest func(e *entry)
 
 // sweep orphans every cached descriptor whose path is gone or names another
 // inode now. The stats run outside mu so a slow filesystem never stalls
@@ -649,14 +744,14 @@ func ReadStats() Stats {
 	return s
 }
 
-// Evict closes cached descriptors whose inode nothing pins, least recently
-// used first (Reader and Hold both count as a use), until at most keep
-// remain, and reports how many it closed. A pinned descriptor is never
-// closed, so more pinned descriptors than keep (more open sessions than
-// serve -fd-budget) leave the cache above keep. Evict(0) closes every
-// unpinned cached descriptor, and a negative keep counts as 0. The daemon's
-// "0 means unlimited" lives in the janitor, which does not call Evict at
-// all then. Orphans are EvictStranded's job.
+// Evict closes cached descriptors whose inode nothing pins and whose path
+// nothing holds, least recently used first (Reader and Hold both count as a
+// use), until at most keep remain, and reports how many it closed. A pinned
+// descriptor is never closed, so more pinned descriptors than keep (more
+// open sessions than serve -fd-budget) leave the cache above keep. Evict(0)
+// closes every unpinned cached descriptor, and a negative keep counts as 0.
+// The daemon's "0 means unlimited" lives in the janitor, which does not call
+// Evict at all then. Orphans are EvictStranded's job.
 func Evict(keep int) int { return evict(keep, nil) }
 
 func evict(keep int, in func(string) bool) int {
@@ -664,7 +759,6 @@ func evict(keep int, in func(string) bool) int {
 		keep = 0
 	}
 	mu.Lock()
-	defer mu.Unlock()
 	var scoped []*entry
 	for _, e := range live {
 		if in == nil || in(e.path) {
@@ -673,23 +767,26 @@ func evict(keep int, in func(string) bool) int {
 	}
 	excess := len(scoped) - keep
 	if excess <= 0 {
+		mu.Unlock()
 		return 0
 	}
 	sort.Slice(scoped, func(i, j int) bool { return scoped[i].lastUse < scoped[j].lastUse })
-	n := 0
+	var victims []*entry
 	for _, e := range scoped {
-		if n == excess {
+		if len(victims) == excess {
 			break
 		}
-		if pins[e.ino] > 0 {
+		if pins[e.ino] > 0 || held[e.path] > 0 {
 			continue
 		}
 		delete(live, e.path)
-		closeLocked(e)
-		n++
+		victims = append(victims, e)
 	}
-	evictedBudget += uint64(n)
-	return n
+	evictedBudget += uint64(len(victims))
+	markClosingLocked(victims)
+	mu.Unlock()
+	closeMarked(victims)
+	return len(victims)
 }
 
 // EvictUnder closes every unpinned descriptor, cached or orphaned, whose
