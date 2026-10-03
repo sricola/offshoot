@@ -99,8 +99,9 @@ export interface DaemonStatus {
   sessions: SessionInfo[];
   /** Checkout descriptors the daemon holds open, cached plus stranded: the
    * `offshoot_dbfile_descriptors` gauge. `offshoot serve -fd-budget` bounds
-   * the cached part. */
-  dbfile_descriptors: number;
+   * the cached part. Absent when the daemon does not report it (one older
+   * than this SDK), so an unknown count never reads as zero. */
+  dbfile_descriptors?: number;
 }
 
 /** Options for {@link Client.fork}. */
@@ -790,7 +791,11 @@ export class Client {
   /** The open sessions plus daemon-wide resource counts. */
   async daemonStatus(): Promise<DaemonStatus> {
     const resp = await this._call("status");
-    return { sessions: resp.sessions ?? [], dbfile_descriptors: resp.dbfile_descriptors ?? 0 };
+    const st: DaemonStatus = { sessions: resp.sessions ?? [] };
+    if (resp.dbfile_descriptors !== undefined) {
+      st.dbfile_descriptors = resp.dbfile_descriptors;
+    }
+    return st;
   }
 
   /** Close the connection to the daemon. */

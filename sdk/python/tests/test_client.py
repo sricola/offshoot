@@ -89,6 +89,28 @@ class TestBranchesWireCompat(unittest.TestCase):
         self.assertEqual(branches[0].state, "active")
 
 
+class TestDaemonStatusWireCompat(unittest.TestCase):
+    """Client.daemon_status()'s response parsing, no daemon needed (see
+    TestBranchesWireCompat for the pattern)."""
+
+    def _client_with_response(self, resp: dict) -> offshoot.Client:
+        client = offshoot.Client.__new__(offshoot.Client)
+        client._call = lambda op, **fields: resp
+        return client
+
+    def test_missing_descriptor_count_is_none_not_zero(self):
+        # A daemon older than dbfile_descriptors sends no such key. Reading
+        # that as 0 would report a healthy "no descriptors" for an unknown.
+        st = self._client_with_response({"ok": True, "sessions": []}).daemon_status()
+        self.assertIsNone(st.dbfile_descriptors)
+
+    def test_present_descriptor_count_is_passed_through(self):
+        st = self._client_with_response(
+            {"ok": True, "sessions": [], "dbfile_descriptors": 0}
+        ).daemon_status()
+        self.assertEqual(st.dbfile_descriptors, 0)
+
+
 class TestCreateFromPathResolution(unittest.TestCase):
     """Pure-logic tests for Client.create's from_path handling; no daemon
     needed -- Client.__new__ skips __init__ (which opens a real socket) and
@@ -439,7 +461,8 @@ class TestClient(unittest.TestCase):
                 st = c.daemon_status()
                 self.assertIsInstance(st, offshoot.DaemonStatus)
                 self.assertTrue(any(x["db"] == "ds" and x["branch"] == "main" for x in st.sessions))
-                self.assertGreaterEqual(st.dbfile_descriptors, 1)
+                self.assertIsNotNone(st.dbfile_descriptors)
+                self.assertGreaterEqual(st.dbfile_descriptors or 0, 1)
                 # status() is unchanged: still the bare session list. Not
                 # compared to st.sessions, whose lag/age fields move between calls.
                 self.assertIsInstance(c.status(), list)

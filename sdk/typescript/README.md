@@ -176,7 +176,8 @@ Like the rest of this package, seeding and `dump` shell out to the
 
 `client.status()` lists the open sessions. `client.daemonStatus()` returns
 the same list plus `dbfile_descriptors`: how many checkout descriptors the
-daemon holds open (see `offshoot serve -fd-budget`).
+daemon holds open (see `offshoot serve -fd-budget`), or `undefined` when the
+daemon is older than the field and does not report it.
 
 ## Links
 

@@ -356,6 +356,25 @@ test('branches: state defaults to "" when an older daemon omits it (wire-compat)
   assert.equal(branches[0].state, "");
 });
 
+test("daemonStatus: dbfile_descriptors is absent, not 0, when an older daemon omits it", async () => {
+  const client = Object.create(Client.prototype) as Client;
+  (client as unknown as { _call: Client["_call"] })._call = async () => ({ ok: true, sessions: [] });
+  const st = await client.daemonStatus();
+  assert.equal(st.dbfile_descriptors, undefined);
+  assert.ok(!("dbfile_descriptors" in st));
+});
+
+test("daemonStatus: dbfile_descriptors is passed through when present", async () => {
+  const client = Object.create(Client.prototype) as Client;
+  (client as unknown as { _call: Client["_call"] })._call = async () => ({
+    ok: true,
+    sessions: [],
+    dbfile_descriptors: 0,
+  });
+  const st = await client.daemonStatus();
+  assert.equal(st.dbfile_descriptors, 0);
+});
+
 test("branches: state is passed through when present", async () => {
   const client = Object.create(Client.prototype) as Client;
   (client as unknown as { _call: Client["_call"] })._call = async () => ({
@@ -463,7 +482,7 @@ test("daemonStatus reports dbfile descriptors", async (t: TestContext) => {
     try {
       const st = await c.daemonStatus();
       assert.ok(st.sessions.some((x) => x.db === "ds" && x.branch === "main"));
-      assert.ok(st.dbfile_descriptors >= 1);
+      assert.ok(st.dbfile_descriptors !== undefined && st.dbfile_descriptors >= 1);
     } finally {
       await s.close();
     }
