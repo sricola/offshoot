@@ -365,9 +365,11 @@ func TestLocalFreshLockNotBroken(t *testing.T) {
 
 // TestLocalConcurrentPutSameKey guards against a regression found while
 // hardening internal/ops's Checkpoint against concurrent callers: Put has no
-// per-key lock (by design -- callers like Checkpoint's orphan-snapshot
-// overwrite and GC's tombstone-list write use it exactly because
-// last-write-wins is intentional there), so multiple goroutines can call
+// per-key lock (by design -- callers like session flush's overwrite of an
+// orphan a crashed prior flush left, and GC's tombstone-list write, use it
+// exactly because last-write-wins is intentional there; the at-rest
+// checkpoint, which once overwrote too, now writes create-only under its
+// own lease's epoch), so multiple goroutines can call
 // Put on the identical key at the same time. The old write() used a fixed
 // shared temp filename (key+".tmp"): one goroutine's os.Create (O_TRUNC) or
 // os.Rename could clobber or disappear another's temp file mid-write,

@@ -130,8 +130,9 @@ func (l *Local) GetReader(key string) (io.ReadCloser, string, error) {
 // write does a write-to-temp-then-rename. The temp file gets a unique name
 // per call (via os.CreateTemp) rather than a fixed p+".tmp": Put has no
 // per-key lock (PutIf's lock guards its own read-then-write, but Put is used
-// standalone wherever last-write-wins is intentional, e.g. Checkpoint's
-// orphan-snapshot overwrite and GC's tombstone-list write), so two
+// standalone wherever last-write-wins is intentional, e.g. session flush's
+// overwrite of an orphan a crashed prior flush left, and GC's tombstone-list
+// write), so two
 // goroutines can legitimately call write() on the same p concurrently. A
 // shared fixed temp name means one goroutine's os.Create (O_TRUNC) or
 // os.Rename can clobber or disappear out from under the other mid-write,
