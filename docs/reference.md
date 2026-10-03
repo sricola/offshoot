@@ -1761,8 +1761,9 @@ CI patterns that mix the two surfaces (CLI seeding + SDK sessions), see
 ## What's not here
 
 See [docs/status.md](status.md) for the full implemented/deferred matrix
-and links to the roadmap milestones tracking each. See also [docs/stability.md](stability.md) for what pre-1.0
-means for the commands above (and the `export` → `create --from` format
-escape hatch), [docs/testing.md](testing.md) for how this surface is
-tested, and [docs/ci-recipes.md](ci-recipes.md) for ready-made GitHub
-Actions workflows built from these commands.
+and links to the roadmap milestones tracking each. See also
+[docs/stability.md](stability.md) for what pre-1.0 means for the commands
+above (and the `export` → `create --from` format escape hatch),
+[docs/testing.md](testing.md) for how this surface is tested, and
+[docs/ci-recipes.md](ci-recipes.md) for ready-made GitHub Actions
+workflows built from these commands.
