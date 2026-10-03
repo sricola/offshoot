@@ -641,7 +641,8 @@ var closeWaitEntered func(key string, deadline time.Time)
 
 // lookup returns the live session for db@branch, or an error if it is not
 // open (including if an open is still in flight — a reserved slot counts as
-// not yet open).
+// not yet open), and a closing one is refused as closing: its Close has
+// already set closed, so a flush would fail with session.ErrClosed anyway.
 func (s *Server) lookup(db, branch string) (*session.Session, error) {
 	if branch == "" {
 		branch = "main"
@@ -649,8 +650,11 @@ func (s *Server) lookup(db, branch string) (*session.Session, error) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	sl, ok := s.sessions[key(db, branch)]
-	if !ok || sl.isReserved() {
+	switch {
+	case !ok || sl.isReserved():
 		return nil, fmt.Errorf("daemon: %s is not open", key(db, branch))
+	case sl.isClosing():
+		return nil, fmt.Errorf("daemon: %s is closing", key(db, branch))
 	}
 	return sl.sess, nil
 }
@@ -813,10 +817,24 @@ const (
 	sessionReserved
 	// sessionOpen: a live session is open here.
 	sessionOpen
+	// sessionClosing: closeSlot has taken the session over and its Close
+	// has not returned. Capture has stopped, but the lease is still held
+	// and renewed until the release, and the checkout is still the old
+	// engine's. Nothing that would touch the branch may run; the close
+	// ends on its own, so every refusal says to retry rather than to close
+	// the session.
+	sessionClosing
 )
 
-// lookupSessionState returns the current sessionState for db@branch and, iff
-// that state is sessionOpen, the live *session.Session (nil otherwise). It
+// errClosing is the refusal for an op that needs db@branch while its
+// session is closing. It names a wait, not an action: the close releases
+// the branch within seconds.
+func errClosing(k string) error {
+	return fmt.Errorf("daemon: %s is closing; retry when the close finishes", k)
+}
+
+// lookupSessionState returns the current sessionState for db@branch and,
+// for sessionOpen and sessionClosing, the session (nil otherwise). It
 // does not default branch to "main" — callers that want that default apply
 // it themselves before calling, exactly as opOpen/lookup/opClose already do;
 // opPromote deliberately does NOT default its target, so it must not be
@@ -830,6 +848,9 @@ func (s *Server) lookupSessionState(db, branch string) (sessionState, *session.S
 	}
 	if sl.isReserved() {
 		return sessionReserved, nil
+	}
+	if sl.isClosing() {
+		return sessionClosing, sl.sess
 	}
 	return sessionOpen, sl.sess
 }
@@ -847,8 +868,8 @@ func (s *Server) lookupSessionState(db, branch string) (sessionState, *session.S
 // applies, win outright over whatever ops.BranchStateAt would have said —
 // see BranchStateAt's doc comment for the full six-state precedence list.
 // The two can never both apply to the SAME db@branch at once: s.sessions
-// holds at most one entry per key, either a nil (reserved) or non-nil
-// (open) value, never both — so this is a simple switch, not a priority
+// holds at most one slot per key, either reserved or open, never both —
+// so this is a simple switch, not a priority
 // comparison between the two. An OPEN, HEALTHY session needs no daemon-side
 // casing at all: its own live lease is exactly what already makes
 // ops.BranchStateAt itself report "active".
@@ -872,8 +893,15 @@ func (s *Server) branchState(db, branch string, ref store.Ref) string {
 // reservation as "not open" here would let a rollback/promote/checkout race
 // session.Open's unlocked materialize step and corrupt the same on-disk
 // file two ways at once (see lookupSessionState's sessionReserved case).
+// A closing session is refused too, with errClosing: its engine may still
+// be folding the WAL on the checkout, and its lease is held until the
+// release. Telling the caller to close it would be wrong; the close is
+// already running.
 func (s *Server) refuseIfClaimed(db, branch string) error {
-	if st, _ := s.lookupSessionState(db, branch); st != sessionAbsent {
+	switch st, _ := s.lookupSessionState(db, branch); st {
+	case sessionClosing:
+		return errClosing(key(db, branch))
+	case sessionReserved, sessionOpen:
 		return fmt.Errorf("daemon: %s is open here; close the session first", key(db, branch))
 	}
 	return nil
@@ -885,8 +913,11 @@ func (s *Server) refuseIfClaimed(db, branch string) error {
 // to flush, and proceeding at-rest would race that in-flight session.Open
 // the same way refuseIfClaimed's callers must not), it refuses with the
 // same "close the session first"-class error rather than silently falling
-// through to an at-rest fork/promote. If absent, it does nothing and the
-// caller proceeds at-rest.
+// through to an at-rest fork/promote. A closing source is refused the same
+// way, with errClosing: Close does not flush, and a flush may still be
+// queued on flushMu ahead of it, so proceeding at rest could miss writes
+// the session captured. If absent, it does nothing and the caller proceeds
+// at-rest.
 func (s *Server) flushIfOpen(db, branch, opName string) error {
 	switch st, sess := s.lookupSessionState(db, branch); st {
 	case sessionOpen:
@@ -895,6 +926,8 @@ func (s *Server) flushIfOpen(db, branch, opName string) error {
 		}
 	case sessionReserved:
 		return fmt.Errorf("daemon: %s is open here; close the session first", key(db, branch))
+	case sessionClosing:
+		return errClosing(key(db, branch))
 	}
 	return nil
 }

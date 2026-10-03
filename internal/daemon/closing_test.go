@@ -3,6 +3,7 @@ package daemon
 import (
 	"encoding/json"
 	"errors"
+	"fmt"
 	"strings"
 	"sync"
 	"sync/atomic"
@@ -378,4 +379,94 @@ func TestCloseOnClosingSlotWaits(t *testing.T) {
 			t.Fatalf("close after the close = %+v, want is not open", r)
 		}
 	})
+}
+
+func TestFlushOnClosingSlotIsRefused(t *testing.T) {
+	srv, _ := newServer(t)
+	sock := srv.SocketPath()
+	closed, release := closingSession(t, sock, "app", "main")
+	r := call(t, sock, Request{Op: "flush", DB: "app", Branch: "main"})
+	release()
+	within(t, closed, "the close")
+	if r.OK || r.Error != "daemon: app@main is closing" {
+		t.Fatalf("flush during a close = %+v, want the closing refusal", r)
+	}
+}
+
+// TestForkFromClosingSourceIsRefused: Close does not flush, and a flush may
+// still be queued on flushMu ahead of it, so an at-rest fork or promote of a
+// closing source could miss writes. Both refuse, as for a reserved source.
+func TestForkFromClosingSourceIsRefused(t *testing.T) {
+	const want = "daemon: app@main is closing; retry when the close finishes"
+	for _, tc := range []struct {
+		name string
+		req  Request
+	}{
+		{"fork", Request{Op: "fork", DB: "app", Branch: "main", Name: "kid"}},
+		{"promote source", Request{Op: "promote", DB: "app", Branch: "main", Name: "target", NoBackup: true}},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			srv, w := newServer(t)
+			sock := srv.SocketPath()
+			if _, err := w.Fork("app", "main", "target", "", 0, nil); err != nil {
+				t.Fatal(err)
+			}
+			before, _, err := w.Store.GetRef("app", "target")
+			if err != nil {
+				t.Fatal(err)
+			}
+			closed, release := closingSession(t, sock, "app", "main")
+			r := call(t, sock, tc.req)
+			release()
+			within(t, closed, "the close")
+			if r.OK || r.Error != want {
+				t.Fatalf("%s = %+v, want %q", tc.name, r, want)
+			}
+			if _, _, err := w.Store.GetRef("app", "kid"); !errors.Is(err, store.ErrNotFound) {
+				t.Fatalf("an at-rest fork ran anyway: GetRef(kid) err = %v", err)
+			}
+			after, _, err := w.Store.GetRef("app", "target")
+			if err != nil {
+				t.Fatal(err)
+			}
+			if after.Lineage != before.Lineage || after.HeadTXID != before.HeadTXID {
+				t.Fatalf("an at-rest promote ran anyway: target moved from %s@%d to %s@%d",
+					before.Lineage, before.HeadTXID, after.Lineage, after.HeadTXID)
+			}
+		})
+	}
+}
+
+func TestRollbackDuringCloseIsRefused(t *testing.T) {
+	for _, tc := range []struct {
+		name    string
+		closing string // the branch whose session is closing
+		req     Request
+	}{
+		{"rollback", "main", Request{Op: "rollback", DB: "app", Branch: "main", Name: "v1"}},
+		{"rollback backup", "main-pre-rollback", Request{Op: "rollback", DB: "app", Branch: "main", Name: "v1"}},
+		{"promote target", "target", Request{Op: "promote", DB: "app", Branch: "main", Name: "target"}},
+		{"promote target backup", "target-pre-promote", Request{Op: "promote", DB: "app", Branch: "main", Name: "target"}},
+		{"compact", "main", Request{Op: "compact", DB: "app", Branch: "main"}},
+		{"checkout at rest", "main", Request{Op: "checkout", DB: "app", Branch: "main"}},
+		{"destroy", "target", Request{Op: "destroy", DB: "app", Branch: "target"}},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			srv, w := newServer(t)
+			sock := srv.SocketPath()
+			for _, b := range []string{"target", "main-pre-rollback", "target-pre-promote"} {
+				if _, err := w.Fork("app", "main", b, "", 0, nil); err != nil {
+					t.Fatal(err)
+				}
+			}
+			closed, release := closingSession(t, sock, "app", tc.closing)
+			r := call(t, sock, tc.req)
+			release()
+			within(t, closed, "the close")
+			want := fmt.Sprintf("daemon: app@%s is closing; retry when the close finishes", tc.closing)
+			if r.OK || r.Error != want {
+				t.Fatalf("%s = %+v, want %q", tc.name, r, want)
+			}
+		})
+	}
 }
