@@ -44,8 +44,8 @@ build a dashboard against a name not in this table.
 | Metric | Type | Labels | Meaning |
 |---|---|---|---|
 | `offshoot_build_info` | gauge | `version` | Always `1`; the `version` label identifies the running build (`"dev"` outside a released binary). |
-| `offshoot_sessions_open` | gauge | — | Number of sessions currently open in this daemon. |
-| `offshoot_capture_lag_bytes` | gauge | `db`, `branch` | WAL bytes committed by writers but not yet applied to the replica. **Open sessions only** — a branch with no live session reports nothing (not zero — absent). |
+| `offshoot_sessions_open` | gauge | — | Number of sessions currently open in this daemon; a session that is closing is not counted. |
+| `offshoot_capture_lag_bytes` | gauge | `db`, `branch` | WAL bytes committed by writers but not yet applied to the replica. **Open sessions only** — a branch with no live session, or whose session is closing, reports nothing (not zero — absent). |
 | `offshoot_durable_age_seconds` | gauge | `db`, `branch` | Seconds since that session's last successful flush. **Open sessions only**, same absence-not-zero rule. |
 | `offshoot_flush_total` | counter | `result` (`ok`/`error`), `kind` (`auto`/`manual`) | Session flushes, by outcome and whether it was `serve -flush-every`'s timer or an explicit `flush` call. All four combinations are pre-registered at `0` from daemon start, so a `rate()` over a combination that's never happened reads `0`, not "no data." |
 | `offshoot_flush_duration_seconds` | histogram | — | Flush latency, fixed buckets (see [Histogram buckets](#histogram-buckets) below). |
@@ -139,7 +139,7 @@ Prometheus datasource when prompted.
 
 ## Branch states
 
-Every branch is in exactly one of six computed states — nothing about state
+Every branch is in exactly one of seven computed states — nothing about state
 is persisted anywhere; `offshoot status` and the daemon `branches` op
 recompute it fresh on every call. Full mechanics, cost, and edge cases are
 in [docs/reference.md](reference.md#branch-states); this table is the
@@ -150,18 +150,20 @@ paged-at-3am version — what each state means for *you*, right now.
 | `active` | Someone holds a live lease and is (or was recently) writing. Normal for any branch in active use. | Both CLI/at-rest and daemon |
 | `pending` | This daemon has a session slot reserved and is mid-`open` — not yet live, but spoken for. If a branch sits here for more than a few seconds, `open` is stuck (slow store attach, a wedged lock) — investigate that daemon, not the branch. | Daemon only |
 | `error` | A session is open and its `Err()` is non-nil — lease loss, a capture failure, a contract violation. **This is the state to alert on.** `session status` (or the daemon `status` op) names the actual error. | Daemon only |
+| `closing` | A session here is closing: capture has stopped and the lease is released when the close finishes. `open` waits for it (up to 15 s); rollback, promote, compact, checkout and destroy refuse with "retry". A branch that stays here more than a few seconds is a slow close (a long flush ahead of it, or a slow store) — check the daemon's log. | Daemon only |
 | `dirty` | No live lease; a checkout exists with un-checkpointed local edits (content hash differs from the ref, sidecar identity otherwise matches). Expected mid-workflow (someone's `sqlite3`'d the checkout by hand); unexpected on a branch you thought was fully flushed. | Both |
 | `detached` | No live lease; a checkout's sidecar-recorded lineage no longer matches the ref's current lineage — an orphan left behind by a `rollback`/`promote` whose best-effort checkout refresh didn't run (the checkout was busy at repoint time). Re-run `offshoot checkout` to fix it; the old checkout content isn't wrong, just stale relative to a branch that moved on. | Both |
 | `idle` | None of the above — nothing going on. **A deliberate addition** to the original state taxonomy (see reference.md's note); added because at-rest `offshoot status` has no daemon and needs a name for "quiet." | Both |
 
-**Precedence, most to least specific:** `error` > `pending` > `active` >
-`dirty` > `detached` > `idle`. `error` and `pending` can never both apply to
-one branch (a daemon's session map holds at most one entry per `db@branch`).
-The precedence that actually bites in practice is `active` over
-`dirty`/`detached`: a branch can be both leased and locally modified at the
-file level, and the lease wins the report — don't read `active` as "nothing
-else to worry about here," it just means the lease question was answered
-first.
+**Precedence, most to least specific:** `closing` > `error` > `pending` >
+`active` > `dirty` > `detached` > `idle`. `pending` never applies together
+with `closing` or `error` (a daemon's session map holds one entry per
+`db@branch`). A fenced session that is being closed reads `closing`, not
+`error`: wait for the close, then reopen. The precedence that actually
+bites in practice is `active` over `dirty`/`detached`: a branch can be both
+leased and locally modified at the file level, and the lease wins the
+report — don't read `active` as "nothing else to worry about here," it just
+means the lease question was answered first.
 
 **Cost note for operators:** determining `dirty` requires a real WAL
 checkpoint plus a full SHA-256 hash of the checkout, per branch, on every
@@ -174,7 +176,7 @@ short-circuit).
 
 **A branch that refuses `open`** with "branch is being deleted" or "branch
 is being reaped" is mid-`destroy`/mid-reap, not stuck — the claim is
-transient (retry shortly). None of the six states above surface that claim:
+transient (retry shortly). None of the seven states above surface that claim:
 they're computed purely from the ref's lease and the checkout's sidecar,
 which a Destroy/Reap claim doesn't touch, so `status`/`branches` reads that
 same branch as `idle` (or `active`, if it still carries a lease at that
@@ -202,7 +204,7 @@ section is the operational summary.
 | `flushed` | A flush succeeds (manual or the `-flush-every` timer) |
 | `flush_failed` | A flush fails |
 | `fenced` | A session is fenced out by a lease it no longer holds |
-| `session_closed` | A session closes |
+| `session_closed` | A session's close has finished and the daemon has let go of the branch: acting on it never meets a `closing` refusal |
 | `reaped` | The janitor destroys a TTL-expired branch |
 | `evicted` | The janitor evicts a `checkouts-ro` entry over `-ro-cache-budget` |
 | `dropped_slow_consumer` | Sent to a subscriber right before it's dropped — never to anyone else |

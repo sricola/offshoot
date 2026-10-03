@@ -904,13 +904,13 @@ can never disagree.
 
 ### Branch states
 
-Every branch is in exactly one of six states, computed fresh on every call
+Every branch is in exactly one of seven states, computed fresh on every call
 — nothing about state is persisted anywhere. `offshoot status`
 (`ops.Workspace.Status`, CLI/at-rest — see above) and the daemon's
 `branches` op (`BranchInfo.state`; Python `Client.branches()`'s
 `Branch.state`, TypeScript `Client.branches()`'s `Branch.state`) report the
 identical computation for the states both can see; a daemon additionally
-knows two states no at-rest computation can, since they depend on its own
+knows three states no at-rest computation can, since they depend on its own
 in-memory session map:
 
 | State | Meaning | Who can report it |
@@ -918,18 +918,21 @@ in-memory session map:
 | `active` | The branch's ref carries a live lease — someone (in or out of a daemon) holds it right now. | Both |
 | `pending` | This daemon has reserved a session slot for the branch and is still inside its (slow) `session.Open` — no live session yet, but the branch is spoken for. | Daemon only |
 | `error` | A session is open here and its `Err()` is non-nil (lease loss, a capture failure, any terminal session failure). | Daemon only |
+| `closing` | A session here is closing: its capture has stopped, and its lease stays live until the close releases it. An `open` of the branch waits for the close (up to 15 s); flush, fork, promote, rollback, compact, checkout and destroy refuse with a "retry" error. | Daemon only |
 | `dirty` | No live lease; a checkout exists whose sidecar-recorded identity (lineage/epoch/txid) matches the ref but whose content hash doesn't — un-checkpointed local edits. | Both |
 | `detached` | No live lease; a checkout exists whose sidecar-recorded **lineage** doesn't match the ref's current lineage — a checkout orphaned by a `rollback`/`promote` that repointed the branch at a new lineage before (or without) refreshing this checkout (their own checkout refresh is best-effort and can be skipped by a busy checkout at repoint time). | Both |
 | `idle` | None of the above. | Both |
 
 **Precedence** when more than one condition technically holds, most to
-least specific: `error` > `pending` > `active` > `dirty` > `detached` >
-`idle`. In practice `error` and `pending` can never both apply to the same
-branch at once (a daemon's session map holds at most one entry per
-`db@branch`, either a reservation or a live session, never both) — the
-ordering matters for `active` vs. `dirty`/`detached`: a branch can be both
-leased AND locally modified/orphaned at the file level, and `active` wins
-the report.
+least specific: `closing` > `error` > `pending` > `active` > `dirty` >
+`detached` > `idle`. A fenced session that is being closed matches both
+`closing` and `error`; `closing` wins because it is the more actionable
+answer: wait, then reopen. `pending` never applies together with `closing`
+or `error` (a daemon's session map holds one entry per `db@branch`: a
+reservation, a live session or a closing one). The ordering that matters in
+practice is `active` vs. `dirty`/`detached`: a branch can be both leased
+AND locally modified/orphaned at the file level, and `active` wins the
+report.
 
 **`idle` is a deliberate addition to the original state taxonomy.** The
 spec's branch-state taxonomy (`active`/`pending`/`dirty`/`detached`/
@@ -1034,10 +1037,12 @@ OFFSHOOT_TOKEN=$(openssl rand -hex 32) offshoot serve -http 127.0.0.1:8080
 Starts the daemon: a long-running process that serves a unix socket (mode
 `0600`) for `session ...` commands, holds branch leases, captures every
 committed WAL transaction continuously, and runs the janitor. Blocks until
-`SIGINT`/`SIGTERM`, at which point it releases every lease and shuts down
-cleanly (closing live sessions, draining in-flight opens, removing the
-socket, and closing any HTTP listener) rather than leaving stale leases
-behind.
+`SIGINT`/`SIGTERM` or the `shutdown` op, at which point it releases every
+lease and shuts down cleanly (closing live sessions, waiting for closes
+already in progress, draining in-flight opens, removing the socket, and
+closing any HTTP listener) rather than leaving stale leases behind. Either
+way the process exits only after every session has closed and released its
+lease (at most 30 s).
 
 `-socket PATH` overrides the default socket location (see `OFFSHOOT_SOCKET`
 above); if a `session` command needs to reach this daemon, it must be given
@@ -1267,7 +1272,7 @@ reference.
 |---|---|---|---|
 | `POST` | `/rpc` | Bearer | The same `Request`/`Response` JSON the unix socket speaks, one op per POST (`Content-Type: application/json` required; body capped at 1MiB, oversized -> `413`). Two ops are refused over HTTP: `subscribe` (use `GET /events`; refused in-band as a normal `{"ok":false,...}` JSON response) and `export` — the one op that writes to an unconfined, client-chosen path on the daemon host, safe under the unix socket's same-host trust model but an arbitrary-file-write primitive for a network client, so `export` alone answers `400` pre-dispatch and stays socket-only |
 | `GET` | `/metrics` | Bearer | Prometheus text exposition of the locked `offshoot_*` metric set — see [docs/operations.md](operations.md#metrics) for the full name/type/label reference table |
-| `GET` | `/healthz` | **none** | `{"ok":true,"sessions":N}` — the one endpoint that needs no token, for liveness probes |
+| `GET` | `/healthz` | **none** | `{"ok":true,"sessions":N}`, where `N` counts open sessions (a closing one is not counted) — the one endpoint that needs no token, for liveness probes |
 | `GET` | `/events` | Bearer | Server-Sent Events: the daemon's event stream (see [Eventing](#eventing-subscribe-op--get-events) below) |
 | `GET` | `/debug/pprof/*` | Bearer | `net/http/pprof`'s standard handlers (index, cmdline, profile, symbol, trace) |
 
@@ -1349,8 +1354,8 @@ sees events published *after* it subscribes.
 | `session_opened` | A session opens (daemon `open` op) | `holder`, `epoch` |
 | `flushed` | A flush succeeds (manual `flush` op or background auto-flush) | `kind` (`manual`/`auto`), `txid`, `duration_seconds` |
 | `flush_failed` | A flush fails | `kind`, `error`, `duration_seconds` |
-| `fenced` | A session is fenced out by a lease it no longer holds | `cause` |
-| `session_closed` | A session closes (daemon `close` op, or `shutdown`) | `error` (only if the close itself errored) |
+| `fenced` | A session is fenced out by a lease it no longer holds | `cause`, `holder`, `epoch` |
+| `session_closed` | A session's close has finished and this daemon has let go of the branch (daemon `close` op, or `shutdown`). Acting on it never meets a `closing` refusal. | `holder`, `epoch`, `error` (only if the close itself errored) |
 | `reaped` | The janitor destroys a branch whose TTL expired | *(none)* |
 | `evicted` | The janitor evicts a `checkouts-ro` entry over `-ro-cache-budget` | `checkpoint`, `bytes` (a by-chain entry reports branch `~by-chain` and its chain ID as `checkpoint`) |
 | `dropped_slow_consumer` | Sent to a subscriber being dropped (see below), never to anyone else | *(none)* |
@@ -1579,7 +1584,13 @@ repoint either way (see "Promote" above). Whatever the CLI does, the MCP
 tools' `force` argument has no effect on this particular refusal: repointing
 or deleting a branch's ref out from under a session the daemon still
 believes it owns is refused unconditionally, and the fix is to close the
-session first (`offshoot session close`) and retry.
+session first (`offshoot session close`) and retry. A session that is
+already closing (`state: "closing"` in the daemon's `status`) is refused
+too, but the refusal says to retry in a few seconds rather than to close
+it, and `offshoot_checkout` and `offshoot_checkpoint` refuse a closing
+session the same way (`a daemon session (holder "...") on <db>@<branch> is
+closing; retry in a few seconds`) instead of falling back to at rest,
+which would race the close for the checkout and the lease.
 `offshoot_promote`'s `source` is the one exception not guarded this way: an
 open session there doesn't block the promote, but the promoted state is the
 source's last-flushed/checkpointed head, not whatever is unflushed in that
@@ -1599,9 +1610,14 @@ Opens a live daemon session on `db@branch`: acquires its lease, materializes
 checkout path. Requires a running `offshoot serve` (reachable at the
 resolved socket). `branch` defaults to `main`.
 
-**Errors:** the branch is already open by this daemon; the branch's lease is
-held elsewhere; the daemon is shutting down; no daemon reachable at the
-socket.
+If a session on the branch is closing (another client's `close`, or one a
+killed client left running), `open` waits up to 15 s for that close to
+finish, then opens with a fresh lease epoch.
+
+**Errors:** the branch is already open by this daemon; the branch is still
+closing after 15 s (`daemon: <db>@<branch> is still closing; retry`); the
+branch's lease is held elsewhere; the daemon is shutting down; no daemon
+reachable at the socket.
 
 ## `offshoot session flush <db>[@branch] [name] [-socket PATH]`
 
@@ -1627,7 +1643,8 @@ which the Python/TypeScript SDKs' `flush(name, meta=...)` expose. This CLI
 subcommand does not have a `--meta` flag today — use an SDK client for
 metadata on a live-session checkpoint.
 
-**Errors:** `db@branch` is not open here; the session has lost its lease
+**Errors:** `db@branch` is not open here; the session is closing
+(`daemon: <db>@<branch> is closing`); the session has lost its lease
 (fenced — it will not write under a dead epoch); `meta` given with no
 checkpoint `name`; `meta` over a cap (SDK-only, since this CLI subcommand
 has no `--meta` flag).
@@ -1638,11 +1655,14 @@ has no `--meta` flag).
 offshoot session status
 ```
 
-Lists every session currently open on this daemon: `db@branch`, durable
-transaction id, epoch, lease holder, checkout path, and — if the session has
-hit an error (e.g. fenced by a lost lease, or a contract violation) — that
-error inline. This is per-session detail; for the computed branch-state
-taxonomy (`active`/`pending`/`error`/`dirty`/`detached`/`idle`) across
+Lists every session currently open on this daemon: `db@branch`, `state=open`
+or `state=closing` (the status op's `SessionInfo.state`; a closing session is
+listed until its close has released the lease; an older daemon sends no
+`state`, which means open), durable transaction id, epoch, lease holder,
+checkout path, and — if the session has hit an error (e.g. fenced by a lost
+lease, or a contract violation) — that error inline. This is per-session
+detail; for the computed branch-state taxonomy
+(`active`/`pending`/`closing`/`error`/`dirty`/`detached`/`idle`) across
 EVERY branch of a db — including ones with no session open at all — see
 [Branch states](#branch-states) above and the daemon `branches` op (SDK
 `Client.branches()`; no CLI `session branches` subcommand exists yet).
@@ -1655,7 +1675,15 @@ offshoot session close app
 
 Closes the session and releases its lease. `branch` defaults to `main`.
 
-**Errors:** `db@branch` is not open here.
+If the session is already closing (a duplicate or retried close), waits up
+to 15 s for that close and returns its result, or `daemon: <db>@<branch> is
+still closing; retry`. While a session is closing, the daemon refuses flush
+with `daemon: <db>@<branch> is closing`, and fork, promote (either side),
+rollback, compact, checkout and destroy of the branch with `daemon:
+<db>@<branch> is closing; retry when the close finishes`.
+
+**Errors:** `db@branch` is not open here (it was never opened, or its close
+has finished).
 
 ## `offshoot session shutdown [-socket PATH]`
 
@@ -1664,8 +1692,11 @@ offshoot session shutdown
 ```
 
 Asks the daemon to shut down gracefully (equivalent to sending it
-`SIGINT`/`SIGTERM`): releases every lease, closes every session, removes the
-socket.
+`SIGINT`/`SIGTERM`): releases every lease, closes every session (waiting for
+closes already in progress), removes the socket. The process exits only
+after every lease is released, bounded by 30 s like the signal path; a
+signal that arrives while the shutdown is still closing sessions waits for
+it too.
 
 ## `offshoot session dbs [-socket PATH]`
 
