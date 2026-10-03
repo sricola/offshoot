@@ -17,7 +17,19 @@ Pin an exact version if you depend on format stability. The full contract:
 
 ## [Unreleased]
 
-Nothing yet.
+### Changed
+
+- **Etags are normalized before the post-checkpoint compare.** After
+  winning its ref CAS, a checkpoint `Head`s the object it just wrote and
+  trusts it with that one request when the etag matches the one its
+  create-only put returned; otherwise it `Get`s the whole object to read
+  the trailer. An S3-compatible provider (MinIO, RustFS, R2, B2, Ceph RGW)
+  may return the same object's etag quoted on `PUT` and bare on `HEAD`,
+  with a weak `W/` prefix, or with the hex in a different case, and every
+  such checkpoint paid a needless full `GET`. Both etags now go through
+  `store.NormalizeETag` (trim, drop `W/`, strip one pair of quotes,
+  lower-case) before the compare. What is sent to the provider as
+  `If-Match` is unchanged, and so are the local backend's own etags.
 
 ## [0.2.15] - 2026-10-02
 
