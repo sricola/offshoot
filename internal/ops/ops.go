@@ -487,10 +487,10 @@ var checkpointAfterQuiesceForTest func()
 type CheckpointOptions struct {
 	// Snapshot forces a full snapshot even when a segment would do.
 	Snapshot bool
-	// Force checkpoints a branch that has a live lease (a daemon session
-	// or `lease acquire` holds it) or a detached checkout (the branch was
-	// repointed since the checkout was materialized). Both are refused
-	// without it: see refuseIfHeld and CheckpointWith's detached check.
+	// Force checkpoints a detached checkout (the branch was repointed since
+	// the checkout was materialized), which is refused without it: see
+	// CheckpointWith's detached check. It does not override a live lease, a
+	// session's or another checkpoint's (see refuseIfHeld).
 	Force bool
 }
 
@@ -554,7 +554,9 @@ func (w *Workspace) CheckpointWith(db, branch, name string, meta map[string]stri
 	if err != nil {
 		return CheckpointResult{}, err
 	}
-	if err := refuseIfHeld(db, branch, ref, "checkpoint", opts.Force); err != nil {
+	// force is false here whatever opts.Force says: a live lease means a
+	// session or another checkpoint is writing this branch (refuseIfHeld).
+	if err := refuseIfHeld(db, branch, ref, "checkpoint", false); err != nil {
 		return CheckpointResult{}, err
 	}
 	if _, exists := ref.Checkpoints[name]; exists {
@@ -907,13 +909,22 @@ func (w *Workspace) warnIfUncheckpointed(db, branch string, ref store.Ref, actio
 }
 
 // refuseIfHeld is the guard every at-rest ref mutation runs right after
-// reading the ref: it refuses a branch that is mid-destroy or mid-reap
-// (another process's CAS claim; never forceable) and, unless force, one
-// with a live lease. A live lease means a daemon session or a `lease
-// acquire` owns the branch right now; repointing or checkpointing under it
-// clears the lease, fences that session, and discards whatever it had not
-// flushed. Destroy applies the same rules in its own body. verb names the
-// operation in the message ("rollback", "promote onto", ...).
+// reading the ref. A branch that is mid-destroy or mid-reap (another
+// process's CAS claim) is refused, never forceably. A live lease is
+// refused too, with an error that unwraps to store.ErrLeaseHeld:
+//
+//   - checkpoint never takes over a live lease, whatever force says: it
+//     takes the lease itself (see CheckpointWith), so a live one means a
+//     session or another checkpoint is writing the branch right now, and
+//     writing under that writer's epoch is the interleaving fencing exists
+//     to prevent;
+//   - a repoint (rollback, promote onto, compact) proceeds under force: it
+//     clears the lease, which fences the session holding it (its unflushed
+//     writes are lost) or makes the checkpoint holding it fail without
+//     committing.
+//
+// verb names the operation in the message ("rollback", "promote onto",
+// ...). Destroy applies the same rules in its own body.
 func refuseIfHeld(db, branch string, ref store.Ref, verb string, force bool) error {
 	if ref.Deleting {
 		return fmt.Errorf("ops: %s@%s is being destroyed; cannot %s it", db, branch, verb)
@@ -921,11 +932,26 @@ func refuseIfHeld(db, branch string, ref store.Ref, verb string, force bool) err
 	if ref.Reaping {
 		return fmt.Errorf("ops: %s@%s is being reaped (its TTL expired); cannot %s it", db, branch, verb)
 	}
-	if !force && store.LeaseLive(ref, time.Now()) {
-		return fmt.Errorf("ops: %s@%s has a live lease held by %q until %s (an open daemon session, or 'offshoot lease acquire'); a %s now would fence that writer and discard its unflushed work — close the session first, or pass --force",
-			db, branch, ref.LeaseHolder, ref.LeaseExpiry, verb)
+	if !store.LeaseLive(ref, time.Now()) {
+		return nil
 	}
-	return nil
+	who := "an open daemon session, or 'offshoot lease acquire'"
+	if isCheckpointHolder(ref.LeaseHolder) {
+		who = "another checkpoint is in progress"
+	}
+	if verb == "checkpoint" {
+		return &leaseHeldError{fmt.Sprintf("ops: %s@%s has a live lease held by %q until %s (%s); --force cannot take over a live lease; close the session (or wait for the other checkpoint) and retry",
+			db, branch, ref.LeaseHolder, ref.LeaseExpiry, who)}
+	}
+	if force {
+		return nil
+	}
+	consequence := "fence that writer and discard its unflushed work — close the session first, or pass --force"
+	if isCheckpointHolder(ref.LeaseHolder) {
+		consequence = "make that checkpoint fail without committing — wait for it to finish, or pass --force"
+	}
+	return &leaseHeldError{fmt.Sprintf("ops: %s@%s has a live lease held by %q until %s (%s); a %s now would %s",
+		db, branch, ref.LeaseHolder, ref.LeaseExpiry, who, verb, consequence)}
 }
 
 // errNoCheckpoint is the error for a checkpoint name that db@branch does

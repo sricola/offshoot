@@ -92,3 +92,11 @@ func (w *Workspace) Leases() ([]LeaseInfo, error) {
 	}
 	return out, nil
 }
+
+// leaseHeldError is an at-rest refusal of a branch under a live lease. It
+// keeps its own message and unwraps to store.ErrLeaseHeld, so a caller
+// tests errors.Is(err, store.ErrLeaseHeld) whichever verb refused.
+type leaseHeldError struct{ msg string }
+
+func (e *leaseHeldError) Error() string { return e.msg }
+func (e *leaseHeldError) Unwrap() error { return store.ErrLeaseHeld }

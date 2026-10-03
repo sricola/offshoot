@@ -61,8 +61,9 @@ Usage:
                                      the pages changed since the last
                                      checkpoint when it can, else a full
                                      snapshot (--snapshot forces one);
-                                     refuses a branch with a live lease or a
-                                     detached checkout unless --force
+                                     refused under a live lease (a session
+                                     or another checkpoint), --force or not;
+                                     --force checkpoints a detached checkout
   offshoot fork <db>[@branch] <new> [--at cp] [--ttl duration] [--meta k=v ...]
                                      branch from head or a checkpoint;
                                      --meta is repeatable (capped: 32 keys,
@@ -610,10 +611,10 @@ func run(args []string) error {
 		force, rest := extractBoolFlag(rest, "--force")
 		meta, rest, err := extractMetaFlags(rest)
 		if err != nil {
-			return fmt.Errorf("usage: offshoot checkpoint <db>[@branch] <name> [--snapshot] [--meta k=v ...]: %w", err)
+			return fmt.Errorf("usage: offshoot checkpoint <db>[@branch] <name> [--snapshot] [--meta k=v ...] [--force]: %w", err)
 		}
 		if len(rest) != 2 {
-			return fmt.Errorf("usage: offshoot checkpoint <db>[@branch] <name> [--snapshot] [--meta k=v ...]")
+			return fmt.Errorf("usage: offshoot checkpoint <db>[@branch] <name> [--snapshot] [--meta k=v ...] [--force]")
 		}
 		db, branch, err := ops.ParseTarget(rest[0])
 		if err != nil {

@@ -1831,3 +1831,27 @@ func TestListReportsTTLAndExpiry(t *testing.T) {
 		t.Fatalf("attempt-1 expires_at %s is not about 2h out", exp)
 	}
 }
+
+// TestCheckpointSurfacesLeaseRefusalUnchanged: an at-rest
+// offshoot_checkpoint on a branch another checkpoint holds returns the ops
+// refusal verbatim: the holder, that a checkpoint is in progress, and that
+// --force cannot take it over, so the agent waits rather than looking for
+// a flag it does not have.
+func TestCheckpointSurfacesLeaseRefusalUnchanged(t *testing.T) {
+	ts, w := newTools(t)
+	if r := call(t, ts, "offshoot_checkout", map[string]any{"database": "app"}); r.IsError {
+		t.Fatalf("checkout: %s", text(r))
+	}
+	holder := "checkpoint:" + ops.LocalHolder() + "/0123abcd"
+	if _, err := w.AcquireLease("app", "main", holder, time.Minute); err != nil {
+		t.Fatal(err)
+	}
+	_, want := w.CheckpointWith("app", "main", "v1", nil, ops.CheckpointOptions{})
+	if !errors.Is(want, store.ErrLeaseHeld) {
+		t.Fatalf("precondition: the ops refusal is %v", want)
+	}
+	r := call(t, ts, "offshoot_checkpoint", map[string]any{"database": "app", "name": "v1"})
+	if !r.IsError || text(r) != want.Error() {
+		t.Fatalf("offshoot_checkpoint = %q (error %v), want the ops refusal verbatim: %q", text(r), r.IsError, want.Error())
+	}
+}

@@ -51,8 +51,8 @@ func (w *Workspace) Destroy(db, branch string, force bool) error {
 	if ref.LeaseHolder != "" && !force {
 		exp, perr := time.Parse(time.RFC3339Nano, ref.LeaseExpiry)
 		if perr == nil && time.Now().Before(exp) {
-			return fmt.Errorf("ops: %s@%s has a live lease held by %q until %s; use --force",
-				db, branch, ref.LeaseHolder, ref.LeaseExpiry)
+			return &leaseHeldError{fmt.Sprintf("ops: %s@%s has a live lease held by %q until %s; use --force",
+				db, branch, ref.LeaseHolder, ref.LeaseExpiry)}
 		}
 	}
 
