@@ -3,6 +3,7 @@ package daemon
 import (
 	"bytes"
 	"encoding/json"
+	"fmt"
 	"os"
 	"os/exec"
 	"path/filepath"
@@ -268,6 +269,12 @@ func TestJanitorBudgetZeroIsUnlimited(t *testing.T) {
 	if st.Pins < 1 || st.StrandedPinned < 1 || st.EvictedStranded == before.EvictedStranded {
 		t.Fatalf("dbfile stats behind the scrape = %+v, want the held checkout's pin, it as a pinned stranded descriptor, and the stranded reclaim counted", st)
 	}
+	// The janitor's log line names the pinned checkout, so an operator can
+	// find the session or read keeping it.
+	heldAbs, _ := filepath.Abs(held)
+	if msg := pinnedStrandsMessage(); !strings.Contains(msg, heldAbs) {
+		t.Fatalf("janitor line %q does not name the pinned checkout %s", msg, heldAbs)
+	}
 }
 
 // TestStatusReportsDescriptors: the status op carries dbfile's descriptor
@@ -306,5 +313,40 @@ func TestStatusReportsDescriptors(t *testing.T) {
 	}
 	if dbs := call(t, sock, Request{Op: "dbs"}); dbs.DBFileDescriptors != nil {
 		t.Fatal("dbfile_descriptors leaked into a non-status op")
+	}
+}
+
+// TestPinnedStrandsMessageCapsThePaths: the janitor's line names at most a
+// few pinned stranded checkouts and counts the rest.
+func TestPinnedStrandsMessageCapsThePaths(t *testing.T) {
+	dir := t.TempDir()
+	var paths []string
+	for i := range pinnedStrandsNamed + 2 {
+		p := filepath.Join(dir, fmt.Sprintf("c%d.db", i))
+		if err := os.WriteFile(p, []byte("x"), 0o600); err != nil {
+			t.Fatal(err)
+		}
+		s, err := dbfile.Reader(p)
+		if err != nil {
+			t.Fatal(err)
+		}
+		t.Cleanup(func() { s.Close() })
+		if err := os.Remove(p); err != nil {
+			t.Fatal(err)
+		}
+		paths = append(paths, p)
+	}
+	t.Cleanup(func() { dbfile.EvictUnder(dir) })
+	dbfile.EvictStrandedAt(dir) // orphans them, pinned
+	msg := pinnedStrandsMessage()
+	named := 0
+	for _, p := range paths {
+		abs, _ := filepath.Abs(p)
+		if strings.Contains(msg, abs) {
+			named++
+		}
+	}
+	if named > pinnedStrandsNamed || !strings.Contains(msg, " more)") {
+		t.Fatalf("janitor line names %d of %d pinned strands, want at most %d plus a count: %q", named, len(paths), pinnedStrandsNamed, msg)
 	}
 }

@@ -3,10 +3,40 @@ package daemon
 import (
 	"fmt"
 	"os"
+	"strings"
 	"time"
 
 	"github.com/sricola/offshoot/internal/dbfile"
 )
+
+// pinnedStrandsNamed caps how many paths pinnedStrandsMessage names.
+const pinnedStrandsNamed = 3
+
+// pinnedStrandsMessage is the janitor's line for stranded descriptors it had
+// to leave open because something still pins them, or "" when there are
+// none. Loud like the gc line: a session or read still open on a checkout
+// that was removed or replaced (outside offshoot, say) is ordinary and keeps
+// the file's disk until it closes, while one that outlives every session
+// and read is a pin leak. Naming the paths is what lets an operator tell
+// the two apart.
+func pinnedStrandsMessage() string {
+	var paths []string
+	for _, e := range dbfile.Entries() {
+		if e.Orphan && e.Pins > 0 {
+			paths = append(paths, e.Path)
+		}
+	}
+	if len(paths) == 0 {
+		return ""
+	}
+	named := strings.Join(paths[:min(len(paths), pinnedStrandsNamed)], ", ")
+	if extra := len(paths) - pinnedStrandsNamed; extra > 0 {
+		named += fmt.Sprintf(" and %d more", extra)
+	}
+	return fmt.Sprintf("offshoot: janitor: dbfile: %d descriptor(s) on removed or replaced checkouts still pinned (%s): "+
+		"a session or read still open on one keeps its disk until it closes; one that persists with none open is a pin leak",
+		len(paths), named)
+}
 
 // StartJanitor reaps expired branches and runs GC every interval until
 // Shutdown. grace is passed to GC (tombstone age before deletion); the
@@ -194,11 +224,8 @@ func (s *Server) janitorTick(grace time.Duration) {
 	if fdBudget > 0 {
 		dbfile.Evict(fdBudget)
 	}
-	if st := dbfile.ReadStats(); st.StrandedPinned > 0 {
-		// Loud like the gc line above: a session or read outliving its file
-		// is ordinary for a moment, but one this line keeps naming across
-		// ticks is a pin leak.
-		fmt.Fprintf(os.Stderr, "offshoot: janitor: dbfile: %d stranded descriptor(s) still pinned; a count that persists across passes is a pin leak\n", st.StrandedPinned)
+	if msg := pinnedStrandsMessage(); msg != "" {
+		fmt.Fprintln(os.Stderr, msg)
 	}
 
 	result := "ok"
