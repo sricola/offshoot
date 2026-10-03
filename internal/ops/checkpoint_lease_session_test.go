@@ -175,3 +175,97 @@ func TestCheckpointPlansFromTheAcquiredRef(t *testing.T) {
 		t.Fatalf("the committed head holds %q, want 1,2", got)
 	}
 }
+
+// TestAtRestCheckpointIsRefusedWhileASessionCloses: a session's Close keeps
+// renewing its lease until it releases it, past the engine shutdown, the
+// sidecar stamp and the shadow refresh, which can outlast the lease's own
+// TTL. An at-rest checkpoint, forced or not, is refused under that lease
+// for the whole close, with the session's holder named and the advice to
+// close the session and retry, and writes nothing: it never quiesces the
+// checkout the closing engine still owns. Had the lease lapsed while the
+// close ran, the checkpoint would have reclaimed it and committed under the
+// closing session. Once the close releases the lease, the checkpoint goes
+// through and the close reports no error. The close is held in
+// session.CloseReleaseHook past the expiry the lease had when it got there.
+func TestAtRestCheckpointIsRefusedWhileASessionCloses(t *testing.T) {
+	w := newWS(t)
+	leaseSeededMain(t, w)
+	const ttl = 1500 * time.Millisecond
+	s, err := session.Open(context.Background(), session.Options{
+		WS: w, DB: "app", Branch: "main", LeaseTTL: ttl, RenewEvery: 100 * time.Millisecond,
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	leaseSQL(t, s.CheckoutPath(), "INSERT INTO t VALUES (2);")
+	if _, err := s.Flush("", nil); err != nil {
+		t.Fatal(err)
+	}
+	entered, proceed := make(chan struct{}), make(chan struct{})
+	var proceedOnce sync.Once
+	release := func() { proceedOnce.Do(func() { close(proceed) }) }
+	session.CloseReleaseHook = func() {
+		close(entered)
+		<-proceed
+	}
+	t.Cleanup(func() { session.CloseReleaseHook = nil; release() })
+	closeErr := make(chan error, 1)
+	go func() { closeErr <- s.Close() }()
+	select {
+	case <-entered:
+	case <-time.After(10 * time.Second):
+		t.Fatal("Close never reached CloseReleaseHook")
+	}
+	session.CloseReleaseHook = nil // the held Close has already read it
+
+	held, heldEtag, err := w.Store.GetRef("app", "main")
+	if err != nil {
+		t.Fatal(err)
+	}
+	exp, err := time.Parse(time.RFC3339Nano, held.LeaseExpiry)
+	if err != nil {
+		t.Fatal(err)
+	}
+	attempts := 0
+	for force := false; attempts == 0 || time.Now().Before(exp.Add(200*time.Millisecond)); force = !force {
+		attempts++
+		_, err := w.CheckpointWith("app", "main", "during-close", nil, ops.CheckpointOptions{Force: force})
+		if !errors.Is(err, store.ErrLeaseHeld) || !strings.Contains(err.Error(), fmt.Sprintf("held by %q", held.LeaseHolder)) ||
+			!strings.Contains(err.Error(), "close the session and retry") {
+			release()
+			<-closeErr
+			t.Fatalf("checkpoint (force %v) while the session closes, %d attempts in: %v; want a refusal under the session's lease", force, attempts, err)
+		}
+		time.Sleep(100 * time.Millisecond)
+	}
+	ref, etag, err := w.Store.GetRef("app", "main")
+	if err != nil {
+		release()
+		<-closeErr
+		t.Fatal(err)
+	}
+	if etag == heldEtag {
+		release()
+		<-closeErr
+		t.Fatal("precondition: no renewal landed while the close was held")
+	}
+	if ref.LeaseHolder != held.LeaseHolder || ref.Epoch != held.Epoch || ref.HeadTXID != held.HeadTXID || ref.Checkpoints["during-close"].TXID != 0 {
+		release()
+		<-closeErr
+		t.Fatalf("the refused checkpoints changed the ref: %+v -> %+v", held, ref)
+	}
+	release()
+	if err := <-closeErr; err != nil {
+		t.Fatalf("close: %v", err)
+	}
+	if s.Err() != nil {
+		t.Fatalf("the session failed while closing: %v", s.Err())
+	}
+	res, err := w.CheckpointWith("app", "main", "after-close", nil, ops.CheckpointOptions{})
+	if err != nil {
+		t.Fatalf("checkpoint after the close released the lease: %v", err)
+	}
+	if res.TXID != held.HeadTXID+1 {
+		t.Fatalf("checkpoint after the close at txid %d, want %d", res.TXID, held.HeadTXID+1)
+	}
+}
