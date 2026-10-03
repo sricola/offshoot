@@ -311,14 +311,14 @@ func indexOf(xs []string, want string) int {
 // killed in its quiesce leaves its claim on a branch a session holds, and
 // ClearStaleDeleteClaims clears it only once it is staleDeletingClaimAfter
 // (30 s) old, longer than the session's 30 s lease. The session's
-// renewals, replayed here on their own clock every TTL/3, write over the
-// claim once the lease is past half its TTL, so with every renewal going
-// through the lease is live for the whole time the claim stands: status
-// says active, an unforced destroy is refused, and once the janitor clears
-// the claim another writer is still refused and the holder's next renewal
-// goes through. Skipping every renewal under the claim instead lets the
-// lease lapse 30 s after the last one, and the first acquirer after the
-// clear fences the session.
+// renewals, replayed here on their own clock every TTL/3, each write over
+// the claim and leave it set, as on a branch without one, so the lease is
+// live for the whole time the claim stands: status says active, an
+// unforced destroy is refused, and once the janitor clears the claim
+// another writer is still refused and the holder's next renewal goes
+// through. Skipping renewals under the claim instead lets the lease lapse
+// before the claim is cleared, and the first acquirer after the clear
+// fences the session.
 func TestRenewingHolderSurvivesAStrandedDestroyClaim(t *testing.T) {
 	w := newWS(t)
 	if err := w.Create("app"); err != nil {
@@ -345,12 +345,10 @@ func TestRenewingHolderSurvivesAStrandedDestroyClaim(t *testing.T) {
 	}
 	for i := 1; i <= 3; i++ {
 		next, err := w.Store.RenewLease(l, ttl, start.Add(time.Duration(i)*every))
-		switch {
-		case err == nil:
-			l = next
-		case !errors.Is(err, store.ErrDeleting):
-			t.Fatalf("renewal %d under the claim: %v", i, err)
+		if err != nil {
+			t.Fatalf("renewal %d under the claim: %v, want it renewed", i, err)
 		}
+		l = next
 	}
 	if state, err := w.BranchState("app", "work"); err != nil || state != "active" {
 		t.Fatalf("branch state under a stranded claim, its holder renewing: %q, %v; want active", state, err)
@@ -367,104 +365,5 @@ func TestRenewingHolderSurvivesAStrandedDestroyClaim(t *testing.T) {
 	}
 	if _, err := w.Store.RenewLease(l, ttl, time.Now()); err != nil {
 		t.Fatalf("the holder's first renewal after the clear: %v", err)
-	}
-}
-
-// writeAfterRefGet runs write once, right after the next Get of key once
-// armed: another ref write landing between a renewal's read and its
-// compare-and-swap.
-type writeAfterRefGet struct {
-	store.Backend
-	key   string
-	armed bool
-	write func()
-}
-
-func (b *writeAfterRefGet) Get(key string) ([]byte, string, error) {
-	data, etag, err := b.Backend.Get(key)
-	if key == b.key && b.armed {
-		b.armed = false
-		b.write()
-	}
-	return data, etag, err
-}
-
-// TestRenewalOverAStrandedClaimSurvivesALostCompareAndSwap: under a destroy
-// claim only every other renewal at the default cadence writes over the
-// claim, with ttl/3 left, so a renewal that lost its compare-and-swap to
-// the session's own flush, a touch or the janitor would leave the next one
-// to come with nothing left. Replayed on the holder's own clock: the first
-// renewal after the claim leaves it alone, and a touch lands between the
-// second's read and its write. The renewal re-reads and renews, so when
-// the third is late (load, or the janitor's pass falling just before it),
-// the branch still reads active, an unforced destroy is refused, and once
-// the janitor clears the 30 s old claim another acquirer is refused and
-// the holder renews. Without the retry the lease has expired by then: the
-// destroy goes through, or the next acquirer fences the holder.
-func TestRenewalOverAStrandedClaimSurvivesALostCompareAndSwap(t *testing.T) {
-	w := newWS(t)
-	if err := w.Create("app"); err != nil {
-		t.Fatal(err)
-	}
-	if _, err := w.Fork("app", "main", "work", "", 0, nil); err != nil {
-		t.Fatal(err)
-	}
-	ttl, every := DefaultLeaseTTL, DefaultLeaseTTL/3
-	// The session took the lease three renewal intervals and 1.2 s ago, a
-	// destroy claimed the branch a second later and was killed, and the
-	// session's third renewal since, due 1.2 s ago, has not landed yet.
-	start := time.Now().Add(-(3*every + 1200*time.Millisecond))
-	l, err := w.Store.AcquireLease("app", "work", "daemon-a", ttl, start)
-	if err != nil {
-		t.Fatal(err)
-	}
-	ref, etag, err := w.Store.GetRef("app", "work")
-	if err != nil {
-		t.Fatal(err)
-	}
-	ref.Deleting, ref.DeletingAt = true, start.Add(time.Second).UTC().Format(time.RFC3339Nano)
-	if _, err := w.Store.PutRef("app", "work", ref, etag); err != nil {
-		t.Fatal(err)
-	}
-	base := w.Store.B
-	plain := &store.Store{B: base}
-	b := &writeAfterRefGet{Backend: base, key: store.RefKey("app", "work"), write: func() {
-		ref, etag, err := plain.GetRef("app", "work")
-		if err != nil {
-			t.Fatal(err)
-		}
-		ref.Touch(time.Now())
-		if _, err := plain.PutRef("app", "work", ref, etag); err != nil {
-			t.Fatal(err)
-		}
-	}}
-	w.Store.B = b
-	if _, err := w.Store.RenewLease(l, ttl, start.Add(every)); !errors.Is(err, store.ErrDeleting) {
-		w.Store.B = base
-		t.Fatalf("the first renewal under the claim, 20 s of the lease left: %v, want ErrDeleting", err)
-	}
-	b.armed = true
-	next, err := w.Store.RenewLease(l, ttl, start.Add(2*every))
-	w.Store.B = base
-	if err != nil {
-		t.Errorf("the second renewal under the claim, a touch landing between its read and its write: %v", err)
-	} else {
-		l = next
-	}
-	if state, err := w.BranchState("app", "work"); err != nil || state != "active" {
-		t.Fatalf("branch state with the third renewal late: %q, %v; want active", state, err)
-	}
-	if err := w.Destroy("app", "work", false); !errors.Is(err, store.ErrLeaseHeld) {
-		t.Fatalf("unforced destroy with the third renewal late: %v, want a live-lease refusal", err)
-	}
-	cleared, err := w.ClearStaleDeleteClaims(time.Now())
-	if err != nil || len(cleared) != 1 || cleared[0] != "app@work" {
-		t.Fatalf("ClearStaleDeleteClaims = %v, %v; want [app@work]", cleared, err)
-	}
-	if _, err := w.Store.AcquireLease("app", "work", "checkpoint:other/1/0123abcd", ttl, time.Now()); !errors.Is(err, store.ErrLeaseHeld) {
-		t.Fatalf("acquire right after the stale claim was cleared: %v, want ErrLeaseHeld", err)
-	}
-	if _, err := w.Store.RenewLease(l, ttl, time.Now()); err != nil {
-		t.Fatalf("the holder's late third renewal: %v", err)
 	}
 }

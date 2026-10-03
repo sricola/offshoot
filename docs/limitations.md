@@ -368,6 +368,13 @@ milliseconds don't):
   to a temp file first), so a legitimate hold is milliseconds — but a
   process paused for over 30 s inside that window can have its lock
   broken.
+- **On S3, an unforced `destroy` cannot see a lease renewed after its
+  claim.** S3 has no conditional delete, so a holder whose lease had
+  lapsed and that renews in the moment between the destroy's claim and
+  its delete loses the branch, and its next renewal finds it gone; on a
+  local store that destroy is refused as a live lease instead. A forced
+  destroy deletes on both, as documented
+  ([destroy](reference.md#offshoot-destroy-dbbranch---force)).
 - **Never `export --force` over a database another process has open.**
   `export` writes a temp file and renames it over the destination; a
   process with the old file open keeps writing to the replaced inode, and

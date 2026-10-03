@@ -19,6 +19,22 @@ Pin an exact version if you depend on format stability. The full contract:
 
 ### Fixed
 
+- **`destroy --force` on a local store failed when the lease holder renewed
+  between the destroy's claim and its delete.** A lease renewal, a daemon
+  session's or (new in this release) an at-rest checkpoint's, writes over
+  a destroy's claim and leaves it set, which moved the etag the local
+  store's conditional delete compares against: a destroy whose checkout
+  quiesce spanned a renewal tick unwound its claim and failed with
+  `compare-and-swap conflict`, and the session carried on, or the
+  checkpoint it was meant to stop went on to commit. The delete now
+  re-reads the ref and deletes again, up to 4 attempts in all, while the
+  ref is still that destroy's claim with only the lease expiry moved; the
+  holder's next renewal finds the branch gone, which ends the session or
+  fails the checkpoint without committing. An unforced `destroy`, which
+  goes ahead only on a lapsed lease, is refused with `has a live lease` if
+  the holder renewed it in that window. Any other write in between (a
+  flush, a `touch`, a release) still fails the destroy, now with `destroy
+  lost a race ... (retry)`. On S3 the delete was already unconditional.
 - **`checkpoint --force` on a branch with a live session wrote a second
   writer's head under the session's epoch.** The docs said `--force`
   fenced the session; it did not. It wrote the head and a checkpoint entry
@@ -69,32 +85,6 @@ Pin an exact version if you depend on format stability. The full contract:
   win, instead of a `--force` the tool does not accept; Go callers test it
   with `errors.Is(err, ops.ErrDetachedCheckout)`. The plugin skill tells
   agents to retry a refusal that names a `checkpoint:` holder.
-- **A lease renewal no longer writes over a reap claim, or over a destroy
-  claim while more than half the lease is left.** A session's or
-  checkpoint's renewal that lands between `destroy --force`'s claim and its
-  conditional delete used to move the etag that delete compares against,
-  so the destroy failed and unwound; now the renewal is skipped (`store:
-  branch is being deleted`, retried on the next tick) and the destroy goes
-  through. At the default cadence the first renewal that writes over the
-  claim normally comes 10 s or more after it, well past a running
-  destroy's quiesce (3 s at most). Once half the lease or less is left,
-  the renewal writes over the claim and leaves it set, because a claim
-  stranded by a killed or crashed destroy stands until the janitor finds
-  it 30 s old, and a 30 s lease that no renewal had extended would by
-  then have expired, letting an unforced `destroy` through while the
-  claim stood and the first acquirer after the clear fence the session.
-  The skip costs one renewal of slack: under a destroy claim only every
-  other renewal writes, so two renewals in a row that fail with a store
-  error let the lease lapse, where without a claim it takes three.
-- **A lease renewal that loses its compare-and-swap to another write of
-  the ref re-reads the ref and tries again**, up to 4 writes, instead of
-  waiting for the next tick. The session's own flush, a `touch`, a TTL
-  change or the janitor clearing a claim no longer cost the holder a
-  renewal, which under a destroy claim, where only every other renewal
-  writes, left the next with no lease to spare. Every check runs again on
-  the re-read ref, so a lease taken meanwhile is reported lost at once,
-  and a renewal whose write landed but reported the loss (an S3 SDK retry
-  answering 412 to its own first attempt) is not written twice.
 - **A checkpoint can now fail after it has started, in two new ways, and
   can end without knowing whether it committed.** If its lease ends while
   it runs (a forced repoint, `offshoot lease release`, `destroy --force`,

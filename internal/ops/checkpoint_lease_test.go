@@ -924,9 +924,9 @@ func waitFor(t *testing.T, what string, cond func() bool) {
 }
 
 // destroyForce runs `destroy --force`, retrying when a lease renewal lands
-// between its read and its claim and so wins the claim's compare-and-swap,
-// or, past half the lease, writes over the claim before the conditional
-// delete (store.RenewLease). The backend must offer the conditional delete
+// between its read and its claim and so wins the claim's compare-and-swap
+// (a renewal between the claim and the delete is Destroy's own to get past;
+// see deleteClaimedRef). The backend must offer the conditional delete
 // (store.ConditionalDeleter), as Local does: through a test wrapper that
 // hides it, Destroy falls back to a plain Delete, which a renewal already
 // past its checks can undo, bringing the branch back still leased.
@@ -1035,8 +1035,6 @@ func TestRenewErrorClassification(t *testing.T) {
 		{fmt.Errorf("%w: app@main now held by %q at epoch 3", store.ErrLeaseLost, "thief"), true},
 		{fmt.Errorf("%w: no branch app@main", store.ErrNotFound), true},
 		{fmt.Errorf("store: renew lease on app@main: %w", store.ErrCAS), false},
-		{fmt.Errorf("%w: app@main; not renewing over the claim", store.ErrDeleting), false},
-		{fmt.Errorf("%w: app@main; not renewing over the claim", store.ErrReaping), false},
 		{errors.New("store: s3 get refs/app/main: connection reset"), false},
 	} {
 		if got := renewErrTerminal(tc.err); got != tc.terminal {
@@ -2211,77 +2209,6 @@ func TestOlderBinaryCheckpointUnderOurLeaseKeepsTheHeadsObject(t *testing.T) {
 	}
 	if _, err := w.CheckoutAt("app", "main", "old", false); err != nil {
 		t.Fatalf("the head the older binary committed does not materialize: %v", err)
-	}
-}
-
-// countRefGets counts Gets of key and forwards the backend's conditional
-// delete, so a test can wait on reads of the ref while Destroy's delete
-// stays conditional.
-type countRefGets struct {
-	store.Backend
-	key string
-	n   atomic.Int32
-}
-
-func (b *countRefGets) Get(key string) ([]byte, string, error) {
-	if key == b.key {
-		b.n.Add(1)
-	}
-	return b.Backend.Get(key)
-}
-
-func (b *countRefGets) DeleteIf(key, ifMatch string) error {
-	return b.Backend.(store.ConditionalDeleter).DeleteIf(key, ifMatch)
-}
-
-// TestRenewalsLeaveADestroyClaimAlone: `destroy --force` claims the ref and
-// quiesces the checkout before its conditional delete, which compares
-// against the claim's etag. A checkpoint renewing its lease meanwhile reads
-// the claim and, while more than half the lease is left, does not write
-// over it, so the delete goes through however many renewals fall inside a
-// quiesce that short (here three, with nearly all of a 2 s lease left), and
-// the checkpoint then fails on the destroyed branch.
-func TestRenewalsLeaveADestroyClaimAlone(t *testing.T) {
-	w := newWS(t)
-	seedDB(t, w, "app", 1<<16)
-	mustSQL(t, w.CheckoutPath("app", "main"), "INSERT INTO t (v) VALUES (randomblob(100));")
-	refKey := store.RefKey("app", "main")
-	cb := &countRefGets{Backend: w.Store.B, key: refKey}
-	w.Store.B = cb
-	var deleteErr error
-	deleted := false
-	checkpointAfterQuiesceForTest = func() {
-		var claimEtag string
-		for i := 0; ; i++ {
-			ref, etag, err := w.Store.GetRef("app", "main")
-			if err != nil {
-				t.Fatal(err)
-			}
-			ref.Deleting, ref.DeletingAt = true, time.Now().UTC().Format(time.RFC3339Nano)
-			if claimEtag, err = w.Store.PutRef("app", "main", ref, etag); err == nil {
-				break
-			}
-			if !errors.Is(err, store.ErrCAS) || i == 20 {
-				t.Fatal(err)
-			}
-		}
-		// Destroy's quiesce of a busy checkout, long enough for the
-		// renewer to read the claimed ref three times.
-		n := cb.n.Load()
-		waitFor(t, "three renewals over the claim", func() bool { return cb.n.Load() >= n+3 })
-		deleteErr, deleted = w.Store.DeleteRefIf("app", "main", claimEtag), true
-	}
-	t.Cleanup(func() { checkpointAfterQuiesceForTest = nil })
-	_, err := w.CheckpointWith("app", "main", "a", nil, CheckpointOptions{Snapshot: true, LeaseTTL: 2 * time.Second, RenewEvery: 10 * time.Millisecond})
-	w.Store.B = cb.Backend
-	if !deleted || deleteErr != nil {
-		t.Fatalf("destroy's conditional delete after renewals over its claim: %v (a renewal moved the claim's etag)", deleteErr)
-	}
-	if !errors.Is(err, store.ErrNotFound) {
-		t.Fatalf("checkpoint of a branch destroyed while it ran: %v, want ErrNotFound", err)
-	}
-	if _, _, err := w.Store.GetRef("app", "main"); !errors.Is(err, store.ErrNotFound) {
-		t.Fatalf("the destroyed branch came back: %v", err)
 	}
 }
 

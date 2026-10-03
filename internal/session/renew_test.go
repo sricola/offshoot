@@ -192,13 +192,12 @@ func TestRenewalEndsWhenBranchDestroyed(t *testing.T) {
 
 // TestRenewalKeepsTheLeaseUnderAStrandedDestroyClaim: a destroy killed
 // between its claim and its delete leaves the claim until the janitor
-// finds it 30 s old, longer than a session's lease. The session's renewals
-// leave the claim alone while the lease has more than half its TTL left
-// and then renew over it, so with its renewals going through the lease
-// stays live for as long as the claim stands; once the claim is cleared,
-// another writer is still refused and the session is not fenced. (A
-// destroy that is still running is done with the claim well inside the
-// first half of a default 30 s lease.)
+// finds it 30 s old, longer than a session's lease. The session renews on
+// every tick under the claim, as it does without one, writing over the
+// claim and leaving it set: for more than a TTL after the claim, the lease
+// never has less than ttl/2 left (a skipped tick would leave ttl/3), and
+// once the claim is cleared another writer is still refused and the
+// session is not fenced.
 func TestRenewalKeepsTheLeaseUnderAStrandedDestroyClaim(t *testing.T) {
 	testutil.RequireSQLite3(t)
 	w := newWS(t)
@@ -228,8 +227,10 @@ func TestRenewalKeepsTheLeaseUnderAStrandedDestroyClaim(t *testing.T) {
 			t.Fatal(err)
 		}
 	}
-	// Past a whole TTL since the claim, the lease has been live at every
-	// look and a renewal has written over the claim.
+	// Past a whole TTL since the claim, the lease has had more than ttl/2
+	// left at every look, and a renewal has written over the claim. With
+	// every tick renewing, the lease has ttl - ttl/3 left just before the
+	// next; one skipped tick would leave it ttl/3.
 	since := time.Now()
 	waitFor(t, 4*ttl, "a renewal over the claim, a TTL after it landed", func() bool {
 		ref, _, err := w.Store.GetRef("app", "main")
@@ -239,14 +240,24 @@ func TestRenewalKeepsTheLeaseUnderAStrandedDestroyClaim(t *testing.T) {
 		if !ref.Deleting || ref.DeletingAt != claimed.DeletingAt {
 			t.Fatalf("the claim changed under the session: deleting %v at %q", ref.Deleting, ref.DeletingAt)
 		}
-		if !store.LeaseLive(ref, time.Now()) {
+		exp, err := time.Parse(time.RFC3339Nano, ref.LeaseExpiry)
+		if err != nil || !store.LeaseLive(ref, time.Now()) {
 			t.Fatalf("the session's lease lapsed under the claim (expiry %s)", ref.LeaseExpiry)
+		}
+		if left := time.Until(exp); left <= ttl/2 {
+			t.Fatalf("the session's lease had %s of %s left under the claim: a renewal tick did not renew it", left, ttl)
 		}
 		return ref.LeaseExpiry != claimed.LeaseExpiry && time.Since(since) > ttl
 	})
-	if cleared, err := w.ClearStaleDeleteClaims(time.Now().Add(time.Minute)); err != nil || len(cleared) != 1 {
-		t.Fatalf("ClearStaleDeleteClaims = %v, %v; want app@main cleared", cleared, err)
-	}
+	// A janitor pass whose clear loses its compare-and-swap to a renewal
+	// leaves the claim to the next pass; passes run until one clears it.
+	waitFor(t, 4*ttl, "a janitor pass to clear the stale claim", func() bool {
+		cleared, err := w.ClearStaleDeleteClaims(time.Now().Add(time.Minute))
+		if err != nil {
+			t.Fatalf("ClearStaleDeleteClaims: %v", err)
+		}
+		return len(cleared) == 1
+	})
 	if _, err := w.AcquireLease("app", "main", "other-writer", ops.DefaultLeaseTTL); !errors.Is(err, store.ErrLeaseHeld) {
 		t.Fatalf("acquire once the stranded claim is cleared: %v, want ErrLeaseHeld", err)
 	}

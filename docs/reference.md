@@ -820,20 +820,17 @@ checkpoint in progress makes that checkpoint fail without committing,
 whether a renewal finds the branch gone or the head write finds the
 destroy's claim; it deletes its own object and leaves the claim alone
 (unless a head write it had already sent may still land, in which case
-it keeps the object and reports that it may have committed). Lease
-renewals, a checkpoint's or a session's, do not write over the claim
-while the lease has more than half its TTL left (at the default cadence,
-the first that does normally comes 10 s or more after the claim), so
-they do not fail the destroy's conditional delete. Past that, a renewal
-writes over the claim and leaves it set, so a destroy that was killed
-after its claim does not let the holder's lease lapse before the janitor
-clears the claim (30 s or more after it was made). Leaving a running
-destroy alone costs one renewal of slack: under the claim only every
-other renewal writes, so two in a row that fail with a store error let
-the lease lapse, where without a claim it takes three. A renewal that
-loses a compare-and-swap to another write of the ref (a flush, a
-`touch`) re-reads the ref and tries again, so such a write does not cost
-the holder a renewal.
+it keeps the object and reports that it may have committed). A lease
+renewal, a checkpoint's or a session's, that lands between the destroy's
+claim and its delete writes over the claim and leaves it set. The
+destroy still deletes the branch (on a local store its conditional
+delete re-reads the ref and deletes again while only the lease expiry
+has moved, up to 4 attempts; on S3 the delete is unconditional), and the
+holder's next renewal finds the branch gone. Without `--force`, a destroy
+that found the lease lapsed is refused as a live lease on a local store
+if the holder renewed it in that window. Under a claim that a killed
+destroy left, renewals go on as they do without one, so the holder's
+lease stays live until the janitor clears the claim.
 
 **Under copy-on-write, "destroyed" and "reclaimed" are different events.**
 Destroying a branch removes its ref immediately, but if any surviving
@@ -851,7 +848,10 @@ child.**
 
 **Errors:** protected without `--force`; live lease without `--force`;
 checkout is busy (close connections first); the destroy lost a race to a
-concurrent `AcquireLease` on the same branch (retry — see below).
+concurrent `AcquireLease` on the same branch, or to another write of its
+ref between its claim and its delete, such as a flush, a `touch` or a
+lease renewal before every one of its 4 delete attempts (retry — see
+below).
 
 ### Claim-guarded delete
 
@@ -880,12 +880,18 @@ a retryable race loss exactly like an unforced one would.
   per-key lock file `PutIf` already uses to implement compare-and-swap also
   backs a compare-and-delete (`Local.DeleteIf`) — belt-and-suspenders, since
   the claim above already serializes concurrent destroys/acquires on its
-  own.
+  own. The lease holder's renewals go on under the claim, so a delete that
+  loses its compare-and-swap to one re-reads the ref and deletes again
+  (above); any other write in between fails the destroy as a retryable
+  race loss.
 - **S3** has no compare-and-delete precondition in its API at all
   (`DeleteObject` ignores `If-Match`/`If-None-Match`; those headers only
   apply to `GetObject`/`PutObject`). Its delete stays unconditional; the
   CAS-written `Deleting` claim marker is the entire safety mechanism on this
-  backend, not a supplement to a conditional delete that doesn't exist.
+  backend, not a supplement to a conditional delete that doesn't exist. A
+  lease renewal between the claim and the delete is not seen, so the
+  branch is deleted even when an unforced destroy's holder renewed a
+  lapsed lease in that window.
 
 A Destroy call that crashes after landing its claim but before finishing
 the delete leaves the claim stranded — the branch is untouched (no partial

@@ -1,6 +1,7 @@
 package ops
 
 import (
+	"bytes"
 	"encoding/json"
 	"errors"
 	"fmt"
@@ -34,6 +35,10 @@ const tombstoneKey = "gc/tombstones"
 // before force lands still wins the CAS race on the ref (this call's own
 // claim write then fails with ErrCAS, reported as a retryable race loss,
 // same as an unforced call).
+//
+// The lease holder's renewals do not stop under the claim
+// (store.RenewLease), so one can land between the claim and the delete;
+// see deleteClaimedRef for how the delete gets past it.
 func (w *Workspace) Destroy(db, branch string, force bool) error {
 	if err := store.ValidateName(db); err != nil {
 		return err
@@ -51,16 +56,7 @@ func (w *Workspace) Destroy(db, branch string, force bool) error {
 	if ref.LeaseHolder != "" && !force {
 		exp, perr := time.Parse(time.RFC3339Nano, ref.LeaseExpiry)
 		if perr == nil && time.Now().Before(exp) {
-			held := fmt.Sprintf("ops: %s@%s has a live lease held by %q until %s", db, branch, ref.LeaseHolder, ref.LeaseExpiry)
-			if isCheckpointHolder(ref.LeaseHolder) {
-				// It ends on its own within seconds: say so first, so an agent
-				// or script retries instead of fetching a human for --force,
-				// which would make the checkpoint fail. "; use --force" stays
-				// the message's tail, as callers that rewrite it expect.
-				refusal := held + " (another checkpoint is in progress); a destroy now would make that checkpoint fail without committing — " + checkpointRetryAdvice
-				return &leaseHeldError{msg: refusal + "; use --force", noForce: refusal, checkpoint: true}
-			}
-			return &leaseHeldError{msg: held + "; use --force", noForce: held}
+			return destroyLeaseRefusal(db, branch, ref)
 		}
 	}
 
@@ -95,7 +91,7 @@ func (w *Workspace) Destroy(db, branch string, force bool) error {
 	// the Deleting claim already landed above is what actually serializes
 	// this against a concurrent AcquireLease/Destroy on every backend. See
 	// store.DeleteRefIf's doc comment.
-	if err := w.Store.DeleteRefIf(db, branch, claimEtag); err != nil {
+	if err := w.deleteClaimedRef(db, branch, ref, claimEtag, force); err != nil {
 		w.unwindDeletingClaim(db, branch)
 		return err
 	}
@@ -110,6 +106,81 @@ func (w *Workspace) Destroy(db, branch string, force bool) error {
 		}
 	}
 	return nil
+}
+
+// destroyLeaseRefusal is Destroy's refusal, without --force, of a branch
+// whose lease ref shows live.
+func destroyLeaseRefusal(db, branch string, ref store.Ref) error {
+	held := fmt.Sprintf("ops: %s@%s has a live lease held by %q until %s", db, branch, ref.LeaseHolder, ref.LeaseExpiry)
+	if isCheckpointHolder(ref.LeaseHolder) {
+		// It ends on its own within seconds: say so first, so an agent or
+		// script retries instead of fetching a human for --force, which
+		// would make the checkpoint fail. "; use --force" stays the
+		// message's tail, as callers that rewrite it expect.
+		refusal := held + " (another checkpoint is in progress); a destroy now would make that checkpoint fail without committing — " + checkpointRetryAdvice
+		return &leaseHeldError{msg: refusal + "; use --force", noForce: refusal, checkpoint: true}
+	}
+	return &leaseHeldError{msg: held + "; use --force", noForce: held}
+}
+
+// destroyDeleteAttempts bounds deleteClaimedRef's conditional deletes. A
+// holder renews once per renewal interval (10 s at the default TTL), so a
+// second attempt wins unless renewals come faster than one re-read and
+// delete of the ref; the bound only ends such a run.
+const destroyDeleteAttempts = 4
+
+// deleteClaimedRef is Destroy's delete of the ref its claim wrote: claimed,
+// at etag. The lease holder's renewals go on under the claim
+// (store.RenewLease writes over it and leaves it set), and one that lands
+// before the delete moves the etag a local store's conditional delete
+// compares against. So a delete that loses its compare-and-swap re-reads
+// the ref, and while the ref is still exactly this call's claim with only
+// the lease expiry moved (onlyRenewed), deletes again against the etag it
+// read, up to destroyDeleteAttempts deletes in all. The claim holds every
+// acquire off throughout, and the holder's next renewal finds the branch
+// gone (ErrNotFound), which ends a session or a checkpoint.
+//
+// Without force, Destroy went ahead only because the lease had lapsed; if
+// its holder has renewed it since, the destroy is refused as a live lease,
+// as it would have been had the renewal landed before its read. Any other
+// change to the ref (a flush, a touch, a release, another destroy's claim,
+// the janitor clearing this one), or a renewal before every attempt, fails
+// the destroy as a lost race (retryable, ErrCAS). On S3 the delete is
+// unconditional and never loses a compare-and-swap, so none of this runs
+// there: a renewal between the claim and the delete is not seen, and the
+// branch is deleted, forced or not.
+func (w *Workspace) deleteClaimedRef(db, branch string, claimed store.Ref, etag string, force bool) error {
+	for attempt := 1; ; attempt++ {
+		err := w.Store.DeleteRefIf(db, branch, etag)
+		if err == nil || !errors.Is(err, store.ErrCAS) {
+			return err
+		}
+		lost := fmt.Errorf("ops: destroy lost a race on %s@%s to another write of its ref (retry): %w", db, branch, err)
+		if attempt == destroyDeleteAttempts {
+			return lost
+		}
+		cur, curEtag, gerr := w.Store.GetRef(db, branch)
+		if gerr != nil || !onlyRenewed(claimed, cur) {
+			return lost
+		}
+		if !force && store.LeaseLive(cur, time.Now()) {
+			return destroyLeaseRefusal(db, branch, cur)
+		}
+		etag = curEtag
+	}
+}
+
+// onlyRenewed reports whether cur is claimed, the ref Destroy's claim
+// wrote, with nothing but its lease expiry moved: what a renewal by the
+// holder writes over the claim. The same DeletingAt is part of that, so
+// another destroy's claim is not this one's. Both refs are compared as
+// PutRef encodes them; both come through GetRef's decode, so the
+// encodings agree on everything a renewal leaves alone.
+func onlyRenewed(claimed, cur store.Ref) bool {
+	cur.LeaseExpiry = claimed.LeaseExpiry
+	a, aerr := json.Marshal(claimed)
+	b, berr := json.Marshal(cur)
+	return aerr == nil && berr == nil && bytes.Equal(a, b)
 }
 
 // unwindDeletingClaim best-effort clears a Deleting claim this Destroy call
