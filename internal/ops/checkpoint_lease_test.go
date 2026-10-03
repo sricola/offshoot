@@ -264,6 +264,53 @@ func TestConcurrentAtRestCheckpointsAreSerialized(t *testing.T) {
 	}
 }
 
+// TestCheckpointHoldsTheLeaseThroughItsUpload: the lease spans the object
+// upload, not only the planning before it: while the create-only put is
+// held, the ref names the checkpoint as live holder at the epoch its key
+// carries, so another writer's acquire and another checkpoint are refused;
+// released, the checkpoint commits.
+func TestCheckpointHoldsTheLeaseThroughItsUpload(t *testing.T) {
+	w := newWS(t)
+	seedDB(t, w, "app", 1<<16)
+	mustSQL(t, w.CheckoutPath("app", "main"), "INSERT INTO t (v) VALUES (randomblob(100));")
+	before := refOf(t, w, "app", "main")
+	g := gateRefCAS(w, "app", "main")
+	g.holdObject(privateSnapshotKey(before))
+	done := make(chan error, 1)
+	go func() {
+		_, err := w.CheckpointWith("app", "main", "a", nil, CheckpointOptions{Snapshot: true})
+		done <- err
+	}()
+	var held chan struct{}
+	select {
+	case held = <-g.objArrived:
+	case err := <-done:
+		t.Fatalf("the checkpoint ended before its upload: %v", err)
+	}
+	var once sync.Once
+	release := func() { once.Do(func() { close(held) }) }
+	t.Cleanup(release)
+
+	ref := refOf(t, w, "app", "main")
+	if !isCheckpointHolder(ref.LeaseHolder) || ref.Epoch != before.Epoch+1 || !store.LeaseLive(ref, time.Now()) {
+		t.Fatalf("during the upload: holder %q epoch %d expiry %s, want a live checkpoint lease at epoch %d",
+			ref.LeaseHolder, ref.Epoch, ref.LeaseExpiry, before.Epoch+1)
+	}
+	if _, err := w.Store.AcquireLease("app", "main", "daemon-b", time.Minute, time.Now()); !errors.Is(err, store.ErrLeaseHeld) {
+		t.Fatalf("an acquire during the checkpoint's upload: %v, want ErrLeaseHeld", err)
+	}
+	if _, err := w.CheckpointWith("app", "main", "rival", nil, CheckpointOptions{}); !errors.Is(err, store.ErrLeaseHeld) {
+		t.Fatalf("a checkpoint during another's upload: %v, want ErrLeaseHeld", err)
+	}
+	release()
+	if err := <-done; err != nil {
+		t.Fatalf("checkpoint: %v", err)
+	}
+	if after := refOf(t, w, "app", "main"); after.LeaseHolder != "" || after.HeadEpoch != before.Epoch+1 {
+		t.Fatalf("after the upload is released: holder %q head epoch %d, want no lease, head epoch %d", after.LeaseHolder, after.HeadEpoch, before.Epoch+1)
+	}
+}
+
 // TestTwoCheckpointsInOneProcessGetDistinctEpochs: two checkpoints from one
 // process hold distinct holders (the per-call nonce), so each acquire is a
 // fresh one that bumps the epoch, and each object goes under its own key.
