@@ -470,3 +470,74 @@ func TestRollbackDuringCloseIsRefused(t *testing.T) {
 		})
 	}
 }
+
+// TestSessionClosedEventFollowsSlotRelease: a client that acts on
+// session_closed must find the branch free. The session's own "closed"
+// transition fires inside Close, while the closing marker is still in the
+// map. To make the ordering deterministic, this test holds srv.mu while the
+// close finishes: Close and OnTransition never take it, so the session's
+// transition still runs, but closeSlot cannot free the key. A session_closed
+// seen at that moment came from inside Close.
+func TestSessionClosedEventFollowsSlotRelease(t *testing.T) {
+	srv, _ := newServer(t)
+	sock := srv.SocketPath()
+	if r := call(t, sock, Request{Op: "open", DB: "app", Branch: "main"}); !r.OK {
+		t.Fatalf("open = %+v", r)
+	}
+	if r := call(t, sock, Request{Op: "flush", DB: "app", Branch: "main", Name: "v1"}); !r.OK {
+		t.Fatalf("flush v1 = %+v", r)
+	}
+	before := getStatus(t, sock, "app", "main")
+
+	events, unsubscribe := srv.events.subscribe(64)
+	defer unsubscribe()
+	prev := session.OnTransition
+	closedLogged := make(chan struct{})
+	var once sync.Once
+	session.OnTransition = func(db, branch, event string, kv []any) {
+		prev(db, branch, event, kv)
+		if event == "closed" && db == "app" && branch == "main" {
+			once.Do(func() { close(closedLogged) })
+		}
+	}
+	t.Cleanup(func() { session.OnTransition = prev })
+
+	entered, release := holdNextClose(t)
+	closed := goCall(sock, Request{Op: "close", DB: "app", Branch: "main"})
+	within(t, entered, "the close to reach the release hook")
+
+	srv.mu.Lock()
+	release()
+	select {
+	case <-closedLogged:
+	case <-time.After(10 * time.Second):
+		srv.mu.Unlock()
+		t.Fatal("Close never logged its closed transition")
+	}
+	for drained := false; !drained; {
+		select {
+		case ev := <-events:
+			if ev.Type == "session_closed" {
+				srv.mu.Unlock()
+				t.Fatal("session_closed was published while app@main's closing marker was still in the session map")
+			}
+		default:
+			drained = true
+		}
+	}
+	srv.mu.Unlock()
+
+	ev := waitForEventType(t, events, "session_closed", 10*time.Second)
+	if r := call(t, sock, Request{Op: "rollback", DB: "app", Branch: "main", Name: "v1", NoBackup: true}); !r.OK {
+		t.Fatalf("rollback right after session_closed = %+v", r)
+	}
+	if br := branchInfo(t, call(t, sock, Request{Op: "branches", DB: "app"}), "main"); br.State == "closing" {
+		t.Fatalf("branches still says closing after session_closed")
+	}
+	if ev.Detail["holder"] != before.Holder || fmt.Sprint(ev.Detail["epoch"]) != fmt.Sprint(before.Epoch) {
+		t.Fatalf("session_closed detail = %v, want holder %q epoch %d", ev.Detail, before.Holder, before.Epoch)
+	}
+	if r := within(t, closed, "the close"); !r.OK {
+		t.Fatalf("close = %+v", r)
+	}
+}

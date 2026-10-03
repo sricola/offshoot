@@ -108,7 +108,8 @@ type Server struct {
 	// events is this daemon's in-memory event bus (Milestone 4 Task 4a) —
 	// always non-nil once NewServer returns. Fed from the session
 	// transition callback (wireEvents, composed alongside metrics'
-	// observer) and the janitor (janitorTick's "reaped" publish); drained
+	// observer), the janitor (janitorTick's "reaped" publish) and the
+	// daemon's own closes (publishSessionClosed's session_closed); drained
 	// by the unix socket "subscribe" op (streamEvents) and HTTP `GET
 	// /events` (handleEvents). See events.go.
 	events *eventBus
@@ -182,7 +183,8 @@ func (s *Server) markClosingLocked(k string, sl *slot) *slot {
 // one s.mu section run from a defer so it happens however Close ends,
 // records the result, deletes k only if it still holds m, and closes
 // m.done. Waiters (opOpen, a duplicate opClose, Shutdown) wait on done,
-// never while holding s.mu.
+// never while holding s.mu. It then publishes session_closed, after the key
+// is free.
 func (s *Server) closeSlot(k string, m *slot) (err error) {
 	defer func() {
 		s.mu.Lock()
@@ -192,6 +194,7 @@ func (s *Server) closeSlot(k string, m *slot) (err error) {
 		}
 		close(m.done)
 		s.mu.Unlock()
+		s.publishSessionClosed(m.sess, err)
 	}()
 	return m.sess.Close()
 }
@@ -616,7 +619,8 @@ func (s *Server) opOpen(req Request) Response {
 		// lease this open just took is released.
 		delete(s.sessions, k)
 		s.mu.Unlock()
-		sess.Close()
+		cerr := sess.Close()
+		s.publishSessionClosed(sess, cerr)
 		s.openWG.Done()
 		return errResp(fmt.Errorf("daemon: shutting down"))
 	}
