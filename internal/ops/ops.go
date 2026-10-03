@@ -685,9 +685,9 @@ func (w *Workspace) checkpointLeased(db, branch, name string, meta map[string]st
 	if err := rn.lost(); err != nil {
 		return CheckpointResult{}, c.renewLost(err)
 	}
-	ownEtag, err := w.Store.B.PutIf(key, buf.Bytes(), "")
+	ownEtag, err := w.putCheckpointObject(key, buf.Bytes())
 	if err != nil {
-		return CheckpointResult{}, fmt.Errorf("ops: upload checkpoint object %s: %w", key, err)
+		return CheckpointResult{}, err
 	}
 	// Join the renewals before the head write, so the write never races our
 	// own heartbeat. A renewal that found the lease gone or the branch

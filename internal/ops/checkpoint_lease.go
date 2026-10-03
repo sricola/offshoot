@@ -1,6 +1,7 @@
 package ops
 
 import (
+	"bytes"
 	"context"
 	"crypto/rand"
 	"encoding/hex"
@@ -309,22 +310,88 @@ func (c checkpointCommit) renewLost(err error) error {
 	return fmt.Errorf("ops: checkpoint %q on %s@%s did not commit: its lease ended while it ran: %w", c.name, c.db, c.branch, err)
 }
 
+// checkpointCommitAttempts bounds the head write. With the premise intact,
+// a lost compare-and-swap can only be a writer that left our lease, lineage
+// and head alone (touch, protect, a TTL change); each lands once, so three
+// attempts ride out a burst of them.
+const checkpointCommitAttempts = 3
+
+// landed reports whether cur records this checkpoint: our name at our txid
+// and private epoch, on our lineage. Only our own head write can have put
+// that entry there, so it is how a write whose response was lost (the S3
+// SDK's retry answering 412 to its own first attempt, a timeout) is
+// recognised as committed.
+func (c checkpointCommit) landed(cur store.Ref) bool {
+	cp, ok := cur.Checkpoints[c.name]
+	return ok && cur.Lineage == c.lineage && cp.TXID == c.txid && cp.Epoch == c.lease.Epoch
+}
+
+// unreferenced reports whether cur proves that no head write naming our
+// object ever landed: a lineage's head only advances, so the same lineage
+// with its head still below txid means none did.
+func (c checkpointCommit) unreferenced(cur store.Ref) bool {
+	return cur.Lineage == c.lineage && cur.HeadTXID < c.txid
+}
+
 // commitCheckpoint is the head write: it re-reads the ref, checks the
 // premise, and advances the head in one write that also records the
-// checkpoint and releases the lease. On error, deletable reports whether
-// our object provably is unreferenced: true when no head write naming it
-// was sent.
+// checkpoint and releases the lease, re-reading and reapplying up to
+// checkpointCommitAttempts times when a write fails with the premise still
+// intact. On error, deletable reports whether our object provably is
+// unreferenced: no head write was sent, or the ref shows none landed.
+// After one was sent and the ref no longer proves that (a repoint
+// replaced the lineage, the branch is gone), the object is left to GC,
+// since a write that landed may be what a fork now reads through.
 func (w *Workspace) commitCheckpoint(c checkpointCommit) (committed store.Ref, deletable bool, err error) {
-	cur, etag, err := w.Store.GetRef(c.db, c.branch)
-	if err != nil {
-		return store.Ref{}, true, c.unconfirmed(err)
+	attempts := 0
+	var lastErr error
+	for {
+		cur, etag, gerr := w.Store.GetRef(c.db, c.branch)
+		if gerr != nil {
+			return store.Ref{}, attempts == 0, c.unconfirmed(gerr)
+		}
+		if attempts > 0 && c.landed(cur) {
+			return cur, false, nil
+		}
+		if !c.premise(cur) {
+			return store.Ref{}, attempts == 0 || c.unreferenced(cur), c.lostTo(cur)
+		}
+		if attempts == checkpointCommitAttempts {
+			// The premise holds, so the head is still txid-1 on our
+			// lineage: nothing names our object.
+			return store.Ref{}, true, fmt.Errorf("ops: checkpoint %q on %s@%s: the head write lost %d compare-and-swaps to concurrent ref writes (retry): %w",
+				c.name, c.db, c.branch, attempts, lastErr)
+		}
+		next := c.advance(cur)
+		attempts++
+		_, perr := w.Store.PutRef(c.db, c.branch, next, etag)
+		if perr == nil {
+			return next, false, nil
+		}
+		lastErr = perr
 	}
-	if !c.premise(cur) {
-		return store.Ref{}, true, c.lostTo(cur)
+}
+
+// putCheckpointObject is the create-only put of data at key, a key under an
+// epoch only this checkpoint's lease minted; it returns the etag the
+// post-commit check compares against. An object already there is ours when
+// its bytes are ours: the S3 SDK retries a PutObject whose response was
+// lost, and the retry's If-None-Match then fails against our own first
+// attempt. An object with other bytes is corruption, since nothing else
+// writes this key, so it is an error and is left in place for inspection.
+// Any other error may still have landed the object, which nothing names,
+// so it is deleted.
+func (w *Workspace) putCheckpointObject(key string, data []byte) (string, error) {
+	etag, err := w.Store.B.PutIf(key, data, "")
+	if err == nil {
+		return etag, nil
 	}
-	next := c.advance(cur)
-	if _, err := w.Store.PutRef(c.db, c.branch, next, etag); err != nil {
-		return store.Ref{}, false, fmt.Errorf("ops: ref update for checkpoint %q on %s@%s: %w", c.name, c.db, c.branch, err)
+	if !errors.Is(err, store.ErrCAS) {
+		w.bestEffortDelete(key)
+		return "", fmt.Errorf("ops: upload checkpoint object %s: %w", key, err)
 	}
-	return next, false, nil
+	if got, gotEtag, gerr := w.Store.B.Get(key); gerr == nil && bytes.Equal(got, data) {
+		return gotEtag, nil
+	}
+	return "", fmt.Errorf("ops: checkpoint object %s already exists under this checkpoint's own epoch, which nothing else writes; refusing to overwrite it (store corruption?): %w", key, err)
 }

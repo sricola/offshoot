@@ -1192,3 +1192,227 @@ func TestDestroyForceDuringCheckpointAbortsIt(t *testing.T) {
 		t.Fatalf("the destroyed branch came back: %v", err)
 	}
 }
+
+// recordsCheckpoint reports whether a ref body records a checkpoint called
+// name.
+func recordsCheckpoint(data []byte, name string) bool {
+	var r struct {
+		Checkpoints map[string]json.RawMessage `json:"checkpoints"`
+	}
+	if json.Unmarshal(data, &r) != nil {
+		return false
+	}
+	_, ok := r.Checkpoints[name]
+	return ok
+}
+
+// refusingHeadWrites answers ErrCAS, without writing, to every ref PutIf
+// that records the checkpoint name: a ref under a storm of metadata writes.
+type refusingHeadWrites struct {
+	store.Backend
+	refKey, name string
+	refused      atomic.Int32
+}
+
+func (b *refusingHeadWrites) PutIf(key string, data []byte, ifMatch string) (string, error) {
+	if key == b.refKey && recordsCheckpoint(data, b.name) {
+		b.refused.Add(1)
+		return "", fmt.Errorf("%w: refused for the test", store.ErrCAS)
+	}
+	return b.Backend.PutIf(key, data, ifMatch)
+}
+
+// TestFinalCASRetriesAfterConcurrentTouch: a touch landing between the
+// checkpoint's premise read and its head write loses the head write its
+// compare-and-swap; the premise still holds, so the checkpoint re-reads,
+// reapplies and commits, and the touch's TTL survives.
+func TestFinalCASRetriesAfterConcurrentTouch(t *testing.T) {
+	w := newWS(t)
+	seedDB(t, w, "app", 1<<16)
+	mustSQL(t, w.CheckoutPath("app", "main"), "INSERT INTO t (v) VALUES (randomblob(100));")
+	g := gateRefCAS(w, "app", "main")
+	ttl := time.Hour
+	res, err := checkpointWhileHeld(t, w, g, CheckpointOptions{}, func() {
+		if _, err := w.Touch("app", "main", &ttl, time.Now()); err != nil {
+			t.Fatal(err)
+		}
+	})
+	if err != nil {
+		t.Fatalf("a touch between the premise read and the head write must be retried past: %v", err)
+	}
+	ref := refOf(t, w, "app", "main")
+	if ref.TTL != ttl.String() {
+		t.Fatalf("the touch's TTL was lost: %q", ref.TTL)
+	}
+	if ref.HeadTXID != res.TXID || ref.LeaseHolder != "" {
+		t.Fatalf("head %d holder %q, want head %d, no lease", ref.HeadTXID, ref.LeaseHolder, res.TXID)
+	}
+}
+
+// TestFinalCASGivesUpAfterThreeLosses: three lost compare-and-swaps with the
+// premise intact end the checkpoint with a retryable error; the head never
+// reached its txid, so it deletes its object and releases its lease.
+func TestFinalCASGivesUpAfterThreeLosses(t *testing.T) {
+	w := newWS(t)
+	seedDB(t, w, "app", 1<<16)
+	mustSQL(t, w.CheckoutPath("app", "main"), "INSERT INTO t (v) VALUES (randomblob(100));")
+	before := refOf(t, w, "app", "main")
+	b := &refusingHeadWrites{Backend: w.Store.B, refKey: store.RefKey("app", "main"), name: "a"}
+	w.Store.B = b
+	_, err := w.CheckpointWith("app", "main", "a", nil, CheckpointOptions{Snapshot: true})
+	w.Store.B = b.Backend
+	if !errors.Is(err, store.ErrCAS) || !strings.Contains(err.Error(), "retry") {
+		t.Fatalf("checkpoint whose head write always loses: %v, want a retryable compare-and-swap error", err)
+	}
+	if n := b.refused.Load(); n != 3 {
+		t.Fatalf("head write attempted %d times, want 3", n)
+	}
+	assertLeaseReleased(t, w, before)
+	if storeHas(w, privateSnapshotKey(before)) {
+		t.Fatal("the object was left behind although the ref proves nothing names it")
+	}
+}
+
+// TestHeadWriteThatLandedIsNotUndone: a head write that landed but reported
+// failure is recognised from the ref (our name at our txid and epoch), so
+// the checkpoint succeeds, its object stays, and the checkout is stamped.
+func TestHeadWriteThatLandedIsNotUndone(t *testing.T) {
+	for name, failure := range map[string]error{
+		"412 after landing":     fmt.Errorf("%w: precondition failed on the retry", store.ErrCAS),
+		"timeout after landing": errors.New("store: s3 conditional put refs/app/main: context deadline exceeded"),
+	} {
+		t.Run(name, func(t *testing.T) {
+			w := newWS(t)
+			requireClone(t, w)
+			seedDB(t, w, "app", 1<<20)
+			path := w.CheckoutPath("app", "main")
+			mustSQL(t, path, "INSERT INTO t (v) VALUES (randomblob(100));")
+			refKey := store.RefKey("app", "main")
+			b := &landsThenFails{Backend: w.Store.B, err: failure, match: func(key string, data []byte) bool {
+				return key == refKey && recordsCheckpoint(data, "a")
+			}}
+			w.Store.B = b
+			res, err := w.CheckpointWith("app", "main", "a", nil, CheckpointOptions{})
+			w.Store.B = b.Backend
+			if err != nil {
+				t.Fatalf("a head write that landed was reported as failed: %v", err)
+			}
+			ref := refOf(t, w, "app", "main")
+			if ref.HeadTXID != res.TXID || ref.LeaseHolder != "" || ref.Checkpoints["a"].TXID != res.TXID {
+				t.Fatalf("ref after a landed head write: head %d holder %q entry %+v", ref.HeadTXID, ref.LeaseHolder, ref.Checkpoints["a"])
+			}
+			at, err := w.CheckoutAt("app", "main", "a", false)
+			if err != nil {
+				t.Fatalf("the committed head does not materialize (object deleted?): %v", err)
+			}
+			if !bytes.Equal(readFile(t, at), readFile(t, path)) {
+				t.Fatal("the committed head differs from the checkout")
+			}
+			assertTrustedStamp(t, path)
+		})
+	}
+}
+
+// TestRetriedObjectPutOfOurOwnBytesIsAccepted: a create-only put that landed
+// but answered ErrCAS (the SDK retry hitting its own first attempt) finds
+// our own bytes at the key, so the checkpoint proceeds; nothing is counted
+// as an overwrite and the stamp is trusted.
+func TestRetriedObjectPutOfOurOwnBytesIsAccepted(t *testing.T) {
+	w := newWS(t)
+	requireClone(t, w)
+	seedDB(t, w, "app", 1<<20)
+	path := w.CheckoutPath("app", "main")
+	mustSQL(t, path, "INSERT INTO t (v) VALUES (randomblob(100));")
+	overwrites := countOverwrites(t)
+	b := &landsThenFails{Backend: w.Store.B, err: fmt.Errorf("%w: key exists", store.ErrCAS), match: func(key string, _ []byte) bool {
+		return strings.HasPrefix(key, "data/")
+	}}
+	w.Store.B = b
+	_, err := w.CheckpointWith("app", "main", "a", nil, CheckpointOptions{})
+	w.Store.B = b.Backend
+	if err != nil {
+		t.Fatalf("a retried put of our own bytes failed the checkpoint: %v", err)
+	}
+	if n := overwrites.Load(); n != 0 {
+		t.Fatalf("overwrite counter %d, want 0", n)
+	}
+	assertTrustedStamp(t, path)
+}
+
+// TestForeignObjectAtPrivateKeyFailsTheCheckpoint: bytes that are not ours
+// at a key only this checkpoint's epoch names can only be corruption; the
+// checkpoint fails, leaves them in place, and releases its lease.
+func TestForeignObjectAtPrivateKeyFailsTheCheckpoint(t *testing.T) {
+	w := newWS(t)
+	seedDB(t, w, "app", 1<<16)
+	mustSQL(t, w.CheckoutPath("app", "main"), "INSERT INTO t (v) VALUES (randomblob(100));")
+	before := refOf(t, w, "app", "main")
+	key := privateSnapshotKey(before)
+	foreign := []byte("written by something other than offshoot")
+	if err := w.Store.B.Put(key, foreign); err != nil {
+		t.Fatal(err)
+	}
+	_, err := w.CheckpointWith("app", "main", "a", nil, CheckpointOptions{Snapshot: true})
+	if !errors.Is(err, store.ErrCAS) || !strings.Contains(err.Error(), "already exists under this checkpoint's own epoch") {
+		t.Fatalf("checkpoint over a foreign object at its key: %v", err)
+	}
+	data, _, gerr := w.Store.B.Get(key)
+	if gerr != nil || !bytes.Equal(data, foreign) {
+		t.Fatalf("the foreign object was overwritten or removed: %q %v", data, gerr)
+	}
+	assertLeaseReleased(t, w, before)
+}
+
+// dropsFirstHeadWrite drops the first ref PutIf that records the checkpoint
+// name without writing it, runs run in its place, and reports err: a head
+// write that never reached the store, with another write landing meanwhile.
+type dropsFirstHeadWrite struct {
+	store.Backend
+	refKey, name string
+	err          error
+	run          func()
+	fired        atomic.Int32
+}
+
+func (b *dropsFirstHeadWrite) PutIf(key string, data []byte, ifMatch string) (string, error) {
+	if key == b.refKey && recordsCheckpoint(data, b.name) && b.fired.CompareAndSwap(0, 1) {
+		b.run()
+		return "", b.err
+	}
+	return b.Backend.PutIf(key, data, ifMatch)
+}
+
+// TestHeadWriteThatFailedThenLostTheLeaseDeletesItsObject: a head write
+// that never landed, followed by a reclaim of the lease before the
+// checkpoint re-reads, fails the premise after a write was sent. The ref
+// still has the lineage's head below the checkpoint's txid, which proves no
+// head write naming the object landed, so the checkpoint deletes it and
+// reports the loss, leaving the reclaimer's lease alone.
+func TestHeadWriteThatFailedThenLostTheLeaseDeletesItsObject(t *testing.T) {
+	w := newWS(t)
+	seedDB(t, w, "app", 1<<16)
+	mustSQL(t, w.CheckoutPath("app", "main"), "INSERT INTO t (v) VALUES (randomblob(100));")
+	before := refOf(t, w, "app", "main")
+	b := &dropsFirstHeadWrite{Backend: w.Store.B, refKey: store.RefKey("app", "main"), name: "a",
+		err: errors.New("store: s3 conditional put refs/app/main: context deadline exceeded")}
+	b.run = func() { stealLease(t, w, "app", "main", "thief") }
+	w.Store.B = b
+	_, err := w.CheckpointWith("app", "main", "a", nil, CheckpointOptions{Snapshot: true})
+	w.Store.B = b.Backend
+	if !errors.Is(err, store.ErrLeaseLost) {
+		t.Fatalf("checkpoint whose head write failed and whose lease was then taken: %v, want ErrLeaseLost", err)
+	}
+	if b.fired.Load() != 1 {
+		t.Fatal("precondition: no head write was dropped")
+	}
+	ref := refOf(t, w, "app", "main")
+	if ref.HeadTXID != before.HeadTXID || ref.LeaseHolder != "thief" {
+		t.Fatalf("after the lost checkpoint: head %d holder %q, want head %d, the thief's lease", ref.HeadTXID, ref.LeaseHolder, before.HeadTXID)
+	}
+	if _, ok := ref.Checkpoints["a"]; ok {
+		t.Fatal("the lost checkpoint was recorded")
+	}
+	if storeHas(w, privateSnapshotKey(before)) {
+		t.Fatal("the object was left behind although the ref proves nothing names it")
+	}
+}
