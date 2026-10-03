@@ -4,11 +4,14 @@ import (
 	"database/sql"
 	"errors"
 	"os"
+	"os/exec"
 	"path/filepath"
 	"slices"
+	"strings"
 	"testing"
 
 	"github.com/sricola/offshoot/internal/dbfile"
+	"github.com/sricola/offshoot/internal/testutil"
 )
 
 func newWALFile(t *testing.T, path string) {
@@ -133,5 +136,157 @@ func TestCreateFromHoldsItsImportSource(t *testing.T) {
 	}
 	if n, _ := dbfile.PinsAt(src); n != 0 {
 		t.Fatalf("pins on the source after import = %d", n)
+	}
+}
+
+// descriptorsAt lists dbfile's descriptors for path: live and orphaned.
+func descriptorsAt(t *testing.T, path string) (live bool, orphans int) {
+	t.Helper()
+	abs, _ := filepath.Abs(path)
+	for _, e := range dbfile.Entries() {
+		if e.Path != abs {
+			continue
+		}
+		if e.Orphan {
+			orphans++
+		} else {
+			live = true
+		}
+	}
+	return live, orphans
+}
+
+// strandedUnder lists dbfile's descriptors under root that no path reaches:
+// orphans, and cached entries whose path is gone but which no sweep has
+// re-checked yet (a by-chain build's stage file, renamed to its entry).
+func strandedUnder(t *testing.T, root string) []dbfile.EntryInfo {
+	t.Helper()
+	abs, _ := filepath.Abs(root)
+	var out []dbfile.EntryInfo
+	for _, e := range dbfile.Entries() {
+		if !strings.HasPrefix(e.Path, abs+string(filepath.Separator)) {
+			continue
+		}
+		if _, err := os.Stat(e.Path); e.Orphan || os.IsNotExist(err) {
+			out = append(out, e)
+		}
+	}
+	return out
+}
+
+func dirtyCheckout(t *testing.T, path string) {
+	t.Helper()
+	if out, err := exec.Command("sqlite3", path,
+		"CREATE TABLE IF NOT EXISTS t (v); INSERT INTO t VALUES (1);").CombinedOutput(); err != nil {
+		t.Fatalf("%v: %s", err, out)
+	}
+}
+
+func TestCheckoutReclaimsTheDescriptorItStrands(t *testing.T) {
+	testutil.RequireSQLite3(t)
+	w := newWS(t)
+	if err := w.Create("app"); err != nil {
+		t.Fatal(err)
+	}
+	path, err := w.Checkout("app", "main")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if live, _ := descriptorsAt(t, path); !live {
+		t.Fatal("precondition: checkout's stamp did not cache a descriptor")
+	}
+	dirtyCheckout(t, path) // the next checkout re-materializes: a new inode is renamed over path
+	before, _ := os.Stat(path)
+	captureStderr(t, func() {
+		if _, err := w.Checkout("app", "main"); err != nil {
+			t.Fatal(err)
+		}
+	})
+	after, _ := os.Stat(path)
+	if os.SameFile(before, after) {
+		t.Fatal("precondition: checkout did not re-materialize")
+	}
+	if _, n := descriptorsAt(t, path); n != 0 {
+		t.Fatalf("%d stranded descriptor(s) left on the re-materialized checkout", n)
+	}
+	if o := strandedUnder(t, w.Root); len(o) != 0 {
+		t.Fatalf("stranded descriptors left under the store (by-chain build stages included): %+v", o)
+	}
+}
+
+func TestRollbackRefreshReclaimsTheDescriptorItStrands(t *testing.T) {
+	testutil.RequireSQLite3(t)
+	w := newWS(t)
+	if err := w.Create("app"); err != nil {
+		t.Fatal(err)
+	}
+	path, err := w.Checkout("app", "main")
+	if err != nil {
+		t.Fatal(err)
+	}
+	dirtyCheckout(t, path)
+	if _, err := w.Checkpoint("app", "main", "cp1", nil); err != nil {
+		t.Fatal(err)
+	}
+	dirtyCheckout(t, path)
+	if _, err := w.Checkpoint("app", "main", "cp2", nil); err != nil {
+		t.Fatal(err)
+	}
+	before, _ := os.Stat(path)
+	if _, err := w.Rollback("app", "main", "cp1"); err != nil {
+		t.Fatal(err)
+	}
+	after, _ := os.Stat(path)
+	if os.SameFile(before, after) {
+		t.Fatal("precondition: rollback did not refresh the checkout")
+	}
+	if _, n := descriptorsAt(t, path); n != 0 {
+		t.Fatalf("%d stranded descriptor(s) left after rollback's refresh", n)
+	}
+}
+
+func TestDestroyReclaimsTheCheckoutDescriptor(t *testing.T) {
+	w := newWS(t)
+	if err := w.Create("app"); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := w.Fork("app", "main", "f", "", 0, nil); err != nil {
+		t.Fatal(err)
+	}
+	path, err := w.Checkout("app", "f")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if live, _ := descriptorsAt(t, path); !live {
+		t.Fatal("precondition: no cached descriptor")
+	}
+	if err := w.Destroy("app", "f", false); err != nil {
+		t.Fatal(err)
+	}
+	if live, n := descriptorsAt(t, path); live || n != 0 {
+		t.Fatalf("destroyed checkout still has descriptors: live=%v orphans=%d", live, n)
+	}
+}
+
+// TestPruneByChainReclaimsTheEntriesItRemoves: pruning runs after the
+// materialize that may have grown the by-chain area, so the materialize's
+// own reclaim has already run by then; the entries prune deletes are
+// reclaimed by prune itself.
+func TestPruneByChainReclaimsTheEntriesItRemoves(t *testing.T) {
+	w := newWS(t)
+	requireClone(t, w)
+	seedDB(t, w, "app", 64<<10)
+	mustFork(t, w, "app", "main", "b0", "seed")
+	mustCheckout(t, w, "app", "b0")
+	entry := w.byChainPath("app", headChainID(t, w, "app", "b0"))
+	if live, _ := descriptorsAt(t, entry); !live {
+		t.Fatal("precondition: building the by-chain entry did not cache a descriptor on it")
+	}
+	w.pruneByChain("app", 0)
+	if _, err := os.Stat(entry); !os.IsNotExist(err) {
+		t.Fatalf("precondition: prune kept the entry (%v)", err)
+	}
+	if live, n := descriptorsAt(t, entry); live || n != 0 {
+		t.Fatalf("pruned by-chain entry still has descriptors: live=%v orphans=%d", live, n)
 	}
 }

@@ -68,10 +68,15 @@
 // path, because a deleted checkout is never asked for again. Until closed,
 // an orphan pins the unlinked inode's disk: a full copy of the database.
 //
-//   - EvictStranded closes every unpinned orphan. ops calls it after every
-//     materialization and every destroy, and the daemon's janitor calls it
-//     every tick, which also catches what pruning the read-only cache
-//     strands.
+//   - EvictStranded closes every unpinned orphan, re-checking every cached
+//     path first. The daemon's janitor calls it every tick, which also
+//     catches what evicting the read-only cache strands.
+//   - EvictStrandedAt re-checks only the paths its caller names, then
+//     closes every unpinned orphan the same way. ops calls it after every
+//     materialization, by-chain prune and destroy, where those strands are
+//     made, so a process with no janitor (offshoot mcp, serve -reap-every
+//     0) reclaims them too, at a cost that does not grow with the number of
+//     cached checkouts.
 //   - Evict(keep) closes unpinned cached descriptors, least recently used
 //     first, until at most keep remain (serve -fd-budget).
 //
@@ -473,8 +478,41 @@ func NoCreateDSN(path, params string) string {
 // notice it is gone.
 func EvictStranded() int { return evictStranded(nil) }
 
+// EvictStrandedAt is EvictStranded for a caller that knows which paths it
+// has just renamed over or removed: the re-check stats only the cached
+// descriptors at or under paths (each a file or a directory), so its cost
+// does not grow with every checkout this process has cached. It still closes
+// every unpinned orphan, wherever it is: closing one needs no stat, and an
+// orphan that was still pinned when its own path was reclaimed (a session
+// outliving a re-materialize) is closed by whichever pass comes next. ops
+// calls it where it makes strands; the daemon's janitor runs the full
+// EvictStranded, which also catches paths removed by anything else.
+func EvictStrandedAt(paths ...string) int {
+	var roots []string
+	for _, p := range paths {
+		if abs, err := filepath.Abs(p); err == nil {
+			roots = append(roots, abs)
+		}
+	}
+	sweep(func(p string) bool {
+		for _, r := range roots {
+			if p == r || strings.HasPrefix(p, r+string(filepath.Separator)) {
+				return true
+			}
+		}
+		return false
+	})
+	return closeOrphans(nil)
+}
+
 func evictStranded(in func(string) bool) int {
 	sweep(in)
+	return closeOrphans(in)
+}
+
+// closeOrphans closes the unpinned orphans whose path in accepts (every one
+// when in is nil) and reports how many.
+func closeOrphans(in func(string) bool) int {
 	mu.Lock()
 	defer mu.Unlock()
 	n := 0

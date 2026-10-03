@@ -101,6 +101,9 @@ func (w *Workspace) Destroy(db, branch string, force bool) error {
 				db, branch, p, err)
 		}
 	}
+	// The removed checkout's cached descriptor would otherwise keep the
+	// deleted database's disk until the process exits.
+	reclaimStranded(path)
 	return nil
 }
 

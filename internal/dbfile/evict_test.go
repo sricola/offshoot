@@ -299,3 +299,63 @@ func TestEvictUnderScopesToDir(t *testing.T) {
 	}
 	EvictUnder(theirs)
 }
+
+// TestEvictStrandedAt: the re-check stats only the cached paths at or under
+// the named files and directories, so its cost does not grow with every
+// checkout the process has cached. Every unpinned orphan is still closed,
+// wherever it is: one that was pinned when its own path was reclaimed is
+// closed by whichever pass comes next.
+func TestEvictStrandedAt(t *testing.T) {
+	dir := t.TempDir()
+	named := filepath.Join(dir, "named")
+	other := filepath.Join(dir, "other")
+	for _, d := range []string{named, other} {
+		if err := os.Mkdir(d, 0o755); err != nil {
+			t.Fatal(err)
+		}
+	}
+	file := filepath.Join(dir, "file.db")
+	inNamed := filepath.Join(named, "a.db")
+	outside := filepath.Join(other, "b.db")
+	sibling := filepath.Join(dir, "named-sibling.db") // named's prefix as a string, not as a directory
+	early := filepath.Join(other, "early.db")
+	entries := map[string]*entry{}
+	for _, p := range []string{file, inNamed, outside, sibling, early} {
+		writeFile(t, p, "x")
+		s, err := Reader(p)
+		if err != nil {
+			t.Fatal(err)
+		}
+		s.Close()
+		entries[p] = lookupLive(t, p)
+	}
+	t.Cleanup(func() { evictStranded(under(dir)) })
+
+	// early is orphaned before the pass, outside the named paths.
+	if err := os.Remove(early); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := Reader(early); !os.IsNotExist(err) {
+		t.Fatalf("Reader on a removed path = %v, want IsNotExist", err)
+	}
+	if !isOrphan(entries[early]) {
+		t.Fatal("precondition: Reader did not orphan the removed path's descriptor")
+	}
+	for _, p := range []string{file, inNamed, outside, sibling} {
+		if err := os.Remove(p); err != nil {
+			t.Fatal(err)
+		}
+	}
+
+	if n := EvictStrandedAt(named, file); n < 3 {
+		t.Fatalf("EvictStrandedAt closed %d descriptor(s), want at least 3", n)
+	}
+	for _, p := range []string{file, inNamed, early} {
+		assertClosed(t, entries[p])
+	}
+	for _, p := range []string{outside, sibling} {
+		if e := entries[p]; !isLive(e) || !isOpen(e) {
+			t.Fatalf("%s is outside the named paths, so this pass must not have re-checked it", p)
+		}
+	}
+}

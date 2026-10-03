@@ -409,8 +409,9 @@ func (w *Workspace) CheckoutProven(db, branch string) (CheckoutResult, error) {
 		// (a fenced writer's orphan vs. the live object), so lineage+txid
 		// alone would not prove identity. A clean, current checkout needs no
 		// re-materialization: return it as-is rather than paying the
-		// temp+rename cost (and, via materializeAt->dbfile, stranding
-		// another descriptor) to rebuild bytes that are already correct.
+		// temp+rename cost (and orphaning the cached descriptor on the old
+		// inode until reclaimStranded closes it) to rebuild bytes that are
+		// already correct.
 		state, postApplyChecksum := checkoutState(path, ref)
 		switch state {
 		case "clean":
