@@ -168,34 +168,104 @@ func TestCheckGrowth(t *testing.T) {
 	}
 }
 
+// v051Fixtures are the fixture sets written by github.com/superfly/ltx
+// v0.5.1 (LZ4 frame page format), one per page size, each a snapshot
+// (txid 1), a segment (txid 2) and final.sqlite, the database the two
+// reproduce. The 4 KiB set is the original; the 64 KiB set (SQLite's
+// largest page size) holds a data page LZ4 cannot shrink, so its page
+// frame carries a stored block of exactly one page — the largest frame
+// the v0.5.1 shape can hold and the edge of frameGuard's block limit. See
+// each directory's README for how it was generated.
+var v051Fixtures = []struct {
+	dir      string
+	pageSize uint32
+	// incompressible: the snapshot carries a page whose frame is at least
+	// a page long.
+	incompressible bool
+}{
+	{"ltx-v0.5.1", 4096, false},
+	{"ltx-v0.5.1-64k", 65536, true},
+}
+
+func readV051Fixture(tb testing.TB, dir, name string) []byte {
+	tb.Helper()
+	b, err := os.ReadFile(filepath.Join("testdata", dir, name))
+	if err != nil {
+		tb.Fatal(err)
+	}
+	return b
+}
+
 // TestDecodesLTXv051FrameFormat: objects written by github.com/superfly/ltx
 // v0.5.1 — LZ4 frame page format, what this repo wrote until 2026-09-26 —
-// still decode through the guard, snapshot and growing segment alike.
-// Fixtures from a one-off generator built against v0.5.1 (see
-// testdata/ltx-v0.5.1); final.sqlite is the database they reproduce.
+// still decode through the guard, snapshot and segment alike, at 4 KiB
+// pages and at 64 KiB pages whose frames hold a whole stored page.
 func TestDecodesLTXv051FrameFormat(t *testing.T) {
-	read := func(name string) []byte {
-		b, err := os.ReadFile(filepath.Join("testdata", "ltx-v0.5.1", name))
-		if err != nil {
-			t.Fatal(err)
+	for _, fx := range v051Fixtures {
+		t.Run(fx.dir, func(t *testing.T) {
+			snap := readV051Fixture(t, fx.dir, "snapshot.ltx")
+			seg := readV051Fixture(t, fx.dir, "segment.ltx")
+			final := readV051Fixture(t, fx.dir, "final.sqlite")
+			if flags := binary.BigEndian.Uint16(snap[104:106]); flags&ltx.PageHeaderFlagSize != 0 {
+				t.Fatal("fixture is not frame format")
+			}
+			if ps := binary.BigEndian.Uint32(snap[8:12]); ps != fx.pageSize {
+				t.Fatalf("fixture PageSize %d, want %d", ps, fx.pageSize)
+			}
+			dst := filepath.Join(t.TempDir(), "db.sqlite")
+			txid, sum, err := MaterializeChain(bytes.NewReader(snap), []io.Reader{bytes.NewReader(seg)}, dst)
+			if err != nil {
+				t.Fatal(err)
+			}
+			got, _ := os.ReadFile(dst)
+			if txid != 2 || !bytes.Equal(got, final) {
+				t.Fatalf("txid %d, content equal %v", txid, bytes.Equal(got, final))
+			}
+			if declared, err := TrailerPostApplyChecksum(seg); err != nil || declared != sum {
+				t.Fatalf("TrailerPostApplyChecksum = %016x, %v; want %016x", declared, err, sum)
+			}
+			if !fx.incompressible {
+				return
+			}
+			// The fixture exists to exercise the frame shape at LZ4's
+			// worst case: at least one page frame must be no shorter than
+			// the page it carries.
+			var largest int
+			for _, n := range v051FrameSizes(t, snap) {
+				largest = max(largest, n)
+			}
+			if largest < int(fx.pageSize) {
+				t.Fatalf("largest page frame is %d bytes, shorter than the %d-byte page: the fixture is not incompressible", largest, fx.pageSize)
+			}
+		})
+	}
+}
+
+// v051FrameSizes walks a frame-format object's page block the way
+// frameGuard does — 6-byte page header, 7-byte LZ4 frame descriptor,
+// 4-byte little-endian block size (high bit: stored), the block, then the
+// 8 bytes of EndMark and content checksum — and returns each page's frame
+// length in bytes.
+func v051FrameSizes(tb testing.TB, obj []byte) map[uint32]int {
+	tb.Helper()
+	out := map[uint32]int{}
+	off := ltx.HeaderSize
+	for {
+		var ph ltx.PageHeader
+		if err := ph.UnmarshalBinary(obj[off : off+ltx.PageHeaderSize]); err != nil {
+			tb.Fatal(err)
 		}
-		return b
-	}
-	snap, seg, final := read("snapshot.ltx"), read("segment.ltx"), read("final.sqlite")
-	if flags := binary.BigEndian.Uint16(snap[104:106]); flags&ltx.PageHeaderFlagSize != 0 {
-		t.Fatal("fixture is not frame format")
-	}
-	dst := filepath.Join(t.TempDir(), "db.sqlite")
-	txid, sum, err := MaterializeChain(bytes.NewReader(snap), []io.Reader{bytes.NewReader(seg)}, dst)
-	if err != nil {
-		t.Fatal(err)
-	}
-	got, _ := os.ReadFile(dst)
-	if txid != 2 || !bytes.Equal(got, final) {
-		t.Fatalf("txid %d, content equal %v", txid, bytes.Equal(got, final))
-	}
-	if declared, err := TrailerPostApplyChecksum(seg); err != nil || declared != sum {
-		t.Fatalf("TrailerPostApplyChecksum = %016x, %v; want %016x", declared, err, sum)
+		if ph.IsZero() {
+			return out
+		}
+		if ph.Flags&ltx.PageHeaderFlagSize != 0 {
+			tb.Fatalf("page %d is block format", ph.Pgno)
+		}
+		off += ltx.PageHeaderSize
+		start := off
+		block := int(binary.LittleEndian.Uint32(obj[off+7:off+11]) &^ (1 << 31))
+		off += 7 + 4 + block + 8
+		out[ph.Pgno] = off - start
 	}
 }
 
@@ -294,19 +364,17 @@ func TestFrameGuardPinsTheV051FrameShape(t *testing.T) {
 }
 
 // frameSeeds are the frame-format fuzz seeds: the real ltx v0.5.1 snapshot
-// and segment fixtures, and the review's desync PoC (an unchecksummed frame
-// followed by a fake ~4 GiB block page). The block-format encoder produces
-// none of these, so without them the fuzzer barely reaches the guard's
-// frame half.
+// and segment fixtures at both page sizes (v051Fixtures), and the review's
+// desync PoC (an unchecksummed frame followed by a fake ~4 GiB block
+// page). The block-format encoder produces none of these, so without them
+// the fuzzer barely reaches the guard's frame half.
 func frameSeeds(tb testing.TB) [][]byte {
 	tb.Helper()
 	var out [][]byte
-	for _, name := range []string{"snapshot.ltx", "segment.ltx"} {
-		b, err := os.ReadFile(filepath.Join("testdata", "ltx-v0.5.1", name))
-		if err != nil {
-			tb.Fatal(err)
+	for _, fx := range v051Fixtures {
+		for _, name := range []string{"snapshot.ltx", "segment.ltx"} {
+			out = append(out, readV051Fixture(tb, fx.dir, name))
 		}
-		out = append(out, b)
 	}
 	page := make([]byte, 4096)
 	page[100] = 1

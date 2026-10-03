@@ -355,7 +355,7 @@ open wart (its own spec said "N materialized forks cost up to N×G").
   - A third concurrent at-rest checkpoint that overwrites the object after
     the winner's check is still unnoticed; closing it needs a lease (or a
     create-only key per attempt) on the at-rest path.
-  - Normalize etags across providers before comparing them (strip quotes
+  - ✅ Normalize etags across providers before comparing them (strip quotes
     and a weak `W/` prefix), so an S3-compatible provider that reformats
     the etag between `PUT` and `HEAD` costs no needless `GET`.
   - ✅ A Local `Head` that does not re-hash the whole object: since v0.2.13
@@ -363,10 +363,11 @@ open wart (its own spec said "N materialized forks cost up to N×G").
     xattr at write time, so `Head` answers from it.
   - ✅ A Dependabot `pip` entry for `requirements/` (v0.2.14), so the
     hash-pinned CI locks get update PRs like the Go modules and Actions do.
-  - Commit a 64 KiB-page, incompressible ltx v0.5.1 fixture beside the
+  - ✅ Commit a 64 KiB-page, incompressible ltx v0.5.1 fixture beside the
     4 KiB ones, so the pinned frame shape is tested at the largest page
-    size and at the LZ4 worst-case block.
-  - Apply the 1 s racily-clean margin to the checkpoint stamp's
+    size and at the LZ4 worst-case block
+    (`internal/ltxio/testdata/ltx-v0.5.1-64k`).
+  - ✅ Apply the 1 s racily-clean margin to the checkpoint stamp's
     matching-fingerprint shortcut (`stampCheckpoint`): on a coarse-mtime
     filesystem in WAL mode a foreign same-size write inside the quiesce
     tick could otherwise be stamped trusted; fall back to
