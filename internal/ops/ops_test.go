@@ -219,12 +219,12 @@ func TestCheckpointAndRematerialize(t *testing.T) {
 	}
 }
 
-// TestCheckpointRecoversFromOrphanedSnapshot simulates a crashed prior
-// Checkpoint attempt: the snapshot object at the deterministic key
-// (lineage, epoch, HeadTXID+1) was uploaded but the ref update never landed
-// (process died, CAS lost, I/O error). A subsequent Checkpoint's create-only
-// put at that same key must not wedge forever behind the orphan; it must
-// recover and succeed with the real (non-garbage) data.
+// TestCheckpointRecoversFromOrphanedSnapshot: a crashed earlier attempt
+// left garbage at the snapshot key for the next txid under the branch's
+// current epoch (its ref write never landed). The next checkpoint takes the
+// lease, which bumps the epoch, so it writes under its own key, and the
+// garbage, a lower-epoch straggler at the same txid, never anchors the
+// head: a fresh checkout holds the real data.
 func TestCheckpointRecoversFromOrphanedSnapshot(t *testing.T) {
 	testutil.RequireSQLite3(t)
 	w := newWS(t)
@@ -244,8 +244,8 @@ func TestCheckpointRecoversFromOrphanedSnapshot(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	// Pre-seed the snapshot key Checkpoint is about to write, with garbage
-	// bytes, simulating a crashed prior attempt whose ref write never landed.
+	// Garbage where a crashed attempt under the current epoch would have put
+	// the next snapshot.
 	orphanKey := store.SnapshotKey(ref.Lineage, ref.Epoch, ref.HeadTXID+1)
 	if err := w.Store.B.Put(orphanKey, []byte("garbage-not-a-valid-ltx-snapshot")); err != nil {
 		t.Fatal(err)
@@ -1376,13 +1376,16 @@ func TestConcurrentCheckpointsOnlyOneWins(t *testing.T) {
 		}(i)
 	}
 	wg.Wait()
-	// At least one wins; losers fail loudly with the CAS-race error, and the
-	// ref must remain internally consistent (head >= every recorded checkpoint).
+	// At least one wins; the others are refused by the lease the winner
+	// holds, and the ref stays internally consistent (head >= every recorded
+	// checkpoint).
 	if okCount == 0 {
 		t.Fatal("no checkpoint succeeded")
 	}
 	for _, e := range loserErrs {
-		t.Logf("loser error: %v", e)
+		if !errors.Is(e, store.ErrLeaseHeld) {
+			t.Fatalf("a losing checkpoint failed with %v, want a lease-held refusal: the lease serializes them", e)
+		}
 	}
 	r, _, err := w.Store.GetRef("app", "main")
 	if err != nil {
@@ -1439,16 +1442,12 @@ func assertRaceWinner(t *testing.T, w *Workspace, r store.Ref, checkout string) 
 }
 
 // TestConcurrentCheckpointsOnlyOneWinsOnS3 is TestConcurrentCheckpointsOnlyOneWins
-// run against the S3 backend instead of Local. It matters specifically
-// because losing racers in Checkpoint fall through to an UNCONDITIONAL
-// Store.B.Put to overwrite an orphaned/rival snapshot object at the
-// deterministic snapshot key (see the comment in ops.go's Checkpoint) —
-// a code path RunConformance never exercised before PutOverwritesExistingKey
-// was added, and Local's Put (rename-over-existing-file) could silently
-// diverge from S3's Put (PutObject, unconditional overwrite) without any
-// test noticing. Same assertions as the Local version: at least one
-// checkpoint wins, the ref stays internally consistent, and the winning
-// checkpoint has exactly one object kind and materializes to the checkout.
+// against the S3 backend: the lease acquire, the create-only object put and
+// the head write are all conditional writes, and S3's conditional-write
+// semantics differ from Local's per-key lock, so the serialization must
+// hold on both. Same assertions: at least one checkpoint wins, the losers
+// are lease-held refusals, the ref stays internally consistent, and the
+// winner has exactly one object kind and materializes to the checkout.
 func TestConcurrentCheckpointsOnlyOneWinsOnS3(t *testing.T) {
 	testutil.RequireSQLite3(t)
 	w := newWSOnFakeS3(t)
@@ -1476,13 +1475,16 @@ func TestConcurrentCheckpointsOnlyOneWinsOnS3(t *testing.T) {
 		}(i)
 	}
 	wg.Wait()
-	// At least one wins; losers fail loudly with the CAS-race error, and the
-	// ref must remain internally consistent (head >= every recorded checkpoint).
+	// At least one wins; the others are refused by the lease the winner
+	// holds, and the ref stays internally consistent (head >= every recorded
+	// checkpoint).
 	if okCount == 0 {
 		t.Fatal("no checkpoint succeeded")
 	}
 	for _, e := range loserErrs {
-		t.Logf("loser error: %v", e)
+		if !errors.Is(e, store.ErrLeaseHeld) {
+			t.Fatalf("a losing checkpoint failed with %v, want a lease-held refusal: the lease serializes them", e)
+		}
 	}
 	r, _, err := w.Store.GetRef("app", "main")
 	if err != nil {
@@ -2168,51 +2170,72 @@ func TestForkRejectsMetaOverCap(t *testing.T) {
 // to 1 (correct — that's where the copy now lives) by constructing a brand
 // new store.Checkpoint{TXID, Epoch}, which silently dropped CreatedAt/Meta
 // on the floor. A rollback must relocate a checkpoint, not erase its
-// history.
+// history. Both paths are covered: below the floor the new lineage reads
+// through a base pointer and a kept checkpoint keeps its recorded epoch
+// (see RollbackWith); materialized, it is copied into the new lineage at
+// epoch 1. (Every at-rest checkpoint takes the branch lease and so records
+// an epoch past 1, which tells the two apart.)
 func TestRollbackPreservesCheckpointCreatedAtAndMeta(t *testing.T) {
-	testutil.RequireSQLite3(t)
-	w := newWS(t)
-	if err := w.Create("app"); err != nil {
-		t.Fatal(err)
-	}
-	if _, err := w.Checkout("app", "main"); err != nil {
-		t.Fatal(err)
-	}
-	if _, err := w.Checkpoint("app", "main", "v1", map[string]string{"agent": "claude"}); err != nil {
-		t.Fatal(err)
-	}
-	beforeRef, _, err := w.Store.GetRef("app", "main")
-	if err != nil {
-		t.Fatal(err)
-	}
-	beforeCP := beforeRef.Checkpoints["v1"]
-	if beforeCP.CreatedAt == "" || beforeCP.Meta["agent"] != "claude" {
-		t.Fatalf("test setup: v1 checkpoint missing CreatedAt/Meta before rollback: %+v", beforeCP)
-	}
+	for _, tc := range []struct {
+		name string
+		opts RollbackOptions
+	}{
+		{"shared", RollbackOptions{}},
+		{"materialized", RollbackOptions{Materialize: true}},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			testutil.RequireSQLite3(t)
+			w := newWS(t)
+			if err := w.Create("app"); err != nil {
+				t.Fatal(err)
+			}
+			if _, err := w.Checkout("app", "main"); err != nil {
+				t.Fatal(err)
+			}
+			if _, err := w.Checkpoint("app", "main", "v1", map[string]string{"agent": "claude"}); err != nil {
+				t.Fatal(err)
+			}
+			beforeRef, _, err := w.Store.GetRef("app", "main")
+			if err != nil {
+				t.Fatal(err)
+			}
+			beforeCP := beforeRef.Checkpoints["v1"]
+			if beforeCP.CreatedAt == "" || beforeCP.Meta["agent"] != "claude" {
+				t.Fatalf("test setup: v1 checkpoint missing CreatedAt/Meta before rollback: %+v", beforeCP)
+			}
 
-	if _, err := w.Checkpoint("app", "main", "v2", nil); err != nil {
-		t.Fatal(err)
-	}
-	if _, err := w.Rollback("app", "main", "v2"); err != nil {
-		t.Fatal(err)
-	}
+			if _, err := w.Checkpoint("app", "main", "v2", nil); err != nil {
+				t.Fatal(err)
+			}
+			if _, err := w.RollbackWith("app", "main", "v2", tc.opts); err != nil {
+				t.Fatal(err)
+			}
 
-	afterRef, _, err := w.Store.GetRef("app", "main")
-	if err != nil {
-		t.Fatal(err)
-	}
-	afterCP, ok := afterRef.Checkpoints["v1"]
-	if !ok {
-		t.Fatal("v1 must survive a rollback to a later checkpoint")
-	}
-	if afterCP.CreatedAt != beforeCP.CreatedAt {
-		t.Fatalf("rollback dropped v1's CreatedAt: got %q, want %q", afterCP.CreatedAt, beforeCP.CreatedAt)
-	}
-	if afterCP.Meta["agent"] != "claude" {
-		t.Fatalf("rollback dropped v1's Meta: %+v", afterCP.Meta)
-	}
-	if afterCP.Epoch != 1 {
-		t.Fatalf("rollback must still relocate the checkpoint to the new lineage's epoch 1, got %d", afterCP.Epoch)
+			afterRef, _, err := w.Store.GetRef("app", "main")
+			if err != nil {
+				t.Fatal(err)
+			}
+			if shared := afterRef.Base != nil; shared == tc.opts.Materialize {
+				t.Fatalf("test setup: rollback with %+v took the shared path = %v", tc.opts, shared)
+			}
+			afterCP, ok := afterRef.Checkpoints["v1"]
+			if !ok {
+				t.Fatal("v1 must survive a rollback to a later checkpoint")
+			}
+			if afterCP.CreatedAt != beforeCP.CreatedAt {
+				t.Fatalf("rollback dropped v1's CreatedAt: got %q, want %q", afterCP.CreatedAt, beforeCP.CreatedAt)
+			}
+			if afterCP.Meta["agent"] != "claude" {
+				t.Fatalf("rollback dropped v1's Meta: %+v", afterCP.Meta)
+			}
+			wantEpoch := beforeCP.Epoch
+			if tc.opts.Materialize {
+				wantEpoch = 1
+			}
+			if afterCP.Epoch != wantEpoch {
+				t.Fatalf("rollback left v1 at epoch %d, want %d (recorded %d)", afterCP.Epoch, wantEpoch, beforeCP.Epoch)
+			}
+		})
 	}
 }
 

@@ -2,6 +2,7 @@ package ops
 
 import (
 	"bytes"
+	"encoding/json"
 	"errors"
 	"os"
 	"strings"
@@ -13,9 +14,11 @@ import (
 	"github.com/sricola/offshoot/internal/store"
 )
 
-// casGate wraps a workspace's backend so a test can hold every PutIf of one
-// ref key (the checkpoint's ref CAS) until it releases that call: each held
-// call sends its own release channel on arrived and waits for it to close.
+// casGate wraps a workspace's backend so a test can hold the checkpoint's
+// head write: every PutIf of one ref key whose body releases the lease (see
+// releasesLease) is held until the test releases it, each held call sending
+// its own release channel on arrived and waiting for it to close; the lease
+// acquire and its renewals carry the holder and pass straight through.
 // holdObject arms a one-shot hold of the next PutIf of one object key (a
 // checkpoint's create-only upload) the same way, on objArrived. Head
 // forwards to the wrapped backend's Header, or fails with headErr, or
@@ -72,7 +75,7 @@ func (g *casGate) holdObject(key string) {
 }
 
 func (g *casGate) PutIf(key string, data []byte, ifMatch string) (string, error) {
-	if key == g.refKey && g.on.Load() {
+	if key == g.refKey && g.on.Load() && releasesLease(data) {
 		release := make(chan struct{})
 		g.arrived <- release
 		<-release
@@ -106,50 +109,55 @@ func countOverwrites(t *testing.T) *atomic.Int64 {
 	return &n
 }
 
-// raceSnapshots runs two forced-snapshot checkpoints, "a" and "b", on
-// app@main so that a uploads its object first, b overwrites it at the same
-// key, a then wins the ref CAS and b loses it. between runs after a's
-// upload and before b's encode. It returns a's result.
-func raceSnapshots(t *testing.T, w *Workspace, g *casGate, between func()) CheckpointResult {
+// releasesLease reports whether a ref body carries no lease holder: an at-rest
+// checkpoint's head write, which advances the head and releases the lease in
+// one write.
+func releasesLease(data []byte) bool {
+	var r struct {
+		LeaseHolder string `json:"lease_holder"`
+	}
+	return json.Unmarshal(data, &r) == nil && r.LeaseHolder == ""
+}
+
+// checkpointWhileHeld runs CheckpointWith(app@main, "a") with g holding its
+// head write, runs during while it is held (its object is already in the
+// store and its lease is still live), then releases it and returns its
+// result.
+func checkpointWhileHeld(t *testing.T, w *Workspace, g *casGate, opts CheckpointOptions, during func()) (CheckpointResult, error) {
 	t.Helper()
-	g.on.Store(true)
-	defer g.on.Store(false)
 	type result struct {
 		res CheckpointResult
 		err error
 	}
-	aDone, bDone := make(chan result, 1), make(chan result, 1)
+	done := make(chan result, 1)
+	g.on.Store(true)
 	go func() {
-		res, err := w.CheckpointWith("app", "main", "a", nil, CheckpointOptions{Snapshot: true})
-		aDone <- result{res, err}
+		res, err := w.CheckpointWith("app", "main", "a", nil, opts)
+		done <- result{res, err}
 	}()
-	releaseA := <-g.arrived
-	between()
-	go func() {
-		res, err := w.CheckpointWith("app", "main", "b", nil, CheckpointOptions{Snapshot: true})
-		bDone <- result{res, err}
-	}()
-	releaseB := <-g.arrived
-	close(releaseA)
-	a := <-aDone
-	if a.err != nil {
-		t.Fatalf("checkpoint a: %v", a.err)
+	var release chan struct{}
+	select {
+	case release = <-g.arrived:
+	case r := <-done:
+		g.on.Store(false)
+		t.Fatalf("the checkpoint ended before its head write: %v", r.err)
 	}
-	close(releaseB)
-	if b := <-bDone; b.err == nil || !strings.Contains(b.err.Error(), "lost a race") {
-		t.Fatalf("checkpoint b error = %v, want a lost race", b.err)
-	}
-	return a.res
+	g.on.Store(false)
+	during()
+	close(release)
+	r := <-done
+	return r.res, r.err
 }
 
-// TestOverwriteWithIdenticalBytesStaysTrusted: two snapshot checkpoints
-// race on one branch with a write to the checkout between their encodes;
-// the loser encoded the newer state, and its object replaces the winner's
-// at the shared key. The overwrite is detected and counted, but the store
-// now holds exactly what the checkout holds, so the winner stamps that
-// content's checksum as trusted (not its own encode's), keeps a shadow,
-// and reads clean; the next checkpoint can be a segment and materializes
-// to the checkout's bytes.
+// TestOverwriteWithIdenticalBytesStaysTrusted: while a snapshot checkpoint
+// is held at its head write, a write lands on the checkout and an object of
+// that newer state replaces the checkpoint's own at its private key. No
+// offshoot writer can do that any more (the key is under an epoch only this
+// checkpoint's lease minted); the replace stands for anything outside
+// offshoot that does. The overwrite is detected and counted, but the store
+// now holds exactly what the checkout holds, so the stamp is trusted, the
+// shadow kept, the checkout reads clean, and the next checkpoint can be a
+// segment that materializes to the checkout's bytes.
 func TestOverwriteWithIdenticalBytesStaysTrusted(t *testing.T) {
 	for name, newW := range map[string]func(*testing.T) *Workspace{"local": newWS, "s3": newWSOnFakeS3} {
 		t.Run(name, func(t *testing.T) {
@@ -159,22 +167,30 @@ func TestOverwriteWithIdenticalBytesStaysTrusted(t *testing.T) {
 			path := w.CheckoutPath("app", "main")
 			mustSQL(t, path, "INSERT INTO t (v) VALUES (randomblob(100));")
 			overwrites := countOverwrites(t)
+			before := refOf(t, w, "app", "main")
+			key := privateSnapshotKey(before)
 			g := gateRefCAS(w, "app", "main")
 
-			a := raceSnapshots(t, w, g, func() {
+			a, err := checkpointWhileHeld(t, w, g, CheckpointOptions{Snapshot: true}, func() {
 				mustSQL(t, path, "INSERT INTO t (v) VALUES (randomblob(300));")
+				if err := w.Store.B.Put(key, encodeCheckout(t, path, before.HeadTXID+1)); err != nil {
+					t.Fatal(err)
+				}
 			})
+			if err != nil {
+				t.Fatalf("checkpoint a: %v", err)
+			}
 			if a.Kind != "snapshot" {
-				t.Fatalf("winner kind %q, want snapshot", a.Kind)
+				t.Fatalf("kind %q, want snapshot", a.Kind)
 			}
 			ref := refOf(t, w, "app", "main")
 			if ref.HeadTXID != a.TXID {
-				t.Fatalf("head txid %d, want the winner's %d", ref.HeadTXID, a.TXID)
+				t.Fatalf("head txid %d, want %d", ref.HeadTXID, a.TXID)
 			}
 			if got := overwrites.Load(); got != 1 {
 				t.Fatalf("overwrite counter %d, want 1", got)
 			}
-			data, _, err := w.Store.B.Get(store.SnapshotKey(ref.Lineage, ref.Epoch, a.TXID))
+			data, _, err := w.Store.B.Get(key)
 			if err != nil {
 				t.Fatal(err)
 			}
@@ -187,12 +203,12 @@ func TestOverwriteWithIdenticalBytesStaysTrusted(t *testing.T) {
 				t.Fatal(err)
 			}
 			if stored != live {
-				t.Fatalf("the race did not leave the newer encode in the store: stored %016x, checkout %016x", stored, live)
+				t.Fatalf("the replace did not leave the newer encode in the store: stored %016x, checkout %016x", stored, live)
 			}
 			assertTrustedStamp(t, path)
 			rec, _ := readSidecar(path)
-			if rec.TXID != a.TXID || rec.Lineage != ref.Lineage {
-				t.Fatalf("sidecar identity %s/%d, want %s/%d", rec.Lineage, rec.TXID, ref.Lineage, a.TXID)
+			if rec.TXID != a.TXID || rec.Lineage != ref.Lineage || rec.Epoch != ref.HeadEpoch {
+				t.Fatalf("sidecar identity %s/%d/%d, want %s/%d/%d", rec.Lineage, rec.Epoch, rec.TXID, ref.Lineage, ref.HeadEpoch, a.TXID)
 			}
 			if state, sum := checkoutState(path, ref); state != "clean" || sum != stored {
 				t.Fatalf("checkoutState = %q %016x, want clean %016x", state, sum, stored)
@@ -217,13 +233,13 @@ func TestOverwriteWithIdenticalBytesStaysTrusted(t *testing.T) {
 	}
 }
 
-// TestOlderEncodeOverwriteReadsModified: the loser encodes first, then a
-// write lands, then the winner encodes the newer state and uploads it; the
-// loser's older object then replaces the winner's at the shared key before
-// the winner's CAS. The head now resolves to the older content while the
-// checkout holds the newer: the winner must stamp checksum 0 with a hash no
-// file matches, so the checkout reads "modified", a fork warns, and the
-// next checkpoint is a snapshot that materializes to the checkout's bytes.
+// TestOlderEncodeOverwriteReadsModified: an object of the checkout's OLDER
+// state replaces the checkpoint's own at its private key while the
+// checkpoint is held at its head write. The head now resolves to the older
+// content while the checkout holds the newer: the checkpoint must stamp
+// checksum 0 with a hash no file matches, so the checkout reads
+// "modified", a fork warns, and the next checkpoint is a snapshot that
+// materializes to the checkout's bytes.
 func TestOlderEncodeOverwriteReadsModified(t *testing.T) {
 	for name, newW := range map[string]func(*testing.T) *Workspace{"local": newWS, "s3": newWSOnFakeS3} {
 		t.Run(name, func(t *testing.T) {
@@ -233,46 +249,25 @@ func TestOlderEncodeOverwriteReadsModified(t *testing.T) {
 			path := w.CheckoutPath("app", "main")
 			mustSQL(t, path, "INSERT INTO t (v) VALUES (randomblob(100));")
 			overwrites := countOverwrites(t)
-			g := gateRefCAS(w, "app", "main")
 			before := refOf(t, w, "app", "main")
-			snapKey := store.SnapshotKey(before.Lineage, before.Epoch, before.HeadTXID+1)
-			g.holdObject(snapKey)
-			g.on.Store(true)
-
-			type result struct {
-				res CheckpointResult
-				err error
-			}
-			bDone, aDone := make(chan result, 1), make(chan result, 1)
-			go func() { // the older encode
-				res, err := w.CheckpointWith("app", "main", "b", nil, CheckpointOptions{Snapshot: true})
-				bDone <- result{res, err}
-			}()
-			releaseBObj := <-g.objArrived
+			key := privateSnapshotKey(before)
+			older := encodeCheckout(t, path, before.HeadTXID+1)
 			mustSQL(t, path, "INSERT INTO t (v) VALUES (randomblob(300));")
-			go func() { // the newer encode, which wins
-				res, err := w.CheckpointWith("app", "main", "a", nil, CheckpointOptions{Snapshot: true})
-				aDone <- result{res, err}
-			}()
-			releaseA := <-g.arrived
-			close(releaseBObj) // b's create-only put fails, and it overwrites a's object
-			releaseB := <-g.arrived
-			g.on.Store(false)
-			close(releaseA)
-			a := <-aDone
-			if a.err != nil {
-				t.Fatalf("checkpoint a: %v", a.err)
-			}
-			close(releaseB)
-			if b := <-bDone; b.err == nil || !strings.Contains(b.err.Error(), "lost a race") {
-				t.Fatalf("checkpoint b error = %v, want a lost race", b.err)
-			}
+			g := gateRefCAS(w, "app", "main")
 
-			ref := refOf(t, w, "app", "main")
-			if ref.HeadTXID != a.res.TXID {
-				t.Fatalf("head txid %d, want the winner's %d", ref.HeadTXID, a.res.TXID)
+			a, err := checkpointWhileHeld(t, w, g, CheckpointOptions{Snapshot: true}, func() {
+				if err := w.Store.B.Put(key, older); err != nil {
+					t.Fatal(err)
+				}
+			})
+			if err != nil {
+				t.Fatalf("checkpoint a: %v", err)
 			}
-			data, _, err := w.Store.B.Get(snapKey)
+			ref := refOf(t, w, "app", "main")
+			if ref.HeadTXID != a.TXID {
+				t.Fatalf("head txid %d, want %d", ref.HeadTXID, a.TXID)
+			}
+			data, _, err := w.Store.B.Get(key)
 			if err != nil {
 				t.Fatal(err)
 			}
@@ -285,7 +280,7 @@ func TestOlderEncodeOverwriteReadsModified(t *testing.T) {
 				t.Fatal(err)
 			}
 			if stored == live {
-				t.Fatal("the race did not leave the older encode in the store")
+				t.Fatal("the replace did not leave the older encode in the store")
 			}
 			if got := overwrites.Load(); got != 1 {
 				t.Fatalf("overwrite counter %d, want 1", got)
@@ -303,7 +298,7 @@ func TestOlderEncodeOverwriteReadsModified(t *testing.T) {
 
 // TestWriteBetweenEncodeAndStampDistrusts: with no racer at all, a write
 // that lands in the checkout after the encode and before the stamp (here,
-// while the ref CAS is held) must not get the encode's checksum stamped
+// while the head write is held) must not get the encode's checksum stamped
 // against the new bytes: the store holds the pre-write content, so the
 // checkout reads "modified" and the next checkpoint is a snapshot.
 func TestWriteBetweenEncodeAndStampDistrusts(t *testing.T) {
@@ -314,20 +309,10 @@ func TestWriteBetweenEncodeAndStampDistrusts(t *testing.T) {
 	mustSQL(t, path, "INSERT INTO t (v) VALUES (randomblob(100));")
 	overwrites := countOverwrites(t)
 	g := gateRefCAS(w, "app", "main")
-	g.on.Store(true)
-
-	done := make(chan error, 1)
-	var res CheckpointResult
-	go func() {
-		var err error
-		res, err = w.CheckpointWith("app", "main", "a", nil, CheckpointOptions{})
-		done <- err
-	}()
-	release := <-g.arrived
-	g.on.Store(false)
-	mustSQL(t, path, "INSERT INTO t (v) VALUES (randomblob(300));")
-	close(release)
-	if err := <-done; err != nil {
+	res, err := checkpointWhileHeld(t, w, g, CheckpointOptions{}, func() {
+		mustSQL(t, path, "INSERT INTO t (v) VALUES (randomblob(300));")
+	})
+	if err != nil {
 		t.Fatalf("checkpoint: %v", err)
 	}
 	if res.Kind != "segment" {
@@ -346,96 +331,6 @@ func TestWriteBetweenEncodeAndStampDistrusts(t *testing.T) {
 	}
 	assertDistrustedStamp(t, w, path, ref)
 	assertRecoveringSnapshot(t, w, path, "next")
-}
-
-// TestMixedKindRaceDistrustsTheSegmentWinner: a snapshot checkpoint encodes
-// first and is held before its upload; a write lands; a segment checkpoint
-// plans (no snapshot at txid yet), uploads and reaches its CAS; then the
-// snapshot is uploaded and its writer is held before its CAS, so it never
-// reaches its loser-side cleanup while the segment wins. The head now
-// resolves to the snapshot's older content (the resolver anchors on the
-// newest snapshot at or below it), so the winner must not trust its own
-// segment's checksum: checksum 0, no shadow, "modified", one overwrite
-// counted; the next checkpoint is a snapshot whose materialization equals
-// the checkout. Released afterwards, the live loser still deletes its
-// snapshot.
-func TestMixedKindRaceDistrustsTheSegmentWinner(t *testing.T) {
-	for name, newW := range map[string]func(*testing.T) *Workspace{"local": newWS, "s3": newWSOnFakeS3} {
-		t.Run(name, func(t *testing.T) {
-			w := newW(t)
-			requireClone(t, w)
-			seedDB(t, w, "app", 1<<20)
-			path := w.CheckoutPath("app", "main")
-			mustSQL(t, path, "INSERT INTO t (v) VALUES (randomblob(100));")
-			overwrites := countOverwrites(t)
-			g := gateRefCAS(w, "app", "main")
-			before := refOf(t, w, "app", "main")
-			txid := before.HeadTXID + 1
-			snapKey := store.SnapshotKey(before.Lineage, before.Epoch, txid)
-			g.holdObject(snapKey)
-			g.on.Store(true)
-
-			type result struct {
-				res CheckpointResult
-				err error
-			}
-			snapDone, segDone := make(chan result, 1), make(chan result, 1)
-			go func() {
-				res, err := w.CheckpointWith("app", "main", "snap", nil, CheckpointOptions{Snapshot: true})
-				snapDone <- result{res, err}
-			}()
-			releaseSnapObj := <-g.objArrived
-			mustSQL(t, path, "INSERT INTO t (v) VALUES (randomblob(300));")
-			go func() {
-				res, err := w.CheckpointWith("app", "main", "seg", nil, CheckpointOptions{})
-				segDone <- result{res, err}
-			}()
-			releaseSeg := <-g.arrived
-			close(releaseSnapObj)
-			releaseSnap := <-g.arrived // the snapshot is up; its writer is held before its CAS
-			g.on.Store(false)
-			close(releaseSeg)
-			seg := <-segDone
-			if seg.err != nil {
-				t.Fatalf("segment checkpoint: %v", seg.err)
-			}
-			if seg.res.Kind != "segment" || seg.res.TXID != txid {
-				t.Fatalf("winner %s at %d, want a segment at %d", seg.res.Kind, seg.res.TXID, txid)
-			}
-			if !storeHas(w, snapKey) {
-				t.Fatal("the loser's snapshot is not beside the winning segment")
-			}
-			ref := refOf(t, w, "app", "main")
-			at, err := w.CheckoutAt("app", "main", "seg", false)
-			if err != nil {
-				t.Fatal(err)
-			}
-			if bytes.Equal(readFile(t, at), readFile(t, path)) {
-				t.Fatal("the head resolves to the checkout's bytes; the snapshot did not anchor it")
-			}
-			if got := overwrites.Load(); got != 1 {
-				t.Fatalf("overwrite counter %d, want 1", got)
-			}
-			assertDistrustedStamp(t, w, path, ref)
-
-			assertRecoveringSnapshot(t, w, path, "next")
-
-			close(releaseSnap)
-			if r := <-snapDone; r.err == nil || !strings.Contains(r.err.Error(), "lost a race") {
-				t.Fatalf("snapshot checkpoint error = %v, want a lost race", r.err)
-			}
-			if storeHas(w, snapKey) {
-				t.Fatal("the live loser did not delete its snapshot beside the winning segment")
-			}
-			at, err = w.CheckoutAt("app", "main", "next", true)
-			if err != nil {
-				t.Fatal(err)
-			}
-			if !bytes.Equal(readFile(t, at), readFile(t, path)) {
-				t.Fatal("the head no longer equals the checkout after the loser's cleanup")
-			}
-		})
-	}
 }
 
 // assertDistrustedStamp checks a checkout's sidecar after a checkpoint that
@@ -483,10 +378,10 @@ func assertRecoveringSnapshot(t *testing.T, w *Workspace, path, name string) {
 	assertTrustedStamp(t, path)
 }
 
-// TestIdenticalOverwriteIsNotFlagged: the same race with nothing written
-// between the encodes. The two objects can differ in bytes (an LTX header
-// carries an encode timestamp) but not in content, so nothing is flagged:
-// the checksum and shadow stay.
+// TestIdenticalOverwriteIsNotFlagged: an object of the same checkout state
+// replaces the checkpoint's own at its private key: byte-different (an LTX
+// header carries an encode timestamp), content-equal, so nothing is
+// flagged: the checksum and shadow stay.
 func TestIdenticalOverwriteIsNotFlagged(t *testing.T) {
 	w := newWS(t)
 	requireClone(t, w)
@@ -494,9 +389,16 @@ func TestIdenticalOverwriteIsNotFlagged(t *testing.T) {
 	path := w.CheckoutPath("app", "main")
 	mustSQL(t, path, "INSERT INTO t (v) VALUES (randomblob(100));")
 	overwrites := countOverwrites(t)
+	before := refOf(t, w, "app", "main")
 	g := gateRefCAS(w, "app", "main")
 
-	raceSnapshots(t, w, g, func() {})
+	if _, err := checkpointWhileHeld(t, w, g, CheckpointOptions{Snapshot: true}, func() {
+		if err := w.Store.B.Put(privateSnapshotKey(before), encodeCheckout(t, path, before.HeadTXID+1)); err != nil {
+			t.Fatal(err)
+		}
+	}); err != nil {
+		t.Fatal(err)
+	}
 	if got := overwrites.Load(); got != 0 {
 		t.Fatalf("overwrite counter %d, want 0", got)
 	}
@@ -560,7 +462,7 @@ func TestReformattedEtagSkipsTheGet(t *testing.T) {
 				path := w.CheckoutPath("app", "main")
 				mustSQL(t, path, "INSERT INTO t (v) VALUES (randomblob(100));")
 				before := refOf(t, w, "app", "main")
-				key := store.SnapshotKey(before.Lineage, before.Epoch, before.HeadTXID+1)
+				key := privateSnapshotKey(before)
 				overwrites := countOverwrites(t)
 				g := gateRefCAS(w, "app", "main")
 				g.headEtag = tc.rewrite
@@ -580,57 +482,29 @@ func TestReformattedEtagSkipsTheGet(t *testing.T) {
 	}
 }
 
-// TestOrphanOverwriteIsNotFlagged: a checkpoint that overwrites an orphan a
-// crashed attempt left at its key (the unconditional-Put path, which returns
-// no etag) and wins the CAS holds its own content, so nothing is flagged.
-func TestOrphanOverwriteIsNotFlagged(t *testing.T) {
-	w := newWS(t)
-	requireClone(t, w)
-	seedDB(t, w, "app", 1<<20)
-	path := w.CheckoutPath("app", "main")
-	mustSQL(t, path, "INSERT INTO t (v) VALUES (randomblob(100));")
-	ref := refOf(t, w, "app", "main")
-	var orphan bytes.Buffer
-	if _, err := ltxio.EncodeSnapshot(path, ref.HeadTXID+1, &orphan); err != nil {
-		t.Fatal(err)
-	}
-	if _, err := w.Store.B.PutIf(store.SnapshotKey(ref.Lineage, ref.Epoch, ref.HeadTXID+1), orphan.Bytes(), ""); err != nil {
-		t.Fatal(err)
-	}
-	mustSQL(t, path, "INSERT INTO t (v) VALUES (randomblob(200));")
-	overwrites := countOverwrites(t)
-
-	if res := mustCheckpointWith(t, w, "app", "main", "a", CheckpointOptions{}); res.Kind != "snapshot" {
-		t.Fatalf("kind %q, want snapshot over the orphan", res.Kind)
-	}
-	if got := overwrites.Load(); got != 0 {
-		t.Fatalf("overwrite counter %d, want 0", got)
-	}
-	assertTrustedStamp(t, path)
-}
-
-// TestUnverifiableOverwriteIsLoggedAndDistrusted: when the object cannot
-// be fetched after an etag mismatch (here, our own unconditional overwrite
-// of an orphan, which returns no etag), the checkpoint still succeeds, the
-// failure is logged, it counts as an overwrite, and the stamp is distrusted.
+// TestUnverifiableOverwriteIsLoggedAndDistrusted: when the object at the
+// private key no longer carries the checkpoint's etag and cannot be
+// fetched, the checkpoint still succeeds, the failure is logged, it counts
+// as an overwrite, and the stamp is distrusted.
 func TestUnverifiableOverwriteIsLoggedAndDistrusted(t *testing.T) {
 	w := newWS(t)
 	requireClone(t, w)
 	seedDB(t, w, "app", 1<<20)
 	path := w.CheckoutPath("app", "main")
 	mustSQL(t, path, "INSERT INTO t (v) VALUES (randomblob(100));")
-	ref := refOf(t, w, "app", "main")
-	key := store.SnapshotKey(ref.Lineage, ref.Epoch, ref.HeadTXID+1)
-	if _, err := w.Store.B.PutIf(key, []byte("orphan from a crashed attempt"), ""); err != nil {
-		t.Fatal(err)
-	}
+	before := refOf(t, w, "app", "main")
+	key := privateSnapshotKey(before)
 	overwrites := countOverwrites(t)
 	g := gateRefCAS(w, "app", "main")
 	g.getErrKey = key
 
 	var err error
 	stderr := captureStderr(t, func() {
-		_, err = w.CheckpointWith("app", "main", "a", nil, CheckpointOptions{})
+		_, err = checkpointWhileHeld(t, w, g, CheckpointOptions{Snapshot: true}, func() {
+			if perr := w.Store.B.Put(key, []byte("not an LTX object")); perr != nil {
+				t.Fatal(perr)
+			}
+		})
 	})
 	if err != nil {
 		t.Fatalf("checkpoint: %v", err)
