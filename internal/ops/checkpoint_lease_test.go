@@ -1066,17 +1066,23 @@ func TestRenewLeaseLostAbortsBeforeRefWrite(t *testing.T) {
 	}
 }
 
-// TestRepointVerbsDuringCheckpoint: while a checkpoint holds the branch,
-// unforced rollback, promote onto, compact and destroy are refused naming
-// it. A forced rollback clears its lease; the checkpoint then fails
-// without committing, leaves the rolled-back ref alone, and deletes its
-// own object.
-func TestRepointVerbsDuringCheckpoint(t *testing.T) {
+// repointSetup returns a workspace whose app@work is a fork of main with an
+// edit in its checkout for a checkpoint to commit.
+func repointSetup(t *testing.T) *Workspace {
+	t.Helper()
 	w := newWS(t)
 	seedDB(t, w, "app", 1<<16)
 	mustFork(t, w, "app", "main", "work", "seed")
-	path := mustCheckout(t, w, "app", "work")
-	mustSQL(t, path, "INSERT INTO t (v) VALUES (randomblob(100));")
+	mustSQL(t, mustCheckout(t, w, "app", "work"), "INSERT INTO t (v) VALUES (randomblob(100));")
+	return w
+}
+
+// pausedCheckpoint starts a checkpoint "a" of app@work that pauses after its
+// quiesce, holding the branch lease and renewing it every 100ms, and returns
+// the ref while it is paused, the channel its result arrives on, and a func
+// that lets it go on (harmless to call twice; it also runs at cleanup).
+func pausedCheckpoint(t *testing.T, w *Workspace) (store.Ref, <-chan error, func()) {
+	t.Helper()
 	paused, resume := make(chan struct{}), make(chan struct{})
 	var pauseOnce, resumeOnce sync.Once
 	release := func() { resumeOnce.Do(func() { close(resume) }) }
@@ -1085,50 +1091,97 @@ func TestRepointVerbsDuringCheckpoint(t *testing.T) {
 	t.Cleanup(func() { checkpointAfterQuiesceForTest = nil })
 	done := make(chan error, 1)
 	go func() {
-		// Renewals every 100ms, not faster: the forced rollback below reads
-		// the ref, resolves a chain and writes a base pointer before its
-		// compare-and-swap, and a renewal landing in that window makes it
-		// lose and retry, so a short interval could starve it.
+		// Renewals every 100ms, not faster: a forced repoint reads the ref,
+		// resolves a chain and writes objects before its compare-and-swap,
+		// and a renewal landing in that window makes it lose and retry, so a
+		// short interval could starve it.
 		_, err := w.CheckpointWith("app", "work", "a", nil, CheckpointOptions{LeaseTTL: time.Second, RenewEvery: 100 * time.Millisecond})
 		done <- err
 	}()
-	<-paused
-	held := refOf(t, w, "app", "work")
+	select {
+	case <-paused:
+	case err := <-done:
+		t.Fatalf("the checkpoint ended before it paused: %v", err)
+	}
+	return refOf(t, w, "app", "work"), done, release
+}
 
-	_, rbErr := w.RollbackWith("app", "work", "fork", RollbackOptions{NoBackup: true})
-	_, prErr := w.PromoteWith("app", "main", "work", PromoteOptions{NoBackup: true})
-	_, cmErr := w.CompactWith("app", "work", CompactOptions{})
-	dsErr := w.Destroy("app", "work", false)
-	for what, err := range map[string]error{"rollback": rbErr, "promote onto": prErr, "compact": cmErr, "destroy": dsErr} {
-		if !errors.Is(err, store.ErrLeaseHeld) || !strings.Contains(err.Error(), held.LeaseHolder) {
-			t.Fatalf("unforced %s during a checkpoint: %v, want a lease-held refusal naming %s", what, err, held.LeaseHolder)
+// TestRepointVerbsDuringCheckpoint: while a checkpoint holds the branch,
+// unforced rollback, promote onto, compact and destroy are refused naming
+// it, and the checkpoint then commits. Forced, each repoint clears the
+// checkpoint's lease; the checkpoint then fails without committing, leaves
+// the repointed ref alone, and deletes its own object. (destroy --force has
+// its own test, TestDestroyForceDuringCheckpointAbortsIt.)
+func TestRepointVerbsDuringCheckpoint(t *testing.T) {
+	t.Run("unforced verbs are refused", func(t *testing.T) {
+		w := repointSetup(t)
+		held, done, release := pausedCheckpoint(t, w)
+		_, rbErr := w.RollbackWith("app", "work", "fork", RollbackOptions{NoBackup: true})
+		_, prErr := w.PromoteWith("app", "main", "work", PromoteOptions{NoBackup: true})
+		_, cmErr := w.CompactWith("app", "work", CompactOptions{})
+		dsErr := w.Destroy("app", "work", false)
+		for what, err := range map[string]error{"rollback": rbErr, "promote onto": prErr, "compact": cmErr, "destroy": dsErr} {
+			if !errors.Is(err, store.ErrLeaseHeld) || !strings.Contains(err.Error(), held.LeaseHolder) {
+				t.Fatalf("unforced %s during a checkpoint: %v, want a lease-held refusal naming %s", what, err, held.LeaseHolder)
+			}
 		}
-	}
-
-	// The checkpoint's renewals write the ref every 100ms, so the forced
-	// rollback's compare-and-swap can lose to one; retry it like a user would.
-	for i := 0; ; i++ {
-		_, err := w.RollbackWith("app", "work", "fork", RollbackOptions{Force: true, NoBackup: true})
-		if err == nil {
-			break
+		release()
+		if err := <-done; err != nil {
+			t.Fatalf("the checkpoint after the refused repoints: %v", err)
 		}
-		if !errors.Is(err, store.ErrCAS) || i == 20 {
-			t.Fatal(err)
-		}
-	}
-	rolled := refOf(t, w, "app", "work")
-	release()
-	if err := <-done; !errors.Is(err, store.ErrLeaseLost) {
-		t.Fatalf("checkpoint after a forced rollback: %v, want ErrLeaseLost", err)
-	}
-	if after := refOf(t, w, "app", "work"); !reflect.DeepEqual(after, rolled) {
-		t.Fatalf("the failed checkpoint changed the ref:\n got %+v\nwant %+v", after, rolled)
-	}
-	txid := held.HeadTXID + 1
-	for _, k := range []string{store.SnapshotKey(held.Lineage, held.Epoch, txid), store.SegmentKey(held.Lineage, held.Epoch, txid, txid)} {
-		if storeHas(w, k) {
-			t.Fatalf("the failed checkpoint left its object %s", k)
-		}
+	})
+	for _, tc := range []struct {
+		name    string
+		repoint func(w *Workspace) error
+	}{
+		{"rollback --force", func(w *Workspace) error {
+			_, err := w.RollbackWith("app", "work", "fork", RollbackOptions{Force: true, NoBackup: true})
+			return err
+		}},
+		{"promote --onto --force", func(w *Workspace) error {
+			_, err := w.PromoteWith("app", "main", "work", PromoteOptions{Force: true, NoBackup: true})
+			return err
+		}},
+		// compact repoints the branch at a fresh lineage under epoch 1, so
+		// the checkpoint's epoch no longer matches either.
+		{"compact --force", func(w *Workspace) error {
+			_, err := w.CompactWith("app", "work", CompactOptions{Force: true})
+			return err
+		}},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			w := repointSetup(t)
+			held, done, release := pausedCheckpoint(t, w)
+			// The checkpoint's renewals write the ref every 100ms, so the
+			// forced repoint's compare-and-swap can lose to one; retry it
+			// like a user would.
+			for i := 0; ; i++ {
+				err := tc.repoint(w)
+				if err == nil {
+					break
+				}
+				if !errors.Is(err, store.ErrCAS) || i == 20 {
+					t.Fatal(err)
+				}
+			}
+			repointed := refOf(t, w, "app", "work")
+			if repointed.LeaseHolder != "" || repointed.Lineage == held.Lineage {
+				t.Fatalf("setup: after %s the ref has lineage %s (was %s) and holder %q", tc.name, repointed.Lineage, held.Lineage, repointed.LeaseHolder)
+			}
+			release()
+			if err := <-done; !errors.Is(err, store.ErrLeaseLost) {
+				t.Fatalf("checkpoint after %s: %v, want ErrLeaseLost", tc.name, err)
+			}
+			if after := refOf(t, w, "app", "work"); !reflect.DeepEqual(after, repointed) {
+				t.Fatalf("the failed checkpoint changed the ref:\n got %+v\nwant %+v", after, repointed)
+			}
+			txid := held.HeadTXID + 1
+			for _, k := range []string{store.SnapshotKey(held.Lineage, held.Epoch, txid), store.SegmentKey(held.Lineage, held.Epoch, txid, txid)} {
+				if storeHas(w, k) {
+					t.Fatalf("the failed checkpoint left its object %s", k)
+				}
+			}
+		})
 	}
 }
 
@@ -1633,6 +1686,101 @@ func TestHeadWriteThatLandedThenMovedKeepsItsObject(t *testing.T) {
 			t.Fatal("the committed head does not hold the checkpoint's content")
 		}
 	})
+}
+
+// TestCheckpointRechecksDetachedAfterItsAcquire: a `promote --onto --force`
+// lands between the checkpoint's first read and its acquire, and the
+// checkout it could not refresh (a busy one, modelled by putting the old
+// identity back on its sidecar) is now detached. The acquire succeeds on
+// the repointed ref, so only the re-check on the ref it returns keeps the
+// checkpoint from putting the old content on the new lineage and silently
+// undoing the promote: it is refused as detached, the promoted ref keeps
+// its head, the lease is released, and nothing is uploaded.
+func TestCheckpointRechecksDetachedAfterItsAcquire(t *testing.T) {
+	w := newWS(t)
+	seedDB(t, w, "app", 1<<16)
+	if _, err := w.Fork("app", "main", "f", "", 0, nil); err != nil {
+		t.Fatal(err)
+	}
+	mustSQL(t, mustCheckout(t, w, "app", "f"), "INSERT INTO t (v) VALUES (randomblob(10));")
+	if _, err := w.Checkpoint("app", "f", "work", nil); err != nil {
+		t.Fatal(err)
+	}
+	mainPath := mustCheckout(t, w, "app", "main")
+	old, ok := readSidecar(mainPath)
+	if !ok {
+		t.Fatal("setup: main's checkout has no sidecar")
+	}
+	var promoted store.Ref
+	fired := false
+	checkpointBeforeAcquireForTest = func() {
+		if fired {
+			return
+		}
+		fired = true
+		if _, err := w.PromoteWith("app", "f", "main", PromoteOptions{Force: true, NoBackup: true}); err != nil {
+			t.Fatal(err)
+		}
+		if err := StampSumHashOnly(mainPath, old.Hash, old.Lineage, old.Epoch, old.TXID, old.PostApplyChecksum, old.ChainID); err != nil {
+			t.Fatal(err)
+		}
+		promoted = refOf(t, w, "app", "main")
+	}
+	t.Cleanup(func() { checkpointBeforeAcquireForTest = nil })
+	_, err := w.CheckpointWith("app", "main", "after", nil, CheckpointOptions{})
+	if promoted.Lineage == "" || promoted.Lineage == old.Lineage {
+		t.Fatalf("setup: the promote did not repoint main (lineage %q, was %q)", promoted.Lineage, old.Lineage)
+	}
+	if err == nil || !strings.Contains(err.Error(), "detached") {
+		t.Fatalf("checkpoint of a checkout detached between its first read and its acquire: %v, want a detached refusal", err)
+	}
+	ref := refOf(t, w, "app", "main")
+	if ref.LeaseHolder != "" || ref.Lineage != promoted.Lineage || ref.HeadTXID != promoted.HeadTXID || ref.HeadEpoch != promoted.HeadEpoch || ref.Epoch != promoted.Epoch+1 {
+		t.Fatalf("after the refused checkpoint: holder %q lineage %s head %d@%d epoch %d; want no lease on the promoted lineage %s, head %d@%d, epoch %d",
+			ref.LeaseHolder, ref.Lineage, ref.HeadTXID, ref.HeadEpoch, ref.Epoch, promoted.Lineage, promoted.HeadTXID, promoted.HeadEpoch, promoted.Epoch+1)
+	}
+	if _, ok := ref.Checkpoints["after"]; ok {
+		t.Fatal("the refused checkpoint was recorded")
+	}
+	txid := promoted.HeadTXID + 1
+	for _, k := range []string{store.SnapshotKey(promoted.Lineage, promoted.Epoch+1, txid), store.SegmentKey(promoted.Lineage, promoted.Epoch+1, txid, txid)} {
+		if storeHas(w, k) {
+			t.Fatalf("the refused checkpoint uploaded %s", k)
+		}
+	}
+}
+
+// TestLeaseLostBeforeUploadSkipsTheUpload: a lease the renewer finds gone
+// before the upload starts ends the checkpoint there, with no upload: a
+// key under an epoch the checkpoint no longer holds is garbage the moment
+// it lands, and the delete that would follow can fail and leave it for GC.
+func TestLeaseLostBeforeUploadSkipsTheUpload(t *testing.T) {
+	w := newWS(t)
+	seedDB(t, w, "app", 1<<16)
+	mustSQL(t, w.CheckoutPath("app", "main"), "INSERT INTO t (v) VALUES (randomblob(100));")
+	before := refOf(t, w, "app", "main")
+	key := privateSnapshotKey(before)
+	terminal := renewTerminal(t)
+	rec := newRPCCountBackend(w.Store.B)
+	w.Store.B = rec
+	checkpointAfterQuiesceForTest = func() {
+		stealLease(t, w, "app", "main", "thief")
+		if err := awaitRenewTerminal(t, terminal, "the stolen lease"); !errors.Is(err, store.ErrLeaseLost) {
+			t.Fatalf("the renewer's terminal error: %v, want ErrLeaseLost", err)
+		}
+	}
+	t.Cleanup(func() { checkpointAfterQuiesceForTest = nil })
+	_, err := w.CheckpointWith("app", "main", "a", nil, CheckpointOptions{Snapshot: true, LeaseTTL: time.Second, RenewEvery: 10 * time.Millisecond})
+	w.Store.B = rec.Backend
+	if !errors.Is(err, store.ErrLeaseLost) || !strings.Contains(err.Error(), "its lease ended while it ran") {
+		t.Fatalf("checkpoint whose lease was stolen before its upload: %v, want the renewer's ErrLeaseLost", err)
+	}
+	if n := rec.putIfCount(key); n != 0 {
+		t.Fatalf("the checkpoint uploaded its object %d time(s) after its renewer found the lease gone", n)
+	}
+	if ref := refOf(t, w, "app", "main"); ref.HeadTXID != before.HeadTXID || ref.LeaseHolder != "thief" {
+		t.Fatalf("after the lost checkpoint: head %d holder %q, want head %d, the thief's lease", ref.HeadTXID, ref.LeaseHolder, before.HeadTXID)
+	}
 }
 
 // TestDestroyClaimBeforeHeadWriteFailsTheCheckpoint: `destroy --force`

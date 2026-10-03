@@ -193,12 +193,15 @@ type checkpointRenewer struct {
 }
 
 // checkpointRenewTerminalForTest, when non-nil, runs in a checkpoint's
-// renewer with the terminal renewal error it is about to cancel the
-// checkpoint with. A test that holds the checkpoint's upload waits on it:
-// the held checkpoint reads nothing, so only the renewer can see a lost
-// lease or a destroyed branch, and the test must know it has before it
-// releases the upload. Test-only; process-global, restore via t.Cleanup
-// (as checkpointAfterQuiesceForTest).
+// renewer with the terminal renewal error it has just cancelled the
+// checkpoint with. A test that holds the checkpoint (its upload, or the
+// after-quiesce hook) waits on it: the held checkpoint reads nothing, so
+// only the renewer can see a lost lease or a destroyed branch, and the test
+// must know the checkpoint's next lease check will see it before it lets
+// the checkpoint go on. It runs after the cancel for that reason: run
+// before it, a checkpoint released at once could stop the renewals first
+// and never hear of the loss. Test-only; process-global, restore via
+// t.Cleanup (as checkpointAfterQuiesceForTest).
 var checkpointRenewTerminalForTest func(error)
 
 // startCheckpointRenewer renews l every every, each renewal extending it
@@ -221,10 +224,10 @@ func (w *Workspace) startCheckpointRenewer(l store.Lease, ttl, every time.Durati
 			case err == nil:
 				l = next
 			case renewErrTerminal(err):
+				cancel(err)
 				if checkpointRenewTerminalForTest != nil {
 					checkpointRenewTerminalForTest(err)
 				}
-				cancel(err)
 				return
 			}
 		}
