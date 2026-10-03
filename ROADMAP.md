@@ -168,16 +168,15 @@ PyPI/npm/registry button-presses — see their own ⏸ bullets below.
   shipped for plain-file egress (backups, handoff) without
   fork-checkout-copy-destroy, daemon op and SDK parity included — this
   half of "Import/export everywhere" is fully shipped.
-- ⏸ **`create --from` reach (daemon protocol, SDKs, MCP) — deferred, not
-  shipped.** The other half of "Import/export everywhere" did not land
-  this milestone. This is a **pre-written deferral, not a gap found
-  late**: importing an existing file through the daemon needs either an
-  upload channel (stream bytes over the unix socket — a new wire
-  primitive) or a same-host path-trust story like `export`'s own (the
-  daemon reads/writes a path the caller names, trusted under the existing
-  same-host/same-user socket trust model) — that design deserves its own
-  pass. CLI `offshoot create --from` remains the only import path; see
-  [docs/status.md](docs/status.md)'s `create --from` reach row.
+- ✅ **`create --from` reach (daemon protocol, SDKs) — shipped in
+  v0.2.11.** The daemon's `create` op takes an optional absolute `path`
+  (refused over HTTP, same-host path trust like `export`'s), both SDKs
+  expose it (`from_path=` / `{ fromPath }`) and both test fixtures seed
+  from a `.db` file through it. MCP deliberately does not get it: an
+  agent must never import an arbitrary host file, so no MCP tool takes a
+  path. The upload-channel alternative was not needed. See
+  [docs/status.md](docs/status.md)'s `create --from` reach row. (This
+  entry said "deferred" until 2026-10-03; it was stale.)
 - ✅ **Read-only and historical checkouts.** Materialize a checkpoint for
   inspection without forking; sanctioned read-only sessions alongside a
   live writer. Shipped as `ops.Workspace.CheckoutAt` / `offshoot checkout
@@ -323,7 +322,19 @@ open wart (its own spec said "N materialized forks cost up to N×G").
   whole objects between a fork and its ancestors only; deduping unrelated
   databases (or sub-object pages) remains the standing non-goal below,
   to be revisited only on evidence that per-object fork sharing isn't
-  enough.
+  enough. **Measured 2026-10-03** (a throwaway tool that decodes every
+  LTX object in a local store and hashes its pages; BranchBench at default
+  scale, v0.2.16): in `software_dev` 55% and in `data_cleaning` 67% of
+  stored page data duplicates a page stored under another lineage, almost
+  none within a lineage (under 1%). The duplicates are in segments, not
+  snapshots (2 snapshots per store): sibling forks applying the same
+  mutation to the same parent state write identical changed pages. But
+  the object data those segments make up is 44 MiB and 76 MiB of stores
+  that end at 3.8 GiB and 8.3 GiB; checkouts and the by-chain cache are
+  the footprint, and reflink already shares those. Page-level dedupe
+  would save tens of MiB per store at the cost of a storage-format
+  change. Not worth it on this evidence; revisit if S3-billed object
+  bytes, not local disk, become the complaint.
 - ✅ **Promote/rollback on sharing — shipped (v0.2.12).**
   Rollback to a kept checkpoint and promote now write a base pointer
   instead of copying (`--materialize` keeps the copy; the fork-time depth
