@@ -7,6 +7,7 @@ import (
 	"os/exec"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"testing"
 	"time"
 
@@ -62,7 +63,7 @@ func TestForceCannotTakeOverLiveLease(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	want := fmt.Sprintf("ops: app@main has a live lease held by %q until %s (an open daemon session, or 'offshoot lease acquire'); --force cannot take over a live lease; close the session and retry, or, if its holder is gone, free it with 'offshoot lease release app@main'",
+	want := fmt.Sprintf("ops: app@main has a live lease held by %q until %s (an open daemon session, or 'offshoot lease acquire'); --force cannot take over a live lease; close the session and retry, or, if the process that holds it has exited, free it with 'offshoot lease release app@main' (never while that daemon still runs: a session it reopened may hold the lease)",
 		held.LeaseHolder, held.LeaseExpiry)
 	_, err = w.CheckpointWith("app", "main", "forced", nil, ops.CheckpointOptions{Force: true})
 	if !errors.Is(err, store.ErrLeaseHeld) || err.Error() != want {
@@ -226,6 +227,11 @@ func TestAtRestCheckpointIsRefusedWhileASessionCloses(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
+	// The hook runs right after a checkpoint's quiesce: a refused checkpoint
+	// must never get that far on the checkout the closing engine owns.
+	var quiesced atomic.Int32
+	ops.SetCheckpointAfterQuiesceForTest(func() { quiesced.Add(1) })
+	t.Cleanup(func() { ops.SetCheckpointAfterQuiesceForTest(nil) })
 	attempts := 0
 	for force := false; attempts == 0 || time.Now().Before(exp.Add(200*time.Millisecond)); force = !force {
 		attempts++
@@ -249,6 +255,12 @@ func TestAtRestCheckpointIsRefusedWhileASessionCloses(t *testing.T) {
 		<-closeErr
 		t.Fatal("precondition: no renewal landed while the close was held")
 	}
+	if n := quiesced.Load(); n != 0 {
+		release()
+		<-closeErr
+		t.Fatalf("%d refused checkpoints quiesced the checkout the closing session still owns", n)
+	}
+	ops.SetCheckpointAfterQuiesceForTest(nil)
 	if ref.LeaseHolder != held.LeaseHolder || ref.Epoch != held.Epoch || ref.HeadTXID != held.HeadTXID || ref.Checkpoints["during-close"].TXID != 0 {
 		release()
 		<-closeErr

@@ -1017,7 +1017,12 @@ func refuseIfHeld(db, branch string, ref store.Ref, verb string, force bool) err
 		// --force used to be the way past a holder that would not let go (a
 		// killed daemon, a forgotten `lease acquire`); name the one that is
 		// left, so the refusal is not a dead end for a whole TTL.
-		return &leaseHeldError{msg: fmt.Sprintf("%s; --force cannot take over a live lease; close the session and retry, or, if its holder is gone, free it with 'offshoot lease release %s@%s'",
+		// "Gone" means the holding process has exited, not that its session
+		// closed: after a close whose lease release failed, a daemon that is
+		// still running renews that same lease for a session it reopens, and
+		// `lease release` would fence that session (see reference.md's
+		// `session close`).
+		return &leaseHeldError{msg: fmt.Sprintf("%s; --force cannot take over a live lease; close the session and retry, or, if the process that holds it has exited, free it with 'offshoot lease release %s@%s' (never while that daemon still runs: a session it reopened may hold the lease)",
 			held, db, branch)}
 	}
 	if force {
