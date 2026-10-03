@@ -6,6 +6,7 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"reflect"
 	"regexp"
 	"strings"
 	"sync"
@@ -264,6 +265,25 @@ func TestConcurrentAtRestCheckpointsAreSerialized(t *testing.T) {
 	}
 }
 
+// heldUpload waits for g to hold the checkpoint's object upload (armed with
+// holdObject) and returns a func that releases it; calling it twice is
+// harmless. A checkpoint that ends before its upload fails the test instead
+// of hanging it, and the upload is released at cleanup too, so a failing
+// test never strands the checkpoint goroutine.
+func heldUpload(t *testing.T, g *casGate, done <-chan error) func() {
+	t.Helper()
+	select {
+	case held := <-g.objArrived:
+		var once sync.Once
+		release := func() { once.Do(func() { close(held) }) }
+		t.Cleanup(release)
+		return release
+	case err := <-done:
+		t.Fatalf("the checkpoint ended before its upload: %v", err)
+		return nil
+	}
+}
+
 // TestCheckpointHoldsTheLeaseThroughItsUpload: the lease spans the object
 // upload, not only the planning before it: while the create-only put is
 // held, the ref names the checkpoint as live holder at the epoch its key
@@ -281,15 +301,7 @@ func TestCheckpointHoldsTheLeaseThroughItsUpload(t *testing.T) {
 		_, err := w.CheckpointWith("app", "main", "a", nil, CheckpointOptions{Snapshot: true})
 		done <- err
 	}()
-	var held chan struct{}
-	select {
-	case held = <-g.objArrived:
-	case err := <-done:
-		t.Fatalf("the checkpoint ended before its upload: %v", err)
-	}
-	var once sync.Once
-	release := func() { once.Do(func() { close(held) }) }
-	t.Cleanup(release)
+	release := heldUpload(t, g, done)
 
 	ref := refOf(t, w, "app", "main")
 	if !isCheckpointHolder(ref.LeaseHolder) || ref.Epoch != before.Epoch+1 || !store.LeaseLive(ref, time.Now()) {
@@ -747,5 +759,436 @@ func TestStragglerUnderOldEpochCannotAnchorHead(t *testing.T) {
 				t.Fatal("GC removed the head's own object")
 			}
 		})
+	}
+}
+
+// stealLease hands db@branch's lease to holder at a higher epoch, the way a
+// reclaim after expiry would, retrying a compare-and-swap lost to a renewal.
+func stealLease(t *testing.T, w *Workspace, db, branch, holder string) {
+	t.Helper()
+	for i := 0; i < 50; i++ {
+		ref, etag, err := w.Store.GetRef(db, branch)
+		if err != nil {
+			t.Fatal(err)
+		}
+		ref.Epoch++
+		ref.LeaseHolder = holder
+		ref.LeaseExpiry = time.Now().Add(time.Minute).UTC().Format(time.RFC3339Nano)
+		_, err = w.Store.PutRef(db, branch, ref, etag)
+		if err == nil {
+			return
+		}
+		if !errors.Is(err, store.ErrCAS) {
+			t.Fatal(err)
+		}
+	}
+	t.Fatal("could not steal the lease in 50 attempts")
+}
+
+// waitFor polls cond every 5ms until it holds, failing after 5s.
+func waitFor(t *testing.T, what string, cond func() bool) {
+	t.Helper()
+	deadline := time.Now().Add(5 * time.Second)
+	for !cond() {
+		if time.Now().After(deadline) {
+			t.Fatalf("timed out waiting for %s", what)
+		}
+		time.Sleep(5 * time.Millisecond)
+	}
+}
+
+// destroyForce runs `destroy --force`, retrying its claim when a lease
+// renewal wins the compare-and-swap first.
+func destroyForce(t *testing.T, w *Workspace, db, branch string) {
+	t.Helper()
+	for i := 0; i < 20; i++ {
+		err := w.Destroy(db, branch, true)
+		if err == nil {
+			return
+		}
+		if !errors.Is(err, store.ErrCAS) {
+			t.Fatal(err)
+		}
+	}
+	t.Fatal("destroy --force kept losing its claim to renewals")
+}
+
+// renewTerminal installs checkpointRenewTerminalForTest for the test and
+// returns the channel it reports on: the terminal error a checkpoint's
+// renewer saw, sent just before the renewer cancels the checkpoint and
+// exits. A test that holds the upload waits on it to know the renewer,
+// not the head write's premise check, caught the loss.
+func renewTerminal(t *testing.T) <-chan error {
+	t.Helper()
+	ch := make(chan error, 1)
+	checkpointRenewTerminalForTest = func(err error) {
+		select {
+		case ch <- err:
+		default:
+		}
+	}
+	t.Cleanup(func() { checkpointRenewTerminalForTest = nil })
+	return ch
+}
+
+// awaitRenewTerminal waits up to 5s for the renewer's terminal error.
+func awaitRenewTerminal(t *testing.T, ch <-chan error, what string) error {
+	t.Helper()
+	select {
+	case err := <-ch:
+		return err
+	case <-time.After(5 * time.Second):
+		t.Fatalf("timed out waiting for the renewer to report %s", what)
+		return nil
+	}
+}
+
+// leasedBranch creates app and acquires main's lease for holder.
+func leasedBranch(t *testing.T, holder string, ttl time.Duration) (*Workspace, store.Lease) {
+	t.Helper()
+	w := newWS(t)
+	if err := w.Create("app"); err != nil {
+		t.Fatal(err)
+	}
+	l, err := w.AcquireLease("app", "main", holder, ttl)
+	if err != nil {
+		t.Fatal(err)
+	}
+	return w, l
+}
+
+// stallBackend holds every PutIf under prefix for stall before forwarding
+// it, closing stalled when the first one starts: an upload slower than the
+// lease TTL.
+type stallBackend struct {
+	store.Backend
+	prefix  string
+	stall   time.Duration
+	once    sync.Once
+	stalled chan struct{}
+}
+
+func (b *stallBackend) PutIf(key string, data []byte, ifMatch string) (string, error) {
+	if strings.HasPrefix(key, b.prefix) {
+		b.once.Do(func() { close(b.stalled) })
+		time.Sleep(b.stall)
+	}
+	return b.Backend.PutIf(key, data, ifMatch)
+}
+
+// flakyRefGets fails the next n Gets of key with a transient error.
+type flakyRefGets struct {
+	store.Backend
+	key string
+	n   atomic.Int32
+}
+
+func (b *flakyRefGets) Get(key string) ([]byte, string, error) {
+	if key == b.key && b.n.Add(-1) >= 0 {
+		return nil, "", errors.New("transient: connection reset")
+	}
+	return b.Backend.Get(key)
+}
+
+func TestRenewErrorClassification(t *testing.T) {
+	for _, tc := range []struct {
+		err      error
+		terminal bool
+	}{
+		{fmt.Errorf("%w: app@main now held by %q at epoch 3", store.ErrLeaseLost, "thief"), true},
+		{fmt.Errorf("%w: no branch app@main", store.ErrNotFound), true},
+		{fmt.Errorf("store: renew lease on app@main: %w", store.ErrCAS), false},
+		{errors.New("store: s3 get refs/app/main: connection reset"), false},
+	} {
+		if got := renewErrTerminal(tc.err); got != tc.terminal {
+			t.Errorf("renewErrTerminal(%v) = %v, want %v", tc.err, got, tc.terminal)
+		}
+	}
+}
+
+// TestCheckpointRenewerKeepsTheLeaseLive: renewals keep a lease live well
+// past its TTL, and once stop returns no renewal runs.
+func TestCheckpointRenewerKeepsTheLeaseLive(t *testing.T) {
+	w, l := leasedBranch(t, newCheckpointHolder(), 200*time.Millisecond)
+	r := w.startCheckpointRenewer(l, 200*time.Millisecond, 20*time.Millisecond)
+	time.Sleep(500 * time.Millisecond)
+	if !store.LeaseLive(refOf(t, w, "app", "main"), time.Now()) {
+		t.Fatal("the lease lapsed while the renewer ran")
+	}
+	if err := r.stop(); err != nil {
+		t.Fatalf("stop: %v", err)
+	}
+	stopped := refOf(t, w, "app", "main").LeaseExpiry
+	time.Sleep(60 * time.Millisecond)
+	if got := refOf(t, w, "app", "main").LeaseExpiry; got != stopped {
+		t.Fatalf("a renewal ran after stop returned: expiry %s -> %s", stopped, got)
+	}
+}
+
+func TestCheckpointRenewerReportsLeaseLoss(t *testing.T) {
+	w, l := leasedBranch(t, newCheckpointHolder(), time.Second)
+	r := w.startCheckpointRenewer(l, time.Second, 10*time.Millisecond)
+	defer r.stop()
+	stealLease(t, w, "app", "main", "thief")
+	waitFor(t, "the renewer to report the loss", func() bool { return r.lost() != nil })
+	if err := r.stop(); !errors.Is(err, store.ErrLeaseLost) {
+		t.Fatalf("stop after a stolen lease: %v, want ErrLeaseLost", err)
+	}
+}
+
+func TestCheckpointRenewerReportsDestroyedBranch(t *testing.T) {
+	w, l := leasedBranch(t, newCheckpointHolder(), time.Second)
+	r := w.startCheckpointRenewer(l, time.Second, 10*time.Millisecond)
+	defer r.stop()
+	destroyForce(t, w, "app", "main")
+	waitFor(t, "the renewer to report the destroyed branch", func() bool { return r.lost() != nil })
+	if err := r.stop(); !errors.Is(err, store.ErrNotFound) {
+		t.Fatalf("stop after destroy: %v, want ErrNotFound", err)
+	}
+}
+
+// TestCheckpointRenewerRidesOutTransientErrors: a renewal that fails for any
+// other reason is retried on the next tick, and the lease stays live.
+func TestCheckpointRenewerRidesOutTransientErrors(t *testing.T) {
+	w, l := leasedBranch(t, newCheckpointHolder(), 300*time.Millisecond)
+	fb := &flakyRefGets{Backend: w.Store.B, key: store.RefKey("app", "main")}
+	fb.n.Store(3)
+	w.Store.B = fb
+	r := w.startCheckpointRenewer(l, 300*time.Millisecond, 20*time.Millisecond)
+	waitFor(t, "the failing reads to be spent", func() bool { return fb.n.Load() < 0 })
+	time.Sleep(100 * time.Millisecond)
+	if err := r.stop(); err != nil {
+		t.Fatalf("stop after transient errors: %v, want nil", err)
+	}
+	w.Store.B = fb.Backend
+	if !store.LeaseLive(refOf(t, w, "app", "main"), time.Now()) {
+		t.Fatal("the lease lapsed across transient renewal errors")
+	}
+}
+
+// TestCheckpointRenewsWhileUploading: an upload that outlasts the lease TTL
+// keeps the lease live, so a writer that tries to take the branch past the
+// TTL is refused and the checkpoint commits.
+func TestCheckpointRenewsWhileUploading(t *testing.T) {
+	w := newWS(t)
+	seedDB(t, w, "app", 1<<16)
+	mustSQL(t, w.CheckoutPath("app", "main"), "INSERT INTO t (v) VALUES (randomblob(100));")
+	const ttl, every, stall = 500 * time.Millisecond, 50 * time.Millisecond, 1200 * time.Millisecond
+	sb := &stallBackend{Backend: w.Store.B, prefix: "data/", stall: stall, stalled: make(chan struct{})}
+	w.Store.B = sb
+	done := make(chan error, 1)
+	go func() {
+		_, err := w.CheckpointWith("app", "main", "a", nil, CheckpointOptions{LeaseTTL: ttl, RenewEvery: every})
+		done <- err
+	}()
+	<-sb.stalled
+	time.Sleep(ttl + 300*time.Millisecond)
+	if _, err := w.Store.AcquireLease("app", "main", "thief", time.Minute, time.Now()); !errors.Is(err, store.ErrLeaseHeld) {
+		t.Fatalf("a writer past the acquire's TTL: %v, want ErrLeaseHeld (renewals keep the lease live)", err)
+	}
+	if err := <-done; err != nil {
+		t.Fatalf("checkpoint with a slow upload: %v", err)
+	}
+	w.Store.B = sb.Backend
+	ref := refOf(t, w, "app", "main")
+	if ref.LeaseHolder != "" || ref.Checkpoints["a"].TXID != ref.HeadTXID {
+		t.Fatalf("after the slow checkpoint: holder %q, head %d, entry %+v", ref.LeaseHolder, ref.HeadTXID, ref.Checkpoints["a"])
+	}
+}
+
+// TestRenewLeaseLostAbortsBeforeRefWrite: a lease stolen while the object
+// uploads is caught by the renewer, which cancels the checkpoint before any
+// head write: it reports the loss, the head does not move, the thief's
+// lease is untouched, and the checkpoint deletes its own object, which
+// nothing names.
+func TestRenewLeaseLostAbortsBeforeRefWrite(t *testing.T) {
+	w := newWS(t)
+	seedDB(t, w, "app", 1<<16)
+	mustSQL(t, w.CheckoutPath("app", "main"), "INSERT INTO t (v) VALUES (randomblob(100));")
+	before := refOf(t, w, "app", "main")
+	key := privateSnapshotKey(before)
+	terminal := renewTerminal(t)
+	g := gateRefCAS(w, "app", "main")
+	g.holdObject(key)
+	done := make(chan error, 1)
+	go func() {
+		_, err := w.CheckpointWith("app", "main", "a", nil, CheckpointOptions{Snapshot: true, LeaseTTL: time.Second, RenewEvery: 10 * time.Millisecond})
+		done <- err
+	}()
+	release := heldUpload(t, g, done)
+	stealLease(t, w, "app", "main", "thief")
+	// The upload is held, so the checkpoint itself reads nothing until it is
+	// released: only its renewer can see the steal. Wait until it has, then
+	// let the upload land.
+	if err := awaitRenewTerminal(t, terminal, "the stolen lease"); !errors.Is(err, store.ErrLeaseLost) {
+		t.Fatalf("the renewer's terminal error: %v, want ErrLeaseLost", err)
+	}
+	release()
+	err := <-done
+	if !errors.Is(err, store.ErrLeaseLost) || !strings.Contains(err.Error(), "its lease ended while it ran") {
+		t.Fatalf("checkpoint whose lease was stolen mid-upload: %v, want the renewer's ErrLeaseLost", err)
+	}
+	ref := refOf(t, w, "app", "main")
+	if ref.HeadTXID != before.HeadTXID || ref.LeaseHolder != "thief" {
+		t.Fatalf("after the lost checkpoint: head %d holder %q, want head %d, the thief's lease", ref.HeadTXID, ref.LeaseHolder, before.HeadTXID)
+	}
+	if _, ok := ref.Checkpoints["a"]; ok {
+		t.Fatal("the lost checkpoint was recorded")
+	}
+	if storeHas(w, key) {
+		t.Fatal("the lost checkpoint's object survived")
+	}
+}
+
+// TestRepointVerbsDuringCheckpoint: while a checkpoint holds the branch,
+// unforced rollback, promote onto, compact and destroy are refused naming
+// it. A forced rollback clears its lease; the checkpoint then fails
+// without committing, leaves the rolled-back ref alone, and deletes its
+// own object.
+func TestRepointVerbsDuringCheckpoint(t *testing.T) {
+	w := newWS(t)
+	seedDB(t, w, "app", 1<<16)
+	mustFork(t, w, "app", "main", "work", "seed")
+	path := mustCheckout(t, w, "app", "work")
+	mustSQL(t, path, "INSERT INTO t (v) VALUES (randomblob(100));")
+	paused, resume := make(chan struct{}), make(chan struct{})
+	var pauseOnce, resumeOnce sync.Once
+	release := func() { resumeOnce.Do(func() { close(resume) }) }
+	t.Cleanup(release)
+	checkpointAfterQuiesceForTest = func() { pauseOnce.Do(func() { close(paused); <-resume }) }
+	t.Cleanup(func() { checkpointAfterQuiesceForTest = nil })
+	done := make(chan error, 1)
+	go func() {
+		// Renewals every 100ms, not faster: the forced rollback below reads
+		// the ref, resolves a chain and writes a base pointer before its
+		// compare-and-swap, and a renewal landing in that window makes it
+		// lose and retry, so a short interval could starve it.
+		_, err := w.CheckpointWith("app", "work", "a", nil, CheckpointOptions{LeaseTTL: time.Second, RenewEvery: 100 * time.Millisecond})
+		done <- err
+	}()
+	<-paused
+	held := refOf(t, w, "app", "work")
+
+	_, rbErr := w.RollbackWith("app", "work", "fork", RollbackOptions{NoBackup: true})
+	_, prErr := w.PromoteWith("app", "main", "work", PromoteOptions{NoBackup: true})
+	_, cmErr := w.CompactWith("app", "work", CompactOptions{})
+	dsErr := w.Destroy("app", "work", false)
+	for what, err := range map[string]error{"rollback": rbErr, "promote onto": prErr, "compact": cmErr, "destroy": dsErr} {
+		if !errors.Is(err, store.ErrLeaseHeld) || !strings.Contains(err.Error(), held.LeaseHolder) {
+			t.Fatalf("unforced %s during a checkpoint: %v, want a lease-held refusal naming %s", what, err, held.LeaseHolder)
+		}
+	}
+
+	// The checkpoint's renewals write the ref every 100ms, so the forced
+	// rollback's compare-and-swap can lose to one; retry it like a user would.
+	for i := 0; ; i++ {
+		_, err := w.RollbackWith("app", "work", "fork", RollbackOptions{Force: true, NoBackup: true})
+		if err == nil {
+			break
+		}
+		if !errors.Is(err, store.ErrCAS) || i == 20 {
+			t.Fatal(err)
+		}
+	}
+	rolled := refOf(t, w, "app", "work")
+	release()
+	if err := <-done; !errors.Is(err, store.ErrLeaseLost) {
+		t.Fatalf("checkpoint after a forced rollback: %v, want ErrLeaseLost", err)
+	}
+	if after := refOf(t, w, "app", "work"); !reflect.DeepEqual(after, rolled) {
+		t.Fatalf("the failed checkpoint changed the ref:\n got %+v\nwant %+v", after, rolled)
+	}
+	txid := held.HeadTXID + 1
+	for _, k := range []string{store.SnapshotKey(held.Lineage, held.Epoch, txid), store.SegmentKey(held.Lineage, held.Epoch, txid, txid)} {
+		if storeHas(w, k) {
+			t.Fatalf("the failed checkpoint left its object %s", k)
+		}
+	}
+}
+
+// TestLeaseReleaseDuringCheckpointFailsIt: `offshoot lease release` on a
+// running checkpoint's lease makes it fail without committing; it deletes
+// its object and the branch stays usable.
+func TestLeaseReleaseDuringCheckpointFailsIt(t *testing.T) {
+	w := newWS(t)
+	seedDB(t, w, "app", 1<<16)
+	mustSQL(t, w.CheckoutPath("app", "main"), "INSERT INTO t (v) VALUES (randomblob(100));")
+	paused, resume := make(chan struct{}), make(chan struct{})
+	var pauseOnce, resumeOnce sync.Once
+	release := func() { resumeOnce.Do(func() { close(resume) }) }
+	t.Cleanup(release)
+	checkpointAfterQuiesceForTest = func() { pauseOnce.Do(func() { close(paused); <-resume }) }
+	t.Cleanup(func() { checkpointAfterQuiesceForTest = nil })
+	done := make(chan error, 1)
+	go func() {
+		_, err := w.CheckpointWith("app", "main", "a", nil, CheckpointOptions{LeaseTTL: time.Second, RenewEvery: 100 * time.Millisecond})
+		done <- err
+	}()
+	<-paused
+	held := refOf(t, w, "app", "main")
+	for i := 0; ; i++ {
+		err := w.ReleaseLease(store.Lease{DB: "app", Branch: "main", Holder: held.LeaseHolder, Epoch: held.Epoch})
+		if err == nil {
+			break
+		}
+		if !errors.Is(err, store.ErrCAS) || i == 20 {
+			t.Fatal(err)
+		}
+	}
+	release()
+	if err := <-done; !errors.Is(err, store.ErrLeaseLost) {
+		t.Fatalf("checkpoint after `lease release`: %v, want ErrLeaseLost", err)
+	}
+	ref := refOf(t, w, "app", "main")
+	if ref.HeadTXID != held.HeadTXID {
+		t.Fatalf("head moved to %d, want %d", ref.HeadTXID, held.HeadTXID)
+	}
+	txid := held.HeadTXID + 1
+	for _, k := range []string{store.SnapshotKey(held.Lineage, held.Epoch, txid), store.SegmentKey(held.Lineage, held.Epoch, txid, txid)} {
+		if storeHas(w, k) {
+			t.Fatalf("the failed checkpoint left its object %s", k)
+		}
+	}
+	checkpointAfterQuiesceForTest = nil
+	mustCheckpointWith(t, w, "app", "main", "b", CheckpointOptions{})
+}
+
+// TestDestroyForceDuringCheckpointAbortsIt: `destroy --force` while a
+// checkpoint uploads reaches it as a terminal ErrNotFound from a renewal;
+// the checkpoint deletes its object and never recreates the branch.
+func TestDestroyForceDuringCheckpointAbortsIt(t *testing.T) {
+	w := newWS(t)
+	seedDB(t, w, "app", 1<<16)
+	mustFork(t, w, "app", "main", "work", "seed")
+	mustSQL(t, mustCheckout(t, w, "app", "work"), "INSERT INTO t (v) VALUES (randomblob(100));")
+	before := refOf(t, w, "app", "work")
+	key := privateSnapshotKey(before)
+	terminal := renewTerminal(t)
+	g := gateRefCAS(w, "app", "work")
+	g.holdObject(key)
+	done := make(chan error, 1)
+	go func() {
+		// Renewals every 100ms, not 10ms: destroy's claim write and its
+		// conditional ref delete straddle a quiesce of the checkout, and a
+		// renewal landing in between makes destroy lose and retry
+		// (destroyForce), so a short interval would starve it.
+		_, err := w.CheckpointWith("app", "work", "a", nil, CheckpointOptions{Snapshot: true, LeaseTTL: 2 * time.Second, RenewEvery: 100 * time.Millisecond})
+		done <- err
+	}()
+	release := heldUpload(t, g, done)
+	destroyForce(t, w, "app", "work")
+	if err := awaitRenewTerminal(t, terminal, "the destroyed branch"); !errors.Is(err, store.ErrNotFound) {
+		t.Fatalf("the renewer's terminal error: %v, want ErrNotFound", err)
+	}
+	release()
+	err := <-done
+	if !errors.Is(err, store.ErrNotFound) || !strings.Contains(err.Error(), "its lease ended while it ran") {
+		t.Fatalf("checkpoint of a branch destroyed mid-upload: %v, want the renewer's ErrNotFound", err)
+	}
+	if storeHas(w, key) {
+		t.Fatal("the aborted checkpoint's object survived")
+	}
+	if _, _, err := w.Store.GetRef("app", "work"); !errors.Is(err, store.ErrNotFound) {
+		t.Fatalf("the destroyed branch came back: %v", err)
 	}
 }

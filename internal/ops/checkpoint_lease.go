@@ -1,6 +1,7 @@
 package ops
 
 import (
+	"context"
 	"crypto/rand"
 	"encoding/hex"
 	"errors"
@@ -42,6 +43,19 @@ func (o CheckpointOptions) leaseTTL() time.Duration {
 		return o.LeaseTTL
 	}
 	return DefaultLeaseTTL
+}
+
+// renewEvery is RenewEvery, or a third of ttl when it is not set: the
+// interval a daemon session renews at, which leaves the lease two missed
+// renewals of slack.
+func (o CheckpointOptions) renewEvery(ttl time.Duration) time.Duration {
+	if o.RenewEvery > 0 {
+		return o.RenewEvery
+	}
+	if every := ttl / 3; every > 0 {
+		return every
+	}
+	return time.Millisecond
 }
 
 // checkpointPreconditions are the checks CheckpointWith runs on the ref it
@@ -154,6 +168,88 @@ func (w *Workspace) releaseCheckpointLease(l store.Lease) {
 	}
 }
 
+// errCheckpointRenewStopped is the cancel cause stop records when the
+// checkpoint itself ends the renewals, so a terminal renewal error stays
+// distinguishable from a normal stop.
+var errCheckpointRenewStopped = errors.New("ops: checkpoint lease renewals stopped")
+
+// checkpointRenewer keeps an at-rest checkpoint's lease alive while it
+// quiesces, encodes and uploads, the way a session's renewLoop does
+// (internal/session/renew.go): a renewal that finds the lease gone
+// (ErrLeaseLost) or the branch destroyed (ErrNotFound) is terminal and
+// cancels ctx with that error as its cause; any other error, including
+// RenewLease's unretried ErrCAS against a concurrent touch, is retried on
+// the next tick, since the lease outlives two missed renewals.
+type checkpointRenewer struct {
+	ctx    context.Context
+	cancel context.CancelCauseFunc
+	done   chan struct{}
+}
+
+// checkpointRenewTerminalForTest, when non-nil, runs in a checkpoint's
+// renewer with the terminal renewal error it is about to cancel the
+// checkpoint with. A test that holds the checkpoint's upload waits on it:
+// the held checkpoint reads nothing, so only the renewer can see a lost
+// lease or a destroyed branch, and the test must know it has before it
+// releases the upload. Test-only; process-global, restore via t.Cleanup
+// (as checkpointAfterQuiesceForTest).
+var checkpointRenewTerminalForTest func(error)
+
+// startCheckpointRenewer renews l every every, each renewal extending it
+// by ttl, until stop is called or a renewal is terminal.
+func (w *Workspace) startCheckpointRenewer(l store.Lease, ttl, every time.Duration) *checkpointRenewer {
+	ctx, cancel := context.WithCancelCause(context.Background())
+	r := &checkpointRenewer{ctx: ctx, cancel: cancel, done: make(chan struct{})}
+	go func() {
+		defer close(r.done)
+		t := time.NewTicker(every)
+		defer t.Stop()
+		for {
+			select {
+			case <-ctx.Done():
+				return
+			case <-t.C:
+			}
+			next, err := w.Store.RenewLease(l, ttl, time.Now())
+			switch {
+			case err == nil:
+				l = next
+			case renewErrTerminal(err):
+				if checkpointRenewTerminalForTest != nil {
+					checkpointRenewTerminalForTest(err)
+				}
+				cancel(err)
+				return
+			}
+		}
+	}()
+	return r
+}
+
+// renewErrTerminal reports whether a renewal error ends the checkpoint.
+func renewErrTerminal(err error) bool {
+	return errors.Is(err, store.ErrLeaseLost) || errors.Is(err, store.ErrNotFound)
+}
+
+// lost is the terminal renewal error, or nil while the lease is held.
+func (r *checkpointRenewer) lost() error {
+	if c := context.Cause(r.ctx); c != nil && c != errCheckpointRenewStopped {
+		return c
+	}
+	return nil
+}
+
+// stop ends the renewals and waits for the goroutine to exit, so no
+// renewal is in flight when the caller writes the ref (Session.Close joins
+// its renewLoop before ReleaseLease for the same reason). It returns the
+// terminal renewal error, if one ended the renewals first. Safe to call
+// more than once.
+func (r *checkpointRenewer) stop() error {
+	r.cancel(errCheckpointRenewStopped)
+	<-r.done
+	return r.lost()
+}
+
 // checkpointCommit is what the head write of an at-rest checkpoint needs:
 // the checkpoint, the lease it holds, and the lineage and txid it encoded.
 type checkpointCommit struct {
@@ -206,20 +302,29 @@ func (c checkpointCommit) unconfirmed(err error) error {
 	return fmt.Errorf("ops: checkpoint %q on %s@%s: reading the ref to commit: %w", c.name, c.db, c.branch, err)
 }
 
+// renewLost is the error for a checkpoint whose renewals found its lease
+// gone or its branch destroyed before its head write; it wraps the
+// renewal's error, so both stay testable with errors.Is.
+func (c checkpointCommit) renewLost(err error) error {
+	return fmt.Errorf("ops: checkpoint %q on %s@%s did not commit: its lease ended while it ran: %w", c.name, c.db, c.branch, err)
+}
+
 // commitCheckpoint is the head write: it re-reads the ref, checks the
 // premise, and advances the head in one write that also records the
-// checkpoint and releases the lease.
-func (w *Workspace) commitCheckpoint(c checkpointCommit) (store.Ref, error) {
+// checkpoint and releases the lease. On error, deletable reports whether
+// our object provably is unreferenced: true when no head write naming it
+// was sent.
+func (w *Workspace) commitCheckpoint(c checkpointCommit) (committed store.Ref, deletable bool, err error) {
 	cur, etag, err := w.Store.GetRef(c.db, c.branch)
 	if err != nil {
-		return store.Ref{}, c.unconfirmed(err)
+		return store.Ref{}, true, c.unconfirmed(err)
 	}
 	if !c.premise(cur) {
-		return store.Ref{}, c.lostTo(cur)
+		return store.Ref{}, true, c.lostTo(cur)
 	}
 	next := c.advance(cur)
 	if _, err := w.Store.PutRef(c.db, c.branch, next, etag); err != nil {
-		return store.Ref{}, fmt.Errorf("ops: ref update for checkpoint %q on %s@%s: %w", c.name, c.db, c.branch, err)
+		return store.Ref{}, false, fmt.Errorf("ops: ref update for checkpoint %q on %s@%s: %w", c.name, c.db, c.branch, err)
 	}
-	return next, nil
+	return next, false, nil
 }

@@ -45,11 +45,13 @@ type Workspace struct {
 }
 
 // bestEffortDelete removes key from the backend, logging to stderr (never
-// failing) on error. It exists for orphan cleanup after a lost ref CAS:
-// every caller deletes keys in a freshly-minted lineage no rival can
-// reference (or a CAS-confirmed orphan), so a failed delete is safe to
-// leave behind — reachability GC reclaims it eventually — but should be
-// LOUD rather than invisible, matching the janitor's logging convention.
+// failing) on error. It exists for orphan cleanup after a failed ref
+// write: every caller deletes a key no ref can name, in a freshly-minted
+// lineage no rival can reference, or under an epoch only an at-rest
+// checkpoint's own lease minted, once the checkpoint knows no head write
+// naming it landed. A failed delete is safe to leave behind (reachability
+// GC reclaims it eventually) but should be LOUD rather than invisible,
+// matching the janitor's logging convention.
 func (w *Workspace) bestEffortDelete(key string) {
 	if err := w.Store.B.Delete(key); err != nil {
 		fmt.Fprintf(os.Stderr,
@@ -500,9 +502,12 @@ type CheckpointOptions struct {
 	// checkpointPreconditions. It does not override a live lease, a
 	// session's or another checkpoint's (see refuseIfHeld).
 	Force bool
-	// LeaseTTL is how long the branch lease this checkpoint takes stays
-	// valid; 0 means DefaultLeaseTTL.
+	// LeaseTTL is how long the branch lease this checkpoint holds stays
+	// valid between renewals; 0 means DefaultLeaseTTL.
 	LeaseTTL time.Duration
+	// RenewEvery is how often the lease is renewed while the checkpoint
+	// quiesces, encodes and uploads; 0 means a third of LeaseTTL.
+	RenewEvery time.Duration
 }
 
 // CheckpointResult is what CheckpointWith wrote.
@@ -540,7 +545,9 @@ func (w *Workspace) Checkpoint(db, branch, name string, meta map[string]string) 
 //     acquireCheckpointLease). The acquire bumps the epoch, so this call's
 //     object key is its own, and returns the ref it wrote, which
 //     everything after plans from; step 1's checks run again on it;
-//  3. quiesce, plan and encode, then upload with a create-only put;
+//  3. renew the lease every opts.RenewEvery (checkpointRenewer); quiesce,
+//     plan and encode; check the lease is still ours, then upload with a
+//     create-only put; stop and join the renewals;
 //  4. re-read the ref and, while it still names our lease, our lineage and
 //     the head we planned from, advance the head, record the checkpoint
 //     and clear the lease in one write (commitCheckpoint);
@@ -622,6 +629,10 @@ func (w *Workspace) checkpointLeased(db, branch, name string, meta map[string]st
 	if err := checkpointPreconditions(db, branch, name, path, ref, opts); err != nil {
 		return CheckpointResult{}, err
 	}
+	ttl := opts.leaseTTL()
+	rn := w.startCheckpointRenewer(lease, ttl, opts.renewEvery(ttl))
+	// Every return below stops the renewals first; stop is idempotent.
+	defer rn.stop()
 	if err := quiesce(path); err != nil {
 		return CheckpointResult{}, err
 	}
@@ -668,12 +679,29 @@ func (w *Workspace) checkpointLeased(db, branch, name string, meta map[string]st
 		key = store.SnapshotKey(ref.Lineage, epoch, txid)
 	}
 	res.Bytes = int64(buf.Len())
+	c := checkpointCommit{db: db, branch: branch, name: name, meta: meta, kind: res.Kind, lease: lease, lineage: ref.Lineage, txid: txid}
+	// The lease must still be ours when the object goes up: a key under an
+	// epoch we no longer hold is garbage the moment it lands.
+	if err := rn.lost(); err != nil {
+		return CheckpointResult{}, c.renewLost(err)
+	}
 	ownEtag, err := w.Store.B.PutIf(key, buf.Bytes(), "")
 	if err != nil {
 		return CheckpointResult{}, fmt.Errorf("ops: upload checkpoint object %s: %w", key, err)
 	}
-	c := checkpointCommit{db: db, branch: branch, name: name, meta: meta, kind: res.Kind, lease: lease, lineage: ref.Lineage, txid: txid}
-	if _, err := w.commitCheckpoint(c); err != nil {
+	// Join the renewals before the head write, so the write never races our
+	// own heartbeat. A renewal that found the lease gone or the branch
+	// destroyed ends the checkpoint here; no head write has been sent, and
+	// the key is under an epoch only this call minted, so nothing can name
+	// our object and it is deleted.
+	if err := rn.stop(); err != nil {
+		w.bestEffortDelete(key)
+		return CheckpointResult{}, c.renewLost(err)
+	}
+	if _, deletable, err := w.commitCheckpoint(c); err != nil {
+		if deletable {
+			w.bestEffortDelete(key)
+		}
 		return CheckpointResult{}, err
 	}
 	// The head write is the point of no return: only now does the checkout
