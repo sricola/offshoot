@@ -883,8 +883,11 @@ func refuseIfHeld(db, branch string, ref store.Ref, verb string, force bool) err
 		who = "another checkpoint is in progress"
 	}
 	if verb == "checkpoint" {
-		return &leaseHeldError{fmt.Sprintf("ops: %s@%s has a live lease held by %q until %s (%s); --force cannot take over a live lease; close the session (or wait for the other checkpoint) and retry",
-			db, branch, ref.LeaseHolder, ref.LeaseExpiry, who)}
+		// --force used to be the way past a holder that would not let go (a
+		// killed daemon, a forgotten `lease acquire`); name the one that is
+		// left, so the refusal is not a dead end for a whole TTL.
+		return &leaseHeldError{fmt.Sprintf("ops: %s@%s has a live lease held by %q until %s (%s); --force cannot take over a live lease; close the session (or wait for the other checkpoint) and retry, or, if its holder is gone, free it with 'offshoot lease release %s@%s'",
+			db, branch, ref.LeaseHolder, ref.LeaseExpiry, who, db, branch)}
 	}
 	if force {
 		return nil
