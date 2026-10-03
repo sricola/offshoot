@@ -141,6 +141,11 @@ type Response struct {
 	// path (see opDiff's doc comment for why that's what makes it safe on
 	// the HTTP surface while export is not).
 	Diff *DiffResult `json:"diff,omitempty"`
+	// DBFileDescriptors ("status" only) is how many checkout descriptors
+	// this daemon's internal/dbfile holds open, cached plus stranded: the
+	// offshoot_dbfile_descriptors gauge. A pointer so that 0 is still
+	// present on a status response, while every other op omits the key.
+	DBFileDescriptors *int `json:"dbfile_descriptors,omitempty"`
 }
 
 // DiffResult is the "diff" op's wire result: a content-aware per-table

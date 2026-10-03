@@ -2,6 +2,7 @@ package daemon
 
 import (
 	"bytes"
+	"encoding/json"
 	"os"
 	"os/exec"
 	"path/filepath"
@@ -185,5 +186,44 @@ func TestJanitorBudgetZeroIsUnlimited(t *testing.T) {
 		if !slices.Contains(cached, p) {
 			t.Fatalf("cached checkouts = %v, want %s still cached", cached, p)
 		}
+	}
+}
+
+// TestStatusReportsDescriptors: the status op carries dbfile's descriptor
+// count, and only status does. dbfile is process-wide, so a bare ">= 1"
+// would pass on descriptors earlier tests left behind; instead the count
+// must match dbfile's own, and the open session's checkout must be one of
+// the descriptors counted.
+func TestStatusReportsDescriptors(t *testing.T) {
+	srv, _ := newServer(t)
+	sock := srv.SocketPath()
+	open := call(t, sock, Request{Op: "open", DB: "app", Branch: "main"})
+	if !open.OK {
+		t.Fatalf("open = %+v", open)
+	}
+	co, _ := filepath.Abs(open.Checkout)
+	deadline := time.Now().Add(10 * time.Second)
+	for !slices.Contains(cachedUnder(filepath.Dir(co)), co) {
+		if time.Now().After(deadline) {
+			t.Fatalf("the session's checkout %s never got a dbfile descriptor; entries: %+v", co, dbfile.Entries())
+		}
+		time.Sleep(10 * time.Millisecond)
+	}
+
+	lo := dbfile.ReadStats().Descriptors()
+	resp := call(t, sock, Request{Op: "status"})
+	hi := dbfile.ReadStats().Descriptors()
+	if !resp.OK || resp.DBFileDescriptors == nil {
+		t.Fatalf("status carries no dbfile_descriptors: %+v", resp)
+	}
+	if n := *resp.DBFileDescriptors; n < 1 || n < min(lo, hi) || n > max(lo, hi) {
+		t.Fatalf("dbfile_descriptors = %d, want dbfile's own count (%d before the call, %d after)", n, lo, hi)
+	}
+	b, _ := json.Marshal(resp)
+	if !strings.Contains(string(b), `"dbfile_descriptors":`) {
+		t.Fatalf("wire name changed: %s", b)
+	}
+	if dbs := call(t, sock, Request{Op: "dbs"}); dbs.DBFileDescriptors != nil {
+		t.Fatal("dbfile_descriptors leaked into a non-status op")
 	}
 }

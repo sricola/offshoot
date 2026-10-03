@@ -450,6 +450,27 @@ test("rollback, promote, status", async (t: TestContext) => {
   }
 });
 
+test("daemonStatus reports dbfile descriptors", async (t: TestContext) => {
+  if (!canRun) {
+    t.skip("go and/or sqlite3 not on PATH");
+    return;
+  }
+  const c = await connect(fixture!.sock);
+  try {
+    await c.create("ds");
+    const s = await c.open("ds");
+    try {
+      const st = await c.daemonStatus();
+      assert.ok(st.sessions.some((x) => x.db === "ds" && x.branch === "main"));
+      assert.ok(st.dbfile_descriptors >= 1);
+    } finally {
+      await s.close();
+    }
+  } finally {
+    await c.close();
+  }
+});
+
 test("dbs lists every database sorted", async (t: TestContext) => {
   if (!canRun) {
     t.skip("go and/or sqlite3 not on PATH");

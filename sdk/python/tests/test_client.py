@@ -431,6 +431,21 @@ class TestClient(unittest.TestCase):
             c.promote("rp", "feature", "main", force=True, backup=False)
             self.assertNotIn("main-pre-promote", {b.branch for b in c.branches("rp")})
 
+    def test_daemon_status_reports_descriptors(self):
+        with offshoot.connect(self.d.sock) as c:
+            c.create("ds")
+            s = c.open("ds")
+            try:
+                st = c.daemon_status()
+                self.assertIsInstance(st, offshoot.DaemonStatus)
+                self.assertTrue(any(x["db"] == "ds" and x["branch"] == "main" for x in st.sessions))
+                self.assertGreaterEqual(st.dbfile_descriptors, 1)
+                # status() is unchanged: still the bare session list. Not
+                # compared to st.sessions, whose lag/age fields move between calls.
+                self.assertIsInstance(c.status(), list)
+            finally:
+                s.close()
+
     def test_dbs_lists_every_database_sorted(self):
         with offshoot.connect(self.d.sock) as c:
             c.create("dbs-zeta")

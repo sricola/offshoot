@@ -94,6 +94,15 @@ export interface SessionInfo {
   error?: string;
 }
 
+/** Daemon-wide status, as returned by {@link Client.daemonStatus}. */
+export interface DaemonStatus {
+  sessions: SessionInfo[];
+  /** Checkout descriptors the daemon holds open, cached plus stranded: the
+   * `offshoot_dbfile_descriptors` gauge. `offshoot serve -fd-budget` bounds
+   * the cached part. */
+  dbfile_descriptors: number;
+}
+
 /** Options for {@link Client.fork}. */
 export interface ForkOptions {
   /** Source checkpoint name; omitted (or "") means source branch's head. */
@@ -343,6 +352,7 @@ interface RawResponse {
   branches?: RawBranchInfo[];
   databases?: string[];
   diff?: DiffResult;
+  dbfile_descriptors?: number;
 }
 
 /** @internal The subscribe op's one-line ack, read off the socket before
@@ -775,6 +785,12 @@ export class Client {
   async status(): Promise<SessionInfo[]> {
     const resp = await this._call("status");
     return resp.sessions ?? [];
+  }
+
+  /** The open sessions plus daemon-wide resource counts. */
+  async daemonStatus(): Promise<DaemonStatus> {
+    const resp = await this._call("status");
+    return { sessions: resp.sessions ?? [], dbfile_descriptors: resp.dbfile_descriptors ?? 0 };
   }
 
   /** Close the connection to the daemon. */

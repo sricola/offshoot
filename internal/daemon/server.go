@@ -18,6 +18,7 @@ import (
 	"syscall"
 	"time"
 
+	"github.com/sricola/offshoot/internal/dbfile"
 	"github.com/sricola/offshoot/internal/ops"
 	"github.com/sricola/offshoot/internal/session"
 	"github.com/sricola/offshoot/internal/store"
@@ -571,6 +572,10 @@ func (s *Server) opFlush(req Request) Response {
 // response can list a session that finished closing a moment ago, the same
 // staleness any status endpoint already has the instant its answer is sent
 // over the wire — not a new correctness gap this introduces.
+//
+// The response also carries dbfile_descriptors, the
+// offshoot_dbfile_descriptors gauge read at the same moment, so a client
+// without a metrics scrape can watch the descriptor count -fd-budget bounds.
 func (s *Server) opStatus() Response {
 	s.mu.Lock()
 	keys := make([]string, 0, len(s.sessions))
@@ -607,7 +612,8 @@ func (s *Server) opStatus() Response {
 		}
 		infos = append(infos, info)
 	}
-	return Response{OK: true, Sessions: infos}
+	n := dbfile.ReadStats().Descriptors()
+	return Response{OK: true, Sessions: infos, DBFileDescriptors: &n}
 }
 
 // sessionCount returns the number of FULLY OPEN sessions (a reserved-but-
