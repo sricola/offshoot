@@ -4,6 +4,7 @@ import (
 	"bufio"
 	"context"
 	"encoding/json"
+	"fmt"
 	"net"
 	"os"
 	"os/exec"
@@ -213,10 +214,17 @@ func rawCall(sock string, req Request) (Response, error) {
 // the old code (verified by re-running this test against a checkout of the
 // pre-fix server.go: it fails on the first iteration, Shutdown returning in
 // well under a millisecond instead of waiting).
+//
+// The open self-closes the session it just opened, so it also publishes
+// that session's session_closed itself: the session's own "closed"
+// transition is not mapped to the event, and this close does not go
+// through closeSlot. A subscriber that saw session_opened must see exactly
+// one session_closed for it, with the same holder and epoch.
 func TestShutdownDuringInFlightOpenLeavesNoLease(t *testing.T) {
 	for i := 0; i < 5; i++ {
 		srv, w := newServer(t)
 		sock := srv.SocketPath()
+		events, unsubscribe := srv.events.subscribe(64)
 
 		entered := make(chan struct{})
 		proceed := make(chan struct{})
@@ -275,6 +283,36 @@ func TestShutdownDuringInFlightOpenLeavesNoLease(t *testing.T) {
 		srv.mu.Unlock()
 		if n != 0 {
 			t.Fatalf("iteration %d: %d session(s) still tracked after shutdown", i, n)
+		}
+
+		var opened, closed []Event
+		for drained := false; !drained; {
+			select {
+			case ev := <-events:
+				if ev.DB != "app" || ev.Branch != "main" {
+					continue
+				}
+				switch ev.Type {
+				case "session_opened":
+					opened = append(opened, ev)
+				case "session_closed":
+					closed = append(closed, ev)
+				}
+			default:
+				drained = true
+			}
+		}
+		unsubscribe()
+		if len(opened) != 1 || len(closed) != 1 {
+			t.Fatalf("iteration %d: %d session_opened and %d session_closed for app@main, want one of each",
+				i, len(opened), len(closed))
+		}
+		o, c := opened[0].Detail, closed[0].Detail
+		if c["holder"] == nil || c["holder"] != o["holder"] || fmt.Sprint(c["epoch"]) != fmt.Sprint(o["epoch"]) {
+			t.Fatalf("iteration %d: session_closed detail %v, want the holder and epoch of session_opened %v", i, c, o)
+		}
+		if _, ok := c["error"]; ok {
+			t.Fatalf("iteration %d: the self-close reported an error: %v", i, c)
 		}
 	}
 }
