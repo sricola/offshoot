@@ -49,7 +49,11 @@ Pin an exact version if you depend on format stability. The full contract:
   30 s ago is refused, forced or not, with `is already being destroyed`
   (retryable; `errors.Is(err, store.ErrDeleting)`) and writes nothing.
   The reaper leaves such a branch to that destroy. A claim 30 s old, or
-  one whose timestamp cannot be read, is still taken over.
+  one whose timestamp cannot be read, is still taken over. A destroy
+  whose claim write landed but reported failure (on S3, the SDK's retry
+  answering 412 to its own first attempt, or a timeout) recognises the
+  claim as its own and goes on to delete, rather than reporting a lost
+  race whose retry that claim would refuse.
 - **`checkpoint --force` on a branch with a live session wrote a second
   writer's head under the session's epoch.** The docs said `--force`
   fenced the session; it did not. It wrote the head and a checkpoint entry

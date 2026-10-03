@@ -34,7 +34,9 @@ const tombstoneKey = "gc/tombstones"
 // Destroy still claims before it deletes, and a lease claimed a moment
 // before force lands still wins the CAS race on the ref (this call's own
 // claim write then fails with ErrCAS, reported as a retryable race loss,
-// same as an unforced call).
+// same as an unforced call). A claim write that reports failure but
+// landed is this call's own claim all the same, and Destroy goes on under
+// it (landedClaim).
 //
 // The lease holder's renewals do not stop under the claim
 // (store.RenewLease), so one can land between the claim and the delete;
@@ -81,10 +83,9 @@ func (w *Workspace) Destroy(db, branch string, force bool) error {
 	ref.DeletingAt = time.Now().UTC().Format(time.RFC3339Nano)
 	claimEtag, err := w.Store.PutRef(db, branch, ref, etag)
 	if err != nil {
-		if errors.Is(err, store.ErrCAS) {
-			return fmt.Errorf("ops: destroy lost a race on %s@%s (retry): %w", db, branch, err)
+		if claimEtag, err = w.landedClaim(db, branch, ref, force, err); err != nil {
+			return err
 		}
-		return err
 	}
 
 	path := w.CheckoutPath(db, branch)
@@ -119,6 +120,42 @@ func (w *Workspace) Destroy(db, branch string, force bool) error {
 		}
 	}
 	return nil
+}
+
+// landedClaim settles Destroy's claim write, of claimed, that reported
+// failure (werr) but may have landed: the S3 SDK's retry of a PutObject
+// whose first attempt landed gets a 412 (or a 409) back from that attempt,
+// which the store reports as a lost compare-and-swap, and a timeout can
+// lose the response to a write that landed. Reported as it stands, such a
+// failure would leave this call's claim on the ref, and the retry the error
+// asks for would be refused under it (liveDeleteClaim) until it was
+// staleDeletingClaimAfter old. So landedClaim re-reads the ref. One that
+// carries this call's claim (its DeletingAt, stamped per call) is that
+// write, landed. With nothing but the lease expiry moved since
+// (onlyRenewed), and, without force, no lease live again, Destroy goes on
+// from the etag read, as deleteClaimedRef does past a renewal over the
+// claim. Otherwise Destroy fails as deleteClaimedRef would have failed it
+// over the same write, and unwinds its claim first. A ref without this
+// call's claim (the write did not land, or another write has since taken
+// the claim off), or one that cannot be read, reports the write's failure.
+func (w *Workspace) landedClaim(db, branch string, claimed store.Ref, force bool, werr error) (string, error) {
+	failed := werr
+	if errors.Is(werr, store.ErrCAS) {
+		failed = fmt.Errorf("ops: destroy lost a race on %s@%s (retry): %w", db, branch, werr)
+	}
+	cur, etag, err := w.Store.GetRef(db, branch)
+	if err != nil || !cur.Deleting || cur.DeletingAt != claimed.DeletingAt {
+		return "", failed
+	}
+	if !onlyRenewed(claimed, cur) {
+		w.unwindDeletingClaim(db, branch, claimed.DeletingAt)
+		return "", fmt.Errorf("ops: destroy lost a race on %s@%s to another write of its ref (retry): %w", db, branch, store.ErrCAS)
+	}
+	if !force && store.LeaseLive(cur, time.Now()) {
+		w.unwindDeletingClaim(db, branch, claimed.DeletingAt)
+		return "", destroyLeaseRefusal(db, branch, cur)
+	}
+	return etag, nil
 }
 
 // destroyLeaseRefusal is Destroy's refusal, without --force, of a branch

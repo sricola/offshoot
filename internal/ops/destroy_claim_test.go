@@ -669,3 +669,205 @@ func TestFailedDestroyUnwindsPastARenewal(t *testing.T) {
 		t.Fatalf("the retried destroy --force: %v", err)
 	}
 }
+
+// claimLandsThenFails is landsThenFails on a destroy's claim writes of
+// refKey (the first one lands and reports failure), with the delete kept
+// as the wrapped backend has it: conditional on Local, unconditional on S3.
+type claimLandsThenFails struct{ *landsThenFails }
+
+func newClaimLandsThenFails(base store.Backend, refKey string, err error) claimLandsThenFails {
+	return claimLandsThenFails{&landsThenFails{Backend: base, err: err, match: func(key string, data []byte) bool {
+		var r store.Ref
+		return key == refKey && json.Unmarshal(data, &r) == nil && r.Deleting
+	}}}
+}
+
+func (b claimLandsThenFails) DeleteIf(key, ifMatch string) error {
+	if cd, ok := b.Backend.(store.ConditionalDeleter); ok {
+		return cd.DeleteIf(key, ifMatch)
+	}
+	return b.Backend.Delete(key)
+}
+
+// TestDestroyGoesOnWhenItsClaimLandedButReportedFailure: a destroy's claim
+// write that landed but reported failure (the S3 SDK's retry answering 412
+// or 409 to its own landed first attempt, which the store reports as a lost
+// race, or a timeout that lost the response) leaves this call's own claim
+// on the ref, stamped with its DeletingAt. The destroy recognises the claim
+// as its own and deletes the branch, past a renewal that lands over the
+// claim before it hears back, and the holder's next renewal finds the
+// branch gone. Reporting a lost race instead would leave the claim behind,
+// and the retry the error asks for would be refused under it as "already
+// being destroyed" until it was 30 s old.
+func TestDestroyGoesOnWhenItsClaimLandedButReportedFailure(t *testing.T) {
+	lost := fmt.Errorf("%w: precondition failed on the retry", store.ErrCAS)
+	timeout := errors.New("store: s3 conditional put refs/app/work: context deadline exceeded")
+	for _, bk := range []struct {
+		name string
+		ws   func(*testing.T) *Workspace
+	}{{"local", newWS}, {"s3", newWSOnFakeS3}} {
+		for _, tc := range []struct {
+			name  string
+			err   error
+			renew bool
+		}{
+			{"412 after landing", lost, false},
+			{"timeout after landing", timeout, false},
+			{"412 after landing and a renewal", lost, true},
+			{"timeout after landing and a renewal", timeout, true},
+		} {
+			t.Run(bk.name+"/"+tc.name, func(t *testing.T) {
+				w := bk.ws(t)
+				if err := w.Create("app"); err != nil {
+					t.Fatal(err)
+				}
+				if _, err := w.Fork("app", "main", "work", "", 0, nil); err != nil {
+					t.Fatal(err)
+				}
+				ttl := DefaultLeaseTTL
+				l, err := w.Store.AcquireLease("app", "work", "daemon-a", ttl, time.Now())
+				if err != nil {
+					t.Fatal(err)
+				}
+				base := w.Store.B
+				plain := &store.Store{B: base}
+				renewed := false
+				b := newClaimLandsThenFails(base, store.RefKey("app", "work"), tc.err)
+				if tc.renew {
+					b.after = func() {
+						next, err := plain.RenewLease(l, ttl, time.Now().Add(time.Millisecond))
+						if err != nil {
+							t.Errorf("the holder's renewal over the landed claim: %v", err)
+							return
+						}
+						l, renewed = next, true
+					}
+				}
+				w.Store.B = b
+				derr := w.Destroy("app", "work", true)
+				w.Store.B = base
+				if n := b.hits.Load(); n != 1 {
+					t.Fatalf("precondition: %d claim writes landed and reported failure, want 1", n)
+				}
+				if tc.renew && !renewed {
+					t.Fatal("precondition: no renewal landed over the claim")
+				}
+				if derr != nil {
+					t.Fatalf("destroy --force whose claim landed but reported failure: %v", derr)
+				}
+				if _, _, err := w.Store.GetRef("app", "work"); !errors.Is(err, store.ErrNotFound) {
+					t.Fatalf("the branch after the destroy: %v, want it gone", err)
+				}
+				if _, err := plain.RenewLease(l, ttl, time.Now()); !errors.Is(err, store.ErrNotFound) {
+					t.Fatalf("the holder's next renewal: %v, want ErrNotFound", err)
+				}
+			})
+		}
+	}
+}
+
+// TestDestroyUnwindsALandedClaimItCannotCarryThrough: a destroy whose claim
+// landed but reported failure, and whose ref then moved in a way that
+// stops the destroy (any write but a renewal over the claim, or, without
+// --force, a renewal that makes the lease live again), fails as it would
+// had the same write landed before its delete, and clears its own claim
+// first, so the retry its error asks for is not refused as a branch another
+// destroy has claimed.
+func TestDestroyUnwindsALandedClaimItCannotCarryThrough(t *testing.T) {
+	for _, bk := range []struct {
+		name string
+		ws   func(*testing.T) *Workspace
+	}{{"local", newWS}, {"s3", newWSOnFakeS3}} {
+		for _, tc := range []struct {
+			name    string
+			force   bool
+			lapsed  bool
+			moveRef func(t *testing.T, s *store.Store, l *store.Lease)
+			want    error
+			check   func(t *testing.T, ref store.Ref, l store.Lease)
+		}{
+			{
+				name:  "a touch over the claim",
+				force: true,
+				moveRef: func(t *testing.T, s *store.Store, _ *store.Lease) {
+					ref, etag, err := s.GetRef("app", "work")
+					if err != nil {
+						t.Fatal(err)
+					}
+					ref.Touch(time.Now().Add(time.Second))
+					if _, err := s.PutRef("app", "work", ref, etag); err != nil {
+						t.Errorf("the touch over the landed claim: %v", err)
+					}
+				},
+				want: store.ErrCAS,
+				check: func(t *testing.T, ref store.Ref, _ store.Lease) {
+					if ref.TouchedAt == "" {
+						t.Fatal("the touch over the claim was undone")
+					}
+				},
+			},
+			{
+				name:   "a renewal that makes a lapsed lease live, without --force",
+				force:  false,
+				lapsed: true,
+				moveRef: func(t *testing.T, s *store.Store, l *store.Lease) {
+					next, err := s.RenewLease(*l, DefaultLeaseTTL, time.Now())
+					if err != nil {
+						t.Errorf("the holder's renewal over the landed claim: %v", err)
+						return
+					}
+					*l = next
+				},
+				want: store.ErrLeaseHeld,
+				check: func(t *testing.T, ref store.Ref, l store.Lease) {
+					exp, perr := time.Parse(time.RFC3339Nano, ref.LeaseExpiry)
+					if perr != nil || ref.LeaseHolder != l.Holder || ref.Epoch != l.Epoch || !exp.Equal(l.Expiry) {
+						t.Fatalf("after the refusal: holder %q epoch %d until %s; want the renewed lease", ref.LeaseHolder, ref.Epoch, ref.LeaseExpiry)
+					}
+				},
+			},
+		} {
+			t.Run(bk.name+"/"+tc.name, func(t *testing.T) {
+				w := bk.ws(t)
+				if err := w.Create("app"); err != nil {
+					t.Fatal(err)
+				}
+				if _, err := w.Fork("app", "main", "work", "", 0, nil); err != nil {
+					t.Fatal(err)
+				}
+				at := time.Now()
+				if tc.lapsed {
+					at = at.Add(-2 * DefaultLeaseTTL)
+				}
+				l, err := w.Store.AcquireLease("app", "work", "daemon-a", DefaultLeaseTTL, at)
+				if err != nil {
+					t.Fatal(err)
+				}
+				base := w.Store.B
+				plain := &store.Store{B: base}
+				b := newClaimLandsThenFails(base, store.RefKey("app", "work"), fmt.Errorf("%w: precondition failed on the retry", store.ErrCAS))
+				b.after = func() { tc.moveRef(t, plain, &l) }
+				w.Store.B = b
+				derr := w.Destroy("app", "work", tc.force)
+				w.Store.B = base
+				if n := b.hits.Load(); n != 1 {
+					t.Fatalf("precondition: %d claim writes landed and reported failure, want 1", n)
+				}
+				if !errors.Is(derr, tc.want) {
+					t.Fatalf("destroy: %v, want %v", derr, tc.want)
+				}
+				ref, _, err := w.Store.GetRef("app", "work")
+				if err != nil {
+					t.Fatalf("the branch after the failed destroy: %v", err)
+				}
+				if ref.Deleting {
+					t.Fatalf("the failed destroy left its landed claim: deleting at %q", ref.DeletingAt)
+				}
+				tc.check(t, ref, l)
+				if err := w.Destroy("app", "work", true); err != nil {
+					t.Fatalf("the retried destroy --force: %v", err)
+				}
+			})
+		}
+	}
+}

@@ -883,7 +883,11 @@ leaves such a branch to that destroy. A destroy that fails after its claim
 removes its own claim and no other. Were a claim cleared under its
 destroy, an acquire could take the branch at a new epoch, and on S3, where
 the delete is unconditional, that destroy would then delete the branch
-under the fresh lease.
+under the fresh lease. A claim write that landed but reported failure (on
+S3, the SDK's retry answering 412 or 409 to its own first attempt, or a
+timeout that lost the response) is still the destroy's own claim, which it
+recognises by the claim's timestamp: it goes on and deletes the branch,
+rather than reporting a lost race whose retry its own claim would refuse.
 
 **Backend-specific mechanics** (deliberately: do not pretend S3
 `DeleteObject` has preconditions it doesn't):
