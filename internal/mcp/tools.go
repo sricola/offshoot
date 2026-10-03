@@ -193,8 +193,9 @@ func (t *OffshootTools) openSession(db, branch string) (info daemon.SessionInfo,
 
 // refuseIfSessionOpen refuses opName on db@branch (ok=true, with a
 // ToolResult naming the session) if the daemon has ANY session entry for
-// that branch — healthy, fenced or closing — in its "status" response; ok=false
-// (proceed at rest) if the daemon isn't reachable or has no such entry.
+// that branch — healthy, fenced or closing — in its "status" response;
+// ok=false (proceed at rest) if the daemon isn't reachable or has no such
+// entry.
 //
 // This mirrors internal/daemon's own refuseIfClaimed guard (server.go),
 // which the daemon already enforces against ITS OWN client for exactly
@@ -210,8 +211,7 @@ func (t *OffshootTools) openSession(db, branch string) (info daemon.SessionInfo,
 // A session still "reserved" (an in-flight daemon "open" not yet resolved
 // into a live session) is invisible here: the daemon's "status" op only
 // reports sessions it holds (open, since-fenced or closing), never a bare
-// reservation
-// (see opStatus) — narrower than the daemon's own in-process
+// reservation (see opStatus) — narrower than the daemon's own in-process
 // refuseIfClaimed, and a gap this package shares with any other
 // out-of-band store client.
 //
