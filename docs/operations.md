@@ -204,7 +204,7 @@ section is the operational summary.
 | `flushed` | A flush succeeds (manual or the `-flush-every` timer) |
 | `flush_failed` | A flush fails |
 | `fenced` | A session is fenced out by a lease it no longer holds |
-| `session_closed` | A session's close has finished and the daemon has let go of the branch: acting on it never meets a `closing` refusal |
+| `session_closed` | A session's close has finished and the daemon has let go of the branch: acting on it never meets a `closing` refusal, and it arrives before a reopen's `session_opened` |
 | `reaped` | The janitor destroys a TTL-expired branch |
 | `evicted` | The janitor evicts a `checkouts-ro` entry over `-ro-cache-budget` |
 | `dropped_slow_consumer` | Sent to a subscriber right before it's dropped — never to anyone else |

@@ -7,6 +7,7 @@ import (
 	"errors"
 	"fmt"
 	"net"
+	"runtime"
 	"strings"
 	"sync"
 	"sync/atomic"
@@ -543,6 +544,97 @@ func TestSessionClosedEventFollowsSlotRelease(t *testing.T) {
 	}
 	if r := within(t, closed, "the close"); !r.OK {
 		t.Fatalf("close = %+v", r)
+	}
+}
+
+// parkedIn reports whether, within 10 s, some goroutine's stack runs
+// through every one of fns: a way to see that a goroutine is blocked at a
+// particular call, which no channel or hook reports.
+func parkedIn(fns ...string) bool {
+	buf := make([]byte, 1<<20)
+	for end := time.Now().Add(10 * time.Second); time.Now().Before(end); time.Sleep(time.Millisecond) {
+		n := runtime.Stack(buf, true)
+		for n == len(buf) {
+			buf = make([]byte, 2*len(buf))
+			n = runtime.Stack(buf, true)
+		}
+	stacks:
+		for _, g := range strings.Split(string(buf[:n]), "\n\n") {
+			for _, fn := range fns {
+				if !strings.Contains(g, fn) {
+					continue stacks
+				}
+			}
+			return true
+		}
+	}
+	return false
+}
+
+// TestSessionClosedPrecedesTheReopen: closeSlot publishes session_closed
+// before it closes done and releases s.mu, so nothing can reserve the
+// branch ahead of the event, and a reopen's session_opened always follows
+// it. Published after the unlock, a reopen could reserve and publish
+// session_opened first, and a subscriber tracking the branch from the
+// stream would mark the new session closed. That took the closing
+// goroutine being descheduled between the unlock and the publish, so the
+// test makes that wait: it holds the bus's lock while the close finishes,
+// and once closeSlot is blocked publishing, the slot must still be closing.
+func TestSessionClosedPrecedesTheReopen(t *testing.T) {
+	srv, _ := newServer(t)
+	sock := srv.SocketPath()
+	if r := call(t, sock, Request{Op: "open", DB: "app", Branch: "main"}); !r.OK {
+		t.Fatalf("open = %+v", r)
+	}
+	events, unsubscribe := srv.events.subscribe(64)
+	defer unsubscribe()
+	entered, release := holdNextClose(t)
+	waits := watchCloseWaits(t)
+	closed := goCall(sock, Request{Op: "close", DB: "app", Branch: "main"})
+	within(t, entered, "the close to reach the release hook")
+	m := slotAt(srv, "app@main")
+
+	queued := make(chan bool, 1)
+	openDelay = func() { // the reopen has just reserved app@main
+		for {
+			select {
+			case ev := <-events:
+				if ev.Type == "session_closed" && ev.DB == "app" && ev.Branch == "main" {
+					queued <- true
+					return
+				}
+			default:
+				queued <- false
+				return
+			}
+		}
+	}
+	t.Cleanup(func() { openDelay = nil })
+	reopened := goCall(sock, Request{Op: "open", DB: "app", Branch: "main"})
+	within(t, waits, "the reopen to wait for the close")
+
+	srv.events.mu.Lock()
+	release()
+	if !parkedIn("daemon.(*eventBus).publish", "daemon.(*Server).closeSlot") {
+		srv.events.mu.Unlock()
+		t.Fatal("closeSlot never blocked publishing session_closed")
+	}
+	select {
+	case <-m.done:
+		srv.events.mu.Unlock()
+		t.Fatal("closeSlot let go of app@main before its session_closed was published")
+	default:
+	}
+	srv.events.mu.Unlock()
+
+	if !within(t, queued, "the reopen to reserve app@main") {
+		t.Fatal("the reopen reserved app@main before the closing session's session_closed was queued")
+	}
+	if r := within(t, closed, "the close"); !r.OK {
+		t.Fatalf("close = %+v", r)
+	}
+	if r := within(t, reopened, "the reopen"); !r.OK {
+		t.Fatalf("reopen = %+v", r)
 	}
 }
 

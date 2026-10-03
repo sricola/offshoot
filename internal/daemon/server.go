@@ -117,7 +117,7 @@ type Server struct {
 	// always non-nil once NewServer returns. Fed from the session
 	// transition callback (wireEvents, composed alongside metrics'
 	// observer), the janitor (janitorTick's "reaped" publish) and the
-	// daemon's own closes (publishSessionClosed's session_closed); drained
+	// daemon's own closes (sessionClosedEvent's session_closed); drained
 	// by the unix socket "subscribe" op (streamEvents) and HTTP `GET
 	// /events` (handleEvents). See events.go.
 	events *eventBus
@@ -189,20 +189,28 @@ func (s *Server) markClosingLocked(k string, sl *slot) *slot {
 // closeSlot closes marker m's session with s.mu released — Close is slow,
 // and never takes s.mu, so nothing here can deadlock against it — then, in
 // one s.mu section run from a defer so it happens however Close ends,
-// records the result, deletes k only if it still holds m, and closes
-// m.done. Waiters (opOpen, a duplicate opClose, Shutdown) wait on done,
-// never while holding s.mu. It then publishes session_closed, after the key
-// is free.
+// records the result, deletes k only if it still holds m, publishes
+// session_closed and closes m.done. Waiters (opOpen, a duplicate opClose,
+// Shutdown) wait on done, never while holding s.mu.
 func (s *Server) closeSlot(k string, m *slot) (err error) {
 	defer func() {
+		ev := sessionClosedEvent(m.sess, err) // takes the session's lock, so before s.mu
 		s.mu.Lock()
 		m.err = err
 		if s.sessions[k] == m {
 			delete(s.sessions, k)
 		}
+		// Published after the key is free, so a client acting on it is not
+		// refused as closing, and before done closes and s.mu is released,
+		// so it reaches subscribers ahead of anything a waiter or a fresh
+		// open of k does next. Published after the unlock, a reopen could
+		// reserve k and publish its session_opened first, and a subscriber
+		// tracking the branch from the stream would then mark the new
+		// session closed. publish never blocks, and the bus's lock is a
+		// leaf: nothing holding it takes s.mu.
+		s.events.publish(ev)
 		close(m.done)
 		s.mu.Unlock()
-		s.publishSessionClosed(m.sess, err)
 	}()
 	return m.sess.Close()
 }
@@ -629,7 +637,7 @@ func (s *Server) opOpen(req Request) Response {
 		delete(s.sessions, k)
 		s.mu.Unlock()
 		cerr := sess.Close()
-		s.publishSessionClosed(sess, cerr)
+		s.events.publish(sessionClosedEvent(sess, cerr))
 		s.openWG.Done()
 		return errResp(fmt.Errorf("daemon: shutting down"))
 	}

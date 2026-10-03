@@ -150,7 +150,8 @@ Pin an exact version if you depend on format stability. The full contract:
   to retry instead of to close the session.
 - **`session_closed` fires once the branch is free.** It used to fire from
   inside the close; it now fires after the daemon has let go of the branch,
-  so acting on it never meets a `closing` refusal. It and `fenced` carry the
+  so acting on it never meets a `closing` refusal, and always before the
+  `session_opened` of a reopen of the same branch. It and `fenced` carry the
   session's `holder` and `epoch`.
 - **`/healthz` and `offshoot_sessions_open` count open sessions only**; a
   closing session is not counted, and reports no

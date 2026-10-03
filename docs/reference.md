@@ -1355,7 +1355,7 @@ sees events published *after* it subscribes.
 | `flushed` | A flush succeeds (manual `flush` op or background auto-flush) | `kind` (`manual`/`auto`), `txid`, `duration_seconds` |
 | `flush_failed` | A flush fails | `kind`, `error`, `duration_seconds` |
 | `fenced` | A session is fenced out by a lease it no longer holds | `cause`, `holder`, `epoch` |
-| `session_closed` | A session's close has finished and this daemon has let go of the branch (daemon `close` op, or `shutdown`). Acting on it never meets a `closing` refusal. | `holder`, `epoch`, `error` (only if the close itself errored) |
+| `session_closed` | A session's close has finished and this daemon has let go of the branch (daemon `close` op, or `shutdown`). Acting on it never meets a `closing` refusal, and it arrives before the `session_opened` of any reopen of the branch. | `holder`, `epoch`, `error` (only if the close itself errored) |
 | `reaped` | The janitor destroys a branch whose TTL expired | *(none)* |
 | `evicted` | The janitor evicts a `checkouts-ro` entry over `-ro-cache-budget` | `checkpoint`, `bytes` (a by-chain entry reports branch `~by-chain` and its chain ID as `checkpoint`) |
 | `dropped_slow_consumer` | Sent to a subscriber being dropped (see below), never to anyone else | *(none)* |

@@ -42,7 +42,7 @@ const eventSchemaVersion = 1
 // "session_closed" (the first four sourced from the session
 // transition-callback call site — see sessionEventType; session_closed
 // published by the daemon once the closed session's slot is gone — see
-// publishSessionClosed), "reaped" (sourced
+// sessionClosedEvent), "reaped" (sourced
 // from the janitor's Reap pass — see Server.janitorTick), "evicted"
 // (Milestone 4 Task 5: sourced from the janitor's ro-cache LRU eviction
 // pass — see janitorTick's EvictROCache call; detail carries "checkpoint"
@@ -260,7 +260,7 @@ func (b *eventBus) subscriberCount() int {
 // "sidecar-refresh-skipped" (internal bookkeeping), and "closed", which
 // fires inside Session.Close while the daemon still holds the branch's
 // closing marker. The daemon publishes session_closed itself once the
-// marker is gone (publishSessionClosed).
+// marker is gone (sessionClosedEvent).
 func sessionEventType(event string) (typ string, ok bool) {
 	switch event {
 	case "opened":
@@ -276,20 +276,22 @@ func sessionEventType(event string) (typ string, ok bool) {
 	}
 }
 
-// publishSessionClosed publishes session_closed for sess once this daemon
-// has let go of its branch: closeSlot calls it after deleting the closing
-// marker, and opOpen's shutdown self-close after its Close returns. A
-// client acting on the event then finds the branch free; one acting on
-// the session's own "closed" transition would be refused by every path
-// that refuses a closing branch. holder and epoch let a subscriber match
-// the close to its session_opened.
-func (s *Server) publishSessionClosed(sess *session.Session, err error) {
+// sessionClosedEvent builds session_closed for sess, which this daemon
+// publishes once it has let go of the branch: closeSlot in the same s.mu
+// section that deletes the closing marker, and opOpen's shutdown
+// self-close after its Close returns. A client acting on the event then
+// finds the branch free; one acting on the session's own "closed"
+// transition would be refused by every path that refuses a closing
+// branch. holder and epoch let a subscriber match the close to its
+// session_opened. It takes the session's own lock to read the lease, so
+// closeSlot builds it before taking s.mu.
+func sessionClosedEvent(sess *session.Session, err error) Event {
 	l := sess.Lease()
 	detail := map[string]any{"holder": l.Holder, "epoch": l.Epoch}
 	if err != nil {
 		detail["error"] = err.Error()
 	}
-	s.events.publish(newEvent("session_closed", sess.DB(), sess.Branch(), detail))
+	return newEvent("session_closed", sess.DB(), sess.Branch(), detail)
 }
 
 // kvToDetail converts session.OnTransition's flat key/value slice (see
