@@ -731,6 +731,81 @@ func TestRefusedAdoptionReleasesItsLease(t *testing.T) {
 	assertLeaseReleased(t, w, before)
 }
 
+// landsAfterTheSettleRead answers the first ref PutIf that carries a
+// checkpoint lease with a lost race without writing it, and lands that
+// write just after the next read of the ref returns, running after once it
+// has: an S3 409 answered while the write's first attempt was still in
+// flight, which lands once the checkpoint has re-read the ref and found
+// nothing of its own.
+type landsAfterTheSettleRead struct {
+	store.Backend
+	refKey string
+	after  func()
+
+	mu      sync.Mutex
+	state   int // 0 before the acquire write, 1 while it is held, 2 once it landed
+	held    []byte
+	heldIf  string
+	landErr error
+}
+
+func (b *landsAfterTheSettleRead) PutIf(key string, data []byte, ifMatch string) (string, error) {
+	b.mu.Lock()
+	if b.state == 0 && key == b.refKey && carriesCheckpointLease(data) {
+		b.state, b.held, b.heldIf = 1, data, ifMatch
+		b.mu.Unlock()
+		return "", fmt.Errorf("%w: conflict with an attempt still in flight", store.ErrCAS)
+	}
+	b.mu.Unlock()
+	return b.Backend.PutIf(key, data, ifMatch)
+}
+
+func (b *landsAfterTheSettleRead) Get(key string) ([]byte, string, error) {
+	data, etag, err := b.Backend.Get(key)
+	b.mu.Lock()
+	defer b.mu.Unlock()
+	if key == b.refKey && b.state == 1 {
+		b.state = 2
+		if _, b.landErr = b.Backend.PutIf(key, b.held, b.heldIf); b.landErr == nil && b.after != nil {
+			b.after()
+		}
+	}
+	return data, etag, err
+}
+
+// TestLateAcquireRefusedOnRetryReleasesItsLease: an acquire answered with a
+// lost race whose write lands only after the checkpoint re-read the ref
+// and found nothing of its own leaves the checkpoint retrying, and the
+// retry's read carries our own lease. A checkout detached in between is
+// refused there, and that lease is released, so a checkpoint that never
+// started does not leave the branch refused to every writer for a TTL.
+func TestLateAcquireRefusedOnRetryReleasesItsLease(t *testing.T) {
+	w := newWS(t)
+	seedDB(t, w, "app", 1<<16)
+	path := w.CheckoutPath("app", "main")
+	mustSQL(t, path, "INSERT INTO t (v) VALUES (randomblob(100));")
+	before := refOf(t, w, "app", "main")
+	rec, ok := readSidecar(path)
+	if !ok {
+		t.Fatal("setup: the checkout has no sidecar")
+	}
+	b := &landsAfterTheSettleRead{Backend: w.Store.B, refKey: store.RefKey("app", "main"), after: func() {
+		if err := StampSumHashOnly(path, rec.Hash, "another-lineage", rec.Epoch, rec.TXID, rec.PostApplyChecksum, rec.ChainID); err != nil {
+			t.Error(err)
+		}
+	}}
+	w.Store.B = b
+	_, err := w.CheckpointWith("app", "main", "a", nil, CheckpointOptions{})
+	w.Store.B = b.Backend
+	if b.state != 2 || b.landErr != nil {
+		t.Fatalf("precondition: the held acquire did not land after the settle read (state %d, %v)", b.state, b.landErr)
+	}
+	if !errors.Is(err, ErrDetachedCheckout) {
+		t.Fatalf("a checkpoint whose retry read found its own late acquire on a detached checkout: %v, want a detached refusal", err)
+	}
+	assertLeaseReleased(t, w, before)
+}
+
 // TestStragglerUnderOldEpochCannotAnchorHead: objects earlier writers left
 // under the current epoch and never committed (an attempt from before
 // checkpoints took the lease, or a fenced one) — a snapshot and a segment at
