@@ -39,6 +39,15 @@ const tombstoneKey = "gc/tombstones"
 // The lease holder's renewals do not stop under the claim
 // (store.RenewLease), so one can land between the claim and the delete;
 // see deleteClaimedRef for how the delete gets past it.
+//
+// One destroy never claims over another's live claim (liveDeleteClaim):
+// it is refused with store.ErrDeleting, retryable, and writes nothing,
+// force or not. And a destroy that fails after its claim unwinds its own
+// claim only (unwindDeletingClaim). Either way a claim stays on the ref
+// for as long as the destroy that wrote it may still delete: were it
+// cleared under that destroy, an acquire could take the branch at a new
+// epoch, and on S3 that destroy's unconditional delete would remove the
+// branch under the fresh lease.
 func (w *Workspace) Destroy(db, branch string, force bool) error {
 	if err := store.ValidateName(db); err != nil {
 		return err
@@ -58,6 +67,10 @@ func (w *Workspace) Destroy(db, branch string, force bool) error {
 		if perr == nil && time.Now().Before(exp) {
 			return destroyLeaseRefusal(db, branch, ref)
 		}
+	}
+	if liveDeleteClaim(ref, time.Now()) {
+		return fmt.Errorf("ops: %s@%s is already being destroyed (claimed at %s); retry once that destroy ends, or once its claim is %s old if it was interrupted: %w",
+			db, branch, ref.DeletingAt, staleDeletingClaimAfter, store.ErrDeleting)
 	}
 
 	// CAS claim: mark the ref as being deleted. A concurrent AcquireLease
@@ -81,7 +94,7 @@ func (w *Workspace) Destroy(db, branch string, force bool) error {
 			// the claim eagerly rather than leave it for
 			// ClearStaleDeleteClaims's age-based self-heal to eventually
 			// catch.
-			w.unwindDeletingClaim(db, branch)
+			w.unwindDeletingClaim(db, branch, ref.DeletingAt)
 			return fmt.Errorf("ops: checkout in use; close connections before destroy: %w", err)
 		}
 	}
@@ -92,7 +105,7 @@ func (w *Workspace) Destroy(db, branch string, force bool) error {
 	// this against a concurrent AcquireLease/Destroy on every backend. See
 	// store.DeleteRefIf's doc comment.
 	if err := w.deleteClaimedRef(db, branch, ref, claimEtag, force); err != nil {
-		w.unwindDeletingClaim(db, branch)
+		w.unwindDeletingClaim(db, branch, ref.DeletingAt)
 		return err
 	}
 	// Best-effort checkout removal: the ref is already gone, so a failed
@@ -143,12 +156,12 @@ const destroyDeleteAttempts = 4
 // Without force, Destroy went ahead only because the lease had lapsed; if
 // its holder has renewed it since, the destroy is refused as a live lease,
 // as it would have been had the renewal landed before its read. Any other
-// change to the ref (a flush, a touch, a release, another destroy's claim,
-// the janitor clearing this one), or a renewal before every attempt, fails
-// the destroy as a lost race (retryable, ErrCAS). On S3 the delete is
-// unconditional and never loses a compare-and-swap, so none of this runs
-// there: a renewal between the claim and the delete is not seen, and the
-// branch is deleted, forced or not.
+// change to the ref (a flush, a touch, a release, another destroy's claim
+// over this one, the janitor clearing this one), or a renewal before every
+// attempt, fails the destroy as a lost race (retryable, ErrCAS). On S3 the
+// delete is unconditional and never loses a compare-and-swap, so none of
+// this runs there: a renewal between the claim and the delete is not seen,
+// and the branch is deleted, forced or not.
 func (w *Workspace) deleteClaimedRef(db, branch string, claimed store.Ref, etag string, force bool) error {
 	for attempt := 1; ; attempt++ {
 		err := w.Store.DeleteRefIf(db, branch, etag)
@@ -183,18 +196,44 @@ func onlyRenewed(claimed, cur store.Ref) bool {
 	return aerr == nil && berr == nil && bytes.Equal(a, b)
 }
 
-// unwindDeletingClaim best-effort clears a Deleting claim this Destroy call
-// itself just landed but could not carry through to a successful delete (a
-// checkout-quiesce failure, a DeleteRefIf error). A lost CAS race here
-// (someone else already cleared or reclaimed this ref in the meantime) is
-// benign — the same idempotent-unwind shape as reapOne's own Reaping unwind
-// on a failed Destroy call.
-func (w *Workspace) unwindDeletingClaim(db, branch string) {
-	if ref, etag, err := w.Store.GetRef(db, branch); err == nil && ref.Deleting {
+// unwindDeletingClaim best-effort clears the Deleting claim this Destroy
+// call landed, stamped claimedAt, when the call cannot carry it through to
+// a delete (a checkout-quiesce failure, a failed or lost delete). It
+// clears that claim and no other: a claim with another DeletingAt belongs
+// to a destroy that wrote over this one (an older binary, which claims
+// over any claim, or one that found this claim stale) and may still be
+// between its claim and its delete, so clearing it would open the window
+// the claim closes (see Destroy). The holder's renewals write over the
+// claim and leave it set, so a write that loses its compare-and-swap
+// re-reads and tries again while the claim is still this call's, up to
+// destroyDeleteAttempts writes. A claim the unwind could not clear blocks
+// acquires and other destroys until it is staleDeletingClaimAfter old,
+// when ClearStaleDeleteClaims clears it and a destroy takes it over.
+func (w *Workspace) unwindDeletingClaim(db, branch, claimedAt string) {
+	for attempt := 1; attempt <= destroyDeleteAttempts; attempt++ {
+		ref, etag, err := w.Store.GetRef(db, branch)
+		if err != nil || !ref.Deleting || ref.DeletingAt != claimedAt {
+			return
+		}
 		ref.Deleting = false
 		ref.DeletingAt = ""
-		_, _ = w.Store.PutRef(db, branch, ref, etag) // best effort; ClearStaleDeleteClaims retries later regardless
+		if _, err := w.Store.PutRef(db, branch, ref, etag); !errors.Is(err, store.ErrCAS) {
+			return
+		}
 	}
+}
+
+// liveDeleteClaim reports whether ref carries a destroy's claim made less
+// than staleDeletingClaimAfter before now, so that its destroy may still be
+// between its claim and its delete. A claim whose DeletingAt cannot be
+// read is not live: ClearStaleDeleteClaims never clears one, and only a
+// destroy taking it over gets the branch out from under it.
+func liveDeleteClaim(ref store.Ref, now time.Time) bool {
+	if !ref.Deleting {
+		return false
+	}
+	at, err := time.Parse(time.RFC3339Nano, ref.DeletingAt)
+	return err == nil && now.Sub(at) < staleDeletingClaimAfter
 }
 
 // staleDeletingClaimAfter bounds how long a Destroy claim (Ref.Deleting) can

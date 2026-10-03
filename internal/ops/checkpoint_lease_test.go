@@ -2082,7 +2082,13 @@ func TestHeadWriteSentBeforeAClaimKeepsItsObject(t *testing.T) {
 		want   error
 	}{
 		{"destroy", func(r *store.Ref) { r.Deleting, r.DeletingAt = true, time.Now().UTC().Format(time.RFC3339Nano) },
-			func(t *testing.T, w *Workspace) { w.unwindDeletingClaim("app", "main") }, store.ErrDeleting},
+			func(t *testing.T, w *Workspace) {
+				ref, _, err := w.Store.GetRef("app", "main")
+				if err != nil {
+					t.Fatal(err)
+				}
+				w.unwindDeletingClaim("app", "main", ref.DeletingAt)
+			}, store.ErrDeleting},
 		{"reap", func(r *store.Ref) { r.Reaping = true }, func(t *testing.T, w *Workspace) {
 			ref, etag, err := w.Store.GetRef("app", "main")
 			if err != nil {

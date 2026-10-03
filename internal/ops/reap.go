@@ -103,6 +103,15 @@ func (w *Workspace) reapOne(db, branch string, now time.Time) (bool, error) {
 		return false, nil
 	}
 
+	if liveDeleteClaim(ref, time.Now()) {
+		// A destroy has claimed the branch and may still be on its way to
+		// its delete: it removes the branch, or unwinds its claim and a
+		// later cycle re-evaluates. A reaping claim now would move the etag
+		// that destroy's conditional delete compares against, and this
+		// cycle's own Destroy would be refused under the live claim.
+		return false, nil
+	}
+
 	// CAS claim: mark the ref as reaping. A concurrent Touch either landed
 	// first (our PutRef fails on ErrCAS -> re-evaluate next cycle) or will
 	// fail loudly on seeing Reaping (see Touch).
@@ -121,6 +130,11 @@ func (w *Workspace) reapOne(db, branch string, now time.Time) (bool, error) {
 		if ref2, etag2, gerr := w.Store.GetRef(db, branch); gerr == nil && ref2.Reaping {
 			ref2.Reaping = false
 			_, _ = w.Store.PutRef(db, branch, ref2, etag2) // best effort; next cycle retries
+		}
+		if errors.Is(err, store.ErrDeleting) {
+			// A destroy claimed the branch after this cycle read it: the
+			// branch is that destroy's to finish, as above.
+			return false, nil
 		}
 		return false, err
 	}

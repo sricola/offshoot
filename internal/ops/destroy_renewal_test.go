@@ -170,8 +170,10 @@ func (b *writeBeforeRefDelete) DeleteIf(key, ifMatch string) error {
 // that went ahead on a lapsed lease does not delete one its holder renewed
 // in that window on Local, where it can see it: it is refused as a live
 // lease. Any other write fails the destroy as a lost race (retryable), as
-// does a renewal before every attempt; each refusal unwinds the claim and
-// leaves the branch.
+// does a renewal before every attempt; each refusal leaves the branch and
+// unwinds its own claim, and only that: another destroy's claim written
+// over it (an older binary's, or one that found this claim stale) stays,
+// since that destroy may still be between its claim and its delete.
 func TestDestroyDeletesPastARenewalOverItsClaim(t *testing.T) {
 	type outcome int
 	const (
@@ -179,6 +181,7 @@ func TestDestroyDeletesPastARenewalOverItsClaim(t *testing.T) {
 		lostRace          // ErrCAS, branch kept, claim unwound
 		leaseHeld         // ErrLeaseHeld, branch and lease kept, claim unwound
 	)
+	othersAt := time.Now().Add(time.Second).UTC().Format(time.RFC3339Nano)
 	for _, tc := range []struct {
 		name    string
 		s3      bool
@@ -188,6 +191,9 @@ func TestDestroyDeletesPastARenewalOverItsClaim(t *testing.T) {
 		write   func(*store.Ref) // the write; nil is the holder's RenewLease
 		want    outcome
 		deletes int32 // deletes Destroy sends, when it matters
+		// The write is another destroy's claim (DeletingAt othersAt),
+		// which the refused destroy must leave on the ref.
+		othersClaim bool
 	}{
 		{name: "forced/local", force: true, n: 1, want: deleted, deletes: 2},
 		{name: "forced/s3", s3: true, force: true, n: 1, want: deleted, deletes: 1},
@@ -199,8 +205,8 @@ func TestDestroyDeletesPastARenewalOverItsClaim(t *testing.T) {
 		{name: "flush/local", force: true, n: 1, write: func(r *store.Ref) { r.HeadTXID++ }, want: lostRace},
 		{name: "release/local", force: true, n: 1, write: func(r *store.Ref) { r.LeaseHolder, r.LeaseExpiry = "", "" }, want: lostRace},
 		{name: "another destroy's claim/local", force: true, n: 1, write: func(r *store.Ref) {
-			r.DeletingAt = time.Now().Add(time.Second).UTC().Format(time.RFC3339Nano)
-		}, want: lostRace},
+			r.DeletingAt = othersAt
+		}, want: lostRace, othersClaim: true},
 		{name: "a renewal and a touch/local", force: true, n: 1, write: func(r *store.Ref) {
 			r.LeaseExpiry = time.Now().Add(time.Minute).UTC().Format(time.RFC3339Nano)
 			r.Touch(time.Now().Add(time.Second))
@@ -284,6 +290,15 @@ func TestDestroyDeletesPastARenewalOverItsClaim(t *testing.T) {
 			}
 			if gerr != nil {
 				t.Fatalf("the refused destroy removed the branch: %v", gerr)
+			}
+			if tc.othersClaim {
+				if !ref.Deleting || ref.DeletingAt != othersAt {
+					t.Fatalf("the refused destroy unwound another destroy's claim: deleting %v at %q, want the claim made at %q", ref.Deleting, ref.DeletingAt, othersAt)
+				}
+				if _, err := w.Store.AcquireLease("app", "work", "daemon-b", ttl, time.Now()); !errors.Is(err, store.ErrDeleting) {
+					t.Fatalf("acquire under the other destroy's claim: %v, want ErrDeleting", err)
+				}
+				return
 			}
 			if ref.Deleting {
 				t.Fatalf("the refused destroy left its claim: deleting at %q", ref.DeletingAt)

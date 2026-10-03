@@ -1,6 +1,7 @@
 package ops
 
 import (
+	"encoding/json"
 	"errors"
 	"sync"
 	"testing"
@@ -264,5 +265,117 @@ func TestReapedLineageIsCollectableByGC(t *testing.T) {
 	}
 	if len(keys) != 0 {
 		t.Fatalf("reaped lineage must be swept by GC, %d objects remain", len(keys))
+	}
+}
+
+// TestReapLeavesABranchADestroyHasClaimed: a branch whose TTL has expired
+// but which a destroy has claimed and not yet deleted is that destroy's to
+// finish. The reap pass reports no error, reaps nothing and writes nothing
+// to the ref: its reaping claim would move the etag the destroy's
+// conditional delete compares against, and its own destroy would be
+// refused under the live claim. Once the claim is stale (its destroy was
+// killed), the reaper takes the branch as usual.
+func TestReapLeavesABranchADestroyHasClaimed(t *testing.T) {
+	w := newWS(t)
+	if err := w.Create("app"); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := w.Fork("app", "main", "expired", "", 0, nil); err != nil {
+		t.Fatal(err)
+	}
+	now := time.Now().UTC()
+	setTTLAt(t, w, "app", "expired", "1h", now.Add(-3*time.Hour).Format(time.RFC3339Nano))
+	claim := func(at time.Time) string {
+		t.Helper()
+		ref, etag, err := w.Store.GetRef("app", "expired")
+		if err != nil {
+			t.Fatal(err)
+		}
+		ref.Deleting, ref.DeletingAt = true, at.Format(time.RFC3339Nano)
+		etag, err = w.Store.PutRef("app", "expired", ref, etag)
+		if err != nil {
+			t.Fatal(err)
+		}
+		return etag
+	}
+	etag := claim(now)
+	reaped, err := w.Reap(now)
+	if err != nil || len(reaped) != 0 {
+		t.Fatalf("reap of a branch a destroy has claimed = %v, %v; want nothing reaped and no error", reaped, err)
+	}
+	ref, after, err := w.Store.GetRef("app", "expired")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if after != etag || ref.Reaping {
+		t.Fatalf("the reap pass wrote the claimed ref (reaping %v)", ref.Reaping)
+	}
+	claim(now.Add(-2 * staleDeletingClaimAfter))
+	reaped, err = w.Reap(now)
+	if err != nil || len(reaped) != 1 || reaped[0] != "app@expired" {
+		t.Fatalf("reap under a stale destroy claim = %v, %v; want [app@expired]", reaped, err)
+	}
+}
+
+// claimAfterReapingClaim lands a destroy's claim on refKey right after the
+// reaper's own claim (Reaping set, no destroy claim yet) is written.
+type claimAfterReapingClaim struct {
+	store.Backend
+	refKey string
+	once   sync.Once
+	claim  func()
+}
+
+func (b *claimAfterReapingClaim) PutIf(key string, data []byte, ifMatch string) (string, error) {
+	etag, err := b.Backend.PutIf(key, data, ifMatch)
+	if err == nil && key == b.refKey {
+		var r store.Ref
+		if json.Unmarshal(data, &r) == nil && r.Reaping && !r.Deleting {
+			b.once.Do(b.claim)
+		}
+	}
+	return etag, err
+}
+
+// TestReapLeavesABranchADestroyClaimsMidReap: a destroy claims an expired
+// branch after the reap pass read it and claimed it for reaping. The
+// pass's own Destroy is refused under that live claim; the pass unwinds
+// its reaping claim, reports no error, reaps nothing, and leaves the
+// destroy's claim.
+func TestReapLeavesABranchADestroyClaimsMidReap(t *testing.T) {
+	w := newWS(t)
+	if err := w.Create("app"); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := w.Fork("app", "main", "expired", "", 0, nil); err != nil {
+		t.Fatal(err)
+	}
+	now := time.Now().UTC()
+	setTTLAt(t, w, "app", "expired", "1h", now.Add(-3*time.Hour).Format(time.RFC3339Nano))
+	base := w.Store.B
+	plain := &store.Store{B: base}
+	claimedAt := now.Format(time.RFC3339Nano)
+	w.Store.B = &claimAfterReapingClaim{Backend: base, refKey: store.RefKey("app", "expired"), claim: func() {
+		ref, etag, err := plain.GetRef("app", "expired")
+		if err != nil {
+			t.Error(err)
+			return
+		}
+		ref.Deleting, ref.DeletingAt = true, claimedAt
+		if _, err := plain.PutRef("app", "expired", ref, etag); err != nil {
+			t.Error(err)
+		}
+	}}
+	reaped, err := w.Reap(now)
+	w.Store.B = base
+	if err != nil || len(reaped) != 0 {
+		t.Fatalf("reap of a branch a destroy claimed mid-reap = %v, %v; want nothing reaped and no error", reaped, err)
+	}
+	ref, _, err := w.Store.GetRef("app", "expired")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if ref.Reaping || !ref.Deleting || ref.DeletingAt != claimedAt {
+		t.Fatalf("after the pass: reaping %v, deleting %v at %q; want the reaping claim unwound and the destroy's claim made at %q", ref.Reaping, ref.Deleting, ref.DeletingAt, claimedAt)
 	}
 }

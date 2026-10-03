@@ -3,8 +3,10 @@ package ops
 import (
 	"encoding/json"
 	"errors"
+	"fmt"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"testing"
 	"time"
 
@@ -365,5 +367,305 @@ func TestRenewingHolderSurvivesAStrandedDestroyClaim(t *testing.T) {
 	}
 	if _, err := w.Store.RenewLease(l, ttl, time.Now()); err != nil {
 		t.Fatalf("the holder's first renewal after the clear: %v", err)
+	}
+}
+
+// otherClaimBeforeRefDelete stands in for a second destroy of the same
+// branch: ahead of the first delete of refKey it runs claim, which writes
+// that destroy's claim over the one on the ref, as an older binary (which
+// claims over any claim) or a destroy that found this claim stale does.
+// With fail set, every delete of refKey then fails with a store error that
+// is not a lost compare-and-swap, as a throttled S3 DeleteObject does;
+// otherwise the wrapped backend's delete runs as it is (conditional on
+// Local, where it loses its compare-and-swap to that write).
+type otherClaimBeforeRefDelete struct {
+	store.Backend
+	refKey string
+	fail   bool
+	once   sync.Once
+	claim  func()
+}
+
+func (b *otherClaimBeforeRefDelete) DeleteIf(key, ifMatch string) error {
+	if key == b.refKey {
+		b.once.Do(b.claim)
+		if b.fail {
+			return fmt.Errorf("store: s3 delete %s: 503 SlowDown", key)
+		}
+	}
+	if cd, ok := b.Backend.(store.ConditionalDeleter); ok {
+		return cd.DeleteIf(key, ifMatch)
+	}
+	return b.Backend.Delete(key)
+}
+
+// TestFailedDestroyLeavesAnotherDestroysClaim: a destroy that fails after
+// its claim unwinds its own claim and nothing else. Here a second
+// destroy's claim lands over the first's before the first deletes, and the
+// first then fails: on Local its conditional delete loses to that write,
+// on S3 the delete itself fails. The second destroy may still be between
+// its claim and its delete, so its claim must stand and keep acquires off
+// (ErrDeleting). Clearing it would let a session or a checkpoint take the
+// branch at a new epoch, and on S3 the second destroy's unconditional
+// delete would then remove the branch under that live lease.
+func TestFailedDestroyLeavesAnotherDestroysClaim(t *testing.T) {
+	for _, tc := range []struct {
+		name string
+		ws   func(*testing.T) *Workspace
+		s3   bool
+	}{
+		{"local", newWS, false},
+		{"s3", newWSOnFakeS3, true},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			w := tc.ws(t)
+			if err := w.Create("app"); err != nil {
+				t.Fatal(err)
+			}
+			if _, err := w.Fork("app", "main", "work", "", 0, nil); err != nil {
+				t.Fatal(err)
+			}
+			base := w.Store.B
+			plain := &store.Store{B: base}
+			othersAt := time.Now().Add(time.Second).UTC().Format(time.RFC3339Nano)
+			b := &otherClaimBeforeRefDelete{Backend: base, refKey: store.RefKey("app", "work"), fail: tc.s3, claim: func() {
+				ref, etag, err := plain.GetRef("app", "work")
+				if err != nil {
+					t.Error(err)
+					return
+				}
+				if !ref.Deleting {
+					t.Error("precondition: the first destroy's claim is not on the ref")
+				}
+				ref.Deleting, ref.DeletingAt = true, othersAt
+				if _, err := plain.PutRef("app", "work", ref, etag); err != nil {
+					t.Error(err)
+				}
+			}}
+			w.Store.B = b
+			err := w.Destroy("app", "work", true)
+			w.Store.B = base
+			switch {
+			case err == nil:
+				t.Fatal("the first destroy succeeded; want it failed after its claim")
+			case tc.s3 && !strings.Contains(err.Error(), "503 SlowDown"):
+				t.Fatalf("the first destroy: %v, want the failed delete", err)
+			case !tc.s3 && !errors.Is(err, store.ErrCAS):
+				t.Fatalf("the first destroy: %v, want a lost race (ErrCAS)", err)
+			}
+			ref, _, err := w.Store.GetRef("app", "work")
+			if err != nil {
+				t.Fatalf("the failed destroy removed the branch: %v", err)
+			}
+			if !ref.Deleting || ref.DeletingAt != othersAt {
+				t.Fatalf("the failed destroy unwound another destroy's claim: deleting %v at %q, want the claim made at %q", ref.Deleting, ref.DeletingAt, othersAt)
+			}
+			if _, err := w.Store.AcquireLease("app", "work", "daemon-b", DefaultLeaseTTL, time.Now()); !errors.Is(err, store.ErrDeleting) {
+				t.Fatalf("acquire under the other destroy's claim: %v, want ErrDeleting", err)
+			}
+		})
+	}
+}
+
+// heldRefDelete holds the first delete of refKey until release is closed,
+// closing arrived when that delete gets there. Later deletes are not held
+// and do not wait for the first.
+type heldRefDelete struct {
+	store.Backend
+	refKey  string
+	held    atomic.Bool
+	arrived chan struct{}
+	release chan struct{}
+}
+
+func (b *heldRefDelete) DeleteIf(key, ifMatch string) error {
+	if key == b.refKey && b.held.CompareAndSwap(false, true) {
+		close(b.arrived)
+		<-b.release
+	}
+	if cd, ok := b.Backend.(store.ConditionalDeleter); ok {
+		return cd.DeleteIf(key, ifMatch)
+	}
+	return b.Backend.Delete(key)
+}
+
+// TestDestroyRefusesABranchAnotherDestroyHasClaimed: while one `destroy
+// --force` sits between its claim and its delete, a second one is refused
+// (ErrDeleting, retryable) and writes nothing; the first then deletes the
+// branch. Claiming over the first's claim instead would leave the branch
+// with no claim at all once the second failed and unwound its own, and on
+// S3 the first's unconditional delete would then remove a branch an
+// acquire had taken in between.
+func TestDestroyRefusesABranchAnotherDestroyHasClaimed(t *testing.T) {
+	for _, tc := range []struct {
+		name string
+		ws   func(*testing.T) *Workspace
+	}{
+		{"local", newWS},
+		{"s3", newWSOnFakeS3},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			w := tc.ws(t)
+			if err := w.Create("app"); err != nil {
+				t.Fatal(err)
+			}
+			if _, err := w.Fork("app", "main", "work", "", 0, nil); err != nil {
+				t.Fatal(err)
+			}
+			base := w.Store.B
+			b := &heldRefDelete{Backend: base, refKey: store.RefKey("app", "work"), arrived: make(chan struct{}), release: make(chan struct{})}
+			w.Store.B = b
+			first := make(chan error, 1)
+			go func() { first <- w.Destroy("app", "work", true) }()
+			select {
+			case <-b.arrived:
+			case err := <-first:
+				t.Fatalf("the first destroy ended before its delete: %v", err)
+			case <-time.After(10 * time.Second):
+				t.Fatal("the first destroy never reached its delete")
+			}
+			claimed, etag, cerr := w.Store.GetRef("app", "work")
+			second := w.Destroy("app", "work", true)
+			after, afterEtag, aerr := w.Store.GetRef("app", "work")
+			close(b.release)
+			ferr := <-first
+			w.Store.B = base
+			if !errors.Is(second, store.ErrDeleting) || errors.Is(second, store.ErrCAS) {
+				t.Fatalf("a second destroy --force under the first's claim: %v, want it refused with ErrDeleting", second)
+			}
+			if cerr != nil || aerr != nil {
+				t.Fatalf("reading the claimed ref: %v, %v", cerr, aerr)
+			}
+			if afterEtag != etag || after.DeletingAt != claimed.DeletingAt {
+				t.Fatalf("the refused destroy wrote the ref: claim at %q (etag %q), want %q (etag %q)", after.DeletingAt, afterEtag, claimed.DeletingAt, etag)
+			}
+			if ferr != nil {
+				t.Fatalf("the first destroy: %v", ferr)
+			}
+			if _, _, err := w.Store.GetRef("app", "work"); !errors.Is(err, store.ErrNotFound) {
+				t.Fatalf("the branch after the first destroy: %v, want it gone", err)
+			}
+		})
+	}
+}
+
+// TestDestroyTakesOverAClaimNoDestroyIsUsing: a claim staleDeletingClaimAfter
+// old (its destroy was killed, or failed and could not unwind it), or one
+// whose DeletingAt cannot be read (which ClearStaleDeleteClaims never
+// clears), does not refuse a destroy: it claims over it and deletes.
+func TestDestroyTakesOverAClaimNoDestroyIsUsing(t *testing.T) {
+	for _, tc := range []struct {
+		name string
+		at   string
+	}{
+		{"stale", time.Now().Add(-2 * staleDeletingClaimAfter).UTC().Format(time.RFC3339Nano)},
+		{"unreadable", "not a time"},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			w := newWS(t)
+			if err := w.Create("app"); err != nil {
+				t.Fatal(err)
+			}
+			if _, err := w.Fork("app", "main", "work", "", 0, nil); err != nil {
+				t.Fatal(err)
+			}
+			ref, etag, err := w.Store.GetRef("app", "work")
+			if err != nil {
+				t.Fatal(err)
+			}
+			ref.Deleting, ref.DeletingAt = true, tc.at
+			if _, err := w.Store.PutRef("app", "work", ref, etag); err != nil {
+				t.Fatal(err)
+			}
+			if err := w.Destroy("app", "work", false); err != nil {
+				t.Fatalf("destroy over a %s claim: %v", tc.name, err)
+			}
+			if _, _, err := w.Store.GetRef("app", "work"); !errors.Is(err, store.ErrNotFound) {
+				t.Fatalf("the branch after the destroy: %v, want it gone", err)
+			}
+		})
+	}
+}
+
+// renewalBeforeUnwind fails every delete of refKey with a store error
+// that is not a lost compare-and-swap, and runs renew ahead of the first
+// write of refKey that clears a destroy claim (the failed destroy's
+// unwind), so that write loses its compare-and-swap to the renewal.
+type renewalBeforeUnwind struct {
+	store.Backend
+	refKey string
+	once   sync.Once
+	renew  func()
+}
+
+func (b *renewalBeforeUnwind) PutIf(key string, data []byte, ifMatch string) (string, error) {
+	if key == b.refKey {
+		var r store.Ref
+		if json.Unmarshal(data, &r) == nil && !r.Deleting {
+			b.once.Do(b.renew)
+		}
+	}
+	return b.Backend.PutIf(key, data, ifMatch)
+}
+
+func (b *renewalBeforeUnwind) DeleteIf(key, ifMatch string) error {
+	if key == b.refKey {
+		return fmt.Errorf("store: s3 delete %s: 503 SlowDown", key)
+	}
+	return b.Backend.(store.ConditionalDeleter).DeleteIf(key, ifMatch)
+}
+
+// TestFailedDestroyUnwindsPastARenewal: a destroy whose delete fails
+// unwinds its claim even when the holder's renewal (which writes over the
+// claim and leaves it set) wins the unwind's first compare-and-swap; the
+// unwind re-reads and clears the claim, which is still its own. The
+// renewed lease stays, and the operator's retry is not refused as a
+// branch another destroy has claimed.
+func TestFailedDestroyUnwindsPastARenewal(t *testing.T) {
+	w := newWS(t)
+	if err := w.Create("app"); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := w.Fork("app", "main", "work", "", 0, nil); err != nil {
+		t.Fatal(err)
+	}
+	ttl := DefaultLeaseTTL
+	l, err := w.Store.AcquireLease("app", "work", "daemon-a", ttl, time.Now())
+	if err != nil {
+		t.Fatal(err)
+	}
+	base := w.Store.B
+	plain := &store.Store{B: base}
+	renewed := false
+	b := &renewalBeforeUnwind{Backend: base, refKey: store.RefKey("app", "work"), renew: func() {
+		next, err := plain.RenewLease(l, ttl, time.Now().Add(time.Millisecond))
+		if err != nil {
+			t.Errorf("the holder's renewal over the claim: %v", err)
+			return
+		}
+		l, renewed = next, true
+	}}
+	w.Store.B = b
+	derr := w.Destroy("app", "work", true)
+	w.Store.B = base
+	if derr == nil || !strings.Contains(derr.Error(), "503 SlowDown") {
+		t.Fatalf("destroy: %v, want the failed delete", derr)
+	}
+	if !renewed {
+		t.Fatal("precondition: no renewal landed ahead of the unwind")
+	}
+	ref, _, err := w.Store.GetRef("app", "work")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if ref.Deleting {
+		t.Fatalf("the failed destroy left its claim: deleting at %q", ref.DeletingAt)
+	}
+	exp, perr := time.Parse(time.RFC3339Nano, ref.LeaseExpiry)
+	if perr != nil || ref.LeaseHolder != l.Holder || ref.Epoch != l.Epoch || !exp.Equal(l.Expiry) {
+		t.Fatalf("after the unwind: holder %q epoch %d until %s; want the renewed lease", ref.LeaseHolder, ref.Epoch, ref.LeaseExpiry)
+	}
+	if err := w.Destroy("app", "work", true); err != nil {
+		t.Fatalf("the retried destroy --force: %v", err)
 	}
 }

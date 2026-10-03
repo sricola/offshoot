@@ -847,7 +847,9 @@ point) are reclaimed on the normal GC schedule right away. In short:
 child.**
 
 **Errors:** protected without `--force`; live lease without `--force`;
-checkout is busy (close connections first); the destroy lost a race to a
+checkout is busy (close connections first); `is already being destroyed`
+while another destroy of the branch is between its claim and its delete,
+with or without `--force` (retry; see below); the destroy lost a race to a
 concurrent `AcquireLease` on the same branch, or to another write of its
 ref between its claim and its delete, such as a flush, a `touch` or a
 lease renewal before every one of its 4 delete attempts (retry — see
@@ -872,6 +874,16 @@ above — an operator's explicit override of *those* — never the claim
 itself. A lease acquired a moment before a forced destroy lands still wins
 the underlying compare-and-swap on the ref, and the forced destroy reports
 a retryable race loss exactly like an unforced one would.
+
+A claim stays on the ref for as long as the destroy that wrote it may
+still delete. A second destroy of the same branch, forced or not, is
+refused with `is already being destroyed` (`store.ErrDeleting`, retryable)
+and writes nothing while the claim is under 30 seconds old, and the reaper
+leaves such a branch to that destroy. A destroy that fails after its claim
+removes its own claim and no other. Were a claim cleared under its
+destroy, an acquire could take the branch at a new epoch, and on S3, where
+the delete is unconditional, that destroy would then delete the branch
+under the fresh lease.
 
 **Backend-specific mechanics** (deliberately: do not pretend S3
 `DeleteObject` has preconditions it doesn't):
@@ -901,7 +913,10 @@ daemon's janitor self-heals this on the same cadence as reap/GC: a
 filesystem operations plus at most one checkout quiesce — anything stuck
 longer means the process that claimed it is gone) is cleared, and the
 branch becomes destroyable/leasable again. `offshoot gc` triggers the same
-self-heal on demand, same as it does for a stranded reap claim.
+self-heal on demand, same as it does for a stranded reap claim. A
+`destroy` takes over a claim that old itself, without waiting for the
+janitor, as it does a claim whose timestamp cannot be read (which the
+janitor never clears).
 
 ## `offshoot gc [--grace duration]`
 

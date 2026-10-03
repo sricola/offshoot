@@ -165,7 +165,9 @@ short-circuit).
 
 **A branch that refuses `open`** with "branch is being deleted" or "branch
 is being reaped" is mid-`destroy`/mid-reap, not stuck — the claim is
-transient (retry shortly). None of the six states above surface that claim:
+transient (retry shortly). A `destroy` of it is refused the same way, with
+"is already being destroyed", until that destroy ends or its claim is 30
+seconds old. None of the six states above surface that claim:
 they're computed purely from the ref's lease and the checkout's sidecar,
 which a Destroy/Reap claim doesn't touch, so `status`/`branches` reads that
 same branch as `idle` (or `active`, if it still carries a lease at that

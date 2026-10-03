@@ -35,6 +35,21 @@ Pin an exact version if you depend on format stability. The full contract:
   the holder renewed it in that window. Any other write in between (a
   flush, a `touch`, a release) still fails the destroy, now with `destroy
   lost a race ... (retry)`. On S3 the delete was already unconditional.
+- **A destroy that failed after its claim cleared another destroy's
+  claim, which on S3 could delete a branch under a fresh lease.** Two
+  destroys of one branch (a second `destroy --force`, or the reaper's on a
+  lapsed lease) could both claim it, the second writing over the first.
+  When either then failed (a busy checkout, a failed or lost delete), it
+  cleared whatever claim was on the ref, so a session or a checkpoint
+  could take the branch while the other destroy was still on its way to
+  its delete; on S3, whose delete is unconditional, that destroy then
+  deleted the branch under the fresh lease and reported success. A
+  destroy now clears only its own claim, retrying past the holder's lease
+  renewals, and a destroy of a branch another destroy claimed less than
+  30 s ago is refused, forced or not, with `is already being destroyed`
+  (retryable; `errors.Is(err, store.ErrDeleting)`) and writes nothing.
+  The reaper leaves such a branch to that destroy. A claim 30 s old, or
+  one whose timestamp cannot be read, is still taken over.
 - **`checkpoint --force` on a branch with a live session wrote a second
   writer's head under the session's epoch.** The docs said `--force`
   fenced the session; it did not. It wrote the head and a checkpoint entry
