@@ -393,6 +393,20 @@ open wart (its own spec said "N materialized forks cost up to N×G").
     the only update path; no `apt-get upgrade` at build time, because an
     unpinned upgrade would make the image non-reproducible and silently
     diverge from the digest the SLSA provenance names.
+- ⏭ **A local lineage listing that does not grow with its epochs.** Since
+  at-rest checkpoints take the branch lease, each one writes under its own
+  epoch, and a local store keeps one directory per epoch, so resolving a
+  lineage's chain reads one more directory per checkpoint it has taken:
+  16 ms after 1,000 checkpoints on one lineage, against 1.2 ms when they
+  shared an epoch ([benchmarks](docs/benchmarks.md)). A `compact` resets
+  it, and S3 is unaffected. Candidates, cheapest first: let a segment
+  checkpoint reuse the chain it resolved last time plus its own object
+  instead of re-listing; remove an epoch directory once it is empty (this
+  bounds GC'd and failed attempts, not kept checkpoints); a local layout
+  that lists a lineage in one directory read, behind a store migration.
+  Not reusing an epoch: `lease release` and forced repoints clear a live
+  checkpoint's lease without bumping it, so two checkpoints could then
+  share a key.
 
 ## Launch track (parallel to v0.1–v0.3)
 

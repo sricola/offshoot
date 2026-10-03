@@ -51,7 +51,10 @@ SQLite client opens. You have nine tools; the loop is four calls.
    runs long. A protected branch (or one under a live lease) refuses, and
    `force` is refused too unless the operator started
    `offshoot mcp -allow-force` — do not retry with force; ask the human, who
-   can destroy from the CLI.
+   can destroy from the CLI. A refusal that says another checkpoint is in
+   progress (a lease holder starting `checkpoint:`) is the exception: that
+   lease ends on its own within seconds, so wait and retry the same call
+   rather than asking the human.
 
 ## Rules
 

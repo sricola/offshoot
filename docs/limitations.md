@@ -328,6 +328,15 @@ milliseconds don't):
 - **A session whose checkout had to be (re)materialized pays one settling
   full-snapshot flush** after open — O(size), once per session; reopening
   a clean, current checkout uploads nothing.
+- **An at-rest `checkpoint` takes the branch lease, which costs one more
+  durable ref write** (checkpoint p50 about 3 ms higher one at a time, 11
+  ms eight at a time). *Caveat:* each one writes under its own epoch, so
+  on a local store each leaves one more directory under its lineage, and
+  resolving that lineage's chain (a segment checkpoint, `checkout`,
+  `fork`) reads them all: 1.6 ms after 100 checkpoints on one lineage, 16
+  ms after 1,000. A branch that checkpoints after every step of a long
+  run slows down until a `compact` starts a fresh lineage
+  ([the numbers](benchmarks.md#branchbench-topologies-v0212)).
 
 ## Smaller edges worth knowing
 

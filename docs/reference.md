@@ -373,26 +373,39 @@ status` and in the daemon's `branches` op, whose `lease_holder` (and both
 SDKs' `Branch.lease_holder`) names the checkpoint, as does `offshoot lease
 list`. If the checkpoint fails after the acquire it releases the lease; if
 its process dies, the lease expires after 30 s and the next writer
-reclaims it. Each checkpoint reads the ref three times and writes it
-twice (plus one read and one write per renewal), where it used to read
-and write it once each. The extra write is the acquire, and it is
-durable, so it costs time: one more fsync on a local store, one more
-conditional `PUT` on S3. On a local macOS store BranchBench measured
-checkpoint p50 about 3 ms higher one at a time and about 11 ms higher
-eight at a time (more on a heavily loaded machine, where the fsyncs
-queue); see [benchmarks](benchmarks.md). A head write that loses its
-compare-and-swap to a `touch`, `protect` or TTL change is retried, up to
-three attempts.
+reclaims it. Each checkpoint reads the ref twice and writes it twice
+(plus one read and one write per renewal), where it used to read and
+write it once each: the acquire, whose read the refusals below run on,
+and the head write. The extra write is the acquire, and it is durable,
+so it costs time. On a local store it is one more fsync, nearly all of
+the difference (a ref read takes about 0.1 ms there); on a local macOS
+store BranchBench measured checkpoint p50 about 3 ms higher one at a
+time and about 11 ms higher eight at a time (more on a heavily loaded
+machine, where the fsyncs queue). On S3 every request is a round trip: a
+snapshot checkpoint makes one more `GET` and one more conditional `PUT`
+of the ref, in sequence, and a segment checkpoint makes as many requests
+as before, the extra `GET` and `PUT` in place of the two `LIST`s it no
+longer needs. On a local store each checkpoint also leaves one more
+`data/<lineage>/<epoch>/` directory, and listing a lineage reads them
+all, so resolving the branch's chain (a segment checkpoint's own
+resolve, `checkout`, `fork`) slows as checkpoints accumulate on one
+lineage: about 1.6 ms after 100 checkpoints and 16 ms after 1,000,
+against well under a millisecond for one; `compact` starts a fresh
+lineage and resets it. See [benchmarks](benchmarks.md). A head write
+that loses its compare-and-swap to a `touch`, `protect` or TTL change is
+retried, up to three attempts.
 
 **Refusals, and `--force`.** A checkpoint is refused when the branch has
 a **live lease** — an open daemon session, `offshoot lease acquire`, or
 another checkpoint in progress — with or without `--force`: the
 checkpoint takes the lease itself, so it waits its turn rather than write
-under another writer's epoch. Close the session (or wait for the other
-checkpoint) and retry. If the holder is gone (a daemon that was killed
-with a session open, a `lease acquire` nobody will release), `offshoot
-lease release <db>@<branch>` frees the lease at once, as the refusal
-says; an expired lease is reclaimed without any flag. A
+under another writer's epoch. Under another checkpoint's lease, retry
+when it finishes, in a few seconds: its lease lapses on its own 30 s
+after its process dies. Under a session's, close the session and retry;
+if the holder is gone (a daemon that was killed with a session open, a
+`lease acquire` nobody will release), `offshoot lease release
+<db>@<branch>` frees the lease at once, as the refusal says. An expired
+lease is reclaimed without any flag. A
 checkpoint is also refused when the checkout is **detached** — its
 sidecar records a lineage the branch no longer points at, because the
 branch was repointed (`rollback`, `promote`, `compact`) after the
@@ -404,7 +417,13 @@ outright; no flag overrides that. `rollback`, `promote --onto` (the target
 only) and `compact` apply the same live-lease, destroy and reap rules,
 except that `--force` does override a live lease for them: the repoint
 clears it, fencing a session (its unflushed writes are lost) or making a
-checkpoint in progress fail without committing.
+checkpoint in progress fail without committing. Their refusal of a
+checkpoint's lease says to retry when it finishes. A forced repoint
+reads the ref, copies objects and then compare-and-swaps the ref; when
+that takes longer than the renewal interval (10 s), say for a large
+database on S3, every attempt loses to the next renewal and returns
+`lost a race (retry)` until the checkpoint ends, as it does against a
+daemon session's renewals.
 
 **Errors:** checkpoint name already exists on this branch; no checkout
 exists yet (run `checkout` first); checkout is busy; live lease (a
@@ -416,13 +435,21 @@ forced repoint, `lease release`, a reclaim after it expired, or
 `destroy --force`, whose claim the head write also refuses to write
 over), in which case nothing was committed and the checkpoint deletes its
 own object; the head write lost three compare-and-swaps to concurrent
-ref writes (retry); an object with other bytes already sits at the
+ref writes (retry; the object is left for GC, since on S3 a conflict
+answer does not rule out an earlier attempt of the write still landing);
+the object's create-only put reported its key taken but nothing could be
+read back there (retry); an object with other bytes already sits at the
 checkpoint's own key, which nothing else writes (store corruption; the
-object is left in place). One outcome is not a failure but an unknown:
-the checkpoint **may have committed** when a head write failed without a
-verdict from the store (a timeout, a 5xx the SDK gave up on) and the ref
-cannot show whether it landed, because the store may still apply it, the
-branch has moved since, or the ref cannot be read. The checkpoint then
+object is left in place); the branch moved under the checkpoint's own
+lease, which only an older offshoot binary's `checkpoint --force` can do
+(the object is kept, since the head may name it; upgrade every binary).
+One outcome is not a failure but an unknown: the checkpoint **may have
+committed** when a head write failed without a verdict from the store (a
+timeout, a 5xx the SDK gave up on) and the ref cannot show whether it
+landed, because the store may still apply it, the branch has moved
+since, the ref cannot be read, or a destroy or reap has claimed the
+branch since (an abandoned claim puts the ref back exactly as the write
+found it). The checkpoint then
 keeps its object, so a head or a fork that names it still materializes,
 and a retry under the same name is refused as already existing if it did
 commit.
@@ -787,10 +814,15 @@ child, whether that child is a shared (copy-on-write) fork or a
 materialized one. `--force` is required to destroy a protected branch
 (`main` by default), and also to destroy a branch under an active lease (a
 live holder may still be mid-write; without `--force` this is refused
-outright). A forced destroy under an at-rest checkpoint in progress makes
-that checkpoint fail without committing, whether a renewal finds the
-branch gone or the head write finds the destroy's claim; it deletes its
-own object and leaves the claim alone.
+outright); under an at-rest checkpoint's lease the refusal says to retry
+when it finishes, in a few seconds. A forced destroy under an at-rest
+checkpoint in progress makes that checkpoint fail without committing,
+whether a renewal finds the branch gone or the head write finds the
+destroy's claim; it deletes its own object and leaves the claim alone
+(unless a head write it had already sent may still land, in which case
+it keeps the object and reports that it may have committed). Lease
+renewals, a checkpoint's or a session's, do not write over the claim, so
+they cannot fail the destroy's conditional delete.
 
 **Under copy-on-write, "destroyed" and "reclaimed" are different events.**
 Destroying a branch removes its ref immediately, but if any surviving
@@ -1054,7 +1086,13 @@ offshoot lease release app@main
 ```
 
 Releases the branch's current lease (looked up first via the same listing
-`lease list` uses).
+`lease list` uses), whoever holds it. It is meant for a holder that is
+gone. Released under a live holder, the lease's next use fails: a daemon
+session is fenced (its next renewal or flush fails, and whatever it had
+not flushed never reaches the store), and an at-rest checkpoint fails
+without committing and deletes its object. A checkpoint's lease
+(`checkpoint:<host>/<pid>/<nonce>`) never needs this: it ends with the
+checkpoint, or lapses on its own 30 s after its process dies.
 
 **Errors:** no lease currently held on that branch.
 

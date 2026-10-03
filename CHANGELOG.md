@@ -26,11 +26,10 @@ Pin an exact version if you depend on format stability. The full contract:
   the session went on flushing on top of an object it had not written, a
   shape the chain resolver assumes cannot happen. `--force` no longer
   overrides a live lease on `checkpoint`: the checkpoint is refused, the
-  session is untouched, and the message says to close the session (or wait
-  for the other checkpoint) and retry, or, if the holder is gone (a killed
-  daemon, a `lease acquire` nobody will release), to free the lease with
-  `offshoot lease release <db>@<branch>`. `--force` still checkpoints a
-  detached checkout.
+  session is untouched, and the message says to close the session and
+  retry, or, if the holder is gone (a killed daemon, a `lease acquire`
+  nobody will release), to free the lease with `offshoot lease release
+  <db>@<branch>`. `--force` still checkpoints a detached checkout.
 - **Two at-rest checkpoints on one branch could still leave the head on the
   wrong content.** v0.2.13 made two racers survivable by checking, after
   the winner's ref write, whether the store still held its content. Two
@@ -47,12 +46,35 @@ Pin an exact version if you depend on format stability. The full contract:
 
 - **A second `offshoot checkpoint` on a branch is refused while the first
   runs**, with `has a live lease held by "checkpoint:<host>/<pid>/<nonce>"
-  ... (another checkpoint is in progress)`, instead of racing it. So is a
-  session open on the branch (the daemon's `open`, both SDKs) and an
-  unforced `rollback`, `promote --onto`, `compact` or `destroy`; forced, a
-  repoint clears the checkpoint's lease, and the checkpoint fails without
-  committing and deletes its object. Every at-rest live-lease refusal now
-  satisfies `errors.Is(err, store.ErrLeaseHeld)`.
+  ... (another checkpoint is in progress)` and the advice to retry when it
+  finishes, instead of racing it. So is a session open on the branch (the
+  daemon's `open`, both SDKs) and an unforced `rollback`, `promote
+  --onto`, `compact` or `destroy`, each of which also says to retry when
+  the checkpoint finishes, in a few seconds (a checkpoint's lease lapses on
+  its own 30 s after its process dies, so none suggests closing a session
+  or `lease release`); forced, a repoint clears the checkpoint's lease, and
+  the checkpoint fails without committing and deletes its object. Every
+  at-rest live-lease refusal now satisfies `errors.Is(err,
+  store.ErrLeaseHeld)`.
+- **Live-lease refusals no longer offer a `--force` the caller does not
+  have.** MCP's `offshoot_rollback` (which has no `force`), and
+  `offshoot_promote` and `offshoot_destroy` on a server without
+  `-allow-force`, drop ops' `--force` advice: under a checkpoint's lease
+  they say to retry, and under any other lease `offshoot_promote` now names
+  the human's CLI command, as `offshoot_destroy` already did. The daemon's
+  `rollback` and `compact` ops (and so both SDKs' `rollback` and
+  `compact`), which take no force, drop it too. `offshoot_checkpoint`'s
+  refusal of a detached checkout names `offshoot_checkout` to refresh it,
+  and the human's `offshoot checkpoint ... --force` for edits that must
+  win, instead of a `--force` the tool does not accept; Go callers test it
+  with `errors.Is(err, ops.ErrDetachedCheckout)`. The plugin skill tells
+  agents to retry a refusal that names a `checkpoint:` holder.
+- **A lease renewal no longer writes over a destroy or reap claim.** A
+  session's or checkpoint's renewal that lands between `destroy --force`'s
+  claim and its conditional delete used to move the etag that delete
+  compares against, so the destroy failed and unwound; now the renewal is
+  skipped (`store: branch is being deleted`, retried on the next tick, with
+  the lease's two missed renewals of slack) and the destroy goes through.
 - **A checkpoint can now fail after it has started, in two new ways, and
   can end without knowing whether it committed.** If its lease ends while
   it runs (a forced repoint, `offshoot lease release`, `destroy --force`,
@@ -63,38 +85,76 @@ Pin an exact version if you depend on format stability. The full contract:
   deletes the object it uploaded; it leaves that claim alone, so the
   destroy goes through. If `touch`, `protect` or a TTL change win the head
   write's compare-and-swap three times running, it reports `the head write
-  lost 3 compare-and-swaps to concurrent ref writes (retry)`, deletes its
-  object and releases the lease, so a retry starts clean. Neither moves
-  the head. If a head write fails without a verdict from the store (a
-  timeout, a 5xx the SDK gave up on) and the ref then cannot show whether
-  it landed, because the store may still apply it, the branch has moved
-  on, or the ref cannot be read, the checkpoint reports that it `may have
-  committed` and keeps its object: deleting it could leave the head, or a
-  fork taken in between, naming an object that is gone. A retry under the
-  same name is refused as already existing if it did commit.
-- **An at-rest checkpoint makes three more ref requests and, for a
-  segment, two fewer `LIST`s.** It reads the ref, acquires the lease (a
-  read and a write), renews it every `LeaseTTL/3` (10 s by default; one
-  read and one write each) while it uploads, and commits with a read and a
-  write that also releases the lease. The probes for another checkpoint's
-  snapshot at its txid, one `LIST` before the write and one after, are
-  gone. The head write retries up to three times when a `touch`, `protect`
-  or TTL change wins the compare-and-swap, and the lease acquire and the
-  head write each recognise their own write when only the response was
-  lost, as when the S3 SDK retries a write that had landed.
-- **An at-rest checkpoint is slower by one durable ref write.** The lease
-  acquire is a second ref write per checkpoint, and it has to be durable
-  to fence anything: one more fsync on a local store (`F_FULLFSYNC` on
-  macOS), one more conditional `PUT` round trip on S3. BranchBench's
-  `simulation` workflow on a local macOS store, alternating builds before
-  and after this change, measured checkpoint p50 at 45.2 → 48.5 ms one at
-  a time and 114.8 → 126.1 ms eight at a time (p99 170.5 → 187.6 ms), with
-  the full workflow's wall time unchanged within noise; on a heavily loaded
-  machine, where concurrent fsyncs queue, the eight-way gap measured 20 to
-  40 ms. The numbers are in [benchmarks](docs/benchmarks.md).
+  lost 3 compare-and-swaps to concurrent ref writes (retry; ...)` and
+  releases the lease. Neither moves the head. Once a head write has been
+  sent, the checkpoint deletes its object only when the ref proves no
+  write of its own landed and none still can. A store can apply a write
+  after the client gave up on it: a timeout or a 5xx gets no verdict, and
+  on S3 a 409 conflict, reported as a lost compare-and-swap, can be the
+  SDK's retry colliding with its own first attempt still in flight. So
+  the object is kept for GC after three lost compare-and-swaps; and when
+  the head write failed and the ref then cannot show whether it landed,
+  because the store may still apply it, the branch has moved on, the ref
+  cannot be read, or a destroy or reap claimed the branch afterwards (an
+  abandoned claim is undone to the very bytes the write was sent
+  against), the checkpoint reports that it `may have committed` and keeps
+  its object: deleting it could leave the head, or a fork taken in
+  between, naming an object that is gone. A retry under the same name is
+  refused as already existing if it did commit.
+- **An at-rest checkpoint makes two more ref requests and, for a
+  segment, two fewer `LIST`s.** It acquires the lease with a read and a
+  write (its refusals, a live lease, a taken name, a missing or detached
+  checkout, run on that read, before the write, so a refused checkpoint
+  writes nothing), renews it every `LeaseTTL/3` (10 s by default; one read
+  and one write each) while it uploads, and commits with a read and a
+  write that also releases the lease, where it used to read and write the
+  ref once each. The probes for another checkpoint's snapshot at its txid,
+  one `LIST` before the write and one after, are gone. The head write
+  makes up to three attempts when a `touch`, `protect` or TTL change wins
+  the compare-and-swap, and the lease acquire and the head write each
+  recognise their own write when only the response was lost, as when the
+  S3 SDK retries a write that had landed; an acquire recognised that way
+  is adopted without another write.
+- **An at-rest checkpoint is slower.** The lease acquire is a second ref
+  write per checkpoint, and it has to be durable to fence anything. On a
+  local store that is one more fsync (`F_FULLFSYNC` on macOS), and it is
+  nearly all of the cost, since a ref read there takes about 0.1 ms.
+  BranchBench's `simulation` workflow on a local macOS store, alternating
+  builds before and after this change, measured checkpoint p50 at 45.2 →
+  48.5 ms one at a time and 114.8 → 126.1 ms eight at a time (p99 170.5 →
+  187.6 ms), with the full workflow's wall time unchanged within noise; on
+  a heavily loaded machine, where concurrent fsyncs queue, the eight-way
+  gap measured 20 to 40 ms. On S3, where every request is a round trip, a
+  snapshot checkpoint makes one more `GET` and one more conditional `PUT`
+  of the ref than before, in sequence; a segment checkpoint makes the
+  same number of requests as before, one more `GET` and `PUT` in place of
+  two `LIST`s. The numbers are in [benchmarks](docs/benchmarks.md).
+- **On a local store, resolving a branch's chain gets slower with every
+  at-rest checkpoint the branch's lineage has taken.** Each checkpoint
+  writes under the epoch its acquire minted, so it leaves one more
+  `data/<lineage>/<epoch>/` directory, and a local listing of the lineage
+  reads every one: a segment checkpoint's own chain resolve, and every
+  `checkout`, `fork` and materialize of the branch or of a fork resolving
+  through it. Measured on the machine in [benchmarks](docs/benchmarks.md)
+  (`BenchmarkChainAfterCheckpoints`), resolving the head's chain took
+  1.6 ms after 100 checkpoints and 16 ms after 1,000, where it took 0.2 ms
+  and 1.2 ms with every checkpoint in one directory before this change.
+  `compact` (or a rollback or promote) starts a fresh lineage and resets
+  it; a daemon
+  session, which writes all its flushes under one epoch, adds one
+  directory per session, as before. S3 lists a lineage flat and is
+  unaffected.
 - Upgrade every `offshoot` binary that touches a store together: an older
-  binary's `checkpoint --force` still writes under whatever epoch the ref
-  carries, including one a newer checkpoint's lease holds.
+  binary's `checkpoint --force` still goes past a live lease and writes
+  under whatever epoch the ref carries, including one a newer checkpoint's
+  lease holds, at the very key that checkpoint writes. A newer checkpoint
+  that finds such a head under its own epoch keeps the object rather than
+  delete what the head may name, and says the branch moved under its
+  lease; but if a renewal moves the ref between the older binary's read
+  and its head write, the older binary's own cleanup deletes the shared
+  object and the newer checkpoint can then commit a head that names it,
+  after which `checkout`, `checkout --at` and `fork` of the branch fail
+  until it is rolled back to an earlier checkpoint.
 
 ### Added
 

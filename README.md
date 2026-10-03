@@ -314,9 +314,11 @@ Longer: [core concepts (glossary)](docs/concepts.md), [architecture](docs/archit
   from the store is checksum-verified (CRC64, per-page and rolling
   checksums) and a corrupt object fails closed; a crash at any point in
   checkpoint, flush, fork, rollback, promote or compact leaves at most an
-  unreferenced object, because the ref update is always last; a fenced
-  writer cannot advance a ref; fuzzing covers the decoder, the sidecar
-  and the wire protocol.
+  unreferenced object, because the ref update that commits is always
+  last (an at-rest checkpoint also takes the branch lease first, and a
+  crash leaves that lease on the branch until it lapses after 30 s or
+  `offshoot lease release` frees it); a fenced writer cannot advance a
+  ref; fuzzing covers the decoder, the sidecar and the wire protocol.
 - **Also proven by test, nightly:** the capture engine itself survives
   `SIGKILL`. A second harness runs the capturer in a child process, kills
   it with `SIGKILL` mid-traffic every round, restarts it on the same state
