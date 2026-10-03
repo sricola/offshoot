@@ -310,6 +310,14 @@ func (c checkpointCommit) renewLost(err error) error {
 	return fmt.Errorf("ops: checkpoint %q on %s@%s did not commit: its lease ended while it ran: %w", c.name, c.db, c.branch, err)
 }
 
+// mayHaveCommitted is the error for a checkpoint whose head write was sent
+// and failed, when the ref cannot settle whether that write landed or
+// still will: why says what is unknown, and err, the failure behind it, is
+// wrapped. The object is kept in every such case (see commitCheckpoint).
+func (c checkpointCommit) mayHaveCommitted(why string, err error) error {
+	return fmt.Errorf("ops: checkpoint %q on %s@%s may have committed: %s: %w", c.name, c.db, c.branch, why, err)
+}
+
 // checkpointCommitAttempts bounds the head write. With the premise intact,
 // a lost compare-and-swap can only be a writer that left our lease, lineage
 // and head alone (touch, protect, a TTL change); each lands once, so three
@@ -338,27 +346,49 @@ func (c checkpointCommit) unreferenced(cur store.Ref) bool {
 // checkpoint and releases the lease, re-reading and reapplying up to
 // checkpointCommitAttempts times when a write fails with the premise still
 // intact. On error, deletable reports whether our object provably is
-// unreferenced: no head write was sent, or the ref shows none landed.
-// After one was sent and the ref no longer proves that (a repoint
-// replaced the lineage, the branch is gone), the object is left to GC,
-// since a write that landed may be what a fork now reads through.
+// unreferenced and will stay so: no head write was sent, or the ref shows
+// none landed and none still can. Otherwise the object is left to GC and
+// the error says the checkpoint may have committed: after a write was
+// sent, a ref that moved to another lineage (a repoint) or could not be
+// read proves nothing, and a write that landed may be what a fork now
+// reads through.
+//
+// A head write that failed with anything but a lost compare-and-swap (a
+// timeout, a 5xx the SDK gave up on) got no verdict from the store, which
+// can still apply it for as long as the ref keeps the etag it was sent
+// against; session flush never deletes after such an error for the same
+// reason. A ref that has changed since settles it, because the etag moved
+// on. Giving up with the premise intact does not, since the ref may still
+// carry that etag, so the object is kept then too. GC keeps an object
+// above the head at the ref's own epoch, and reclaims it once the next
+// acquire bumps the epoch if no head write ever named it.
 func (w *Workspace) commitCheckpoint(c checkpointCommit) (committed store.Ref, deletable bool, err error) {
 	attempts := 0
-	var lastErr error
+	var lastErr, unsettled error
 	for {
 		cur, etag, gerr := w.Store.GetRef(c.db, c.branch)
 		if gerr != nil {
-			return store.Ref{}, attempts == 0, c.unconfirmed(gerr)
+			if attempts == 0 || errors.Is(gerr, store.ErrNotFound) {
+				return store.Ref{}, attempts == 0, c.unconfirmed(gerr)
+			}
+			return store.Ref{}, false, c.mayHaveCommitted(fmt.Sprintf("its head write failed (%v), and the ref could not be re-read to tell whether it landed, so its object is kept", lastErr), gerr)
 		}
 		if attempts > 0 && c.landed(cur) {
 			return cur, false, nil
 		}
 		if !c.premise(cur) {
-			return store.Ref{}, attempts == 0 || c.unreferenced(cur), c.lostTo(cur)
+			if attempts == 0 || c.unreferenced(cur) {
+				return store.Ref{}, true, c.lostTo(cur)
+			}
+			return store.Ref{}, false, c.mayHaveCommitted(fmt.Sprintf("its head write failed, and the branch moved before the checkpoint could re-read it (it is now at lineage %s, head txid %d), so whether that write landed first cannot be told; its object is kept, since a fork may read through it", cur.Lineage, cur.HeadTXID), lastErr)
 		}
 		if attempts == checkpointCommitAttempts {
+			if unsettled != nil {
+				return store.Ref{}, false, c.mayHaveCommitted("a head write failed without a verdict from the store, which may still apply it, so its object is kept (a retry under the same name is refused as already existing if it did)", unsettled)
+			}
 			// The premise holds, so the head is still txid-1 on our
-			// lineage: nothing names our object.
+			// lineage, and the store refused every write outright: nothing
+			// names our object, and nothing still can.
 			return store.Ref{}, true, fmt.Errorf("ops: checkpoint %q on %s@%s: the head write lost %d compare-and-swaps to concurrent ref writes (retry): %w",
 				c.name, c.db, c.branch, attempts, lastErr)
 		}
@@ -369,6 +399,9 @@ func (w *Workspace) commitCheckpoint(c checkpointCommit) (committed store.Ref, d
 			return next, false, nil
 		}
 		lastErr = perr
+		if !errors.Is(perr, store.ErrCAS) {
+			unsettled = perr
+		}
 	}
 }
 

@@ -141,10 +141,13 @@ func carriesCheckpointLease(data []byte) bool {
 // landsThenFails forwards the first PutIf that match accepts to the store
 // and then reports failure anyway: the AWS SDK's retry answering 412 to its
 // own first attempt that landed, or a timeout that lost the response.
+// after, when set, runs between the two: whatever other writers do before
+// the caller hears back.
 type landsThenFails struct {
 	store.Backend
 	match func(key string, data []byte) bool
 	err   error
+	after func()
 	hits  atomic.Int32
 }
 
@@ -152,6 +155,9 @@ func (b *landsThenFails) PutIf(key string, data []byte, ifMatch string) (string,
 	etag, err := b.Backend.PutIf(key, data, ifMatch)
 	if err != nil || !b.match(key, data) || b.hits.Add(1) > 1 {
 		return etag, err
+	}
+	if b.after != nil {
+		b.after()
 	}
 	return "", b.err
 }
@@ -1415,4 +1421,196 @@ func TestHeadWriteThatFailedThenLostTheLeaseDeletesItsObject(t *testing.T) {
 	if storeHas(w, privateSnapshotKey(before)) {
 		t.Fatal("the object was left behind although the ref proves nothing names it")
 	}
+}
+
+// errHeadWriteTimeout is a head write the client gave up on: no verdict
+// from the store, which may still apply it.
+var errHeadWriteTimeout = errors.New("store: s3 conditional put refs/app/main: context deadline exceeded")
+
+// verdictlessHeadWrites answers the ref PutIfs that record the checkpoint
+// name in turn from script: "cas" refuses one without writing, a
+// compare-and-swap lost to a metadata write; "pending" holds one back
+// without writing and reports errHeadWriteTimeout, a request the client gave
+// up on that the store has yet to apply. The held write is applied, under
+// the etag it was sent with, just before the second ref read after the
+// script runs out. The checkpoint's give-up read is the first, so that is
+// the release's: the last moment the store could still apply it, since the
+// release then moves the etag on.
+type verdictlessHeadWrites struct {
+	store.Backend
+	refKey, name string
+	script       []string
+	mu           sync.Mutex
+	sent, reads  int
+	held         func() error
+	applied      bool
+	appliedErr   error
+}
+
+func (b *verdictlessHeadWrites) PutIf(key string, data []byte, ifMatch string) (string, error) {
+	if key != b.refKey || !recordsCheckpoint(data, b.name) {
+		return b.Backend.PutIf(key, data, ifMatch)
+	}
+	b.mu.Lock()
+	defer b.mu.Unlock()
+	if b.sent == len(b.script) {
+		return b.Backend.PutIf(key, data, ifMatch)
+	}
+	step := b.script[b.sent]
+	b.sent++
+	if step == "pending" {
+		body := append([]byte(nil), data...)
+		b.held = func() error {
+			_, err := b.Backend.PutIf(key, body, ifMatch)
+			return err
+		}
+		return "", errHeadWriteTimeout
+	}
+	return "", fmt.Errorf("%w: refused for the test", store.ErrCAS)
+}
+
+func (b *verdictlessHeadWrites) Get(key string) ([]byte, string, error) {
+	if key == b.refKey {
+		b.mu.Lock()
+		if b.sent == len(b.script) && b.held != nil {
+			if b.reads++; b.reads == 2 {
+				b.appliedErr, b.applied = b.held(), true
+				b.held = nil
+			}
+		}
+		b.mu.Unlock()
+	}
+	return b.Backend.Get(key)
+}
+
+// TestHeadWriteWithoutAVerdictKeepsItsObject: a head write that timed out
+// got no verdict from the store, which can still apply it while the ref
+// keeps the etag it was sent against. Giving up with the premise intact
+// leaves that etag in place, so the checkpoint keeps its object and says it
+// may have committed rather than that it lost compare-and-swaps; when the
+// store then applies the write, the head names an object that is still
+// there. The timeout can be the last attempt, or an earlier one whose etag
+// the later, refused attempts shared, so the last error alone does not
+// settle it.
+func TestHeadWriteWithoutAVerdictKeepsItsObject(t *testing.T) {
+	for name, script := range map[string][]string{
+		"last attempt timed out":  {"cas", "cas", "pending"},
+		"first attempt timed out": {"pending", "cas", "cas"},
+	} {
+		t.Run(name, func(t *testing.T) {
+			w := newWS(t)
+			seedDB(t, w, "app", 1<<16)
+			path := w.CheckoutPath("app", "main")
+			mustSQL(t, path, "INSERT INTO t (v) VALUES (randomblob(100));")
+			before := refOf(t, w, "app", "main")
+			b := &verdictlessHeadWrites{Backend: w.Store.B, refKey: store.RefKey("app", "main"), name: "a", script: script}
+			w.Store.B = b
+			_, err := w.CheckpointWith("app", "main", "a", nil, CheckpointOptions{Snapshot: true})
+			w.Store.B = b.Backend
+			if !errors.Is(err, errHeadWriteTimeout) || !strings.Contains(err.Error(), "may have committed") || strings.Contains(err.Error(), "compare-and-swaps") {
+				t.Fatalf("checkpoint whose head write got no verdict: %v, want a may-have-committed error wrapping the timeout", err)
+			}
+			if !b.applied || b.appliedErr != nil {
+				t.Fatalf("precondition: the held head write was not applied before the release (applied %v: %v)", b.applied, b.appliedErr)
+			}
+			ref := refOf(t, w, "app", "main")
+			if ref.HeadTXID != before.HeadTXID+1 || ref.Checkpoints["a"].TXID != ref.HeadTXID || ref.LeaseHolder != "" {
+				t.Fatalf("after the late head write: head %d entry %+v holder %q", ref.HeadTXID, ref.Checkpoints["a"], ref.LeaseHolder)
+			}
+			if !storeHas(w, privateSnapshotKey(before)) {
+				t.Fatal("the object was deleted while a head write the store could still apply named it")
+			}
+			if _, err := w.CheckoutAt("app", "main", "a", false); err != nil {
+				t.Fatalf("the head the late write committed does not materialize: %v", err)
+			}
+		})
+	}
+}
+
+// TestHeadWriteThatLandedThenMovedKeepsItsObject: a head write that landed
+// but reported a timeout, after which the checkpoint cannot tell from the
+// ref that it did. Either the branch was forked at the new checkpoint (the
+// fork reads through its object) and then rolled back, which the landed
+// write's lease release lets through unforced and which replaces the
+// lineage, or the ref could not be read at all. The ref proves neither
+// that the write landed nor that it did not, so the checkpoint keeps its
+// object, reports that it may have committed, and the fork, or the head,
+// materializes.
+func TestHeadWriteThatLandedThenMovedKeepsItsObject(t *testing.T) {
+	refKey := store.RefKey("app", "main")
+	recordsA := func(key string, data []byte) bool { return key == refKey && recordsCheckpoint(data, "a") }
+	setup := func(t *testing.T) (*Workspace, store.Ref, []byte) {
+		t.Helper()
+		w := newWS(t)
+		seedDB(t, w, "app", 1<<16)
+		path := w.CheckoutPath("app", "main")
+		mustSQL(t, path, "INSERT INTO t (v) VALUES (randomblob(100));")
+		return w, refOf(t, w, "app", "main"), encodeCheckout(t, path, 1)
+	}
+	// sameContent reports whether the database at path holds the content the
+	// checkpoint encoded (a snapshot's checksum is of its pages, not the txid
+	// it was encoded at).
+	sameContent := func(t *testing.T, path string, want []byte) bool {
+		t.Helper()
+		wantSum, err := ltxio.TrailerPostApplyChecksum(want)
+		if err != nil {
+			t.Fatal(err)
+		}
+		gotSum, err := ltxio.TrailerPostApplyChecksum(encodeCheckout(t, path, 1))
+		if err != nil {
+			t.Fatal(err)
+		}
+		return gotSum == wantSum
+	}
+
+	t.Run("forked then rolled back", func(t *testing.T) {
+		w, before, want := setup(t)
+		b := &landsThenFails{Backend: w.Store.B, err: errHeadWriteTimeout, match: recordsA, after: func() {
+			if _, err := w.Fork("app", "main", "kid", "a", 0, nil); err != nil {
+				t.Fatal(err)
+			}
+			if _, err := w.RollbackWith("app", "main", "seed", RollbackOptions{NoBackup: true}); err != nil {
+				t.Fatal(err)
+			}
+		}}
+		w.Store.B = b
+		_, err := w.CheckpointWith("app", "main", "a", nil, CheckpointOptions{Snapshot: true})
+		w.Store.B = b.Backend
+		if !errors.Is(err, errHeadWriteTimeout) || !strings.Contains(err.Error(), "may have committed") || !strings.Contains(err.Error(), "branch moved") {
+			t.Fatalf("checkpoint whose landed head write was followed by a fork and a rollback: %v, want a may-have-committed error", err)
+		}
+		if !storeHas(w, privateSnapshotKey(before)) {
+			t.Fatal("the object was deleted while a fork reads through it")
+		}
+		if !sameContent(t, mustCheckout(t, w, "app", "kid"), want) {
+			t.Fatal("the fork at the landed checkpoint does not hold the checkpoint's content")
+		}
+	})
+
+	t.Run("ref unreadable", func(t *testing.T) {
+		w, before, want := setup(t)
+		fb := &flakyRefGets{Backend: w.Store.B, key: refKey}
+		b := &landsThenFails{Backend: fb, err: errHeadWriteTimeout, match: recordsA, after: func() { fb.n.Store(1 << 20) }}
+		w.Store.B = b
+		_, err := w.CheckpointWith("app", "main", "a", nil, CheckpointOptions{Snapshot: true})
+		fb.n.Store(0)
+		w.Store.B = fb.Backend
+		if err == nil || !strings.Contains(err.Error(), "may have committed") || !strings.Contains(err.Error(), "could not be re-read") {
+			t.Fatalf("checkpoint whose landed head write could not be confirmed: %v, want a may-have-committed error", err)
+		}
+		if !storeHas(w, privateSnapshotKey(before)) {
+			t.Fatal("the object was deleted although the ref could not be read to show nothing names it")
+		}
+		ref := refOf(t, w, "app", "main")
+		if ref.HeadTXID != before.HeadTXID+1 || ref.Checkpoints["a"].TXID != ref.HeadTXID {
+			t.Fatalf("precondition: the head write did not land: head %d entry %+v", ref.HeadTXID, ref.Checkpoints["a"])
+		}
+		at, err := w.CheckoutAt("app", "main", "a", false)
+		if err != nil {
+			t.Fatalf("the committed head does not materialize: %v", err)
+		}
+		if !sameContent(t, at, want) {
+			t.Fatal("the committed head does not hold the checkpoint's content")
+		}
+	})
 }
