@@ -54,7 +54,8 @@ Pin an exact version if you depend on format stability. The full contract:
   connection closes. If the path is renamed over between the pin and the
   open, they refuse with `dbfile: path was replaced while a SQLite open held
   it` rather than work on a file the pin does not cover. A test fails on
-  any new `sql.Open` in the tree until it is classified.
+  any new `sql.Open` in the tree until it is classified, and on a pinned
+  one whose release could run before its connection closes.
 
 ### Added
 
