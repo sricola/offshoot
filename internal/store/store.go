@@ -51,9 +51,9 @@ type Checkpoint struct {
 	// Compact copy kept checkpoints into. Omitempty so a checkpoint written
 	// before this field existed (or one whose writer does not know, such as
 	// Fork's shared "fork") decodes with it empty, which means unknown.
-	// ops.CheckpointWith's CAS-loser cleanup reads it to tell whether its
-	// own object at the same txid is the winner's key or a different-kind
-	// orphan.
+	// No code path reads it back since at-rest checkpoints took the branch
+	// lease (their CAS-loser cleanup used to); it stays in the ref,
+	// documented in docs/reference.md, for tools that inspect refs.
 	Kind string `json:"kind,omitempty"`
 }
 
@@ -567,10 +567,11 @@ func ParseMemberKey(key string) (ChainMember, bool) {
 // members of the SHAPE this binary's writers produce. A snapshot always
 // qualifies; a segment qualifies when it is SINGLE-TXID, because that is what
 // makes its MaxTXID identify it as completely as its range does — and every
-// production segment is single-txid (the sole production ltxio.EncodeSegment
-// caller, session/flush.go, passes (txid, txid)). A MULTI-txid segment cannot
-// be produced by any writer in this binary; it is a hand-written fixture or
-// corruption, its MaxTXID does NOT identify it, and collapsing it against a
+// production segment is single-txid (both production ltxio.EncodeSegment
+// callers, session/flush.go and ops.CheckpointWith, pass (txid, txid)). A
+// MULTI-txid segment cannot be produced by any writer in this binary; it is
+// a hand-written fixture or corruption, its MaxTXID does NOT identify it,
+// and collapsing it against a
 // snapshot at the same MaxTXID would let a stray object EVICT the live
 // snapshot and break the chain outright. Those keep the original, conservative
 // {MinTXID, MaxTXID} key and never collide with a snapshot — exactly the
@@ -622,8 +623,9 @@ func keepHighestEpoch(members []ChainMember) []ChainMember {
 //     path.
 //  2. Same epoch: the SNAPSHOT wins. This should not occur in practice — one
 //     flush writes either a snapshot or a segment for a given txid, never
-//     both, and txids only advance (ops.Checkpoint likewise snapshots at
-//     HeadTXID+1, a txid nothing else has written). If it somehow does, the
+//     both, and txids only advance (an at-rest ops.CheckpointWith writes
+//     at HeadTXID+1 under an epoch its own lease acquire minted, which no
+//     other writer shares). If it somehow does, the
 //     snapshot is the safer pick: it is self-contained and can anchor a chain,
 //     whereas a segment can only extend one.
 //

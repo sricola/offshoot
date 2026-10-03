@@ -353,7 +353,9 @@ type liveHead struct {
 // ref's own lineage, and at an epoch a CURRENT writer could still make live,
 // may be an orphan a session flush is entitled to re-create at the same key
 // (session/flush.go's ambiguous-ref-write retry overwrites the SAME
-// (lineage, epoch, txid) key), so the sweep must never delete there.
+// (lineage, epoch, txid) key), or an at-rest checkpoint's object between
+// its upload and its head write, under the epoch its lease acquire just
+// minted, so the sweep must never delete there.
 //
 // Both fields take the MINIMUM across every ref naming the lineage, and both
 // for the same reason: erring toward OVER-protection under a stale or
@@ -625,8 +627,10 @@ func (w *Workspace) GC(grace time.Duration) (tombstoned, deleted int, err error)
 		// somehow still loses the CAS itself — the epoch bump goes through
 		// AcquireLease, which writes a fresh etag (lease.go's PutRef), so
 		// the fenced writer's PutRef (built from its stale GetRef's etag)
-		// fails unconditionally, not just probabilistically. (The at-rest
-		// Checkpoint path is the same shape: one GetRef, one CAS'd PutRef.)
+		// fails unconditionally, not just probabilistically. (An at-rest
+		// checkpoint is the same shape: it holds the lease, writes under the
+		// epoch its acquire minted, and its head write re-checks holder and
+		// epoch before its CAS.)
 		// keepHighestEpoch is NOT the mechanism here — it has no knowledge
 		// of Ref.Epoch at all; it only picks the higher-epoch member between
 		// two objects covering the IDENTICAL txid range, which is chain

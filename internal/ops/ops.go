@@ -739,21 +739,22 @@ func (w *Workspace) checkpointLeased(db, branch, name string, meta map[string]st
 }
 
 // verifyOwnObject returns the post-apply checksum of the object at key,
-// just committed by a winning ref CAS, and whether it is known. A Head
-// whose etag equals ownEtag (the etag our create-only put returned)
-// answers checksum with one request; the two are compared normalized
+// just named by the checkpoint's head write, and whether it is known. A
+// Head whose etag equals ownEtag (the etag our create-only put returned,
+// or our object's own when a retried put found it already there) answers
+// checksum with one request; the two are compared normalized
 // (store.NormalizeETag), so an S3-compatible provider that quotes, weakens
 // or re-cases the etag between the PUT and the HEAD still answers with
-// that one request. Otherwise — a rival's overwrite, or
-// our own unconditional overwrite, which returns no etag — the object is
-// fetched and its trailer read: two encodes of the same checkout state
-// differ in bytes (an LTX header carries its encode time) but not in
-// checksum, so only a real content change returns a different one. An
-// object that cannot be read or decoded after an etag mismatch is logged
-// and answers unknown: distrusting costs one snapshot, trusting a wrong
-// checksum costs a session's correctness. A failing Head never fails the
-// checkpoint: it is logged and answers checksum, as before this check
-// existed.
+// that one request. Otherwise — an object replaced out of band, since no
+// offshoot writer shares the epoch the key is under, or a put whose
+// response carried no etag — the object is fetched and its trailer read:
+// two encodes of the same checkout state differ in bytes (an LTX header
+// carries its encode time) but not in checksum, so only a real content
+// change returns a different one. An object that cannot be read or
+// decoded after an etag mismatch is logged and answers unknown:
+// distrusting costs one snapshot, trusting a wrong checksum costs a
+// session's correctness. A failing Head never fails the checkpoint: it is
+// logged and answers checksum, as before this check existed.
 func (w *Workspace) verifyOwnObject(key, ownEtag string, checksum uint64) (uint64, bool) {
 	etag, _, err := w.Store.Head(key)
 	if err != nil {
@@ -1062,15 +1063,14 @@ var ObserveFork func(dur time.Duration, fast, shared bool)
 var ObserveCheckpoint func(dur time.Duration)
 
 // ObserveCheckpointOverwrite, when non-nil, is invoked by CheckpointWith
-// each time its post-CAS check finds that the store may not resolve the
-// head to the content it encoded: the object it committed was replaced, at
-// its shared key, by a racing same-kind checkpoint's different content, or
-// could not be verified after an etag mismatch (see verifyOwnObject); or a
-// racing snapshot with different content (or one that could not be read)
-// sits beside its winning segment and anchors the head (see
-// snapshotBesideSegment). The checkpoint still succeeds; the daemon
-// feeds this into offshoot_checkpoint_overwrite_detected_total. Same
-// injection shape as ObserveFork.
+// each time its post-commit check finds that the store may not resolve the
+// head to the content it encoded: the object at its key no longer carries
+// what it uploaded (the key is under an epoch only that checkpoint's lease
+// minted, so this means something outside offshoot replaced it), or it
+// could not be verified after an etag mismatch (see verifyOwnObject). The
+// checkpoint still succeeds; the daemon feeds this into
+// offshoot_checkpoint_overwrite_detected_total. Same injection shape as
+// ObserveFork.
 var ObserveCheckpointOverwrite func()
 
 // ObserveRollback and ObservePromote, when non-nil, are invoked once the

@@ -2,6 +2,7 @@ package daemon
 
 import (
 	"context"
+	"strings"
 	"testing"
 	"time"
 
@@ -138,5 +139,54 @@ func TestOpBranchesReportsActiveForHealthyOpenSession(t *testing.T) {
 	br := branchInfo(t, resp, "main")
 	if br.State != "active" {
 		t.Fatalf("state = %q, want active", br.State)
+	}
+}
+
+// TestBranchesReportsAnAtRestCheckpointAsActive is a wiring pin: a lease
+// under a checkpoint: holder (acquired by hand here; a real running
+// checkpoint's is asserted through ops.BranchState, Status and Leases in
+// internal/ops's TestConcurrentAtRestCheckpointsAreSerialized) reaches the
+// daemon's branches op as state active with that holder, which is what
+// both SDKs' Branch.state and Branch.lease_holder carry.
+func TestBranchesReportsAnAtRestCheckpointAsActive(t *testing.T) {
+	srv, w := newServer(t)
+	holder := "checkpoint:" + ops.LocalHolder() + "/0123abcd"
+	if _, err := w.AcquireLease("app", "main", holder, time.Minute); err != nil {
+		t.Fatal(err)
+	}
+	resp := call(t, srv.SocketPath(), Request{Op: "branches", DB: "app"})
+	if !resp.OK {
+		t.Fatalf("branches = %+v", resp)
+	}
+	if br := branchInfo(t, resp, "main"); br.State != "active" || br.LeaseHolder != holder {
+		t.Fatalf("branch during a checkpoint: state %q holder %q, want active and %q", br.State, br.LeaseHolder, holder)
+	}
+}
+
+// TestOpenRefusedWhileACheckpointHoldsTheBranch is a wiring pin: the
+// daemon's open op (what an SDK session uses) on a branch held under a
+// checkpoint: holder (acquired by hand here; the real checkpoint is
+// internal/ops's TestSessionOpenDuringAtRestCheckpointIsRefused) fails
+// with the lease-held error naming the holder, and leaves the lease alone.
+func TestOpenRefusedWhileACheckpointHoldsTheBranch(t *testing.T) {
+	srv, w := newServer(t)
+	holder := "checkpoint:" + ops.LocalHolder() + "/0123abcd"
+	l, err := w.AcquireLease("app", "main", holder, time.Minute)
+	if err != nil {
+		t.Fatal(err)
+	}
+	resp, err := rawCall(srv.SocketPath(), Request{Op: "open", DB: "app", Branch: "main"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if resp.OK || !strings.Contains(resp.Error, "lease is held") || !strings.Contains(resp.Error, holder) {
+		t.Fatalf("open during a checkpoint = %+v, want a lease-held refusal naming %s", resp, holder)
+	}
+	ref, _, err := w.Store.GetRef("app", "main")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if ref.LeaseHolder != holder || ref.Epoch != l.Epoch {
+		t.Fatalf("the refused open changed the checkpoint's lease: %q@%d", ref.LeaseHolder, ref.Epoch)
 	}
 }

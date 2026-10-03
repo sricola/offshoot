@@ -182,8 +182,8 @@ func TestSharedForksGetManifestOnce(t *testing.T) {
 // read and one write (the head write, which also releases the lease), with
 // no renewal inside a short checkpoint. A segment checkpoint lists the
 // head's lineage once (the chain resolve) and never lists a snapshot key:
-// the probes for a racer's snapshot at its txid went away with the
-// private epoch.
+// the probes for another checkpoint's snapshot at its txid went away with
+// the private epoch.
 func TestAtRestCheckpointStoreRequests(t *testing.T) {
 	w := newWS(t)
 	requireClone(t, w)

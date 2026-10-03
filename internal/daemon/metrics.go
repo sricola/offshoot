@@ -65,13 +65,12 @@ type Metrics struct {
 
 	CheckpointDuration *metrics.Histogram
 	// CheckpointOverwriteTotal (offshoot_checkpoint_overwrite_detected_total)
-	// counts at-rest checkpoints whose post-CAS check found the store's
-	// head may not be their own content: their object replaced by a racing
-	// same-kind checkpoint's different content, a racer's snapshot anchoring
-	// the head beside their segment, or an object they could not verify
-	// (see ops.ObserveCheckpointOverwrite). Like CheckpointDuration it only
-	// moves in a process that runs ops.Workspace.CheckpointWith itself.
-	// Locked once shipped, like the rest.
+	// counts at-rest checkpoints whose post-commit check found the store's
+	// head may not be their own content: their object replaced out of band
+	// (no offshoot writer shares the epoch its key is under) or one they
+	// could not verify (see ops.ObserveCheckpointOverwrite). Like
+	// CheckpointDuration it only moves in a process that runs
+	// ops.Workspace.CheckpointWith itself. Locked once shipped, like the rest.
 	CheckpointOverwriteTotal *metrics.Counter
 
 	ReapTotal         *metrics.Counter
@@ -154,10 +153,9 @@ func newMetrics() *Metrics {
 				"ObserveCheckpoint doc comment.", metrics.DefaultDurationBuckets),
 		CheckpointOverwriteTotal: r.NewCounter("offshoot_checkpoint_overwrite_detected_total",
 			"At-rest checkpoints that committed but found the store's head may not be their own content "+
-				"(object replaced by a racing same-kind checkpoint, a racer's snapshot beside their segment, "+
-				"or an object that could not be verified); unless the checkout equals the head, its checksum "+
-				"is then not trusted and the next checkpoint writes a snapshot. Only populated by a process "+
-				"that runs checkpoints itself (CLI/MCP)."),
+				"(their object replaced out of band, or one that could not be verified); unless the checkout "+
+				"equals the head, its checksum is then not trusted and the next checkpoint writes a snapshot. "+
+				"Only populated by a process that runs checkpoints itself (CLI/MCP)."),
 
 		ReapTotal:         r.NewCounter("offshoot_reap_total", "Branches reaped by the janitor."),
 		GCTombstonedTotal: r.NewCounter("offshoot_gc_tombstoned_total", "Objects newly tombstoned by GC."),
