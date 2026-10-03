@@ -9,6 +9,7 @@ import (
 	"reflect"
 	"slices"
 	"sort"
+	"strconv"
 	"strings"
 	"testing"
 	"time"
@@ -48,6 +49,77 @@ func waitForPins(t *testing.T, want int) {
 		}
 		time.Sleep(10 * time.Millisecond)
 	}
+}
+
+// sampleValue returns series' value in a full exposition dump, from the
+// line that starts with it: a family's # HELP and # TYPE lines name it too.
+func sampleValue(t *testing.T, exposition, series string) float64 {
+	t.Helper()
+	for _, line := range strings.Split(exposition, "\n") {
+		if v, ok := strings.CutPrefix(line, series+" "); ok {
+			f, err := strconv.ParseFloat(v, 64)
+			if err != nil {
+				t.Fatalf("parsing %s's value %q: %v", series, v, err)
+			}
+			return f
+		}
+	}
+	t.Fatalf("exposition lacks a %s sample:\n%s", series, exposition)
+	return 0
+}
+
+// checkDBFileMetrics scrapes srv and checks each offshoot_dbfile_* sample
+// against dbfile's registry as the scrape saw it, which it returns. Every
+// family is registered up front and both reason labels are pre-populated,
+// so a scrape that never ran collectDBFile still prints every series, at
+// 0: only the values show the collector ran. dbfile is process-wide and an
+// open session's engine reads its checkout in the background, so the
+// scrape is retried until ReadStats reads the same just before and just
+// after it.
+func checkDBFileMetrics(t *testing.T, srv *Server) dbfile.Stats {
+	t.Helper()
+	var out string
+	var st dbfile.Stats
+	for i := 0; ; i++ {
+		lo := dbfile.ReadStats()
+		var buf bytes.Buffer
+		if err := srv.WritePrometheus(&buf); err != nil {
+			t.Fatal(err)
+		}
+		if hi := dbfile.ReadStats(); hi == lo {
+			out, st = buf.String(), lo
+			break
+		}
+		if i == 50 {
+			t.Fatal("dbfile's registry never held still across a scrape")
+		}
+		time.Sleep(10 * time.Millisecond)
+	}
+	for _, want := range []string{
+		"# TYPE offshoot_dbfile_descriptors gauge",
+		"# TYPE offshoot_dbfile_pins gauge",
+		"# TYPE offshoot_dbfile_stranded_pinned gauge",
+		"# TYPE offshoot_dbfile_evicted_total counter",
+	} {
+		if !strings.Contains(out, want) {
+			t.Errorf("exposition lacks %q", want)
+		}
+	}
+	for _, c := range []struct {
+		series string
+		want   float64
+	}{
+		{"offshoot_dbfile_descriptors", float64(st.Descriptors())},
+		{"offshoot_dbfile_pins", float64(st.Pins)},
+		{"offshoot_dbfile_stranded_pinned", float64(st.StrandedPinned)},
+		{`offshoot_dbfile_evicted_total{reason="stranded"}`, float64(st.EvictedStranded)},
+		{`offshoot_dbfile_evicted_total{reason="budget"}`, float64(st.EvictedBudget)},
+	} {
+		if got := sampleValue(t, out, c.series); got != c.want {
+			t.Errorf("%s = %v, want %v (dbfile.ReadStats: %+v)", c.series, got, c.want, st)
+		}
+	}
+	return st
 }
 
 func TestJanitorEvictsUnderFDBudget(t *testing.T) {
@@ -125,30 +197,21 @@ func TestJanitorEvictsUnderFDBudget(t *testing.T) {
 		t.Fatal("the session could not flush after the budget pass")
 	}
 
-	var buf bytes.Buffer
-	if err := srv.WritePrometheus(&buf); err != nil {
-		t.Fatal(err)
-	}
-	out := buf.String()
-	for _, want := range []string{
-		"# TYPE offshoot_dbfile_descriptors gauge",
-		"# TYPE offshoot_dbfile_pins gauge",
-		"# TYPE offshoot_dbfile_stranded_pinned gauge",
-		"# TYPE offshoot_dbfile_evicted_total counter",
-		`offshoot_dbfile_evicted_total{reason="stranded"}`,
-		`offshoot_dbfile_evicted_total{reason="budget"}`,
-	} {
-		if !strings.Contains(out, want) {
-			t.Errorf("exposition lacks %q", want)
-		}
+	// The metrics carry the pass's real numbers: the engine's pin, at least
+	// the two cached descriptors the pass kept, and its evictions.
+	waitForPins(t, 1)
+	st := checkDBFileMetrics(t, srv)
+	if st.Pins != 1 || st.Descriptors() < 2 || st.EvictedBudget-before < 2 {
+		t.Fatalf("dbfile stats behind the scrape = %+v, want 1 pin, >= 2 descriptors and >= 2 budget evictions since the pass", st)
 	}
 }
 
 // TestJanitorBudgetZeroIsUnlimited: -fd-budget 0 runs no budget pass, but
-// stranded reclaim still runs.
+// stranded reclaim still runs, and a pinned stranded descriptor is kept and
+// reported.
 func TestJanitorBudgetZeroIsUnlimited(t *testing.T) {
 	srv, w := newServer(t)
-	for _, b := range []string{"a", "b", "gone"} {
+	for _, b := range []string{"a", "b", "gone", "held"} {
 		if _, err := w.Fork("app", "main", b, "", 0, nil); err != nil {
 			t.Fatal(err)
 		}
@@ -163,6 +226,20 @@ func TestJanitorBudgetZeroIsUnlimited(t *testing.T) {
 		t.Fatalf("cached checkouts = %v, want %s among them", got, gone)
 	}
 	if err := os.Remove(gone); err != nil {
+		t.Fatal(err)
+	}
+	// One removed while pinned, the way a session outlives its checkout:
+	// the sweep orphans it but must keep it open, and the metrics report it.
+	held := w.CheckoutPath("app", "held")
+	release, _, err := dbfile.Hold(held)
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() {
+		release()
+		dbfile.EvictUnder(filepath.Dir(held))
+	})
+	if err := os.Remove(held); err != nil {
 		t.Fatal(err)
 	}
 	srv.SetFDBudget(0)
@@ -186,6 +263,10 @@ func TestJanitorBudgetZeroIsUnlimited(t *testing.T) {
 		if !slices.Contains(cached, p) {
 			t.Fatalf("cached checkouts = %v, want %s still cached", cached, p)
 		}
+	}
+	st := checkDBFileMetrics(t, srv)
+	if st.Pins < 1 || st.StrandedPinned < 1 || st.EvictedStranded == before.EvictedStranded {
+		t.Fatalf("dbfile stats behind the scrape = %+v, want the held checkout's pin, it as a pinned stranded descriptor, and the stranded reclaim counted", st)
 	}
 }
 
