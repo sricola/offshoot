@@ -65,6 +65,15 @@ func (w *Workspace) reapOne(db, branch string, now time.Time) (bool, error) {
 	if ref.TTL == "" || ref.Protected {
 		return false, nil
 	}
+	if liveDeleteClaim(ref, time.Now()) {
+		// A destroy has claimed the branch and may still be on its way to
+		// its delete: it removes the branch, or unwinds its claim and a
+		// later cycle re-evaluates. Any write now, a reaping claim or the
+		// clearing of a stale one, would move the etag that destroy's
+		// conditional delete compares against, and this cycle's own
+		// Destroy would be refused under the live claim.
+		return false, nil
+	}
 	deadline, ok := ReapDeadline(ref)
 	if !ok {
 		if ref.Reaping {
@@ -103,15 +112,6 @@ func (w *Workspace) reapOne(db, branch string, now time.Time) (bool, error) {
 		return false, nil
 	}
 
-	if liveDeleteClaim(ref, time.Now()) {
-		// A destroy has claimed the branch and may still be on its way to
-		// its delete: it removes the branch, or unwinds its claim and a
-		// later cycle re-evaluates. A reaping claim now would move the etag
-		// that destroy's conditional delete compares against, and this
-		// cycle's own Destroy would be refused under the live claim.
-		return false, nil
-	}
-
 	// CAS claim: mark the ref as reaping. A concurrent Touch either landed
 	// first (our PutRef fails on ErrCAS -> re-evaluate next cycle) or will
 	// fail loudly on seeing Reaping (see Touch).
@@ -127,7 +127,13 @@ func (w *Workspace) reapOne(db, branch string, now time.Time) (bool, error) {
 	// writer. Protected also wins here even though force could bypass it —
 	// Reap deliberately never passes force.
 	if err := w.Destroy(db, branch, false); err != nil {
-		if ref2, etag2, gerr := w.Store.GetRef(db, branch); gerr == nil && ref2.Reaping {
+		// Unwind the reaping claim, unless a destroy's live claim is on
+		// the ref (one that claimed the branch after this cycle read it):
+		// the unwind would move the etag that destroy's conditional delete
+		// compares against, as above. Left set, the reaping claim goes
+		// with the branch when that destroy deletes it, or, if it unwinds
+		// instead, the next cycle reaps the branch or clears the claim.
+		if ref2, etag2, gerr := w.Store.GetRef(db, branch); gerr == nil && ref2.Reaping && !liveDeleteClaim(ref2, time.Now()) {
 			ref2.Reaping = false
 			_, _ = w.Store.PutRef(db, branch, ref2, etag2) // best effort; next cycle retries
 		}

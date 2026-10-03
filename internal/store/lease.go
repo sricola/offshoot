@@ -193,11 +193,16 @@ func (s *Store) AcquireLeaseRefIf(db, branch, holder string, ttl time.Duration, 
 // the claim still stands and AcquireLease still refuses, and a claim a
 // killed destroy stranded (cleared by ops.ClearStaleDeleteClaims only once
 // it is 30 s old) never lapses a lease whose renewals go through. A
-// renewal that lands between a destroy's claim and its delete moves the
-// etag a local store's conditional delete compares against, but does not
-// save the branch: ops.Destroy re-reads the ref and deletes again while it
-// is still that destroy's claim with only the lease expiry moved, and the
-// holder's next renewal then finds the branch gone (ErrNotFound).
+// renewal that lands between a forced destroy's claim and its delete moves
+// the etag a local store's conditional delete compares against, but does
+// not save the branch: ops.Destroy re-reads the ref and deletes again while
+// it is still that destroy's claim with only the lease expiry moved, and
+// the holder's next renewal then finds the branch gone (ErrNotFound). An
+// unforced destroy (the reaper's included) went ahead only because the
+// lease had lapsed, so on a local store a renewal in that window does save
+// the branch: the destroy finds the lease live again and is refused as a
+// live lease. On S3 the delete is unconditional, so the renewal is not
+// seen there and the branch is deleted, forced or not.
 func (s *Store) RenewLease(l Lease, ttl time.Duration, now time.Time) (Lease, error) {
 	ref, etag, err := s.GetRef(l.DB, l.Branch)
 	if err != nil {

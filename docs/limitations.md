@@ -375,6 +375,19 @@ milliseconds don't):
   local store that destroy is refused as a live lease instead. A forced
   destroy deletes on both, as documented
   ([destroy](reference.md#offshoot-destroy-dbbranch---force)).
+- **On S3, a `destroy` stalled for over 30 s between its claim and its
+  delete can delete a branch a new session has taken.** A destroy's claim
+  keeps acquires off for 30 s from its timestamp; after that the janitor
+  treats it as abandoned (its destroy was killed) and clears it, and an
+  acquire can take the branch at a new epoch. S3 has no conditional
+  delete, so if that destroy was only held up, by request timeouts and SDK
+  retries on its claim or its delete or by a suspended process, its delete
+  still lands and removes the branch under the fresh lease. A healthy
+  destroy reaches its delete in well under a second; on a local store a
+  destroy that late fails instead, since its delete is conditional on the
+  claim. The 30 s is judged on each host's clock, so it also assumes the
+  hosts sharing a store agree on the time: a claim stamped more than a
+  minute ahead of a host's clock counts as abandoned there.
 - **Never `export --force` over a database another process has open.**
   `export` writes a temp file and renames it over the destination; a
   process with the old file open keeps writing to the replaced inode, and

@@ -48,12 +48,21 @@ Pin an exact version if you depend on format stability. The full contract:
   renewals, and a destroy of a branch another destroy claimed less than
   30 s ago is refused, forced or not, with `is already being destroyed`
   (retryable; `errors.Is(err, store.ErrDeleting)`) and writes nothing.
-  The reaper leaves such a branch to that destroy. A claim 30 s old, or
-  one whose timestamp cannot be read, is still taken over. A destroy
-  whose claim write landed but reported failure (on S3, the SDK's retry
+  The reaper leaves such a branch to that destroy and writes nothing to
+  its ref, even when it had claimed the branch for reaping first. A claim
+  30 s old, one stamped more than a minute ahead of the clock (written by
+  a host whose clock runs ahead; the janitor clears these too), or one
+  whose timestamp cannot be read, is still taken over. A destroy whose
+  claim write landed but reported failure (on S3, the SDK's retry
   answering 412 to its own first attempt, or a timeout) recognises the
   claim as its own and goes on to delete, rather than reporting a lost
-  race whose retry that claim would refuse.
+  race whose retry that claim would refuse; when the ref shows nothing
+  landed yet (a 409 or a timeout, with the write possibly still in
+  flight), it re-reads the ref for about 2 s before reporting the failure,
+  and then says the claim may still land. On S3 a destroy held up for
+  over 30 s between its claim and its delete can still delete a branch a
+  new session has taken; see
+  [limitations](docs/limitations.md#smaller-edges-worth-knowing).
 - **`checkpoint --force` on a branch with a live session wrote a second
   writer's head under the session's epoch.** The docs said `--force`
   fenced the session; it did not. It wrote the head and a checkpoint entry

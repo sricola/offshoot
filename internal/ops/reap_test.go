@@ -3,6 +3,7 @@ package ops
 import (
 	"encoding/json"
 	"errors"
+	"fmt"
 	"sync"
 	"testing"
 	"time"
@@ -317,8 +318,8 @@ func TestReapLeavesABranchADestroyHasClaimed(t *testing.T) {
 	}
 }
 
-// claimAfterReapingClaim lands a destroy's claim on refKey right after the
-// reaper's own claim (Reaping set, no destroy claim yet) is written.
+// claimAfterReapingClaim runs claim once, right after the reaper's own
+// claim (Reaping set, no destroy claim yet) is written to refKey.
 type claimAfterReapingClaim struct {
 	store.Backend
 	refKey string
@@ -337,12 +338,90 @@ func (b *claimAfterReapingClaim) PutIf(key string, data []byte, ifMatch string) 
 	return etag, err
 }
 
-// TestReapLeavesABranchADestroyClaimsMidReap: a destroy claims an expired
-// branch after the reap pass read it and claimed it for reaping. The
-// pass's own Destroy is refused under that live claim; the pass unwinds
-// its reaping claim, reports no error, reaps nothing, and leaves the
-// destroy's claim.
+// DeleteIf keeps the wrapped backend's conditional delete visible through
+// the wrapper (store.DeleteRefIf type-asserts for it).
+func (b *claimAfterReapingClaim) DeleteIf(key, ifMatch string) error {
+	if cd, ok := b.Backend.(store.ConditionalDeleter); ok {
+		return cd.DeleteIf(key, ifMatch)
+	}
+	return b.Backend.Delete(key)
+}
+
+// TestReapLeavesABranchADestroyClaimsMidReap: a destroy, forced or not,
+// claims an expired branch after the reap pass read it and claimed it for
+// reaping, and sits between its claim and its delete. The pass's own
+// Destroy is refused under that live claim; the pass reports no error,
+// reaps nothing, and writes nothing to the ref, leaving its reaping claim
+// set. Clearing it would move the etag the destroy's conditional delete
+// compares against, and on a local store fail that destroy, so that
+// neither of them deleted the branch. The destroy then deletes it.
 func TestReapLeavesABranchADestroyClaimsMidReap(t *testing.T) {
+	for _, bk := range []struct {
+		name string
+		ws   func(*testing.T) *Workspace
+	}{{"local", newWS}, {"s3", newWSOnFakeS3}} {
+		for _, force := range []bool{false, true} {
+			t.Run(fmt.Sprintf("%s/force=%v", bk.name, force), func(t *testing.T) {
+				w := bk.ws(t)
+				if err := w.Create("app"); err != nil {
+					t.Fatal(err)
+				}
+				if _, err := w.Fork("app", "main", "expired", "", 0, nil); err != nil {
+					t.Fatal(err)
+				}
+				now := time.Now().UTC()
+				setTTLAt(t, w, "app", "expired", "1h", now.Add(-3*time.Hour).Format(time.RFC3339Nano))
+				base := w.Store.B
+				plain := &store.Store{B: base}
+				key := store.RefKey("app", "expired")
+				held := &heldRefDelete{Backend: base, refKey: key, arrived: make(chan struct{}), release: make(chan struct{})}
+				destroyed := make(chan error, 1)
+				var claimEtag string
+				w.Store.B = &claimAfterReapingClaim{Backend: held, refKey: key, claim: func() {
+					go func() { destroyed <- w.Destroy("app", "expired", force) }()
+					select {
+					case <-held.arrived:
+					case err := <-destroyed:
+						destroyed <- err
+						t.Errorf("the destroy ended before its delete: %v", err)
+						return
+					case <-time.After(10 * time.Second):
+						t.Error("the destroy never reached its delete")
+						return
+					}
+					ref, etag, err := plain.GetRef("app", "expired")
+					if err != nil || !ref.Deleting || !ref.Reaping {
+						t.Errorf("precondition: the destroy's claim over the reaping claim: deleting %v, reaping %v, %v", ref.Deleting, ref.Reaping, err)
+					}
+					claimEtag = etag
+				}}
+				reaped, err := w.Reap(now)
+				_, afterEtag, aerr := plain.GetRef("app", "expired")
+				close(held.release)
+				derr := <-destroyed
+				w.Store.B = base
+				if err != nil || len(reaped) != 0 {
+					t.Fatalf("reap of a branch a destroy claimed mid-reap = %v, %v; want nothing reaped and no error", reaped, err)
+				}
+				if aerr != nil || afterEtag != claimEtag {
+					t.Fatalf("the reap pass wrote the ref under the destroy's live claim (%v)", aerr)
+				}
+				if derr != nil {
+					t.Fatalf("the destroy that claimed the branch mid-reap: %v", derr)
+				}
+				if _, _, err := w.Store.GetRef("app", "expired"); !errors.Is(err, store.ErrNotFound) {
+					t.Fatalf("the branch after the destroy: %v, want it gone", err)
+				}
+			})
+		}
+	}
+}
+
+// TestReapReapsABranchOnceAMidReapDestroyUnwinds: the reaping claim a
+// pass leaves under a destroy's live claim does not strand the branch.
+// When that destroy fails and unwinds its own claim instead of deleting,
+// the next pass reaps the branch.
+func TestReapReapsABranchOnceAMidReapDestroyUnwinds(t *testing.T) {
 	w := newWS(t)
 	if err := w.Create("app"); err != nil {
 		t.Fatal(err)
@@ -371,11 +450,13 @@ func TestReapLeavesABranchADestroyClaimsMidReap(t *testing.T) {
 	if err != nil || len(reaped) != 0 {
 		t.Fatalf("reap of a branch a destroy claimed mid-reap = %v, %v; want nothing reaped and no error", reaped, err)
 	}
+	w.unwindDeletingClaim("app", "expired", claimedAt)
 	ref, _, err := w.Store.GetRef("app", "expired")
-	if err != nil {
-		t.Fatal(err)
+	if err != nil || ref.Deleting {
+		t.Fatalf("precondition: the destroy's claim unwound: deleting %v, %v", ref.Deleting, err)
 	}
-	if ref.Reaping || !ref.Deleting || ref.DeletingAt != claimedAt {
-		t.Fatalf("after the pass: reaping %v, deleting %v at %q; want the reaping claim unwound and the destroy's claim made at %q", ref.Reaping, ref.Deleting, ref.DeletingAt, claimedAt)
+	reaped, err = w.Reap(now)
+	if err != nil || len(reaped) != 1 || reaped[0] != "app@expired" {
+		t.Fatalf("reap once the destroy unwound = %v, %v; want [app@expired]", reaped, err)
 	}
 }

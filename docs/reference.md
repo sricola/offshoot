@@ -875,19 +875,28 @@ itself. A lease acquired a moment before a forced destroy lands still wins
 the underlying compare-and-swap on the ref, and the forced destroy reports
 a retryable race loss exactly like an unforced one would.
 
-A claim stays on the ref for as long as the destroy that wrote it may
-still delete. A second destroy of the same branch, forced or not, is
-refused with `is already being destroyed` (`store.ErrDeleting`, retryable)
-and writes nothing while the claim is under 30 seconds old, and the reaper
-leaves such a branch to that destroy. A destroy that fails after its claim
-removes its own claim and no other. Were a claim cleared under its
-destroy, an acquire could take the branch at a new epoch, and on S3, where
-the delete is unconditional, that destroy would then delete the branch
-under the fresh lease. A claim write that landed but reported failure (on
-S3, the SDK's retry answering 412 or 409 to its own first attempt, or a
-timeout that lost the response) is still the destroy's own claim, which it
-recognises by the claim's timestamp: it goes on and deletes the branch,
-rather than reporting a lost race whose retry its own claim would refuse.
+A claim stands for 30 seconds from its timestamp. While it does, a second
+destroy of the same branch, forced or not, is refused with `is already
+being destroyed` (`store.ErrDeleting`, retryable) and writes nothing, and
+the reaper leaves such a branch to that destroy without writing its ref,
+even when the reaper had claimed the branch first. A destroy that fails
+after its claim removes its own claim and no other. Were a claim cleared
+under its destroy, an acquire could take the branch at a new epoch, and on
+S3, where the delete is unconditional, that destroy would then delete the
+branch under the fresh lease. A destroy held up for longer than the 30
+seconds between its claim and its delete can still do that on S3
+([limitations](limitations.md#smaller-edges-worth-knowing)). A claim
+stamped more than a minute ahead of a host's clock (its writer's clock runs
+ahead) counts as abandoned on that host, as one 30 seconds old does. A
+claim write that landed but reported failure (on S3, the SDK's
+retry answering 412 or 409 to its own first attempt, or a timeout that lost
+the response) is still the destroy's own claim, which it recognises by the
+claim's timestamp: it goes on and deletes the branch, rather than reporting
+a lost race whose retry its own claim would refuse. When the ref shows
+nothing landed yet (a 409 or a timeout with the write possibly still in
+flight), the destroy re-reads it for about 2 seconds before giving up, and
+its error then says the claim may still land, in which case a retry is
+refused for up to 30 seconds.
 
 **Backend-specific mechanics** (deliberately: do not pretend S3
 `DeleteObject` has preconditions it doesn't):
@@ -897,9 +906,9 @@ rather than reporting a lost race whose retry its own claim would refuse.
   backs a compare-and-delete (`Local.DeleteIf`) — belt-and-suspenders, since
   the claim above already serializes concurrent destroys/acquires on its
   own. The lease holder's renewals go on under the claim, so a delete that
-  loses its compare-and-swap to one re-reads the ref and deletes again
-  (above); any other write in between fails the destroy as a retryable
-  race loss.
+  loses its compare-and-swap to one (or to a reaper clearing its own
+  reaping claim) re-reads the ref and deletes again (above); any other
+  write in between fails the destroy as a retryable race loss.
 - **S3** has no compare-and-delete precondition in its API at all
   (`DeleteObject` ignores `If-Match`/`If-None-Match`; those headers only
   apply to `GetObject`/`PutObject`). Its delete stays unconditional; the
@@ -916,9 +925,10 @@ daemon's janitor self-heals this on the same cadence as reap/GC: a
 `Deleting` claim older than 30 seconds (destroy is a handful of local
 filesystem operations plus at most one checkout quiesce — anything stuck
 longer means the process that claimed it is gone) is cleared, and the
-branch becomes destroyable/leasable again. `offshoot gc` triggers the same
+branch becomes destroyable/leasable again, as is a claim stamped more than
+a minute in the future. `offshoot gc` triggers the same
 self-heal on demand, same as it does for a stranded reap claim. A
-`destroy` takes over a claim that old itself, without waiting for the
+`destroy` takes over such a claim itself, without waiting for the
 janitor, as it does a claim whose timestamp cannot be read (which the
 janitor never clears).
 
