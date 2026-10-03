@@ -1634,3 +1634,51 @@ func TestHeadWriteThatLandedThenMovedKeepsItsObject(t *testing.T) {
 		}
 	})
 }
+
+// TestDestroyClaimBeforeHeadWriteFailsTheCheckpoint: `destroy --force`
+// claims the ref (Deleting, with the lease fields left alone) and then
+// quiesces the checkout before its conditional delete. A checkpoint whose
+// head write re-reads the ref in that window finds the claim and fails
+// without committing: it deletes its object, and neither its head write
+// nor its release moves the claim's etag, so the destroy's conditional
+// delete still goes through.
+func TestDestroyClaimBeforeHeadWriteFailsTheCheckpoint(t *testing.T) {
+	w := newWS(t)
+	seedDB(t, w, "app", 1<<16)
+	mustSQL(t, w.CheckoutPath("app", "main"), "INSERT INTO t (v) VALUES (randomblob(100));")
+	before := refOf(t, w, "app", "main")
+	key := privateSnapshotKey(before)
+	g := gateRefCAS(w, "app", "main")
+	g.holdObject(key)
+	done := make(chan error, 1)
+	go func() {
+		// The default renewal interval (a third of 30 s) puts no renewal
+		// inside this test, so the claim's etag stays the one the delete
+		// compares against unless the checkpoint itself writes the ref.
+		_, err := w.CheckpointWith("app", "main", "a", nil, CheckpointOptions{Snapshot: true})
+		done <- err
+	}()
+	release := heldUpload(t, g, done)
+	// Destroy's claim write, by hand, so the test holds the window open.
+	ref, etag, err := w.Store.GetRef("app", "main")
+	if err != nil {
+		t.Fatal(err)
+	}
+	ref.Deleting = true
+	ref.DeletingAt = time.Now().UTC().Format(time.RFC3339Nano)
+	claimEtag, err := w.Store.PutRef("app", "main", ref, etag)
+	if err != nil {
+		t.Fatal(err)
+	}
+	release()
+	err = <-done
+	if !errors.Is(err, store.ErrDeleting) || !strings.Contains(err.Error(), "did not commit") {
+		t.Fatalf("checkpoint that found a destroy claim at its head write: %v, want a did-not-commit ErrDeleting", err)
+	}
+	if storeHas(w, key) {
+		t.Fatal("the failed checkpoint left its object")
+	}
+	if err := w.Store.DeleteRefIf("app", "main", claimEtag); err != nil {
+		t.Fatalf("destroy's conditional delete after the failed checkpoint: %v (the checkpoint wrote over the claim)", err)
+	}
+}

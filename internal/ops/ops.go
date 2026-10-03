@@ -549,8 +549,9 @@ func (w *Workspace) Checkpoint(db, branch, name string, meta map[string]string) 
 //     plan and encode; check the lease is still ours, then upload with a
 //     create-only put; stop and join the renewals;
 //  4. re-read the ref and, while it still names our lease, our lineage and
-//     the head we planned from, advance the head, record the checkpoint
-//     and clear the lease in one write (commitCheckpoint);
+//     the head we planned from and carries no destroy or reap claim,
+//     advance the head, record the checkpoint and clear the lease in one
+//     write (commitCheckpoint);
 //  5. on any failure, release the lease (releaseCheckpointLease).
 //
 // The sidecar and shadow are refreshed after the head write.

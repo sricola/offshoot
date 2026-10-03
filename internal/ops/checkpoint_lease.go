@@ -153,12 +153,17 @@ func (w *Workspace) acquireCheckpointLease(db, branch, holder string, ttl time.D
 // the TTL. ReleaseLease clears the lease only while it is still ours, so a
 // lease someone else took (ErrLeaseLost) or a branch that is gone
 // (ErrNotFound) is left alone silently; a release lost to a concurrent
-// metadata write is retried. Anything else is logged, and the lease then
-// expires after its TTL and the next acquirer reclaims it with a higher
-// epoch.
+// metadata write is retried. A branch mid-destroy or mid-reap is left alone
+// too: it is on its way out, and a release written over the claim would
+// change the etag Destroy's conditional delete compares against and fail
+// that destroy. Anything else is logged, and the lease then expires after
+// its TTL and the next acquirer reclaims it with a higher epoch.
 func (w *Workspace) releaseCheckpointLease(l store.Lease) {
 	var err error
 	for i := 0; i < 3; i++ {
+		if ref, _, gerr := w.Store.GetRef(l.DB, l.Branch); gerr == nil && (ref.Deleting || ref.Reaping) {
+			return
+		}
 		if err = w.Store.ReleaseLease(l); err == nil || !errors.Is(err, store.ErrCAS) {
 			break
 		}
@@ -264,10 +269,16 @@ type checkpointCommit struct {
 
 // premise reports whether cur is still the ref this checkpoint planned
 // from, give or take lease bookkeeping and metadata: our holder and epoch,
-// the lineage we encoded against, and the head one txid below ours.
+// the lineage we encoded against, the head one txid below ours, and no
+// destroy or reap claim. Destroy's claim leaves the lease fields alone, so
+// only the claim itself shows that a `destroy --force` is underway; a head
+// written over it would change the etag Destroy's conditional delete
+// compares against (failing that destroy), or, on S3, be deleted a moment
+// after the checkpoint reported it committed.
 func (c checkpointCommit) premise(cur store.Ref) bool {
 	return cur.LeaseHolder == c.lease.Holder && cur.Epoch == c.lease.Epoch &&
-		cur.Lineage == c.lineage && cur.HeadTXID == c.txid-1
+		cur.Lineage == c.lineage && cur.HeadTXID == c.txid-1 &&
+		!cur.Deleting && !cur.Reaping
 }
 
 // advance is cur with the head moved to this checkpoint's object, the
@@ -288,8 +299,16 @@ func (c checkpointCommit) advance(cur store.Ref) store.Ref {
 
 // lostTo is the error for a checkpoint whose premise failed: its lease was
 // taken (a reclaim after expiry), cleared (a forced repoint, `lease
-// release`), or the branch moved under it. It wraps store.ErrLeaseLost.
+// release`), or the branch moved under it, all of which wrap
+// store.ErrLeaseLost; or the branch is being destroyed or reaped, which
+// wrap store.ErrDeleting and store.ErrReaping.
 func (c checkpointCommit) lostTo(cur store.Ref) error {
+	switch {
+	case cur.Deleting:
+		return fmt.Errorf("ops: checkpoint %q on %s@%s did not commit: %w", c.name, c.db, c.branch, store.ErrDeleting)
+	case cur.Reaping:
+		return fmt.Errorf("ops: checkpoint %q on %s@%s did not commit: %w", c.name, c.db, c.branch, store.ErrReaping)
+	}
 	return fmt.Errorf("ops: checkpoint %q on %s@%s did not commit: %w (the branch is now at lineage %s, head txid %d, lease held by %q at epoch %d); retry",
 		c.name, c.db, c.branch, store.ErrLeaseLost, cur.Lineage, cur.HeadTXID, cur.LeaseHolder, cur.Epoch)
 }
