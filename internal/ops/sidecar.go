@@ -14,6 +14,7 @@ import (
 	"github.com/sricola/offshoot/internal/dbfile"
 	"github.com/sricola/offshoot/internal/fsutil"
 	"github.com/sricola/offshoot/internal/ltxio"
+	"github.com/sricola/offshoot/internal/reflink"
 	"github.com/sricola/offshoot/internal/store"
 )
 
@@ -640,11 +641,16 @@ func shadowPath(checkoutPath string) string { return checkoutPath + ".shadow" }
 // ErrUnsupported), or any other failure, drops the shadow instead: the
 // next Checkpoint then writes a snapshot, exactly as before shadows
 // existed. Best-effort by design, so it returns nothing.
+//
+// It runs in the daemon right after a checkout or refresh, and on a
+// session's clean Close, where another request's session or quiesce may
+// already have the checkout open. So the clone goes through dbfile's pinned
+// descriptor (cloneCheckout), never one of its own.
 func refreshShadow(path string) {
 	shadow := shadowPath(path)
 	tmp := shadow + ".tmp"
 	os.Remove(tmp) // a leftover from an interrupted refresh is never live
-	if err := cloneFile(tmp, path); err != nil {
+	if err := cloneCheckout(tmp, path); err != nil {
 		dropShadow(path)
 		return
 	}
@@ -664,6 +670,25 @@ func refreshShadow(path string) {
 	if err := setSidecarShadow(path, true); err != nil {
 		dropShadow(path)
 	}
+}
+
+// cloneCheckout makes dst a copy-on-write clone of the checkout at path
+// through dbfile's cached descriptor, pinned for the clone. reflink.Clone
+// would open and close a descriptor of its own on Linux, before FICLONE can
+// even fail, and that close drops every SQLite lock this process holds on
+// the checkout: a capture engine on it would run on unlocked, with no error
+// (see internal/dbfile). The by-chain clones in chainid.go keep cloneFile:
+// their sources are cache entries no SQLite connection opens.
+func cloneCheckout(dst, path string) error {
+	if reflinkUnsupportedForTest {
+		return reflink.ErrUnsupported
+	}
+	s, err := dbfile.Reader(path)
+	if err != nil {
+		return err
+	}
+	defer s.Close()
+	return s.CloneTo(dst)
 }
 
 // RefreshShadow is refreshShadow for internal/session, whose clean Close
