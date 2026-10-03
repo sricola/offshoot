@@ -3,6 +3,7 @@ package dbfile
 import (
 	"os"
 	"path/filepath"
+	"strings"
 	"testing"
 )
 
@@ -153,4 +154,148 @@ func TestReadStatsCountsDescriptors(t *testing.T) {
 		t.Fatalf("Pins = %d, want %d", got.Pins, before.Pins+1)
 	}
 	evictStranded(under(dir))
+}
+
+func TestEvictHonorsBudgetLRU(t *testing.T) {
+	dir := t.TempDir()
+	in := under(dir)
+	paths := map[string]string{}
+	for _, n := range []string{"a", "b", "c", "d"} {
+		paths[n] = filepath.Join(dir, n+".db")
+		writeFile(t, paths[n], n)
+	}
+	touch := func(n string) {
+		s, err := Reader(paths[n])
+		if err != nil {
+			t.Fatal(err)
+		}
+		s.Close()
+	}
+	for _, n := range []string{"a", "b", "c", "d", "a"} { // a is touched again last
+		touch(n)
+	}
+	es := map[string]*entry{}
+	for n, p := range paths {
+		es[n] = lookupLive(t, p)
+	}
+	if got := evict(2, in); got != 2 {
+		t.Fatalf("evict(2) closed %d, want 2", got)
+	}
+	for _, n := range []string{"d", "a"} {
+		if !isLive(es[n]) || !isOpen(es[n]) {
+			t.Fatalf("%s (recently used) was evicted", n)
+		}
+	}
+	for _, n := range []string{"b", "c"} {
+		assertClosed(t, es[n])
+	}
+	evict(0, in)
+}
+
+func TestEvictSkipsInFlightReader(t *testing.T) {
+	dir := t.TempDir()
+	in := under(dir)
+	path := filepath.Join(dir, "big.db")
+	writeFile(t, path, strings.Repeat("x", 1<<20))
+	s, err := Reader(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	e := lookupLive(t, path)
+	half := make([]byte, 512<<10)
+	if _, err := s.ReadAt(half, 0); err != nil {
+		t.Fatal(err)
+	}
+	if n := evict(0, in); n != 0 {
+		t.Fatalf("evict(0) closed %d descriptor(s) under an in-flight read", n)
+	}
+	if _, err := s.ReadAt(half, 512<<10); err != nil {
+		t.Fatalf("read after eviction pass: %v", err)
+	}
+	s.Close()
+	if n := evict(0, in); n != 1 {
+		t.Fatalf("evict(0) after Close = %d, want 1", n)
+	}
+	assertClosed(t, e)
+}
+
+// TestPinProtectsEveryPathToTheInode: pins belong to the inode. A Hold
+// taken through a hard link must protect the descriptor cached under the
+// original name.
+func TestPinProtectsEveryPathToTheInode(t *testing.T) {
+	dir := t.TempDir()
+	in := under(dir)
+	path := filepath.Join(dir, "c.db")
+	link := filepath.Join(dir, "alias.db")
+	writeFile(t, path, "x")
+	if err := os.Link(path, link); err != nil {
+		t.Fatal(err)
+	}
+	s, _ := Reader(path)
+	s.Close()
+	e := lookupLive(t, path)
+	release, _, err := Hold(link)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if n := evict(0, in); n != 0 {
+		t.Fatalf("evict(0) closed %d descriptor(s) on an inode held through another path", n)
+	}
+	if !isOpen(e) {
+		t.Fatal("descriptor closed")
+	}
+	release()
+	evict(0, in)
+	assertClosed(t, e)
+}
+
+// TestEvictStopsAtPinnedEntries: a budget smaller than the number of pinned
+// descriptors (more open sessions than -fd-budget) closes every unpinned
+// one and no pinned one.
+func TestEvictStopsAtPinnedEntries(t *testing.T) {
+	dir := t.TempDir()
+	in := under(dir)
+	var ps []string
+	for _, n := range []string{"a", "b", "c"} {
+		p := filepath.Join(dir, n+".db")
+		writeFile(t, p, n)
+		ps = append(ps, p)
+	}
+	pinned, _ := Reader(ps[0]) // oldest, and pinned
+	for _, p := range ps[1:] {
+		s, _ := Reader(p)
+		s.Close()
+	}
+	a := lookupLive(t, ps[0])
+	if n := evict(0, in); n != 2 {
+		t.Fatalf("evict(0) = %d, want 2 (both unpinned)", n)
+	}
+	if !isLive(a) || !isOpen(a) {
+		t.Fatal("pinned descriptor was evicted")
+	}
+	if n := evict(0, in); n != 0 {
+		t.Fatalf("second pass closed %d", n)
+	}
+	pinned.Close()
+	evict(0, in)
+	assertClosed(t, a)
+}
+
+func TestEvictUnderScopesToDir(t *testing.T) {
+	mine, theirs := t.TempDir(), t.TempDir()
+	pm, pt := filepath.Join(mine, "m.db"), filepath.Join(theirs, "t.db")
+	writeFile(t, pm, "m")
+	writeFile(t, pt, "t")
+	for _, p := range []string{pm, pt} {
+		s, _ := Reader(p)
+		s.Close()
+	}
+	et := lookupLive(t, pt)
+	if n := EvictUnder(mine); n != 1 {
+		t.Fatalf("EvictUnder = %d, want 1", n)
+	}
+	if !isLive(et) || !isOpen(et) {
+		t.Fatal("EvictUnder closed a descriptor outside its directory")
+	}
+	EvictUnder(theirs)
 }

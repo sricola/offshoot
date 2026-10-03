@@ -147,6 +147,7 @@ import (
 	"os"
 	"path/filepath"
 	"sort"
+	"strings"
 	"sync"
 )
 
@@ -516,4 +517,62 @@ func ReadStats() Stats {
 		s.Pins += n
 	}
 	return s
+}
+
+// Evict closes cached descriptors whose inode nothing pins, least recently
+// used first (Reader and Hold both count as a use), until at most keep
+// remain, and reports how many it closed. A pinned descriptor is never
+// closed, so more pinned descriptors than keep (more open sessions than
+// serve -fd-budget) leave the cache above keep. Evict(0) closes every
+// unpinned cached descriptor, and a negative keep counts as 0. The daemon's
+// "0 means unlimited" lives in the janitor, which does not call Evict at
+// all then. Orphans are EvictStranded's job.
+func Evict(keep int) int { return evict(keep, nil) }
+
+func evict(keep int, in func(string) bool) int {
+	if keep < 0 {
+		keep = 0
+	}
+	mu.Lock()
+	defer mu.Unlock()
+	var scoped []*entry
+	for _, e := range live {
+		if in == nil || in(e.path) {
+			scoped = append(scoped, e)
+		}
+	}
+	excess := len(scoped) - keep
+	if excess <= 0 {
+		return 0
+	}
+	sort.Slice(scoped, func(i, j int) bool { return scoped[i].lastUse < scoped[j].lastUse })
+	n := 0
+	for _, e := range scoped {
+		if n == excess {
+			break
+		}
+		if pins[e.ino] > 0 {
+			continue
+		}
+		delete(live, e.path)
+		e.f.Close() // under mu: see the package doc's "Orphans and eviction"
+		n++
+	}
+	evictedBudget += uint64(n)
+	return n
+}
+
+// EvictUnder closes every unpinned descriptor, cached or orphaned, whose
+// path lies under dir, and reports how many. It exists for tests that share
+// a process with SQLite connections that take no Hold (test code is outside
+// sites_test.go's inventory): scoping the eviction to the test's own
+// directory leaves everyone else's descriptors alone.
+func EvictUnder(dir string) int {
+	abs, err := filepath.Abs(dir)
+	if err != nil {
+		return 0
+	}
+	prefix := abs + string(filepath.Separator)
+	in := func(p string) bool { return strings.HasPrefix(p, prefix) }
+	return evictStranded(in) + evict(0, in)
 }
