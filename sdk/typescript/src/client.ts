@@ -358,6 +358,7 @@ interface RawResponse {
   error?: string;
   checkout?: string;
   txid?: number;
+  epoch?: number;
   sessions?: RawSessionInfo[];
   branches?: RawBranchInfo[];
   databases?: string[];
@@ -498,7 +499,7 @@ export class Client {
     // protocol.go's Response.Checkout — same non-defaulted assumption this
     // line always made back when resp was `any`, now spelled out as a
     // non-null assertion instead of an implicit one.
-    return new Session(this, resp.checkout!, db, branch);
+    return new Session(this, resp.checkout!, db, branch, resp.epoch);
   }
 
   /** Materialize db@branch's head snapshot at rest; returns its path. */
@@ -825,6 +826,10 @@ export class Session {
     public readonly path: string,
     private readonly db: string,
     private readonly branch: string,
+    /** The lease epoch the daemon's open returned (undefined from a daemon
+     * too old to send it): {@link Session.close} sends it back so it can
+     * only ever close this session. */
+    private readonly epoch?: number,
   ) {}
 
   /** Flush the checkout to a durable snapshot; returns its txid. */
@@ -840,8 +845,13 @@ export class Session {
   }
 
   /** Close the session, releasing its lease. If another close of it is in
-   * progress, waits for that one and returns its result. */
+   * progress, waits for that one and returns its result.
+   *
+   * It closes only this session: once this session has closed, another call
+   * fails with "is not open at epoch N", even if another client has opened
+   * the branch since. (A daemon too old to report the epoch closes whatever
+   * session is open on the branch.) */
   async close(): Promise<void> {
-    await this.client._call("close", { db: this.db, branch: this.branch });
+    await this.client._call("close", { db: this.db, branch: this.branch, epoch: this.epoch });
   }
 }

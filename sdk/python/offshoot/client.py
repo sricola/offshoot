@@ -278,7 +278,7 @@ class Client:
         closing; retry".
         """
         resp = self._call("open", db=db, branch=branch)
-        return Session(self, resp["checkout"], db, branch)
+        return Session(self, resp["checkout"], db, branch, epoch=resp.get("epoch"))
 
     def checkout(self, db: str, branch: str) -> str:
         """Materialize db@branch's head snapshot at rest; returns its path."""
@@ -589,8 +589,13 @@ class Client:
 class Session:
     """A live daemon session: a lease plus a checkout under continuous capture."""
 
-    def __init__(self, client: Client, path: str, db: str, branch: str):
+    def __init__(self, client: Client, path: str, db: str, branch: str,
+                 epoch: int | None = None):
         self._client, self.path, self._db, self._branch = client, path, db, branch
+        # The lease epoch the daemon's open returned (None from a daemon too
+        # old to send it): close() sends it back so it can only ever close
+        # this session.
+        self._epoch = epoch
 
     def flush(self, name: str = "", meta: dict[str, str] | None = None) -> int:
         """Flush the checkout to a durable snapshot; returns its txid.
@@ -612,5 +617,11 @@ class Session:
 
     def close(self) -> None:
         """Close the session, releasing its lease. If another close of it is
-        already in progress, waits for that one and returns its result."""
-        self._client._call("close", db=self._db, branch=self._branch)
+        already in progress, waits for that one and returns its result.
+
+        It closes only this session: once this session has closed, another
+        call fails with "is not open at epoch N", even if another client
+        has opened the branch since. (A daemon too old to report the epoch
+        closes whatever session is open on the branch.)
+        """
+        self._client._call("close", db=self._db, branch=self._branch, epoch=self._epoch)

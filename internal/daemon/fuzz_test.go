@@ -23,6 +23,7 @@ func FuzzDecodeRequest(f *testing.F) {
 	for _, req := range []Request{
 		{Op: "status"},
 		{Op: "open", DB: "app", Branch: "main"},
+		{Op: "close", DB: "app", Branch: "main", Epoch: 3},
 		{Op: "flush", DB: "app", Branch: "main", Name: "cp1", Meta: map[string]string{"k": "v"}},
 		{Op: "fork", DB: "app", Branch: "main", Name: "exp", From: "cp1", TTL: "1h", Meta: map[string]string{"run": "42"}},
 		{Op: "promote", DB: "app", Branch: "exp", Name: "main", Force: true, NoBackup: true, BackupTTL: "24h", Materialize: true},

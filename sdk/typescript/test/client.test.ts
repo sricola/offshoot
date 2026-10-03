@@ -417,6 +417,25 @@ test("rollback and promote send the materialize wire field", async () => {
   ]);
 });
 
+test("session close sends back the epoch its open returned, and none to an older daemon", async () => {
+  for (const [openResp, want] of [
+    [{ ok: true, checkout: "/c", epoch: 3 }, 3],
+    [{ ok: true, checkout: "/c" }, undefined], // an older daemon sends no epoch
+  ] as const) {
+    const client = Object.create(Client.prototype) as Client;
+    const sent: Array<[string, Record<string, unknown>]> = [];
+    (client as unknown as { _call: (op: string, fields: Record<string, unknown>) => Promise<unknown> })._call =
+      async (op, fields) => {
+        sent.push([op, fields]);
+        return op === "open" ? openResp : { ok: true };
+      };
+    await (await client.open("app")).close();
+    const [op, fields] = sent[sent.length - 1];
+    assert.equal(op, "close");
+    assert.equal(fields.epoch, want);
+  }
+});
+
 test("errors are loud", async (t: TestContext) => {
   if (!canRun) {
     t.skip("go and/or sqlite3 not on PATH");
@@ -481,6 +500,40 @@ test("rollback, promote, status", async (t: TestContext) => {
     assert.ok(!names.has("main-pre-promote"));
   } finally {
     await c.close();
+  }
+});
+
+test("a stale session close leaves another client's reopened session open", async (t: TestContext) => {
+  if (!canRun) {
+    t.skip("go and/or sqlite3 not on PATH");
+    return;
+  }
+  const a = await connect(fixture!.sock);
+  const b = await connect(fixture!.sock);
+  try {
+    await a.create("stale");
+    const first = await a.open("stale");
+    await first.close();
+    const second = await b.open("stale");
+    try {
+      await assert.rejects(
+        () => first.close(),
+        (err: unknown) => {
+          assert.ok(err instanceof OffshootError);
+          assert.match(err.message, /is not open at epoch/);
+          return true;
+        },
+      );
+      const mine = (await b.status()).filter((st) => st.db === "stale" && st.branch === "main");
+      assert.equal(mine.length, 1);
+      assert.equal(mine[0].state, "open");
+      await second.flush(); // rejects if the stale close had closed it
+    } finally {
+      await second.close();
+    }
+  } finally {
+    await a.close();
+    await b.close();
   }
 });
 

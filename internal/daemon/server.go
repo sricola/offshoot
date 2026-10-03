@@ -161,14 +161,17 @@ const DefaultFDBudget = 64
 func key(db, branch string) string { return db + "@" + branch }
 
 // slot is what s.sessions holds for one db@branch. sess is nil while an
-// open is in flight (reserved). done is non-nil only on a closing marker:
-// closeSlot closes it, under s.mu, after recording err and deleting the
-// key, so a waiter that sees done closed knows this daemon has let go of
-// the branch. err is written before done closes and read only after.
+// open is in flight (reserved). epoch is sess's lease epoch, which never
+// changes for a session; opClose compares a close's Request.Epoch against
+// it. done is non-nil only on a closing marker: closeSlot closes it, under
+// s.mu, after recording err and deleting the key, so a waiter that sees
+// done closed knows this daemon has let go of the branch. err is written
+// before done closes and read only after.
 type slot struct {
-	sess *session.Session
-	done chan struct{}
-	err  error
+	sess  *session.Session
+	epoch uint64
+	done  chan struct{}
+	err   error
 }
 
 func (sl *slot) isReserved() bool { return sl.sess == nil }
@@ -181,7 +184,7 @@ func (sl *slot) isOpen() bool     { return sl.sess != nil && sl.done == nil }
 // step first (opClose, Shutdown), so from here until closeSlot frees the
 // key, nothing in this daemon can treat the branch as free.
 func (s *Server) markClosingLocked(k string, sl *slot) *slot {
-	m := &slot{sess: sl.sess, done: make(chan struct{})}
+	m := &slot{sess: sl.sess, epoch: sl.epoch, done: make(chan struct{})}
 	s.sessions[k] = m
 	return m
 }
@@ -618,6 +621,10 @@ func (s *Server) opOpen(req Request) Response {
 		WS: s.ws, DB: req.DB, Branch: branch, FlushEvery: flushEvery,
 		SnapshotEvery: snapshotEvery,
 	})
+	var epoch uint64
+	if err == nil {
+		epoch = sess.Lease().Epoch // Lease takes the session's lock: read it before s.mu
+	}
 
 	s.mu.Lock()
 	if err != nil {
@@ -641,10 +648,10 @@ func (s *Server) opOpen(req Request) Response {
 		s.openWG.Done()
 		return errResp(fmt.Errorf("daemon: shutting down"))
 	}
-	s.sessions[k] = &slot{sess: sess}
+	s.sessions[k] = &slot{sess: sess, epoch: epoch}
 	s.openWG.Done()
 	s.mu.Unlock()
-	return Response{OK: true, Checkout: sess.CheckoutPath()}
+	return Response{OK: true, Checkout: sess.CheckoutPath(), Epoch: epoch}
 }
 
 // openDelay, when non-nil, is invoked by opOpen after it reserves a slot and
@@ -799,6 +806,17 @@ func (s *Server) sessionCount() int {
 // claimed, as a closing marker, until Close has released its lease. A close
 // of a branch that is already closing waits for that close, under the same
 // closeWaitBudget as an open, and returns its result.
+//
+// A close that carries req.Epoch acts only on the session at that epoch,
+// open or closing; any other slot answers "is not open at epoch N" at once.
+// Before close carried an epoch, a close retried after its session had
+// finished closing (a client that gave up waiting for the answer) closed
+// whatever session another client had opened on the branch since, and that
+// session's writes since its last flush were never shipped. A close with no epoch, from an
+// older client or the CLI, still closes whatever session is open on the
+// branch. Until each session has its own lease holder, a reopen after a
+// close whose release failed renews that lease in place and keeps its
+// epoch, so there the epoch cannot tell the two sessions apart.
 func (s *Server) opClose(req Request) Response {
 	branch := req.Branch
 	if branch == "" {
@@ -807,8 +825,11 @@ func (s *Server) opClose(req Request) Response {
 	k := key(req.DB, branch)
 	s.mu.Lock()
 	sl, ok := s.sessions[k]
-	if !ok || sl.isReserved() {
+	if !ok || sl.isReserved() || (req.Epoch != 0 && sl.epoch != req.Epoch) {
 		s.mu.Unlock()
+		if req.Epoch != 0 {
+			return errResp(fmt.Errorf("daemon: %s is not open at epoch %d", k, req.Epoch))
+		}
 		return errResp(fmt.Errorf("daemon: %s is not open", k))
 	}
 	if sl.isClosing() {
