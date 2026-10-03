@@ -681,6 +681,15 @@ func TestFailedDestroyUnwindsPastARenewal(t *testing.T) {
 // claimLandsThenFails is landsThenFails on a destroy's claim writes of
 // refKey (the first one lands and reports failure), with the delete kept
 // as the wrapped backend has it: conditional on Local, unconditional on S3.
+//
+// It embeds only store.Backend, so it hides Local's store.SettledWriter,
+// and that is what lets it run over Local at all: a real local write that
+// reports failure wrote nothing, and landedClaim reports it at once
+// (TestDestroyReportsAFailedClaimWriteAtOnceOnALocalStore). Over Local it
+// stands for a backend that has a conditional delete but does not settle
+// its writes, so the "local-unsettled" variants below drive landedClaim's
+// re-read path into deleteClaimedRef's conditional delete; they are not
+// what a local store does.
 type claimLandsThenFails struct{ *landsThenFails }
 
 func newClaimLandsThenFails(base store.Backend, refKey string, err error) claimLandsThenFails {
@@ -706,14 +715,16 @@ func (b claimLandsThenFails) DeleteIf(key, ifMatch string) error {
 // claim before it hears back, and the holder's next renewal finds the
 // branch gone. Reporting a lost race instead would leave the claim behind,
 // and the retry the error asks for would be refused under it as "already
-// being destroyed" until it was 30 s old.
+// being destroyed" until it was 30 s old. Only S3 does this; the
+// "local-unsettled" variant runs the same path over Local's conditional
+// delete through a wrapper (see claimLandsThenFails).
 func TestDestroyGoesOnWhenItsClaimLandedButReportedFailure(t *testing.T) {
 	lost := fmt.Errorf("%w: precondition failed on the retry", store.ErrCAS)
 	timeout := errors.New("store: s3 conditional put refs/app/work: context deadline exceeded")
 	for _, bk := range []struct {
 		name string
 		ws   func(*testing.T) *Workspace
-	}{{"local", newWS}, {"s3", newWSOnFakeS3}} {
+	}{{"local-unsettled", newWS}, {"s3", newWSOnFakeS3}} {
 		for _, tc := range []struct {
 			name  string
 			err   error
@@ -741,6 +752,9 @@ func TestDestroyGoesOnWhenItsClaimLandedButReportedFailure(t *testing.T) {
 				plain := &store.Store{B: base}
 				renewed := false
 				b := newClaimLandsThenFails(base, store.RefKey("app", "work"), tc.err)
+				if s, ok := any(b).(store.SettledWriter); ok && s.WritesSettled() {
+					t.Fatal("precondition: claimLandsThenFails settles its writes, so landedClaim would never re-read the ref")
+				}
 				if tc.renew {
 					b.after = func() {
 						next, err := plain.RenewLease(l, ttl, time.Now().Add(time.Millisecond))
@@ -780,12 +794,14 @@ func TestDestroyGoesOnWhenItsClaimLandedButReportedFailure(t *testing.T) {
 // --force, a renewal that makes the lease live again), fails as it would
 // had the same write landed before its delete, and clears its own claim
 // first, so the retry its error asks for is not refused as a branch another
-// destroy has claimed.
+// destroy has claimed. As in TestDestroyGoesOnWhenItsClaimLandedButReportedFailure,
+// the "local-unsettled" variant is Local behind claimLandsThenFails, not
+// a path a local store takes.
 func TestDestroyUnwindsALandedClaimItCannotCarryThrough(t *testing.T) {
 	for _, bk := range []struct {
 		name string
 		ws   func(*testing.T) *Workspace
-	}{{"local", newWS}, {"s3", newWSOnFakeS3}} {
+	}{{"local-unsettled", newWS}, {"s3", newWSOnFakeS3}} {
 		for _, tc := range []struct {
 			name    string
 			force   bool
@@ -854,6 +870,9 @@ func TestDestroyUnwindsALandedClaimItCannotCarryThrough(t *testing.T) {
 				base := w.Store.B
 				plain := &store.Store{B: base}
 				b := newClaimLandsThenFails(base, store.RefKey("app", "work"), fmt.Errorf("%w: precondition failed on the retry", store.ErrCAS))
+				if s, ok := any(b).(store.SettledWriter); ok && s.WritesSettled() {
+					t.Fatal("precondition: claimLandsThenFails settles its writes, so landedClaim would never re-read the ref")
+				}
 				b.after = func() { tc.moveRef(t, plain, &l) }
 				w.Store.B = b
 				derr := w.Destroy("app", "work", tc.force)
@@ -1239,9 +1258,14 @@ func TestDestroyReportsAFailedClaimWriteAtOnceOnALocalStore(t *testing.T) {
 // slowClaim holds up a destroy's claim write of refKey for hold before
 // passing it on, as response timeouts and SDK retries hold up a PutObject
 // on S3, and hides the wrapped backend's conditional delete, as S3 has
-// none: a destroy's delete of refKey is a plain Delete. beforeDelete, when
-// set, runs as that delete is sent, before it lands: what other hosts do
-// while it is on its way. Run under synctest, so holds take no real time.
+// none: a destroy's delete of refKey is a plain Delete. It embeds only
+// store.Backend, so it hides the wrapped backend's store.SettledWriter
+// too, as S3 does not implement it: over Local (or a claimLandsLate over
+// Local, which forwards Local's answer) a claim write that reports failure
+// is settled by landedClaim's re-reads, as on S3, never reported at once.
+// beforeDelete, when set, runs as that delete is sent, before it lands:
+// what other hosts do while it is on its way. Run under synctest, so holds
+// take no real time.
 type slowClaim struct {
 	store.Backend
 	refKey       string
