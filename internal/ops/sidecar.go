@@ -403,10 +403,30 @@ func untrustedHash(txid uint64) string {
 // head to (headKnown false when it could not be established), and encSum
 // the checksum of the bytes this checkpoint encoded, whose fingerprint
 // (taken right after quiesce, before the encode) is fpEncode (fpEncodeOK
-// false when that stat failed). The live checkout is hashed between two
-// fingerprints as in writeSum; its post-apply checksum is encSum when that
-// fingerprint still equals fpEncode, and otherwise ltxio.ChecksumDatabase
-// read under the same fingerprint.
+// false when that stat failed), read at wall-clock instant encodeNS. The
+// live checkout is hashed between two fingerprints as in writeSum; its
+// post-apply checksum is encSum when that fingerprint still equals
+// fpEncode AND fpEncode is settled (below), and otherwise
+// ltxio.ChecksumDatabase read under the same fingerprint.
+//
+// fpEncode is settled when its mtime is at least fingerprintSafetyMargin
+// older than encodeNS — the racily-clean guard (see
+// fingerprintSafetyMargin's doc comment), applied here to the encode
+// fingerprint exactly as fingerprintMatches applies it to a sidecar's. A
+// matching fingerprint is only evidence that nothing wrote to the checkout
+// between the encode and now if a write COULD NOT have left the fingerprint
+// unchanged: a checkout is WAL mode, where the change counter is not
+// evidence (see sumRecord's doc comment), so size and mtime alone carry
+// the match, and on a filesystem with coarse mtime resolution a foreign
+// same-size write landing in the same mtime tick as the stat that produced
+// fpEncode (the tick the quiesce itself wrote in) leaves fp == fpEncode
+// with the content changed. Taking the shortcut then would stamp encSum —
+// what the store holds — as the checksum of bytes it does not describe,
+// refresh the shadow from them, and leave checkoutState reading "clean"
+// for content that was never checkpointed. When the margin is not met the
+// shortcut is simply not taken: ChecksumDatabase hashes the live content
+// under its own fingerprint sandwich, which costs one pass over the file
+// and cannot be fooled by the tick.
 //
 // The stamp is trusted — the real hash, fingerprint and headSum — only
 // when the live checkout's checksum is known and equals headSum: the store
@@ -415,13 +435,14 @@ func untrustedHash(txid uint64) string {
 // now, or either side is unknown) it records checksum 0 and untrustedHash
 // with no fingerprint, so checkoutState reads "modified" and the next
 // checkpoint writes a snapshot.
-func stampCheckpoint(path, lineage string, epoch, txid, headSum uint64, headKnown bool, encSum uint64, fpEncode fingerprint, fpEncodeOK bool) (bool, error) {
+func stampCheckpoint(path, lineage string, epoch, txid, headSum uint64, headKnown bool, encSum uint64, fpEncode fingerprint, encodeNS int64, fpEncodeOK bool) (bool, error) {
 	sum, fp, beforeNS, ok, err := sandwichedSum(path)
 	if err != nil {
 		return false, err
 	}
 	if headKnown && ok {
-		liveSum, liveKnown := encSum, fpEncodeOK && fp == fpEncode
+		settled := fpEncode.mtimeNS <= encodeNS-int64(fingerprintSafetyMargin)
+		liveSum, liveKnown := encSum, fpEncodeOK && settled && fp == fpEncode
 		if !liveKnown {
 			if c, cerr := ltxio.ChecksumDatabase(path); cerr == nil {
 				if fpAfter, ferr := stampFingerprint(path); ferr == nil && fpAfter == fp {

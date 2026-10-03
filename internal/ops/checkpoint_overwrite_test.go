@@ -5,6 +5,7 @@ import (
 	"errors"
 	"os"
 	"strings"
+	"sync"
 	"sync/atomic"
 	"testing"
 
@@ -17,25 +18,44 @@ import (
 // call sends its own release channel on arrived and waits for it to close.
 // holdObject arms a one-shot hold of the next PutIf of one object key (a
 // checkpoint's create-only upload) the same way, on objArrived. Head
-// forwards to the wrapped backend's Header, or fails with headErr.
+// forwards to the wrapped backend's Header, or fails with headErr, or
+// returns the forwarded etag rewritten by headEtag when that is set. Every
+// Get is counted per key in gets.
 type casGate struct {
 	store.Backend
 	refKey     string
 	on         atomic.Bool
 	arrived    chan chan struct{}
 	headErr    error
+	headEtag   func(etag string) string
 	objKey     string
 	objArmed   atomic.Bool
 	objArrived chan chan struct{}
 	getErrKey  string
+	mu         sync.Mutex
+	gets       map[string]int
 }
 
-// Get fails for getErrKey, and forwards everything else.
+// Get fails for getErrKey, and forwards everything else, counting each
+// call against its key.
 func (g *casGate) Get(key string) ([]byte, string, error) {
+	g.mu.Lock()
+	if g.gets == nil {
+		g.gets = map[string]int{}
+	}
+	g.gets[key]++
+	g.mu.Unlock()
 	if g.getErrKey != "" && key == g.getErrKey {
 		return nil, "", errors.New("get unavailable")
 	}
 	return g.Backend.Get(key)
+}
+
+// getCount is how many times key has been Get through the gate.
+func (g *casGate) getCount(key string) int {
+	g.mu.Lock()
+	defer g.mu.Unlock()
+	return g.gets[key]
 }
 
 func gateRefCAS(w *Workspace, db, branch string) *casGate {
@@ -69,7 +89,11 @@ func (g *casGate) Head(key string) (string, int64, error) {
 	if g.headErr != nil {
 		return "", 0, g.headErr
 	}
-	return g.Backend.(store.Header).Head(key)
+	etag, size, err := g.Backend.(store.Header).Head(key)
+	if err == nil && g.headEtag != nil {
+		etag = g.headEtag(etag)
+	}
+	return etag, size, err
 }
 
 // countOverwrites installs ObserveCheckpointOverwrite for the test and
@@ -506,6 +530,54 @@ func TestOverwriteDetectionSkipsWhenHeadUnsupported(t *testing.T) {
 		t.Fatalf("overwrite counter %d, want 0", got)
 	}
 	assertTrustedStamp(t, path)
+}
+
+// TestReformattedEtagSkipsTheGet: an S3-compatible provider may return
+// the same object's etag in a different shape on HEAD than on PUT (bare
+// where the put was quoted, a weak "W/" prefix, upper-case hex). That is
+// still our own object, so the post-CAS check must trust it from the Head
+// alone: no Get of the object, nothing counted as an overwrite, and the
+// stamp trusted. A genuinely different etag still costs the Get, which
+// then finds the same content and is likewise not counted.
+func TestReformattedEtagSkipsTheGet(t *testing.T) {
+	reformat := func(etag string) string {
+		return `W/"` + strings.ToUpper(strings.Trim(etag, `"`)) + `"`
+	}
+	different := func(string) string { return `"not-the-etag-the-put-returned"` }
+	for name, newW := range map[string]func(*testing.T) *Workspace{"local": newWS, "s3": newWSOnFakeS3} {
+		for _, tc := range []struct {
+			name     string
+			rewrite  func(string) string
+			wantGets int
+		}{
+			{"reformatted", reformat, 0},
+			{"different", different, 1},
+		} {
+			t.Run(name+"/"+tc.name, func(t *testing.T) {
+				w := newW(t)
+				requireClone(t, w)
+				seedDB(t, w, "app", 1<<20)
+				path := w.CheckoutPath("app", "main")
+				mustSQL(t, path, "INSERT INTO t (v) VALUES (randomblob(100));")
+				before := refOf(t, w, "app", "main")
+				key := store.SnapshotKey(before.Lineage, before.Epoch, before.HeadTXID+1)
+				overwrites := countOverwrites(t)
+				g := gateRefCAS(w, "app", "main")
+				g.headEtag = tc.rewrite
+
+				if res := mustCheckpointWith(t, w, "app", "main", "a", CheckpointOptions{Snapshot: true}); res.Kind != "snapshot" {
+					t.Fatalf("kind %q, want snapshot", res.Kind)
+				}
+				if got := g.getCount(key); got != tc.wantGets {
+					t.Fatalf("the checkpoint Get its own object %d times, want %d", got, tc.wantGets)
+				}
+				if got := overwrites.Load(); got != 0 {
+					t.Fatalf("overwrite counter %d, want 0", got)
+				}
+				assertTrustedStamp(t, path)
+			})
+		}
+	}
 }
 
 // TestOrphanOverwriteIsNotFlagged: a checkpoint that overwrites an orphan a

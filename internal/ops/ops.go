@@ -579,7 +579,11 @@ func (w *Workspace) CheckpointWith(db, branch, name string, meta map[string]stri
 	// The checkout's fingerprint right after quiesce, before the encode:
 	// stampCheckpoint compares it with the file it stamps, so a write
 	// landing between the encode and the stamp cannot get our checksum
-	// attributed to bytes we never encoded.
+	// attributed to bytes we never encoded. encodeNS is the wall clock
+	// read just BEFORE that stat (the same anchoring sandwichedSum uses
+	// for StampedNS): stampCheckpoint trusts the comparison only when the
+	// fingerprint's mtime is a racily-clean margin older than this instant.
+	encodeNS := time.Now().UnixNano()
 	fpEncode, fpEncodeErr := stampFingerprint(path)
 	if checkpointAfterQuiesceForTest != nil {
 		checkpointAfterQuiesceForTest()
@@ -742,7 +746,7 @@ func (w *Workspace) CheckpointWith(db, branch, name string, meta map[string]stri
 	if (!headKnown || headSum != checksum) && ObserveCheckpointOverwrite != nil {
 		ObserveCheckpointOverwrite()
 	}
-	trusted, err := stampCheckpoint(path, ref.Lineage, ref.HeadEpoch, txid, headSum, headKnown, checksum, fpEncode, fpEncodeErr == nil)
+	trusted, err := stampCheckpoint(path, ref.Lineage, ref.HeadEpoch, txid, headSum, headKnown, checksum, fpEncode, encodeNS, fpEncodeErr == nil)
 	if err != nil {
 		return CheckpointResult{}, fmt.Errorf("ops: checkpoint %q committed (txid %d), but the checkout fingerprint could not be refreshed: %w", name, txid, err)
 	}
@@ -760,7 +764,10 @@ func (w *Workspace) CheckpointWith(db, branch, name string, meta map[string]stri
 // verifyOwnObject returns the post-apply checksum of the object at key,
 // just committed by a winning ref CAS, and whether it is known. A Head
 // whose etag equals ownEtag (the etag our create-only put returned)
-// answers checksum with one request. Otherwise — a rival's overwrite, or
+// answers checksum with one request; the two are compared normalized
+// (store.NormalizeETag), so an S3-compatible provider that quotes, weakens
+// or re-cases the etag between the PUT and the HEAD still answers with
+// that one request. Otherwise — a rival's overwrite, or
 // our own unconditional overwrite, which returns no etag — the object is
 // fetched and its trailer read: two encodes of the same checkout state
 // differ in bytes (an LTX header carries its encode time) but not in
@@ -776,7 +783,7 @@ func (w *Workspace) verifyOwnObject(key, ownEtag string, checksum uint64) (uint6
 		fmt.Fprintf(os.Stderr, "offshoot: warning: could not verify checkpoint object %s after committing it (trusting it): %v\n", key, err)
 		return checksum, true
 	}
-	if ownEtag != "" && etag == ownEtag {
+	if ownEtag != "" && store.NormalizeETag(etag) == store.NormalizeETag(ownEtag) {
 		return checksum, true
 	}
 	data, _, err := w.Store.B.Get(key)

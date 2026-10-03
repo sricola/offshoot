@@ -17,7 +17,46 @@ Pin an exact version if you depend on format stability. The full contract:
 
 ## [Unreleased]
 
-Nothing yet.
+### Fixed
+
+- **A `checkpoint` could stamp its checkout trusted for content it never
+  encoded.** The stamp trusted the encode's checksum whenever the
+  checkout's fingerprint (size, mtime, change counter) still matched the
+  one taken right after quiesce. Checkouts are WAL mode, where SQLite can
+  leave the change counter untouched across commits, so size and mtime
+  alone carried that match; on a filesystem with 1 s mtime resolution a
+  foreign same-size write landing in the same tick as the quiesce left the
+  fingerprint identical with the content changed, and the sidecar then
+  read "clean" (and the shadow was refreshed) for bytes the store does not
+  hold. The stamp now applies the same 1 s racily-clean margin that
+  `checkout` already applies to its fingerprint fast path: when the encode
+  fingerprint's mtime is younger than the margin, the live database is
+  checksummed instead, which costs one pass over the file and cannot be
+  fooled by the tick.
+
+### Changed
+
+- **Etags are normalized before the post-checkpoint compare.** After
+  winning its ref CAS, a checkpoint `Head`s the object it just wrote and
+  trusts it with that one request when the etag matches the one its
+  create-only put returned; otherwise it `Get`s the whole object to read
+  the trailer. An S3-compatible provider (MinIO, RustFS, R2, B2, Ceph RGW)
+  may return the same object's etag quoted on `PUT` and bare on `HEAD`,
+  with a weak `W/` prefix, or with the hex in a different case, and every
+  such checkpoint paid a needless full `GET`. Both etags now go through
+  `store.NormalizeETag` (trim, drop `W/`, strip one pair of quotes,
+  lower-case) before the compare. What is sent to the provider as
+  `If-Match` is unchanged, and so are the local backend's own etags.
+
+### Added
+
+- A 64 KiB-page ltx v0.5.1 fixture (`internal/ltxio/testdata/ltx-v0.5.1-64k`)
+  beside the 4 KiB one. Its data page is random bytes LZ4 cannot shrink, so
+  the page frame carries a stored block of exactly one page: the largest
+  frame the pinned v0.5.1 shape can hold and the edge of the decode guard's
+  block limit. `TestDecodesLTXv051FrameFormat` now decodes both sets and
+  asserts the 64 KiB one really is incompressible; both seed the fuzz
+  targets.
 
 ## [0.2.15] - 2026-10-02
 
