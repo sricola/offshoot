@@ -65,6 +65,15 @@ func (w *Workspace) reapOne(db, branch string, now time.Time) (bool, error) {
 	if ref.TTL == "" || ref.Protected {
 		return false, nil
 	}
+	if liveDeleteClaim(ref, time.Now()) {
+		// A destroy has claimed the branch and may still be on its way to
+		// its delete: it removes the branch, or unwinds its claim and a
+		// later cycle re-evaluates. Any write now, a reaping claim or the
+		// clearing of a stale one, would move the etag that destroy's
+		// conditional delete compares against, and this cycle's own
+		// Destroy would be refused under the live claim.
+		return false, nil
+	}
 	deadline, ok := ReapDeadline(ref)
 	if !ok {
 		if ref.Reaping {
@@ -118,9 +127,27 @@ func (w *Workspace) reapOne(db, branch string, now time.Time) (bool, error) {
 	// writer. Protected also wins here even though force could bypass it —
 	// Reap deliberately never passes force.
 	if err := w.Destroy(db, branch, false); err != nil {
-		if ref2, etag2, gerr := w.Store.GetRef(db, branch); gerr == nil && ref2.Reaping {
+		// Unwind the reaping claim, unless a destroy's live claim is on
+		// the ref (one that claimed the branch after this cycle read it):
+		// the unwind would move the etag that destroy's conditional delete
+		// compares against, as above. Left set, the reaping claim goes
+		// with the branch when that destroy deletes it, or, if it unwinds
+		// instead, the next cycle reaps the branch or clears the claim.
+		// Until that cycle, touch refuses the branch as being reaped
+		// ("too late to touch") and acquires with store.ErrReaping. The
+		// destroy's unwind leaves the reaping claim alone: it cannot tell
+		// this pass's claim from one whose reaper is still between its
+		// claim and its Destroy, and clearing that one would let a touch
+		// land that its Destroy, which does not look at the deadline
+		// again, deletes past.
+		if ref2, etag2, gerr := w.Store.GetRef(db, branch); gerr == nil && ref2.Reaping && !liveDeleteClaim(ref2, time.Now()) {
 			ref2.Reaping = false
 			_, _ = w.Store.PutRef(db, branch, ref2, etag2) // best effort; next cycle retries
+		}
+		if errors.Is(err, store.ErrDeleting) {
+			// A destroy claimed the branch after this cycle read it: the
+			// branch is that destroy's to finish, as above.
+			return false, nil
 		}
 		return false, err
 	}

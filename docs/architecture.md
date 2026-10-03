@@ -324,12 +324,12 @@ the parent. Branches without a TTL live until destroyed.
 **Not in scope: multi-node orchestration — and one daemon per store is
 the supported topology today.** The epoch-fencing scheme protects the
 live-session write path, but it is not yet the whole story across
-machines: the at-rest command paths (`checkpoint`, `rollback`, `promote`,
-`compact` from a second machine) don't take the branch lease before
-writing, and lease identity/expiry currently assume distinct hostnames
-and bounded clock skew. Until that groundwork lands, point exactly one
-daemon (and its CLI) at a store; there is no placement, failover, or
-cross-node routing, and offshoot deliberately doesn't use the word
+machines: the at-rest repoints (`rollback`, `promote`, `compact` from a
+second machine) don't take the branch lease before writing (an at-rest
+`checkpoint` does), and lease identity/expiry currently assume distinct
+hostnames and bounded clock skew. Until that groundwork lands, point
+exactly one daemon (and its CLI) at a store; there is no placement,
+failover, or cross-node routing, and offshoot deliberately doesn't use the word
 "cluster." Cross-node movement today is checkpoint + `export` (or
 re-checkout) elsewhere. See [docs/limitations.md](limitations.md#one-daemon-per-store).
 

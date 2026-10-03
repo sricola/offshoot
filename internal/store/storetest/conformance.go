@@ -38,12 +38,15 @@ func RunConformance(t *testing.T, keyPrefix string, newBackend func(t *testing.T
 	})
 
 	t.Run("PutOverwritesExistingKey", func(t *testing.T) {
-		// ops relies on this: Checkpoint's orphan-recovery path (see the
-		// comment in ops.Checkpoint) falls back to an UNCONDITIONAL Put to
-		// overwrite a snapshot object left by a crashed or racing prior
-		// attempt at the same deterministic key. Every backend must agree
-		// that a second Put to an existing key wins outright, not merge,
-		// append, or silently no-op.
+		// session flush relies on this: when its create-only upload finds
+		// the key taken, the only occupant can be an orphan a crashed
+		// prior flush left at the same deterministic key (nothing names a
+		// txid beyond the head yet), and it falls back to an UNCONDITIONAL
+		// Put (or PutReader) to overwrite it (see Session.flush in
+		// internal/session/flush.go). GC's tombstone-list write is
+		// last-write-wins too. Every backend must agree that a second Put
+		// to an existing key wins outright, not merge, append, or silently
+		// no-op.
 		b := newBackend(t)
 		if err := b.Put(k("data/overwrite"), []byte("first")); err != nil {
 			t.Fatal(err)

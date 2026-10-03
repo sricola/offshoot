@@ -432,8 +432,8 @@ func untrustedHash(txid uint64) string {
 //
 // The stamp is trusted — the real hash, fingerprint and headSum — only
 // when the live checkout's checksum is known and equals headSum: the store
-// holds exactly what the checkout holds. Otherwise (a racer's different
-// content resolves the head, the checkout changed between the encode and
+// holds exactly what the checkout holds. Otherwise (an object replaced out
+// of band resolves the head, the checkout changed between the encode and
 // now, or either side is unknown) it records checksum 0 and untrustedHash
 // with no fingerprint, so checkoutState reads "modified" and the next
 // checkpoint writes a snapshot.

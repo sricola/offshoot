@@ -9,20 +9,21 @@ import (
 	"github.com/sricola/offshoot/internal/testutil"
 )
 
-// rpcCountBackend wraps a real Backend and counts List calls per prefix and
-// Get calls per key, leaving every operation's behavior untouched. It exists
-// to pin ops' store-RPC counts: on a remote backend every List/Get is a
-// round trip, so a redundant re-resolution or re-enumeration is a real cost
-// regression, not noise.
+// rpcCountBackend wraps a real Backend and counts List calls per prefix, and
+// Get and PutIf calls per key, leaving every operation's behavior untouched.
+// It exists to pin ops' store-RPC counts: on a remote backend every
+// List/Get/PutIf is a round trip, so a redundant re-resolution,
+// re-enumeration or ref write is a real cost regression, not noise.
 type rpcCountBackend struct {
 	store.Backend
-	mu    sync.Mutex
-	lists map[string]int
-	gets  map[string]int
+	mu     sync.Mutex
+	lists  map[string]int
+	gets   map[string]int
+	putIfs map[string]int
 }
 
 func newRPCCountBackend(b store.Backend) *rpcCountBackend {
-	return &rpcCountBackend{Backend: b, lists: map[string]int{}, gets: map[string]int{}}
+	return &rpcCountBackend{Backend: b, lists: map[string]int{}, gets: map[string]int{}, putIfs: map[string]int{}}
 }
 
 func (b *rpcCountBackend) List(prefix string) ([]string, error) {
@@ -39,6 +40,13 @@ func (b *rpcCountBackend) Get(key string) ([]byte, string, error) {
 	return b.Backend.Get(key)
 }
 
+func (b *rpcCountBackend) PutIf(key string, data []byte, ifMatch string) (string, error) {
+	b.mu.Lock()
+	b.putIfs[key]++
+	b.mu.Unlock()
+	return b.Backend.PutIf(key, data, ifMatch)
+}
+
 func (b *rpcCountBackend) listCount(prefix string) int {
 	b.mu.Lock()
 	defer b.mu.Unlock()
@@ -49,6 +57,12 @@ func (b *rpcCountBackend) getCount(key string) int {
 	b.mu.Lock()
 	defer b.mu.Unlock()
 	return b.gets[key]
+}
+
+func (b *rpcCountBackend) putIfCount(key string) int {
+	b.mu.Lock()
+	defer b.mu.Unlock()
+	return b.putIfs[key]
 }
 
 // A Fork that takes the MATERIALIZE branch must resolve the source chain
@@ -160,5 +174,43 @@ func TestSharedForksGetManifestOnce(t *testing.T) {
 	// EnsureLayoutV2) — pinned here by name since the constant is unexported.
 	if n := cb.getCount("offshoot.json"); n != 1 {
 		t.Fatalf("two shared forks Got the manifest %d times, want exactly 1 (>= v2 must be memoized)", n)
+	}
+}
+
+// An at-rest checkpoint's store requests are pinned: on the ref, one read
+// and one write (the lease acquire, whose read the refusals also run on),
+// and one read and one write (the head write, which also releases the
+// lease), with no renewal inside a short checkpoint. A segment checkpoint lists the
+// head's lineage once (the chain resolve) and never lists a snapshot key:
+// the probes for another checkpoint's snapshot at its txid went away with
+// the private epoch.
+func TestAtRestCheckpointStoreRequests(t *testing.T) {
+	w := newWS(t)
+	requireClone(t, w)
+	path := seedRows(t, w, "app", 1<<20, 4000)
+	mustCheckpointWith(t, w, "app", "main", "a", CheckpointOptions{})
+	mustSQL(t, path, "INSERT INTO t (v) VALUES (randomblob(100));")
+	before := refOf(t, w, "app", "main")
+	cb := newRPCCountBackend(w.Store.B)
+	w.Store.B = cb
+	res := mustCheckpointWith(t, w, "app", "main", "b", CheckpointOptions{})
+	w.Store.B = cb.Backend
+	if res.Kind != "segment" {
+		t.Fatalf("kind %q, want segment", res.Kind)
+	}
+	refKey := store.RefKey("app", "main")
+	if n := cb.getCount(refKey); n != 2 {
+		t.Fatalf("the ref was read %d times, want 2: acquire, head write", n)
+	}
+	if n := cb.putIfCount(refKey); n != 2 {
+		t.Fatalf("the ref was written %d times, want 2: acquire, head write", n)
+	}
+	if n := cb.listCount(store.LineagePrefix(before.Lineage)); n != 1 {
+		t.Fatalf("the lineage was listed %d times, want 1 (the chain resolve)", n)
+	}
+	for _, epoch := range []uint64{before.Epoch, before.Epoch + 1} {
+		if n := cb.listCount(store.SnapshotKey(before.Lineage, epoch, res.TXID)); n != 0 {
+			t.Fatalf("the snapshot key at epoch %d was listed %d times, want 0", epoch, n)
+		}
 	}
 }

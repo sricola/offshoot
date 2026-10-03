@@ -55,7 +55,7 @@ build a dashboard against a name not in this table.
 | `offshoot_rollback_total` | counter | `mode` (`shared`/`materialized`) | Successful rollbacks, by storage mode — `shared` = the new lineage is a base pointer at the kept checkpoint (the default since v0.2.12); `materialized` = a snapshot copy (`--materialize`, or the fork-time depth floor). Both label values pre-registered at `0`. Counted once the ref repoint lands. |
 | `offshoot_promote_total` | counter | `mode` (`shared`/`materialized`) | Successful promotes, by storage mode, with the same meaning as `offshoot_rollback_total`. Both label values pre-registered at `0`. |
 | `offshoot_checkpoint_duration_seconds` | histogram | — | **At-rest** checkpoint latency only — a process that calls `ops.Workspace.Checkpoint` directly (the CLI or `offshoot mcp`, no daemon session involved). A live session's named `flush` is *not* counted here; it's a flush, tallied under `offshoot_flush_duration_seconds` instead. This histogram reads all-zero on a daemon that only ever serves live sessions and never itself runs an at-rest checkpoint. |
-| `offshoot_checkpoint_overwrite_detected_total` | counter | — | **At-rest** checkpoints that committed but found the store's head may not be their own content: their object was replaced by a racing same-kind checkpoint's different content, a racing snapshot with different content sits beside their winning segment and anchors the head (two `offshoot checkpoint` calls on one branch at once, with a write between their encodes), or the object could not be verified after an etag mismatch (it could not be fetched or decoded; logged to stderr). Unless the checkout turns out to hold exactly the store's content, it then reads as modified, records no checksum, and the next checkpoint writes a snapshot; see [limitations](limitations.md#one-writer-per-branch). Like `offshoot_checkpoint_duration_seconds`, it only moves in a process that runs at-rest checkpoints itself. Registered at `0`. |
+| `offshoot_checkpoint_overwrite_detected_total` | counter | — | **At-rest** checkpoints that committed but found the store's head may not be their own content: the object at their key no longer carries what they uploaded (the key is under an epoch only that checkpoint's lease minted, so no offshoot writer can have replaced it; something outside offshoot did), or the object could not be verified after an etag mismatch (it could not be fetched or decoded; logged to stderr). Unless the checkout turns out to hold exactly the store's content, it then reads as modified, records no checksum, and the next checkpoint writes a snapshot; see [limitations](limitations.md#one-writer-per-branch). Like `offshoot_checkpoint_duration_seconds`, it only moves in a process that runs at-rest checkpoints itself. Registered at `0`. |
 | `offshoot_reap_total` | counter | — | Branches reaped (TTL-expired, destroyed) by the janitor. |
 | `offshoot_gc_tombstoned_total` | counter | — | Objects newly tombstoned by a GC pass. |
 | `offshoot_gc_deleted_total` | counter | — | Objects actually deleted by GC, after their grace period. |
@@ -176,7 +176,18 @@ short-circuit).
 
 **A branch that refuses `open`** with "branch is being deleted" or "branch
 is being reaped" is mid-`destroy`/mid-reap, not stuck — the claim is
-transient (retry shortly). None of the seven states above surface that claim:
+transient (retry shortly). A `destroy` of it is refused the same way, with
+"is already being destroyed", until that destroy ends or its claim is 30
+seconds old. A reap claim can outlast a destroy it gave way to: when a
+`destroy` claims an expired branch the reaper had already claimed, and
+then fails and removes its own claim, the reap claim stays until the next
+reap pass (the janitor's next tick, or `offshoot gc`). That pass reaps
+the branch or clears the claim: it clears it if the branch's deadline has
+moved since, or if its own destroy of the branch fails (a busy checkout,
+say). Until then `open`, `touch`, `lease acquire` and `checkpoint` refuse
+it as being reaped. The failed destroy cannot clear the reap claim
+itself: it cannot tell it from one whose reaper is still on its way to
+its delete. None of the seven states above surface either claim:
 they're computed purely from the ref's lease and the checkout's sidecar,
 which a Destroy/Reap claim doesn't touch, so `status`/`branches` reads that
 same branch as `idle` (or `active`, if it still carries a lease at that

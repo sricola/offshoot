@@ -24,50 +24,29 @@ riskier problem than the one offshoot solves
 are copy-on-write and near-free, so fork-per-writer is the intended
 pattern, not a workaround.
 
-**Two at-rest `offshoot checkpoint` commands on one branch at once are
-still not a supported pattern; they are now safe to survive.** The at-rest
-path takes no lease (see [One daemon per store](#one-daemon-per-store)), so
-two racers compute the same next txid and race one ref CAS. Exactly one
-wins, but what the store then resolves the head to can be the loser's
-content rather than the winner's. After its CAS, the winner checks for each
-way that can happen:
+**Two at-rest `offshoot checkpoint` commands on one branch: the second is
+refused.** An at-rest checkpoint takes the branch lease before it writes
+anything and releases it in the same ref write that advances the head, so
+it is a leased, epoch-fenced writer like a daemon session. While one runs,
+a second checkpoint on the branch fails at once with `has a live lease
+held by "checkpoint:<host>/<pid>/<nonce>" ... (another checkpoint is in
+progress)`; retry once the first finishes. The acquire bumps the epoch, so
+the checkpoint's object key is its own: no other writer can overwrite it,
+and an object a crashed or fenced writer left at the same txid sits under
+an older epoch, which chain resolution never picks and GC reclaims.
+`--force` does not take over a live lease, a session's or a checkpoint's.
 
-- **Same-kind overwrite.** Both racers chose the same kind (snapshot or
-  segment), so they share one object key, and the loser's upload replaced
-  the winner's. The winner sends one `HEAD` and compares the etag with the
-  one its own upload returned; on a mismatch it reads the object's trailer
-  checksum.
-- **Mixed kind.** The winner wrote a segment and the loser a snapshot at
-  the same txid. The chain resolver anchors the head on the newest snapshot
-  at or below it, so the loser's snapshot becomes the head. A live loser
-  deletes its snapshot when it sees the winner's kind, but one that died
-  first (or has not got there yet) cannot. So a segment winner also lists
-  the snapshot key at its txid (one `LIST`) and, when one is there, reads
-  that snapshot's trailer checksum.
-- **A write between encode and stamp.** No racer is needed for this one. A
-  write landing on the checkout after the winner's encode and before its
-  stamp means the checkout no longer holds what was committed. The winner
-  compares the checkout's fingerprint from right after quiesce with the one
-  at stamp time.
-
-When any check finds that the store's head may differ from the checkout,
-the winner compares the head's checksum with the checkout's own. If they
-are equal, the store holds exactly what the checkout holds, and the stamp
-is trusted as usual. Otherwise it records no checksum and a hash no file
-can match. The checkout then reads as having un-checkpointed changes, so
-`fork` warns and `checkout` says it is overwriting them. The shadow is
-dropped, so the next checkpoint writes a full snapshot of whatever the
-checkout holds, and no daemon session opened on the checkout trusts a
-checksum for it. A racer's content replacing (or anchoring) the head is
-also counted in `offshoot_checkpoint_overwrite_detected_total`, and so is
-an object that could not be re-read to check it. Either way, the branch
-holds a valid checkpoint at that txid, but it may be the loser's encode.
-
-**What remains:** a third racer that overwrites the object after the
-winner's check has run is not noticed, and neither is a two-racer
-ordering where the losing snapshot lands after the winner's probe and its
-writer dies before reaching its own ref CAS (so its cleanup never runs). To get exactly the content you
-checkpointed, serialize at-rest checkpoints per branch, or fork per writer.
+Two checks remain for what a lease cannot fence. After its ref write the
+checkpoint `HEAD`s its object and compares the etag with the one its
+upload returned (on a mismatch it reads the trailer checksum), which
+catches something outside offshoot replacing the object; and it compares
+the checkout's fingerprint from right after quiesce with the one at stamp
+time, which catches a write to the checkout between the encode and the
+stamp. When either finds the store's head may differ from the checkout,
+it stamps no checksum and a hash no file can match: the checkout reads as
+having un-checkpointed changes, so `fork` warns and `checkout` says it is
+overwriting them, the shadow is dropped, the next checkpoint writes a full
+snapshot, and `offshoot_checkpoint_overwrite_detected_total` counts it.
 
 ## One daemon per store
 
@@ -76,9 +55,10 @@ CLI) per store. Pointing daemons on two machines — or two daemons on one
 machine — at the same bucket or directory is not supported and has not
 been tested, even though each branch has only one leased writer.
 
-**Why:** the epoch-fencing scheme protects the live-session write path,
-but three pieces of groundwork for shared-store fleets haven't landed:
-the at-rest verbs (`checkpoint`, `rollback`, `promote`, `compact`) still
+**Why:** the epoch-fencing scheme protects the live-session write path
+and, since an at-rest checkpoint takes the branch lease, `checkpoint`
+too, but three pieces of groundwork for shared-store fleets haven't
+landed: the at-rest repoints (`rollback`, `promote`, `compact`) still
 write without taking the branch lease — they refuse a live one instead
 (below), which is a same-host courtesy, not a cross-host protocol; lease
 holder identity is hostname+pid, which containers can collide; and lease
@@ -89,19 +69,23 @@ step of any future fleet work ([non-goals](../ROADMAP.md#non-goals-v1)).
 
 **The same-host rule (v0.2.14):** on the one supported host, the at-rest
 verbs `checkpoint`, `rollback`, `promote --onto`, and `compact` refuse a
-branch that has a live lease — an open daemon session, or `offshoot lease
-acquire` — unless `--force`, and refuse a branch that is mid-`destroy` or
-mid-reap outright (no flag overrides that). A lease on `promote`'s
-*source* never blocks; only the target's does. `--force` fences the
-session: the repoint or checkpoint clears the lease and bumps the epoch,
-the session's next flush fails rather than writing under a dead epoch,
-and whatever it had committed since its last flush — up to one
-`-flush-every` interval, default 30 s — never reaches the store.
-`checkpoint` also refuses a *detached* checkout (one whose sidecar
-lineage no longer matches the ref, because the branch was repointed after
-it was materialized) unless `--force`, since checkpointing it would
-silently revert the repoint. `destroy` already applied the same live-lease
-rule.
+branch that has a live lease — an open daemon session, `offshoot lease
+acquire`, or an at-rest checkpoint in progress — and refuse a branch that
+is mid-`destroy` or mid-reap outright (no flag overrides that). A lease on
+`promote`'s *source* never blocks; only the target's does. For the three
+repoints, `--force` overrides the lease: the repoint clears it, so a
+session's next flush fails rather than writing under a dead lineage, and
+whatever it had committed since its last flush — up to one `-flush-every`
+interval, default 30 s — never reaches the store; a checkpoint in
+progress fails without committing. `checkpoint --force` never overrides a
+lease: `checkpoint` takes the lease itself, so it waits its turn behind a
+session or another checkpoint; a lease whose holder is gone (a killed
+daemon, a forgotten `lease acquire`) is freed with `offshoot lease
+release`. `checkpoint` also refuses a *detached*
+checkout (one whose sidecar lineage no longer matches the ref, because the
+branch was repointed after it was materialized) unless `--force`, since
+checkpointing it would silently revert the repoint. `destroy` already
+applied the same live-lease rule.
 
 **Instead:** shard by store, not by daemon: give each host its own store
 (the eval-harness per-worker pattern), and move state between them with
@@ -344,6 +328,15 @@ milliseconds don't):
 - **A session whose checkout had to be (re)materialized pays one settling
   full-snapshot flush** after open — O(size), once per session; reopening
   a clean, current checkout uploads nothing.
+- **An at-rest `checkpoint` takes the branch lease, which costs one more
+  durable ref write** (checkpoint p50 about 3 ms higher one at a time, 11
+  ms eight at a time). *Caveat:* each one writes under its own epoch, so
+  on a local store each leaves one more directory under its lineage, and
+  resolving that lineage's chain (a segment checkpoint, `checkout`,
+  `fork`) reads them all: 1.6 ms after 100 checkpoints on one lineage, 16
+  ms after 1,000. A branch that checkpoints after every step of a long
+  run slows down until a `compact` starts a fresh lineage
+  ([the numbers](benchmarks.md#branchbench-topologies-v0212)).
 
 ## Smaller edges worth knowing
 
@@ -375,6 +368,32 @@ milliseconds don't):
   to a temp file first), so a legitimate hold is milliseconds — but a
   process paused for over 30 s inside that window can have its lock
   broken.
+- **On S3, an unforced `destroy` cannot see a lease renewed after its
+  claim.** S3 has no conditional delete, so a holder whose lease had
+  lapsed and that renews in the moment between the destroy's claim and
+  its delete loses the branch, and its next renewal finds it gone; on a
+  local store that destroy is refused as a live lease instead. A forced
+  destroy deletes on both, as documented
+  ([destroy](reference.md#offshoot-destroy-dbbranch---force)).
+- **On S3, a `destroy` whose delete is held up for over 30 s after its
+  claim can delete a branch a new session has taken.** A destroy's claim
+  keeps acquires off for 30 s from its timestamp; after that the janitor
+  treats it as abandoned (its destroy was killed) and clears it, and an
+  acquire can take the branch at a new epoch. A destroy sends its delete
+  only while its claim has more than 10 s of that left, so one whose claim
+  write was held up by request timeouts and SDK retries (whether the write
+  then succeeded, or reported a timeout and landed anyway), or whose
+  checkout quiesce was, fails instead, deleting nothing and removing its
+  claim (retryable). But S3 has no conditional delete, so if
+  the delete request itself is held up past the 30 s, by timeouts and SDK
+  retries, or the process is suspended that long between the check and
+  the delete, the delete still lands and removes the branch under the
+  fresh lease. A
+  healthy destroy reaches its delete in well under a second; on a local
+  store a destroy that late fails instead, since its delete is conditional
+  on the claim. The 30 s is judged on each host's clock, so it also
+  assumes the hosts sharing a store agree on the time: a claim stamped
+  more than a minute ahead of a host's clock counts as abandoned there.
 - **Wait for an at-rest `checkout`, `rollback`, `promote` or `compact` to
   return before opening the same branch in the daemon.** Those daemon ops
   check for an open session without reserving the branch, so an `open`

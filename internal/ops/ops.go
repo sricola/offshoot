@@ -46,11 +46,13 @@ type Workspace struct {
 }
 
 // bestEffortDelete removes key from the backend, logging to stderr (never
-// failing) on error. It exists for orphan cleanup after a lost ref CAS:
-// every caller deletes keys in a freshly-minted lineage no rival can
-// reference (or a CAS-confirmed orphan), so a failed delete is safe to
-// leave behind — reachability GC reclaims it eventually — but should be
-// LOUD rather than invisible, matching the janitor's logging convention.
+// failing) on error. It exists for orphan cleanup after a failed ref
+// write: every caller deletes a key no ref can name, in a freshly-minted
+// lineage no rival can reference, or under an epoch only an at-rest
+// checkpoint's own lease minted, once the checkpoint knows no head write
+// naming it landed. A failed delete is safe to leave behind (reachability
+// GC reclaims it eventually) but should be LOUD rather than invisible,
+// matching the janitor's logging convention.
 func (w *Workspace) bestEffortDelete(key string) {
 	if err := w.Store.B.Delete(key); err != nil {
 		fmt.Fprintf(os.Stderr,
@@ -503,22 +505,35 @@ func copyFile(from, to string) error {
 	return out.Close()
 }
 
-// checkpointAfterQuiesceForTest, when non-nil, runs in CheckpointWith after
-// it has read the ref and quiesced the checkout, before it plans and encodes
-// — where a rival checkpoint can commit and leave this call a late loser.
-// Test-only; process-global, restore via t.Cleanup (as
-// compactBeforeCASForTest).
+// checkpointBeforeAcquireForTest, when non-nil, runs in CheckpointWith
+// just before its lease acquire reads the ref: whatever a session, another
+// checkpoint or a repoint writes there is what the acquire's checks see and
+// what the checkpoint plans from. Test-only; process-global, restore via
+// t.Cleanup (as compactBeforeCASForTest).
+var checkpointBeforeAcquireForTest func()
+
+// checkpointAfterQuiesceForTest, when non-nil, runs in CheckpointWith while
+// it holds the branch lease, after it has quiesced the checkout and before
+// it plans and encodes: where another checkpoint, a session open or an
+// unforced repoint of the branch must be refused. Test-only;
+// process-global, restore via t.Cleanup (as compactBeforeCASForTest).
 var checkpointAfterQuiesceForTest func()
 
 // CheckpointOptions tunes CheckpointWith.
 type CheckpointOptions struct {
 	// Snapshot forces a full snapshot even when a segment would do.
 	Snapshot bool
-	// Force checkpoints a branch that has a live lease (a daemon session
-	// or `lease acquire` holds it) or a detached checkout (the branch was
-	// repointed since the checkout was materialized). Both are refused
-	// without it: see refuseIfHeld and CheckpointWith's detached check.
+	// Force checkpoints a detached checkout (the branch was repointed since
+	// the checkout was materialized), which is refused without it: see
+	// checkpointPreconditions. It does not override a live lease, a
+	// session's or another checkpoint's (see refuseIfHeld).
 	Force bool
+	// LeaseTTL is how long the branch lease this checkpoint holds stays
+	// valid between renewals; 0 means DefaultLeaseTTL.
+	LeaseTTL time.Duration
+	// RenewEvery is how often the lease is renewed while the checkpoint
+	// quiesces, encodes and uploads; 0 means a third of LeaseTTL.
+	RenewEvery time.Duration
 }
 
 // CheckpointResult is what CheckpointWith wrote.
@@ -544,9 +559,28 @@ func (w *Workspace) Checkpoint(db, branch, name string, meta map[string]string) 
 // (busy timeout 3s, then clean failure). It writes a segment of only the
 // pages changed since the head when planSegment allows (a shadow of the
 // head is kept next to the checkout; see its doc comment for the rule),
-// and a full snapshot otherwise or when opts.Snapshot is set. Either way
-// the object goes up with the same create-only put and ref CAS, and the
-// sidecar and shadow are refreshed after the CAS.
+// and a full snapshot otherwise or when opts.Snapshot is set.
+//
+// It holds the branch lease from before its object write until the ref
+// write that advances the head, and that write releases it:
+//
+//  1. acquire the lease under a per-call holder (newCheckpointHolder,
+//     acquireCheckpointLease), refusing, on the ref the acquire reads and
+//     before it writes, a branch mid-destroy, mid-reap or under any live
+//     lease (refuseIfHeld), a taken name, a missing checkout, and a
+//     detached one unless opts.Force (checkpointPreconditions). The acquire
+//     bumps the epoch, so this call's object key is its own, and returns
+//     the ref the lease is part of, which everything after plans from;
+//  2. renew the lease every opts.RenewEvery (checkpointRenewer); quiesce,
+//     plan and encode; check the lease is still ours, then upload with a
+//     create-only put; stop and join the renewals;
+//  3. re-read the ref and, while it still names our lease, our lineage and
+//     the head we planned from and carries no destroy or reap claim,
+//     advance the head, record the checkpoint and clear the lease in one
+//     write (commitCheckpoint);
+//  4. on any failure, release the lease (releaseCheckpointLease).
+//
+// The sidecar and shadow are refreshed after the head write.
 //
 // NOT SAFE against a live in-process connection on the checkout: it
 // raw-opens (and closes) the checkout path to encode it (snapshot), to diff
@@ -556,10 +590,14 @@ func (w *Workspace) Checkpoint(db, branch, name string, meta map[string]string) 
 // internal/dbfile. Today only the CLI (cmd/offshoot) and MCP
 // (internal/mcp) reach this, both of which are separate processes from the
 // daemon that runs sessions, so no in-process session can be holding that
-// checkout. In offshoot mcp the reaper goroutine still can: a TTL fork
-// reaped mid-checkpoint has Destroy's quiesce connection open on it, whose
-// locks these closes drop (a known, narrow hazard: see internal/dbfile's
-// package doc). The daemon conspicuously has no checkpoint op; if one is
+// checkout. In offshoot mcp the reaper goroutine still can, though only
+// after the head write: until then the lease keeps reaping off the branch
+// (a reap's destroy refuses a live lease, and the acquire refuses a reap
+// or destroy claim), and the head write stamps the activity clock. So only
+// a fork whose TTL runs out before the stamp is done can be reaped with
+// Destroy's quiesce connection open on it, whose locks the stamp's closes
+// drop (a known, narrow hazard: see internal/dbfile's package doc).
+// The daemon conspicuously has no checkpoint op; if one is
 // ever added it MUST NOT call this directly — route the snapshot through
 // the session's own engine, or through dbfile.
 //
@@ -582,29 +620,54 @@ func (w *Workspace) CheckpointWith(db, branch, name string, meta map[string]stri
 	if err := ValidateMeta(meta); err != nil {
 		return CheckpointResult{}, err
 	}
-	ref, etag, err := w.Store.GetRef(db, branch)
+	path := w.CheckoutPath(db, branch)
+	holder := newCheckpointHolder()
+	// The refusals run on the ref the acquire reads, before it writes, so
+	// the ref the lease lands on is the one they passed. force is false for
+	// the live-lease guard whatever opts.Force says: a live lease means a
+	// session or another checkpoint is writing this branch, and this call
+	// is about to take the lease itself, so it waits its turn instead. Our
+	// own holder can only be there when an acquire of ours landed without
+	// our hearing so, and is not a lease to refuse.
+	check := func(ref store.Ref) error {
+		guard := ref
+		if guard.LeaseHolder == holder {
+			guard.LeaseHolder, guard.LeaseExpiry = "", ""
+		}
+		if err := refuseIfHeld(db, branch, guard, "checkpoint", false); err != nil {
+			return err
+		}
+		return checkpointPreconditions(db, branch, name, path, ref, opts)
+	}
+	if checkpointBeforeAcquireForTest != nil {
+		checkpointBeforeAcquireForTest()
+	}
+	lease, ref, err := w.acquireCheckpointLease(db, branch, holder, opts.leaseTTL(), check)
 	if err != nil {
 		return CheckpointResult{}, err
 	}
-	if err := refuseIfHeld(db, branch, ref, "checkpoint", opts.Force); err != nil {
+	res, err := w.checkpointLeased(db, branch, name, meta, opts, path, lease, ref)
+	if err != nil {
+		// A head write that landed released the lease with it, and the
+		// release below then finds the lease no longer ours and leaves the
+		// ref alone; on every other path the lease is still ours.
+		w.releaseCheckpointLease(lease)
 		return CheckpointResult{}, err
 	}
-	if _, exists := ref.Checkpoints[name]; exists {
-		return CheckpointResult{}, fmt.Errorf("ops: checkpoint %q already exists on %s@%s", name, db, branch)
+	if ObserveCheckpoint != nil {
+		ObserveCheckpoint(time.Since(start))
 	}
-	path := w.CheckoutPath(db, branch)
-	if _, err := os.Stat(path); err != nil {
-		return CheckpointResult{}, fmt.Errorf("ops: no checkout for %s@%s (run 'offshoot checkout %s@%s' first)", db, branch, db, branch)
-	}
-	// A detached checkout embodies a lineage the branch no longer points
-	// at: a promote, rollback or compact repointed the ref but could not
-	// refresh this file (it was busy, or the process died in between).
-	// Checkpointing it would snapshot the OLD content onto the NEW lineage
-	// and silently undo that repoint, so refuse and name the ways out.
-	if rec, ok := readSidecar(path); ok && rec.Lineage != ref.Lineage && !opts.Force {
-		return CheckpointResult{}, fmt.Errorf("ops: checkout of %s@%s is detached: the branch was repointed (now at txid %d) after this checkout was materialized, so checkpointing it would revert that repoint; run 'offshoot checkout %s@%s' to refresh it (discarding its local edits), 'offshoot export' to keep them as a file, or pass --force to checkpoint it anyway",
-			db, branch, ref.HeadTXID, db, branch)
-	}
+	return res, nil
+}
+
+// checkpointLeased is CheckpointWith from the acquire on. lease is held and
+// ref is the ref it is part of, which passed CheckpointWith's checks; the
+// caller releases the lease when this returns an error.
+func (w *Workspace) checkpointLeased(db, branch, name string, meta map[string]string, opts CheckpointOptions, path string, lease store.Lease, ref store.Ref) (CheckpointResult, error) {
+	ttl := opts.leaseTTL()
+	rn := w.startCheckpointRenewer(lease, ttl, opts.renewEvery(ttl))
+	// Every return below stops the renewals first; stop is idempotent.
+	defer rn.stop()
 	if err := quiesce(path); err != nil {
 		return CheckpointResult{}, retryHint("checkpoint", db, branch, err)
 	}
@@ -621,164 +684,84 @@ func (w *Workspace) CheckpointWith(db, branch, name string, meta map[string]stri
 		checkpointAfterQuiesceForTest()
 	}
 	txid := ref.HeadTXID + 1
+	epoch := lease.Epoch
 	res := CheckpointResult{TXID: txid, Kind: "snapshot"}
 	var buf bytes.Buffer
 	var key string
 	var checksum uint64
-	// A segment is written only when no snapshot already sits at txid. Only
-	// a failed earlier attempt (object uploaded, ref write never landed, or
-	// a crash between them) can have left one there, since no ref names
-	// that key; left beside a segment it would anchor the head (the chain
-	// resolver anchors on the newest snapshot at or below the target), so
-	// the head would resolve to that attempt's older content. Checking
-	// before the write rather than deleting after the CAS means no failure
-	// or crash can leave the two side by side: a snapshot here takes the
-	// create-only put's overwrite path below instead. An error from the
-	// probe also answers "write a snapshot", which is always correct.
-	//
 	// The head's chain is resolved here, once, and only when a segment is
 	// locally possible (segmentShadow); planSegment uses this resolution
 	// and never re-resolves. A failed resolve leaves members nil, which
-	// planSegment answers with a snapshot.
+	// planSegment answers with a snapshot. No probe for an object an
+	// earlier attempt left at txid is needed: that attempt wrote under an
+	// older epoch, and chain resolution prefers our higher one
+	// (store.keepHighestEpoch), whichever kind either object is.
 	var members []store.ChainMember
 	if _, _, ok := segmentShadow(path, ref, opts); ok {
 		members, _ = w.Store.Chain(ref.Lineage, ref.HeadTXID)
 	}
-	if d, ok := w.planSegment(path, ref, members, opts); ok && !w.snapshotMayExist(ref, txid) {
+	if d, ok := w.planSegment(path, ref, members, opts); ok {
 		if err := ltxio.EncodeSegment(d.pageSize, d.commit, txid, txid, d.pre, d.post, d.pages, &buf); err != nil {
 			return CheckpointResult{}, err
 		}
-		key, checksum = store.SegmentKey(ref.Lineage, ref.Epoch, txid, txid), d.post
+		key, checksum = store.SegmentKey(ref.Lineage, epoch, txid, txid), d.post
 		res.Kind, res.Pages = "segment", len(d.pages)
 	} else {
+		var err error
 		if checksum, err = ltxio.EncodeSnapshot(path, txid, &buf); err != nil {
 			return CheckpointResult{}, err
 		}
-		key = store.SnapshotKey(ref.Lineage, ref.Epoch, txid)
+		key = store.SnapshotKey(ref.Lineage, epoch, txid)
 	}
 	res.Bytes = int64(buf.Len())
-	ownEtag, err := w.Store.B.PutIf(key, buf.Bytes(), "")
+	c := checkpointCommit{db: db, branch: branch, name: name, meta: meta, kind: res.Kind, lease: lease, lineage: ref.Lineage, txid: txid}
+	// The lease must still be ours when the object goes up: a key under an
+	// epoch we no longer hold is garbage the moment it lands.
+	if err := rn.lost(); err != nil {
+		return CheckpointResult{}, c.renewLost(err)
+	}
+	ownEtag, err := w.putCheckpointObject(key, buf.Bytes())
 	if err != nil {
-		if !errors.Is(err, store.ErrCAS) {
-			return CheckpointResult{}, err
-		}
-		// An object already lives at this deterministic key. HeadTXID only
-		// ever advances via a successful ref write, and nothing is written
-		// under a txid beyond HeadTXID+1 until that happens, so nothing can
-		// legitimately reference this key yet: it can only be (a) an orphan
-		// left by a crashed prior Checkpoint attempt (object uploaded, ref
-		// write never landed), or (b) a rival Checkpoint call racing on this
-		// same branch right now, which computed the identical HeadTXID+1 and
-		// simply lost the write here. Overwriting is benign under either
-		// cause: both writers quiesced and encoded the SAME checkout file at
-		// the SAME pre-checkpoint state, so whichever encoding ends up
-		// stored is content-equivalent, and only one of the two racers can
-		// possibly win the PutRef CAS below to ever reference this key by
-		// name — there is no rival ref left dangling by the overwrite. Safe
-		// to overwrite unconditionally and proceed. The key names the kind
-		// (snapshot or segment), so a racer that chose the other kind wrote
-		// a different key; both then race the same CAS below. That loser's
-		// object is NOT an orphan like any other when it is a snapshot
-		// beside a winning segment: the chain resolver anchors the head on
-		// the newest snapshot at or below it, so the head resolves to the
-		// loser's content. A live loser deletes it (the ErrCAS path below);
-		// a dead one, or one that has not got there yet, is caught by the
-		// winner's post-CAS probe (snapshotMayExist after PutRef).
-		//
-		// "Content-equivalent" holds only when nothing wrote to the checkout
-		// between the two encodes. When something did, whichever racer
-		// wins the CAS may find the other's content under its key; the
-		// post-CAS verifyOwnObject below detects exactly that. Put returns
-		// no etag, so ownEtag stays "" here and the check compares content.
-		if err := w.Store.B.Put(key, buf.Bytes()); err != nil {
-			return CheckpointResult{}, err
-		}
+		return CheckpointResult{}, err
 	}
-	ref.HeadTXID = txid
-	ref.HeadEpoch = ref.Epoch
-	ref.SetCheckpoint(name, store.Checkpoint{TXID: txid, Epoch: ref.Epoch, CreatedAt: nowStamp(), Meta: meta, Kind: res.Kind})
-	ref.Touch(time.Now())
-	if _, err := w.Store.PutRef(db, branch, ref, etag); err != nil {
-		// Decide whether to clean up the object after PutRef failure.
-		// Unlike Fork/Rollback/Promote (which delete keys in freshly-minted
-		// lineages no rival can reference), we must gate cleanup on the error
-		// type: under concurrent Checkpoint calls on the same branch, every
-		// racer computes the same deterministic txid (HeadTXID+1) and key.
-		//
-		// On ErrCAS (lost the CAS race): serialization via PutIf means the
-		// winner's ref is already visible, so the object is confirmed an
-		// orphan left by a crashed prior Checkpoint — safe to delete so a
-		// retry's create-only put doesn't wedge behind our orphan.
-		//
-		// On non-CAS errors (lock timeout, I/O error): deletion is UNSAFE.
-		// A concurrent checkpointer may already be mid-write, and we can't
-		// tell from here whether they've landed their ref yet. Deleting would
-		// rip the object out from under them, leaving a checkpoint recorded
-		// in their ref with no backing object — silent corruption for them.
-		// Leave the object alone; worst case it's a harmless orphan for a
-		// later GC pass.
-		//
-		// On ErrCAS with a winner on this lineage whose head covers txid, our
-		// key is the winner's own when the winner wrote the same kind (the
-		// key is deterministic per kind), and must stay. When the winner
-		// wrote the OTHER kind at txid, our object is an orphan beside it,
-		// and a harmful one: a loser's snapshot beside a winner's segment
-		// becomes the head's anchor (the chain resolver anchors on the
-		// newest snapshot at or below the head), so if the checkout changed
-		// between the two encodes every later segment's pre-apply checksum
-		// fails. The winner's ref records its kind on the checkpoint entry
-		// at txid (store.Checkpoint.Kind); we delete our object only when
-		// that entry exists with a known kind different from ours. An
-		// unknown kind, or no entry at txid, keeps it: probing for the
-		// other key's existence instead cannot tell the winner's object
-		// from an orphan a crashed earlier attempt left at the same txid.
-		if errors.Is(err, store.ErrCAS) {
-			if cur, _, gerr := w.Store.GetRef(db, branch); gerr == nil {
-				if cur.Lineage != ref.Lineage || cur.HeadTXID < txid {
-					w.bestEffortDelete(key)
-				} else if k := checkpointKindAt(cur, txid); k != "" && k != res.Kind {
-					w.bestEffortDelete(key)
-				}
-			}
-			return CheckpointResult{}, fmt.Errorf("ops: ref update lost a race (retry): %w", err)
-		}
-		return CheckpointResult{}, fmt.Errorf("ops: ref update for checkpoint %q on %s@%s: %w", name, db, branch, err)
+	// Join the renewals before the head write, so the write never races our
+	// own heartbeat. A renewal that found the lease gone or the branch
+	// destroyed ends the checkpoint here; no head write has been sent, and
+	// the key is under an epoch only this call minted, so nothing can name
+	// our object and it is deleted.
+	if err := rn.stop(); err != nil {
+		w.bestEffortDelete(key)
+		return CheckpointResult{}, c.renewLost(err)
 	}
-	// The ref CAS is the point of no return: only now does the checkout truly
-	// equal committed state (lineage unchanged, head advanced to txid).
-	// Writing the sidecar here, after the CAS, means an interrupt between the
-	// encode above and this point leaves the OLD sidecar in place — which
-	// still correctly describes the checkout's actual (pre-checkpoint)
-	// identity, rather than claiming a commit that never landed. The same
-	// goes for the shadow: it is re-cloned only after the new stamp, which
-	// records no shadow until refreshShadow has one in place.
+	if _, deletable, err := w.commitCheckpoint(c); err != nil {
+		if deletable {
+			w.bestEffortDelete(key)
+		}
+		return CheckpointResult{}, err
+	}
+	// The head write is the point of no return: only now does the checkout
+	// truly equal committed state. Writing the sidecar here, after it,
+	// means an interrupt between the encode and this point leaves the OLD
+	// sidecar in place, which still correctly describes the checkout's
+	// actual (pre-checkpoint) identity. The same goes for the shadow: it is
+	// re-cloned only after the new stamp, which records no shadow until
+	// refreshShadow has one in place.
 	//
-	// What the store now resolves the head to may not be what we encoded:
-	//
-	//   - a racing same-kind checkpoint can have replaced the object at our
-	//     key with its own content (verifyOwnObject);
-	//   - a racing snapshot checkpoint can have left its snapshot at txid
-	//     beside our segment, and the chain resolver anchors the head on
-	//     that snapshot, not on our segment. Its loser-side cleanup does
-	//     not help when the loser died first or has not reached it yet, so
-	//     a segment winner probes for one (one List) and, when present,
-	//     takes the head's checksum from it.
-	//
-	// Either way the overwrite is counted, and stampCheckpoint then stamps
-	// the checksum only when the live checkout provably holds the content
-	// the store resolves the head to; otherwise the stamp records no
-	// checksum and a hash no file can match, so the checkout reads
-	// "modified", the shadow is dropped, and the next checkpoint writes a
-	// snapshot of whatever the checkout holds. The same happens when the
-	// checkout changed between our encode and this stamp.
+	// The store resolves the head to our object unless something outside
+	// offshoot's writers replaced it: the key is under an epoch only this
+	// call's lease minted, so no checkpoint or session writes it, but a
+	// hand edit or a misbehaving tool can (verifyOwnObject). The checkout
+	// can also have changed between our encode and this stamp. Either way
+	// stampCheckpoint stamps the checksum only when the live checkout
+	// provably holds the content the store resolves the head to; otherwise
+	// the stamp records no checksum and a hash no file can match, so the
+	// checkout reads "modified", the shadow is dropped, and the next
+	// checkpoint writes a snapshot of whatever the checkout holds.
 	headSum, headKnown := w.verifyOwnObject(key, ownEtag, checksum)
-	if res.Kind == "segment" && w.snapshotMayExist(ref, txid) {
-		headSum, headKnown = w.snapshotBesideSegment(store.SnapshotKey(ref.Lineage, ref.Epoch, txid), headSum, headKnown)
-	}
 	if (!headKnown || headSum != checksum) && ObserveCheckpointOverwrite != nil {
 		ObserveCheckpointOverwrite()
 	}
-	trusted, err := stampCheckpoint(path, ref.Lineage, ref.HeadEpoch, txid, headSum, headKnown, checksum, fpEncode, encodeNS, fpEncodeErr == nil)
+	trusted, err := stampCheckpoint(path, ref.Lineage, epoch, txid, headSum, headKnown, checksum, fpEncode, encodeNS, fpEncodeErr == nil)
 	if err != nil {
 		return CheckpointResult{}, fmt.Errorf("ops: checkpoint %q committed (txid %d), but the checkout fingerprint could not be refreshed: %w", name, txid, err)
 	}
@@ -787,28 +770,26 @@ func (w *Workspace) CheckpointWith(db, branch, name string, meta map[string]stri
 	} else {
 		dropShadow(path)
 	}
-	if ObserveCheckpoint != nil {
-		ObserveCheckpoint(time.Since(start))
-	}
 	return res, nil
 }
 
 // verifyOwnObject returns the post-apply checksum of the object at key,
-// just committed by a winning ref CAS, and whether it is known. A Head
-// whose etag equals ownEtag (the etag our create-only put returned)
-// answers checksum with one request; the two are compared normalized
+// just named by the checkpoint's head write, and whether it is known. A
+// Head whose etag equals ownEtag (the etag our create-only put returned,
+// or our object's own when a retried put found it already there) answers
+// checksum with one request; the two are compared normalized
 // (store.NormalizeETag), so an S3-compatible provider that quotes, weakens
 // or re-cases the etag between the PUT and the HEAD still answers with
-// that one request. Otherwise — a rival's overwrite, or
-// our own unconditional overwrite, which returns no etag — the object is
-// fetched and its trailer read: two encodes of the same checkout state
-// differ in bytes (an LTX header carries its encode time) but not in
-// checksum, so only a real content change returns a different one. An
-// object that cannot be read or decoded after an etag mismatch is logged
-// and answers unknown: distrusting costs one snapshot, trusting a wrong
-// checksum costs a session's correctness. A failing Head never fails the
-// checkpoint: it is logged and answers checksum, as before this check
-// existed.
+// that one request. Otherwise — an object replaced out of band, since no
+// offshoot writer shares the epoch the key is under, or a put whose
+// response carried no etag — the object is fetched and its trailer read:
+// two encodes of the same checkout state differ in bytes (an LTX header
+// carries its encode time) but not in checksum, so only a real content
+// change returns a different one. An object that cannot be read or
+// decoded after an etag mismatch is logged and answers unknown:
+// distrusting costs one snapshot, trusting a wrong checksum costs a
+// session's correctness. A failing Head never fails the checkpoint: it is
+// logged and answers checksum, as before this check existed.
 func (w *Workspace) verifyOwnObject(key, ownEtag string, checksum uint64) (uint64, bool) {
 	etag, _, err := w.Store.Head(key)
 	if err != nil {
@@ -820,20 +801,6 @@ func (w *Workspace) verifyOwnObject(key, ownEtag string, checksum uint64) (uint6
 	}
 	data, _, err := w.Store.B.Get(key)
 	return objectChecksum(key, data, err)
-}
-
-// snapshotBesideSegment is the head's checksum when a segment checkpoint
-// has just won its CAS and snapshotMayExist reported a snapshot at the
-// same txid (snapKey): that snapshot anchors the head, so its trailer is
-// the head's content. A snapshot that turns out not to exist (the probe
-// answers "maybe" when its List fails) leaves the segment's own (sum,
-// known).
-func (w *Workspace) snapshotBesideSegment(snapKey string, sum uint64, known bool) (uint64, bool) {
-	data, _, err := w.Store.B.Get(snapKey)
-	if errors.Is(err, store.ErrNotFound) {
-		return sum, known
-	}
-	return objectChecksum(snapKey, data, err)
 }
 
 // objectChecksum is the trailer post-apply checksum of data, the LTX
@@ -851,26 +818,6 @@ func objectChecksum(key string, data []byte, getErr error) (uint64, bool) {
 		return 0, false
 	}
 	return sum, true
-}
-
-// snapshotMayExist reports whether a snapshot object may already sit at
-// txid in ref's lineage and writer epoch: true when one does, and when the
-// probe (one List of that exact key) fails, since the caller's safe answer
-// to "maybe" is to write a snapshot. See CheckpointWith.
-func (w *Workspace) snapshotMayExist(ref store.Ref, txid uint64) bool {
-	exists, err := w.Store.ObjectExists(store.SnapshotKey(ref.Lineage, ref.Epoch, txid))
-	return err != nil || exists
-}
-
-// checkpointKindAt is the recorded Kind of ref's checkpoint at txid, or ""
-// when none is recorded there or its writer did not record a kind.
-func checkpointKindAt(ref store.Ref, txid uint64) string {
-	for _, c := range ref.Checkpoints {
-		if c.TXID == txid && c.Kind != "" {
-			return c.Kind
-		}
-	}
-	return ""
 }
 
 // errQuiesceBusy is quiesce's error specifically for wal_checkpoint(TRUNCATE)
@@ -1021,13 +968,28 @@ func (w *Workspace) warnIfUncheckpointed(db, branch string, ref store.Ref, actio
 }
 
 // refuseIfHeld is the guard every at-rest ref mutation runs right after
-// reading the ref: it refuses a branch that is mid-destroy or mid-reap
-// (another process's CAS claim; never forceable) and, unless force, one
-// with a live lease. A live lease means a daemon session or a `lease
-// acquire` owns the branch right now; repointing or checkpointing under it
-// clears the lease, fences that session, and discards whatever it had not
-// flushed. Destroy applies the same rules in its own body. verb names the
-// operation in the message ("rollback", "promote onto", ...).
+// reading the ref. A branch that is mid-destroy or mid-reap (another
+// process's CAS claim) is refused, never forceably. A live lease is
+// refused too, with an error that unwraps to store.ErrLeaseHeld:
+//
+//   - checkpoint never takes over a live lease, whatever force says: it
+//     takes the lease itself (see CheckpointWith), so a live one means a
+//     session or another checkpoint is writing the branch right now, and
+//     writing under that writer's epoch is the interleaving fencing exists
+//     to prevent;
+//   - a repoint (rollback, promote onto, compact) proceeds under force: it
+//     clears the lease, which fences the session holding it (its unflushed
+//     writes are lost) or makes the checkpoint holding it fail without
+//     committing.
+//
+// verb names the operation in the message ("rollback", "promote onto",
+// ...). Destroy applies the same rules in its own body.
+//
+// A checkpoint holder's lease ends with the checkpoint, within seconds, or
+// lapses on its own 30 s after its process died (it renews every 10 s), so
+// its refusal says to retry; it never suggests closing a session or
+// `offshoot lease release`, which would only abort a checkpoint that is
+// still running.
 func refuseIfHeld(db, branch string, ref store.Ref, verb string, force bool) error {
 	if ref.Deleting {
 		return fmt.Errorf("ops: %s@%s is being destroyed; cannot %s it", db, branch, verb)
@@ -1035,12 +997,44 @@ func refuseIfHeld(db, branch string, ref store.Ref, verb string, force bool) err
 	if ref.Reaping {
 		return fmt.Errorf("ops: %s@%s is being reaped (its TTL expired); cannot %s it", db, branch, verb)
 	}
-	if !force && store.LeaseLive(ref, time.Now()) {
-		return fmt.Errorf("ops: %s@%s has a live lease held by %q until %s (an open daemon session, or 'offshoot lease acquire'); a %s now would fence that writer and discard its unflushed work — close the session first, or pass --force",
-			db, branch, ref.LeaseHolder, ref.LeaseExpiry, verb)
+	if !store.LeaseLive(ref, time.Now()) {
+		return nil
 	}
-	return nil
+	held := fmt.Sprintf("ops: %s@%s has a live lease held by %q until %s", db, branch, ref.LeaseHolder, ref.LeaseExpiry)
+	if isCheckpointHolder(ref.LeaseHolder) {
+		held += " (another checkpoint is in progress)"
+		if verb == "checkpoint" {
+			return &leaseHeldError{msg: held + "; --force cannot take over a live lease; " + checkpointRetryAdvice, checkpoint: true}
+		}
+		if force {
+			return nil
+		}
+		refusal := fmt.Sprintf("%s; a %s now would make that checkpoint fail without committing — %s", held, verb, checkpointRetryAdvice)
+		return &leaseHeldError{msg: refusal + ", or pass --force", noForce: refusal, checkpoint: true}
+	}
+	held += " (an open daemon session, or 'offshoot lease acquire')"
+	if verb == "checkpoint" {
+		// --force used to be the way past a holder that would not let go (a
+		// killed daemon, a forgotten `lease acquire`); name the one that is
+		// left, so the refusal is not a dead end for a whole TTL.
+		// "Gone" means the holding process has exited, not that its session
+		// closed: after a close whose lease release failed, a daemon that is
+		// still running renews that same lease for a session it reopens, and
+		// `lease release` would fence that session (see reference.md's
+		// `session close`).
+		return &leaseHeldError{msg: fmt.Sprintf("%s; --force cannot take over a live lease; close the session and retry, or, if the process that holds it has exited, free it with 'offshoot lease release %s@%s' (never while that daemon still runs: a session it reopened may hold the lease)",
+			held, db, branch)}
+	}
+	if force {
+		return nil
+	}
+	refusal := fmt.Sprintf("%s; a %s now would fence that writer and discard its unflushed work — close the session first", held, verb)
+	return &leaseHeldError{msg: refusal + ", or pass --force", noForce: refusal}
 }
+
+// checkpointRetryAdvice is what a refusal under a checkpoint holder's
+// lease tells the caller to do.
+const checkpointRetryAdvice = "retry when it finishes, in a few seconds (if its process died, the lease lapses on its own at that expiry)"
 
 // errNoCheckpoint is the error for a checkpoint name that db@branch does
 // not carry. Checkpoints belong to one branch and are not inherited by
@@ -1209,15 +1203,14 @@ var ObserveFork func(dur time.Duration, fast, shared bool)
 var ObserveCheckpoint func(dur time.Duration)
 
 // ObserveCheckpointOverwrite, when non-nil, is invoked by CheckpointWith
-// each time its post-CAS check finds that the store may not resolve the
-// head to the content it encoded: the object it committed was replaced, at
-// its shared key, by a racing same-kind checkpoint's different content, or
-// could not be verified after an etag mismatch (see verifyOwnObject); or a
-// racing snapshot with different content (or one that could not be read)
-// sits beside its winning segment and anchors the head (see
-// snapshotBesideSegment). The checkpoint still succeeds; the daemon
-// feeds this into offshoot_checkpoint_overwrite_detected_total. Same
-// injection shape as ObserveFork.
+// each time its post-commit check finds that the store may not resolve the
+// head to the content it encoded: the object at its key no longer carries
+// what it uploaded (the key is under an epoch only that checkpoint's lease
+// minted, so this means something outside offshoot replaced it), or it
+// could not be verified after an etag mismatch (see verifyOwnObject). The
+// checkpoint still succeeds; the daemon feeds this into
+// offshoot_checkpoint_overwrite_detected_total. Same injection shape as
+// ObserveFork.
 var ObserveCheckpointOverwrite func()
 
 // ObserveRollback and ObservePromote, when non-nil, are invoked once the
@@ -1828,8 +1821,13 @@ func (w *Workspace) safetyFork(db, branch, suffix, metaKey, verb string, ttl tim
 		// would misdirect a caller here — replace it before wrapping.
 		if err := w.Destroy(db, name, false); err != nil {
 			msg := strings.Replace(err.Error(), "use --force", "ask the human", 1)
-			return "", fmt.Errorf("ops: %s: replacing the previous safety fork %s@%s: %s (close that session, or pass --no-backup)",
-				verb, db, name, msg)
+			way := "close that session, or pass --no-backup"
+			if CheckpointInProgress(err) {
+				// A checkpoint on the previous fork ends on its own.
+				msg, way = WithoutForceAdvice(err).Error(), "or pass --no-backup"
+			}
+			return "", fmt.Errorf("ops: %s: replacing the previous safety fork %s@%s: %s (%s)",
+				verb, db, name, msg, way)
 		}
 	case errors.Is(err, store.ErrNotFound):
 	default:

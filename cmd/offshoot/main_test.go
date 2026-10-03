@@ -865,3 +865,28 @@ func TestRollbackAndPromoteOutputNameTheirMode(t *testing.T) {
 		}
 	}
 }
+
+// TestCheckpointForceDoesNotTakeOverALease: `checkpoint --force` on a
+// branch with a live lease is refused with the ops message, which names
+// `lease release` as the way past a holder that is gone, and `help
+// checkpoint` says --force only overrides a detached checkout.
+func TestCheckpointForceDoesNotTakeOverALease(t *testing.T) {
+	testutil.RequireSQLite3(t)
+	store := filepath.Join(t.TempDir(), "s")
+	call(t, store, "init")
+	call(t, store, "create", "app")
+	call(t, store, "checkout", "app")
+	call(t, store, "lease", "acquire", "app", "--ttl", "1m")
+	if _, err := callErr(t, store, "checkpoint", "app", "v1", "--force"); err == nil ||
+		!strings.Contains(err.Error(), "--force cannot take over a live lease") ||
+		!strings.Contains(err.Error(), "'offshoot lease release app@main'") {
+		t.Fatalf("checkpoint --force under a live lease: %v", err)
+	}
+	help, err := callErr(t, store, "help", "checkpoint")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !strings.Contains(help, "--force or not") || !strings.Contains(help, "--force checkpoints a detached checkout") {
+		t.Fatalf("help checkpoint does not say what --force does: %q", help)
+	}
+}

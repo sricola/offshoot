@@ -10,7 +10,9 @@ package ops
 // but Task 6's "fork past a segment still takes the slow path" test needs
 // exactly that (session.Options.SnapshotEvery to build a multi-member
 // chain). This is the standard Go pattern for exporting unexported test
-// hooks across that boundary.
+// hooks across that boundary. It also exposes CheckpointWith's two test
+// hooks, for the session-level checkpoint tests that need a real
+// session.Session (checkpoint_lease_session_test.go).
 
 // SetForkSlowPathForTest forces (true) or releases (false)
 // copySnapshotToNewLineage's slow materialize-and-re-encode path,
@@ -27,3 +29,14 @@ func SetForkMaterializeForTest(v bool) { forkMaterializeForTest = v }
 // ForkFastPathHits returns how many times the fast object-copy fork path
 // has fired since process start.
 func ForkFastPathHits() int { return int(forkFastPathHits.Load()) }
+
+// SetCheckpointBeforeAcquireForTest installs (nil removes) the hook
+// CheckpointWith runs just before its lease acquire reads the ref; see
+// checkpointBeforeAcquireForTest. Process-global: restore via t.Cleanup.
+func SetCheckpointBeforeAcquireForTest(f func()) { checkpointBeforeAcquireForTest = f }
+
+// SetCheckpointAfterQuiesceForTest installs (nil removes) the hook
+// CheckpointWith runs while it holds the branch lease, after quiesce and
+// before it plans; see checkpointAfterQuiesceForTest. Process-global:
+// restore via t.Cleanup.
+func SetCheckpointAfterQuiesceForTest(f func()) { checkpointAfterQuiesceForTest = f }

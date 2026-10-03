@@ -191,9 +191,13 @@
 //     is the only containment. In offshoot mcp, the reaper goroutine runs
 //     beside tool calls, so a TTL fork reaped while it is being checkpointed
 //     has destroy's quiesce connection open on the checkout, and any of
-//     those closes drops that connection's locks. This predates the
-//     package and is left in place: the connection only folds the WAL of a
-//     branch that is being destroyed.
+//     those closes drops that connection's locks. The checkpoint's branch
+//     lease narrows this to its stamp: from its acquire to its head write
+//     the lease keeps a reap off the branch, and the head write stamps the
+//     activity clock, so only a fork whose TTL runs out during the stamp
+//     is reaped under it. This predates the package and is left in place:
+//     the connection only folds the WAL of a branch that is being
+//     destroyed.
 //
 // # What is NOT covered
 //

@@ -660,12 +660,11 @@ func (s *Session) flush(name string, meta map[string]string, auto bool) (txid ui
 			}
 		}
 		// Decide whether to clean up the uploaded object after a failed ref
-		// update. This mirrors ops.Checkpoint's identical decision exactly
-		// (see its comment for the full reasoning) — flushMu serializes
-		// concurrent Flush calls on THIS Session, but a rival can still win
-		// the ref CAS out from under us: another holder that reclaimed the
-		// lease between our GetRef above and this PutRef, or a crashed prior
-		// Flush attempt that already occupies objKey.
+		// update. flushMu serializes concurrent Flush calls on THIS Session,
+		// but a rival can still win the ref CAS out from under us: another
+		// holder that reclaimed the lease between our GetRef above and this
+		// PutRef, or a crashed prior Flush attempt that already occupies
+		// objKey.
 		//
 		// On ErrCAS (lost the CAS race): PutIf's serialization means the
 		// winner's ref, if any, is already visible. Re-read it and delete the

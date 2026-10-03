@@ -1885,3 +1885,148 @@ func TestListReportsTTLAndExpiry(t *testing.T) {
 		t.Fatalf("attempt-1 expires_at %s is not about 2h out", exp)
 	}
 }
+
+// TestCheckpointSurfacesLeaseRefusalUnchanged: an at-rest
+// offshoot_checkpoint on a branch another checkpoint holds returns the ops
+// refusal verbatim: the holder, that a checkpoint is in progress, and that
+// --force cannot take it over, so the agent waits rather than looking for
+// a flag it does not have.
+func TestCheckpointSurfacesLeaseRefusalUnchanged(t *testing.T) {
+	ts, w := newTools(t)
+	if r := call(t, ts, "offshoot_checkout", map[string]any{"database": "app"}); r.IsError {
+		t.Fatalf("checkout: %s", text(r))
+	}
+	holder := "checkpoint:" + ops.LocalHolder() + "/0123abcd"
+	if _, err := w.AcquireLease("app", "main", holder, time.Minute); err != nil {
+		t.Fatal(err)
+	}
+	_, want := w.CheckpointWith("app", "main", "v1", nil, ops.CheckpointOptions{})
+	if !errors.Is(want, store.ErrLeaseHeld) {
+		t.Fatalf("precondition: the ops refusal is %v", want)
+	}
+	r := call(t, ts, "offshoot_checkpoint", map[string]any{"database": "app", "name": "v1"})
+	if !r.IsError || text(r) != want.Error() {
+		t.Fatalf("offshoot_checkpoint = %q (error %v), want the ops refusal verbatim: %q", text(r), r.IsError, want.Error())
+	}
+}
+
+// TestRefusalsUnderACheckpointLeaseSayRetry: a branch held by an at-rest
+// checkpoint is free again within seconds. offshoot_rollback (which has no
+// force), and offshoot_promote and offshoot_destroy on a server without
+// -allow-force, forced or not, refuse it with ops' advice to retry when the
+// checkpoint finishes, and never offer --force or send the agent to a human
+// whose --force would only make that checkpoint fail.
+func TestRefusalsUnderACheckpointLeaseSayRetry(t *testing.T) {
+	ts, w := newTools(t)
+	if r := call(t, ts, "offshoot_fork", map[string]any{"database": "app", "new_branch": "x"}); r.IsError {
+		t.Fatalf("fork: %s", text(r))
+	}
+	holder := "checkpoint:" + ops.LocalHolder() + "/0123abcd"
+	if _, err := w.AcquireLease("app", "x", holder, time.Minute); err != nil {
+		t.Fatal(err)
+	}
+	refusals := map[string]ToolResult{
+		"rollback": call(t, ts, "offshoot_rollback", map[string]any{"database": "app", "branch": "x", "to": "fork"}),
+	}
+	for _, force := range []bool{false, true} {
+		refusals[fmt.Sprintf("promote (force=%v)", force)] = call(t, ts, "offshoot_promote", map[string]any{
+			"database": "app", "source": "main", "target": "x", "force": force})
+		refusals[fmt.Sprintf("destroy (force=%v)", force)] = call(t, ts, "offshoot_destroy", map[string]any{
+			"database": "app", "branch": "x", "force": force})
+	}
+	for what, r := range refusals {
+		got := text(r)
+		if !r.IsError || !strings.Contains(got, holder) || !strings.Contains(got, "another checkpoint is in progress") || !strings.Contains(got, "retry when it finishes") {
+			t.Fatalf("%s under a checkpoint's lease = %q, want a refusal that says to retry", what, got)
+		}
+		if strings.Contains(got, "--force") || strings.Contains(got, "force:true") || strings.Contains(got, "ask the human") {
+			t.Fatalf("%s under a checkpoint's lease offers force or a human: %s", what, got)
+		}
+	}
+	if _, _, err := w.Store.GetRef("app", "x"); err != nil {
+		t.Fatalf("the branch must survive the refusals: %v", err)
+	}
+}
+
+// TestLeaseRefusalsNeverOfferAForceTheToolLacks: under a session's or
+// `lease acquire`'s lease, offshoot_rollback (no force at all) says to
+// close the session, and offshoot_promote without -allow-force names the
+// human's command, as offshoot_destroy already did; neither passes on ops'
+// "pass --force".
+func TestLeaseRefusalsNeverOfferAForceTheToolLacks(t *testing.T) {
+	ts, w := newTools(t)
+	if r := call(t, ts, "offshoot_fork", map[string]any{"database": "app", "new_branch": "y"}); r.IsError {
+		t.Fatalf("fork: %s", text(r))
+	}
+	if _, err := w.AcquireLease("app", "y", "tester", time.Minute); err != nil {
+		t.Fatal(err)
+	}
+	rb := call(t, ts, "offshoot_rollback", map[string]any{"database": "app", "branch": "y", "to": "fork"})
+	if got := text(rb); !rb.IsError || strings.Contains(got, "--force") || !strings.Contains(got, "close the session first") {
+		t.Fatalf("rollback under a session's lease = %q", got)
+	}
+	pr := call(t, ts, "offshoot_promote", map[string]any{"database": "app", "source": "main", "target": "y"})
+	if got := text(pr); !pr.IsError || strings.Contains(got, "pass --force") ||
+		!strings.Contains(got, "do not retry with force:true") ||
+		!strings.Contains(got, "`offshoot promote app@main --onto y --force`") {
+		t.Fatalf("promote under a session's lease = %q", got)
+	}
+}
+
+// TestCheckpointDetachedRefusalNamesTheToolCalls: offshoot_checkpoint has
+// no force, so the refusal of a detached checkout (the branch was repointed
+// after it was materialized, and the checkout could not be refreshed) names
+// offshoot_checkout to refresh it and the human's `checkpoint --force` for
+// edits that must win, instead of ops' "pass --force". A force:true the
+// schema does not have changes nothing.
+func TestCheckpointDetachedRefusalNamesTheToolCalls(t *testing.T) {
+	ts, w := newTools(t)
+	if r := call(t, ts, "offshoot_checkout", map[string]any{"database": "app"}); r.IsError {
+		t.Fatalf("checkout main: %s", text(r))
+	}
+	if r := call(t, ts, "offshoot_fork", map[string]any{"database": "app", "new_branch": "f"}); r.IsError {
+		t.Fatalf("fork: %s", text(r))
+	}
+	if r := call(t, ts, "offshoot_checkout", map[string]any{"database": "app", "branch": "f"}); r.IsError {
+		t.Fatalf("checkout f: %s", text(r))
+	}
+	sqliteExec(t, w.CheckoutPath("app", "f"), "CREATE TABLE t (v); INSERT INTO t VALUES (1);")
+	if r := call(t, ts, "offshoot_checkpoint", map[string]any{"database": "app", "branch": "f", "name": "work"}); r.IsError {
+		t.Fatalf("checkpoint f: %s", text(r))
+	}
+	// A promote onto main whose checkout refresh did not happen (a busy
+	// checkout): the old identity stays on main's sidecar.
+	sum := w.CheckoutPath("app", "main") + ".sum"
+	old, err := os.ReadFile(sum)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := w.PromoteWith("app", "f", "main", ops.PromoteOptions{Force: true, NoBackup: true}); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(sum, old, 0o600); err != nil {
+		t.Fatal(err)
+	}
+	_, want := w.CheckpointWith("app", "main", "v1", nil, ops.CheckpointOptions{})
+	if !errors.Is(want, ops.ErrDetachedCheckout) {
+		t.Fatalf("precondition: the ops refusal is %v", want)
+	}
+	var first string
+	for _, args := range []map[string]any{
+		{"database": "app", "name": "v1"},
+		{"database": "app", "name": "v1", "force": true},
+	} {
+		r := call(t, ts, "offshoot_checkpoint", args)
+		got := text(r)
+		if !r.IsError || strings.Contains(got, "pass --force") ||
+			!strings.Contains(got, `offshoot_checkout {database:"app", branch:"main"}`) ||
+			!strings.Contains(got, "`offshoot checkpoint app@main v1 --force`") {
+			t.Fatalf("offshoot_checkpoint %v of a detached checkout = %q", args, got)
+		}
+		if first == "" {
+			first = got
+		} else if got != first {
+			t.Fatalf("force:true changed the refusal:\n%s\n%s", first, got)
+		}
+	}
+}

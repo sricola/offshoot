@@ -1,6 +1,7 @@
 package ops
 
 import (
+	"bytes"
 	"encoding/json"
 	"errors"
 	"fmt"
@@ -33,7 +34,38 @@ const tombstoneKey = "gc/tombstones"
 // Destroy still claims before it deletes, and a lease claimed a moment
 // before force lands still wins the CAS race on the ref (this call's own
 // claim write then fails with ErrCAS, reported as a retryable race loss,
-// same as an unforced call).
+// same as an unforced call). A claim write that reports failure but
+// landed is this call's own claim all the same, and Destroy goes on under
+// it (landedClaim), deleting only while the claim is young enough (below).
+//
+// The lease holder's renewals do not stop under the claim
+// (store.RenewLease), so one can land between the claim and the delete;
+// see deleteClaimedRef for how the delete gets past it.
+//
+// One destroy never claims over another's live claim (liveDeleteClaim):
+// it is refused with store.ErrDeleting, retryable, and writes nothing,
+// force or not. And a destroy that fails after its claim unwinds its own
+// claim only (unwindDeletingClaim). Either way no other destroy clears or
+// replaces a claim while it is live, and a reap pass writes nothing to the
+// ref under one (reapOne): were a claim cleared under its destroy, an
+// acquire could take the branch at a new epoch, and on S3 that destroy's
+// unconditional delete would remove the branch under the fresh lease. A
+// claim is live for staleDeletingClaimAfter (30 s) from its stamp
+// (liveDeleteClaim), not for as long as its destroy may still delete: once
+// it is that old, ClearStaleDeleteClaims clears it and another destroy
+// takes it over.
+// So a destroy sends its delete only while its own stamp says the claim
+// has more than deleteClaimMargin (10 s) of that left, judged after the
+// checkout quiesce; one held up past that (its claim write held up by
+// response timeouts and SDK retries, whether it then succeeded or landed
+// after reporting failure, or a slow quiesce) unwinds its claim and fails,
+// retryable, deleting nothing. On a local store the delete
+// is also conditional on the claim's etag, so a destroy whose delete lands
+// later than that fails instead. On S3 it is not: a destroy whose delete
+// request is itself held up until the claim is stale, or whose process is
+// suspended that long between that check and its delete, can delete a
+// branch an acquire took after the janitor cleared its claim
+// (docs/limitations.md).
 func (w *Workspace) Destroy(db, branch string, force bool) error {
 	if err := store.ValidateName(db); err != nil {
 		return err
@@ -51,9 +83,12 @@ func (w *Workspace) Destroy(db, branch string, force bool) error {
 	if ref.LeaseHolder != "" && !force {
 		exp, perr := time.Parse(time.RFC3339Nano, ref.LeaseExpiry)
 		if perr == nil && time.Now().Before(exp) {
-			return fmt.Errorf("ops: %s@%s has a live lease held by %q until %s; use --force",
-				db, branch, ref.LeaseHolder, ref.LeaseExpiry)
+			return destroyLeaseRefusal(db, branch, ref)
 		}
+	}
+	if liveDeleteClaim(ref, time.Now()) {
+		return fmt.Errorf("ops: %s@%s is already being destroyed (claimed at %s); retry once that destroy ends, or once its claim is %s old if it was interrupted: %w",
+			db, branch, ref.DeletingAt, staleDeletingClaimAfter, store.ErrDeleting)
 	}
 
 	// CAS claim: mark the ref as being deleted. A concurrent AcquireLease
@@ -64,25 +99,34 @@ func (w *Workspace) Destroy(db, branch string, force bool) error {
 	ref.DeletingAt = time.Now().UTC().Format(time.RFC3339Nano)
 	claimEtag, err := w.Store.PutRef(db, branch, ref, etag)
 	if err != nil {
-		if errors.Is(err, store.ErrCAS) {
-			return fmt.Errorf("ops: destroy lost a race on %s@%s (retry): %w", db, branch, err)
+		if claimEtag, err = w.landedClaim(db, branch, ref, etag, force, err); err != nil {
+			return err
 		}
-		return err
 	}
 
 	path := w.CheckoutPath(db, branch)
 	if _, err := os.Stat(path); err == nil {
-		if err := quiesce(path); err != nil {
+		if err := destroyQuiesce(path); err != nil {
 			// This call knows right now it isn't going to finish — unwind
 			// the claim eagerly rather than leave it for
 			// ClearStaleDeleteClaims's age-based self-heal to eventually
 			// catch.
-			w.unwindDeletingClaim(db, branch)
+			w.unwindDeletingClaim(db, branch, ref.DeletingAt)
 			if errors.Is(err, errCheckoutReplaced) {
 				return retryHint("destroy", db, branch, err)
 			}
 			return fmt.Errorf("ops: checkout in use; close connections before destroy: %w", err)
 		}
+	}
+	// The claim's stamp is this call's own, so its age needs no read of
+	// the ref. A claim too near staleDeletingClaimAfter old may be cleared
+	// by the janitor on any host, and the branch taken at a new epoch,
+	// before the delete lands; on S3 that delete would then remove the
+	// branch under the new lease.
+	if !liveDeleteClaim(ref, time.Now().Add(deleteClaimMargin)) {
+		w.unwindDeletingClaim(db, branch, ref.DeletingAt)
+		return fmt.Errorf("ops: destroy of %s@%s was held up too long to delete under its claim (made at %s; another host may clear a claim %s old and take the branch), so it deleted nothing (retry): %w",
+			db, branch, ref.DeletingAt, staleDeletingClaimAfter, store.ErrCAS)
 	}
 	// DeleteRefIf is a true CAS delete on the local backend (belt-and-
 	// suspenders on top of the claim above) and an unconditional delete on
@@ -90,8 +134,8 @@ func (w *Workspace) Destroy(db, branch string, force bool) error {
 	// the Deleting claim already landed above is what actually serializes
 	// this against a concurrent AcquireLease/Destroy on every backend. See
 	// store.DeleteRefIf's doc comment.
-	if err := w.Store.DeleteRefIf(db, branch, claimEtag); err != nil {
-		w.unwindDeletingClaim(db, branch)
+	if err := w.deleteClaimedRef(db, branch, ref, claimEtag, force); err != nil {
+		w.unwindDeletingClaim(db, branch, ref.DeletingAt)
 		return err
 	}
 	// Best-effort checkout removal: the ref is already gone, so a failed
@@ -110,19 +154,236 @@ func (w *Workspace) Destroy(db, branch string, force bool) error {
 	return nil
 }
 
-// unwindDeletingClaim best-effort clears a Deleting claim this Destroy call
-// itself just landed but could not carry through to a successful delete (a
-// checkout-quiesce failure, a DeleteRefIf error). A lost CAS race here
-// (someone else already cleared or reclaimed this ref in the meantime) is
-// benign — the same idempotent-unwind shape as reapOne's own Reaping unwind
-// on a failed Destroy call.
-func (w *Workspace) unwindDeletingClaim(db, branch string) {
-	if ref, etag, err := w.Store.GetRef(db, branch); err == nil && ref.Deleting {
-		ref.Deleting = false
-		ref.DeletingAt = ""
-		_, _ = w.Store.PutRef(db, branch, ref, etag) // best effort; ClearStaleDeleteClaims retries later regardless
+// destroyQuiesce is the checkout quiesce Destroy runs between its claim and
+// its delete, which can take the claim's age close to the margin (see
+// Destroy). It is a var only so tests can hold it up.
+var destroyQuiesce = quiesce
+
+// landedClaim settles Destroy's claim write, of claimed against the ref
+// read at sentEtag, that reported failure (werr) but may have landed: on
+// S3, the SDK's retry of a PutObject whose first attempt landed gets a 412
+// (or a 409) back from that attempt, which the store reports as a lost
+// compare-and-swap, and a timeout can lose the response to a write that
+// landed. Reported as it stands, such a failure would leave this call's
+// claim on the ref, and the retry the error asks for would be refused
+// under it (liveDeleteClaim) until it was staleDeletingClaimAfter old. A
+// backend that settles its writes before they return
+// (store.SettledWriter: Local) wrote nothing on a failure, so landedClaim
+// reports it at once there, and otherwise re-reads the ref. One that
+// carries this call's claim (its DeletingAt, stamped per call) is that
+// write, landed. With nothing but the lease expiry moved since
+// (onlyRenewed), and, without force, no lease live again, Destroy goes on
+// under it from the etag read, as deleteClaimedRef does past a renewal
+// over the claim. Going on is not yet deleting: a write that took long
+// enough to time out can land a claim already near stale, and Destroy
+// deletes only while the claim has more than deleteClaimMargin left to
+// stand; one closer than that to stale unwinds the claim and fails,
+// retryable, with no delete sent. A ref moved otherwise fails Destroy as
+// deleteClaimedRef would have failed it over the same write, and the
+// claim is unwound first. A ref without this call's claim (the write did
+// not land, or another write has since taken the claim off), or one that
+// cannot be read, reports the write's failure.
+//
+// A ref still at sentEtag has had nothing land on it, so the failure gave
+// no verdict: a 409 against a write still in flight, perhaps this call's
+// own first attempt, or a timeout with the write still on its way, which
+// can land after the re-read. landedClaim re-reads such a ref
+// claimSettleReads more times, claimSettleEvery apart, and goes on as
+// above once anything lands; a definite loss (a 412: another write landed
+// first) has moved the ref and is reported at once. A ref still at
+// sentEtag after that reports the write's failure, saying the claim may
+// still land and a retry be refused under it for up to
+// staleDeletingClaimAfter. (A ref that another write moved and an unwind
+// put back to the same bytes also reads at sentEtag; that costs the wait
+// and the warning, never a go-ahead, which takes this call's claim.)
+func (w *Workspace) landedClaim(db, branch string, claimed store.Ref, sentEtag string, force bool, werr error) (string, error) {
+	failed := werr
+	if errors.Is(werr, store.ErrCAS) {
+		failed = fmt.Errorf("ops: destroy lost a race on %s@%s (retry): %w", db, branch, werr)
+	}
+	if s, ok := w.Store.B.(store.SettledWriter); ok && s.WritesSettled() {
+		return "", failed
+	}
+	cur, etag, err := w.Store.GetRef(db, branch)
+	for n := 0; err == nil && etag == sentEtag && n < claimSettleReads; n++ {
+		time.Sleep(claimSettleEvery)
+		cur, etag, err = w.Store.GetRef(db, branch)
+	}
+	if err == nil && etag == sentEtag {
+		return "", fmt.Errorf("%w; the claim write got no verdict and may still land, and a retry would then be refused as already being destroyed until the claim is %s old", failed, staleDeletingClaimAfter)
+	}
+	if err != nil || !cur.Deleting || cur.DeletingAt != claimed.DeletingAt {
+		return "", failed
+	}
+	if !onlyRenewed(claimed, cur) {
+		w.unwindDeletingClaim(db, branch, claimed.DeletingAt)
+		return "", fmt.Errorf("ops: destroy lost a race on %s@%s to another write of its ref (retry): %w", db, branch, store.ErrCAS)
+	}
+	if !force && store.LeaseLive(cur, time.Now()) {
+		w.unwindDeletingClaim(db, branch, claimed.DeletingAt)
+		return "", destroyLeaseRefusal(db, branch, cur)
+	}
+	return etag, nil
+}
+
+// claimSettleReads and claimSettleEvery bound landedClaim's wait for a
+// claim write that got no verdict: about 2 s in all, well past the moment
+// a write still in flight lands in all but a stalled request, and short
+// enough for an operator's destroy to wait out. claimSettleEvery is a var
+// only so tests can shrink it.
+const claimSettleReads = 3
+
+var claimSettleEvery = 700 * time.Millisecond
+
+// destroyLeaseRefusal is Destroy's refusal, without --force, of a branch
+// whose lease ref shows live.
+func destroyLeaseRefusal(db, branch string, ref store.Ref) error {
+	held := fmt.Sprintf("ops: %s@%s has a live lease held by %q until %s", db, branch, ref.LeaseHolder, ref.LeaseExpiry)
+	if isCheckpointHolder(ref.LeaseHolder) {
+		// It ends on its own within seconds: say so first, so an agent or
+		// script retries instead of fetching a human for --force, which
+		// would make the checkpoint fail. "; use --force" stays the
+		// message's tail, as callers that rewrite it expect.
+		refusal := held + " (another checkpoint is in progress); a destroy now would make that checkpoint fail without committing — " + checkpointRetryAdvice
+		return &leaseHeldError{msg: refusal + "; use --force", noForce: refusal, checkpoint: true}
+	}
+	return &leaseHeldError{msg: held + "; use --force", noForce: held}
+}
+
+// destroyDeleteAttempts bounds deleteClaimedRef's conditional deletes. A
+// holder renews once per renewal interval (10 s at the default TTL), so a
+// second attempt wins unless renewals come faster than one re-read and
+// delete of the ref; the bound only ends such a run.
+const destroyDeleteAttempts = 4
+
+// deleteClaimedRef is Destroy's delete of the ref its claim wrote: claimed,
+// at etag. The lease holder's renewals go on under the claim
+// (store.RenewLease writes over it and leaves it set), and one that lands
+// before the delete moves the etag a local store's conditional delete
+// compares against. So a delete that loses its compare-and-swap re-reads
+// the ref, and while the ref is still exactly this call's claim with only
+// the lease expiry moved (onlyRenewed), deletes again against the etag it
+// read, up to destroyDeleteAttempts deletes in all. The claim holds every
+// acquire off throughout, and the holder's next renewal finds the branch
+// gone (ErrNotFound), which ends a session or a checkpoint.
+//
+// Without force, Destroy went ahead only because the lease had lapsed; if
+// its holder has renewed it since, the destroy is refused as a live lease,
+// as it would have been had the renewal landed before its read. Any other
+// change to the ref (a flush, a touch, a release, another destroy's claim
+// over this one, the janitor clearing this one), or a renewal before every
+// attempt, fails the destroy as a lost race (retryable, ErrCAS). On S3 the
+// delete is unconditional and never loses a compare-and-swap, so none of
+// this runs there: a renewal between the claim and the delete is not seen,
+// and the branch is deleted, forced or not.
+func (w *Workspace) deleteClaimedRef(db, branch string, claimed store.Ref, etag string, force bool) error {
+	for attempt := 1; ; attempt++ {
+		err := w.Store.DeleteRefIf(db, branch, etag)
+		if err == nil || !errors.Is(err, store.ErrCAS) {
+			return err
+		}
+		lost := fmt.Errorf("ops: destroy lost a race on %s@%s to another write of its ref (retry): %w", db, branch, err)
+		if attempt == destroyDeleteAttempts {
+			return lost
+		}
+		cur, curEtag, gerr := w.Store.GetRef(db, branch)
+		if gerr != nil || !onlyRenewed(claimed, cur) {
+			return lost
+		}
+		if !force && store.LeaseLive(cur, time.Now()) {
+			return destroyLeaseRefusal(db, branch, cur)
+		}
+		etag = curEtag
 	}
 }
+
+// onlyRenewed reports whether cur is claimed, the ref Destroy's claim
+// wrote, with nothing but its lease expiry moved: what a renewal by the
+// holder writes over the claim. The same DeletingAt is part of that, so
+// another destroy's claim is not this one's. A reaping claim that was set
+// under this claim and has since been cleared (a reaper unwinding its own
+// claim after its destroy was refused) counts as no change either: the
+// destroy's own claim still keeps acquires off. Both refs are compared as
+// PutRef encodes them; both come through GetRef's decode, so the
+// encodings agree on everything a renewal leaves alone.
+func onlyRenewed(claimed, cur store.Ref) bool {
+	cur.LeaseExpiry = claimed.LeaseExpiry
+	if claimed.Reaping {
+		cur.Reaping = true
+	}
+	a, aerr := json.Marshal(claimed)
+	b, berr := json.Marshal(cur)
+	return aerr == nil && berr == nil && bytes.Equal(a, b)
+}
+
+// unwindDeletingClaim best-effort clears the Deleting claim this Destroy
+// call landed, stamped claimedAt, when the call cannot carry it through to
+// a delete (a checkout-quiesce failure, a failed or lost delete). It
+// clears that claim and no other: a claim with another DeletingAt belongs
+// to a destroy that wrote over this one (an older binary, which claims
+// over any claim, or one that found this claim stale) and may still be
+// between its claim and its delete, so clearing it would open the window
+// the claim closes (see Destroy). The holder's renewals write over the
+// claim and leave it set, so a write that loses its compare-and-swap
+// re-reads and tries again while the claim is still this call's, up to
+// destroyDeleteAttempts writes. A claim the unwind could not clear blocks
+// acquires and other destroys until it is staleDeletingClaimAfter old,
+// when ClearStaleDeleteClaims clears it and a destroy takes it over. A
+// reaping claim under this one is left for the reaper (see reapOne).
+func (w *Workspace) unwindDeletingClaim(db, branch, claimedAt string) {
+	for attempt := 1; attempt <= destroyDeleteAttempts; attempt++ {
+		ref, etag, err := w.Store.GetRef(db, branch)
+		if err != nil || !ref.Deleting || ref.DeletingAt != claimedAt {
+			return
+		}
+		ref.Deleting = false
+		ref.DeletingAt = ""
+		if _, err := w.Store.PutRef(db, branch, ref, etag); !errors.Is(err, store.ErrCAS) {
+			return
+		}
+	}
+}
+
+// liveDeleteClaim reports whether ref carries a destroy's claim made less
+// than staleDeletingClaimAfter before now, so that its destroy may still be
+// between its claim and its delete. A claim whose DeletingAt cannot be
+// read is not live: ClearStaleDeleteClaims never clears one, and only a
+// destroy taking it over gets the branch out from under it. Nor is one
+// stamped more than deleteClaimClockSlack after now (deleteClaimFresh).
+func liveDeleteClaim(ref store.Ref, now time.Time) bool {
+	if !ref.Deleting {
+		return false
+	}
+	at, err := time.Parse(time.RFC3339Nano, ref.DeletingAt)
+	return err == nil && deleteClaimFresh(at, now)
+}
+
+// deleteClaimFresh reports whether a destroy claim stamped at is too recent,
+// at now, to have been abandoned: less than staleDeletingClaimAfter old,
+// and stamped no more than deleteClaimClockSlack in the future. A stamp
+// further ahead than that came from a clock that runs ahead of this one (or
+// was set far in the future), and its distance from now says nothing about
+// whether its destroy is still running; counted as fresh, it would refuse
+// acquires and destroys, and keep the janitor off it, for as long as that
+// clock is ahead (for good, for a stamp far in the future). Treating it as
+// stale assumes, as the 30 s bound already does, that hosts sharing a store
+// agree on the time to well within the slack.
+func deleteClaimFresh(at, now time.Time) bool {
+	age := now.Sub(at)
+	return age < staleDeletingClaimAfter && age >= -deleteClaimClockSlack
+}
+
+// deleteClaimClockSlack is how far ahead of this host's clock a destroy
+// claim's DeletingAt may be and still count as fresh: room for the
+// ordinary clock skew between hosts sharing a store (see deleteClaimFresh).
+const deleteClaimClockSlack = time.Minute
+
+// deleteClaimMargin is how much of its staleDeletingClaimAfter a destroy's
+// own claim must still have left when the destroy sends its delete: room
+// for that delete to land, and for a janitor whose clock runs a little
+// ahead of this one, before any host may count the claim abandoned and
+// clear it (see Destroy).
+const deleteClaimMargin = 10 * time.Second
 
 // staleDeletingClaimAfter bounds how long a Destroy claim (Ref.Deleting) can
 // sit unresolved before ClearStaleDeleteClaims treats it as abandoned by a
@@ -132,7 +393,9 @@ func (w *Workspace) unwindDeletingClaim(db, branch string) {
 // own internal busy-timeout) — order of milliseconds in the healthy case, so
 // this is deliberately generous, matching the local backend's own
 // lock-staleness window (Local.lock: 30s) rather than trying to tune a
-// tighter bound.
+// tighter bound. On S3, where the delete is unconditional, it also bounds
+// how long a destroy has to reach its delete safely: a destroy sends its
+// delete only with more than deleteClaimMargin of this left (see Destroy).
 const staleDeletingClaimAfter = 30 * time.Second
 
 // ClearStaleDeleteClaims self-heals a Deleting claim (Milestone 4 Task 6b)
@@ -145,10 +408,12 @@ const staleDeletingClaimAfter = 30 * time.Second
 //
 // Unlike Reap's self-heal (driven by a TTL/activity deadline recomputing
 // into the future), a Deleting claim has no deadline concept to recompute:
-// it self-heals purely by age (staleDeletingClaimAfter). A ref with an
-// unparseable DeletingAt is left alone (conservative, matching Reap's own
-// stance on an unparseable TTL/expiry elsewhere in this package) rather than
-// guessed at. Called by the janitor on every tick, alongside Reap/GC.
+// it self-heals purely by age (staleDeletingClaimAfter), and a claim
+// stamped more than deleteClaimClockSlack in the future counts as stale
+// too (deleteClaimFresh). A ref with an unparseable DeletingAt is left
+// alone (conservative, matching Reap's own stance on an unparseable
+// TTL/expiry elsewhere in this package) rather than guessed at. Called by
+// the janitor on every tick, alongside Reap/GC.
 func (w *Workspace) ClearStaleDeleteClaims(now time.Time) (cleared []string, err error) {
 	refs, err := w.Store.ListRefs()
 	if err != nil {
@@ -178,7 +443,7 @@ func (w *Workspace) ClearStaleDeleteClaims(now time.Time) (cleared []string, err
 				continue
 			}
 			claimedAt, perr := time.Parse(time.RFC3339Nano, ref.DeletingAt)
-			if perr != nil || now.Sub(claimedAt) < staleDeletingClaimAfter {
+			if perr != nil || deleteClaimFresh(claimedAt, now) {
 				continue
 			}
 			ref.Deleting = false
@@ -359,7 +624,9 @@ type liveHead struct {
 // ref's own lineage, and at an epoch a CURRENT writer could still make live,
 // may be an orphan a session flush is entitled to re-create at the same key
 // (session/flush.go's ambiguous-ref-write retry overwrites the SAME
-// (lineage, epoch, txid) key), so the sweep must never delete there.
+// (lineage, epoch, txid) key), or an at-rest checkpoint's object between
+// its upload and its head write, under the epoch its lease acquire just
+// minted, so the sweep must never delete there.
 //
 // Both fields take the MINIMUM across every ref naming the lineage, and both
 // for the same reason: erring toward OVER-protection under a stale or
@@ -631,8 +898,10 @@ func (w *Workspace) GC(grace time.Duration) (tombstoned, deleted int, err error)
 		// somehow still loses the CAS itself — the epoch bump goes through
 		// AcquireLease, which writes a fresh etag (lease.go's PutRef), so
 		// the fenced writer's PutRef (built from its stale GetRef's etag)
-		// fails unconditionally, not just probabilistically. (The at-rest
-		// Checkpoint path is the same shape: one GetRef, one CAS'd PutRef.)
+		// fails unconditionally, not just probabilistically. (An at-rest
+		// checkpoint is the same shape: it holds the lease, writes under the
+		// epoch its acquire minted, and its head write re-checks holder and
+		// epoch before its CAS.)
 		// keepHighestEpoch is NOT the mechanism here — it has no knowledge
 		// of Ref.Epoch at all; it only picks the higher-epoch member between
 		// two objects covering the IDENTICAL txid range, which is chain

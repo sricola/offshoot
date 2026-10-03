@@ -5,6 +5,7 @@ import (
 	"fmt"
 	"io"
 	"os"
+	"reflect"
 	"strings"
 	"sync"
 	"testing"
@@ -391,5 +392,175 @@ func TestRenewAfterExpiryButBeforeReclaimStillWorks(t *testing.T) {
 	}
 	if l2.Epoch != l.Epoch {
 		t.Errorf("renew bumped the epoch: %d -> %d", l.Epoch, l2.Epoch)
+	}
+}
+
+// TestAcquireLeaseRefReturnsTheWrittenRef: AcquireLeaseRef hands back the
+// exact ref its acquire wrote and that write's etag, so a caller can plan
+// from the revision its lease is part of and compare-and-swap against it
+// without a second GetRef.
+func TestAcquireLeaseRefReturnsTheWrittenRef(t *testing.T) {
+	s := newStore(t)
+	seedBranch(t, s)
+	now := time.Date(2026, 8, 1, 12, 0, 0, 0, time.UTC)
+	l, got, etag, err := s.AcquireLeaseRef("app", "main", "checkpoint:h/1/0123abcd", time.Minute, now)
+	if err != nil {
+		t.Fatal(err)
+	}
+	stored, storedEtag, err := s.GetRef("app", "main")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !reflect.DeepEqual(got, stored) {
+		t.Fatalf("returned ref\n %+v\nstored ref\n %+v", got, stored)
+	}
+	if etag != storedEtag {
+		t.Fatalf("returned etag %q, stored etag %q", etag, storedEtag)
+	}
+	if got.Epoch != 2 || l.Epoch != got.Epoch || got.LeaseHolder != l.Holder {
+		t.Fatalf("lease %+v does not match the returned ref %+v", l, got)
+	}
+	// The etag is the write's own: a compare-and-swap against it lands.
+	got.Protected = true
+	if _, err := s.PutRef("app", "main", got, etag); err != nil {
+		t.Fatalf("PutRef against the returned etag: %v", err)
+	}
+}
+
+// TestAcquireLeaseRefRefusesALiveLease: AcquireLeaseRef refuses exactly
+// what AcquireLease refuses, and returns no ref with the refusal.
+func TestAcquireLeaseRefRefusesALiveLease(t *testing.T) {
+	s := newStore(t)
+	seedBranch(t, s)
+	now := time.Date(2026, 8, 1, 12, 0, 0, 0, time.UTC)
+	if _, err := s.AcquireLease("app", "main", "daemon-a", time.Minute, now); err != nil {
+		t.Fatal(err)
+	}
+	_, ref, etag, err := s.AcquireLeaseRef("app", "main", "checkpoint:h/1/0123abcd", time.Minute, now)
+	if !errors.Is(err, ErrLeaseHeld) {
+		t.Fatalf("want ErrLeaseHeld, got %v", err)
+	}
+	if !reflect.DeepEqual(ref, Ref{}) || etag != "" {
+		t.Fatalf("a refused acquire returned ref %+v etag %q", ref, etag)
+	}
+}
+
+// TestAcquireLeaseRefIfChecksTheRefItWrites: the check runs on the ref the
+// acquire reads, before its own refusals and its write. A refusal is
+// returned unwrapped and writes nothing; a pass writes exactly the checked
+// ref plus the lease.
+func TestAcquireLeaseRefIfChecksTheRefItWrites(t *testing.T) {
+	s := newStore(t)
+	seedBranch(t, s)
+	now := time.Date(2026, 8, 1, 12, 0, 0, 0, time.UTC)
+	before, beforeEtag, err := s.GetRef("app", "main")
+	if err != nil {
+		t.Fatal(err)
+	}
+	refusal := errors.New("refused by the caller")
+	var seen Ref
+	_, ref, etag, err := s.AcquireLeaseRefIf("app", "main", "checkpoint:h/1/0123abcd", time.Minute, now, func(r Ref) error {
+		seen = r
+		return refusal
+	})
+	if err != refusal || !reflect.DeepEqual(ref, Ref{}) || etag != "" {
+		t.Fatalf("a refused check: err %v ref %+v etag %q, want the check's own error and nothing else", err, ref, etag)
+	}
+	if !reflect.DeepEqual(seen, before) {
+		t.Fatalf("the check saw %+v, want the stored ref %+v", seen, before)
+	}
+	if after, afterEtag, err := s.GetRef("app", "main"); err != nil || afterEtag != beforeEtag || !reflect.DeepEqual(after, before) {
+		t.Fatalf("a refused check wrote the ref: %+v (%v)", after, err)
+	}
+	// The check runs before the acquire's own refusals: a claimed branch
+	// is the caller's to word.
+	before.Deleting = true
+	if _, err := s.PutRef("app", "main", before, beforeEtag); err != nil {
+		t.Fatal(err)
+	}
+	if _, _, _, err := s.AcquireLeaseRefIf("app", "main", "checkpoint:h/1/0123abcd", time.Minute, now, func(Ref) error { return refusal }); err != refusal {
+		t.Fatalf("check on a claimed branch: %v, want the check's own error", err)
+	}
+	cur, curEtag, err := s.GetRef("app", "main")
+	if err != nil {
+		t.Fatal(err)
+	}
+	cur.Deleting = false
+	if _, err := s.PutRef("app", "main", cur, curEtag); err != nil {
+		t.Fatal(err)
+	}
+	l, got, _, err := s.AcquireLeaseRefIf("app", "main", "checkpoint:h/1/0123abcd", time.Minute, now, func(r Ref) error {
+		seen = r
+		return nil
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	want := seen
+	want.Epoch++
+	want.LeaseHolder, want.LeaseExpiry = l.Holder, l.Expiry.Format(time.RFC3339Nano)
+	if !reflect.DeepEqual(got, want) {
+		t.Fatalf("a passed check wrote\n %+v\nwant the checked ref plus the lease\n %+v", got, want)
+	}
+}
+
+// TestRenewLeaseLeavesAClaimSet: a renewal under a destroy or a reap claim,
+// with nearly all of the lease left, extends the lease and leaves the ref
+// exactly as the claim wrote it apart from the expiry, as a renewal does
+// without a claim. The claim still stands, so another holder's acquire is
+// still refused; a renewal of a lease that is no longer ours is still
+// ErrLeaseLost. A renewal never stops under a claim, so a claim a killed
+// destroy stranded does not lapse a lease whose renewals go through, and
+// Destroy's delete tolerates the renewal (see ops.Destroy).
+func TestRenewLeaseLeavesAClaimSet(t *testing.T) {
+	for _, tc := range []struct {
+		name    string
+		claim   func(*Ref)
+		refusal error
+	}{
+		{"destroy", func(r *Ref) { r.Deleting, r.DeletingAt = true, "2026-08-01T12:00:01Z" }, ErrDeleting},
+		{"reap", func(r *Ref) { r.Reaping = true }, ErrReaping},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			s := newStore(t)
+			seedBranch(t, s)
+			now := time.Date(2026, 8, 1, 12, 0, 0, 0, time.UTC)
+			l, err := s.AcquireLease("app", "main", "daemon-a", time.Minute, now)
+			if err != nil {
+				t.Fatal(err)
+			}
+			ref, etag, err := s.GetRef("app", "main")
+			if err != nil {
+				t.Fatal(err)
+			}
+			tc.claim(&ref)
+			if _, err := s.PutRef("app", "main", ref, etag); err != nil {
+				t.Fatal(err)
+			}
+			next, err := s.RenewLease(l, time.Minute, now.Add(2*time.Second))
+			if err != nil {
+				t.Fatalf("renewal under a %s claim: %v, want it renewed", tc.name, err)
+			}
+			if want := now.Add(2*time.Second + time.Minute); !next.Expiry.Equal(want) || next.Epoch != l.Epoch || next.Holder != l.Holder {
+				t.Fatalf("renewed lease %+v, want %s's epoch %d until %s", next, l.Holder, l.Epoch, want)
+			}
+			got, _, err := s.GetRef("app", "main")
+			if err != nil {
+				t.Fatal(err)
+			}
+			want := ref
+			want.LeaseExpiry = next.Expiry.Format(time.RFC3339Nano)
+			if !reflect.DeepEqual(got, want) {
+				t.Fatalf("after a renewal under a %s claim the ref is\n %+v\nwant the claimed ref with only the expiry moved\n %+v", tc.name, got, want)
+			}
+			if _, err := s.AcquireLease("app", "main", "daemon-b", time.Minute, now.Add(3*time.Second)); !errors.Is(err, tc.refusal) {
+				t.Fatalf("acquire under a %s claim a renewal wrote over: %v, want %v", tc.name, err, tc.refusal)
+			}
+			stolen := l
+			stolen.Holder = "someone-else"
+			if _, err := s.RenewLease(stolen, time.Minute, now.Add(3*time.Second)); !errors.Is(err, ErrLeaseLost) {
+				t.Fatalf("renewal of a lease that is not ours under a %s claim: %v, want ErrLeaseLost", tc.name, err)
+			}
+		})
 	}
 }

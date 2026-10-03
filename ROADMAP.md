@@ -346,7 +346,7 @@ open wart (its own spec said "N materialized forks cost up to N×G").
   by-chain cache, an O(1) clean check, and at-rest segment checkpoints
   against a reflinked shadow. ⏸ **Compact stays a copy**, by design —
   dropping the base pointer is what it is for.
-- ⏭ **Tier 2 follow-ups from that work** (none blocks v0.2.12):
+- ✅ **Tier 2 follow-ups from that work** (none blocks v0.2.12):
   - ✅ Route Rollback/Promote/Compact's local checkout refresh through the
     by-chain cache (`materializeFromChain`), so the local refresh is
     O(delta) like `checkout`, not a full decode.
@@ -366,9 +366,14 @@ open wart (its own spec said "N materialized forks cost up to N×G").
     write between encode and stamp is caught by fingerprint, and a
     distrusted stamp records a hash no file matches, so the checkout reads
     "modified" unless it provably equals the store's head.
-  - A third concurrent at-rest checkpoint that overwrites the object after
-    the winner's check is still unnoticed; closing it needs a lease (or a
-    create-only key per attempt) on the at-rest path.
+  - ✅ Fence concurrent at-rest checkpoints with the branch lease
+    ([limitations](docs/limitations.md#one-writer-per-branch)): an at-rest
+    checkpoint takes the lease before it writes its object and releases it
+    in the ref write that advances the head, so its epoch, and with it its
+    object key, is its own. A second checkpoint (or a session open) on the
+    branch is refused while it runs, the third-racer and dead-loser windows
+    are gone, and `checkpoint --force` no longer writes under a live
+    session's epoch.
   - ✅ Normalize etags across providers before comparing them (strip quotes
     and a weak `W/` prefix), so an S3-compatible provider that reformats
     the etag between `PUT` and `HEAD` costs no needless `GET`.
@@ -391,6 +396,20 @@ open wart (its own spec said "N materialized forks cost up to N×G").
     the only update path; no `apt-get upgrade` at build time, because an
     unpinned upgrade would make the image non-reproducible and silently
     diverge from the digest the SLSA provenance names.
+- ⏭ **A local lineage listing that does not grow with its epochs.** Since
+  at-rest checkpoints take the branch lease, each one writes under its own
+  epoch, and a local store keeps one directory per epoch, so resolving a
+  lineage's chain reads one more directory per checkpoint it has taken:
+  16 ms after 1,000 checkpoints on one lineage, against 1.2 ms when they
+  shared an epoch ([benchmarks](docs/benchmarks.md)). A `compact` resets
+  it, and S3 is unaffected. Candidates, cheapest first: let a segment
+  checkpoint reuse the chain it resolved last time plus its own object
+  instead of re-listing; remove an epoch directory once it is empty (this
+  bounds GC'd and failed attempts, not kept checkpoints); a local layout
+  that lists a lineage in one directory read, behind a store migration.
+  Not reusing an epoch: `lease release` and forced repoints clear a live
+  checkpoint's lease without bumping it, so two checkpoints could then
+  share a key.
 
 ## Launch track (parallel to v0.1–v0.3)
 

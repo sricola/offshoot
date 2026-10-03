@@ -151,7 +151,10 @@ the tool description says: ask the human to promote or destroy from the
 CLI (`offshoot promote ... --force` / `offshoot destroy ... --force`), or
 work on a fork instead. See [`mcp-walkthrough.md`](demo/mcp-walkthrough.md)
 for this refusal firing for real, followed by an `offshoot_diff` call and
-a human-run CLI promote.
+a human-run CLI promote. One live lease is not the human's to clear: an
+at-rest checkpoint in progress holds its branch for a few seconds, so a
+refusal naming a `checkpoint:` holder says to retry when it finishes, and
+offers neither `force` nor a human.
 
 Any branch, not just `main`, can be put under the same protection:
 `offshoot protect <db>[@branch]` sets the flag (`offshoot unprotect`

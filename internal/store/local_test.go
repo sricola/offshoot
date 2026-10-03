@@ -365,9 +365,11 @@ func TestLocalFreshLockNotBroken(t *testing.T) {
 
 // TestLocalConcurrentPutSameKey guards against a regression found while
 // hardening internal/ops's Checkpoint against concurrent callers: Put has no
-// per-key lock (by design -- callers like Checkpoint's orphan-snapshot
-// overwrite and GC's tombstone-list write use it exactly because
-// last-write-wins is intentional there), so multiple goroutines can call
+// per-key lock (by design -- callers like session flush's overwrite of an
+// orphan a crashed prior flush left, and GC's tombstone-list write, use it
+// exactly because last-write-wins is intentional there; the at-rest
+// checkpoint, which once overwrote too, now writes create-only under its
+// own lease's epoch), so multiple goroutines can call
 // Put on the identical key at the same time. The old write() used a fixed
 // shared temp filename (key+".tmp"): one goroutine's os.Create (O_TRUNC) or
 // os.Rename could clobber or disappear another's temp file mid-write,
@@ -519,5 +521,24 @@ func TestLocalHeadRecordedEtag(t *testing.T) {
 	}
 	if etag, size := head("data/copy"); etag != want || size != int64(len(payload)) {
 		t.Fatalf("Head(copy) = (%s, %d), want (%s, %d)", etag, size, want, len(payload))
+	}
+}
+
+// TestOnlyLocalSettlesItsWrites: a local store's conditional write that
+// returns an error wrote nothing and never will, and it says so
+// (SettledWriter); S3's can still land after it reported failure (a
+// timeout, or the SDK's retry answered by its own first attempt), so it
+// must not claim to settle them, or a caller would stop waiting for a
+// write that is still on its way.
+func TestOnlyLocalSettlesItsWrites(t *testing.T) {
+	l, err := NewLocal(t.TempDir())
+	if err != nil {
+		t.Fatal(err)
+	}
+	if s, ok := Backend(l).(SettledWriter); !ok || !s.WritesSettled() {
+		t.Fatal("a local store does not say it settles its writes")
+	}
+	if _, ok := Backend((*S3)(nil)).(SettledWriter); ok {
+		t.Fatal("S3 says it settles its writes")
 	}
 }

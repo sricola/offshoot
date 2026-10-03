@@ -583,6 +583,77 @@ Every workflow completed every step: 2,310/2,310 worker-steps, 107.9 s of
 workflow wall time in total (1 min 52 s for the whole run, including a seed
 build per workflow), no CAS retries, nothing aborted or timed out.
 
+**Since the table: at-rest checkpoints take the branch lease
+(unreleased).** An at-rest checkpoint now writes the ref twice instead of
+once: it acquires the branch lease before it uploads, and releases it in
+the write that advances the head ([reference](reference.md)). On a local
+store every ref write is fsynced (`F_FULLFSYNC` on macOS), so that is one
+more flush per checkpoint, and the table's checkpoint column reads low for
+code with the lease. Measured 2026-10-03 on the machine above, alternating
+a build of `c9ca45d` (before) with one of the change (after) run by run,
+at load average 2 to 6 (other processes were running):
+
+| `simulation` | Checkpoint p50, before → after | Checkpoint p99, before → after | Wall, before → after |
+|---|---|---|---|
+| full (1000 steps), concurrency 8, 3 runs each | 104.9 / 114.8 / 120.5 → 122.9 / 126.1 / 128.2 ms | 154.6 / 170.5 / 186.9 → 177.2 / 187.6 / 191.8 ms | 43.4 / 47.6 / 48.2 → 46.1 / 47.9 / 48.2 s |
+| `-quick` (20 steps), concurrency 1, 6 runs each | 44.5–45.5 → 48.2–49.8 ms | 46.5–129.4 → 48.9–62.0 ms | 2.5–5.0 → 2.7–2.9 s |
+
+Every after run's checkpoint p50 sits above every before run's: by the
+medians, +11.3 ms (+10%) eight at a time and +3.3 ms (+7%) one at a time.
+The full runs' wall time does not move outside run-to-run noise; the
+sequential quick runs take about 0.1 s more of 2.6 s, roughly twenty
+checkpoints' worth (the 5.0 s before run stalled once, which is also its
+129.4 ms p99). On a heavily loaded machine (load average 10 and above)
+the eight-way p50 gap measured 20 to 40 ms, as concurrent fsyncs queue
+behind one another. On a local store that is the cost of the design: the
+acquire is what makes the object key private to the call, and it must be
+durable to fence a concurrent writer, while a ref read costs 0.06 to
+0.16 ms there (timed per request in an eight-way burst). The build
+measured above also read the ref once more, before the acquire; the
+checkpoint now runs its refusals on the acquire's own read, which saves
+nothing measurable locally. The table will carry it from its next
+quiet-machine run.
+
+On S3 every request is a round trip, so there the request count is the
+cost. Before the lease, an at-rest checkpoint read and wrote the ref once
+each, and a segment checkpoint also made two `LIST`s probing for another
+checkpoint's snapshot. Now it reads and writes the ref twice each (the
+acquire, then the head write), in sequence, and makes no probe: a
+snapshot checkpoint adds one `GET` and one conditional `PUT`, and a
+segment checkpoint makes the same number of requests as before, with a
+`GET` and a durable `PUT` in place of the two `LIST`s. A renewal adds a
+`GET` and a `PUT` per 10 s of upload. This was not measured against a
+real S3 endpoint.
+
+**On a local store, chain resolution slows as at-rest checkpoints
+accumulate on one lineage.** Each checkpoint writes under the epoch its
+lease acquire minted, so it leaves one more `data/<lineage>/<epoch>/`
+directory, and a local listing of the lineage, which every chain
+resolution makes (a segment checkpoint's own, `checkout`, `fork`,
+materialize, and every descendant resolving through the lineage),
+reads every one. Before the lease, at-rest checkpoints all wrote under
+the branch's one epoch. `BenchmarkChainAfterCheckpoints` takes n
+sequential at-rest checkpoints on one branch and then times
+`Store.Chain` at its head (2026-10-03, the machine above, load average 2
+to 3, `go test ./internal/ops -run '^$' -bench ChainAfterCheckpoints
+-benchtime=50x`, before = `c9ca45d`):
+
+| Checkpoints on the lineage | Epoch directories, before → after | `Store.Chain` at the head, before → after |
+|---|---|---|
+| 1 | 1 → 2 | 0.08 → 0.05 ms |
+| 100 | 1 → 101 | 0.21 → 1.6 ms |
+| 1,000 | 1 → 1,001 | 1.2 → 16.1 ms |
+
+Seeding the 1,000 took about 25 s before and about 45 s after, the
+difference being the growing resolve inside each segment checkpoint plus
+the extra fsync. `compact`, `rollback` and `promote` start a fresh
+lineage and reset the count; a daemon session, which writes all of its
+flushes under one epoch, adds one directory per session, as before. An S3
+listing of a lineage is flat, so the count does not slow it. Removing an
+epoch directory once GC or a failed checkpoint empties it would bound
+the count for objects that are gone, but not for checkpoints the branch
+keeps.
+
 **What changed in v0.2.12.** The before is the same target run at
 `97320cc` (the commit before this work) on the same machine the same day;
 its wall times reproduce the v0.2.11 table this section used to carry to

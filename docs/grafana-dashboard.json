@@ -639,7 +639,7 @@
       "id": 24,
       "type": "stat",
       "title": "Checkpoint overwrites detected",
-      "description": "offshoot_checkpoint_overwrite_detected_total: at-rest checkpoints that committed but found the store's head may not be their own content: their object replaced by a racing same-kind checkpoint, a racer's snapshot beside their segment (two at-rest checkpoints on one branch at once, with a write between their encodes), or an object that could not be verified. Unless the checkout equals the head, it then reads as modified and the next checkpoint writes a snapshot. At-rest only (CLI/MCP), like checkpoint latency; any increase means at-rest checkpoints on one branch are not serialized.",
+      "description": "offshoot_checkpoint_overwrite_detected_total: at-rest checkpoints that committed but found the store's head may not be their own content: their object replaced out of band (its key is under an epoch only that checkpoint's lease minted, so no offshoot writer shares it), or an object that could not be verified. Unless the checkout equals the head, it then reads as modified and the next checkpoint writes a snapshot. At-rest only (CLI/MCP), like checkpoint latency; any increase means something outside offshoot is rewriting objects in the store, or the store could not be read back.",
       "datasource": {
         "type": "prometheus",
         "uid": "${datasource}"

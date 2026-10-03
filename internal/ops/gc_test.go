@@ -98,7 +98,7 @@ func TestDestroyRefusesLiveLeaseWithoutForce(t *testing.T) {
 // instead of Local. GC's sweep phase deletes every object under a
 // tombstoned lineage's prefix (Store.B.Delete in a loop) and its earlier
 // phase persists the tombstone map via an unconditional Store.B.Put — both
-// paths that, like Checkpoint's orphan-overwrite path, depend on ops's
+// paths that, like session flush's orphan-overwrite path, depend on ops's
 // object-storage semantics matching across backends rather than being
 // accidents of Local's filesystem behavior. Same assertions as the Local
 // version: phase 1 tombstones without deleting, phase 2 with zero grace

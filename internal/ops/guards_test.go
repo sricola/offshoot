@@ -2,11 +2,15 @@ package ops
 
 import (
 	"database/sql"
+	"errors"
+	"fmt"
 	"path/filepath"
+	"reflect"
 	"strings"
 	"testing"
 	"time"
 
+	"github.com/sricola/offshoot/internal/store"
 	"github.com/sricola/offshoot/internal/testutil"
 )
 
@@ -52,8 +56,9 @@ func TestCheckpointRefusesDetachedCheckout(t *testing.T) {
 
 // TestAtRestVerbsRefuseLiveLease: checkpoint, rollback, promote-onto and
 // compact refuse a branch under a live lease (a daemon session or `lease
-// acquire`), because each would clear the lease and fence that writer,
-// discarding its unflushed work. --force overrides; a lease on promote's
+// acquire`), with an error that unwraps to store.ErrLeaseHeld. --force
+// overrides the three repoints, which clear the lease and fence that
+// writer; it never overrides a checkpoint's refusal. A lease on promote's
 // SOURCE never blocks.
 func TestAtRestVerbsRefuseLiveLease(t *testing.T) {
 	w := newWS(t)
@@ -66,7 +71,7 @@ func TestAtRestVerbsRefuseLiveLease(t *testing.T) {
 	}
 	wantLease := func(what string, err error) {
 		t.Helper()
-		if err == nil || !strings.Contains(err.Error(), "live lease") || !strings.Contains(err.Error(), "--force") {
+		if !errors.Is(err, store.ErrLeaseHeld) || !strings.Contains(err.Error(), "live lease") || !strings.Contains(err.Error(), "--force") {
 			t.Fatalf("%s under a live lease: got %v, want a live-lease refusal naming --force", what, err)
 		}
 	}
@@ -78,16 +83,118 @@ func TestAtRestVerbsRefuseLiveLease(t *testing.T) {
 	wantLease("promote onto", err)
 	_, err = w.CompactWith("app", "main", CompactOptions{})
 	wantLease("compact", err)
+	_, err = w.CheckpointWith("app", "main", "cp", nil, CheckpointOptions{Force: true})
+	wantLease("checkpoint --force", err)
 
-	if _, err := w.CheckpointWith("app", "main", "cp", nil, CheckpointOptions{Force: true}); err != nil {
-		t.Fatalf("checkpoint --force under a lease: %v", err)
-	}
 	// A lease on the source does not block promoting it.
 	if _, err := w.AcquireLease("app", "f", "tester", time.Minute); err != nil {
 		t.Fatal(err)
 	}
 	if _, err := w.PromoteWith("app", "f", "main", PromoteOptions{Force: true}); err != nil {
 		t.Fatalf("promote from a leased source (forced past main's protection and lease): %v", err)
+	}
+}
+
+// TestCheckpointRefusesLiveLeaseEvenWithForce: a live lease refuses an
+// at-rest checkpoint with one message whether or not --force is given, and
+// the refusal leaves the ref exactly as it was. Before this, --force wrote
+// the head and a checkpoint entry under the session's own epoch and left
+// its lease in place: two writers interleaved under one epoch.
+func TestCheckpointRefusesLiveLeaseEvenWithForce(t *testing.T) {
+	w := newWS(t)
+	seedDB(t, w, "app", 1<<16)
+	mustSQL(t, w.CheckoutPath("app", "main"), "INSERT INTO t (v) VALUES (randomblob(10));")
+	if _, err := w.AcquireLease("app", "main", "tester", time.Minute); err != nil {
+		t.Fatal(err)
+	}
+	held := refOf(t, w, "app", "main")
+	want := fmt.Sprintf("ops: app@main has a live lease held by %q until %s (an open daemon session, or 'offshoot lease acquire'); --force cannot take over a live lease; close the session and retry, or, if the process that holds it has exited, free it with 'offshoot lease release app@main' (never while that daemon still runs: a session it reopened may hold the lease)",
+		held.LeaseHolder, held.LeaseExpiry)
+	for _, force := range []bool{false, true} {
+		_, err := w.CheckpointWith("app", "main", "cp", nil, CheckpointOptions{Force: force})
+		if !errors.Is(err, store.ErrLeaseHeld) || err.Error() != want {
+			t.Fatalf("checkpoint (force=%v) under a live lease: %v\nwant: %s", force, err, want)
+		}
+		if after := refOf(t, w, "app", "main"); !reflect.DeepEqual(after, held) {
+			t.Fatalf("a refused checkpoint (force=%v) changed the ref:\n got %+v\nwant %+v", force, after, held)
+		}
+	}
+}
+
+// TestLeaseRefusalsNameAnInProgressCheckpoint: when the live lease is an
+// at-rest checkpoint's, every at-rest verb's refusal unwraps to
+// store.ErrLeaseHeld, names the holder, says a checkpoint is in progress
+// and to retry when it finishes, and never sends the user looking for a
+// session to close or for `lease release`, which would only abort a
+// checkpoint that is still running. Every refusal but the checkpoint's own
+// still offers --force to the CLI; without it (WithoutForceAdvice, what
+// MCP and the daemon's rollback and compact report), none mentions it.
+func TestLeaseRefusalsNameAnInProgressCheckpoint(t *testing.T) {
+	w := newWS(t)
+	seedDB(t, w, "app", 1<<16)
+	mustFork(t, w, "app", "main", "work", "seed")
+	holder := checkpointHolderPrefix + LocalHolder() + "/0123abcd"
+	if _, err := w.AcquireLease("app", "work", holder, time.Minute); err != nil {
+		t.Fatal(err)
+	}
+	_, cpErr := w.CheckpointWith("app", "work", "cp", nil, CheckpointOptions{})
+	_, rbErr := w.RollbackWith("app", "work", "fork", RollbackOptions{NoBackup: true})
+	_, prErr := w.PromoteWith("app", "main", "work", PromoteOptions{NoBackup: true})
+	_, cmErr := w.CompactWith("app", "work", CompactOptions{})
+	dsErr := w.Destroy("app", "work", false)
+	for what, err := range map[string]error{"checkpoint": cpErr, "rollback": rbErr, "promote onto": prErr, "compact": cmErr, "destroy": dsErr} {
+		if !errors.Is(err, store.ErrLeaseHeld) || !strings.Contains(err.Error(), holder) {
+			t.Fatalf("%s under a checkpoint's lease: %v, want a lease-held refusal naming %s", what, err, holder)
+		}
+		msg := err.Error()
+		if !strings.Contains(msg, "another checkpoint is in progress") || !strings.Contains(msg, "retry when it finishes") {
+			t.Fatalf("%s refusal does not say a checkpoint is in progress and to retry: %v", what, err)
+		}
+		if strings.Contains(msg, "close the session") || strings.Contains(msg, "lease release") {
+			t.Fatalf("%s refusal under a checkpoint's lease sends the user to a session or `lease release`: %v", what, err)
+		}
+		if !CheckpointInProgress(err) {
+			t.Fatalf("CheckpointInProgress(%s refusal) = false", what)
+		}
+		if what != "checkpoint" && !strings.Contains(msg, "--force") {
+			t.Fatalf("%s refusal does not offer --force to the CLI: %v", what, err)
+		}
+		bare := WithoutForceAdvice(err)
+		if !errors.Is(bare, store.ErrLeaseHeld) || !CheckpointInProgress(bare) || !strings.Contains(bare.Error(), "retry when it finishes") {
+			t.Fatalf("%s refusal without --force advice: %v", what, bare)
+		}
+		if what != "checkpoint" && strings.Contains(bare.Error(), "--force") {
+			t.Fatalf("%s refusal without --force advice still mentions it: %v", what, bare)
+		}
+	}
+}
+
+// TestLeaseRefusalsWithoutForceAdvice: a session holder's refusal of a
+// repoint or destroy offers --force to the CLI; WithoutForceAdvice, what a
+// caller that cannot force reports, keeps the rest and drops it, and leaves
+// every other error alone.
+func TestLeaseRefusalsWithoutForceAdvice(t *testing.T) {
+	w := newWS(t)
+	seedDB(t, w, "app", 1<<16)
+	mustFork(t, w, "app", "main", "work", "seed")
+	if _, err := w.AcquireLease("app", "work", "tester", time.Minute); err != nil {
+		t.Fatal(err)
+	}
+	_, rbErr := w.RollbackWith("app", "work", "fork", RollbackOptions{NoBackup: true})
+	_, cmErr := w.CompactWith("app", "work", CompactOptions{})
+	dsErr := w.Destroy("app", "work", false)
+	for what, err := range map[string]error{"rollback": rbErr, "compact": cmErr, "destroy": dsErr} {
+		if !errors.Is(err, store.ErrLeaseHeld) || !strings.Contains(err.Error(), "--force") || CheckpointInProgress(err) {
+			t.Fatalf("%s under a session's lease: %v", what, err)
+		}
+		bare := WithoutForceAdvice(err)
+		if !errors.Is(bare, store.ErrLeaseHeld) || strings.Contains(bare.Error(), "--force") || !strings.Contains(bare.Error(), `held by "tester"`) {
+			t.Fatalf("%s refusal without --force advice: %v", what, bare)
+		}
+	}
+	other := errors.New("ops: something else; use --force")
+	if got := WithoutForceAdvice(other); got != other {
+		t.Fatalf("WithoutForceAdvice changed an unrelated error: %v", got)
 	}
 }
 

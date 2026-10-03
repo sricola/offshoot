@@ -348,8 +348,9 @@ snapshot rounds to 0.0 MiB.)
 Each checkpoint entry in the ref records the same thing as an additive
 `kind` field (`"snapshot"` or `"segment"`; empty on entries written before
 v0.2.12, on `fork`/`promote` entries, and by writers that don't know).
-Concurrent checkpoints use it to clean up after a lost compare-and-swap
-without deleting the winner's object.
+offshoot itself no longer reads it back (concurrent checkpoints used it
+before the checkpoint took the branch lease); it stays for tools that
+inspect refs.
 
 Every checkpoint records a creation timestamp (`created_at`, RFC3339 UTC)
 automatically. `--meta k=v` is repeatable and attaches a small string→string
@@ -363,27 +364,102 @@ begins at its fork point (even a shared, copy-on-write fork's ref carries
 only its auto-created `fork` checkpoint), so a checkpoint made before the
 fork isn't addressable from the child; resolve it on the parent instead.
 
+**The checkpoint holds the branch lease.** From before it quiesces the
+checkout until the ref write that advances the head, an at-rest checkpoint
+holds the branch lease as `checkpoint:<host>/<pid>/<nonce>` (the nonce is
+per call), renewing it every 10 s; the head write releases it. The
+acquire bumps the branch's epoch, so the object goes under a key no other
+writer can name. While it runs, the branch reads `active` in `offshoot
+status` and in the daemon's `branches` op, whose `lease_holder` (and both
+SDKs' `Branch.lease_holder`) names the checkpoint, as does `offshoot lease
+list`. If the checkpoint fails after the acquire it releases the lease; if
+its process dies, the lease expires after 30 s and the next writer
+reclaims it. Each checkpoint reads the ref twice and writes it twice
+(plus one read and one write per renewal), where it used to read and
+write it once each: the acquire, whose read the refusals below run on,
+and the head write. The extra write is the acquire, and it is durable,
+so it costs time. On a local store it is one more fsync, nearly all of
+the difference (a ref read takes about 0.1 ms there); on a local macOS
+store BranchBench measured checkpoint p50 about 3 ms higher one at a
+time and about 11 ms higher eight at a time (more on a heavily loaded
+machine, where the fsyncs queue). On S3 every request is a round trip: a
+snapshot checkpoint makes one more `GET` and one more conditional `PUT`
+of the ref, in sequence, and a segment checkpoint makes as many requests
+as before, the extra `GET` and `PUT` in place of the two `LIST`s it no
+longer needs. On a local store each checkpoint also leaves one more
+`data/<lineage>/<epoch>/` directory, and listing a lineage reads them
+all, so resolving the branch's chain (a segment checkpoint's own
+resolve, `checkout`, `fork`) slows as checkpoints accumulate on one
+lineage: about 1.6 ms after 100 checkpoints and 16 ms after 1,000,
+against well under a millisecond for one; `compact` starts a fresh
+lineage and resets it. See [benchmarks](benchmarks.md). A head write
+that loses its compare-and-swap to a `touch`, `protect` or TTL change is
+retried, up to three attempts.
+
 **Refusals, and `--force`.** A checkpoint is refused when the branch has
-a **live lease** — an open daemon session, or `offshoot lease acquire` —
-because stamping the ref under a live writer would fence that session and
-discard whatever it had not flushed; close the session first, or pass
-`--force` to do exactly that (the lease is cleared, the epoch bumps, the
-session's next flush fails, and its unflushed writes never reach the
-store). It is also refused when the checkout is **detached** — its sidecar
-records a lineage the branch no longer points at, because the branch was
-repointed (`rollback`, `promote`, `compact`) after the checkout was
-materialized — since checkpointing it would silently revert that repoint;
-`offshoot checkout` refreshes it (discarding its local edits), `offshoot
-export` keeps them as a file, or `--force` checkpoints it anyway. A branch
-that is mid-`destroy` or mid-reap is refused outright; no flag overrides
-that. The same rules apply to `rollback`, `promote --onto` (the target
-only) and `compact`.
+a **live lease** — an open daemon session, `offshoot lease acquire`, or
+another checkpoint in progress — with or without `--force`: the
+checkpoint takes the lease itself, so it waits its turn rather than write
+under another writer's epoch. Under another checkpoint's lease, retry
+when it finishes, in a few seconds: its lease lapses on its own 30 s
+after its process dies. Under a session's, close the session and retry;
+a session that is already closing holds its lease until its close
+releases it, and `session close` then waits for that close. If the holder
+is gone (a daemon that was killed with a session open, a `lease acquire`
+nobody will release), `offshoot lease release <db>@<branch>` frees the
+lease at once, as the refusal says. A session whose close failed to
+release its lease is not such a holder: that lease lapses at its expiry,
+and once the branch is reopened it is the new session's (see [`session
+close`](#offshoot-session-close-dbbranch--socket-path)). An expired lease
+is reclaimed without any flag. A
+checkpoint is also refused when the checkout is **detached** — its
+sidecar records a lineage the branch no longer points at, because the
+branch was repointed (`rollback`, `promote`, `compact`) after the
+checkout was materialized — since checkpointing it would silently revert
+that repoint; `offshoot checkout` refreshes it (discarding its local
+edits), `offshoot export` keeps them as a file, or `--force` checkpoints
+it anyway. A branch that is mid-`destroy` or mid-reap is refused
+outright; no flag overrides that. `rollback`, `promote --onto` (the target
+only) and `compact` apply the same live-lease, destroy and reap rules,
+except that `--force` does override a live lease for them: the repoint
+clears it, fencing a session (its unflushed writes are lost) or making a
+checkpoint in progress fail without committing. Their refusal of a
+checkpoint's lease says to retry when it finishes. A forced repoint
+reads the ref, copies objects and then compare-and-swaps the ref; when
+that takes longer than the renewal interval (10 s), say for a large
+database on S3, every attempt loses to the next renewal and returns
+`lost a race (retry)` until the checkpoint ends, as it does against a
+daemon session's renewals.
 
 **Errors:** checkpoint name already exists on this branch; no checkout
 exists yet (run `checkout` first); checkout is busy; another operation
 replaced or removed the checkout while it was being opened (retry); live
-lease without `--force`; detached checkout without `--force`; branch mid-destroy or
+lease (a session, `lease acquire`, or another checkpoint; `--force` does
+not override it); detached checkout without `--force`; branch mid-destroy or
 mid-reap; `--meta` over a cap (key count, key length, or value length).
+After the lease is taken: the lease ended while the checkpoint ran (a
+forced repoint, `lease release`, a reclaim after it expired, or
+`destroy --force`, whose claim the head write also refuses to write
+over), in which case nothing was committed and the checkpoint deletes its
+own object; the head write lost three compare-and-swaps to concurrent
+ref writes (retry; the object is left for GC, since on S3 a conflict
+answer does not rule out an earlier attempt of the write still landing);
+the object's create-only put reported its key taken but nothing could be
+read back there (retry); an object with other bytes already sits at the
+checkpoint's own key, which nothing else writes (store corruption; the
+object is left in place); the branch moved under the checkpoint's own
+lease, which only an older offshoot binary's `checkpoint --force` can do
+(the object is kept, since the head may name it; upgrade every binary).
+One outcome is not a failure but an unknown: the checkpoint **may have
+committed** when a head write failed without a verdict from the store (a
+timeout, a 5xx the SDK gave up on) and the ref cannot show whether it
+landed, because the store may still apply it, the branch has moved
+since, the ref cannot be read, or a destroy or reap has claimed the
+branch since (an abandoned claim puts the ref back exactly as the write
+found it). The checkpoint then
+keeps its object, so a head or a fork that names it still materializes,
+and a retry under the same name is refused as already existing if it did
+commit.
 
 ## `offshoot fork <db>[@branch] <new-branch> [--at checkpoint] [--ttl duration] [--meta k=v ...]`
 
@@ -529,9 +605,10 @@ offshoot rollback app@attempt-1 --to fork --force
 Repoints the branch at a **new** lineage seeded from `checkpoint`'s state
 (internally, the same machinery as fork). Checkpoints at or before the
 target are kept; checkpoints after it are dropped. A branch with a live
-lease (an open daemon session, or `lease acquire`) is refused unless
-`--force`, which clears the lease by the repoint and fences that session —
-its unflushed writes are lost (see [checkpoint](#offshoot-checkpoint-dbbranch-name---snapshot---meta-kv----force)'s
+lease (an open daemon session, `lease acquire`, or an at-rest checkpoint
+in progress) is refused unless `--force`, which clears the lease by the
+repoint: a session is fenced and its unflushed writes are lost, and a
+checkpoint in progress fails without committing (see [checkpoint](#offshoot-checkpoint-dbbranch-name---snapshot---meta-kv----force)'s
 refusal rules; a branch mid-destroy or mid-reap is never forceable).
 Afterwards the branch is immediately acquirable.
 
@@ -653,9 +730,10 @@ until the fork is reaped or destroyed, so the old lineage's storage is
 reclaimed after the TTL, not at promote time — exactly the "base-pointing
 into a lineage meant to die pins it" trade-off [concepts](concepts.md)
 describes, here bounded by the TTL. `--no-backup` skips all of this. A
-live lease on `target` (an open daemon session, or `lease acquire`) is
-refused unless `--force`, which clears it by the repoint and fences that
-session — its unflushed writes are lost; a `target` mid-destroy or
+live lease on `target` (an open daemon session, `lease acquire`, or an
+at-rest checkpoint in progress) is refused unless `--force`, which clears
+it by the repoint: a session is fenced and its unflushed writes are lost,
+and a checkpoint in progress fails without committing; a `target` mid-destroy or
 mid-reap is refused outright. A lease on `source` never blocks a promote.
 Afterwards `target` is immediately acquirable. `target`'s
 checkout, if any, is refreshed after a busy probe — same best-effort
@@ -731,12 +809,14 @@ concurrent flush from elsewhere that advances the head between the copy
 and the ref swap loses the CAS and returns a retry error.
 
 **Errors:** no such `db@branch`; branch has a live lease (an open session,
-or `lease acquire`) without `--force`, which fences that session and loses
-its unflushed writes; branch mid-destroy or mid-reap; lost a concurrent
-CAS race to a flush (retry). After the repoint, a checkout that is busy,
-or that another operation replaced or removed during the refresh, is not
-refreshed; the compact stands and reports it (close the checkout's
-connections if it was busy, then run `offshoot checkout <db>@<branch>`).
+`lease acquire`, or an at-rest checkpoint in progress) without `--force`,
+which fences that session and loses its unflushed writes, or makes the
+checkpoint fail without committing; branch mid-destroy or mid-reap; lost
+a concurrent CAS race to a flush (retry). After the repoint, a checkout
+that is busy, or that another operation replaced or removed during the
+refresh, is not refreshed; the compact stands and reports it (close the
+checkout's connections if it was busy, then run `offshoot checkout
+<db>@<branch>`).
 
 ## `offshoot destroy <db>[@branch] [--force]`
 
@@ -753,7 +833,23 @@ child, whether that child is a shared (copy-on-write) fork or a
 materialized one. `--force` is required to destroy a protected branch
 (`main` by default), and also to destroy a branch under an active lease (a
 live holder may still be mid-write; without `--force` this is refused
-outright).
+outright); under an at-rest checkpoint's lease the refusal says to retry
+when it finishes, in a few seconds. A forced destroy under an at-rest
+checkpoint in progress makes that checkpoint fail without committing,
+whether a renewal finds the branch gone or the head write finds the
+destroy's claim; it deletes its own object and leaves the claim alone
+(unless a head write it had already sent may still land, in which case
+it keeps the object and reports that it may have committed). A lease
+renewal, a checkpoint's or a session's, that lands between the destroy's
+claim and its delete writes over the claim and leaves it set. The
+destroy still deletes the branch (on a local store its conditional
+delete re-reads the ref and deletes again while only the lease expiry
+has moved, up to 4 attempts; on S3 the delete is unconditional), and the
+holder's next renewal finds the branch gone. Without `--force`, a destroy
+that found the lease lapsed is refused as a live lease on a local store
+if the holder renewed it in that window. Under a claim that a killed
+destroy left, renewals go on as they do without one, so the holder's
+lease stays live until the janitor clears the claim.
 
 **Under copy-on-write, "destroyed" and "reclaimed" are different events.**
 Destroying a branch removes its ref immediately, but if any surviving
@@ -771,8 +867,13 @@ child.**
 
 **Errors:** protected without `--force`; live lease without `--force`;
 checkout is busy (close connections first); another operation replaced or
-removed the checkout while destroy was opening it (retry); the destroy
-lost a race to a concurrent `AcquireLease` on the same branch (retry — see
+removed the checkout while destroy was opening it (retry); `is already
+being destroyed` while another destroy of the branch is between its claim
+and its delete, with or without `--force` (retry; see below); the destroy
+lost a race to a concurrent `AcquireLease` on the same branch, or to
+another write of its ref between its claim and its delete, such as a
+flush, a `touch` or a lease renewal before every one of its 4 delete
+attempts (retry — see
 below).
 
 ### Claim-guarded delete
@@ -795,6 +896,40 @@ itself. A lease acquired a moment before a forced destroy lands still wins
 the underlying compare-and-swap on the ref, and the forced destroy reports
 a retryable race loss exactly like an unforced one would.
 
+A claim stands for 30 seconds from its timestamp. While it does, a second
+destroy of the same branch, forced or not, is refused with `is already
+being destroyed` (`store.ErrDeleting`, retryable) and writes nothing, and
+the reaper leaves such a branch to that destroy without writing its ref,
+even when the reaper had claimed the branch first. A destroy that fails
+after its claim removes its own claim and no other. Were a claim cleared
+under its destroy, an acquire could take the branch at a new epoch, and on
+S3, where the delete is unconditional, that destroy would then delete the
+branch under the fresh lease. So a destroy sends its delete only while
+its claim has more than 10 seconds left to stand, judged after the
+checkout quiesce; one held up past that (its claim write slowed by
+request timeouts and SDK retries, or a slow quiesce) removes its claim
+and fails with `was held up too long to delete under its claim`
+(retryable; `errors.Is(err, store.ErrCAS)`), deleting nothing. A destroy
+whose delete request is itself held up past the 30 seconds can still
+delete under a fresh lease on S3
+([limitations](limitations.md#smaller-edges-worth-knowing)). A claim
+stamped more than a minute ahead of a host's clock (its writer's clock runs
+ahead) counts as abandoned on that host, as one 30 seconds old does. On
+S3 a claim write can land and still report failure (the SDK's retry
+answered 412 or 409 by its own first attempt, or a timeout that lost the
+response). That claim is still the destroy's own, which it recognises by
+the claim's timestamp, and it goes on under it rather than reporting a
+lost race whose retry its own claim would refuse: if the claim landed in
+time it deletes the branch, and if it is by then within 10 seconds of
+standing 30 the destroy fails with `was held up too long to delete under
+its claim` as above, sending no delete and removing its claim. When the
+ref shows nothing landed yet (a 409 or a timeout with the write possibly
+still in flight), the destroy re-reads it for about 2 seconds before
+giving up, and its error then says the claim may still land, in which
+case a retry is refused for up to 30 seconds. A local store settles
+every write before it returns, so there a claim write that failed wrote
+nothing, and the destroy reports the failure at once.
+
 **Backend-specific mechanics** (deliberately: do not pretend S3
 `DeleteObject` has preconditions it doesn't):
 
@@ -802,12 +937,18 @@ a retryable race loss exactly like an unforced one would.
   per-key lock file `PutIf` already uses to implement compare-and-swap also
   backs a compare-and-delete (`Local.DeleteIf`) — belt-and-suspenders, since
   the claim above already serializes concurrent destroys/acquires on its
-  own.
+  own. The lease holder's renewals go on under the claim, so a delete that
+  loses its compare-and-swap to one (or to a reaper clearing its own
+  reaping claim) re-reads the ref and deletes again (above); any other
+  write in between fails the destroy as a retryable race loss.
 - **S3** has no compare-and-delete precondition in its API at all
   (`DeleteObject` ignores `If-Match`/`If-None-Match`; those headers only
   apply to `GetObject`/`PutObject`). Its delete stays unconditional; the
   CAS-written `Deleting` claim marker is the entire safety mechanism on this
-  backend, not a supplement to a conditional delete that doesn't exist.
+  backend, not a supplement to a conditional delete that doesn't exist. A
+  lease renewal between the claim and the delete is not seen, so the
+  branch is deleted even when an unforced destroy's holder renewed a
+  lapsed lease in that window.
 
 A Destroy call that crashes after landing its claim but before finishing
 the delete leaves the claim stranded — the branch is untouched (no partial
@@ -816,8 +957,12 @@ daemon's janitor self-heals this on the same cadence as reap/GC: a
 `Deleting` claim older than 30 seconds (destroy is a handful of local
 filesystem operations plus at most one checkout quiesce — anything stuck
 longer means the process that claimed it is gone) is cleared, and the
-branch becomes destroyable/leasable again. `offshoot gc` triggers the same
-self-heal on demand, same as it does for a stranded reap claim.
+branch becomes destroyable/leasable again, as is a claim stamped more than
+a minute in the future. `offshoot gc` triggers the same
+self-heal on demand, same as it does for a stranded reap claim. A
+`destroy` takes over such a claim itself, without waiting for the
+janitor, as it does a claim whose timestamp cannot be read (which the
+janitor never clears).
 
 ## `offshoot gc [--grace duration]`
 
@@ -915,7 +1060,7 @@ in-memory session map:
 
 | State | Meaning | Who can report it |
 |---|---|---|
-| `active` | The branch's ref carries a live lease — someone (in or out of a daemon) holds it right now. | Both |
+| `active` | The branch's ref carries a live lease — someone (in or out of a daemon) holds it right now: a session, `offshoot lease acquire`, or an at-rest `checkpoint` in progress (holder `checkpoint:<host>/<pid>/<nonce>`). | Both |
 | `pending` | This daemon has reserved a session slot for the branch and is still inside its (slow) `session.Open` — no live session yet, but the branch is spoken for. | Daemon only |
 | `error` | A session is open here and its `Err()` is non-nil (lease loss, a capture failure, any terminal session failure). | Daemon only |
 | `closing` | A session here is closing: its capture has stopped, and its lease stays live until the close releases it. An `open` of the branch waits for the close (up to 15 s); flush, fork, promote, rollback, compact, checkout and destroy refuse with a "retry" error. | Daemon only |
@@ -989,7 +1134,8 @@ offshoot lease list
 ```
 
 Lists every branch currently carrying a lease record: holder identity
-(`<hostname>/<pid>` by convention), state (`held` or `expired`), epoch, and
+(`<hostname>/<pid>` by convention; `checkpoint:<hostname>/<pid>/<nonce>`
+for an at-rest checkpoint in progress), state (`held` or `expired`), epoch, and
 expiry timestamp. A lease with a corrupt (unparseable) expiry is listed as
 expired with a warning to stderr, rather than hiding the branch or crashing
 the listing.
@@ -1009,8 +1155,10 @@ something else renews it before then. It exists for inspection and for
 deliberately breaking/reclaiming a stuck lease (acquiring bumps the epoch,
 fencing out whatever previously held it), not for long-running write
 sessions — use `offshoot serve` + `session open` for that. While the lease
-is live, the at-rest verbs (`checkpoint`, `rollback`, `promote --onto`,
-`compact`, `destroy`) refuse the branch unless `--force`.
+is live, `checkpoint` refuses the branch with or without `--force` (it
+takes the lease itself, so it waits for this one to be released or to
+expire), and `rollback`, `promote --onto`, `compact` and `destroy` refuse
+it unless `--force`.
 
 ## `offshoot lease release <db>[@branch]`
 
@@ -1019,7 +1167,13 @@ offshoot lease release app@main
 ```
 
 Releases the branch's current lease (looked up first via the same listing
-`lease list` uses).
+`lease list` uses), whoever holds it. It is meant for a holder that is
+gone. Released under a live holder, the lease's next use fails: a daemon
+session is fenced (its next renewal or flush fails, and whatever it had
+not flushed never reaches the store), and an at-rest checkpoint fails
+without committing and deletes its object. A checkpoint's lease
+(`checkpoint:<host>/<pid>/<nonce>`) never needs this: it ends with the
+checkpoint, or lapses on its own 30 s after its process dies.
 
 **Errors:** no lease currently held on that branch.
 
@@ -1633,8 +1787,9 @@ until each daemon session has a lease holder of its own.
 
 **Errors:** the branch is already open by this daemon; the branch is still
 closing after 15 s (`daemon: <db>@<branch> is still closing; retry`); the
-branch's lease is held elsewhere; the daemon is shutting down; no daemon
-reachable at the socket.
+branch's lease is held elsewhere (an at-rest checkpoint's,
+`checkpoint:<host>/<pid>/<nonce>`, ends within seconds: retry); the daemon
+is shutting down; no daemon reachable at the socket.
 
 ## `offshoot session flush <db>[@branch] [name] [-socket PATH]`
 

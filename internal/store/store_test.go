@@ -435,10 +435,11 @@ func TestLiveSnapshotSupersedesAFencedSegmentAtTheSameTXID(t *testing.T) {
 // deliberate limit on the MaxTXID collapse above.
 //
 // Collapsing a snapshot and a segment at the same MaxTXID is justified by one
-// premise: every segment this binary's writers produce is SINGLE-TXID (the
-// sole production ltxio.EncodeSegment caller passes (txid, txid)), so a
-// segment's MaxTXID identifies it as completely as its range does. A
-// MULTI-txid segment is outside that premise — no writer here can make one, so
+// premise: every segment this binary's writers produce is SINGLE-TXID (both
+// production ltxio.EncodeSegment callers, session/flush.go and
+// ops.CheckpointWith, pass (txid, txid)), so a segment's MaxTXID identifies
+// it as completely as its range does. A MULTI-txid segment is outside that
+// premise — no writer here can make one, so
 // it is a hand-written fixture or corruption — and its MaxTXID does NOT
 // identify it. If the collapse applied to it anyway, a stray {Min=0, Max=T}
 // segment at any epoch above the live one would EVICT the real snapshot at T

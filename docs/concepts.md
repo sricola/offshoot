@@ -210,8 +210,9 @@ daemon, every command runs *at rest* — open, do the work, exit.
 ### Lease
 
 The claim that makes a branch's single writer explicit: at most one
-holder per branch, renewed continuously by a daemon session, inspectable
-and breakable via `offshoot lease list/acquire/release`. Expiry is
+holder per branch, renewed continuously by a daemon session (an at-rest
+`checkpoint` holds it too, for as long as it runs), inspectable and
+breakable via `offshoot lease list/acquire/release`. Expiry is
 wall-clock and advisory — the actual guarantee against a stale writer
 comes from the epoch fence and ref CAS, not the clock
 ([fencing in two paragraphs](testing.md#fencing-and-cas-in-two-paragraphs)).
