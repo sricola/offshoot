@@ -238,3 +238,41 @@ func TestRollbackNoBackupAndTTL(t *testing.T) {
 		t.Fatalf("safety fork TTL = %q, want 2h0m0s", ref.TTL)
 	}
 }
+
+// TestSafetyForkUnderACheckpointLeaseSaysRetry: a rollback whose previous
+// safety fork an at-rest checkpoint is writing cannot replace it; the
+// refusal says to retry when that checkpoint finishes (or skip the safety
+// fork), not to close a session or ask a human, and main is untouched.
+func TestSafetyForkUnderACheckpointLeaseSaysRetry(t *testing.T) {
+	w := seedPromotePair(t)
+	mp, err := w.Checkout("app", "main")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if out, err := exec.Command("sqlite3", mp, "INSERT INTO t VALUES (2);").CombinedOutput(); err != nil {
+		t.Fatalf("%v: %s", err, out)
+	}
+	if _, err := w.Checkpoint("app", "main", "v2", nil); err != nil {
+		t.Fatal(err)
+	}
+	res, err := w.RollbackWith("app", "main", "v1", RollbackOptions{})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := w.AcquireLease("app", res.Backup, checkpointHolderPrefix+LocalHolder()+"/0123abcd", time.Minute); err != nil {
+		t.Fatal(err)
+	}
+	before := refOf(t, w, "app", "main")
+	_, err = w.RollbackWith("app", "main", "v1", RollbackOptions{})
+	if err == nil || !strings.Contains(err.Error(), "replacing the previous safety fork") || !strings.Contains(err.Error(), "retry when it finishes") {
+		t.Fatalf("rollback over a safety fork a checkpoint holds: %v", err)
+	}
+	for _, bad := range []string{"close that session", "ask the human", "--force"} {
+		if strings.Contains(err.Error(), bad) {
+			t.Fatalf("the refusal says %q: %v", bad, err)
+		}
+	}
+	if after := refOf(t, w, "app", "main"); after.Lineage != before.Lineage || after.HeadTXID != before.HeadTXID {
+		t.Fatalf("the refused rollback moved main: %+v -> %+v", before, after)
+	}
+}

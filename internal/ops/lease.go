@@ -1,9 +1,11 @@
 package ops
 
 import (
+	"errors"
 	"fmt"
 	"os"
 	"sort"
+	"strings"
 	"time"
 
 	"github.com/sricola/offshoot/internal/store"
@@ -96,7 +98,44 @@ func (w *Workspace) Leases() ([]LeaseInfo, error) {
 // leaseHeldError is an at-rest refusal of a branch under a live lease. It
 // keeps its own message and unwraps to store.ErrLeaseHeld, so a caller
 // tests errors.Is(err, store.ErrLeaseHeld) whichever verb refused.
-type leaseHeldError struct{ msg string }
+//
+// noForce is the message for a caller that cannot pass --force (MCP's
+// offshoot_rollback; promote and destroy through an MCP server without
+// -allow-force; the daemon's rollback and compact ops, so both SDKs), and
+// "" when msg offers no --force; WithoutForceAdvice picks it. checkpoint
+// reports that the holder is an at-rest checkpoint's, whose lease clears
+// on its own within seconds (CheckpointInProgress).
+type leaseHeldError struct {
+	msg, noForce string
+	checkpoint   bool
+}
 
 func (e *leaseHeldError) Error() string { return e.msg }
 func (e *leaseHeldError) Unwrap() error { return store.ErrLeaseHeld }
+
+// WithoutForceAdvice is err as a caller that cannot pass --force reports
+// it: a live-lease refusal (store.ErrLeaseHeld) loses the --force advice it
+// gave the CLI, so it names only the steps that caller has, such as waiting
+// for a checkpoint in progress to finish. Any other error is returned
+// unchanged.
+func WithoutForceAdvice(err error) error {
+	var lhe *leaseHeldError
+	if !errors.As(err, &lhe) || lhe.noForce == "" {
+		return err
+	}
+	msg := lhe.noForce
+	if err != error(lhe) {
+		msg = strings.Replace(err.Error(), lhe.msg, lhe.noForce, 1)
+	}
+	return &leaseHeldError{msg: msg, checkpoint: lhe.checkpoint}
+}
+
+// CheckpointInProgress reports whether err is a live-lease refusal whose
+// holder is an at-rest checkpoint (holder "checkpoint:<host>/<pid>/<nonce>").
+// That lease clears on its own when the checkpoint ends, within seconds,
+// or 30 s after its process died, so the next step is to retry, not to
+// reach for --force or a human.
+func CheckpointInProgress(err error) bool {
+	var lhe *leaseHeldError
+	return errors.As(err, &lhe) && lhe.checkpoint
+}

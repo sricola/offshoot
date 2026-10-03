@@ -190,3 +190,27 @@ func TestOpenRefusedWhileACheckpointHoldsTheBranch(t *testing.T) {
 		t.Fatalf("the refused open changed the checkpoint's lease: %q@%d", ref.LeaseHolder, ref.Epoch)
 	}
 }
+
+// TestRollbackAndCompactRefusalsOfferNoForce: the rollback and compact ops
+// take no force (nor do the SDKs' rollback and compact), so their refusal
+// of a branch an at-rest checkpoint holds says to retry when it finishes,
+// without ops' --force advice for the CLI.
+func TestRollbackAndCompactRefusalsOfferNoForce(t *testing.T) {
+	srv, w := newServer(t)
+	holder := "checkpoint:" + ops.LocalHolder() + "/0123abcd"
+	if _, err := w.AcquireLease("app", "main", holder, time.Minute); err != nil {
+		t.Fatal(err)
+	}
+	for _, req := range []Request{
+		{Op: "rollback", DB: "app", Branch: "main", Name: "seed", NoBackup: true},
+		{Op: "compact", DB: "app", Branch: "main"},
+	} {
+		resp, err := rawCall(srv.SocketPath(), req)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if resp.OK || !strings.Contains(resp.Error, holder) || !strings.Contains(resp.Error, "retry when it finishes") || strings.Contains(resp.Error, "--force") {
+			t.Fatalf("%s during a checkpoint = %+v, want a refusal that says to retry and offers no --force", req.Op, resp)
+		}
+	}
+}

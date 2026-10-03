@@ -51,8 +51,16 @@ func (w *Workspace) Destroy(db, branch string, force bool) error {
 	if ref.LeaseHolder != "" && !force {
 		exp, perr := time.Parse(time.RFC3339Nano, ref.LeaseExpiry)
 		if perr == nil && time.Now().Before(exp) {
-			return &leaseHeldError{fmt.Sprintf("ops: %s@%s has a live lease held by %q until %s; use --force",
-				db, branch, ref.LeaseHolder, ref.LeaseExpiry)}
+			held := fmt.Sprintf("ops: %s@%s has a live lease held by %q until %s", db, branch, ref.LeaseHolder, ref.LeaseExpiry)
+			if isCheckpointHolder(ref.LeaseHolder) {
+				// It ends on its own within seconds: say so first, so an agent
+				// or script retries instead of fetching a human for --force,
+				// which would make the checkpoint fail. "; use --force" stays
+				// the message's tail, as callers that rewrite it expect.
+				refusal := held + " (another checkpoint is in progress); a destroy now would make that checkpoint fail without committing — " + checkpointRetryAdvice
+				return &leaseHeldError{msg: refusal + "; use --force", noForce: refusal, checkpoint: true}
+			}
+			return &leaseHeldError{msg: held + "; use --force", noForce: held}
 		}
 	}
 

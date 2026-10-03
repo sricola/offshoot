@@ -59,11 +59,25 @@ func (o CheckpointOptions) renewEvery(ttl time.Duration) time.Duration {
 	return time.Millisecond
 }
 
-// checkpointPreconditions are the checks CheckpointWith runs on the ref it
-// first reads and again on the ref its lease acquire returns, since a
-// session can flush and close, or a repoint land, in between: the name is
-// new on the branch, a checkout exists, and the checkout is not detached
-// (unless opts.Force).
+// ErrDetachedCheckout is what a checkpoint refused for a detached checkout
+// unwraps to: the branch was repointed (rollback, promote, compact) after
+// the checkout was materialized, so checkpointing it would revert that
+// repoint. Its message is CLI-shaped; MCP's offshoot_checkpoint, which has
+// no force, turns it into the tool calls an agent has.
+var ErrDetachedCheckout = errors.New("ops: checkout is detached")
+
+// detachedError is checkpointPreconditions' refusal of a detached
+// checkout: its own message, unwrapping to ErrDetachedCheckout.
+type detachedError struct{ msg string }
+
+func (e *detachedError) Error() string { return e.msg }
+func (e *detachedError) Unwrap() error { return ErrDetachedCheckout }
+
+// checkpointPreconditions are the checks CheckpointWith runs on the ref
+// its lease acquire reads, before that acquire writes
+// (store.AcquireLeaseRefIf), so the ref the lease lands on is the ref that
+// passed them: the name is new on the branch, a checkout exists, and the
+// checkout is not detached (unless opts.Force).
 func checkpointPreconditions(db, branch, name, path string, ref store.Ref, opts CheckpointOptions) error {
 	if _, exists := ref.Checkpoints[name]; exists {
 		return fmt.Errorf("ops: checkpoint %q already exists on %s@%s", name, db, branch)
@@ -77,8 +91,8 @@ func checkpointPreconditions(db, branch, name, path string, ref store.Ref, opts 
 	// Checkpointing it would snapshot the OLD content onto the NEW lineage
 	// and silently undo that repoint, so refuse and name the ways out.
 	if rec, ok := readSidecar(path); ok && rec.Lineage != ref.Lineage && !opts.Force {
-		return fmt.Errorf("ops: checkout of %s@%s is detached: the branch was repointed (now at txid %d) after this checkout was materialized, so checkpointing it would revert that repoint; run 'offshoot checkout %s@%s' to refresh it (discarding its local edits), 'offshoot export' to keep them as a file, or pass --force to checkpoint it anyway",
-			db, branch, ref.HeadTXID, db, branch)
+		return &detachedError{fmt.Sprintf("ops: checkout of %s@%s is detached: the branch was repointed (now at txid %d) after this checkout was materialized, so checkpointing it would revert that repoint; run 'offshoot checkout %s@%s' to refresh it (discarding its local edits), 'offshoot export' to keep them as a file, or pass --force to checkpoint it anyway",
+			db, branch, ref.HeadTXID, db, branch)}
 	}
 	return nil
 }
@@ -88,22 +102,28 @@ func checkpointPreconditions(db, branch, name, path string, ref store.Ref, opts 
 const checkpointAcquireAttempts = 2
 
 // acquireCheckpointLease takes db@branch's lease for holder, a holder unique
-// to this call (newCheckpointHolder), and returns it with the ref the
-// acquire wrote. first is the ref CheckpointWith checked before the
-// acquire. A failed acquire is settled by re-reading the ref:
+// to this call (newCheckpointHolder), and returns it with the ref it is part
+// of. check is CheckpointWith's refusals (a live lease, a taken name, a
+// missing or detached checkout); it runs on the ref each acquire reads,
+// before that acquire writes (store.AcquireLeaseRefIf), so a refusal writes
+// nothing, and a writer that moves the ref after the check fails the
+// acquire's compare-and-swap. A failed acquire write is settled by
+// re-reading the ref:
 //
-//   - a live lease held by anyone else, or a branch mid-destroy or
-//     mid-reap, is refused with refuseIfHeld's own message, so a second
-//     checkpoint reads the same refusal whichever check caught it;
 //   - our own holder means the acquire landed though it reported failure:
 //     the S3 SDK's retry answering 412 to its own landed first attempt
 //     (which the store reports as a lost acquisition race), or a timeout
 //     that lost the response. Nothing else writes this holder, so the
-//     lease is ours, and the retry adopts it as an idempotent self-renew
-//     under the epoch the landed write minted;
-//   - no live lease, with the epoch and lineage first had, means the
-//     compare-and-swap lost to a write that took no lease (touch, protect,
-//     a TTL change), so the retry is a fresh acquire;
+//     lease, under the epoch the landed write minted, is ours. It is
+//     adopted from the re-read ref as it stands once check passes on that
+//     ref, with no second acquire: a write that just landed and reported
+//     failure can do so again;
+//   - a live lease held by anyone else, or a branch mid-destroy or
+//     mid-reap, is refused with refuseIfHeld's own message, so a second
+//     checkpoint reads the same refusal whichever check caught it;
+//   - no live lease, with the epoch and lineage the failed acquire read,
+//     means the compare-and-swap lost to a write that took no lease
+//     (touch, protect, a TTL change), so the retry is a fresh acquire;
 //   - no live lease under a newer epoch means another writer took the
 //     lease and let it go in between: a checkpoint that ran start to
 //     finish, or a session that flushed and closed (a new lineage means a
@@ -112,40 +132,72 @@ const checkpointAcquireAttempts = 2
 //     call would have met a moment earlier, rather than retried into a
 //     second checkpoint.
 //
-// A lease of ours still on the ref when the attempts run out is released,
-// so a checkpoint that never started does not leave the branch refused to
-// every writer for a whole TTL.
-func (w *Workspace) acquireCheckpointLease(db, branch, holder string, ttl time.Duration, first store.Ref) (store.Lease, store.Ref, error) {
+// A refusal by check of a ref that carries our own holder (one being
+// adopted, or a retry's read finding an earlier acquire that landed late)
+// releases that lease, so a checkpoint that never started does not leave
+// the branch refused to every writer for a whole TTL.
+func (w *Workspace) acquireCheckpointLease(db, branch, holder string, ttl time.Duration, check func(store.Ref) error) (store.Lease, store.Ref, error) {
+	// read is the ref the latest acquire read, and refused what check
+	// returned on it; readOK is false when that read itself failed.
+	var read store.Ref
+	var readOK bool
+	var refused error
+	checked := func(r store.Ref) error {
+		read, readOK = r, true
+		refused = check(r)
+		return refused
+	}
 	var err error
 	for attempt := 1; ; attempt++ {
-		var lease store.Lease
-		var ref store.Ref
-		if lease, ref, _, err = w.Store.AcquireLeaseRef(db, branch, holder, ttl, time.Now()); err == nil {
+		readOK, refused = false, nil
+		lease, ref, _, aerr := w.Store.AcquireLeaseRefIf(db, branch, holder, ttl, time.Now(), checked)
+		if aerr == nil {
 			return lease, ref, nil
+		}
+		if refused != nil {
+			if read.LeaseHolder == holder {
+				w.releaseCheckpointLease(leaseOn(db, branch, holder, read))
+			}
+			return store.Lease{}, store.Ref{}, refused
+		}
+		if !readOK && attempt == 1 {
+			// No branch, or a store that cannot be read: nothing was
+			// written, and the error is the read's own.
+			return store.Lease{}, store.Ref{}, aerr
+		}
+		err = aerr
+		if !readOK {
+			break
 		}
 		cur, _, gerr := w.Store.GetRef(db, branch)
 		if gerr != nil {
 			break
 		}
-		ours := cur.LeaseHolder == holder
-		if !ours {
-			if rerr := refuseIfHeld(db, branch, cur, "checkpoint", false); rerr != nil {
-				return store.Lease{}, store.Ref{}, rerr
+		if cur.LeaseHolder == holder {
+			if cerr := check(cur); cerr != nil {
+				w.releaseCheckpointLease(leaseOn(db, branch, holder, cur))
+				return store.Lease{}, store.Ref{}, cerr
 			}
-			if errors.Is(err, store.ErrLeaseHeld) && (cur.Epoch != first.Epoch || cur.Lineage != first.Lineage) {
-				return store.Lease{}, store.Ref{}, &leaseHeldError{fmt.Sprintf("ops: %s@%s was written by another checkpoint, session or repoint while this checkpoint took its lease (the head is now txid %d); retry", db, branch, cur.HeadTXID)}
-			}
+			return leaseOn(db, branch, holder, cur), cur, nil
 		}
-		if attempt < checkpointAcquireAttempts && (ours || errors.Is(err, store.ErrLeaseHeld)) {
+		if rerr := refuseIfHeld(db, branch, cur, "checkpoint", false); rerr != nil {
+			return store.Lease{}, store.Ref{}, rerr
+		}
+		if errors.Is(err, store.ErrLeaseHeld) && (cur.Epoch != read.Epoch || cur.Lineage != read.Lineage) {
+			return store.Lease{}, store.Ref{}, &leaseHeldError{msg: fmt.Sprintf("ops: %s@%s was written by another checkpoint, session or repoint while this checkpoint took its lease (the head is now txid %d); retry", db, branch, cur.HeadTXID)}
+		}
+		if attempt < checkpointAcquireAttempts && errors.Is(err, store.ErrLeaseHeld) {
 			continue
-		}
-		if ours {
-			expiry, _ := time.Parse(time.RFC3339Nano, cur.LeaseExpiry)
-			w.releaseCheckpointLease(store.Lease{DB: db, Branch: branch, Holder: holder, Epoch: cur.Epoch, Expiry: expiry})
 		}
 		break
 	}
 	return store.Lease{}, store.Ref{}, fmt.Errorf("ops: checkpoint %s@%s: %w", db, branch, err)
+}
+
+// leaseOn is holder's lease on db@branch as ref records it.
+func leaseOn(db, branch, holder string, ref store.Ref) store.Lease {
+	expiry, _ := time.Parse(time.RFC3339Nano, ref.LeaseExpiry)
+	return store.Lease{DB: db, Branch: branch, Holder: holder, Epoch: ref.Epoch, Expiry: expiry}
 }
 
 // releaseCheckpointLease is the last step of a checkpoint that failed after
@@ -156,13 +208,22 @@ func (w *Workspace) acquireCheckpointLease(db, branch, holder string, ttl time.D
 // metadata write is retried. A branch mid-destroy or mid-reap is left alone
 // too: it is on its way out, and a release written over the claim would
 // change the etag Destroy's conditional delete compares against and fail
-// that destroy. Anything else is logged, and the lease then expires after
-// its TTL and the next acquirer reclaims it with a higher epoch.
+// that destroy. Anything else is logged with the expiry the ref carries
+// (renewals have moved it past the one l was acquired with), and the lease
+// then expires at that time and the next acquirer reclaims it with a
+// higher epoch.
 func (w *Workspace) releaseCheckpointLease(l store.Lease) {
 	var err error
 	for i := 0; i < 3; i++ {
-		if ref, _, gerr := w.Store.GetRef(l.DB, l.Branch); gerr == nil && (ref.Deleting || ref.Reaping) {
-			return
+		if ref, _, gerr := w.Store.GetRef(l.DB, l.Branch); gerr == nil {
+			if ref.Deleting || ref.Reaping {
+				return
+			}
+			if ref.LeaseHolder == l.Holder && ref.Epoch == l.Epoch {
+				if expiry, perr := time.Parse(time.RFC3339Nano, ref.LeaseExpiry); perr == nil {
+					l.Expiry = expiry
+				}
+			}
 		}
 		if err = w.Store.ReleaseLease(l); err == nil || !errors.Is(err, store.ErrCAS) {
 			break
@@ -184,7 +245,9 @@ var errCheckpointRenewStopped = errors.New("ops: checkpoint lease renewals stopp
 // (internal/session/renew.go): a renewal that finds the lease gone
 // (ErrLeaseLost) or the branch destroyed (ErrNotFound) is terminal and
 // cancels ctx with that error as its cause; any other error, including
-// RenewLease's unretried ErrCAS against a concurrent touch, is retried on
+// RenewLease's unretried ErrCAS against a concurrent touch and its refusal
+// to renew over a destroy or reap claim (ErrDeleting, ErrReaping, which
+// leaves the claim's etag for Destroy's conditional delete), is retried on
 // the next tick, since the lease outlives two missed renewals.
 type checkpointRenewer struct {
 	ctx    context.Context
@@ -271,17 +334,32 @@ type checkpointCommit struct {
 }
 
 // premise reports whether cur is still the ref this checkpoint planned
-// from, give or take lease bookkeeping and metadata: our holder and epoch,
-// the lineage we encoded against, the head one txid below ours, and no
-// destroy or reap claim. Destroy's claim leaves the lease fields alone, so
-// only the claim itself shows that a `destroy --force` is underway; a head
-// written over it would change the etag Destroy's conditional delete
-// compares against (failing that destroy), or, on S3, be deleted a moment
-// after the checkpoint reported it committed.
+// from, give or take lease bookkeeping and metadata: ours, and no destroy
+// or reap claim. Destroy's claim leaves the lease fields alone, so only the
+// claim itself shows that a `destroy --force` is underway; a head written
+// over it would change the etag Destroy's conditional delete compares
+// against (failing that destroy), or, on S3, be deleted a moment after the
+// checkpoint reported it committed.
 func (c checkpointCommit) premise(cur store.Ref) bool {
+	return c.ours(cur) && !cur.Deleting && !cur.Reaping
+}
+
+// ours reports whether cur carries our holder and epoch, the lineage we
+// encoded against and the head one txid below ours: the premise, with any
+// destroy or reap claim on top left out.
+func (c checkpointCommit) ours(cur store.Ref) bool {
 	return cur.LeaseHolder == c.lease.Holder && cur.Epoch == c.lease.Epoch &&
-		cur.Lineage == c.lineage && cur.HeadTXID == c.txid-1 &&
-		!cur.Deleting && !cur.Reaping
+		cur.Lineage == c.lineage && cur.HeadTXID == c.txid-1
+}
+
+// headUnderOurEpoch reports whether cur's head is at or past our txid, on
+// our lineage, under the epoch only our lease minted. No offshoot writer
+// of this version puts a head there, but an older binary's `checkpoint
+// --force` plans under whatever epoch the ref carries and so computes our
+// very key, overwrites our object with its own and makes it the head: an
+// object that head may name is not ours to delete.
+func (c checkpointCommit) headUnderOurEpoch(cur store.Ref) bool {
+	return cur.Lineage == c.lineage && cur.HeadEpoch == c.lease.Epoch && cur.HeadTXID >= c.txid
 }
 
 // advance is cur with the head moved to this checkpoint's object, the
@@ -304,16 +382,39 @@ func (c checkpointCommit) advance(cur store.Ref) store.Ref {
 // taken (a reclaim after expiry), cleared (a forced repoint, `lease
 // release`), or the branch moved under it, all of which wrap
 // store.ErrLeaseLost; or the branch is being destroyed or reaped, which
-// wrap store.ErrDeleting and store.ErrReaping.
+// wrap store.ErrDeleting and store.ErrReaping. A branch that moved while
+// our holder and epoch are still on it moved under our live lease, which
+// only a writer that ignores the lease can do; that is said, rather than
+// reported as a lease lost to our own holder.
 func (c checkpointCommit) lostTo(cur store.Ref) error {
 	switch {
 	case cur.Deleting:
 		return fmt.Errorf("ops: checkpoint %q on %s@%s did not commit: %w", c.name, c.db, c.branch, store.ErrDeleting)
 	case cur.Reaping:
 		return fmt.Errorf("ops: checkpoint %q on %s@%s did not commit: %w", c.name, c.db, c.branch, store.ErrReaping)
+	case cur.LeaseHolder == c.lease.Holder && cur.Epoch == c.lease.Epoch:
+		return fmt.Errorf("ops: checkpoint %q on %s@%s did not commit: %w: the branch moved under this checkpoint's own lease (it is now at lineage %s, head txid %d), which only a writer that ignores the lease can do, such as an older offshoot binary's `checkpoint --force`; upgrade every binary that writes this store, then retry",
+			c.name, c.db, c.branch, store.ErrLeaseLost, cur.Lineage, cur.HeadTXID)
 	}
 	return fmt.Errorf("ops: checkpoint %q on %s@%s did not commit: %w (the branch is now at lineage %s, head txid %d, lease held by %q at epoch %d); retry",
 		c.name, c.db, c.branch, store.ErrLeaseLost, cur.Lineage, cur.HeadTXID, cur.LeaseHolder, cur.Epoch)
+}
+
+// claimedAfterWrite is the error for a checkpoint whose head write was sent
+// and failed, and whose branch then took a destroy or reap claim with
+// nothing else moved. The claim fails the premise, but unlike every other
+// change that fails it, it can be undone to the very bytes it was put on: a
+// destroy whose quiesce or conditional delete fails unwinds its claim, and
+// so do the janitor and the reaper for a stale one. The ref's etag is then
+// the one the write was sent against, and the store may still apply that
+// write, so the object is kept and the checkpoint may have committed.
+func (c checkpointCommit) claimedAfterWrite(cur store.Ref, writeErr error) error {
+	claim, verb := store.ErrDeleting, "destroyed"
+	if !cur.Deleting {
+		claim, verb = store.ErrReaping, "reaped"
+	}
+	return fmt.Errorf("ops: checkpoint %q on %s@%s may have committed: its head write failed (%w), and the branch is now being %s (%w); if that is abandoned, the ref goes back to exactly what the write was sent against and the store may still apply it, so its object is kept",
+		c.name, c.db, c.branch, writeErr, verb, claim)
 }
 
 // unconfirmed is the error for a checkpoint that could not read the ref to
@@ -368,22 +469,37 @@ func (c checkpointCommit) unreferenced(cur store.Ref) bool {
 // checkpoint and releases the lease, re-reading and reapplying up to
 // checkpointCommitAttempts times when a write fails with the premise still
 // intact. On error, deletable reports whether our object provably is
-// unreferenced and will stay so: no head write was sent, or the ref shows
-// none landed and none still can. Otherwise the object is left to GC and
-// the error says the checkpoint may have committed: after a write was
-// sent, a ref that moved to another lineage (a repoint) or could not be
-// read proves nothing, and a write that landed may be what a fork now
-// reads through.
+// unreferenced and will stay so; otherwise it is left to GC, which keeps an
+// object above the head at the ref's own epoch and reclaims it once the
+// next acquire bumps the epoch, if no head write ever named it.
 //
-// A head write that failed with anything but a lost compare-and-swap (a
-// timeout, a 5xx the SDK gave up on) got no verdict from the store, which
-// can still apply it for as long as the ref keeps the etag it was sent
-// against; session flush never deletes after such an error for the same
-// reason. A ref that has changed since settles it, because the etag moved
-// on. Giving up with the premise intact does not, since the ref may still
-// carry that etag, so the object is kept then too. GC keeps an object
-// above the head at the ref's own epoch, and reclaims it once the next
-// acquire bumps the epoch if no head write ever named it.
+// Before any head write is sent, nothing of ours can name the object, so a
+// failed premise deletes it, unless the head has moved to our txid under
+// our own epoch (headUnderOurEpoch), which only an older binary writing
+// under our lease can do and which may name our key.
+//
+// Once a head write has been sent, the object is deleted only when the ref
+// proves that no write of ours landed and none still can: the same lineage
+// with its head below our txid (none landed, since a lineage's head only
+// advances), changed in a way that cannot be undone (our lease taken or
+// cleared, the epoch bumped), so the etag every write was sent against is
+// gone for good. A store can apply a write after the client has given up
+// on it: a timeout or a 5xx gets no verdict at all, and on S3 a 409
+// conflict, which the store reports as a lost compare-and-swap like a 412,
+// can be the SDK's retry colliding with its own first attempt still in
+// flight. So the object is kept, and the error says so, when
+//
+//   - only a destroy or reap claim fails the premise (claimedAfterWrite):
+//     an abandoned claim is undone to the very bytes the write was sent
+//     against;
+//   - the branch moved to another lineage (a repoint), or the ref could
+//     not be read: a write that landed first may be what a fork now reads
+//     through;
+//   - every attempt failed with the premise intact: the ref may still
+//     carry the etag an unsettled write was sent against.
+//
+// session flush never deletes after a write without a verdict, for the
+// same reason.
 func (w *Workspace) commitCheckpoint(c checkpointCommit) (committed store.Ref, deletable bool, err error) {
 	attempts := 0
 	var lastErr, unsettled error
@@ -399,7 +515,14 @@ func (w *Workspace) commitCheckpoint(c checkpointCommit) (committed store.Ref, d
 			return cur, false, nil
 		}
 		if !c.premise(cur) {
-			if attempts == 0 || c.unreferenced(cur) {
+			switch {
+			case attempts == 0 && c.headUnderOurEpoch(cur):
+				return store.Ref{}, false, fmt.Errorf("%w; its object is kept, since that head, under this checkpoint's own epoch, may name it", c.lostTo(cur))
+			case attempts == 0:
+				return store.Ref{}, true, c.lostTo(cur)
+			case c.ours(cur):
+				return store.Ref{}, false, c.claimedAfterWrite(cur, lastErr)
+			case c.unreferenced(cur):
 				return store.Ref{}, true, c.lostTo(cur)
 			}
 			return store.Ref{}, false, c.mayHaveCommitted(fmt.Sprintf("its head write failed, and the branch moved before the checkpoint could re-read it (it is now at lineage %s, head txid %d), so whether that write landed first cannot be told; its object is kept, since a fork may read through it", cur.Lineage, cur.HeadTXID), lastErr)
@@ -409,9 +532,10 @@ func (w *Workspace) commitCheckpoint(c checkpointCommit) (committed store.Ref, d
 				return store.Ref{}, false, c.mayHaveCommitted("a head write failed without a verdict from the store, which may still apply it, so its object is kept (a retry under the same name is refused as already existing if it did)", unsettled)
 			}
 			// The premise holds, so the head is still txid-1 on our
-			// lineage, and the store refused every write outright: nothing
-			// names our object, and nothing still can.
-			return store.Ref{}, true, fmt.Errorf("ops: checkpoint %q on %s@%s: the head write lost %d compare-and-swaps to concurrent ref writes (retry): %w",
+			// lineage, but the ref may still carry the etag a refused
+			// write was sent against, and on S3 a refusal (a 409) does not
+			// rule out an earlier attempt of that write still landing.
+			return store.Ref{}, false, fmt.Errorf("ops: checkpoint %q on %s@%s: the head write lost %d compare-and-swaps to concurrent ref writes (retry; its object is left for GC, since on S3 a conflict answer does not rule out an earlier attempt of the write still landing, in which case a retry under the same name is refused as already existing): %w",
 				c.name, c.db, c.branch, attempts, lastErr)
 		}
 		next := c.advance(cur)
@@ -434,7 +558,10 @@ func (w *Workspace) commitCheckpoint(c checkpointCommit) (committed store.Ref, d
 // lost, and the retry's If-None-Match then fails against our own first
 // attempt. An object with other bytes is corruption, since nothing else
 // writes this key, so it is an error and is left in place for inspection.
-// Any other error may still have landed the object, which nothing names,
+// A put refused as a taken key with nothing readable there (on S3, a 409
+// against an earlier attempt still in flight, or a read-back that failed)
+// is a retryable failure, and whatever lands later is left to GC. Any
+// other put error may still have landed the object, which nothing names,
 // so it is deleted.
 func (w *Workspace) putCheckpointObject(key string, data []byte) (string, error) {
 	etag, err := w.Store.B.PutIf(key, data, "")
@@ -445,8 +572,14 @@ func (w *Workspace) putCheckpointObject(key string, data []byte) (string, error)
 		w.bestEffortDelete(key)
 		return "", fmt.Errorf("ops: upload checkpoint object %s: %w", key, err)
 	}
-	if got, gotEtag, gerr := w.Store.B.Get(key); gerr == nil && bytes.Equal(got, data) {
+	got, gotEtag, gerr := w.Store.B.Get(key)
+	switch {
+	case gerr == nil && bytes.Equal(got, data):
 		return gotEtag, nil
+	case gerr == nil:
+		return "", fmt.Errorf("ops: checkpoint object %s already exists under this checkpoint's own epoch, which nothing else writes; refusing to overwrite it (store corruption?): %w", key, err)
+	case errors.Is(gerr, store.ErrNotFound):
+		return "", fmt.Errorf("ops: upload checkpoint object %s: the create-only put reported the key taken, but nothing is there (on S3, a conflict with an earlier attempt of the same put still in flight); retry: %w", key, err)
 	}
-	return "", fmt.Errorf("ops: checkpoint object %s already exists under this checkpoint's own epoch, which nothing else writes; refusing to overwrite it (store corruption?): %w", key, err)
+	return "", fmt.Errorf("ops: upload checkpoint object %s: the create-only put reported the key taken (%w), and reading it back failed: %w; retry", key, err, gerr)
 }

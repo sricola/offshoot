@@ -479,11 +479,10 @@ func copyFile(from, to string) error {
 }
 
 // checkpointBeforeAcquireForTest, when non-nil, runs in CheckpointWith
-// after its checks on the first ref read and before its lease acquire: the
-// window in which a session can flush and close, or another checkpoint
-// commit, so the acquire returns a newer ref than the one checked.
-// Test-only; process-global, restore via t.Cleanup (as
-// compactBeforeCASForTest).
+// just before its lease acquire reads the ref: whatever a session, another
+// checkpoint or a repoint writes there is what the acquire's checks see and
+// what the checkpoint plans from. Test-only; process-global, restore via
+// t.Cleanup (as compactBeforeCASForTest).
 var checkpointBeforeAcquireForTest func()
 
 // checkpointAfterQuiesceForTest, when non-nil, runs in CheckpointWith while
@@ -538,21 +537,21 @@ func (w *Workspace) Checkpoint(db, branch, name string, meta map[string]string) 
 // It holds the branch lease from before its object write until the ref
 // write that advances the head, and that write releases it:
 //
-//  1. read the ref; refuse a branch mid-destroy, mid-reap or under any
-//     live lease (refuseIfHeld), a taken name, a missing checkout, and a
-//     detached one unless opts.Force (checkpointPreconditions);
-//  2. acquire the lease under a per-call holder (newCheckpointHolder,
-//     acquireCheckpointLease). The acquire bumps the epoch, so this call's
-//     object key is its own, and returns the ref it wrote, which
-//     everything after plans from; step 1's checks run again on it;
-//  3. renew the lease every opts.RenewEvery (checkpointRenewer); quiesce,
+//  1. acquire the lease under a per-call holder (newCheckpointHolder,
+//     acquireCheckpointLease), refusing, on the ref the acquire reads and
+//     before it writes, a branch mid-destroy, mid-reap or under any live
+//     lease (refuseIfHeld), a taken name, a missing checkout, and a
+//     detached one unless opts.Force (checkpointPreconditions). The acquire
+//     bumps the epoch, so this call's object key is its own, and returns
+//     the ref the lease is part of, which everything after plans from;
+//  2. renew the lease every opts.RenewEvery (checkpointRenewer); quiesce,
 //     plan and encode; check the lease is still ours, then upload with a
 //     create-only put; stop and join the renewals;
-//  4. re-read the ref and, while it still names our lease, our lineage and
+//  3. re-read the ref and, while it still names our lease, our lineage and
 //     the head we planned from and carries no destroy or reap claim,
 //     advance the head, record the checkpoint and clear the lease in one
 //     write (commitCheckpoint);
-//  5. on any failure, release the lease (releaseCheckpointLease).
+//  4. on any failure, release the lease (releaseCheckpointLease).
 //
 // The sidecar and shadow are refreshed after the head write.
 //
@@ -585,24 +584,29 @@ func (w *Workspace) CheckpointWith(db, branch, name string, meta map[string]stri
 	if err := ValidateMeta(meta); err != nil {
 		return CheckpointResult{}, err
 	}
-	first, _, err := w.Store.GetRef(db, branch)
-	if err != nil {
-		return CheckpointResult{}, err
-	}
-	// force is false here whatever opts.Force says: a live lease means a
-	// session or another checkpoint is writing this branch, and this call
-	// is about to take the lease itself, so it waits its turn instead.
-	if err := refuseIfHeld(db, branch, first, "checkpoint", false); err != nil {
-		return CheckpointResult{}, err
-	}
 	path := w.CheckoutPath(db, branch)
-	if err := checkpointPreconditions(db, branch, name, path, first, opts); err != nil {
-		return CheckpointResult{}, err
+	holder := newCheckpointHolder()
+	// The refusals run on the ref the acquire reads, before it writes, so
+	// the ref the lease lands on is the one they passed. force is false for
+	// the live-lease guard whatever opts.Force says: a live lease means a
+	// session or another checkpoint is writing this branch, and this call
+	// is about to take the lease itself, so it waits its turn instead. Our
+	// own holder can only be there when an acquire of ours landed without
+	// our hearing so, and is not a lease to refuse.
+	check := func(ref store.Ref) error {
+		guard := ref
+		if guard.LeaseHolder == holder {
+			guard.LeaseHolder, guard.LeaseExpiry = "", ""
+		}
+		if err := refuseIfHeld(db, branch, guard, "checkpoint", false); err != nil {
+			return err
+		}
+		return checkpointPreconditions(db, branch, name, path, ref, opts)
 	}
 	if checkpointBeforeAcquireForTest != nil {
 		checkpointBeforeAcquireForTest()
 	}
-	lease, ref, err := w.acquireCheckpointLease(db, branch, newCheckpointHolder(), opts.leaseTTL(), first)
+	lease, ref, err := w.acquireCheckpointLease(db, branch, holder, opts.leaseTTL(), check)
 	if err != nil {
 		return CheckpointResult{}, err
 	}
@@ -621,15 +625,9 @@ func (w *Workspace) CheckpointWith(db, branch, name string, meta map[string]stri
 }
 
 // checkpointLeased is CheckpointWith from the acquire on. lease is held and
-// ref is the ref the acquire wrote; the caller releases the lease when this
-// returns an error.
+// ref is the ref it is part of, which passed CheckpointWith's checks; the
+// caller releases the lease when this returns an error.
 func (w *Workspace) checkpointLeased(db, branch, name string, meta map[string]string, opts CheckpointOptions, path string, lease store.Lease, ref store.Ref) (CheckpointResult, error) {
-	// A session can flush and close, or a repoint land, between the first
-	// read and the acquire, so the name and detached checks run again on
-	// the ref the lease is part of.
-	if err := checkpointPreconditions(db, branch, name, path, ref, opts); err != nil {
-		return CheckpointResult{}, err
-	}
 	ttl := opts.leaseTTL()
 	rn := w.startCheckpointRenewer(lease, ttl, opts.renewEvery(ttl))
 	// Every return below stops the renewals first; stop is idempotent.
@@ -868,6 +866,12 @@ func (w *Workspace) warnIfUncheckpointed(db, branch string, ref store.Ref, actio
 //
 // verb names the operation in the message ("rollback", "promote onto",
 // ...). Destroy applies the same rules in its own body.
+//
+// A checkpoint holder's lease ends with the checkpoint, within seconds, or
+// lapses on its own 30 s after its process died (it renews every 10 s), so
+// its refusal says to retry; it never suggests closing a session or
+// `offshoot lease release`, which would only abort a checkpoint that is
+// still running.
 func refuseIfHeld(db, branch string, ref store.Ref, verb string, force bool) error {
 	if ref.Deleting {
 		return fmt.Errorf("ops: %s@%s is being destroyed; cannot %s it", db, branch, verb)
@@ -878,27 +882,36 @@ func refuseIfHeld(db, branch string, ref store.Ref, verb string, force bool) err
 	if !store.LeaseLive(ref, time.Now()) {
 		return nil
 	}
-	who := "an open daemon session, or 'offshoot lease acquire'"
+	held := fmt.Sprintf("ops: %s@%s has a live lease held by %q until %s", db, branch, ref.LeaseHolder, ref.LeaseExpiry)
 	if isCheckpointHolder(ref.LeaseHolder) {
-		who = "another checkpoint is in progress"
+		held += " (another checkpoint is in progress)"
+		if verb == "checkpoint" {
+			return &leaseHeldError{msg: held + "; --force cannot take over a live lease; " + checkpointRetryAdvice, checkpoint: true}
+		}
+		if force {
+			return nil
+		}
+		refusal := fmt.Sprintf("%s; a %s now would make that checkpoint fail without committing — %s", held, verb, checkpointRetryAdvice)
+		return &leaseHeldError{msg: refusal + ", or pass --force", noForce: refusal, checkpoint: true}
 	}
+	held += " (an open daemon session, or 'offshoot lease acquire')"
 	if verb == "checkpoint" {
 		// --force used to be the way past a holder that would not let go (a
 		// killed daemon, a forgotten `lease acquire`); name the one that is
 		// left, so the refusal is not a dead end for a whole TTL.
-		return &leaseHeldError{fmt.Sprintf("ops: %s@%s has a live lease held by %q until %s (%s); --force cannot take over a live lease; close the session (or wait for the other checkpoint) and retry, or, if its holder is gone, free it with 'offshoot lease release %s@%s'",
-			db, branch, ref.LeaseHolder, ref.LeaseExpiry, who, db, branch)}
+		return &leaseHeldError{msg: fmt.Sprintf("%s; --force cannot take over a live lease; close the session and retry, or, if its holder is gone, free it with 'offshoot lease release %s@%s'",
+			held, db, branch)}
 	}
 	if force {
 		return nil
 	}
-	consequence := "fence that writer and discard its unflushed work — close the session first, or pass --force"
-	if isCheckpointHolder(ref.LeaseHolder) {
-		consequence = "make that checkpoint fail without committing — wait for it to finish, or pass --force"
-	}
-	return &leaseHeldError{fmt.Sprintf("ops: %s@%s has a live lease held by %q until %s (%s); a %s now would %s",
-		db, branch, ref.LeaseHolder, ref.LeaseExpiry, who, verb, consequence)}
+	refusal := fmt.Sprintf("%s; a %s now would fence that writer and discard its unflushed work — close the session first", held, verb)
+	return &leaseHeldError{msg: refusal + ", or pass --force", noForce: refusal}
 }
+
+// checkpointRetryAdvice is what a refusal under a checkpoint holder's
+// lease tells the caller to do.
+const checkpointRetryAdvice = "retry when it finishes, in a few seconds (if its process died, the lease lapses on its own at that expiry)"
 
 // errNoCheckpoint is the error for a checkpoint name that db@branch does
 // not carry. Checkpoints belong to one branch and are not inherited by
@@ -1678,8 +1691,13 @@ func (w *Workspace) safetyFork(db, branch, suffix, metaKey, verb string, ttl tim
 		// would misdirect a caller here — replace it before wrapping.
 		if err := w.Destroy(db, name, false); err != nil {
 			msg := strings.Replace(err.Error(), "use --force", "ask the human", 1)
-			return "", fmt.Errorf("ops: %s: replacing the previous safety fork %s@%s: %s (close that session, or pass --no-backup)",
-				verb, db, name, msg)
+			way := "close that session, or pass --no-backup"
+			if CheckpointInProgress(err) {
+				// A checkpoint on the previous fork ends on its own.
+				msg, way = WithoutForceAdvice(err).Error(), "or pass --no-backup"
+			}
+			return "", fmt.Errorf("ops: %s: replacing the previous safety fork %s@%s: %s (%s)",
+				verb, db, name, msg, way)
 		}
 	case errors.Is(err, store.ErrNotFound):
 	default:

@@ -379,9 +379,9 @@ func TestCheckpointReleasesLeaseInHeadWrite(t *testing.T) {
 }
 
 // TestCheckpointBuildsOnACommitBeforeItsAcquire: a checkpoint that commits
-// between this checkpoint's first ref read and its acquire moves the head
-// and the epoch under it. Planning from the ref the acquire returned, this
-// checkpoint lands at the next txid, as a segment over the other's state.
+// just before this checkpoint's acquire moves the head and the epoch.
+// Planning from the ref its acquire read and wrote, this checkpoint lands
+// at the next txid, as a segment over the other's state.
 func TestCheckpointBuildsOnACommitBeforeItsAcquire(t *testing.T) {
 	w := newWS(t)
 	requireClone(t, w)
@@ -401,7 +401,7 @@ func TestCheckpointBuildsOnACommitBeforeItsAcquire(t *testing.T) {
 	t.Cleanup(func() { checkpointBeforeAcquireForTest = nil })
 	res := mustCheckpointWith(t, w, "app", "main", "after", CheckpointOptions{})
 	if res.TXID != between.TXID+1 {
-		t.Fatalf("checkpoint at txid %d, want %d: it planned from the ref it first read", res.TXID, between.TXID+1)
+		t.Fatalf("checkpoint at txid %d, want %d: it planned from a ref older than its acquire's", res.TXID, between.TXID+1)
 	}
 	ref := refOf(t, w, "app", "main")
 	if ref.Checkpoints["after"].Epoch != ref.Checkpoints["between"].Epoch+1 {
@@ -463,7 +463,10 @@ func TestCheckpointFailureReleasesLease(t *testing.T) {
 		assertLeaseReleased(t, w, before)
 		mustCheckpointWith(t, w, "app", "main", "a", CheckpointOptions{})
 	})
-	t.Run("name taken before the acquire", func(t *testing.T) {
+	// A name taken just before the acquire is refused on the ref the
+	// acquire reads, before it writes: no lease is taken, so there is none
+	// to release, and the epoch stays where the other checkpoint left it.
+	t.Run("name taken just before the acquire", func(t *testing.T) {
 		w := newWS(t)
 		seedDB(t, w, "app", 1<<16)
 		mustSQL(t, w.CheckoutPath("app", "main"), "INSERT INTO t (v) VALUES (randomblob(10));")
@@ -477,13 +480,13 @@ func TestCheckpointFailureReleasesLease(t *testing.T) {
 		}
 		t.Cleanup(func() { checkpointBeforeAcquireForTest = nil })
 		if _, err := w.CheckpointWith("app", "main", "dup", nil, CheckpointOptions{}); err == nil || !strings.Contains(err.Error(), `checkpoint "dup" already exists`) {
-			t.Fatalf("a name taken between the first read and the acquire: %v", err)
+			t.Fatalf("a name taken just before the acquire: %v", err)
 		}
 		ref := refOf(t, w, "app", "main")
 		won := ref.Checkpoints["dup"]
-		if ref.LeaseHolder != "" || ref.HeadTXID != won.TXID || ref.Epoch != won.Epoch+1 {
-			t.Fatalf("after the refused re-check: holder %q head %d epoch %d, want no lease, head %d, epoch %d",
-				ref.LeaseHolder, ref.HeadTXID, ref.Epoch, won.TXID, won.Epoch+1)
+		if ref.LeaseHolder != "" || ref.HeadTXID != won.TXID || ref.Epoch != won.Epoch {
+			t.Fatalf("after the refusal: holder %q head %d epoch %d, want no lease, head %d, epoch %d (nothing written)",
+				ref.LeaseHolder, ref.HeadTXID, ref.Epoch, won.TXID, won.Epoch)
 		}
 	})
 }
@@ -561,9 +564,11 @@ func TestCheckpointReclaimsAnExpiredLease(t *testing.T) {
 // answering 412 to its own landed first attempt (which the store reports as
 // a lost acquisition race), or a timeout that lost the response. The
 // holder is unique to the call, so the checkpoint recognises the lease as
-// its own and adopts it under the epoch the landed write minted, rather
-// than refusing itself as "another checkpoint" and leaving that lease to
-// block the branch for a whole TTL.
+// its own and adopts it from the ref as it stands, under the epoch the
+// landed write minted, rather than refusing itself as "another checkpoint"
+// and leaving that lease to block the branch for a whole TTL. Adopting it
+// writes nothing: a second acquire could land and report failure the same
+// way.
 func TestAcquireThatLandedIsAdopted(t *testing.T) {
 	for name, failure := range map[string]error{
 		"412 after landing":     fmt.Errorf("%w: precondition failed on the retry", store.ErrCAS),
@@ -584,8 +589,8 @@ func TestAcquireThatLandedIsAdopted(t *testing.T) {
 			if err != nil {
 				t.Fatalf("a checkpoint whose acquire landed but reported failure: %v", err)
 			}
-			if n := b.hits.Load(); n < 2 {
-				t.Fatalf("%d acquires carried a checkpoint lease, want the failed one and the one that adopted it", n)
+			if n := b.hits.Load(); n != 1 {
+				t.Fatalf("%d ref writes carried a checkpoint lease, want 1: the landed acquire, adopted without another write", n)
 			}
 			ref := refOf(t, w, "app", "main")
 			if ref.LeaseHolder != "" || ref.Epoch != before.Epoch+1 || ref.HeadTXID != res.TXID || ref.HeadEpoch != ref.Epoch {
@@ -663,27 +668,67 @@ func TestAcquireLostToACompletedCheckpointIsRefused(t *testing.T) {
 	}
 }
 
-// TestAcquireThatKeepsFailingReleasesItsLease: when the acquire and its one
-// retry both land but report failure, the checkpoint gives up, and releases
-// the lease its holder left on the ref rather than leaving the branch
-// refused to every writer for a whole TTL.
-func TestAcquireThatKeepsFailingReleasesItsLease(t *testing.T) {
+// TestAcquireThatAlwaysReportsFailureIsAdopted: a store where every write
+// carrying the checkpoint's lease lands but reports a lost race (a proxy
+// whose timeout is shorter than the backend's write latency, in front of
+// the S3 SDK's retry) still commits: the acquire is adopted from the ref
+// without a second acquire write, which would only land and fail the same
+// way, and the head write carries no lease.
+func TestAcquireThatAlwaysReportsFailureIsAdopted(t *testing.T) {
 	w := newWS(t)
 	seedDB(t, w, "app", 1<<16)
 	mustSQL(t, w.CheckoutPath("app", "main"), "INSERT INTO t (v) VALUES (randomblob(100));")
 	before := refOf(t, w, "app", "main")
 	b := &acquiresLandThenFail{Backend: w.Store.B, refKey: store.RefKey("app", "main")}
 	w.Store.B = b
+	res, err := w.CheckpointWith("app", "main", "a", nil, CheckpointOptions{})
+	w.Store.B = b.Backend
+	if err != nil {
+		t.Fatalf("a checkpoint whose every lease write reports failure: %v", err)
+	}
+	if n := b.hits.Load(); n != 1 {
+		t.Fatalf("%d ref writes carried the checkpoint's lease, want 1 (the acquire)", n)
+	}
+	ref := refOf(t, w, "app", "main")
+	if ref.LeaseHolder != "" || ref.Epoch != before.Epoch+1 || ref.HeadTXID != res.TXID {
+		t.Fatalf("after the adopted acquire: holder %q epoch %d head %d, want no lease, epoch %d, head %d",
+			ref.LeaseHolder, ref.Epoch, ref.HeadTXID, before.Epoch+1, res.TXID)
+	}
+}
+
+// TestRefusedAdoptionReleasesItsLease: an acquire that landed but reported
+// failure is adopted only once the checkpoint's checks pass on the ref it
+// re-reads. A checkout detached in between (a repoint that could not
+// refresh it) is refused there, and the lease the landed acquire left is
+// released, so the branch is not refused to every writer for a whole TTL.
+func TestRefusedAdoptionReleasesItsLease(t *testing.T) {
+	w := newWS(t)
+	seedDB(t, w, "app", 1<<16)
+	path := w.CheckoutPath("app", "main")
+	mustSQL(t, path, "INSERT INTO t (v) VALUES (randomblob(100));")
+	before := refOf(t, w, "app", "main")
+	rec, ok := readSidecar(path)
+	if !ok {
+		t.Fatal("setup: the checkout has no sidecar")
+	}
+	refKey := store.RefKey("app", "main")
+	b := &landsThenFails{Backend: w.Store.B, err: fmt.Errorf("%w: precondition failed on the retry", store.ErrCAS),
+		match: func(key string, data []byte) bool { return key == refKey && carriesCheckpointLease(data) },
+		after: func() {
+			if err := StampSumHashOnly(path, rec.Hash, "another-lineage", rec.Epoch, rec.TXID, rec.PostApplyChecksum, rec.ChainID); err != nil {
+				t.Error(err)
+			}
+		}}
+	w.Store.B = b
 	_, err := w.CheckpointWith("app", "main", "a", nil, CheckpointOptions{})
 	w.Store.B = b.Backend
-	if err == nil {
-		t.Fatal("a checkpoint whose every acquire reports failure must fail")
+	if !errors.Is(err, ErrDetachedCheckout) {
+		t.Fatalf("a checkpoint whose checkout detached before it adopted its landed acquire: %v, want a detached refusal", err)
 	}
-	if n := b.hits.Load(); n != 2 {
-		t.Fatalf("the acquire was tried %d times, want 2 (one retry)", n)
+	if b.hits.Load() != 1 {
+		t.Fatal("precondition: no acquire landed")
 	}
 	assertLeaseReleased(t, w, before)
-	mustCheckpointWith(t, w, "app", "main", "a", CheckpointOptions{})
 }
 
 // TestStragglerUnderOldEpochCannotAnchorHead: objects earlier writers left
@@ -803,12 +848,13 @@ func waitFor(t *testing.T, what string, cond func() bool) {
 	}
 }
 
-// destroyForce runs `destroy --force`, retrying when a lease renewal wins
-// its claim's compare-and-swap, or moves the ref between the claim and the
-// conditional delete. The backend must offer that conditional delete
-// (store.ConditionalDeleter), as Local does: through a test wrapper that
-// hides it, Destroy falls back to a plain Delete, which a renewal already
-// past its etag check can undo, bringing the branch back still leased.
+// destroyForce runs `destroy --force`, retrying when a lease renewal lands
+// between its read and its claim and so wins the claim's compare-and-swap
+// (a renewal no longer writes over a claim once it has landed). The
+// backend must offer the conditional delete (store.ConditionalDeleter), as
+// Local does: through a test wrapper that hides it, Destroy falls back to
+// a plain Delete, which a renewal already past its checks can undo,
+// bringing the branch back still leased.
 func destroyForce(t *testing.T, w *Workspace, db, branch string) {
 	t.Helper()
 	if _, ok := w.Store.B.(store.ConditionalDeleter); !ok {
@@ -914,6 +960,8 @@ func TestRenewErrorClassification(t *testing.T) {
 		{fmt.Errorf("%w: app@main now held by %q at epoch 3", store.ErrLeaseLost, "thief"), true},
 		{fmt.Errorf("%w: no branch app@main", store.ErrNotFound), true},
 		{fmt.Errorf("store: renew lease on app@main: %w", store.ErrCAS), false},
+		{fmt.Errorf("%w: app@main; not renewing over the claim", store.ErrDeleting), false},
+		{fmt.Errorf("%w: app@main; not renewing over the claim", store.ErrReaping), false},
 		{errors.New("store: s3 get refs/app/main: connection reset"), false},
 	} {
 		if got := renewErrTerminal(tc.err); got != tc.terminal {
@@ -1078,9 +1126,9 @@ func repointSetup(t *testing.T) *Workspace {
 }
 
 // pausedCheckpoint starts a checkpoint "a" of app@work that pauses after its
-// quiesce, holding the branch lease and renewing it every 100ms, and returns
-// the ref while it is paused, the channel its result arrives on, and a func
-// that lets it go on (harmless to call twice; it also runs at cleanup).
+// quiesce, holding the branch lease, and returns the ref while it is
+// paused, the channel its result arrives on, and a func that lets it go on
+// (harmless to call twice; it also runs at cleanup).
 func pausedCheckpoint(t *testing.T, w *Workspace) (store.Ref, <-chan error, func()) {
 	t.Helper()
 	paused, resume := make(chan struct{}), make(chan struct{})
@@ -1091,11 +1139,14 @@ func pausedCheckpoint(t *testing.T, w *Workspace) (store.Ref, <-chan error, func
 	t.Cleanup(func() { checkpointAfterQuiesceForTest = nil })
 	done := make(chan error, 1)
 	go func() {
-		// Renewals every 100ms, not faster: a forced repoint reads the ref,
-		// resolves a chain and writes objects before its compare-and-swap,
-		// and a renewal landing in that window makes it lose and retry, so a
-		// short interval could starve it.
-		_, err := w.CheckpointWith("app", "work", "a", nil, CheckpointOptions{LeaseTTL: time.Second, RenewEvery: 100 * time.Millisecond})
+		// The default lease (30 s, renewed every 10 s): no renewal falls
+		// inside the test. A forced repoint reads the ref, resolves a chain
+		// and writes objects before its compare-and-swap, and a renewal
+		// landing in that window makes it lose; under load that window
+		// outlasts any short renewal interval, and the repoint would never
+		// win. The head write's premise reports the lease lost either way,
+		// renewals or not.
+		_, err := w.CheckpointWith("app", "work", "a", nil, CheckpointOptions{})
 		done <- err
 	}()
 	select {
@@ -1152,17 +1203,8 @@ func TestRepointVerbsDuringCheckpoint(t *testing.T) {
 		t.Run(tc.name, func(t *testing.T) {
 			w := repointSetup(t)
 			held, done, release := pausedCheckpoint(t, w)
-			// The checkpoint's renewals write the ref every 100ms, so the
-			// forced repoint's compare-and-swap can lose to one; retry it
-			// like a user would.
-			for i := 0; ; i++ {
-				err := tc.repoint(w)
-				if err == nil {
-					break
-				}
-				if !errors.Is(err, store.ErrCAS) || i == 20 {
-					t.Fatal(err)
-				}
+			if err := tc.repoint(w); err != nil {
+				t.Fatal(err)
 			}
 			repointed := refOf(t, w, "app", "work")
 			if repointed.LeaseHolder != "" || repointed.Lineage == held.Lineage {
@@ -1200,7 +1242,10 @@ func TestLeaseReleaseDuringCheckpointFailsIt(t *testing.T) {
 	t.Cleanup(func() { checkpointAfterQuiesceForTest = nil })
 	done := make(chan error, 1)
 	go func() {
-		_, err := w.CheckpointWith("app", "main", "a", nil, CheckpointOptions{LeaseTTL: time.Second, RenewEvery: 100 * time.Millisecond})
+		// The default lease: no renewal falls inside the test, so the
+		// release below never loses its compare-and-swap to one, and the
+		// head write's premise catches the release either way.
+		_, err := w.CheckpointWith("app", "main", "a", nil, CheckpointOptions{})
 		done <- err
 	}()
 	<-paused
@@ -1247,10 +1292,9 @@ func TestDestroyForceDuringCheckpointAbortsIt(t *testing.T) {
 	g.holdObject(key)
 	done := make(chan error, 1)
 	go func() {
-		// Renewals every 100ms, not 10ms: destroy's claim write and its
-		// conditional ref delete straddle a quiesce of the checkout, and a
-		// renewal landing in between makes destroy lose and retry
-		// (destroyForce), so a short interval would starve it.
+		// Renewals every 100ms, not 10ms: one landing between destroy's
+		// read and its claim makes the claim lose and retry
+		// (destroyForce), so a short interval could starve it.
 		_, err := w.CheckpointWith("app", "work", "a", nil, CheckpointOptions{Snapshot: true, LeaseTTL: 2 * time.Second, RenewEvery: 100 * time.Millisecond})
 		done <- err
 	}()
@@ -1329,8 +1373,10 @@ func TestFinalCASRetriesAfterConcurrentTouch(t *testing.T) {
 }
 
 // TestFinalCASGivesUpAfterThreeLosses: three lost compare-and-swaps with the
-// premise intact end the checkpoint with a retryable error; the head never
-// reached its txid, so it deletes its object and releases its lease.
+// premise intact end the checkpoint with a retryable error and release its
+// lease. The head never reached its txid, but the object is kept: on S3 a
+// conflict answer does not rule out an earlier attempt of the head write
+// still landing (TestHeadWriteHiddenBehindAConflictKeepsItsObject).
 func TestFinalCASGivesUpAfterThreeLosses(t *testing.T) {
 	w := newWS(t)
 	seedDB(t, w, "app", 1<<16)
@@ -1340,15 +1386,15 @@ func TestFinalCASGivesUpAfterThreeLosses(t *testing.T) {
 	w.Store.B = b
 	_, err := w.CheckpointWith("app", "main", "a", nil, CheckpointOptions{Snapshot: true})
 	w.Store.B = b.Backend
-	if !errors.Is(err, store.ErrCAS) || !strings.Contains(err.Error(), "retry") {
+	if !errors.Is(err, store.ErrCAS) || !strings.Contains(err.Error(), "lost 3 compare-and-swaps") || !strings.Contains(err.Error(), "retry") {
 		t.Fatalf("checkpoint whose head write always loses: %v, want a retryable compare-and-swap error", err)
 	}
 	if n := b.refused.Load(); n != 3 {
 		t.Fatalf("head write attempted %d times, want 3", n)
 	}
 	assertLeaseReleased(t, w, before)
-	if storeHas(w, privateSnapshotKey(before)) {
-		t.Fatal("the object was left behind although the ref proves nothing names it")
+	if !storeHas(w, privateSnapshotKey(before)) {
+		t.Fatal("the object was deleted although a refused head write can still land on S3")
 	}
 }
 
@@ -1504,11 +1550,13 @@ var errHeadWriteTimeout = errors.New("store: s3 conditional put refs/app/main: c
 // name in turn from script: "cas" refuses one without writing, a
 // compare-and-swap lost to a metadata write; "pending" holds one back
 // without writing and reports errHeadWriteTimeout, a request the client gave
-// up on that the store has yet to apply. The held write is applied, under
-// the etag it was sent with, just before the second ref read after the
-// script runs out. The checkpoint's give-up read is the first, so that is
-// the release's: the last moment the store could still apply it, since the
-// release then moves the etag on.
+// up on that the store has yet to apply; "pending-cas" holds one back the
+// same way but reports a lost compare-and-swap, as S3's 409 does when the
+// SDK's retry of the write collides with its own first attempt still in
+// flight. The held write is applied, under the etag it was sent with, just
+// before the second ref read after the script runs out. The checkpoint's
+// give-up read is the first, so that is the release's: the last moment the
+// store could still apply it, since the release then moves the etag on.
 type verdictlessHeadWrites struct {
 	store.Backend
 	refKey, name string
@@ -1531,13 +1579,16 @@ func (b *verdictlessHeadWrites) PutIf(key string, data []byte, ifMatch string) (
 	}
 	step := b.script[b.sent]
 	b.sent++
-	if step == "pending" {
+	if step == "pending" || step == "pending-cas" {
 		body := append([]byte(nil), data...)
 		b.held = func() error {
 			_, err := b.Backend.PutIf(key, body, ifMatch)
 			return err
 		}
-		return "", errHeadWriteTimeout
+		if step == "pending" {
+			return "", errHeadWriteTimeout
+		}
+		return "", fmt.Errorf("%w: s3 409 ConditionalRequestConflict", store.ErrCAS)
 	}
 	return "", fmt.Errorf("%w: refused for the test", store.ErrCAS)
 }
@@ -1688,65 +1739,109 @@ func TestHeadWriteThatLandedThenMovedKeepsItsObject(t *testing.T) {
 	})
 }
 
-// TestCheckpointRechecksDetachedAfterItsAcquire: a `promote --onto --force`
-// lands between the checkpoint's first read and its acquire, and the
-// checkout it could not refresh (a busy one, modelled by putting the old
-// identity back on its sidecar) is now detached. The acquire succeeds on
-// the repointed ref, so only the re-check on the ref it returns keeps the
-// checkpoint from putting the old content on the new lineage and silently
-// undoing the promote: it is refused as detached, the promoted ref keeps
-// its head, the lease is released, and nothing is uploaded.
-func TestCheckpointRechecksDetachedAfterItsAcquire(t *testing.T) {
-	w := newWS(t)
-	seedDB(t, w, "app", 1<<16)
-	if _, err := w.Fork("app", "main", "f", "", 0, nil); err != nil {
-		t.Fatal(err)
-	}
-	mustSQL(t, mustCheckout(t, w, "app", "f"), "INSERT INTO t (v) VALUES (randomblob(10));")
-	if _, err := w.Checkpoint("app", "f", "work", nil); err != nil {
-		t.Fatal(err)
-	}
-	mainPath := mustCheckout(t, w, "app", "main")
-	old, ok := readSidecar(mainPath)
-	if !ok {
-		t.Fatal("setup: main's checkout has no sidecar")
-	}
-	var promoted store.Ref
-	fired := false
-	checkpointBeforeAcquireForTest = func() {
-		if fired {
-			return
-		}
-		fired = true
-		if _, err := w.PromoteWith("app", "f", "main", PromoteOptions{Force: true, NoBackup: true}); err != nil {
-			t.Fatal(err)
-		}
-		if err := StampSumHashOnly(mainPath, old.Hash, old.Lineage, old.Epoch, old.TXID, old.PostApplyChecksum, old.ChainID); err != nil {
-			t.Fatal(err)
-		}
-		promoted = refOf(t, w, "app", "main")
-	}
-	t.Cleanup(func() { checkpointBeforeAcquireForTest = nil })
-	_, err := w.CheckpointWith("app", "main", "after", nil, CheckpointOptions{})
-	if promoted.Lineage == "" || promoted.Lineage == old.Lineage {
-		t.Fatalf("setup: the promote did not repoint main (lineage %q, was %q)", promoted.Lineage, old.Lineage)
-	}
-	if err == nil || !strings.Contains(err.Error(), "detached") {
-		t.Fatalf("checkpoint of a checkout detached between its first read and its acquire: %v, want a detached refusal", err)
-	}
-	ref := refOf(t, w, "app", "main")
-	if ref.LeaseHolder != "" || ref.Lineage != promoted.Lineage || ref.HeadTXID != promoted.HeadTXID || ref.HeadEpoch != promoted.HeadEpoch || ref.Epoch != promoted.Epoch+1 {
-		t.Fatalf("after the refused checkpoint: holder %q lineage %s head %d@%d epoch %d; want no lease on the promoted lineage %s, head %d@%d, epoch %d",
-			ref.LeaseHolder, ref.Lineage, ref.HeadTXID, ref.HeadEpoch, ref.Epoch, promoted.Lineage, promoted.HeadTXID, promoted.HeadEpoch, promoted.Epoch+1)
-	}
-	if _, ok := ref.Checkpoints["after"]; ok {
-		t.Fatal("the refused checkpoint was recorded")
-	}
-	txid := promoted.HeadTXID + 1
-	for _, k := range []string{store.SnapshotKey(promoted.Lineage, promoted.Epoch+1, txid), store.SegmentKey(promoted.Lineage, promoted.Epoch+1, txid, txid)} {
-		if storeHas(w, k) {
-			t.Fatalf("the refused checkpoint uploaded %s", k)
-		}
+// TestCheckpointChecksTheRefItsAcquireReads: the detached-checkout check
+// runs on the ref the lease acquire reads, before it writes, so a `promote
+// --onto --force` that leaves the checkout detached (a busy one it could
+// not refresh, modelled by putting the old identity back on its sidecar)
+// keeps the checkpoint from putting the old content on the new lineage and
+// silently undoing the promote, however close to the acquire it lands:
+//
+//   - just before the acquire reads the ref: the check sees the new
+//     lineage and refuses as detached, with nothing written;
+//   - between the acquire's read and its write: the acquire's
+//     compare-and-swap loses, and the re-read finds another writer came
+//     and went, which is refused like a live lease.
+//
+// Either way the promoted ref keeps its head and epoch, no lease is left,
+// and nothing is uploaded.
+func TestCheckpointChecksTheRefItsAcquireReads(t *testing.T) {
+	for _, tc := range []struct {
+		name string
+		when string
+		want func(error) bool
+	}{
+		{"promote before the acquire's read", "hook", func(err error) bool { return errors.Is(err, ErrDetachedCheckout) }},
+		{"promote inside the acquire", "acquire", func(err error) bool {
+			return errors.Is(err, store.ErrLeaseHeld) && strings.Contains(err.Error(), "written by another checkpoint, session or repoint")
+		}},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			w := newWS(t)
+			seedDB(t, w, "app", 1<<16)
+			if _, err := w.Fork("app", "main", "f", "", 0, nil); err != nil {
+				t.Fatal(err)
+			}
+			mustSQL(t, mustCheckout(t, w, "app", "f"), "INSERT INTO t (v) VALUES (randomblob(10));")
+			if _, err := w.Checkpoint("app", "f", "work", nil); err != nil {
+				t.Fatal(err)
+			}
+			mainPath := mustCheckout(t, w, "app", "main")
+			old, ok := readSidecar(mainPath)
+			if !ok {
+				t.Fatal("setup: main's checkout has no sidecar")
+			}
+			var promoted store.Ref
+			promote := func() {
+				if _, err := w.PromoteWith("app", "f", "main", PromoteOptions{Force: true, NoBackup: true}); err != nil {
+					t.Error(err)
+					return
+				}
+				if err := StampSumHashOnly(mainPath, old.Hash, old.Lineage, old.Epoch, old.TXID, old.PostApplyChecksum, old.ChainID); err != nil {
+					t.Error(err)
+				}
+				ref, _, err := w.Store.GetRef("app", "main")
+				if err != nil {
+					t.Error(err)
+				}
+				promoted = ref
+			}
+			var orig store.Backend
+			switch tc.when {
+			case "hook":
+				fired := false
+				checkpointBeforeAcquireForTest = func() {
+					if !fired {
+						fired = true
+						promote()
+					}
+				}
+				t.Cleanup(func() { checkpointBeforeAcquireForTest = nil })
+			case "acquire":
+				orig = w.Store.B
+				w.Store.B = &runBeforeAcquire{Backend: orig, refKey: store.RefKey("app", "main"), run: func() {
+					// The promote runs through the unwrapped store, so this
+					// wrapper sees only the checkpoint's writes.
+					w.Store.B = orig
+					promote()
+				}}
+			}
+			_, err := w.CheckpointWith("app", "main", "after", nil, CheckpointOptions{})
+			if orig != nil {
+				w.Store.B = orig
+			}
+			if promoted.Lineage == "" || promoted.Lineage == old.Lineage {
+				t.Fatalf("setup: the promote did not repoint main (lineage %q, was %q)", promoted.Lineage, old.Lineage)
+			}
+			if !tc.want(err) {
+				t.Fatalf("checkpoint of a checkout the promote detached: %v", err)
+			}
+			ref := refOf(t, w, "app", "main")
+			if ref.LeaseHolder != "" || ref.Lineage != promoted.Lineage || ref.HeadTXID != promoted.HeadTXID || ref.HeadEpoch != promoted.HeadEpoch || ref.Epoch != promoted.Epoch {
+				t.Fatalf("after the refused checkpoint: holder %q lineage %s head %d@%d epoch %d; want the promoted ref untouched: lineage %s, head %d@%d, epoch %d",
+					ref.LeaseHolder, ref.Lineage, ref.HeadTXID, ref.HeadEpoch, ref.Epoch, promoted.Lineage, promoted.HeadTXID, promoted.HeadEpoch, promoted.Epoch)
+			}
+			if _, ok := ref.Checkpoints["after"]; ok {
+				t.Fatal("the refused checkpoint was recorded")
+			}
+			txid := promoted.HeadTXID + 1
+			for epoch := promoted.Epoch; epoch <= promoted.Epoch+1; epoch++ {
+				for _, k := range []string{store.SnapshotKey(promoted.Lineage, epoch, txid), store.SegmentKey(promoted.Lineage, epoch, txid, txid)} {
+					if storeHas(w, k) {
+						t.Fatalf("the refused checkpoint uploaded %s", k)
+					}
+				}
+			}
+		})
 	}
 }
 
@@ -1828,5 +1923,376 @@ func TestDestroyClaimBeforeHeadWriteFailsTheCheckpoint(t *testing.T) {
 	}
 	if err := w.Store.DeleteRefIf("app", "main", claimEtag); err != nil {
 		t.Fatalf("destroy's conditional delete after the failed checkpoint: %v (the checkpoint wrote over the claim)", err)
+	}
+}
+
+// TestHeadWriteHiddenBehindAConflictKeepsItsObject: on S3 a 409 conflict,
+// which the store reports as a lost compare-and-swap, can be the SDK's
+// retry of the head write colliding with its own first attempt, still in
+// flight after a 5xx or a dropped connection. Every attempt then reads as
+// refused with the premise intact, and the checkpoint gives up, but the
+// first attempt can still land. It keeps its object, so when that write
+// lands the head names an object that is there.
+func TestHeadWriteHiddenBehindAConflictKeepsItsObject(t *testing.T) {
+	w := newWS(t)
+	seedDB(t, w, "app", 1<<16)
+	mustSQL(t, w.CheckoutPath("app", "main"), "INSERT INTO t (v) VALUES (randomblob(100));")
+	before := refOf(t, w, "app", "main")
+	b := &verdictlessHeadWrites{Backend: w.Store.B, refKey: store.RefKey("app", "main"), name: "a", script: []string{"pending-cas", "cas", "cas"}}
+	w.Store.B = b
+	_, err := w.CheckpointWith("app", "main", "a", nil, CheckpointOptions{Snapshot: true})
+	w.Store.B = b.Backend
+	if !errors.Is(err, store.ErrCAS) || !strings.Contains(err.Error(), "lost 3 compare-and-swaps") {
+		t.Fatalf("checkpoint whose head writes all read as conflicts: %v", err)
+	}
+	if !b.applied || b.appliedErr != nil {
+		t.Fatalf("precondition: the first head write did not land after the checkpoint gave up (applied %v: %v)", b.applied, b.appliedErr)
+	}
+	ref := refOf(t, w, "app", "main")
+	if ref.HeadTXID != before.HeadTXID+1 || ref.Checkpoints["a"].TXID != ref.HeadTXID || ref.LeaseHolder != "" {
+		t.Fatalf("after the late head write: head %d entry %+v holder %q", ref.HeadTXID, ref.Checkpoints["a"], ref.LeaseHolder)
+	}
+	if !storeHas(w, privateSnapshotKey(before)) {
+		t.Fatal("the object was deleted while a head write hidden behind a conflict could still land")
+	}
+	if _, err := w.CheckoutAt("app", "main", "a", false); err != nil {
+		t.Fatalf("the head the late write committed does not materialize: %v", err)
+	}
+}
+
+// claimAfterHeldHeadWrite holds back the first ref PutIf that records the
+// checkpoint name, reporting errHeadWriteTimeout (a write the store has yet
+// to apply), and runs claim just before the next ref read: a destroy or
+// reap claim landing after the head write was sent.
+type claimAfterHeldHeadWrite struct {
+	store.Backend
+	refKey, name string
+	claim        func()
+	armed        atomic.Int32
+	held         func() error
+}
+
+func (b *claimAfterHeldHeadWrite) PutIf(key string, data []byte, ifMatch string) (string, error) {
+	if key == b.refKey && b.held == nil && recordsCheckpoint(data, b.name) {
+		body := append([]byte(nil), data...)
+		b.held = func() error {
+			_, err := b.Backend.PutIf(key, body, ifMatch)
+			return err
+		}
+		b.armed.Store(1)
+		return "", errHeadWriteTimeout
+	}
+	return b.Backend.PutIf(key, data, ifMatch)
+}
+
+func (b *claimAfterHeldHeadWrite) Get(key string) ([]byte, string, error) {
+	if key == b.refKey && b.armed.CompareAndSwap(1, 0) {
+		b.claim()
+	}
+	return b.Backend.Get(key)
+}
+
+// TestHeadWriteSentBeforeAClaimKeepsItsObject: a head write that got no
+// verdict, then a `destroy --force` or a reap that claims the branch before
+// the checkpoint re-reads it. The claim fails the premise, but it is the
+// one change that can be undone to the very bytes the write was sent
+// against: Destroy unwinds its claim when its quiesce or conditional delete
+// fails, and the reaper clears a stale one, after which the store can still
+// apply the held write. The checkpoint keeps its object and says it may
+// have committed, so the head that write then sets names an object that is
+// there.
+func TestHeadWriteSentBeforeAClaimKeepsItsObject(t *testing.T) {
+	for _, tc := range []struct {
+		name   string
+		claim  func(*store.Ref)
+		unwind func(t *testing.T, w *Workspace)
+		want   error
+	}{
+		{"destroy", func(r *store.Ref) { r.Deleting, r.DeletingAt = true, time.Now().UTC().Format(time.RFC3339Nano) },
+			func(t *testing.T, w *Workspace) { w.unwindDeletingClaim("app", "main") }, store.ErrDeleting},
+		{"reap", func(r *store.Ref) { r.Reaping = true }, func(t *testing.T, w *Workspace) {
+			ref, etag, err := w.Store.GetRef("app", "main")
+			if err != nil {
+				t.Fatal(err)
+			}
+			if _, err := w.clearStaleReapingClaim("app", "main", ref, etag); err != nil {
+				t.Fatal(err)
+			}
+		}, store.ErrReaping},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			w := newWS(t)
+			seedDB(t, w, "app", 1<<16)
+			mustSQL(t, w.CheckoutPath("app", "main"), "INSERT INTO t (v) VALUES (randomblob(100));")
+			before := refOf(t, w, "app", "main")
+			b := &claimAfterHeldHeadWrite{Backend: w.Store.B, refKey: store.RefKey("app", "main"), name: "a"}
+			b.claim = func() {
+				ref, etag, err := w.Store.GetRef("app", "main")
+				if err != nil {
+					t.Error(err)
+					return
+				}
+				tc.claim(&ref)
+				if _, err := w.Store.PutRef("app", "main", ref, etag); err != nil {
+					t.Error(err)
+				}
+			}
+			w.Store.B = b
+			_, err := w.CheckpointWith("app", "main", "a", nil, CheckpointOptions{Snapshot: true})
+			w.Store.B = b.Backend
+			if !errors.Is(err, tc.want) || !errors.Is(err, errHeadWriteTimeout) || !strings.Contains(err.Error(), "may have committed") {
+				t.Fatalf("checkpoint whose sent head write was followed by a %s claim: %v, want a may-have-committed error wrapping the claim and the timeout", tc.name, err)
+			}
+			key := privateSnapshotKey(before)
+			if !storeHas(w, key) {
+				t.Fatal("the object was deleted while a head write the store could still apply names it")
+			}
+			tc.unwind(t, w)
+			if b.held == nil {
+				t.Fatal("precondition: no head write was held")
+			}
+			if err := b.held(); err != nil {
+				t.Fatalf("precondition: the held head write did not land after the claim was undone: %v", err)
+			}
+			ref := refOf(t, w, "app", "main")
+			if ref.HeadTXID != before.HeadTXID+1 || ref.Checkpoints["a"].TXID != ref.HeadTXID {
+				t.Fatalf("after the late head write: head %d entry %+v", ref.HeadTXID, ref.Checkpoints["a"])
+			}
+			if _, err := w.CheckoutAt("app", "main", "a", false); err != nil {
+				t.Fatalf("the head the late write committed does not materialize: %v", err)
+			}
+		})
+	}
+}
+
+// afterObjectPut forwards PutIf and, right after the create-only put of key
+// lands, runs after.
+type afterObjectPut struct {
+	store.Backend
+	key   string
+	after func()
+	fired atomic.Int32
+}
+
+func (b *afterObjectPut) PutIf(key string, data []byte, ifMatch string) (string, error) {
+	etag, err := b.Backend.PutIf(key, data, ifMatch)
+	if err == nil && key == b.key && b.fired.CompareAndSwap(0, 1) {
+		b.after()
+	}
+	return etag, err
+}
+
+// TestOlderBinaryCheckpointUnderOurLeaseKeepsTheHeadsObject: an offshoot
+// older than the checkpoint lease runs `checkpoint --force` while a new
+// checkpoint holds the branch. It goes past the live lease, plans under the
+// epoch the ref carries, the new checkpoint's private one, and so computes
+// the same key; it finds the key taken, overwrites it unconditionally, and
+// moves the head to it, leaving the lease in place. The new checkpoint
+// cannot commit, but the head now names its key, so it keeps that object
+// (the branch stays materializable) and says the branch moved under its own
+// lease, rather than that it lost the lease to its own holder.
+func TestOlderBinaryCheckpointUnderOurLeaseKeepsTheHeadsObject(t *testing.T) {
+	w := newWS(t)
+	seedDB(t, w, "app", 1<<16)
+	path := w.CheckoutPath("app", "main")
+	mustSQL(t, path, "INSERT INTO t (v) VALUES (randomblob(100));")
+	before := refOf(t, w, "app", "main")
+	key := privateSnapshotKey(before)
+	oldBytes := encodeCheckout(t, path, before.HeadTXID+1)
+	b := &afterObjectPut{Backend: w.Store.B, key: key}
+	var holder string
+	b.after = func() {
+		// What v0.2.16's CheckpointWith does with --force under a live lease.
+		ref, etag, err := w.Store.GetRef("app", "main")
+		if err != nil {
+			t.Error(err)
+			return
+		}
+		holder = ref.LeaseHolder
+		if _, err := b.Backend.PutIf(key, oldBytes, ""); !errors.Is(err, store.ErrCAS) {
+			t.Errorf("the older binary's create-only put: %v, want ErrCAS", err)
+		}
+		if err := b.Backend.Put(key, oldBytes); err != nil {
+			t.Error(err)
+		}
+		txid := ref.HeadTXID + 1
+		ref.HeadTXID, ref.HeadEpoch = txid, ref.Epoch
+		ref.SetCheckpoint("old", store.Checkpoint{TXID: txid, Epoch: ref.Epoch, CreatedAt: nowStamp(), Kind: "snapshot"})
+		if _, err := w.Store.PutRef("app", "main", ref, etag); err != nil {
+			t.Errorf("the older binary's head write: %v", err)
+		}
+	}
+	w.Store.B = b
+	_, err := w.CheckpointWith("app", "main", "new", nil, CheckpointOptions{Snapshot: true})
+	w.Store.B = b.Backend
+	if b.fired.Load() != 1 {
+		t.Fatal("precondition: the older binary's checkpoint did not run")
+	}
+	if !errors.Is(err, store.ErrLeaseLost) || !strings.Contains(err.Error(), "moved under this checkpoint's own lease") || strings.Contains(err.Error(), fmt.Sprintf("held by %q", holder)) {
+		t.Fatalf("checkpoint whose branch an older binary moved under its lease: %v", err)
+	}
+	if !storeHas(w, key) {
+		t.Fatal("the checkpoint deleted the object the head names")
+	}
+	if _, err := w.CheckoutAt("app", "main", "old", false); err != nil {
+		t.Fatalf("the head the older binary committed does not materialize: %v", err)
+	}
+}
+
+// countRefGets counts Gets of key and forwards the backend's conditional
+// delete, so a test can wait on reads of the ref while Destroy's delete
+// stays conditional.
+type countRefGets struct {
+	store.Backend
+	key string
+	n   atomic.Int32
+}
+
+func (b *countRefGets) Get(key string) ([]byte, string, error) {
+	if key == b.key {
+		b.n.Add(1)
+	}
+	return b.Backend.Get(key)
+}
+
+func (b *countRefGets) DeleteIf(key, ifMatch string) error {
+	return b.Backend.(store.ConditionalDeleter).DeleteIf(key, ifMatch)
+}
+
+// TestRenewalsLeaveADestroyClaimAlone: `destroy --force` claims the ref and
+// quiesces the checkout before its conditional delete, which compares
+// against the claim's etag. A checkpoint renewing its lease meanwhile reads
+// the claim and does not write over it, so the delete goes through however
+// many renewals fall inside the quiesce, and the checkpoint then fails on
+// the destroyed branch.
+func TestRenewalsLeaveADestroyClaimAlone(t *testing.T) {
+	w := newWS(t)
+	seedDB(t, w, "app", 1<<16)
+	mustSQL(t, w.CheckoutPath("app", "main"), "INSERT INTO t (v) VALUES (randomblob(100));")
+	refKey := store.RefKey("app", "main")
+	cb := &countRefGets{Backend: w.Store.B, key: refKey}
+	w.Store.B = cb
+	var deleteErr error
+	deleted := false
+	checkpointAfterQuiesceForTest = func() {
+		var claimEtag string
+		for i := 0; ; i++ {
+			ref, etag, err := w.Store.GetRef("app", "main")
+			if err != nil {
+				t.Fatal(err)
+			}
+			ref.Deleting, ref.DeletingAt = true, time.Now().UTC().Format(time.RFC3339Nano)
+			if claimEtag, err = w.Store.PutRef("app", "main", ref, etag); err == nil {
+				break
+			}
+			if !errors.Is(err, store.ErrCAS) || i == 20 {
+				t.Fatal(err)
+			}
+		}
+		// Destroy's quiesce of a busy checkout, long enough for the
+		// renewer to read the claimed ref three times.
+		n := cb.n.Load()
+		waitFor(t, "three renewals over the claim", func() bool { return cb.n.Load() >= n+3 })
+		deleteErr, deleted = w.Store.DeleteRefIf("app", "main", claimEtag), true
+	}
+	t.Cleanup(func() { checkpointAfterQuiesceForTest = nil })
+	_, err := w.CheckpointWith("app", "main", "a", nil, CheckpointOptions{Snapshot: true, LeaseTTL: 2 * time.Second, RenewEvery: 10 * time.Millisecond})
+	w.Store.B = cb.Backend
+	if !deleted || deleteErr != nil {
+		t.Fatalf("destroy's conditional delete after renewals over its claim: %v (a renewal moved the claim's etag)", deleteErr)
+	}
+	if !errors.Is(err, store.ErrNotFound) {
+		t.Fatalf("checkpoint of a branch destroyed while it ran: %v, want ErrNotFound", err)
+	}
+	if _, _, err := w.Store.GetRef("app", "main"); !errors.Is(err, store.ErrNotFound) {
+		t.Fatalf("the destroyed branch came back: %v", err)
+	}
+}
+
+// conflictingObjectPuts answers every create-only put under data/ with a
+// lost compare-and-swap without writing, and fails reads of those keys with
+// getErr when it is set: a 409 against an earlier attempt still in flight,
+// with nothing (yet) to read back, or a read-back that fails.
+type conflictingObjectPuts struct {
+	store.Backend
+	getErr error
+}
+
+func (b conflictingObjectPuts) PutIf(key string, data []byte, ifMatch string) (string, error) {
+	if strings.HasPrefix(key, "data/") {
+		return "", fmt.Errorf("%w: s3 409 ConditionalRequestConflict", store.ErrCAS)
+	}
+	return b.Backend.PutIf(key, data, ifMatch)
+}
+
+func (b conflictingObjectPuts) Get(key string) ([]byte, string, error) {
+	if strings.HasPrefix(key, "data/") && b.getErr != nil {
+		return nil, "", b.getErr
+	}
+	return b.Backend.Get(key)
+}
+
+// TestObjectPutConflictWithNothingToReadIsNotCorruption: a create-only put
+// refused as a taken key is corruption only when the key holds bytes that
+// are not ours. With nothing there (on S3, a 409 against an earlier attempt
+// of the same put still in flight), or a read-back that fails, the
+// checkpoint fails with a retryable error that says what happened, and
+// releases its lease.
+func TestObjectPutConflictWithNothingToReadIsNotCorruption(t *testing.T) {
+	readFailure := errors.New("transient: connection reset")
+	for name, tc := range map[string]struct {
+		getErr error
+		want   string
+	}{
+		"nothing there":     {nil, "nothing is there"},
+		"read-back failure": {readFailure, "reading it back failed"},
+	} {
+		t.Run(name, func(t *testing.T) {
+			w := newWS(t)
+			seedDB(t, w, "app", 1<<16)
+			mustSQL(t, w.CheckoutPath("app", "main"), "INSERT INTO t (v) VALUES (randomblob(100));")
+			before := refOf(t, w, "app", "main")
+			orig := w.Store.B
+			w.Store.B = conflictingObjectPuts{Backend: orig, getErr: tc.getErr}
+			_, err := w.CheckpointWith("app", "main", "a", nil, CheckpointOptions{Snapshot: true})
+			w.Store.B = orig
+			if !errors.Is(err, store.ErrCAS) || !strings.Contains(err.Error(), tc.want) || !strings.Contains(err.Error(), "retry") || strings.Contains(err.Error(), "corruption") {
+				t.Fatalf("checkpoint whose object put conflicted with nothing readable: %v", err)
+			}
+			if tc.getErr != nil && !errors.Is(err, tc.getErr) {
+				t.Fatalf("the read-back's error is not wrapped: %v", err)
+			}
+			assertLeaseReleased(t, w, before)
+		})
+	}
+}
+
+// failRefWrites fails every ref PutIf with a store error that is not a
+// compare-and-swap: a store that cannot be written right now.
+type failRefWrites struct{ store.Backend }
+
+func (b failRefWrites) PutIf(key string, data []byte, ifMatch string) (string, error) {
+	if strings.HasPrefix(key, "refs/") {
+		return "", errors.New("store unreachable")
+	}
+	return b.Backend.PutIf(key, data, ifMatch)
+}
+
+// TestReleaseFailureLogsTheLeasesRealExpiry: a release that fails is
+// logged with the expiry the ref carries, which renewals have moved past
+// the one the lease was acquired with, so the log does not say the lease
+// has lapsed while it is still live.
+func TestReleaseFailureLogsTheLeasesRealExpiry(t *testing.T) {
+	w, l := leasedBranch(t, newCheckpointHolder(), time.Minute)
+	renewed, err := w.Store.RenewLease(l, time.Hour, time.Now())
+	if err != nil {
+		t.Fatal(err)
+	}
+	orig := w.Store.B
+	w.Store.B = failRefWrites{orig}
+	out := captureStderr(t, func() { w.releaseCheckpointLease(l) })
+	w.Store.B = orig
+	if want := "it expires at " + renewed.Expiry.Format(time.RFC3339); !strings.Contains(out, want) {
+		t.Fatalf("release failure logged %q, want it to say %q", out, want)
 	}
 }

@@ -178,9 +178,9 @@ func TestSharedForksGetManifestOnce(t *testing.T) {
 }
 
 // An at-rest checkpoint's store requests are pinned: on the ref, one read
-// (refuseIfHeld's), one read and one write (the lease acquire), and one
-// read and one write (the head write, which also releases the lease), with
-// no renewal inside a short checkpoint. A segment checkpoint lists the
+// and one write (the lease acquire, whose read the refusals also run on),
+// and one read and one write (the head write, which also releases the
+// lease), with no renewal inside a short checkpoint. A segment checkpoint lists the
 // head's lineage once (the chain resolve) and never lists a snapshot key:
 // the probes for another checkpoint's snapshot at its txid went away with
 // the private epoch.
@@ -199,8 +199,8 @@ func TestAtRestCheckpointStoreRequests(t *testing.T) {
 		t.Fatalf("kind %q, want segment", res.Kind)
 	}
 	refKey := store.RefKey("app", "main")
-	if n := cb.getCount(refKey); n != 3 {
-		t.Fatalf("the ref was read %d times, want 3: first read, acquire, head write", n)
+	if n := cb.getCount(refKey); n != 2 {
+		t.Fatalf("the ref was read %d times, want 2: acquire, head write", n)
 	}
 	if n := cb.putIfCount(refKey); n != 2 {
 		t.Fatalf("the ref was written %d times, want 2: acquire, head write", n)

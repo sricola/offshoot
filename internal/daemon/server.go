@@ -869,7 +869,9 @@ func (s *Server) opRollback(req Request) Response {
 	}
 	res, err := s.ws.RollbackWith(req.DB, branch, req.Name, opts)
 	if err != nil {
-		return errResp(err)
+		// The rollback op has no force (nor do the SDKs' rollback), so a
+		// live-lease refusal's --force advice is no step its caller can take.
+		return errResp(ops.WithoutForceAdvice(err))
 	}
 	return Response{OK: true, Checkout: res.Path, Backup: res.Backup, Shared: res.Shared}
 }
@@ -945,7 +947,8 @@ func (s *Server) opCompact(req Request) Response {
 	}
 	txid, err := s.ws.Compact(req.DB, branch)
 	if err != nil {
-		return errResp(err)
+		// No force here either; see opRollback.
+		return errResp(ops.WithoutForceAdvice(err))
 	}
 	return Response{OK: true, TXID: txid}
 }

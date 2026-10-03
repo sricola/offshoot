@@ -266,27 +266,62 @@ func protectedRefusal(db, branch, cliCmd string) string {
 		"or keep working on the fork.", db, branch, cliCmd)
 }
 
-// rewrapForceRefusal rewraps an ops error that asked for "--force" (the
-// protected-branch and, for destroy, live-lease checks in internal/ops both
-// phrase their refusal that way — see gc.go's Destroy and ops.go's
-// PromoteWith) into one that points at the actual lever an MCP agent has:
+// rewrapForceRefusal rewraps an ops error that asked for --force (the
+// protected-branch and live-lease checks in internal/ops phrase their
+// refusals that way — see gc.go's Destroy, ops.go's PromoteWith and
+// refuseIfHeld) into one that points at the actual lever an MCP agent has:
 // -allow-force on this server, not `force` on the call. It applies whenever
 // this server isn't honoring force, forced call or not: an unforced call
 // that was handed ops' raw "use --force" would retry with force:true and
 // be refused again by refuseForceOnProtected. A protected refusal becomes
-// protectedRefusal; any other "--force" refusal (destroy's live lease) is
-// kept, minus the --force advice. With -allow-force, and for every other
-// ops error, err passes through untouched.
+// protectedRefusal. A live lease held by an at-rest checkpoint clears on
+// its own within seconds, so its refusal keeps only its advice to retry
+// (ops.WithoutForceAdvice), and the agent waits rather than fetching a
+// human to abort that checkpoint. Any other live-lease refusal is kept,
+// minus the --force advice, and names the human's command. With
+// -allow-force, and for every other ops error, err passes through
+// untouched.
 func (t *OffshootTools) rewrapForceRefusal(err error, db, branch, cliCmd string) error {
-	if err == nil || t.allowForce || !strings.Contains(err.Error(), "use --force") {
+	if err == nil || t.allowForce {
 		return err
 	}
-	if strings.Contains(err.Error(), "is protected") {
-		return errors.New(protectedRefusal(db, branch, cliCmd))
+	if ops.CheckpointInProgress(err) {
+		return ops.WithoutForceAdvice(err)
 	}
-	msg := strings.Replace(err.Error(), "; use --force", "", 1)
+	var msg string
+	switch {
+	case !strings.Contains(err.Error(), "--force"):
+		return err
+	case strings.Contains(err.Error(), "is protected"):
+		return errors.New(protectedRefusal(db, branch, cliCmd))
+	case errors.Is(err, store.ErrLeaseHeld):
+		msg = ops.WithoutForceAdvice(err).Error()
+	default:
+		msg = strings.Replace(err.Error(), "; use --force", "", 1)
+	}
 	return fmt.Errorf("%s. This MCP server does not honor force (operator flag: offshoot mcp -allow-force), "+
 		"so do not retry with force:true; ask the human to run `%s`", msg, cliCmd)
+}
+
+// checkpointErrorResult turns an at-rest checkpoint's ops error into the
+// agent's next step. offshoot_checkpoint has no force, so the
+// detached-checkout refusal, which offers the CLI --force, names the tool
+// call that refreshes the checkout instead, and the human's command for
+// keeping its edits; a refusal under another checkpoint's lease already
+// says to retry, and passes through like every other error.
+func checkpointErrorResult(err error, db, branch, name string) ToolResult {
+	switch {
+	case strings.Contains(err.Error(), "no checkout for"):
+		return ErrorResult("no checkout for %s@%s yet; call offshoot_checkout {database:%q, branch:%q} "+
+			"first, write to the returned path, then checkpoint.", db, branch, db, branch)
+	case errors.Is(err, ops.ErrDetachedCheckout):
+		return ErrorResult("the checkout of %s@%s is detached: the branch was repointed (a rollback, promote or "+
+			"compact) after this checkout was materialized, so checkpointing it would undo that repoint. Call "+
+			"offshoot_checkout {database:%q, branch:%q} to refresh it to the branch's head (this discards its "+
+			"local edits); if those edits must replace what the repoint put there, ask the human to run "+
+			"`offshoot checkpoint %s@%s %s --force`.", db, branch, db, branch, db, branch, name)
+	}
+	return ErrorResult("%v", agentNextStep(err, db))
 }
 
 // agentNextStep rewrites the ops errors an agent most often hits into the
@@ -859,11 +894,7 @@ func (t *OffshootTools) checkpoint(args json.RawMessage) (ToolResult, error) {
 	}
 	res, err := t.ws.CheckpointWith(a.Database, branch, a.Name, a.Meta, ops.CheckpointOptions{})
 	if err != nil {
-		if strings.Contains(err.Error(), "no checkout for") {
-			return ErrorResult("no checkout for %s@%s yet; call offshoot_checkout {database:%q, branch:%q} "+
-				"first, write to the returned path, then checkpoint.", a.Database, branch, a.Database, branch), nil
-		}
-		return ErrorResult("%v", agentNextStep(err, a.Database)), nil
+		return checkpointErrorResult(err, a.Database, branch, a.Name), nil
 	}
 	return StructuredResult(map[string]any{
 		"database": a.Database, "branch": branch, "name": a.Name, "txid": res.TXID, "live": false,
@@ -1142,7 +1173,9 @@ func (t *OffshootTools) rollback(args json.RawMessage) (ToolResult, error) {
 	backupTTL := max(t.defaultTTL, ops.DefaultPromoteBackupTTL)
 	res, err := t.ws.RollbackWith(a.Database, branch, a.To, ops.RollbackOptions{BackupTTL: backupTTL})
 	if err != nil {
-		return ErrorResult("%v", agentNextStep(err, a.Database)), nil
+		// offshoot_rollback has no force, so a live-lease refusal's
+		// --force advice is no step it can take.
+		return ErrorResult("%v", agentNextStep(ops.WithoutForceAdvice(err), a.Database)), nil
 	}
 	sc := map[string]any{
 		"database": a.Database, "branch": branch, "to": a.To, "path": res.Path, "backup": res.Backup,

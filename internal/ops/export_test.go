@@ -31,9 +31,8 @@ func SetForkMaterializeForTest(v bool) { forkMaterializeForTest = v }
 func ForkFastPathHits() int { return int(forkFastPathHits.Load()) }
 
 // SetCheckpointBeforeAcquireForTest installs (nil removes) the hook
-// CheckpointWith runs between its first ref read and its lease acquire;
-// see checkpointBeforeAcquireForTest. Process-global: restore via
-// t.Cleanup.
+// CheckpointWith runs just before its lease acquire reads the ref; see
+// checkpointBeforeAcquireForTest. Process-global: restore via t.Cleanup.
 func SetCheckpointBeforeAcquireForTest(f func()) { checkpointBeforeAcquireForTest = f }
 
 // SetCheckpointAfterQuiesceForTest installs (nil removes) the hook
