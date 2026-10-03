@@ -59,7 +59,8 @@ class Branch:
     existed; new code should prefer ``checkpoints_v2``.
 
     ``state`` is this branch's computed state — one of ``"active"``,
-    ``"pending"``, ``"error"``, ``"dirty"``, ``"detached"``, or ``"idle"``;
+    ``"pending"``, ``"closing"``, ``"error"``, ``"dirty"``, ``"detached"``,
+    or ``"idle"``;
     see ``internal/ops/status.go``'s ``BranchStateAt`` for the full
     taxonomy and precedence. Defaults to ``""`` against a pre-Milestone-4
     daemon that never sends this field at all (wire-additive: an old daemon
@@ -269,7 +270,12 @@ class Client:
         self._call("create", db=db, path=os.path.abspath(os.fspath(from_path)))
 
     def open(self, db: str, branch: str = "main") -> "Session":
-        """Open a live session on db@branch; returns its Session."""
+        """Open a live session on db@branch; returns its Session.
+
+        If a session on the branch is closing, the daemon waits up to 15 s
+        for the close to finish; after that the call fails with "still
+        closing; retry".
+        """
         resp = self._call("open", db=db, branch=branch)
         return Session(self, resp["checkout"], db, branch)
 
@@ -553,7 +559,13 @@ class Client:
             sock.close()
 
     def status(self) -> list[dict[str, Any]]:
-        """List every session open in the daemon, as raw dicts."""
+        """List every session open in the daemon, as raw dicts.
+
+        Each dict carries ``state``: ``"open"``, or ``"closing"`` while the
+        daemon is closing the session (it stays listed until the close has
+        released the lease). A daemon older than the field sends no
+        ``state``; read that as ``"open"``.
+        """
         resp = self._call("status")
         return cast(list[dict[str, Any]], resp.get("sessions", []))
 
@@ -597,5 +609,6 @@ class Session:
         return self.flush(name, meta)
 
     def close(self) -> None:
-        """Close the session, releasing its lease."""
+        """Close the session, releasing its lease. If another close of it is
+        already in progress, waits for that one and returns its result."""
         self._client._call("close", db=self._db, branch=self._branch)

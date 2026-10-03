@@ -40,7 +40,7 @@ export interface CheckpointInfo {
  * code should prefer `checkpoints_v2`.
  *
  * `state` is this branch's computed state — one of `"active"`, `"pending"`,
- * `"error"`, `"dirty"`, `"detached"`, or `"idle"`; see
+ * `"closing"`, `"error"`, `"dirty"`, `"detached"`, or `"idle"`; see
  * `internal/ops/status.go`'s `BranchStateAt` for the full taxonomy and
  * precedence. `""` against a pre-Milestone-4 daemon that never sends this
  * field at all (wire-additive: an old daemon still answers every other
@@ -83,13 +83,18 @@ export interface OffshootEvent {
   detail?: Record<string, unknown>;
 }
 
-/** One session open in the daemon, as returned by {@link Client.status}. */
+/** One session the daemon holds, open or closing, as returned by
+ * {@link Client.status}. */
 export interface SessionInfo {
   db: string;
   branch: string;
   checkout: string;
   holder: string;
   epoch: number;
+  /** `"open"`, or `"closing"` while the daemon is closing the session (it
+   * stays listed until the close has released the lease). Absent from a
+   * daemon older than the field; read that as `"open"`. */
+  state?: string;
   durable_txid: number;
   error?: string;
 }
@@ -333,6 +338,10 @@ interface RawSessionInfo {
   checkout: string;
   holder: string;
   epoch: number;
+  /** `"open"`, or `"closing"` while the daemon is closing the session (it
+   * stays listed until the close has released the lease). Absent from a
+   * daemon older than the field; read that as `"open"`. */
+  state?: string;
   durable_txid: number;
   error?: string;
 }
@@ -480,7 +489,9 @@ export class Client {
     });
   }
 
-  /** Open a live session on db@branch; returns its Session. */
+  /** Open a live session on db@branch; returns its Session. If a session on
+   * the branch is closing, the daemon waits up to 15 s for it, then fails
+   * with "still closing; retry". */
   async open(db: string, branch = "main"): Promise<Session> {
     const resp = await this._call("open", { db, branch });
     // "open" always populates checkout on an ok:true response — see
@@ -826,7 +837,8 @@ export class Session {
     return this.flush(name, opts);
   }
 
-  /** Close the session, releasing its lease. */
+  /** Close the session, releasing its lease. If another close of it is in
+   * progress, waits for that one and returns its result. */
   async close(): Promise<void> {
     await this.client._call("close", { db: this.db, branch: this.branch });
   }

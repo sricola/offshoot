@@ -375,6 +375,20 @@ test("daemonStatus: dbfile_descriptors is passed through when present", async ()
   assert.equal(st.dbfile_descriptors, 0);
 });
 
+test("status: session state is passed through, and absent from an older daemon", async () => {
+  const client = Object.create(Client.prototype) as Client;
+  (client as unknown as { _call: Client["_call"] })._call = async () => ({
+    ok: true,
+    sessions: [
+      { db: "app", branch: "main", checkout: "/c", holder: "h/1", epoch: 2, durable_txid: 1, state: "closing" },
+      { db: "app", branch: "b", checkout: "/d", holder: "h/1", epoch: 1, durable_txid: 1 },
+    ],
+  });
+  const sessions = await client.status();
+  assert.equal(sessions[0].state, "closing");
+  assert.equal(sessions[1].state, undefined);
+});
+
 test("branches: state is passed through when present", async () => {
   const client = Object.create(Client.prototype) as Client;
   (client as unknown as { _call: Client["_call"] })._call = async () => ({
@@ -435,7 +449,7 @@ test("rollback, promote, status", async (t: TestContext) => {
     await c.create("rp");
     const s = await c.open("rp");
     const sessions = await c.status();
-    assert.ok(sessions.some((st) => st.db === "rp" && st.branch === "main"));
+    assert.ok(sessions.some((st) => st.db === "rp" && st.branch === "main" && st.state === "open"));
 
     sqlite3(s.path, "CREATE TABLE t (v TEXT);");
     const cp1 = await s.flush("cp1");

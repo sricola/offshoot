@@ -110,6 +110,15 @@ class TestDaemonStatusWireCompat(unittest.TestCase):
         ).daemon_status()
         self.assertEqual(st.dbfile_descriptors, 0)
 
+    def test_status_passes_session_state_through(self):
+        sessions = self._client_with_response({"ok": True, "sessions": [
+            {"db": "app", "branch": "main", "state": "closing"},
+            {"db": "app", "branch": "b"},
+        ]}).status()
+        self.assertEqual(sessions[0]["state"], "closing")
+        # An older daemon sends no state; callers read that as "open".
+        self.assertEqual(sessions[1].get("state", "open"), "open")
+
 
 class TestCreateFromPathResolution(unittest.TestCase):
     """Pure-logic tests for Client.create's from_path handling; no daemon
@@ -415,8 +424,9 @@ class TestClient(unittest.TestCase):
         with offshoot.connect(self.d.sock) as c:
             c.create("rp")
             s = c.open("rp")
-            self.assertTrue(
-                any(st["db"] == "rp" and st["branch"] == "main" for st in c.status()))
+            mine = [st for st in c.status() if st["db"] == "rp" and st["branch"] == "main"]
+            self.assertEqual(len(mine), 1)
+            self.assertEqual(mine[0]["state"], "open")
 
             db = sqlite3.connect(s.path)
             db.execute("CREATE TABLE t (v TEXT)")

@@ -1451,21 +1451,7 @@ func run(args []string) error {
 				return err
 			}
 			for _, in := range resp.Sessions {
-				line := fmt.Sprintf("%s@%s durable=%d epoch=%d holder=%s checkout=%s lag=%d",
-					in.DB, in.Branch, in.DurableTXID, in.Epoch, in.Holder, in.Checkout, in.CaptureLag)
-				if in.LastFlushAt != "" {
-					line += " last_flush=" + in.LastFlushAt
-				}
-				if in.DurableAge != "" {
-					line += " age=" + in.DurableAge
-				}
-				if in.FlushError != "" {
-					line += " flush_error=" + in.FlushError
-				}
-				if in.Error != "" {
-					line += " ERROR=" + in.Error
-				}
-				fmt.Println(line)
+				fmt.Println(sessionStatusLine(in))
 			}
 			return nil
 		case "close":
@@ -1493,6 +1479,32 @@ func run(args []string) error {
 	default:
 		return fmt.Errorf("unknown command %q (run 'offshoot help')", cmd)
 	}
+}
+
+// sessionStatusLine is one `session status` line. state comes first after
+// the target because it says whether the rest still describes a live
+// session: a closing one is listed until its close has released the lease.
+// An older daemon sends no state, which means open.
+func sessionStatusLine(in daemon.SessionInfo) string {
+	state := in.State
+	if state == "" {
+		state = daemon.SessionStateOpen
+	}
+	line := fmt.Sprintf("%s@%s state=%s durable=%d epoch=%d holder=%s checkout=%s lag=%d",
+		in.DB, in.Branch, state, in.DurableTXID, in.Epoch, in.Holder, in.Checkout, in.CaptureLag)
+	if in.LastFlushAt != "" {
+		line += " last_flush=" + in.LastFlushAt
+	}
+	if in.DurableAge != "" {
+		line += " age=" + in.DurableAge
+	}
+	if in.FlushError != "" {
+		line += " flush_error=" + in.FlushError
+	}
+	if in.Error != "" {
+		line += " ERROR=" + in.Error
+	}
+	return line
 }
 
 // storageMode is rollback's and promote's output tag for the new lineage:
