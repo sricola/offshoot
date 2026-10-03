@@ -23,7 +23,8 @@ import (
 // checkpoint's create-only upload) the same way, on objArrived. Head
 // forwards to the wrapped backend's Header, or fails with headErr, or
 // returns the forwarded etag rewritten by headEtag when that is set. Every
-// Get is counted per key in gets.
+// Get is counted per key in gets. DeleteIf forwards, so a Destroy through
+// the gate keeps the wrapped backend's conditional delete.
 type casGate struct {
 	store.Backend
 	refKey     string
@@ -86,6 +87,19 @@ func (g *casGate) PutIf(key string, data []byte, ifMatch string) (string, error)
 		<-release
 	}
 	return g.Backend.PutIf(key, data, ifMatch)
+}
+
+// DeleteIf keeps the wrapped backend's conditional delete visible through
+// the gate (store.DeleteRefIf type-asserts for it), as refWriteRecorder
+// does. Without it a Destroy through the gate falls back to Local's plain
+// Delete, which takes no lock: a lease renewal that passed its etag check
+// just before can then rename the ref back into place after the delete,
+// and the destroyed branch returns, still leased.
+func (g *casGate) DeleteIf(key, ifMatch string) error {
+	if cd, ok := g.Backend.(store.ConditionalDeleter); ok {
+		return cd.DeleteIf(key, ifMatch)
+	}
+	return g.Backend.Delete(key)
 }
 
 func (g *casGate) Head(key string) (string, int64, error) {

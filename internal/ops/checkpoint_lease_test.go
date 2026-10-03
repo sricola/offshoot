@@ -803,10 +803,17 @@ func waitFor(t *testing.T, what string, cond func() bool) {
 	}
 }
 
-// destroyForce runs `destroy --force`, retrying its claim when a lease
-// renewal wins the compare-and-swap first.
+// destroyForce runs `destroy --force`, retrying when a lease renewal wins
+// its claim's compare-and-swap, or moves the ref between the claim and the
+// conditional delete. The backend must offer that conditional delete
+// (store.ConditionalDeleter), as Local does: through a test wrapper that
+// hides it, Destroy falls back to a plain Delete, which a renewal already
+// past its etag check can undo, bringing the branch back still leased.
 func destroyForce(t *testing.T, w *Workspace, db, branch string) {
 	t.Helper()
+	if _, ok := w.Store.B.(store.ConditionalDeleter); !ok {
+		t.Fatalf("destroyForce through %T, which hides the backend's conditional delete", w.Store.B)
+	}
 	for i := 0; i < 20; i++ {
 		err := w.Destroy(db, branch, true)
 		if err == nil {
@@ -863,21 +870,24 @@ func leasedBranch(t *testing.T, holder string, ttl time.Duration) (*Workspace, s
 	return w, l
 }
 
-// stallBackend holds every PutIf under prefix for stall before forwarding
-// it, closing stalled when the first one starts: an upload slower than the
-// lease TTL.
+// stallBackend holds the first PutIf under prefix until release is
+// closed, closing stalled when it starts: an upload slower than the lease
+// TTL, for exactly as long as the test needs.
 type stallBackend struct {
 	store.Backend
 	prefix  string
-	stall   time.Duration
 	once    sync.Once
 	stalled chan struct{}
+	release chan struct{}
 }
 
 func (b *stallBackend) PutIf(key string, data []byte, ifMatch string) (string, error) {
 	if strings.HasPrefix(key, b.prefix) {
-		b.once.Do(func() { close(b.stalled) })
-		time.Sleep(b.stall)
+		first := false
+		b.once.Do(func() { close(b.stalled); first = true })
+		if first {
+			<-b.release
+		}
 	}
 	return b.Backend.PutIf(key, data, ifMatch)
 }
@@ -974,24 +984,34 @@ func TestCheckpointRenewerRidesOutTransientErrors(t *testing.T) {
 
 // TestCheckpointRenewsWhileUploading: an upload that outlasts the lease TTL
 // keeps the lease live, so a writer that tries to take the branch past the
-// TTL is refused and the checkpoint commits.
+// TTL is refused and the checkpoint commits. The upload is held until that
+// refusal is in: the sleep only bounds from below how long it has run, so
+// a slow test goroutine cannot let the upload finish first.
 func TestCheckpointRenewsWhileUploading(t *testing.T) {
 	w := newWS(t)
 	seedDB(t, w, "app", 1<<16)
 	mustSQL(t, w.CheckoutPath("app", "main"), "INSERT INTO t (v) VALUES (randomblob(100));")
-	const ttl, every, stall = 500 * time.Millisecond, 50 * time.Millisecond, 1200 * time.Millisecond
-	sb := &stallBackend{Backend: w.Store.B, prefix: "data/", stall: stall, stalled: make(chan struct{})}
+	const ttl, every = 500 * time.Millisecond, 50 * time.Millisecond
+	sb := &stallBackend{Backend: w.Store.B, prefix: "data/", stalled: make(chan struct{}), release: make(chan struct{})}
+	var releaseOnce sync.Once
+	release := func() { releaseOnce.Do(func() { close(sb.release) }) }
+	t.Cleanup(release)
 	w.Store.B = sb
 	done := make(chan error, 1)
 	go func() {
 		_, err := w.CheckpointWith("app", "main", "a", nil, CheckpointOptions{LeaseTTL: ttl, RenewEvery: every})
 		done <- err
 	}()
-	<-sb.stalled
+	select {
+	case <-sb.stalled:
+	case err := <-done:
+		t.Fatalf("the checkpoint ended before its upload: %v", err)
+	}
 	time.Sleep(ttl + 300*time.Millisecond)
 	if _, err := w.Store.AcquireLease("app", "main", "thief", time.Minute, time.Now()); !errors.Is(err, store.ErrLeaseHeld) {
 		t.Fatalf("a writer past the acquire's TTL: %v, want ErrLeaseHeld (renewals keep the lease live)", err)
 	}
+	release()
 	if err := <-done; err != nil {
 		t.Fatalf("checkpoint with a slow upload: %v", err)
 	}
