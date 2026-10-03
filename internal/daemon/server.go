@@ -646,7 +646,8 @@ var closeWaitEntered func(key string, deadline time.Time)
 // lookup returns the live session for db@branch, or an error if it is not
 // open (including if an open is still in flight — a reserved slot counts as
 // not yet open), and a closing one is refused as closing: its Close has
-// already set closed, so a flush would fail with session.ErrClosed anyway.
+// set closed, or is about to, so a flush would fail with session.ErrClosed
+// anyway.
 func (s *Server) lookup(db, branch string) (*session.Session, error) {
 	if branch == "" {
 		branch = "main"
@@ -822,9 +823,9 @@ const (
 	// sessionOpen: a live session is open here.
 	sessionOpen
 	// sessionClosing: closeSlot has taken the session over and its Close
-	// has not returned. Capture has stopped, but the lease is still held
-	// and renewed until the release, and the checkout is still the old
-	// engine's. Nothing that would touch the branch may run; the close
+	// has not returned. Capture is stopping or has stopped, but the lease
+	// is still held and renewed until the release, and the checkout is
+	// still the old engine's. Nothing that would touch the branch may run; the close
 	// ends on its own, so every refusal says to retry rather than to close
 	// the session.
 	sessionClosing
