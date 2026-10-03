@@ -99,16 +99,19 @@ Pin an exact version if you depend on format stability. The full contract:
   same holder and epoch; that ends once each daemon session has a lease
   holder of its own.
 - **A close retried after its session had closed could close another
-  client's session.** A `close` named only `db@branch`. A client that gave
-  up waiting for its close's answer and retried it after another client had
-  reopened the branch closed that client's session: its lease was released
-  under it, its next flush failed with `is not open`, and its writes since
-  its last flush were never shipped. The daemon's `open` now returns the
-  session's lease `epoch`, and a `close` that sends it back closes only that
-  session; once that session has closed, it fails with `daemon:
-  <db>@<branch> is not open at epoch <n>`. The Python and TypeScript SDKs'
-  `Session.close()` send it. `offshoot session close`, and any client that
-  sends no epoch, still closes whatever session is open on the branch.
+  client's session.** A `close` named only `db@branch`. A client that
+  retried its close after the branch had been reopened closed the reopened
+  session: its lease was released under it, its next flush failed with
+  `is not open`, and its writes since its last flush were never shipped.
+  The usual ways to get there are a client that gave up waiting for its
+  close's answer, and a close that raised because its lease release failed
+  (the session is closed all the same). The daemon's `open` now returns a
+  `session_id`, 128 random bits minted for that session, and a `close` that
+  sends it back closes only that session; once that session has closed, it
+  fails with `daemon: session <id> on <db>@<branch> is not open`. The
+  Python and TypeScript SDKs' `Session.close()` send it. `offshoot session
+  close`, and any client that sends no `session_id`, still closes whatever
+  session is open on the branch.
 - **`offshoot session shutdown` could exit before every lease was
   released.** The process exited as soon as the daemon stopped listening,
   while sessions were still closing; a close another client had started
@@ -189,9 +192,9 @@ Pin an exact version if you depend on format stability. The full contract:
   `Client.daemon_status()` and TypeScript `client.daemonStatus()` return the
   open sessions plus that count (`None` / `undefined` from an older daemon
   that does not report it); `status()` is unchanged.
-- **`epoch` on the daemon `open` response and `close` request** (see
+- **`session_id` on the daemon `open` response and `close` request** (see
   Fixed). Both are additive: a close without one closes by branch as
-  before, and the SDKs send none when an older daemon's `open` reports none.
+  before, and the SDKs send none when an older daemon's `open` returns none.
 - **`SessionInfo.state`** (`open` or `closing`) in the daemon `status` op.
   `offshoot session status` prints `state=`, TypeScript `SessionInfo` has
   `state?`, and Python's `status()` dicts carry it. An older daemon sends

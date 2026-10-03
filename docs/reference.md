@@ -1360,12 +1360,16 @@ sees events published *after* it subscribes.
 | `evicted` | The janitor evicts a `checkouts-ro` entry over `-ro-cache-budget` | `checkpoint`, `bytes` (a by-chain entry reports branch `~by-chain` and its chain ID as `checkpoint`) |
 | `dropped_slow_consumer` | Sent to a subscriber being dropped (see below), never to anyone else | *(none)* |
 
-`holder` and `epoch` match a `session_closed` or `fenced` to its session's
-`session_opened`, with one exception until each daemon session has a lease
-holder of its own: when a close fails to release its lease, a reopen of the
-branch by the same daemon renews that lease in place, so its
-`session_opened` carries the same `holder` and `epoch` as the
-`session_closed` (with `error`) just before it.
+`holder` and `epoch` name a session's lease, not the session, and a later
+session of the branch can carry the same pair. When a close fails to
+release its lease, a reopen of the branch by the same daemon renews that
+lease in place, so its `session_opened` repeats the `holder` and `epoch` of
+the `session_closed` (with `error`) just before it. And rollback, promote
+and compact restart a branch's epoch, as does destroying the branch and
+creating it again, so the next session's `epoch` can equal an earlier
+one's. To match a `session_closed` or `fenced` to its `session_opened`, take
+the latest `session_opened` for the same `db` and `branch`: a session's
+`session_closed` always arrives before the `session_opened` of a reopen.
 
 **Slow-subscriber drop:** publishing never blocks the daemon (a session
 transition or the janitor). A subscriber whose bounded buffer (64 events)
@@ -1616,8 +1620,9 @@ Opens a live daemon session on `db@branch`: acquires its lease, materializes
 (or reuses) its checkout, and starts continuous WAL capture. Prints the
 checkout path. Requires a running `offshoot serve` (reachable at the
 resolved socket). `branch` defaults to `main`. The daemon protocol's `open`
-response also carries the session's lease `epoch`, which a `close` can send
-back to close only this session (see `session close` below).
+response also carries a `session_id`, 128 random bits the daemon mints for
+this session, which a `close` can send back to close only this session
+(see `session close` below).
 
 If a session on the branch is closing (another client's `close`, or one a
 killed client left running), `open` waits up to 15 s for that close to
@@ -1696,21 +1701,20 @@ rollback, compact, checkout and destroy of the branch with `daemon:
 
 This command names a branch, not a session: it closes whatever session is
 open on the branch when it runs. A close retried after the first one has
-finished therefore closes a session another client has opened on the branch
-since, and that session's writes since its last flush are never shipped. A
-daemon protocol `close` that carries `epoch` (the value its `open` returned)
-closes only the session at that epoch: if that session is still closing,
-the close waits for it as above, and if it has closed, the close fails with
-`daemon: <db>@<branch> is not open at epoch <n>` even when another session
-is open on the branch by then. The Python and TypeScript SDKs'
-`Session.close()` send it. Until each daemon session has a lease holder of
-its own, the epoch cannot tell a session apart from a reopen after a close
-whose lease release failed, because that reopen keeps the epoch (see
-`session open` above).
+finished therefore closes a session opened on the branch since, and that
+session's writes since its last flush are never shipped. A daemon protocol
+`close` that carries `session_id` (the value its `open` returned) closes
+only that session: if that session is still closing, the close waits for it
+as above, and if it has closed, the close fails with `daemon: session <id>
+on <db>@<branch> is not open` even when another session is open on the
+branch by then. The Python and TypeScript SDKs' `Session.close()` send it.
+A close whose lease release failed has still closed its session: retried
+with `session_id`, it fails with `is not open`.
 
 **Errors:** `db@branch` is not open here (it was never opened, or its close
-has finished); with `epoch`, no session at that epoch is open or closing
-here.
+has finished); with `session_id`, that session is neither open nor closing
+here; the session closed but its lease release failed (the lease lapses at
+its expiry, or `offshoot lease release` frees it now).
 
 ## `offshoot session shutdown [-socket PATH]`
 
@@ -1825,7 +1829,7 @@ Which operations exist on which surface today — verified against
 |---|---|---|---|---|
 | create / checkout / fork / destroy / rollback / promote / compact / touch / branches / dbs | yes | yes | yes | Full parity. `compact` through the daemon refuses while a session is open on the branch (see above). `rollback`/`promote`'s safety-fork backup (`--no-backup`/`--backup-ttl` on the CLI, `no_backup`/`backup_ttl` request fields and a `backup` response field on the daemon op, `backup`/`backup_ttl` kwargs on both SDKs) is full parity too, and so is their `--materialize` (`materialize` request field and `shared` response field on the daemon op; Python `materialize=False`, TypeScript `materialize?: boolean`). |
 | `protect` / `unprotect` | yes | no | no | **CLI-only, by design.** No daemon op or MCP tool sets the `protected` flag — only `offshoot_list`/the daemon's `branches` op reads it. Keeping the write side off every remote-callable surface means an agent (MCP) or a network client (daemon/HTTP) can observe protection but never grant or revoke it. |
-| open / flush / status / close (sessions) | `session ...` | yes | yes | SDK `flush(name, meta=...)` can attach checkpoint metadata; the CLI `session flush` subcommand has no `--meta` flag. The SDKs' `Session.close()` sends the `epoch` its `open` returned, so it closes only that session; the CLI `session close` sends none and closes whatever session is open on the branch. |
+| open / flush / status / close (sessions) | `session ...` | yes | yes | SDK `flush(name, meta=...)` can attach checkpoint metadata; the CLI `session flush` subcommand has no `--meta` flag. The SDKs' `Session.close()` sends the `session_id` its `open` returned, so it closes only that session; the CLI `session close` sends none and closes whatever session is open on the branch. |
 | export / historical read-only checkout | yes | yes (`export`, `checkout-at`) | yes | No CLI `session` subcommand — the CLI's `export`/`checkout --at --read-only` are the at-rest equivalents (see the section above); `export` is unix-socket-only over the daemon. |
 | events | — | yes (`subscribe` / `GET /events`) | yes (`events()`) | No CLI subscriber today. |
 | shutdown | `session shutdown` | yes | **no** | Neither SDK exposes shutdown. |

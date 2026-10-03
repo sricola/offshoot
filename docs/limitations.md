@@ -382,11 +382,11 @@ milliseconds don't):
   replaced under its capture engine
   ([status](status.md#daemon-and-durability)). A `close` in progress needs
   no such care: an `open` waits for it.
-- **Retry a `close` with its session's `epoch`.** `offshoot session close`,
-  and a daemon `close` that sends no `epoch`, close whatever session is
-  open on the branch, so one retried after the first close has finished
-  closes a session another client has opened since. A `close` that sends
-  the `epoch` its `open` returned closes only that session; the SDKs'
+- **Retry a `close` with its session's `session_id`.** `offshoot session
+  close`, and a daemon `close` that sends no `session_id`, close whatever
+  session is open on the branch, so one retried after the first close has
+  finished closes a session opened since. A `close` that sends the
+  `session_id` its `open` returned closes only that session; the SDKs'
   `Session.close()` sends it
   ([details](reference.md#offshoot-session-close-dbbranch--socket-path)).
 - **Never `export --force` over a database another process has open.**

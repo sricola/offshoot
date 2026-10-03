@@ -417,10 +417,11 @@ test("rollback and promote send the materialize wire field", async () => {
   ]);
 });
 
-test("session close sends back the epoch its open returned, and none to an older daemon", async () => {
+test("session close sends back the session id its open returned, and none to an older daemon", async () => {
+  const sid = "0123456789abcdef0123456789abcdef";
   for (const [openResp, want] of [
-    [{ ok: true, checkout: "/c", epoch: 3 }, 3],
-    [{ ok: true, checkout: "/c" }, undefined], // an older daemon sends no epoch
+    [{ ok: true, checkout: "/c", session_id: sid }, sid],
+    [{ ok: true, checkout: "/c" }, undefined], // an older daemon sends no session_id
   ] as const) {
     const client = Object.create(Client.prototype) as Client;
     const sent: Array<[string, Record<string, unknown>]> = [];
@@ -432,7 +433,7 @@ test("session close sends back the epoch its open returned, and none to an older
     await (await client.open("app")).close();
     const [op, fields] = sent[sent.length - 1];
     assert.equal(op, "close");
-    assert.equal(fields.epoch, want);
+    assert.equal(fields.session_id, want);
   }
 });
 
@@ -508,32 +509,40 @@ test("a stale session close leaves another client's reopened session open", asyn
     t.skip("go and/or sqlite3 not on PATH");
     return;
   }
-  const a = await connect(fixture!.sock);
-  const b = await connect(fixture!.sock);
-  try {
-    await a.create("stale");
-    const first = await a.open("stale");
-    await first.close();
-    const second = await b.open("stale");
+  // The rollback case reopens the branch at the closed session's lease
+  // epoch, so only the session id tells the two sessions apart.
+  for (const [db, rollback] of [
+    ["stale", false],
+    ["stalerb", true],
+  ] as const) {
+    const a = await connect(fixture!.sock);
+    const b = await connect(fixture!.sock);
     try {
-      await assert.rejects(
-        () => first.close(),
-        (err: unknown) => {
-          assert.ok(err instanceof OffshootError);
-          assert.match(err.message, /is not open at epoch/);
-          return true;
-        },
-      );
-      const mine = (await b.status()).filter((st) => st.db === "stale" && st.branch === "main");
-      assert.equal(mine.length, 1);
-      assert.equal(mine[0].state, "open");
-      await second.flush(); // rejects if the stale close had closed it
+      await a.create(db);
+      const first = await a.open(db);
+      await first.close();
+      if (rollback) await b.rollback(db, "main", "init", { noBackup: true });
+      const second = await b.open(db);
+      try {
+        await assert.rejects(
+          () => first.close(),
+          (err: unknown) => {
+            assert.ok(err instanceof OffshootError);
+            assert.match(err.message, new RegExp(`session [0-9a-f]{32} on ${db}@main is not open`));
+            return true;
+          },
+        );
+        const mine = (await b.status()).filter((st) => st.db === db && st.branch === "main");
+        assert.equal(mine.length, 1);
+        assert.equal(mine[0].state, "open");
+        await second.flush(); // rejects if the stale close had closed it
+      } finally {
+        await second.close();
+      }
     } finally {
-      await second.close();
+      await a.close();
+      await b.close();
     }
-  } finally {
-    await a.close();
-    await b.close();
   }
 });
 

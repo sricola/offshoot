@@ -358,7 +358,7 @@ interface RawResponse {
   error?: string;
   checkout?: string;
   txid?: number;
-  epoch?: number;
+  session_id?: string;
   sessions?: RawSessionInfo[];
   branches?: RawBranchInfo[];
   databases?: string[];
@@ -499,7 +499,7 @@ export class Client {
     // protocol.go's Response.Checkout — same non-defaulted assumption this
     // line always made back when resp was `any`, now spelled out as a
     // non-null assertion instead of an implicit one.
-    return new Session(this, resp.checkout!, db, branch, resp.epoch);
+    return new Session(this, resp.checkout!, db, branch, resp.session_id);
   }
 
   /** Materialize db@branch's head snapshot at rest; returns its path. */
@@ -826,10 +826,10 @@ export class Session {
     public readonly path: string,
     private readonly db: string,
     private readonly branch: string,
-    /** The lease epoch the daemon's open returned (undefined from a daemon
-     * too old to send it): {@link Session.close} sends it back so it can
-     * only ever close this session. */
-    private readonly epoch?: number,
+    /** The id the daemon's open minted for this session (undefined from a
+     * daemon too old to send one): {@link Session.close} sends it back so it
+     * can only ever close this session. */
+    private readonly sessionId?: string,
   ) {}
 
   /** Flush the checkout to a durable snapshot; returns its txid. */
@@ -847,11 +847,13 @@ export class Session {
   /** Close the session, releasing its lease. If another close of it is in
    * progress, waits for that one and returns its result.
    *
-   * It closes only this session: once this session has closed, another call
-   * fails with "is not open at epoch N", even if another client has opened
-   * the branch since. (A daemon too old to report the epoch closes whatever
-   * session is open on the branch.) */
+   * It closes only this session: it sends the id the daemon's open returned
+   * for it. Once this session has closed, another call fails with "session
+   * <id> on <db>@<branch> is not open", even if the branch has been opened
+   * again since. That includes a close that rejected because the lease
+   * release failed: the session is closed all the same. (A daemon too old to
+   * return the id closes whatever session is open on the branch.) */
   async close(): Promise<void> {
-    await this.client._call("close", { db: this.db, branch: this.branch, epoch: this.epoch });
+    await this.client._call("close", { db: this.db, branch: this.branch, session_id: this.sessionId });
   }
 }

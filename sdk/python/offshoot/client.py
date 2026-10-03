@@ -278,7 +278,7 @@ class Client:
         closing; retry".
         """
         resp = self._call("open", db=db, branch=branch)
-        return Session(self, resp["checkout"], db, branch, epoch=resp.get("epoch"))
+        return Session(self, resp["checkout"], db, branch, session_id=resp.get("session_id"))
 
     def checkout(self, db: str, branch: str) -> str:
         """Materialize db@branch's head snapshot at rest; returns its path."""
@@ -590,12 +590,12 @@ class Session:
     """A live daemon session: a lease plus a checkout under continuous capture."""
 
     def __init__(self, client: Client, path: str, db: str, branch: str,
-                 epoch: int | None = None):
+                 session_id: str | None = None):
         self._client, self.path, self._db, self._branch = client, path, db, branch
-        # The lease epoch the daemon's open returned (None from a daemon too
-        # old to send it): close() sends it back so it can only ever close
-        # this session.
-        self._epoch = epoch
+        # The id the daemon's open minted for this session (None from a
+        # daemon too old to send one): close() sends it back so it can only
+        # ever close this session.
+        self._session_id = session_id
 
     def flush(self, name: str = "", meta: dict[str, str] | None = None) -> int:
         """Flush the checkout to a durable snapshot; returns its txid.
@@ -619,9 +619,13 @@ class Session:
         """Close the session, releasing its lease. If another close of it is
         already in progress, waits for that one and returns its result.
 
-        It closes only this session: once this session has closed, another
-        call fails with "is not open at epoch N", even if another client
-        has opened the branch since. (A daemon too old to report the epoch
-        closes whatever session is open on the branch.)
+        It closes only this session: it sends the id the daemon's open
+        returned for it. Once this session has closed, another call fails
+        with "session <id> on <db>@<branch> is not open", even if the
+        branch has been opened again since. That includes a close that
+        raised because the lease release failed: the session is closed all
+        the same. (A daemon too old to return the id closes whatever session
+        is open on the branch.)
         """
-        self._client._call("close", db=self._db, branch=self._branch, epoch=self._epoch)
+        self._client._call("close", db=self._db, branch=self._branch,
+                           session_id=self._session_id)

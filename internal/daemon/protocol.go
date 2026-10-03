@@ -115,13 +115,14 @@ type Request struct {
 	Full     bool   `json:"full,omitempty"`
 	MaxBytes int    `json:"max_bytes,omitempty"`
 
-	// Epoch (close only) names the session to close by the lease epoch its
-	// open returned (Response.Epoch). A close that carries it acts only on
-	// the session at that epoch: once that session's close has finished, a
-	// retry fails with "is not open at epoch N" instead of closing a session
-	// another client has since opened on the branch. 0 (absent, as from an
-	// older client) closes whatever session is open on the branch.
-	Epoch uint64 `json:"epoch,omitempty"`
+	// SessionID (close only) names the session to close: the session_id
+	// its open returned (Response.SessionID). A close that carries it acts
+	// only on that session, open or closing. Once that session's close has
+	// finished, a retry fails with "session <id> on <db>@<branch> is not
+	// open", whoever has opened the branch since and whatever lease epoch
+	// they hold. Empty (absent, as from an older client or the CLI) closes
+	// whatever session is open on the branch.
+	SessionID string `json:"session_id,omitempty"`
 }
 
 // Response is the daemon's reply to a single Request.
@@ -130,9 +131,14 @@ type Response struct {
 	Error    string `json:"error,omitempty"`
 	Checkout string `json:"checkout,omitempty"`
 	TXID     uint64 `json:"txid,omitempty"`
-	// Epoch (open only) is the new session's lease epoch. Send it back as
-	// Request.Epoch on close so the close can only ever close this session.
-	Epoch uint64 `json:"epoch,omitempty"`
+	// SessionID (open only) identifies the new session: 128 random bits
+	// the daemon mints for each open, so no two sessions share one. Send it
+	// back as Request.SessionID on close so the close can only ever close
+	// this session. The lease epoch cannot do that: a reopen after a close
+	// whose release failed keeps it, and the first open after a rollback,
+	// promote or compact of the branch, or after it is destroyed and
+	// created again, gets an epoch an earlier session already had.
+	SessionID string `json:"session_id,omitempty"`
 	// Backup (promote and rollback) names the safety fork that kept the
 	// previous head — the target's for promote (ops.PromoteResult.Backup),
 	// the branch's for rollback (ops.RollbackResult.Backup); empty when

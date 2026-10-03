@@ -904,7 +904,9 @@ func (s *Session) Close() error {
 		os.RemoveAll(s.dir)
 		s.flushMu.Unlock()
 	}
-	// holder and epoch let a subscriber match the close to its "opened".
+	// holder and epoch name the lease this close released, or failed to,
+	// as "opened" named it. A later session can repeat the pair (see the
+	// daemon's session_closed), so they do not identify the session.
 	if relErr != nil {
 		s.logTransition("closed", "holder", lease.Holder, "epoch", lease.Epoch, "error", relErr.Error())
 	} else {

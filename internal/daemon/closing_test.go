@@ -398,36 +398,66 @@ func TestCloseOnClosingSlotWaits(t *testing.T) {
 }
 
 // TestStaleCloseLeavesTheReopenedSessionOpen: a close names its session by
-// the epoch its open returned, so a close retried after that session has
-// closed (a client that gave up waiting for the first close's answer, then
-// retried) cannot close a session another client has opened on the branch
-// since. Before the fix, close carried only db@branch: the retry closed the
-// reopened session and released its lease, and that session's writes since
-// its last flush were never shipped.
+// the session_id its open returned, so a close retried after that session
+// has closed (a client that gave up waiting for the first close's answer,
+// or whose close returned a failed release, then retried) cannot close a
+// session opened on the branch since. Before close carried an id, the retry
+// closed the reopened session and released its lease, and that session's
+// writes since its last flush were never shipped. The lease epoch, which an
+// earlier version of the fix matched instead, does not tell the two apart
+// whenever the reopen lands on the closed session's epoch: after a close
+// whose release failed, and after a rollback (likewise promote, compact, or
+// a destroyed branch created again).
 func TestStaleCloseLeavesTheReopenedSessionOpen(t *testing.T) {
-	// open opens app@main and returns its open response, which must name
-	// the session's epoch.
+	// open opens app@main and returns its open response, which must carry a
+	// session id.
 	open := func(t *testing.T, sock string) Response {
 		t.Helper()
 		r := call(t, sock, Request{Op: "open", DB: "app", Branch: "main"})
-		if !r.OK {
-			t.Fatalf("open = %+v", r)
-		}
-		if st := getStatus(t, sock, "app", "main"); r.Epoch == 0 || r.Epoch != st.Epoch {
-			t.Fatalf("open returned epoch %d, want the session's epoch %d", r.Epoch, st.Epoch)
+		if !r.OK || len(r.SessionID) != 32 {
+			t.Fatalf("open = %+v, want OK with a 128-bit hex session_id", r)
 		}
 		return r
+	}
+	closeReq := func(id string) Request {
+		return Request{Op: "close", DB: "app", Branch: "main", SessionID: id}
+	}
+	notOpen := func(id string) string {
+		return fmt.Sprintf("daemon: session %s on app@main is not open", id)
+	}
+	// staleCloseRefused retries a's close and checks that it is refused and
+	// that the session open since (b, listed by status as cur) is untouched:
+	// still open, still holding the ref's lease, and able to flush.
+	staleCloseRefused := func(t *testing.T, sock string, w *ops.Workspace, a Response, cur SessionInfo) {
+		t.Helper()
+		if r := call(t, sock, closeReq(a.SessionID)); r.OK || r.Error != notOpen(a.SessionID) {
+			t.Fatalf("A's retried close = %+v, want %q", r, notOpen(a.SessionID))
+		}
+		if st := getStatus(t, sock, "app", "main"); st.State != SessionStateOpen || st.Epoch != cur.Epoch {
+			t.Fatalf("after A's retried close, status = %+v, want B open at epoch %d", st, cur.Epoch)
+		}
+		ref, _, err := w.Store.GetRef("app", "main")
+		if err != nil {
+			t.Fatal(err)
+		}
+		if ref.LeaseHolder != cur.Holder || ref.Epoch != cur.Epoch {
+			t.Fatalf("after A's retried close the ref's lease is %q@%d, want B's %q@%d", ref.LeaseHolder, ref.Epoch, cur.Holder, cur.Epoch)
+		}
+		if r := call(t, sock, Request{Op: "flush", DB: "app", Branch: "main"}); !r.OK {
+			t.Fatalf("B's flush after A's retried close = %+v", r)
+		}
 	}
 
 	t.Run("retried after the close finished, with a reopen in between", func(t *testing.T) {
 		srv, w := newServer(t)
 		sock := srv.SocketPath()
 		a := open(t, sock)
+		aEpoch := getStatus(t, sock, "app", "main").Epoch
 
 		// The finding's sequence: A's close is held; B's open waits for it.
 		entered, release := holdNextClose(t)
 		waits := watchCloseWaits(t)
-		closed := goCall(sock, Request{Op: "close", DB: "app", Branch: "main", Epoch: a.Epoch})
+		closed := goCall(sock, closeReq(a.SessionID))
 		within(t, entered, "A's close to reach the release hook")
 		reopened := goCall(sock, Request{Op: "open", DB: "app", Branch: "main"})
 		within(t, waits, "B's open to wait for A's close")
@@ -436,53 +466,90 @@ func TestStaleCloseLeavesTheReopenedSessionOpen(t *testing.T) {
 			t.Fatalf("A's close = %+v", r)
 		}
 		b := within(t, reopened, "B's open")
-		if !b.OK || b.Epoch <= a.Epoch {
-			t.Fatalf("B's open = %+v, want OK at an epoch above A's %d", b, a.Epoch)
+		if !b.OK || b.SessionID == "" || b.SessionID == a.SessionID {
+			t.Fatalf("B's open = %+v, want OK with a session id other than A's %s", b, a.SessionID)
+		}
+		cur := getStatus(t, sock, "app", "main")
+		if cur.Epoch <= aEpoch {
+			t.Fatalf("B opened at epoch %d, want above A's %d", cur.Epoch, aEpoch)
 		}
 
 		// A never saw its close's answer, so it retries.
-		want := fmt.Sprintf("daemon: app@main is not open at epoch %d", a.Epoch)
-		if r := call(t, sock, Request{Op: "close", DB: "app", Branch: "main", Epoch: a.Epoch}); r.OK || r.Error != want {
-			t.Fatalf("A's retried close = %+v, want %q", r, want)
-		}
-		if st := getStatus(t, sock, "app", "main"); st.State != SessionStateOpen || st.Epoch != b.Epoch {
-			t.Fatalf("after A's retried close, status = %+v, want B open at epoch %d", st, b.Epoch)
-		}
-		ref, _, err := w.Store.GetRef("app", "main")
-		if err != nil {
-			t.Fatal(err)
-		}
-		if ref.LeaseHolder == "" || ref.Epoch != b.Epoch {
-			t.Fatalf("after A's retried close the ref's lease is %q@%d, want B's at epoch %d", ref.LeaseHolder, ref.Epoch, b.Epoch)
-		}
-		if r := call(t, sock, Request{Op: "flush", DB: "app", Branch: "main"}); !r.OK {
-			t.Fatalf("B's flush after A's retried close = %+v", r)
-		}
+		staleCloseRefused(t, sock, w, a, cur)
 
-		// A close that names no epoch, as from an older client, still closes
-		// whatever session is open on the branch.
+		// A close that names no session, as from an older client or the
+		// CLI, still closes whatever session is open on the branch.
 		if r := call(t, sock, Request{Op: "close", DB: "app", Branch: "main"}); !r.OK {
-			t.Fatalf("close with no epoch = %+v", r)
+			t.Fatalf("close with no session id = %+v", r)
 		}
 		if sl := slotAt(srv, "app@main"); sl != nil {
-			t.Fatalf("slot after a close with no epoch: %+v", sl)
+			t.Fatalf("slot after a close with no session id: %+v", sl)
 		}
+	})
+
+	t.Run("retried after a rollback reopened the branch at the closed session's epoch", func(t *testing.T) {
+		srv, w := newServer(t)
+		sock := srv.SocketPath()
+		a := open(t, sock)
+		aEpoch := getStatus(t, sock, "app", "main").Epoch
+		if r := call(t, sock, closeReq(a.SessionID)); !r.OK {
+			t.Fatalf("A's close = %+v", r)
+		}
+		// Rollback moves the branch to a new lineage at epoch 1, so the next
+		// open's acquire lands on epoch 2 again, A's epoch.
+		if r := call(t, sock, Request{Op: "rollback", DB: "app", Branch: "main", Name: "init", NoBackup: true}); !r.OK {
+			t.Fatalf("rollback = %+v", r)
+		}
+		b := open(t, sock)
+		cur := getStatus(t, sock, "app", "main")
+		if cur.Epoch != aEpoch {
+			t.Fatalf("B opened at epoch %d, want A's %d again: the case this subtest covers", cur.Epoch, aEpoch)
+		}
+		if b.SessionID == a.SessionID {
+			t.Fatalf("B's session id %s repeats A's", b.SessionID)
+		}
+		staleCloseRefused(t, sock, w, a, cur)
+	})
+
+	t.Run("retried after a close whose release failed, with a reopen in between", func(t *testing.T) {
+		srv, w := newServer(t)
+		sock := srv.SocketPath()
+		fr := &failReleases{Backend: w.Store.B}
+		w.Store.B = fr // before any session exists
+		a := open(t, sock)
+		aEpoch := getStatus(t, sock, "app", "main").Epoch
+		fr.arm(3) // every attempt Close's release makes
+		if r := call(t, sock, closeReq(a.SessionID)); r.OK || !strings.Contains(r.Error, "injected release failure") {
+			t.Fatalf("A's close = %+v, want the injected release failure", r)
+		}
+		// The release failed, so B's open renews A's lease in place, epoch
+		// and all (daemon sessions share one holder).
+		b := open(t, sock)
+		cur := getStatus(t, sock, "app", "main")
+		if cur.Epoch != aEpoch {
+			t.Fatalf("B opened at epoch %d, want A's %d again: the case this subtest covers", cur.Epoch, aEpoch)
+		}
+		if b.SessionID == a.SessionID {
+			t.Fatalf("B's session id %s repeats A's", b.SessionID)
+		}
+		// A's close raised, so A retries it.
+		staleCloseRefused(t, sock, w, a, cur)
 	})
 
 	t.Run("while a later session is closing, refused without waiting", func(t *testing.T) {
 		srv, _ := newServer(t)
 		sock := srv.SocketPath()
 		a := open(t, sock)
-		if r := call(t, sock, Request{Op: "close", DB: "app", Branch: "main", Epoch: a.Epoch}); !r.OK {
+		if r := call(t, sock, closeReq(a.SessionID)); !r.OK {
 			t.Fatalf("A's close = %+v", r)
 		}
 		b := open(t, sock)
 		entered, release := holdNextClose(t)
 		waits := watchCloseWaits(t)
-		closed := goCall(sock, Request{Op: "close", DB: "app", Branch: "main", Epoch: b.Epoch})
+		closed := goCall(sock, closeReq(b.SessionID))
 		within(t, entered, "B's close to reach the release hook")
 
-		r := call(t, sock, Request{Op: "close", DB: "app", Branch: "main", Epoch: a.Epoch})
+		r := call(t, sock, closeReq(a.SessionID))
 		select {
 		case <-waits:
 			t.Error("A's stale close waited for B's close")
@@ -492,8 +559,8 @@ func TestStaleCloseLeavesTheReopenedSessionOpen(t *testing.T) {
 		if r := within(t, closed, "B's close"); !r.OK {
 			t.Fatalf("B's close = %+v", r)
 		}
-		if want := fmt.Sprintf("daemon: app@main is not open at epoch %d", a.Epoch); r.OK || r.Error != want {
-			t.Fatalf("A's stale close during B's close = %+v, want %q", r, want)
+		if r.OK || r.Error != notOpen(a.SessionID) {
+			t.Fatalf("A's stale close during B's close = %+v, want %q", r, notOpen(a.SessionID))
 		}
 	})
 
@@ -503,9 +570,9 @@ func TestStaleCloseLeavesTheReopenedSessionOpen(t *testing.T) {
 		a := open(t, sock)
 		entered, release := holdNextClose(t)
 		waits := watchCloseWaits(t)
-		closed := goCall(sock, Request{Op: "close", DB: "app", Branch: "main", Epoch: a.Epoch})
+		closed := goCall(sock, closeReq(a.SessionID))
 		within(t, entered, "the close to reach the release hook")
-		again := goCall(sock, Request{Op: "close", DB: "app", Branch: "main", Epoch: a.Epoch})
+		again := goCall(sock, closeReq(a.SessionID))
 		within(t, waits, "the duplicate close to wait")
 		release()
 		if r := within(t, closed, "the close"); !r.OK {
