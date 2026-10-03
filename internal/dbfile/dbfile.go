@@ -141,6 +141,8 @@
 package dbfile
 
 import (
+	"errors"
+	"fmt"
 	"io"
 	"os"
 	"path/filepath"
@@ -337,4 +339,73 @@ func Entries() []EntryInfo {
 		return !out[i].Orphan && out[j].Orphan
 	})
 	return out
+}
+
+// ErrReplaced reports that a held path was renamed over, or removed, before
+// the SQLite connection opened on it was verified (see Hold).
+var ErrReplaced = errors.New("dbfile: path was replaced while a SQLite open held it")
+
+// HoldHookForTest, when non-nil, runs inside Hold with the absolute path,
+// after the pin is taken and before Hold returns: where a test renames a
+// fresh file over the path to land a re-materialize between a Hold and the
+// connection it guards, or records which paths were held. Test-only and
+// process-global; set it and restore nil with t.Cleanup.
+var HoldHookForTest func(path string)
+
+// Hold pins the inode path names now, on behalf of an in-process SQLite open
+// of that file. Take it BEFORE sql.Open, and release it only AFTER every
+// connection from that open is closed: defer release() before deferring the
+// database's Close, so it runs last on every return path. database/sql opens
+// lazily, so once the first real connection exists (db.Conn), call
+// Verify(path, ino). If the path was renamed over in between, that
+// connection is on a file this pin does not cover. Every materialization
+// renames a fresh inode over the path, so an inode never reappears there,
+// and Hold, Conn, then Verify is sufficient.
+//
+// Hold opens no descriptor. It touches path's cached descriptor, if that
+// still names the held inode, for Evict's least-recently-used order. release
+// is safe to call more than once.
+func Hold(path string) (release func(), ino Inode, err error) {
+	abs, err := filepath.Abs(path)
+	if err != nil {
+		return nil, Inode{}, err
+	}
+	fi, err := os.Stat(abs)
+	if err != nil {
+		return nil, Inode{}, err
+	}
+	if ino, err = inodeOf(fi); err != nil {
+		return nil, Inode{}, err
+	}
+	mu.Lock()
+	pins[ino]++
+	if e := live[abs]; e != nil && e.ino == ino {
+		touchLocked(e)
+	}
+	mu.Unlock()
+	var once sync.Once
+	release = func() { once.Do(func() { unpin(ino) }) }
+	if HoldHookForTest != nil {
+		HoldHookForTest(abs)
+	}
+	return release, ino, nil
+}
+
+// Verify reports whether path still names ino, the inode a Hold pinned.
+// Call it right after the held open's first real connection (db.Conn): on
+// ErrReplaced, close the connection, release the hold and return the error.
+// A path that is gone wraps both ErrReplaced and the stat error.
+func Verify(path string, ino Inode) error {
+	fi, err := os.Stat(path)
+	if err != nil {
+		return fmt.Errorf("%w: %s: %w", ErrReplaced, path, err)
+	}
+	got, err := inodeOf(fi)
+	if err != nil {
+		return err
+	}
+	if got != ino {
+		return fmt.Errorf("%w: %s", ErrReplaced, path)
+	}
+	return nil
 }
