@@ -268,6 +268,25 @@ func TestServeNonPositiveSnapshotEveryIsRejected(t *testing.T) {
 	}
 }
 
+// TestServeBadFDBudgetIsRejected: -fd-budget is a count of descriptors,
+// 0 meaning unlimited. A negative or non-integer value is refused before
+// any socket or daemon exists.
+func TestServeBadFDBudgetIsRejected(t *testing.T) {
+	dir := filepath.Join(t.TempDir(), "s")
+	if err := run([]string{"-store", dir, "init"}); err != nil {
+		t.Fatal(err)
+	}
+	for _, v := range []string{"-1", "lots", "1.5"} {
+		// The error must name the flag. Without that check, today's code
+		// passes for the wrong reason: the unparsed flag is left over and
+		// returns the generic usage error.
+		err := run([]string{"-store", dir, "serve", "-fd-budget", v})
+		if err == nil || !strings.HasPrefix(err.Error(), "-fd-budget") {
+			t.Fatalf("serve -fd-budget %s = %v, want an -fd-budget error", v, err)
+		}
+	}
+}
+
 // TestParseByteSize pins -ro-cache-budget's value grammar (Milestone 4 Task
 // 5): bare integers are bytes (the contract), a trailing power-of-1024
 // K/M/G/T(B) suffix is a convenience multiplier, "" (flag omitted) is 0

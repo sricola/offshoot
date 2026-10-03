@@ -17,7 +17,58 @@ Pin an exact version if you depend on format stability. The full contract:
 
 ## [Unreleased]
 
-Nothing yet.
+### Fixed
+
+- **A re-materialized checkout's old descriptor could be closed by the
+  garbage collector.** When `internal/dbfile` found a checkout path naming
+  a new inode, it dropped its only reference to the descriptor for the old
+  one, and Go's `*os.File` finalizer closed it at some later GC. Closing
+  any descriptor releases every POSIX lock this process holds on that
+  inode, so a capture engine or `quiesce` still on the old file could lose
+  its SHARED lock with no error. The old descriptor is now kept, and closed
+  only explicitly, once nothing pins its inode.
+- **A long-lived process kept a full copy of every re-materialized or
+  deleted checkout on disk.** Each re-materialize (a dirty or stale
+  `checkout` or `session open`, a rollback, promote or compact refresh),
+  each `destroy` or reap, and on a cloning filesystem each by-chain cache
+  build and prune stranded one descriptor for the life of the daemon or
+  `offshoot mcp` process, holding the unlinked file's disk until a
+  restart. Those descriptors are now closed as soon as nothing pins them:
+  right after the materialize, by-chain prune or delete that strands them,
+  and on every janitor tick.
+- **A checkout removed while `quiesce` or a capture engine was opening it
+  came back as an empty database.** SQLite creates a missing file on open,
+  so a checkout removed between a caller's check and the open (a `destroy`
+  or reap racing `branches`, or an engine started on a checkout that had
+  just been removed) left an empty database at its path. Those opens now
+  never create the file: a path already gone fails with "no such file or
+  directory", and one removed after the pin fails to open.
+
+### Changed
+
+- **Every in-process SQLite open of a checkout pins the file first.** The
+  capture engine, `quiesce` (behind `checkout`, `checkpoint`, `branches`,
+  rollback, promote and compact, `fork`'s uncheckpointed-changes warning,
+  `destroy` and reap) and `create`'s read of an imported file take a pin on
+  the file's inode before opening it and release it only after the
+  connection closes. If the path is renamed over between the pin and the
+  open, they refuse with `dbfile: path was replaced while a SQLite open held
+  it` rather than work on a file the pin does not cover. A test fails on
+  any new `sql.Open` in the tree until it is classified.
+
+### Added
+
+- **`offshoot serve -fd-budget N`** (default `64`, `0` unlimited) bounds
+  the checkout descriptors the daemon keeps cached. Each janitor tick
+  closes the least recently used until `N` remain, never one an open
+  session or an in-flight read pins.
+- **Four metrics:** `offshoot_dbfile_descriptors`, `offshoot_dbfile_pins`,
+  `offshoot_dbfile_stranded_pinned` (non-zero across janitor passes means a
+  pin leak, which the janitor also logs) and
+  `offshoot_dbfile_evicted_total{reason="stranded"|"budget"}`.
+- **The daemon `status` op reports `dbfile_descriptors`.** Python
+  `Client.daemon_status()` and TypeScript `client.daemonStatus()` return the
+  open sessions plus that count; `status()` is unchanged.
 
 ## [0.2.16] - 2026-10-03
 

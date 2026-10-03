@@ -122,12 +122,13 @@ class DaemonFixture {
  * -- best effort, not load-bearing on every CI runner).
  *
  * Deliberately filtered to TYPE "unix" rather than a raw total fd count:
- * internal/dbfile's checkout file descriptors are DELIBERATELY NEVER
- * closed for the life of the daemon (see docs/status.md's Resource
- * behavior table) -- opening a session over the course of a test
- * legitimately grows the daemon's REG-file fd count by design, which
- * would make a raw total-fd-count comparison spuriously fail regardless
- * of whether events()'s dedicated socket itself leaked. Counting only
+ * internal/dbfile caches checkout file descriptors and closes them only
+ * once nothing pins them, on its own schedule (janitor passes under
+ * serve -fd-budget; see docs/status.md's Resource behavior table) --
+ * opening a session over the course of a test legitimately grows the
+ * daemon's REG-file fd count by design, which would make a raw
+ * total-fd-count comparison spuriously fail regardless of whether
+ * events()'s dedicated socket itself leaked. Counting only
  * "unix" rows isolates exactly the resource events()'s dedicated
  * connection actually holds.
  */

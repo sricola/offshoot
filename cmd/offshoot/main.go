@@ -97,7 +97,7 @@ Usage:
   offshoot lease acquire <db>[@branch] [--ttl 30s]   claim or renew a lease
   offshoot lease release <db>[@branch]      release a lease
   offshoot serve [-socket PATH] [-reap-every d] [-gc-grace d] [-flush-every d]
-                 [-snapshot-every N] [-ro-cache-budget BYTES] [-http ADDR] [-token TOKEN] [-http-allow-non-loopback]
+                 [-snapshot-every N] [-ro-cache-budget BYTES] [-fd-budget N] [-http ADDR] [-token TOKEN] [-http-allow-non-loopback]
                                              run the daemon until SIGINT/SIGTERM;
                                              -flush-every ships every open session's
                                              work on a cadence even if it's never
@@ -115,6 +115,12 @@ Usage:
                                              is bytes, or use a K/M/G/T suffix
                                              (power-of-1024); checkouts/ (writable,
                                              leased) is never evicted
+                                             -fd-budget N bounds the checkout
+                                             descriptors kept open (default 64;
+                                             0 = unlimited); the janitor closes
+                                             the least recently used on the
+                                             -reap-every cadence, never one an
+                                             open session or in-flight read pins
                                              -http ADDR (e.g. 127.0.0.1:8080) additionally
                                              starts an HTTP listener (POST /rpc, GET
                                              /metrics, GET /healthz, GET /debug/pprof/*,
@@ -1152,7 +1158,7 @@ func run(args []string) error {
 		return srv.Serve(ctx)
 	case "serve":
 		const serveUsage = "usage: offshoot serve [-socket PATH] [-reap-every DURATION] [-gc-grace DURATION] " +
-			"[-flush-every DURATION] [-snapshot-every N] [-ro-cache-budget BYTES] [-http ADDR] [-token TOKEN | -token-file PATH] [-http-allow-non-loopback]"
+			"[-flush-every DURATION] [-snapshot-every N] [-ro-cache-budget BYTES] [-fd-budget N] [-http ADDR] [-token TOKEN | -token-file PATH] [-http-allow-non-loopback]"
 		sock, rest, err := socketOverride(rest)
 		if err != nil {
 			return fmt.Errorf("%s: %w", serveUsage, err)
@@ -1217,6 +1223,21 @@ func run(args []string) error {
 		roCacheBudget, err := parseByteSize(roCacheBudgetStr)
 		if err != nil {
 			return fmt.Errorf("-ro-cache-budget: %w", err)
+		}
+		fdBudgetStr, rest, fdBudgetGiven, err := extractFlag(rest, "-fd-budget")
+		if err != nil {
+			return err
+		}
+		fdBudget := daemon.DefaultFDBudget
+		if fdBudgetGiven {
+			n, err := strconv.Atoi(fdBudgetStr)
+			if err != nil {
+				return fmt.Errorf("-fd-budget: %w", err)
+			}
+			if n < 0 {
+				return fmt.Errorf("-fd-budget %d must be >= 0 (0 means unlimited)", n)
+			}
+			fdBudget = n
 		}
 		httpAddr, rest, _, err := extractFlag(rest, "-http")
 		if err != nil {
@@ -1326,6 +1347,9 @@ func run(args []string) error {
 		// janitor still computes and reports checkouts-ro usage every pass,
 		// it just never evicts. See SetROCacheBudget's doc comment.
 		srv.SetROCacheBudget(roCacheBudget)
+		// 0 means unlimited (no budget pass); stranded descriptors are
+		// reclaimed either way. See SetFDBudget's doc comment.
+		srv.SetFDBudget(fdBudget)
 		if httpAddr != "" {
 			if err := srv.StartHTTP(daemon.HTTPConfig{
 				Addr:             httpAddr,

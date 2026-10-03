@@ -1005,7 +1005,7 @@ Releases the branch's current lease (looked up first via the same listing
 
 **Errors:** no lease currently held on that branch.
 
-## `offshoot serve [-socket PATH] [-reap-every DURATION] [-gc-grace DURATION] [-flush-every DURATION] [-snapshot-every N] [-ro-cache-budget BYTES] [-http ADDR] [-token TOKEN] [-http-allow-non-loopback]`
+## `offshoot serve [-socket PATH] [-reap-every DURATION] [-gc-grace DURATION] [-flush-every DURATION] [-snapshot-every N] [-ro-cache-budget BYTES] [-fd-budget N] [-http ADDR] [-token TOKEN] [-http-allow-non-loopback]`
 
 ```
 offshoot serve
@@ -1067,7 +1067,8 @@ default of 16.
 **Errors:** socket path already in use by another listener; underlying
 store-attach failure; `-flush-every` given a negative duration;
 `-snapshot-every` given a value less than 1, or a non-integer;
-`-ro-cache-budget` given a negative value.
+`-ro-cache-budget` given a negative value; `-fd-budget` given a negative
+or non-integer value.
 
 ### `-ro-cache-budget BYTES` — checkouts-ro disk budget
 
@@ -1193,6 +1194,42 @@ and self-heals into staying hot from then on.
 `checkouts-ro` remains safe to `rm -rf` at any time regardless of the
 budget (see the read-only checkout section above) — a budget just
 automates what that manual cleanup would otherwise require doing by hand.
+
+### `-fd-budget N` — cached checkout descriptors
+
+```
+offshoot serve -fd-budget 64     # the default
+offshoot serve -fd-budget 0      # unlimited
+```
+
+The daemon reads checkout files raw, to fingerprint and snapshot them,
+through descriptors it caches, one per checkout path. `-fd-budget N`
+bounds how many it keeps: each janitor pass (on the `-reap-every`
+cadence) closes cached descriptors least recently used first until `N`
+remain. It bounds cached checkout descriptors, not the process's total
+(sockets, WAL readers and store files are not counted), and it counts
+every file the cache holds, `checkouts-ro/<db>/~by-chain/` entries
+included. A descriptor pinned by an open session or an in-flight read is
+never closed: the session's capture engine holds SQLite locks on its
+checkout, and closing any descriptor on that file would drop them. So a
+daemon with more open sessions than `N` keeps one per session. `0` means
+unlimited, matching `-ro-cache-budget`; `-reap-every 0` turns the janitor,
+and with it this bound, off.
+
+Separately, whatever the budget: a descriptor whose checkout was renamed
+over (re-materialized) or deleted is stranded, holding the unlinked file's
+disk, and is closed as soon as nothing pins it. That happens right after
+the checkout, rollback, promote or compact refresh, by-chain prune,
+destroy or reap that stranded it, and on every janitor pass. `offshoot
+mcp` gets the same reclaim without a janitor.
+
+Metrics: `offshoot_dbfile_descriptors` (cached plus stranded),
+`offshoot_dbfile_pins`, `offshoot_dbfile_stranded_pinned` (stranded but
+still pinned: brief while a session or read outlives its file, a pin leak
+if it stays non-zero across passes, logged as `offshoot: janitor:
+dbfile: ...`) and `offshoot_dbfile_evicted_total{reason}` (`stranded` or
+`budget`). The daemon `status` op reports the descriptor count as
+`dbfile_descriptors` (SDK `daemon_status()` / `daemonStatus()`).
 
 ### `-http ADDR` — opt-in HTTP listener
 
@@ -1724,9 +1761,7 @@ CI patterns that mix the two surfaces (CLI seeding + SDK sessions), see
 ## What's not here
 
 See [docs/status.md](status.md) for the full implemented/deferred matrix
-and links to the roadmap milestones tracking each — e.g. the FD budget
-with idle-checkout eviction, still not yet implemented as of this page's
-last update. See also [docs/stability.md](stability.md) for what pre-1.0
+and links to the roadmap milestones tracking each. See also [docs/stability.md](stability.md) for what pre-1.0
 means for the commands above (and the `export` → `create --from` format
 escape hatch), [docs/testing.md](testing.md) for how this surface is
 tested, and [docs/ci-recipes.md](ci-recipes.md) for ready-made GitHub

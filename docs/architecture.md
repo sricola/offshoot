@@ -450,8 +450,10 @@ counters and backlog, fork/flush/checkpoint latencies, ro-cache usage) and
 an event stream (socket `subscribe` op / SSE `GET /events`); and
 `serve -ro-cache-budget` bounds the read-only checkout cache with LRU
 eviction. See [docs/operations.md](operations.md) for the operator
-reference. Still deferred: an FD budget with eviction of cold *writable*
-checkouts — see [status.md](status.md#resource-behavior).
+reference. `serve -fd-budget` bounds the checkout descriptors
+`internal/dbfile` caches, and a renamed-over or deleted checkout's
+descriptor is reclaimed as soon as nothing pins it; see
+[status.md](status.md#resource-behavior).
 
 ## Platform support
 
