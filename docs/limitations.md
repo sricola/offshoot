@@ -79,7 +79,9 @@ whatever it had committed since its last flush — up to one `-flush-every`
 interval, default 30 s — never reaches the store; a checkpoint in
 progress fails without committing. `checkpoint --force` never overrides a
 lease: `checkpoint` takes the lease itself, so it waits its turn behind a
-session or another checkpoint. `checkpoint` also refuses a *detached*
+session or another checkpoint; a lease whose holder is gone (a killed
+daemon, a forgotten `lease acquire`) is freed with `offshoot lease
+release`. `checkpoint` also refuses a *detached*
 checkout (one whose sidecar lineage no longer matches the ref, because the
 branch was repointed after it was materialized) unless `--force`, since
 checkpointing it would silently revert the repoint. `destroy` already

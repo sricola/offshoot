@@ -583,6 +583,33 @@ Every workflow completed every step: 2,310/2,310 worker-steps, 107.9 s of
 workflow wall time in total (1 min 52 s for the whole run, including a seed
 build per workflow), no CAS retries, nothing aborted or timed out.
 
+**Since the table: at-rest checkpoints take the branch lease
+(unreleased).** An at-rest checkpoint now writes the ref twice instead of
+once: it acquires the branch lease before it uploads, and releases it in
+the write that advances the head ([reference](reference.md)). On a local
+store every ref write is fsynced (`F_FULLFSYNC` on macOS), so that is one
+more flush per checkpoint, and the table's checkpoint column reads low for
+code with the lease. Measured 2026-10-03 on the machine above, alternating
+a build of `c9ca45d` (before) with one of the change (after) run by run,
+at load average 2 to 6 (other processes were running):
+
+| `simulation` | Checkpoint p50, before → after | Checkpoint p99, before → after | Wall, before → after |
+|---|---|---|---|
+| full (1000 steps), concurrency 8, 3 runs each | 104.9 / 114.8 / 120.5 → 122.9 / 126.1 / 128.2 ms | 154.6 / 170.5 / 186.9 → 177.2 / 187.6 / 191.8 ms | 43.4 / 47.6 / 48.2 → 46.1 / 47.9 / 48.2 s |
+| `-quick` (20 steps), concurrency 1, 6 runs each | 44.5–45.5 → 48.2–49.8 ms | 46.5–129.4 → 48.9–62.0 ms | 2.5–5.0 → 2.7–2.9 s |
+
+Every after run's checkpoint p50 sits above every before run's: by the
+medians, +11.3 ms (+10%) eight at a time and +3.3 ms (+7%) one at a time.
+The full runs' wall time does not move outside run-to-run noise; the
+sequential quick runs take about 0.1 s more of 2.6 s, roughly twenty
+checkpoints' worth (the 5.0 s before run stalled once, which is also its
+129.4 ms p99). On a heavily loaded machine (load average 10 and above)
+the eight-way p50 gap measured 20 to 40 ms, as concurrent fsyncs queue
+behind one another. That is the cost of the design, not of its
+implementation: the acquire is what makes the object key private to the
+call, and it must be durable to fence a concurrent writer. The table
+will carry it from its next quiet-machine run.
+
 **What changed in v0.2.12.** The before is the same target run at
 `97320cc` (the commit before this work) on the same machine the same day;
 its wall times reproduce the v0.2.11 table this section used to carry to

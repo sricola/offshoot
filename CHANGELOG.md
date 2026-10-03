@@ -27,7 +27,9 @@ Pin an exact version if you depend on format stability. The full contract:
   shape the chain resolver assumes cannot happen. `--force` no longer
   overrides a live lease on `checkpoint`: the checkpoint is refused, the
   session is untouched, and the message says to close the session (or wait
-  for the other checkpoint) and retry. `--force` still checkpoints a
+  for the other checkpoint) and retry, or, if the holder is gone (a killed
+  daemon, a `lease acquire` nobody will release), to free the lease with
+  `offshoot lease release <db>@<branch>`. `--force` still checkpoints a
   detached checkout.
 - **Two at-rest checkpoints on one branch could still leave the head on the
   wrong content.** v0.2.13 made two racers survivable by checking, after
@@ -51,16 +53,25 @@ Pin an exact version if you depend on format stability. The full contract:
   repoint clears the checkpoint's lease, and the checkpoint fails without
   committing and deletes its object. Every at-rest live-lease refusal now
   satisfies `errors.Is(err, store.ErrLeaseHeld)`.
-- **A checkpoint can now fail after it has started, in two new ways.** If
-  its lease ends while it runs (a forced repoint, `offshoot lease
-  release`, `destroy --force`, or a reclaim after the process stalled past
-  the 30 s TTL), it reports that it `did not commit`, with either `its
-  lease ended while it ran` or `store: branch lease lost` and the branch's
-  current state, and deletes the object it uploaded. If `touch`, `protect`
-  or a TTL change win the head write's compare-and-swap three times
-  running, it reports `the head write lost 3 compare-and-swaps to
-  concurrent ref writes (retry)`, deletes its object and releases the
-  lease, so a retry starts clean. Neither moves the head.
+- **A checkpoint can now fail after it has started, in two new ways, and
+  can end without knowing whether it committed.** If its lease ends while
+  it runs (a forced repoint, `offshoot lease release`, `destroy --force`,
+  or a reclaim after the process stalled past the 30 s TTL), it reports
+  that it `did not commit`, with `its lease ended while it ran`, `store:
+  branch lease lost` and the branch's current state, or `store: branch is
+  being deleted` when its head write finds a forced destroy's claim, and
+  deletes the object it uploaded; it leaves that claim alone, so the
+  destroy goes through. If `touch`, `protect` or a TTL change win the head
+  write's compare-and-swap three times running, it reports `the head write
+  lost 3 compare-and-swaps to concurrent ref writes (retry)`, deletes its
+  object and releases the lease, so a retry starts clean. Neither moves
+  the head. If a head write fails without a verdict from the store (a
+  timeout, a 5xx the SDK gave up on) and the ref then cannot show whether
+  it landed, because the store may still apply it, the branch has moved
+  on, or the ref cannot be read, the checkpoint reports that it `may have
+  committed` and keeps its object: deleting it could leave the head, or a
+  fork taken in between, naming an object that is gone. A retry under the
+  same name is refused as already existing if it did commit.
 - **An at-rest checkpoint makes three more ref requests and, for a
   segment, two fewer `LIST`s.** It reads the ref, acquires the lease (a
   read and a write), renews it every `LeaseTTL/3` (10 s by default; one
@@ -71,6 +82,16 @@ Pin an exact version if you depend on format stability. The full contract:
   or TTL change wins the compare-and-swap, and the lease acquire and the
   head write each recognise their own write when only the response was
   lost, as when the S3 SDK retries a write that had landed.
+- **An at-rest checkpoint is slower by one durable ref write.** The lease
+  acquire is a second ref write per checkpoint, and it has to be durable
+  to fence anything: one more fsync on a local store (`F_FULLFSYNC` on
+  macOS), one more conditional `PUT` round trip on S3. BranchBench's
+  `simulation` workflow on a local macOS store, alternating builds before
+  and after this change, measured checkpoint p50 at 45.2 → 48.5 ms one at
+  a time and 114.8 → 126.1 ms eight at a time (p99 170.5 → 187.6 ms), with
+  the full workflow's wall time unchanged within noise; on a heavily loaded
+  machine, where concurrent fsyncs queue, the eight-way gap measured 20 to
+  40 ms. The numbers are in [benchmarks](docs/benchmarks.md).
 - Upgrade every `offshoot` binary that touches a store together: an older
   binary's `checkpoint --force` still writes under whatever epoch the ref
   carries, including one a newer checkpoint's lease holds.
