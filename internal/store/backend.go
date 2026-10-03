@@ -142,3 +142,20 @@ type ReaderPutter interface {
 type Header interface {
 	Head(key string) (etag string, size int64, err error)
 }
+
+// SettledWriter is an optional Backend capability. WritesSettled reports
+// whether every conditional write (PutIf, PutReaderIf) is settled by the
+// time it returns: one that returns an error wrote nothing and will write
+// nothing later. Local's are: the compare and the rename that applies a
+// write both happen under the key's lock, and every error comes back
+// before that rename. S3's are not, and S3 does not implement this: a
+// request that timed out may still be applied, and the SDK's retry of a
+// PutObject can be answered 409 or 412 by its own first attempt, still in
+// flight or already landed. A backend without it is taken not to settle
+// its writes, so a caller waits for a write that may still land (ops'
+// destroy claim) rather than assume it never will. It answers with a
+// bool, rather than by its presence alone, so that a wrapper can forward
+// the wrapped backend's answer.
+type SettledWriter interface {
+	WritesSettled() bool
+}

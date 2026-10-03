@@ -49,24 +49,29 @@ Pin an exact version if you depend on format stability. The full contract:
   30 s ago is refused, forced or not, with `is already being destroyed`
   (retryable; `errors.Is(err, store.ErrDeleting)`) and writes nothing.
   The reaper leaves such a branch to that destroy and writes nothing to
-  its ref, even when it had claimed the branch for reaping first. A claim
-  30 s old, one stamped more than a minute ahead of the clock (written by
-  a host whose clock runs ahead; the janitor clears these too), or one
-  whose timestamp cannot be read, is still taken over. A destroy whose
-  claim write landed but reported failure (on S3, the SDK's retry
-  answering 412 to its own first attempt, or a timeout) recognises the
-  claim as its own and goes on to delete, rather than reporting a lost
-  race whose retry that claim would refuse; when the ref shows nothing
-  landed yet (a 409 or a timeout, with the write possibly still in
-  flight), it re-reads the ref for about 2 s before reporting the failure,
-  and then says the claim may still land. A destroy sends its delete only
-  while its claim has more than 10 s of its 30 s left: one held up past
-  that (its claim write slowed by timeouts and SDK retries, whether it
-  then succeeded or landed after reporting failure, when the claim is
-  already stale) removes its claim and fails with `was held up too long to
-  delete under its claim` (retryable; `errors.Is(err, store.ErrCAS)`),
-  rather than send an S3 delete that could land after the janitor cleared
-  the claim and a new session took the branch. On S3 a destroy whose
+  its ref, even when it had claimed the branch for reaping first; if that
+  destroy then fails, the reap claim stays until the next reap pass,
+  which reaps the branch or clears the claim. A claim 30 s old, one
+  stamped more than a minute ahead of the clock (written by a host whose
+  clock runs ahead; the janitor clears these too), or one whose timestamp
+  cannot be read, is still taken over. On S3, a destroy whose claim write
+  landed but reported failure (the SDK's retry answering 412 to its own
+  first attempt, or a timeout) recognises the claim as its own and goes
+  on under it, deleting the branch if the claim landed in time (below),
+  rather than reporting a lost race whose retry that claim would refuse;
+  when the ref shows nothing landed yet (a 409 or a timeout, with the
+  write possibly still in flight), it re-reads the ref for about 2 s
+  before reporting the failure, and then says the claim may still land.
+  A local store's failed write never lands, and is reported at once. A
+  destroy sends its delete only while its claim has more than 10 s of its
+  30 s left, judged after the checkout quiesce: one held up past that
+  (its claim write slowed by timeouts and SDK retries, whether the write
+  then succeeded or landed after reporting failure, or a slow quiesce)
+  sends no delete, removes its claim and fails with `was held up too long
+  to delete under its claim` (retryable;
+  `errors.Is(err, store.ErrCAS)`), rather than send an S3 delete that
+  could land after the janitor cleared the claim and a new session took
+  the branch. On S3 a destroy whose
   delete request is itself held up for over 30 s after its claim can
   still delete a branch a new session has taken; see
   [limitations](docs/limitations.md#smaller-edges-worth-knowing).

@@ -884,24 +884,30 @@ after its claim removes its own claim and no other. Were a claim cleared
 under its destroy, an acquire could take the branch at a new epoch, and on
 S3, where the delete is unconditional, that destroy would then delete the
 branch under the fresh lease. So a destroy sends its delete only while
-its claim has more than 10 seconds left to stand; one held up past that
-(its claim write slowed by request timeouts and SDK retries) removes its
-claim and fails with `was held up too long to delete under its claim`
+its claim has more than 10 seconds left to stand, judged after the
+checkout quiesce; one held up past that (its claim write slowed by
+request timeouts and SDK retries, or a slow quiesce) removes its claim
+and fails with `was held up too long to delete under its claim`
 (retryable; `errors.Is(err, store.ErrCAS)`), deleting nothing. A destroy
 whose delete request is itself held up past the 30 seconds can still
 delete under a fresh lease on S3
 ([limitations](limitations.md#smaller-edges-worth-knowing)). A claim
 stamped more than a minute ahead of a host's clock (its writer's clock runs
-ahead) counts as abandoned on that host, as one 30 seconds old does. A
-claim write that landed but reported failure (on S3, the SDK's
-retry answering 412 or 409 to its own first attempt, or a timeout that lost
-the response) is still the destroy's own claim, which it recognises by the
-claim's timestamp: it goes on and deletes the branch, rather than reporting
-a lost race whose retry its own claim would refuse. When the ref shows
-nothing landed yet (a 409 or a timeout with the write possibly still in
-flight), the destroy re-reads it for about 2 seconds before giving up, and
-its error then says the claim may still land, in which case a retry is
-refused for up to 30 seconds.
+ahead) counts as abandoned on that host, as one 30 seconds old does. On
+S3 a claim write can land and still report failure (the SDK's retry
+answered 412 or 409 by its own first attempt, or a timeout that lost the
+response). That claim is still the destroy's own, which it recognises by
+the claim's timestamp, and it goes on under it rather than reporting a
+lost race whose retry its own claim would refuse: if the claim landed in
+time it deletes the branch, and if it is by then within 10 seconds of
+standing 30 the destroy fails with `was held up too long to delete under
+its claim` as above, sending no delete and removing its claim. When the
+ref shows nothing landed yet (a 409 or a timeout with the write possibly
+still in flight), the destroy re-reads it for about 2 seconds before
+giving up, and its error then says the claim may still land, in which
+case a retry is refused for up to 30 seconds. A local store settles
+every write before it returns, so there a claim write that failed wrote
+nothing, and the destroy reports the failure at once.
 
 **Backend-specific mechanics** (deliberately: do not pretend S3
 `DeleteObject` has preconditions it doesn't):

@@ -4,6 +4,8 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"os"
+	"path/filepath"
 	"sort"
 	"strings"
 	"sync"
@@ -1053,102 +1055,184 @@ func (b *claimLandsLate) DeleteIf(key, ifMatch string) error {
 	return b.Backend.Delete(key)
 }
 
-// TestDestroyWaitsForAClaimWriteStillInFlight: a destroy's claim write that
-// reported failure without a verdict (on S3, a 409 against its own first
-// attempt still in flight, or a timeout) can land after the destroy's first
-// re-read of the ref. While the ref still reads as it did before the claim
-// write, the destroy re-reads it a few more times over a short window, and
-// once its claim shows up it goes on and deletes the branch. Reporting a
-// lost race at the first re-read instead would leave the claim to land
-// with no destroy running, and the retry the error asks for would be
-// refused as "already being destroyed" for 30 s. A claim that never shows
-// up fails the destroy with an error that says it may still land. A claim
-// write refused because another write landed first (a 412: the ref has
-// moved) is a definite loss, reported at the first re-read.
+// WritesSettled keeps the wrapped backend's answer visible through the
+// wrapper (ops.landedClaim type-asserts for it): true on Local, whose
+// failed writes never land, and false on S3.
+func (b *claimLandsLate) WritesSettled() bool {
+	s, ok := b.Backend.(store.SettledWriter)
+	return ok && s.WritesSettled()
+}
+
+// TestDestroyWaitsForAClaimWriteStillInFlight: on S3, a destroy's claim
+// write that reported failure without a verdict (a 409 against its own
+// first attempt still in flight, or a timeout) can land after the
+// destroy's first re-read of the ref. While the ref still reads as it did
+// before the claim write, the destroy re-reads it a few more times over a
+// short window, and once its claim shows up it goes on and deletes the
+// branch. Reporting a lost race at the first re-read instead would leave
+// the claim to land with no destroy running, and the retry the error asks
+// for would be refused as "already being destroyed" for 30 s. A claim that
+// never shows up fails the destroy with an error that says it may still
+// land. A claim write refused because another write landed first (a 412:
+// the ref has moved) is a definite loss, reported at the first re-read. A
+// local store's failed writes never land
+// (TestDestroyReportsAFailedClaimWriteAtOnceOnALocalStore).
 func TestDestroyWaitsForAClaimWriteStillInFlight(t *testing.T) {
 	defer func(d time.Duration) { claimSettleEvery = d }(claimSettleEvery)
 	claimSettleEvery = 10 * time.Millisecond
 	conflict := fmt.Errorf("%w: refs/app/work: ConditionalRequestConflict", store.ErrCAS)
 	timeout := errors.New("store: s3 conditional put refs/app/work: context deadline exceeded")
-	for _, bk := range []struct {
+	for _, tc := range []struct {
+		name      string
+		err       error
+		landAfter int
+		other     bool
+	}{
+		{"409, lands after the first re-read", conflict, 1, false},
+		{"timeout, lands after the first re-read", timeout, 1, false},
+		{"409, lands before the last re-read", conflict, claimSettleReads, false},
+		{"409, never lands", conflict, 0, false},
+		{"timeout, never lands", timeout, 0, false},
+		{"412 after another write landed", fmt.Errorf("%w: refs/app/work", store.ErrCAS), 0, true},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			w := newWSOnFakeS3(t)
+			if err := w.Create("app"); err != nil {
+				t.Fatal(err)
+			}
+			if _, err := w.Fork("app", "main", "work", "", 0, nil); err != nil {
+				t.Fatal(err)
+			}
+			base := w.Store.B
+			plain := &store.Store{B: base}
+			b := &claimLandsLate{Backend: base, refKey: store.RefKey("app", "work"), err: tc.err, landAfter: tc.landAfter}
+			if tc.other {
+				b.other = func() {
+					if _, err := plain.AcquireLease("app", "work", "daemon-b", DefaultLeaseTTL, time.Now()); err != nil {
+						t.Errorf("the other write: %v", err)
+					}
+				}
+			}
+			w.Store.B = b
+			derr := w.Destroy("app", "work", false)
+			w.Store.B = base
+			if b.landErr != nil {
+				t.Fatalf("precondition: the held claim write did not land: %v", b.landErr)
+			}
+			ref, _, gerr := w.Store.GetRef("app", "work")
+			switch {
+			case tc.landAfter > 0:
+				if !b.landed {
+					t.Fatalf("precondition: the held claim write never landed (%d reads)", b.reads)
+				}
+				if derr != nil {
+					t.Fatalf("destroy whose claim landed after its first re-read: %v", derr)
+				}
+				if !errors.Is(gerr, store.ErrNotFound) {
+					t.Fatalf("the branch after the destroy: %v, want it gone", gerr)
+				}
+			case tc.other:
+				if !errors.Is(derr, store.ErrCAS) || strings.Contains(derr.Error(), "may still land") {
+					t.Fatalf("destroy that lost its claim write to another write: %v, want a lost race", derr)
+				}
+				if b.reads != 1 {
+					t.Fatalf("destroy re-read the ref %d times after a definite loss, want 1", b.reads)
+				}
+				if gerr != nil || ref.Deleting || ref.LeaseHolder != "daemon-b" {
+					t.Fatalf("the branch after the lost race: deleting %v, holder %q, %v; want the other write's lease and no claim", ref.Deleting, ref.LeaseHolder, gerr)
+				}
+			default:
+				if derr == nil || !strings.Contains(derr.Error(), "may still land") {
+					t.Fatalf("destroy whose claim write never landed: %v, want an error saying it may still land", derr)
+				}
+				if errors.Is(tc.err, store.ErrCAS) != errors.Is(derr, store.ErrCAS) {
+					t.Fatalf("destroy whose claim write never landed: %v, want it to wrap %v", derr, tc.err)
+				}
+				if b.reads != 1+claimSettleReads {
+					t.Fatalf("destroy re-read the ref %d times, want %d", b.reads, 1+claimSettleReads)
+				}
+				if gerr != nil || ref.Deleting {
+					t.Fatalf("the branch after the failed destroy: deleting %v, %v", ref.Deleting, gerr)
+				}
+			}
+		})
+	}
+}
+
+// TestDestroyReportsAFailedClaimWriteAtOnceOnALocalStore: a local store
+// settles every write before it returns (store.SettledWriter), so a claim
+// write that reported failure wrote nothing and never will. The destroy
+// reports the failure at once, without re-reading the ref or saying the
+// claim may still land, even when the ref reads as it did before the claim
+// write: a lock timeout, or a compare-and-swap lost to a write that was
+// then undone to the same bytes. Its retry goes through. On S3 the same
+// failure can be a write still on its way
+// (TestDestroyWaitsForAClaimWriteStillInFlight).
+func TestDestroyReportsAFailedClaimWriteAtOnceOnALocalStore(t *testing.T) {
+	for _, tc := range []struct {
 		name string
-		ws   func(*testing.T) *Workspace
-	}{{"local", newWS}, {"s3", newWSOnFakeS3}} {
-		for _, tc := range []struct {
-			name      string
-			err       error
-			landAfter int
-			other     bool
-		}{
-			{"409, lands after the first re-read", conflict, 1, false},
-			{"timeout, lands after the first re-read", timeout, 1, false},
-			{"409, lands before the last re-read", conflict, claimSettleReads, false},
-			{"409, never lands", conflict, 0, false},
-			{"timeout, never lands", timeout, 0, false},
-			{"412 after another write landed", fmt.Errorf("%w: refs/app/work", store.ErrCAS), 0, true},
-		} {
-			t.Run(bk.name+"/"+tc.name, func(t *testing.T) {
-				w := bk.ws(t)
-				if err := w.Create("app"); err != nil {
-					t.Fatal(err)
-				}
-				if _, err := w.Fork("app", "main", "work", "", 0, nil); err != nil {
-					t.Fatal(err)
-				}
-				base := w.Store.B
-				plain := &store.Store{B: base}
-				b := &claimLandsLate{Backend: base, refKey: store.RefKey("app", "work"), err: tc.err, landAfter: tc.landAfter}
-				if tc.other {
-					b.other = func() {
-						if _, err := plain.AcquireLease("app", "work", "daemon-b", DefaultLeaseTTL, time.Now()); err != nil {
+		err  error
+		// undone has another write land on the ref, and be undone, before
+		// the claim write fails.
+		undone bool
+	}{
+		{"lock timeout", errors.New("store: lock timeout on refs/app/work.lock (if no offshoot process is running, delete this file)"), false},
+		{"compare-and-swap lost to a write since undone", fmt.Errorf("%w: etag mismatch", store.ErrCAS), true},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			w := newWS(t)
+			if err := w.Create("app"); err != nil {
+				t.Fatal(err)
+			}
+			if _, err := w.Fork("app", "main", "work", "", 0, nil); err != nil {
+				t.Fatal(err)
+			}
+			base := w.Store.B
+			plain := &store.Store{B: base}
+			_, sent, err := plain.GetRef("app", "work")
+			if err != nil {
+				t.Fatal(err)
+			}
+			b := &claimLandsLate{Backend: base, refKey: store.RefKey("app", "work"), err: tc.err}
+			if tc.undone {
+				b.other = func() {
+					for _, protected := range []bool{true, false} {
+						ref, etag, err := plain.GetRef("app", "work")
+						if err != nil {
+							t.Error(err)
+							return
+						}
+						ref.Protected = protected
+						if _, err := plain.PutRef("app", "work", ref, etag); err != nil {
 							t.Errorf("the other write: %v", err)
+							return
 						}
 					}
 				}
-				w.Store.B = b
-				derr := w.Destroy("app", "work", false)
-				w.Store.B = base
-				if b.landErr != nil {
-					t.Fatalf("precondition: the held claim write did not land: %v", b.landErr)
-				}
-				ref, _, gerr := w.Store.GetRef("app", "work")
-				switch {
-				case tc.landAfter > 0:
-					if !b.landed {
-						t.Fatalf("precondition: the held claim write never landed (%d reads)", b.reads)
-					}
-					if derr != nil {
-						t.Fatalf("destroy whose claim landed after its first re-read: %v", derr)
-					}
-					if !errors.Is(gerr, store.ErrNotFound) {
-						t.Fatalf("the branch after the destroy: %v, want it gone", gerr)
-					}
-				case tc.other:
-					if !errors.Is(derr, store.ErrCAS) || strings.Contains(derr.Error(), "may still land") {
-						t.Fatalf("destroy that lost its claim write to another write: %v, want a lost race", derr)
-					}
-					if b.reads != 1 {
-						t.Fatalf("destroy re-read the ref %d times after a definite loss, want 1", b.reads)
-					}
-					if gerr != nil || ref.Deleting || ref.LeaseHolder != "daemon-b" {
-						t.Fatalf("the branch after the lost race: deleting %v, holder %q, %v; want the other write's lease and no claim", ref.Deleting, ref.LeaseHolder, gerr)
-					}
-				default:
-					if derr == nil || !strings.Contains(derr.Error(), "may still land") {
-						t.Fatalf("destroy whose claim write never landed: %v, want an error saying it may still land", derr)
-					}
-					if errors.Is(tc.err, store.ErrCAS) != errors.Is(derr, store.ErrCAS) {
-						t.Fatalf("destroy whose claim write never landed: %v, want it to wrap %v", derr, tc.err)
-					}
-					if b.reads != 1+claimSettleReads {
-						t.Fatalf("destroy re-read the ref %d times, want %d", b.reads, 1+claimSettleReads)
-					}
-					if gerr != nil || ref.Deleting {
-						t.Fatalf("the branch after the failed destroy: deleting %v, %v", ref.Deleting, gerr)
-					}
-				}
-			})
-		}
+			}
+			w.Store.B = b
+			derr := w.Destroy("app", "work", false)
+			w.Store.B = base
+			if b.reads != 0 {
+				t.Fatalf("destroy re-read the ref %d times after a local claim write failed, want none", b.reads)
+			}
+			if derr == nil || strings.Contains(derr.Error(), "may still land") {
+				t.Fatalf("destroy whose local claim write failed: %v, want the failure without a warning that the claim may still land", derr)
+			}
+			if errors.Is(tc.err, store.ErrCAS) != errors.Is(derr, store.ErrCAS) {
+				t.Fatalf("destroy whose local claim write failed: %v, want it to wrap %v", derr, tc.err)
+			}
+			ref, etag, err := w.Store.GetRef("app", "work")
+			if err != nil || ref.Deleting || etag != sent {
+				t.Fatalf("the branch after the failed destroy: deleting %v, at its etag before the claim %v, %v", ref.Deleting, etag == sent, err)
+			}
+			if err := w.Destroy("app", "work", false); err != nil {
+				t.Fatalf("the retried destroy: %v", err)
+			}
+			if _, _, err := w.Store.GetRef("app", "work"); !errors.Is(err, store.ErrNotFound) {
+				t.Fatalf("the branch after the retried destroy: %v, want it gone", err)
+			}
+		})
 	}
 }
 
@@ -1290,6 +1374,90 @@ func TestDestroyDeletesOnlyWhileItsClaimStands(t *testing.T) {
 				}
 				if !errors.Is(gerr, store.ErrNotFound) {
 					t.Fatalf("the branch after the destroy: %v, want it gone", gerr)
+				}
+			})
+		})
+	}
+}
+
+// TestDestroyChecksItsClaimsAgeAfterTheQuiesce: the checkout quiesce runs
+// between a destroy's claim and its delete, and a quiesce held up (a busy
+// checkout's busy timeout, a slow WAL checkpoint, a suspended process)
+// ages the claim as a slow claim write does. One that ends with the claim
+// within deleteClaimMargin of going stale sends no delete: the destroy
+// clears its own claim and fails, retryable, and the retry goes through.
+// Checking the claim's age before the quiesce instead would send S3's
+// unconditional delete under a claim the janitor may clear, and an
+// acquire take the branch, before it lands. A quiesce that ends with more
+// than the margin left deletes the branch.
+func TestDestroyChecksItsClaimsAgeAfterTheQuiesce(t *testing.T) {
+	inTime := staleDeletingClaimAfter - deleteClaimMargin
+	for _, tc := range []struct {
+		name    string
+		hold    time.Duration
+		deletes bool
+	}{
+		{"quiesce ends inside the margin", inTime + time.Second, false},
+		{"quiesce ends in time", inTime - time.Second, true},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			w := newWS(t)
+			if err := w.Create("app"); err != nil {
+				t.Fatal(err)
+			}
+			if _, err := w.Fork("app", "main", "work", "", 0, nil); err != nil {
+				t.Fatal(err)
+			}
+			path := w.CheckoutPath("app", "work")
+			if err := os.MkdirAll(filepath.Dir(path), 0o700); err != nil {
+				t.Fatal(err)
+			}
+			if err := os.WriteFile(path, nil, 0o600); err != nil {
+				t.Fatal(err)
+			}
+			defer func(q func(string) error) { destroyQuiesce = q }(destroyQuiesce)
+			synctest.Test(t, func(t *testing.T) {
+				base := w.Store.B
+				// slowClaim with no hold: the claim write goes straight
+				// through, and the delete is S3's unconditional one.
+				b := &slowClaim{Backend: base, refKey: store.RefKey("app", "work")}
+				quiesced := 0
+				destroyQuiesce = func(string) error {
+					quiesced++
+					time.Sleep(tc.hold)
+					return nil
+				}
+				w.Store.B = b
+				derr := w.Destroy("app", "work", false)
+				w.Store.B = base
+				if quiesced != 1 {
+					t.Fatalf("precondition: the destroy quiesced the checkout %d times, want 1", quiesced)
+				}
+				ref, _, gerr := w.Store.GetRef("app", "work")
+				if tc.deletes {
+					if derr != nil || b.deletes != 1 || !errors.Is(gerr, store.ErrNotFound) {
+						t.Fatalf("destroy whose quiesce ended in time: %v, %d deletes, branch %v; want it deleted", derr, b.deletes, gerr)
+					}
+					return
+				}
+				if !errors.Is(derr, store.ErrCAS) {
+					t.Fatalf("destroy whose quiesce ended inside the margin: %v, want a retryable lost race", derr)
+				}
+				if b.deletes != 0 {
+					t.Fatalf("destroy sent %d deletes after a quiesce that ended inside the margin, want none", b.deletes)
+				}
+				if gerr != nil || ref.Deleting {
+					t.Fatalf("the branch after the destroy gave up: deleting %v, %v; want it there without the claim", ref.Deleting, gerr)
+				}
+				destroyQuiesce = func(string) error { return nil }
+				w.Store.B = b
+				derr = w.Destroy("app", "work", false)
+				w.Store.B = base
+				if derr != nil || b.deletes != 1 {
+					t.Fatalf("the retried destroy: %v, %d deletes", derr, b.deletes)
+				}
+				if _, _, err := w.Store.GetRef("app", "work"); !errors.Is(err, store.ErrNotFound) {
+					t.Fatalf("the branch after the retried destroy: %v, want it gone", err)
 				}
 			})
 		})

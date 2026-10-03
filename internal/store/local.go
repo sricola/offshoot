@@ -558,6 +558,11 @@ func (l *Local) DeleteObjects(keys []string) (deleted []string, err error) {
 	return deleted, nil
 }
 
+// WritesSettled implements store.SettledWriter: PutIf and PutReaderIf
+// compare and rename under the key's lock, and return an error only
+// before the rename that would apply the write.
+func (l *Local) WritesSettled() bool { return true }
+
 // DeleteIf implements store.ConditionalDeleter: a true compare-and-delete,
 // using the exact same per-key O_CREAT|O_EXCL lock file PutIf uses to
 // implement its own compare-and-swap (see the package doc comment on Local).

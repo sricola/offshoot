@@ -523,3 +523,22 @@ func TestLocalHeadRecordedEtag(t *testing.T) {
 		t.Fatalf("Head(copy) = (%s, %d), want (%s, %d)", etag, size, want, len(payload))
 	}
 }
+
+// TestOnlyLocalSettlesItsWrites: a local store's conditional write that
+// returns an error wrote nothing and never will, and it says so
+// (SettledWriter); S3's can still land after it reported failure (a
+// timeout, or the SDK's retry answered by its own first attempt), so it
+// must not claim to settle them, or a caller would stop waiting for a
+// write that is still on its way.
+func TestOnlyLocalSettlesItsWrites(t *testing.T) {
+	l, err := NewLocal(t.TempDir())
+	if err != nil {
+		t.Fatal(err)
+	}
+	if s, ok := Backend(l).(SettledWriter); !ok || !s.WritesSettled() {
+		t.Fatal("a local store does not say it settles its writes")
+	}
+	if _, ok := Backend((*S3)(nil)).(SettledWriter); ok {
+		t.Fatal("S3 says it settles its writes")
+	}
+}

@@ -381,8 +381,10 @@ milliseconds don't):
   treats it as abandoned (its destroy was killed) and clears it, and an
   acquire can take the branch at a new epoch. A destroy sends its delete
   only while its claim has more than 10 s of that left, so one whose claim
-  write was held up by request timeouts and SDK retries fails instead,
-  deleting nothing (retryable). But S3 has no conditional delete, so if
+  write was held up by request timeouts and SDK retries (whether the write
+  then succeeded, or reported a timeout and landed anyway), or whose
+  checkout quiesce was, fails instead, deleting nothing and removing its
+  claim (retryable). But S3 has no conditional delete, so if
   the delete request itself is held up past the 30 s, by timeouts and SDK
   retries, or the process is suspended that long between the check and
   the delete, the delete still lands and removes the branch under the

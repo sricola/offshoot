@@ -167,7 +167,15 @@ short-circuit).
 is being reaped" is mid-`destroy`/mid-reap, not stuck — the claim is
 transient (retry shortly). A `destroy` of it is refused the same way, with
 "is already being destroyed", until that destroy ends or its claim is 30
-seconds old. None of the six states above surface that claim:
+seconds old. A reap claim can outlast a destroy it gave way to: when a
+`destroy` claims an expired branch the reaper had already claimed, and
+then fails and removes its own claim, the reap claim stays until the next
+reap pass (the janitor's next tick, or `offshoot gc`), which reaps the
+branch or, if its deadline has moved since, clears the claim. Until then
+`open`, `touch`, `lease acquire` and `checkpoint` refuse it as being
+reaped. The failed destroy cannot clear the reap claim itself: it cannot
+tell it from one whose reaper is still on its way to its delete. None of
+the six states above surface either claim:
 they're computed purely from the ref's lease and the checkout's sidecar,
 which a Destroy/Reap claim doesn't touch, so `status`/`branches` reads that
 same branch as `idle` (or `active`, if it still carries a lease at that

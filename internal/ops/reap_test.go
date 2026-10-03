@@ -417,6 +417,85 @@ func TestReapLeavesABranchADestroyClaimsMidReap(t *testing.T) {
 	}
 }
 
+// TestReapWritesNothingUnderADestroyClaimOverAStaleReapingClaim: a
+// destroy sits between its claim and its delete on a branch that also
+// carries a stale reaping claim, one a reaper left before activity
+// deferred the branch's deadline, or that no longer computes a deadline.
+// The reap pass leaves the branch to that destroy and writes nothing to its
+// ref, not even the clearing of the stale reaping claim, which would move
+// the etag a local store's conditional delete compares against. The
+// destroy then deletes the branch.
+func TestReapWritesNothingUnderADestroyClaimOverAStaleReapingClaim(t *testing.T) {
+	for _, bk := range []struct {
+		name string
+		ws   func(*testing.T) *Workspace
+	}{{"local", newWS}, {"s3", newWSOnFakeS3}} {
+		for _, tc := range []struct {
+			name string
+			// touchedAt is the branch's activity clock under its 1h TTL.
+			touchedAt func(now time.Time) string
+		}{
+			{"deadline deferred", func(now time.Time) string { return now.Format(time.RFC3339Nano) }},
+			{"no deadline", func(time.Time) string { return "" }},
+		} {
+			t.Run(bk.name+"/"+tc.name, func(t *testing.T) {
+				w := bk.ws(t)
+				if err := w.Create("app"); err != nil {
+					t.Fatal(err)
+				}
+				if _, err := w.Fork("app", "main", "work", "", 0, nil); err != nil {
+					t.Fatal(err)
+				}
+				now := time.Now().UTC()
+				setTTLAt(t, w, "app", "work", "1h", tc.touchedAt(now))
+				ref, etag, err := w.Store.GetRef("app", "work")
+				if err != nil {
+					t.Fatal(err)
+				}
+				ref.Reaping = true
+				if _, err := w.Store.PutRef("app", "work", ref, etag); err != nil {
+					t.Fatal(err)
+				}
+				base := w.Store.B
+				plain := &store.Store{B: base}
+				held := &heldRefDelete{Backend: base, refKey: store.RefKey("app", "work"), arrived: make(chan struct{}), release: make(chan struct{})}
+				w.Store.B = held
+				destroyed := make(chan error, 1)
+				go func() { destroyed <- w.Destroy("app", "work", false) }()
+				select {
+				case <-held.arrived:
+				case err := <-destroyed:
+					w.Store.B = base
+					t.Fatalf("the destroy ended before its delete: %v", err)
+				case <-time.After(10 * time.Second):
+					t.Fatal("the destroy never reached its delete")
+				}
+				ref, claimEtag, err := plain.GetRef("app", "work")
+				if err != nil || !ref.Deleting || !ref.Reaping {
+					t.Errorf("precondition: the destroy's claim over the stale reaping claim: deleting %v, reaping %v, %v", ref.Deleting, ref.Reaping, err)
+				}
+				reaped, rerr := w.Reap(now)
+				_, afterEtag, aerr := plain.GetRef("app", "work")
+				close(held.release)
+				derr := <-destroyed
+				w.Store.B = base
+				if rerr != nil || len(reaped) != 0 {
+					t.Fatalf("reap under the destroy's claim = %v, %v; want nothing reaped and no error", reaped, rerr)
+				}
+				if aerr != nil || afterEtag != claimEtag {
+					t.Fatalf("the reap pass wrote the ref under the destroy's live claim (%v)", aerr)
+				}
+				if derr != nil {
+					t.Fatalf("the destroy: %v", derr)
+				}
+				if _, _, err := w.Store.GetRef("app", "work"); !errors.Is(err, store.ErrNotFound) {
+					t.Fatalf("the branch after the destroy: %v, want it gone", err)
+				}
+			})
+		}
+	}
+}
+
 // TestReapReapsABranchOnceAMidReapDestroyUnwinds: the reaping claim a
 // pass leaves under a destroy's live claim does not strand the branch.
 // When that destroy fails and unwinds its own claim instead of deleting,

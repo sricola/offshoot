@@ -36,7 +36,7 @@ const tombstoneKey = "gc/tombstones"
 // claim write then fails with ErrCAS, reported as a retryable race loss,
 // same as an unforced call). A claim write that reports failure but
 // landed is this call's own claim all the same, and Destroy goes on under
-// it (landedClaim).
+// it (landedClaim), deleting only while the claim is young enough (below).
 //
 // The lease holder's renewals do not stop under the claim
 // (store.RenewLease), so one can land between the claim and the delete;
@@ -55,10 +55,11 @@ const tombstoneKey = "gc/tombstones"
 // it is that old, ClearStaleDeleteClaims clears it and another destroy
 // takes it over.
 // So a destroy sends its delete only while its own stamp says the claim
-// has more than deleteClaimMargin (10 s) of that left; one held up past
-// that (its claim write held up by response timeouts and SDK retries,
-// whether it then succeeded or landed after reporting failure) unwinds its
-// claim and fails, retryable, deleting nothing. On a local store the delete
+// has more than deleteClaimMargin (10 s) of that left, judged after the
+// checkout quiesce; one held up past that (its claim write held up by
+// response timeouts and SDK retries, whether it then succeeded or landed
+// after reporting failure, or a slow quiesce) unwinds its claim and fails,
+// retryable, deleting nothing. On a local store the delete
 // is also conditional on the claim's etag, so a destroy whose delete lands
 // later than that fails instead. On S3 it is not: a destroy whose delete
 // request is itself held up until the claim is stale, or whose process is
@@ -105,7 +106,7 @@ func (w *Workspace) Destroy(db, branch string, force bool) error {
 
 	path := w.CheckoutPath(db, branch)
 	if _, err := os.Stat(path); err == nil {
-		if err := quiesce(path); err != nil {
+		if err := destroyQuiesce(path); err != nil {
 			// This call knows right now it isn't going to finish — unwind
 			// the claim eagerly rather than leave it for
 			// ClearStaleDeleteClaims's age-based self-heal to eventually
@@ -147,24 +148,34 @@ func (w *Workspace) Destroy(db, branch string, force bool) error {
 	return nil
 }
 
+// destroyQuiesce is the checkout quiesce Destroy runs between its claim and
+// its delete, which can take the claim's age close to the margin (see
+// Destroy). It is a var only so tests can hold it up.
+var destroyQuiesce = quiesce
+
 // landedClaim settles Destroy's claim write, of claimed against the ref
-// read at sentEtag, that reported failure (werr) but may have landed: the
-// S3 SDK's retry of a PutObject whose first attempt landed gets a 412 (or
-// a 409) back from that attempt, which the store reports as a lost
+// read at sentEtag, that reported failure (werr) but may have landed: on
+// S3, the SDK's retry of a PutObject whose first attempt landed gets a 412
+// (or a 409) back from that attempt, which the store reports as a lost
 // compare-and-swap, and a timeout can lose the response to a write that
 // landed. Reported as it stands, such a failure would leave this call's
 // claim on the ref, and the retry the error asks for would be refused
-// under it (liveDeleteClaim) until it was staleDeletingClaimAfter old. So
-// landedClaim re-reads the ref. One that carries this call's claim (its
-// DeletingAt, stamped per call) is that write, landed. With nothing but
-// the lease expiry moved since (onlyRenewed), and, without force, no lease
-// live again, Destroy goes on from the etag read, as deleteClaimedRef does
-// past a renewal over the claim, and still deletes only if the claim is
-// young enough by then (Destroy): a write that took long enough to time out
-// lands a claim that is already stale. Otherwise Destroy fails as
-// deleteClaimedRef would have failed it over the same write, and unwinds
-// its claim first. A ref without this call's claim (the write did not
-// land, or another write has since taken the claim off), or one that
+// under it (liveDeleteClaim) until it was staleDeletingClaimAfter old. A
+// backend that settles its writes before they return
+// (store.SettledWriter: Local) wrote nothing on a failure, so landedClaim
+// reports it at once there, and otherwise re-reads the ref. One that
+// carries this call's claim (its DeletingAt, stamped per call) is that
+// write, landed. With nothing but the lease expiry moved since
+// (onlyRenewed), and, without force, no lease live again, Destroy goes on
+// under it from the etag read, as deleteClaimedRef does past a renewal
+// over the claim. Going on is not yet deleting: a write that took long
+// enough to time out can land a claim already near stale, and Destroy
+// deletes only while the claim has more than deleteClaimMargin left to
+// stand; one closer than that to stale unwinds the claim and fails,
+// retryable, with no delete sent. A ref moved otherwise fails Destroy as
+// deleteClaimedRef would have failed it over the same write, and the
+// claim is unwound first. A ref without this call's claim (the write did
+// not land, or another write has since taken the claim off), or one that
 // cannot be read, reports the write's failure.
 //
 // A ref still at sentEtag has had nothing land on it, so the failure gave
@@ -183,6 +194,9 @@ func (w *Workspace) landedClaim(db, branch string, claimed store.Ref, sentEtag s
 	failed := werr
 	if errors.Is(werr, store.ErrCAS) {
 		failed = fmt.Errorf("ops: destroy lost a race on %s@%s (retry): %w", db, branch, werr)
+	}
+	if s, ok := w.Store.B.(store.SettledWriter); ok && s.WritesSettled() {
+		return "", failed
 	}
 	cur, etag, err := w.Store.GetRef(db, branch)
 	for n := 0; err == nil && etag == sentEtag && n < claimSettleReads; n++ {
@@ -308,7 +322,8 @@ func onlyRenewed(claimed, cur store.Ref) bool {
 // re-reads and tries again while the claim is still this call's, up to
 // destroyDeleteAttempts writes. A claim the unwind could not clear blocks
 // acquires and other destroys until it is staleDeletingClaimAfter old,
-// when ClearStaleDeleteClaims clears it and a destroy takes it over.
+// when ClearStaleDeleteClaims clears it and a destroy takes it over. A
+// reaping claim under this one is left for the reaper (see reapOne).
 func (w *Workspace) unwindDeletingClaim(db, branch, claimedAt string) {
 	for attempt := 1; attempt <= destroyDeleteAttempts; attempt++ {
 		ref, etag, err := w.Store.GetRef(db, branch)
