@@ -59,3 +59,37 @@ func (s *Session) renewLoop(ctx context.Context, every, ttl time.Duration) {
 		s.mu.Unlock()
 	}
 }
+
+// releaseAttempts and releaseRetryPause bound Close's lease release. A
+// release can lose its compare-and-swap to a write that leaves the lease
+// ours — touch and protect both stamp the ref while a session is live — or
+// hit a transient store error, and a later attempt gets past either.
+// Without the retry, one failure left the branch leased until the lease
+// expired. releaseRetryPause is a var so tests can shrink it.
+const releaseAttempts = 3
+
+var releaseRetryPause = 50 * time.Millisecond
+
+// releaseLease releases l through release, retrying up to releaseAttempts
+// times with a pause that grows by releaseRetryPause each time. Every
+// attempt re-reads the ref and releases only while it still names l's
+// holder and epoch (store.ReleaseLease), so an attempt that finds the lease
+// gone — ErrLeaseLost, which is also what a release that landed but
+// reported an error reads back as — counts as released. ErrNotFound (the
+// branch was destroyed) returns at once: no attempt can succeed.
+func releaseLease(release func(store.Lease) error, l store.Lease) error {
+	var err error
+	for attempt := 0; attempt < releaseAttempts; attempt++ {
+		if attempt > 0 {
+			time.Sleep(time.Duration(attempt) * releaseRetryPause)
+		}
+		err = release(l)
+		switch {
+		case err == nil, errors.Is(err, store.ErrLeaseLost):
+			return nil
+		case errors.Is(err, store.ErrNotFound):
+			return err
+		}
+	}
+	return err
+}

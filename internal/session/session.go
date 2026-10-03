@@ -896,10 +896,7 @@ func (s *Session) Close() error {
 	<-s.renewDone
 	lease := s.Lease()
 
-	var relErr error
-	if err := s.ws.ReleaseLease(lease); err != nil && !errors.Is(err, store.ErrLeaseLost) {
-		relErr = err
-	}
+	relErr := releaseLease(s.ws.ReleaseLease, lease)
 	if s.ownsDir {
 		s.flushMu.Lock()
 		os.RemoveAll(s.dir)
