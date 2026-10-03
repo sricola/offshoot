@@ -524,6 +524,27 @@ func parseByteSize(raw string) (int64, error) {
 	return n * mult, nil
 }
 
+// fdBudgetFlag extracts serve's -fd-budget from args. Only an absent flag
+// means daemon.DefaultFDBudget: a given 0 stays 0, which the janitor reads
+// as unlimited, so it must not fall back to the default the way an empty
+// -ro-cache-budget does.
+func fdBudgetFlag(args []string) (n int, rest []string, err error) {
+	raw, rest, given, err := extractFlag(args, "-fd-budget")
+	if err != nil {
+		return 0, nil, err
+	}
+	if !given {
+		return daemon.DefaultFDBudget, rest, nil
+	}
+	if n, err = strconv.Atoi(raw); err != nil {
+		return 0, nil, fmt.Errorf("-fd-budget: %w", err)
+	}
+	if n < 0 {
+		return 0, nil, fmt.Errorf("-fd-budget %d must be >= 0 (0 means unlimited)", n)
+	}
+	return n, rest, nil
+}
+
 func main() {
 	if err := run(os.Args[1:]); err != nil {
 		fmt.Fprintln(os.Stderr, "offshoot:", err)
@@ -1224,20 +1245,9 @@ func run(args []string) error {
 		if err != nil {
 			return fmt.Errorf("-ro-cache-budget: %w", err)
 		}
-		fdBudgetStr, rest, fdBudgetGiven, err := extractFlag(rest, "-fd-budget")
+		fdBudget, rest, err := fdBudgetFlag(rest)
 		if err != nil {
 			return err
-		}
-		fdBudget := daemon.DefaultFDBudget
-		if fdBudgetGiven {
-			n, err := strconv.Atoi(fdBudgetStr)
-			if err != nil {
-				return fmt.Errorf("-fd-budget: %w", err)
-			}
-			if n < 0 {
-				return fmt.Errorf("-fd-budget %d must be >= 0 (0 means unlimited)", n)
-			}
-			fdBudget = n
 		}
 		httpAddr, rest, _, err := extractFlag(rest, "-http")
 		if err != nil {

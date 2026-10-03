@@ -13,6 +13,7 @@ import (
 	"time"
 
 	"github.com/sricola/offshoot/internal/daemon"
+	"github.com/sricola/offshoot/internal/dbfile"
 	"github.com/sricola/offshoot/internal/reflink"
 	"github.com/sricola/offshoot/internal/testutil"
 )
@@ -284,6 +285,101 @@ func TestServeBadFDBudgetIsRejected(t *testing.T) {
 		if err == nil || !strings.HasPrefix(err.Error(), "-fd-budget") {
 			t.Fatalf("serve -fd-budget %s = %v, want an -fd-budget error", v, err)
 		}
+	}
+}
+
+// TestFDBudgetFlag: the value given is the value parsed, a given 0 stays 0
+// (unlimited) instead of falling back to the default, and only an absent
+// flag means the default.
+func TestFDBudgetFlag(t *testing.T) {
+	for _, c := range []struct {
+		args []string
+		want int
+	}{
+		{[]string{"-socket", "s"}, daemon.DefaultFDBudget},
+		{[]string{"-fd-budget", "5", "-socket", "s"}, 5},
+		{[]string{"-fd-budget=5", "-socket", "s"}, 5},
+		{[]string{"-fd-budget", "0", "-socket", "s"}, 0},
+	} {
+		n, rest, err := fdBudgetFlag(append([]string(nil), c.args...))
+		if err != nil || n != c.want {
+			t.Errorf("fdBudgetFlag(%q) = %d, %v; want %d", c.args, n, err, c.want)
+		}
+		if len(rest) != 2 || rest[0] != "-socket" || rest[1] != "s" {
+			t.Errorf("fdBudgetFlag(%q) left %q, want [-socket s]", c.args, rest)
+		}
+	}
+	for _, v := range []string{"-1", "lots", "1.5", ""} {
+		if _, _, err := fdBudgetFlag([]string{"-fd-budget=" + v}); err == nil {
+			t.Errorf("fdBudgetFlag(-fd-budget=%q) accepted it", v)
+		}
+	}
+}
+
+// TestServeFDBudgetReachesTheJanitor: the -fd-budget serve parses is the
+// budget its janitor evicts to, not the default. The CLI runs in this
+// process, so the descriptors the checkouts below cache are the ones the
+// daemon's janitor sees.
+func TestServeFDBudgetReachesTheJanitor(t *testing.T) {
+	store := filepath.Join(t.TempDir(), "s")
+	call(t, store, "init")
+	call(t, store, "create", "app")
+	var dir string
+	for _, b := range []string{"a", "b", "c"} {
+		call(t, store, "fork", "app", b)
+		dir = filepath.Dir(strings.TrimSpace(call(t, store, "checkout", "app@"+b)))
+	}
+	cached := func() int {
+		abs, _ := filepath.Abs(dir)
+		n := 0
+		for _, e := range dbfile.Entries() {
+			if !e.Orphan && strings.HasPrefix(e.Path, abs+string(filepath.Separator)) {
+				n++
+			}
+		}
+		return n
+	}
+	if n := cached(); n < 3 {
+		t.Fatalf("precondition: %d cached checkout descriptor(s), want >= 3", n)
+	}
+
+	sockDir, err := os.MkdirTemp("", "offshoot-cli-test-*")
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { os.RemoveAll(sockDir) })
+	sock := filepath.Join(sockDir, "fd.sock")
+	serveDone := make(chan error, 1)
+	go func() {
+		serveDone <- run([]string{"-store", store, "serve", "-socket", sock, "-fd-budget", "1", "-reap-every", "20ms"})
+	}()
+	t.Cleanup(func() {
+		run([]string{"-store", store, "session", "shutdown", "-socket", sock})
+	})
+	deadline := time.Now().Add(10 * time.Second)
+	for !daemon.Running(sock) {
+		if time.Now().After(deadline) {
+			t.Fatal("daemon never came up")
+		}
+		time.Sleep(20 * time.Millisecond)
+	}
+	// The default budget (64) would keep all three.
+	for cached() > 1 {
+		if time.Now().After(deadline) {
+			t.Fatalf("%d checkout descriptor(s) still cached under serve -fd-budget 1", cached())
+		}
+		time.Sleep(20 * time.Millisecond)
+	}
+	if err := run([]string{"-store", store, "session", "shutdown", "-socket", sock}); err != nil {
+		t.Fatal(err)
+	}
+	select {
+	case err := <-serveDone:
+		if err != nil {
+			t.Fatalf("serve returned: %v", err)
+		}
+	case <-time.After(10 * time.Second):
+		t.Fatal("serve did not exit after session shutdown")
 	}
 }
 
