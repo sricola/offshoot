@@ -17,6 +17,15 @@ Pin an exact version if you depend on format stability. The full contract:
 
 ## [Unreleased]
 
+Nothing yet.
+
+## [0.2.16] - 2026-10-03
+
+Small hardening: one checkpoint-stamp fix for coarse-mtime filesystems,
+cheaper post-checkpoint verification on S3-compatible providers that
+reformat etags, and the LTX decoder pinned by test at the largest page
+size and the LZ4 worst case.
+
 ### Fixed
 
 - **A `checkpoint` could stamp its checkout trusted for content it never
