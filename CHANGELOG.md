@@ -17,7 +17,72 @@ Pin an exact version if you depend on format stability. The full contract:
 
 ## [Unreleased]
 
-Nothing yet.
+### Fixed
+
+- **`checkpoint --force` on a branch with a live session wrote a second
+  writer's head under the session's epoch.** The docs said `--force`
+  fenced the session; it did not. It wrote the head and a checkpoint entry
+  under the session's own epoch and left the session's lease in place, so
+  the session went on flushing on top of an object it had not written, a
+  shape the chain resolver assumes cannot happen. `--force` no longer
+  overrides a live lease on `checkpoint`: the checkpoint is refused, the
+  session is untouched, and the message says to close the session (or wait
+  for the other checkpoint) and retry. `--force` still checkpoints a
+  detached checkout.
+- **Two at-rest checkpoints on one branch could still leave the head on the
+  wrong content.** v0.2.13 made two racers survivable by checking, after
+  the winner's ref write, whether the store still held its content. Two
+  windows were left: a third racer overwriting the shared object key after
+  that check, and a losing snapshot landing beside a winning segment from a
+  writer that then died before cleaning up. An at-rest checkpoint now takes
+  the branch lease before it writes its object and releases it in the ref
+  write that advances the head. The acquire bumps the epoch, so the object
+  key is private to the call and nothing else writes it; an object an
+  earlier writer left at the same txid sits under an older epoch, never
+  anchors the head, and is reclaimed by GC.
+
+### Changed
+
+- **A second `offshoot checkpoint` on a branch is refused while the first
+  runs**, with `has a live lease held by "checkpoint:<host>/<pid>/<nonce>"
+  ... (another checkpoint is in progress)`, instead of racing it. So is a
+  session open on the branch (the daemon's `open`, both SDKs) and an
+  unforced `rollback`, `promote --onto`, `compact` or `destroy`; forced, a
+  repoint clears the checkpoint's lease, and the checkpoint fails without
+  committing and deletes its object. Every at-rest live-lease refusal now
+  satisfies `errors.Is(err, store.ErrLeaseHeld)`.
+- **A checkpoint can now fail after it has started, in two new ways.** If
+  its lease ends while it runs (a forced repoint, `offshoot lease
+  release`, `destroy --force`, or a reclaim after the process stalled past
+  the 30 s TTL), it reports that it `did not commit`, with either `its
+  lease ended while it ran` or `store: branch lease lost` and the branch's
+  current state, and deletes the object it uploaded. If `touch`, `protect`
+  or a TTL change win the head write's compare-and-swap three times
+  running, it reports `the head write lost 3 compare-and-swaps to
+  concurrent ref writes (retry)`, deletes its object and releases the
+  lease, so a retry starts clean. Neither moves the head.
+- **An at-rest checkpoint makes three more ref requests and, for a
+  segment, two fewer `LIST`s.** It reads the ref, acquires the lease (a
+  read and a write), renews it every `LeaseTTL/3` (10 s by default; one
+  read and one write each) while it uploads, and commits with a read and a
+  write that also releases the lease. The probes for another checkpoint's
+  snapshot at its txid, one `LIST` before the write and one after, are
+  gone. The head write retries up to three times when a `touch`, `protect`
+  or TTL change wins the compare-and-swap, and the lease acquire and the
+  head write each recognise their own write when only the response was
+  lost, as when the S3 SDK retries a write that had landed.
+- Upgrade every `offshoot` binary that touches a store together: an older
+  binary's `checkpoint --force` still writes under whatever epoch the ref
+  carries, including one a newer checkpoint's lease holds.
+
+### Added
+
+- While an at-rest checkpoint runs, the branch shows as leased: `offshoot
+  status` reports `state=active`, and `offshoot lease list`, the daemon's
+  `branches` op and both SDKs' `Branch.lease_holder` name
+  `checkpoint:<host>/<pid>/<nonce>`. The per-call nonce keeps two
+  checkpoints in one process (an MCP server, a script) from sharing an
+  epoch.
 
 ## [0.2.16] - 2026-10-03
 

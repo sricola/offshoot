@@ -328,9 +328,7 @@ Longer: [core concepts (glossary)](docs/concepts.md), [architecture](docs/archit
   meant to survive power loss, not only process death. No harness cuts
   power.
 - **Explicitly at risk:** committed-but-unflushed writes in a daemon
-  session, bounded by `-flush-every`. Two at-rest `checkpoint` commands on
-  one branch at the same moment are detected and recovered but remain an
-  unsupported pattern.
+  session, bounded by `-flush-every`.
 
 [How offshoot is tested](docs/testing.md) names each harness, and
 [limitations](docs/limitations.md) states the remaining windows plainly.
