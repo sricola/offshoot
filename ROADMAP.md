@@ -363,9 +363,10 @@ open wart (its own spec said "N materialized forks cost up to N×G").
     compute the etag `PutIf` returned.
   - A Dependabot `pip` entry for `requirements/`, so the hash-pinned CI
     locks get update PRs like the Go modules and Actions do.
-  - Commit a 64 KiB-page, incompressible ltx v0.5.1 fixture beside the
+  - ✅ Commit a 64 KiB-page, incompressible ltx v0.5.1 fixture beside the
     4 KiB ones, so the pinned frame shape is tested at the largest page
-    size and at the LZ4 worst-case block.
+    size and at the LZ4 worst-case block
+    (`internal/ltxio/testdata/ltx-v0.5.1-64k`).
   - Apply the 1 s racily-clean margin to the checkpoint stamp's
     matching-fingerprint shortcut (`stampCheckpoint`): on a coarse-mtime
     filesystem in WAL mode a foreign same-size write inside the quiesce

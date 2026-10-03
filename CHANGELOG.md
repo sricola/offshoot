@@ -17,7 +17,15 @@ Pin an exact version if you depend on format stability. The full contract:
 
 ## [Unreleased]
 
-Nothing yet.
+### Added
+
+- A 64 KiB-page ltx v0.5.1 fixture (`internal/ltxio/testdata/ltx-v0.5.1-64k`)
+  beside the 4 KiB one. Its data page is random bytes LZ4 cannot shrink, so
+  the page frame carries a stored block of exactly one page: the largest
+  frame the pinned v0.5.1 shape can hold and the edge of the decode guard's
+  block limit. `TestDecodesLTXv051FrameFormat` now decodes both sets and
+  asserts the 64 KiB one really is incompressible; both seed the fuzz
+  targets.
 
 ## [0.2.15] - 2026-10-02
 
