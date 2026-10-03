@@ -1,12 +1,14 @@
 package main
 
 import (
+	"context"
 	"database/sql"
 	"fmt"
 	"math/rand"
 	"os"
 	"strings"
 
+	"github.com/sricola/offshoot/internal/dbfile"
 	"github.com/sricola/offshoot/internal/ops"
 )
 
@@ -80,11 +82,28 @@ func buildSeed(ws *ops.Workspace, warehouses int) (int64, error) {
 // synchronous=OFF because durability of a scratch checkout is not what is
 // being measured.
 func writeSeedRows(path string, warehouses int) error {
-	db, err := sql.Open("sqlite3", path)
+	// Pinned for the guardrail's rule like stepSQL (see there).
+	release, ino, err := dbfile.Hold(path)
+	if err != nil {
+		return err
+	}
+	defer release()
+	db, err := sql.Open("sqlite3", dbfile.NoCreateDSN(path, ""))
 	if err != nil {
 		return err
 	}
 	db.SetMaxOpenConns(1)
+	conn, err := db.Conn(context.Background())
+	if err != nil {
+		db.Close()
+		return err
+	}
+	if err := dbfile.Verify(path, ino); err != nil {
+		conn.Close()
+		db.Close()
+		return err
+	}
+	conn.Close()
 	if _, err := db.Exec(`PRAGMA journal_mode=DELETE; PRAGMA synchronous=OFF`); err != nil {
 		db.Close()
 		return err
