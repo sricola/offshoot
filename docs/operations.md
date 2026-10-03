@@ -181,12 +181,13 @@ transient (retry shortly). A `destroy` of it is refused the same way, with
 seconds old. A reap claim can outlast a destroy it gave way to: when a
 `destroy` claims an expired branch the reaper had already claimed, and
 then fails and removes its own claim, the reap claim stays until the next
-reap pass (the janitor's next tick, or `offshoot gc`), which reaps the
-branch or, if its deadline has moved since, clears the claim. Until then
-`open`, `touch`, `lease acquire` and `checkpoint` refuse it as being
-reaped. The failed destroy cannot clear the reap claim itself: it cannot
-tell it from one whose reaper is still on its way to its delete. None of
-the seven states above surface either claim:
+reap pass (the janitor's next tick, or `offshoot gc`). That pass reaps
+the branch or clears the claim: it clears it if the branch's deadline has
+moved since, or if its own destroy of the branch fails (a busy checkout,
+say). Until then `open`, `touch`, `lease acquire` and `checkpoint` refuse
+it as being reaped. The failed destroy cannot clear the reap claim
+itself: it cannot tell it from one whose reaper is still on its way to
+its delete. None of the seven states above surface either claim:
 they're computed purely from the ref's lease and the checkout's sidecar,
 which a Destroy/Reap claim doesn't touch, so `status`/`branches` reads that
 same branch as `idle` (or `active`, if it still carries a lease at that

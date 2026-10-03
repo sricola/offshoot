@@ -133,12 +133,13 @@ func (w *Workspace) reapOne(db, branch string, now time.Time) (bool, error) {
 		// compares against, as above. Left set, the reaping claim goes
 		// with the branch when that destroy deletes it, or, if it unwinds
 		// instead, the next cycle reaps the branch or clears the claim.
-		// Until that cycle, touch and acquires refuse the branch as being
-		// reaped (store.ErrReaping). The destroy's unwind leaves the
-		// reaping claim alone: it cannot tell this pass's claim from one
-		// whose reaper is still between its claim and its Destroy, and
-		// clearing that one would let a touch land that its Destroy, which
-		// does not look at the deadline again, deletes past.
+		// Until that cycle, touch refuses the branch as being reaped
+		// ("too late to touch") and acquires with store.ErrReaping. The
+		// destroy's unwind leaves the reaping claim alone: it cannot tell
+		// this pass's claim from one whose reaper is still between its
+		// claim and its Destroy, and clearing that one would let a touch
+		// land that its Destroy, which does not look at the deadline
+		// again, deletes past.
 		if ref2, etag2, gerr := w.Store.GetRef(db, branch); gerr == nil && ref2.Reaping && !liveDeleteClaim(ref2, time.Now()) {
 			ref2.Reaping = false
 			_, _ = w.Store.PutRef(db, branch, ref2, etag2) // best effort; next cycle retries
