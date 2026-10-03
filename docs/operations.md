@@ -583,17 +583,24 @@ any descriptor on it would drop them. A checkout that gets re-materialized
 (destroy, reap) strands its old descriptor, and with it the unlinked
 file's disk: a full copy of the database. So does a `~by-chain/` entry
 the by-chain bound prunes. offshoot closes a stranded descriptor as soon
-as nothing pins it: right after the materialize, by-chain prune or
-destroy that stranded it, and again on every janitor pass, so
-`offshoot mcp` and a daemon started with `-reap-every 0` reclaim them
-too. `serve -fd-budget N` (default `64`, `0` unlimited) bounds the rest:
+as nothing pins it. A process closes the ones it strands itself right
+after the materialize, by-chain prune or destroy that stranded them. A
+checkout another process removes or replaces (a CLI `destroy`, `gc` or
+`checkout` against the store a daemon or `offshoot mcp` is serving) is
+found only by a full sweep: the daemon's janitor runs one every pass, and
+`offshoot mcp` on every `-reap-every` tick (default `60s`). With
+`-reap-every 0`, either process keeps those until it restarts.
+`serve -fd-budget N` (default `64`, `0` unlimited) bounds the rest:
 each janitor pass closes cached descriptors least recently used first
 until `N` remain, never one an open session or an in-flight read pins,
 so a daemon with more open sessions than `N` keeps one per session. The
 budget counts every file the cache holds, `checkouts-ro/<db>/~by-chain/`
 entries included, and nothing else (not sockets, not WAL readers).
 `offshoot_dbfile_descriptors` and the daemon `status` op's
-`dbfile_descriptors` report the total.
+`dbfile_descriptors` report the total. A session whose checkout another
+request re-materializes or removes in the instant its capture engine
+opens it fails at once (state `error`, `capture stopped: dbfile: path was
+replaced while a SQLite open held it`); close and reopen it.
 
 **Disk.** `Checkout` reuses a checkout that's already clean and current at
 the branch's head instead of re-materializing it, so a daemon that keeps

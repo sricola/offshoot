@@ -27,35 +27,66 @@ Pin an exact version if you depend on format stability. The full contract:
   inode, so a capture engine or `quiesce` still on the old file could lose
   its SHARED lock with no error. The old descriptor is now kept, and closed
   only explicitly, once nothing pins its inode.
-- **A long-lived process kept a full copy of every re-materialized or
-  deleted checkout on disk.** Each re-materialize (a dirty or stale
-  `checkout` or `session open`, a rollback, promote or compact refresh),
-  each `destroy` or reap, and on a cloning filesystem each by-chain cache
-  build and prune stranded one descriptor for the life of the daemon or
-  `offshoot mcp` process, holding the unlinked file's disk until a
-  restart. Those descriptors are now closed as soon as nothing pins them:
-  right after the materialize, by-chain prune or delete that strands them,
-  and on every janitor tick.
+- **A long-lived process kept a full copy of every deleted checkout on
+  disk.** Each `destroy` or reap of a checked-out branch, and on a cloning
+  filesystem each by-chain cache build and prune, stranded a descriptor on
+  a file nothing would ever ask for again, holding the unlinked file's
+  disk for the life of the daemon or `offshoot mcp` process. Those
+  descriptors are now closed as soon as nothing pins them: right after the
+  destroy, reap, build or prune that strands them in the same process, and
+  by a full sweep on every janitor tick and every `offshoot mcp`
+  `-reap-every` tick, which also finds checkouts another process removed.
+  A process run with `-reap-every 0` keeps descriptors another process
+  stranded until it restarts.
+- **On Linux, refreshing a checkout's shadow could drop a running
+  session's SQLite lock.** After a `checkout`, a rollback, promote or
+  compact refresh, and a session's clean close, offshoot clones the
+  checkout to its `.shadow` for the next segment checkpoint. On Linux that
+  clone opened and closed the checkout, even on ext4 where the clone then
+  fails, and closing any descriptor releases every POSIX lock the process
+  holds on the file. If another request had opened a session on that
+  checkout by then (an `open` right after a `close` of the same branch, or
+  racing an at-rest `checkout`), its capture engine lost its SHARED lock
+  with no error, so a foreign writer's close-time checkpoint could later
+  fold and unlink the WAL under it. The clone now goes through offshoot's
+  own pinned descriptor and opens nothing on the checkout. macOS was not
+  affected: clonefile(2) takes paths.
 - **A checkout removed while `quiesce` or a capture engine was opening it
   came back as an empty database.** SQLite creates a missing file on open,
   so a checkout removed between a caller's check and the open (a `destroy`
   or reap racing `branches`, or an engine started on a checkout that had
   just been removed) left an empty database at its path. Those opens now
-  never create the file: a path already gone fails with "no such file or
-  directory", and one removed after the pin fails to open.
+  never create the file. `quiesce` (behind `checkout`, `destroy`,
+  `branches` and the refreshes) reports a checkout removed or renamed over
+  while it was opening it as `ops: the checkout was replaced or removed
+  while it was being opened (retry)`, and `destroy` no longer calls such a
+  checkout "in use".
+- **`create --from` a path containing `?` imported an empty database.**
+  The import opened `<path>?_busy_timeout=5000`, and go-sqlite3 cut the
+  name at the first `?`: `create imp --from '/dir/q?x.db'` created an
+  empty `/dir/q` and imported that, with no error. In-process SQLite opens
+  of an import source or a checkout now escape `?`, `#` and `%`, so the
+  path names exactly that file. `quiesce` and the capture engine get the
+  same fix for a store root containing those characters.
 
 ### Changed
 
 - **Every in-process SQLite open of a checkout pins the file first.** The
   capture engine, `quiesce` (behind `checkout`, `checkpoint`, `branches`,
   rollback, promote and compact, `fork`'s uncheckpointed-changes warning,
-  `destroy` and reap) and `create`'s read of an imported file take a pin on
-  the file's inode before opening it and release it only after the
-  connection closes. If the path is renamed over between the pin and the
-  open, they refuse with `dbfile: path was replaced while a SQLite open held
-  it` rather than work on a file the pin does not cover. A test fails on
-  any new `sql.Open` in the tree until it is classified, and on a pinned
-  one whose release could run before its connection closes.
+  `destroy` and reap) and `create`'s read of an imported file pin the file
+  and its path before opening it and release them only after the
+  connection closes. Until then no descriptor offshoot caches under that
+  path is closed, whatever file the path names by then. If the path is
+  renamed over or removed between the pin and the open, the open is
+  refused rather than left working on a file that is no longer the
+  checkout: `quiesce` fails with a retryable error (see Fixed), and
+  `create --from` fails the import. A session's capture engine that loses
+  this race still opens and then fails at once: the branch shows state
+  `error` with `capture stopped: dbfile: path was replaced while a SQLite
+  open held it`, and closing and reopening the session recovers. A test
+  fails on any new `sql.Open` in the tree until it is classified, and on a
+  pinned one whose release could run before its connection closes.
 
 ### Added
 
@@ -69,7 +100,8 @@ Pin an exact version if you depend on format stability. The full contract:
   `offshoot_dbfile_evicted_total{reason="stranded"|"budget"}`.
 - **The daemon `status` op reports `dbfile_descriptors`.** Python
   `Client.daemon_status()` and TypeScript `client.daemonStatus()` return the
-  open sessions plus that count; `status()` is unchanged.
+  open sessions plus that count (`None` / `undefined` from an older daemon
+  that does not report it); `status()` is unchanged.
 
 ## [0.2.16] - 2026-10-03
 

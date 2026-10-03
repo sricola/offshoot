@@ -1218,10 +1218,15 @@ and with it this bound, off.
 
 Separately, whatever the budget: a descriptor whose checkout was renamed
 over (re-materialized) or deleted is stranded, holding the unlinked file's
-disk, and is closed as soon as nothing pins it. That happens right after
-the checkout, rollback, promote or compact refresh, by-chain prune,
-destroy or reap that stranded it, and on every janitor pass. `offshoot
-mcp` gets the same reclaim without a janitor.
+disk, and is closed as soon as nothing pins it. When this process made the
+strand, that happens right after the checkout, rollback, promote or
+compact refresh, by-chain prune, destroy or reap that made it. A checkout
+another process removed or replaced (a CLI `destroy`, `gc` or `checkout`
+against the same store) is found only by the full sweep every janitor
+pass runs. `offshoot mcp` reclaims its own strands the same way and runs
+the full sweep on every `-reap-every` tick, daemon or not. With
+`-reap-every 0`, the daemon or `offshoot mcp` keeps descriptors stranded
+by another process until it restarts.
 
 Metrics: `offshoot_dbfile_descriptors` (cached plus stranded),
 `offshoot_dbfile_pins`, `offshoot_dbfile_stranded_pinned` (stranded but
@@ -1478,7 +1483,9 @@ socket, the MCP process defers to it entirely and logs once that it's
 skipping its own pass — never a second writer racing the daemon's own
 janitor against the same store. Either way, `-reap-every` runs **no GC**:
 reclaiming a reaped branch's storage still needs `offshoot gc` (by hand) or
-a running `offshoot serve` daemon.
+a running `offshoot serve` daemon. Each tick, daemon or not, also closes
+this process's descriptors on checkouts that were renamed over or removed
+(see `serve -fd-budget`), including ones another process removed.
 
 **Annotations.** Every tool's `tools/list` entry carries an explicit
 `annotations` object — `readOnlyHint`, `destructiveHint`, `idempotentHint`,

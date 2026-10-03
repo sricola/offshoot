@@ -375,6 +375,13 @@ milliseconds don't):
   to a temp file first), so a legitimate hold is milliseconds — but a
   process paused for over 30 s inside that window can have its lock
   broken.
+- **Wait for `close` to return before reopening the same branch.** The
+  daemon frees a session's slot before its close finishes, and its at-rest
+  `checkout`, `rollback`, `promote` and `compact` check for an open session
+  without reserving the branch. An `open` of that branch landing in either
+  window can be fenced soon after (the closing session's lease release
+  clears the new one's lease), or fail at once because the checkout was
+  replaced under its capture engine ([status](status.md#daemon-and-durability)).
 - **Never `export --force` over a database another process has open.**
   `export` writes a temp file and renames it over the destination; a
   process with the old file open keeps writing to the replaced inode, and
