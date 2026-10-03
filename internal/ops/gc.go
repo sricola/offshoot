@@ -54,12 +54,17 @@ const tombstoneKey = "gc/tombstones"
 // (liveDeleteClaim), not for as long as its destroy may still delete: once
 // it is that old, ClearStaleDeleteClaims clears it and another destroy
 // takes it over.
-// On a local store the delete is conditional on the claim's etag, so a
-// destroy that gets to its delete later than that fails instead. On S3 it
-// is not: a destroy whose delete lands more than 30 s after its claim (a
-// claim or delete request held up by response timeouts and SDK retries, or
-// a suspended process) can delete a branch an acquire took after the
-// janitor cleared its claim (docs/limitations.md).
+// So a destroy sends its delete only while its own stamp says the claim
+// has more than deleteClaimMargin (10 s) of that left; one held up past
+// that (its claim write held up by response timeouts and SDK retries,
+// whether it then succeeded or landed after reporting failure) unwinds its
+// claim and fails, retryable, deleting nothing. On a local store the delete
+// is also conditional on the claim's etag, so a destroy whose delete lands
+// later than that fails instead. On S3 it is not: a destroy whose delete
+// request is itself held up until the claim is stale, or whose process is
+// suspended that long between that check and its delete, can delete a
+// branch an acquire took after the janitor cleared its claim
+// (docs/limitations.md).
 func (w *Workspace) Destroy(db, branch string, force bool) error {
 	if err := store.ValidateName(db); err != nil {
 		return err
@@ -109,6 +114,16 @@ func (w *Workspace) Destroy(db, branch string, force bool) error {
 			return fmt.Errorf("ops: checkout in use; close connections before destroy: %w", err)
 		}
 	}
+	// The claim's stamp is this call's own, so its age needs no read of
+	// the ref. A claim too near staleDeletingClaimAfter old may be cleared
+	// by the janitor on any host, and the branch taken at a new epoch,
+	// before the delete lands; on S3 that delete would then remove the
+	// branch under the new lease.
+	if !liveDeleteClaim(ref, time.Now().Add(deleteClaimMargin)) {
+		w.unwindDeletingClaim(db, branch, ref.DeletingAt)
+		return fmt.Errorf("ops: destroy of %s@%s was held up too long to delete under its claim (made at %s; another host may clear a claim %s old and take the branch), so it deleted nothing (retry): %w",
+			db, branch, ref.DeletingAt, staleDeletingClaimAfter, store.ErrCAS)
+	}
 	// DeleteRefIf is a true CAS delete on the local backend (belt-and-
 	// suspenders on top of the claim above) and an unconditional delete on
 	// S3 (which cannot condition a DeleteObject call at all) — either way,
@@ -144,7 +159,9 @@ func (w *Workspace) Destroy(db, branch string, force bool) error {
 // DeletingAt, stamped per call) is that write, landed. With nothing but
 // the lease expiry moved since (onlyRenewed), and, without force, no lease
 // live again, Destroy goes on from the etag read, as deleteClaimedRef does
-// past a renewal over the claim. Otherwise Destroy fails as
+// past a renewal over the claim, and still deletes only if the claim is
+// young enough by then (Destroy): a write that took long enough to time out
+// lands a claim that is already stale. Otherwise Destroy fails as
 // deleteClaimedRef would have failed it over the same write, and unwinds
 // its claim first. A ref without this call's claim (the write did not
 // land, or another write has since taken the claim off), or one that
@@ -340,6 +357,13 @@ func deleteClaimFresh(at, now time.Time) bool {
 // ordinary clock skew between hosts sharing a store (see deleteClaimFresh).
 const deleteClaimClockSlack = time.Minute
 
+// deleteClaimMargin is how much of its staleDeletingClaimAfter a destroy's
+// own claim must still have left when the destroy sends its delete: room
+// for that delete to land, and for a janitor whose clock runs a little
+// ahead of this one, before any host may count the claim abandoned and
+// clear it (see Destroy).
+const deleteClaimMargin = 10 * time.Second
+
 // staleDeletingClaimAfter bounds how long a Destroy claim (Ref.Deleting) can
 // sit unresolved before ClearStaleDeleteClaims treats it as abandoned by a
 // crashed Destroy call rather than one still legitimately in flight. Destroy
@@ -348,8 +372,9 @@ const deleteClaimClockSlack = time.Minute
 // own internal busy-timeout) — order of milliseconds in the healthy case, so
 // this is deliberately generous, matching the local backend's own
 // lock-staleness window (Local.lock: 30s) rather than trying to tune a
-// tighter bound. On S3, where the delete is unconditional, it is also how
-// long a destroy has to reach its delete safely (see Destroy).
+// tighter bound. On S3, where the delete is unconditional, it also bounds
+// how long a destroy has to reach its delete safely: a destroy sends its
+// delete only with more than deleteClaimMargin of this left (see Destroy).
 const staleDeletingClaimAfter = 30 * time.Second
 
 // ClearStaleDeleteClaims self-heals a Deleting claim (Milestone 4 Task 6b)

@@ -9,6 +9,7 @@ import (
 	"sync"
 	"sync/atomic"
 	"testing"
+	"testing/synctest"
 	"time"
 
 	"github.com/sricola/offshoot/internal/store"
@@ -1148,5 +1149,149 @@ func TestDestroyWaitsForAClaimWriteStillInFlight(t *testing.T) {
 				}
 			})
 		}
+	}
+}
+
+// slowClaim holds up a destroy's claim write of refKey for hold before
+// passing it on, as response timeouts and SDK retries hold up a PutObject
+// on S3, and hides the wrapped backend's conditional delete, as S3 has
+// none: a destroy's delete of refKey is a plain Delete. beforeDelete, when
+// set, runs as that delete is sent, before it lands: what other hosts do
+// while it is on its way. Run under synctest, so holds take no real time.
+type slowClaim struct {
+	store.Backend
+	refKey       string
+	hold         time.Duration
+	beforeDelete func()
+	deletes      int
+}
+
+func (b *slowClaim) PutIf(key string, data []byte, ifMatch string) (string, error) {
+	var r store.Ref
+	if key == b.refKey && json.Unmarshal(data, &r) == nil && r.Deleting {
+		time.Sleep(b.hold)
+	}
+	return b.Backend.PutIf(key, data, ifMatch)
+}
+
+func (b *slowClaim) Delete(key string) error {
+	if key == b.refKey {
+		b.deletes++
+		if b.beforeDelete != nil {
+			b.beforeDelete()
+		}
+	}
+	return b.Backend.Delete(key)
+}
+
+// TestDestroyDeletesOnlyWhileItsClaimStands: on S3, where the delete is
+// unconditional, a destroy's claim is all that keeps an acquire from
+// taking the branch before the delete lands, and the claim stands only
+// until it is staleDeletingClaimAfter old, when the janitor on any host
+// clears it as abandoned. A destroy held up until its claim is that old,
+// or within deleteClaimMargin of it, by the time it would send its delete
+// (its claim write held up by response timeouts and SDK retries, whether
+// the write then succeeds or reports a timeout and lands during the
+// destroy's settle reads) deletes nothing: it clears its own claim and
+// fails, retryable, and the retry goes through. Sending the delete would
+// let the janitor clear the claim and an acquire take the branch at a new
+// epoch while it is on its way, and it would then remove the branch under
+// that lease. A destroy that reaches its delete with more than the margin
+// left deletes the branch, with acquires refused throughout.
+func TestDestroyDeletesOnlyWhileItsClaimStands(t *testing.T) {
+	timeout := errors.New("store: s3 conditional put refs/app/work: context deadline exceeded")
+	inTime := staleDeletingClaimAfter - deleteClaimMargin
+	for _, tc := range []struct {
+		name string
+		// hold is how long the claim write takes; with lands set, it
+		// then reports a timeout and lands after the destroy's second
+		// re-read of the ref (landedClaim).
+		hold  time.Duration
+		lands bool
+		// holdDelete is how long the delete takes to land once sent.
+		holdDelete time.Duration
+		deletes    bool
+	}{
+		{"claim lands after a timeout, already stale", 61 * time.Second, true, 0, false},
+		{"claim write succeeds stale", staleDeletingClaimAfter + time.Second, false, 0, false},
+		{"claim write succeeds inside the margin, delete lands after the claim is stale", inTime + time.Second, false, deleteClaimMargin, false},
+		{"claim write succeeds in time", inTime - time.Second, false, 0, true},
+		{"claim lands after a timeout, in time", inTime - 3*time.Second, true, 0, true},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			w := newWS(t)
+			if err := w.Create("app"); err != nil {
+				t.Fatal(err)
+			}
+			if _, err := w.Fork("app", "main", "work", "", 0, nil); err != nil {
+				t.Fatal(err)
+			}
+			synctest.Test(t, func(t *testing.T) {
+				base := w.Store.B
+				plain := &store.Store{B: base}
+				janitor := &Workspace{Store: plain, Root: w.Root}
+				refKey := store.RefKey("app", "work")
+				var late *claimLandsLate
+				b := &slowClaim{Backend: base, refKey: refKey, hold: tc.hold}
+				if tc.lands {
+					late = &claimLandsLate{Backend: base, refKey: refKey, err: timeout, landAfter: 2}
+					b.Backend = late
+				}
+				var cleared []string
+				var acqErr error
+				b.beforeDelete = func() {
+					time.Sleep(tc.holdDelete)
+					var err error
+					if cleared, err = janitor.ClearStaleDeleteClaims(time.Now()); err != nil {
+						t.Errorf("the janitor while the delete is on its way: %v", err)
+					}
+					_, acqErr = plain.AcquireLease("app", "work", "holder-b", DefaultLeaseTTL, time.Now())
+				}
+				w.Store.B = b
+				derr := w.Destroy("app", "work", false)
+				w.Store.B = base
+				if late != nil && (!late.landed || late.landErr != nil) {
+					t.Fatalf("precondition: the held claim write landed %v (%v)", late.landed, late.landErr)
+				}
+				ref, _, gerr := w.Store.GetRef("app", "work")
+				if !tc.deletes {
+					if derr == nil {
+						t.Fatalf("destroy whose claim is too old to delete under: deleted the branch (janitor cleared %v, holder-b acquire: %v)", cleared, acqErr)
+					}
+					if !errors.Is(derr, store.ErrCAS) {
+						t.Fatalf("destroy whose claim is too old to delete under: %v, want a retryable lost race", derr)
+					}
+					if b.deletes != 0 {
+						t.Fatalf("destroy sent %d deletes under a claim too old to delete under, want none", b.deletes)
+					}
+					if gerr != nil || ref.Deleting {
+						t.Fatalf("the branch after the destroy gave up: deleting %v, %v; want it there without the claim", ref.Deleting, gerr)
+					}
+					b.hold, b.beforeDelete = 0, nil
+					w.Store.B = b
+					derr = w.Destroy("app", "work", false)
+					w.Store.B = base
+					if derr != nil {
+						t.Fatalf("the retried destroy: %v", derr)
+					}
+					if _, _, err := w.Store.GetRef("app", "work"); !errors.Is(err, store.ErrNotFound) {
+						t.Fatalf("the branch after the retried destroy: %v, want it gone", err)
+					}
+					return
+				}
+				if derr != nil {
+					t.Fatalf("destroy that reached its delete in time: %v", derr)
+				}
+				if b.deletes != 1 {
+					t.Fatalf("destroy sent %d deletes, want 1", b.deletes)
+				}
+				if len(cleared) != 0 || !errors.Is(acqErr, store.ErrDeleting) {
+					t.Fatalf("while the delete was on its way: janitor cleared %v, holder-b acquire %v; want nothing cleared and the acquire refused", cleared, acqErr)
+				}
+				if !errors.Is(gerr, store.ErrNotFound) {
+					t.Fatalf("the branch after the destroy: %v, want it gone", gerr)
+				}
+			})
+		})
 	}
 }

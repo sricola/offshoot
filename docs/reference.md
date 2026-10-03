@@ -883,8 +883,13 @@ even when the reaper had claimed the branch first. A destroy that fails
 after its claim removes its own claim and no other. Were a claim cleared
 under its destroy, an acquire could take the branch at a new epoch, and on
 S3, where the delete is unconditional, that destroy would then delete the
-branch under the fresh lease. A destroy held up for longer than the 30
-seconds between its claim and its delete can still do that on S3
+branch under the fresh lease. So a destroy sends its delete only while
+its claim has more than 10 seconds left to stand; one held up past that
+(its claim write slowed by request timeouts and SDK retries) removes its
+claim and fails with `was held up too long to delete under its claim`
+(retryable; `errors.Is(err, store.ErrCAS)`), deleting nothing. A destroy
+whose delete request is itself held up past the 30 seconds can still
+delete under a fresh lease on S3
 ([limitations](limitations.md#smaller-edges-worth-knowing)). A claim
 stamped more than a minute ahead of a host's clock (its writer's clock runs
 ahead) counts as abandoned on that host, as one 30 seconds old does. A

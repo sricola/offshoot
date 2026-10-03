@@ -59,9 +59,16 @@ Pin an exact version if you depend on format stability. The full contract:
   race whose retry that claim would refuse; when the ref shows nothing
   landed yet (a 409 or a timeout, with the write possibly still in
   flight), it re-reads the ref for about 2 s before reporting the failure,
-  and then says the claim may still land. On S3 a destroy held up for
-  over 30 s between its claim and its delete can still delete a branch a
-  new session has taken; see
+  and then says the claim may still land. A destroy sends its delete only
+  while its claim has more than 10 s of its 30 s left: one held up past
+  that (its claim write slowed by timeouts and SDK retries, whether it
+  then succeeded or landed after reporting failure, when the claim is
+  already stale) removes its claim and fails with `was held up too long to
+  delete under its claim` (retryable; `errors.Is(err, store.ErrCAS)`),
+  rather than send an S3 delete that could land after the janitor cleared
+  the claim and a new session took the branch. On S3 a destroy whose
+  delete request is itself held up for over 30 s after its claim can
+  still delete a branch a new session has taken; see
   [limitations](docs/limitations.md#smaller-edges-worth-knowing).
 - **`checkpoint --force` on a branch with a live session wrote a second
   writer's head under the session's epoch.** The docs said `--force`
