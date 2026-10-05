@@ -2,7 +2,9 @@ package ops
 
 import (
 	"errors"
+	"fmt"
 	"os/exec"
+	"regexp"
 	"strings"
 	"testing"
 	"time"
@@ -301,5 +303,89 @@ func TestFencedHolderLeaseOpsFailAfterReclaim(t *testing.T) {
 	}
 	if _, err := w.Checkpoint("app", "main", "v1", nil); err != nil {
 		t.Fatalf("branch unusable after fencing: %v", err)
+	}
+}
+
+// TestNewSessionHolderFormatAndUniqueness: NewSessionHolder is per-call,
+// "session:<host>/<pid>/<8 hex>" (the same shape newCheckpointHolder uses
+// for its own kind), and IsSessionHolder classifies it but not a bare
+// LocalHolder or a checkpoint's holder.
+func TestNewSessionHolderFormatAndUniqueness(t *testing.T) {
+	re := regexp.MustCompile(`^session:` + regexp.QuoteMeta(LocalHolder()) + `/[0-9a-f]{8}$`)
+	seen := map[string]bool{}
+	for i := 0; i < 100; i++ {
+		h := NewSessionHolder()
+		if !re.MatchString(h) {
+			t.Fatalf("holder %q does not match %s", h, re)
+		}
+		if seen[h] {
+			t.Fatalf("duplicate holder %q", h)
+		}
+		seen[h] = true
+	}
+	if !IsSessionHolder(NewSessionHolder()) || IsSessionHolder(LocalHolder()) || IsSessionHolder(newCheckpointHolder()) {
+		t.Fatal("IsSessionHolder misclassifies")
+	}
+}
+
+// TestRefuseIfHeldNamesTheHolderKind: refuseIfHeld's message names the
+// kind of holder it found — a session holder says "an open daemon
+// session" (no "lease acquire", since a session holder was never taken by
+// `lease acquire`), a bare holder keeps today's "an open daemon session,
+// or 'offshoot lease acquire'" — and either way, the checkpoint-verb
+// refusal's `lease release` advice carries `--holder <exact holder>` so
+// the CLI flag (Task 3) can target the one lease. A checkpoint holder's
+// refusal is unchanged: it never mentions `lease release` or a session,
+// and unwraps to CheckpointInProgress.
+func TestRefuseIfHeldNamesTheHolderKind(t *testing.T) {
+	liveRef := func(holder string) store.Ref {
+		return store.Ref{
+			LeaseHolder: holder,
+			LeaseExpiry: time.Now().Add(time.Minute).Format(time.RFC3339Nano),
+		}
+	}
+
+	sessionHolder := NewSessionHolder()
+	err := refuseIfHeld("app", "main", liveRef(sessionHolder), "checkpoint", false)
+	if err == nil {
+		t.Fatal("session holder: want a refusal, got nil")
+	}
+	msg := err.Error()
+	if !strings.Contains(msg, "an open daemon session") {
+		t.Fatalf("session holder refusal does not name the holder kind: %v", err)
+	}
+	if strings.Contains(msg, "lease acquire") {
+		t.Fatalf("session holder refusal wrongly suggests 'lease acquire': %v", err)
+	}
+	if !strings.Contains(msg, "close the session") {
+		t.Fatalf("session holder refusal does not say to close the session: %v", err)
+	}
+	if want := fmt.Sprintf("lease release app@main --holder %s", sessionHolder); !strings.Contains(msg, want) {
+		t.Fatalf("session holder refusal does not carry %q: %v", want, err)
+	}
+
+	bareHolder := LocalHolder()
+	err = refuseIfHeld("app", "main", liveRef(bareHolder), "checkpoint", false)
+	if err == nil {
+		t.Fatal("bare holder: want a refusal, got nil")
+	}
+	msg = err.Error()
+	if !strings.Contains(msg, "an open daemon session, or 'offshoot lease acquire'") {
+		t.Fatalf("bare holder refusal lost today's wording: %v", err)
+	}
+	if want := fmt.Sprintf("--holder %s", bareHolder); !strings.Contains(msg, want) {
+		t.Fatalf("bare holder refusal does not carry %q: %v", want, err)
+	}
+
+	cpHolder := newCheckpointHolder()
+	err = refuseIfHeld("app", "main", liveRef(cpHolder), "checkpoint", false)
+	if err == nil {
+		t.Fatal("checkpoint holder: want a refusal, got nil")
+	}
+	if !strings.Contains(err.Error(), "another checkpoint is in progress") {
+		t.Fatalf("checkpoint holder refusal changed: %v", err)
+	}
+	if !CheckpointInProgress(err) {
+		t.Fatalf("CheckpointInProgress(checkpoint holder refusal) = false: %v", err)
 	}
 }

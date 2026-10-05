@@ -1,6 +1,8 @@
 package ops
 
 import (
+	"crypto/rand"
+	"encoding/hex"
 	"errors"
 	"fmt"
 	"os"
@@ -15,12 +17,53 @@ import (
 const DefaultLeaseTTL = 30 * time.Second
 
 // LocalHolder returns "<hostname>/<pid>", the conventional holder identity.
+// Bare (unprefixed by newHolder) is for a caller with no finer-grained
+// holder of its own — "offshoot lease acquire" and tests — where sharing
+// this string across every such caller on the same host is accepted:
+// AcquireLease's same-holder self-renew makes two of them collide rather
+// than fence. A daemon session uses NewSessionHolder, and an at-rest
+// checkpoint newCheckpointHolder, each a per-call holder built on this
+// with newHolder, precisely so two of those never share an epoch.
 func LocalHolder() string {
 	host, err := os.Hostname()
 	if err != nil || host == "" {
 		host = "unknown"
 	}
 	return fmt.Sprintf("%s/%d", host, os.Getpid())
+}
+
+// newHolder returns a per-call lease holder for kind ("session" or
+// "checkpoint"): "<kind>:<host>/<pid>/<8 hex>". It keeps LocalHolder's
+// <host>/<pid>, which `lease list` and status print, and adds a per-call
+// nonce: AcquireLease treats the same holder on a live lease as a
+// self-renew with no epoch bump, so two callers of the same kind in one
+// process sharing a holder would share an epoch, and with it an object
+// key, and race again.
+func newHolder(kind string) string {
+	var nonce [4]byte
+	_, _ = rand.Read(nonce[:]) // crypto/rand.Read does not return an error since Go 1.24
+	return kind + ":" + LocalHolder() + "/" + hex.EncodeToString(nonce[:])
+}
+
+// sessionHolderPrefix marks a lease held by an open daemon session, so a
+// refusal can say which kind of holder it is without ever comparing a
+// holder to LocalHolder() or anything else by equality.
+const sessionHolderPrefix = "session:"
+
+// NewSessionHolder is the lease holder for one daemon session:
+// "session:<host>/<pid>/<8 hex>" (see newHolder). Each session.Open call
+// gets its own, so two sessions in one process — or two daemons that
+// happen to share a hostname and pid, as in containers with one hostname
+// and PID 1 — never collide into the same holder and silently share an
+// epoch.
+func NewSessionHolder() string {
+	return newHolder("session")
+}
+
+// IsSessionHolder reports whether a lease holder is a daemon session's
+// (see NewSessionHolder).
+func IsSessionHolder(holder string) bool {
+	return strings.HasPrefix(holder, sessionHolderPrefix)
 }
 
 // AcquireLease claims db@branch for this process. holder identifies the

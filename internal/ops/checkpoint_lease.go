@@ -3,8 +3,6 @@ package ops
 import (
 	"bytes"
 	"context"
-	"crypto/rand"
-	"encoding/hex"
 	"errors"
 	"fmt"
 	"maps"
@@ -21,21 +19,23 @@ import (
 const checkpointHolderPrefix = "checkpoint:"
 
 // newCheckpointHolder is the lease holder for one at-rest checkpoint call:
-// "checkpoint:<host>/<pid>/<8 hex>". It keeps LocalHolder's <host>/<pid>,
-// which `lease list` and status print, and adds a per-call nonce:
-// AcquireLease treats the same holder on a live lease as a self-renew with
-// no epoch bump, so two checkpoints in one process sharing a holder would
-// share an epoch, and with it an object key, and race again.
+// "checkpoint:<host>/<pid>/<8 hex>" (see newHolder in lease.go).
 func newCheckpointHolder() string {
-	var nonce [4]byte
-	_, _ = rand.Read(nonce[:]) // crypto/rand.Read does not return an error since Go 1.24
-	return checkpointHolderPrefix + LocalHolder() + "/" + hex.EncodeToString(nonce[:])
+	return newHolder("checkpoint")
 }
 
-// isCheckpointHolder reports whether a lease holder is an at-rest
-// checkpoint's (see newCheckpointHolder).
-func isCheckpointHolder(holder string) bool {
+// IsCheckpointHolder reports whether a lease holder is an at-rest
+// checkpoint's (see newCheckpointHolder). Exported for the session
+// package's settle classification; isCheckpointHolder is kept as an
+// unexported alias so this package's own call sites need no churn.
+func IsCheckpointHolder(holder string) bool {
 	return strings.HasPrefix(holder, checkpointHolderPrefix)
+}
+
+// isCheckpointHolder is IsCheckpointHolder, unexported for this package's
+// own call sites.
+func isCheckpointHolder(holder string) bool {
+	return IsCheckpointHolder(holder)
 }
 
 // leaseTTL is LeaseTTL, or DefaultLeaseTTL when it is not set.
