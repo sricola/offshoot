@@ -217,21 +217,27 @@ Pin an exact version if you depend on format stability. The full contract:
   key is private to the call and nothing else writes it; an object an
   earlier writer left at the same txid sits under an older epoch, never
   anchors the head, and is reclaimed by GC.
-- **A daemon restarted in a container with the same hostname and PID 1
-  renewed its dead predecessor's live lease in place and shared its
-  epoch.** Every daemon session shared one holder, bare `<host>/<pid>`,
-  so a reopen after a close whose lease release failed renewed that same
-  lease under that same holder — and, in a container, PID 1 and the
-  hostname are both fixed, so a daemon that crashed and restarted could
-  reopen the branch and pick its own dead predecessor's lease back up as
-  if it had never left, with no new epoch to fence the old process's
-  stragglers from the new one (two writers effectively sharing an
-  epoch). Each session now mints its own holder (see Changed, below), so
-  a restarted daemon's session can never match the orphaned one: the
-  reopen is refused instead, naming the orphaned holder, when its lease
-  lapses, and `offshoot lease release <db>@<branch> --holder <holder>`
-  to free it now, until the operator frees it or its TTL (30 s default)
-  runs out.
+- **Two daemons in look-alike containers renewed each other's leases and
+  shared an epoch, a split brain; a daemon restarted in such a container
+  picked up its dead predecessor's lease the same way.** Every daemon
+  session shared one holder, bare `<host>/<pid>`, and `AcquireLease`
+  treats the same holder on a live lease as a self-renew under the same
+  epoch. In containers, offshoot runs as PID 1 and two containers on
+  host networking share a hostname, so two live daemons on one store held
+  every lease as the same `<host>/1`: each one's open renewed the other's
+  live lease, and both wrote under one epoch with nothing to fence
+  either. A daemon that crashed and restarted under the same hostname did
+  the same to its predecessor's lease. Each session now mints its own
+  holder (see Changed, below), so no open can ever match another
+  session's lease, live or orphaned: it is refused instead. The daemon
+  records the exact holder of any of its own sessions whose lease release
+  failed, and only a lease held by exactly that holder is called "held by
+  an earlier session of this daemon", with its lapse time and `offshoot
+  lease release <db>@<branch> --holder <holder>` to free it now. Any
+  other `session:` holder, a twin daemon's included even though it shares
+  the `session:<host>/<pid>/` prefix, gets the conditional advice the
+  checkpoint refusal gives: close that session, or, if its daemon has
+  exited, free it by its exact `--holder`.
 
 ### Changed
 
@@ -391,12 +397,31 @@ Pin an exact version if you depend on format stability. The full contract:
   status` and the daemon's `branches` op show it in place of the old
   `<host>/<pid>`. A script that matches a lease holder against
   `"<host>/<pid>"` to recognize a daemon session needs to match the
-  `session:` prefix instead. `offshoot lease acquire` is unaffected — it
-  still claims the bare `<host>/<pid>` holder, as does an at-rest
-  checkpoint's `checkpoint:<host>/<pid>/<8 hex>` (unchanged). A reopen
-  after a close whose lease release failed is refused for up to the
-  lease TTL instead of renewing that lease in place under the closed
+  `session:` prefix instead. Holders now come in three shapes: a daemon
+  session's `session:<host>/<pid>/<8 hex>`, an at-rest checkpoint's
+  `checkpoint:<host>/<pid>/<8 hex>` (unchanged), and the bare
+  `<host>/<pid>` that only `offshoot lease acquire` still claims. A
+  reopen after a close whose lease release failed is refused for up to
+  the lease TTL instead of renewing that lease in place under the closed
   session's holder and epoch (see Fixed, above).
+- **A `session close` whose lease release failed says what to do about
+  the lease it left.** The error was the store's bare release failure; it
+  is now `session <db>@<branch> closed but its lease release failed:
+  <cause>; the lease (holder <holder>) lapses at <time>, or 'offshoot
+  lease release <db>@<branch> --holder <holder>' frees it now`, naming
+  the closed session's own holder, which no session holds any more. An
+  open that fails after its acquire and then cannot release says the
+  same, and an open's checksum-baseline failure now retries that release
+  like a failed checkout does.
+- **Every lease expiry a refusal prints is rounded up to the second**
+  (RFC3339, UTC), so the time it names is never before the lease lapses;
+  refusals used to print the stored nanosecond timestamp, or truncate it.
+- **`offshoot lease release --holder H` refuses in its own words**: `lease
+  release: <db>@<branch> is held by <current>, not H; nothing released`,
+  or `lease release: <db>@<branch> is not leased; nothing released`,
+  instead of the store's `branch lease lost: ... is held by "", not ...`.
+  An empty `H` (`--holder=`, `--holder ""`) is a usage error rather than a
+  release attempt.
 
 ### Added
 
@@ -430,8 +455,9 @@ Pin an exact version if you depend on format stability. The full contract:
 - **`offshoot lease release <db>[@branch] --holder H`** releases a lease
   only if its current holder is exactly `H` — a compare-and-swap, not a
   blind release: a mismatch (including an unleased ref, which never
-  equals a non-empty `H`) refuses with `<db>@<branch> is held by
-  "<current>", not "H"; nothing released` and writes nothing. This is the
+  equals a non-empty `H`) refuses with `lease release: <db>@<branch> is
+  held by <current>, not H; nothing released` (or `is not leased`) and
+  writes nothing. This is the
   safe way to free a holder a refusal already named (a `session:` or
   `checkpoint:` holder, unique to one session or checkpoint), since the
   exact match can never free a different session or checkpoint the same

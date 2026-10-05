@@ -63,9 +63,13 @@ write without taking the branch lease — they refuse a live one instead
 (below), which is a same-host courtesy, not a cross-host protocol; `lease
 acquire`'s holder identity is bare hostname+pid, which containers can
 collide on (a daemon session's holder adds a per-open nonce,
-`session:<host>/<pid>/<8 hex>`, so two containers sharing a hostname and
-pid never collide there, though two full daemons sharing both still are
-not otherwise distinguished); and lease expiry is judged against the
+`session:<host>/<pid>/<8 hex>`, so two daemons in containers sharing a
+hostname and pid never share a lease or an epoch; a daemon calls a lease
+"an earlier session of this daemon" only when its holder is exactly one
+it recorded as its own failed release, and gives any other `session:`
+holder, a look-alike twin's included, the conditional advice to close
+that session or, once its daemon has exited, `lease release --holder`
+it); and lease expiry is judged against the
 claimant's wall clock, so large clock skew
 between machines could steal a live lease. Each is fixable — the fencing
 core is designed for this — and multi-daemon safety is the named first
