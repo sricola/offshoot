@@ -14,6 +14,7 @@ import (
 
 	"github.com/sricola/offshoot/internal/daemon"
 	"github.com/sricola/offshoot/internal/dbfile"
+	"github.com/sricola/offshoot/internal/ops"
 	"github.com/sricola/offshoot/internal/reflink"
 	"github.com/sricola/offshoot/internal/testutil"
 )
@@ -868,8 +869,9 @@ func TestRollbackAndPromoteOutputNameTheirMode(t *testing.T) {
 
 // TestCheckpointForceDoesNotTakeOverALease: `checkpoint --force` on a
 // branch with a live lease is refused with the ops message, which names
-// `lease release` as the way past a holder that is gone, and `help
-// checkpoint` says --force only overrides a detached checkout.
+// `lease release ... --holder <exact holder>` as the way past a holder
+// that is gone, and `help checkpoint` says --force only overrides a
+// detached checkout.
 func TestCheckpointForceDoesNotTakeOverALease(t *testing.T) {
 	testutil.RequireSQLite3(t)
 	store := filepath.Join(t.TempDir(), "s")
@@ -877,10 +879,14 @@ func TestCheckpointForceDoesNotTakeOverALease(t *testing.T) {
 	call(t, store, "create", "app")
 	call(t, store, "checkout", "app")
 	call(t, store, "lease", "acquire", "app", "--ttl", "1m")
+	// `lease acquire` with no finer-grained holder of its own uses
+	// ops.LocalHolder() ("<host>/<pid>"), so the refusal's --holder suffix
+	// names exactly that.
+	wantHolderSuffix := fmt.Sprintf("'offshoot lease release app@main --holder %s'", ops.LocalHolder())
 	if _, err := callErr(t, store, "checkpoint", "app", "v1", "--force"); err == nil ||
 		!strings.Contains(err.Error(), "--force cannot take over a live lease") ||
-		!strings.Contains(err.Error(), "'offshoot lease release app@main'") {
-		t.Fatalf("checkpoint --force under a live lease: %v", err)
+		!strings.Contains(err.Error(), wantHolderSuffix) {
+		t.Fatalf("checkpoint --force under a live lease: %v, want it to contain %q", err, wantHolderSuffix)
 	}
 	help, err := callErr(t, store, "help", "checkpoint")
 	if err != nil {
@@ -888,5 +894,112 @@ func TestCheckpointForceDoesNotTakeOverALease(t *testing.T) {
 	}
 	if !strings.Contains(help, "--force or not") || !strings.Contains(help, "--force checkpoints a detached checkout") {
 		t.Fatalf("help checkpoint does not say what --force does: %q", help)
+	}
+}
+
+// TestLeaseReleaseWithHolderMatchingFreesIt: `lease release <db>[@branch]
+// --holder H` with H exactly matching the ref's current holder releases it
+// and prints the holder it freed.
+func TestLeaseReleaseWithHolderMatchingFreesIt(t *testing.T) {
+	store := filepath.Join(t.TempDir(), "s")
+	call(t, store, "init")
+	call(t, store, "create", "app")
+	call(t, store, "lease", "acquire", "app", "--ttl", "1m")
+	holder := ops.LocalHolder()
+	out, err := callErr(t, store, "lease", "release", "app", "--holder", holder)
+	if err != nil {
+		t.Fatalf("lease release --holder %s (matching): %v", holder, err)
+	}
+	want := fmt.Sprintf("released app@main held by %s\n", holder)
+	if out != want {
+		t.Fatalf("lease release --holder (matching) printed %q, want %q", out, want)
+	}
+	if list := call(t, store, "lease", "list"); strings.Contains(list, "app@main") {
+		t.Fatalf("lease still listed after release: %q", list)
+	}
+}
+
+// TestLeaseReleaseWithHolderMismatchExitsNonZero: `--holder H` with H not
+// matching the ref's current holder is refused, names both holders, says
+// nothing was released, and leaves the lease held.
+func TestLeaseReleaseWithHolderMismatchExitsNonZero(t *testing.T) {
+	store := filepath.Join(t.TempDir(), "s")
+	call(t, store, "init")
+	call(t, store, "create", "app")
+	call(t, store, "lease", "acquire", "app", "--ttl", "1m")
+	holder := ops.LocalHolder()
+	_, err := callErr(t, store, "lease", "release", "app", "--holder", "someone-else")
+	if err == nil {
+		t.Fatal("lease release --holder with a mismatched holder must exit non-zero")
+	}
+	want := fmt.Sprintf("lease release: app@main is held by %s, not someone-else; nothing released", holder)
+	if err.Error() != want {
+		t.Fatalf("lease release --holder mismatch: got %v, want %q", err, want)
+	}
+	if list := call(t, store, "lease", "list"); !strings.Contains(list, "app@main") {
+		t.Fatalf("a refused release must leave the lease held: %q", list)
+	}
+	// Once the lease is gone, the same command says the branch is not
+	// leased, rather than that it is held by an empty holder.
+	call(t, store, "lease", "release", "app", "--holder", holder)
+	_, err = callErr(t, store, "lease", "release", "app", "--holder", holder)
+	if want := "lease release: app@main is not leased; nothing released"; err == nil || err.Error() != want {
+		t.Fatalf("lease release --holder on an unleased branch: got %v, want %q", err, want)
+	}
+}
+
+// TestLeaseReleaseHolderFlagParsing: --holder with no value or an empty
+// value is a usage error that releases nothing (an empty holder names no
+// lease), and --holder before the target parses the same as after it.
+func TestLeaseReleaseHolderFlagParsing(t *testing.T) {
+	store := filepath.Join(t.TempDir(), "s")
+	call(t, store, "init")
+	call(t, store, "create", "app")
+	call(t, store, "lease", "acquire", "app", "--ttl", "1m")
+	holder := ops.LocalHolder()
+	for _, c := range []struct {
+		args []string
+		want string
+	}{
+		{[]string{"lease", "release", "app", "--holder"}, "--holder requires a value"},
+		{[]string{"lease", "release", "app", "--holder="}, "--holder requires a non-empty holder"},
+		{[]string{"lease", "release", "app", "--holder", ""}, "--holder requires a non-empty holder"},
+		{[]string{"lease", "release", "--holder", "", "app"}, "--holder requires a non-empty holder"},
+	} {
+		if _, err := callErr(t, store, c.args...); err == nil || !strings.Contains(err.Error(), c.want) {
+			t.Fatalf("offshoot %q: got %v, want an error containing %q", c.args, err, c.want)
+		}
+		if list := call(t, store, "lease", "list"); !strings.Contains(list, "app@main") {
+			t.Fatalf("offshoot %q released the lease: %q", c.args, list)
+		}
+	}
+	out, err := callErr(t, store, "lease", "release", "--holder", holder, "app")
+	if err != nil {
+		t.Fatalf("lease release --holder %s app (flag before the target): %v", holder, err)
+	}
+	if want := fmt.Sprintf("released app@main held by %s\n", holder); out != want {
+		t.Fatalf("lease release with --holder before the target printed %q, want %q", out, want)
+	}
+	if list := call(t, store, "lease", "list"); strings.Contains(list, "app@main") {
+		t.Fatalf("lease still listed after release: %q", list)
+	}
+}
+
+// TestLeaseReleaseWithoutHolderPrintsTheHolderItFreed: the no-flag path
+// behaves as before (frees whatever the ref holds) but now also prints the
+// holder it freed, rather than succeeding silently.
+func TestLeaseReleaseWithoutHolderPrintsTheHolderItFreed(t *testing.T) {
+	store := filepath.Join(t.TempDir(), "s")
+	call(t, store, "init")
+	call(t, store, "create", "app")
+	call(t, store, "lease", "acquire", "app", "--ttl", "1m")
+	holder := ops.LocalHolder()
+	out := call(t, store, "lease", "release", "app")
+	want := fmt.Sprintf("released app@main held by %s\n", holder)
+	if out != want {
+		t.Fatalf("lease release (no --holder) printed %q, want %q", out, want)
+	}
+	if list := call(t, store, "lease", "list"); strings.Contains(list, "app@main") {
+		t.Fatalf("lease still listed after release: %q", list)
 	}
 }

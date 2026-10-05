@@ -3,8 +3,6 @@ package ops
 import (
 	"bytes"
 	"context"
-	"crypto/rand"
-	"encoding/hex"
 	"errors"
 	"fmt"
 	"maps"
@@ -21,21 +19,23 @@ import (
 const checkpointHolderPrefix = "checkpoint:"
 
 // newCheckpointHolder is the lease holder for one at-rest checkpoint call:
-// "checkpoint:<host>/<pid>/<8 hex>". It keeps LocalHolder's <host>/<pid>,
-// which `lease list` and status print, and adds a per-call nonce:
-// AcquireLease treats the same holder on a live lease as a self-renew with
-// no epoch bump, so two checkpoints in one process sharing a holder would
-// share an epoch, and with it an object key, and race again.
+// "checkpoint:<host>/<pid>/<8 hex>" (see newHolder in lease.go).
 func newCheckpointHolder() string {
-	var nonce [4]byte
-	_, _ = rand.Read(nonce[:]) // crypto/rand.Read does not return an error since Go 1.24
-	return checkpointHolderPrefix + LocalHolder() + "/" + hex.EncodeToString(nonce[:])
+	return newHolder("checkpoint")
 }
 
-// isCheckpointHolder reports whether a lease holder is an at-rest
-// checkpoint's (see newCheckpointHolder).
-func isCheckpointHolder(holder string) bool {
+// IsCheckpointHolder reports whether a lease holder is an at-rest
+// checkpoint's (see newCheckpointHolder). Exported for the session
+// package's settle classification; isCheckpointHolder is kept as an
+// unexported alias so this package's own call sites need no churn.
+func IsCheckpointHolder(holder string) bool {
 	return strings.HasPrefix(holder, checkpointHolderPrefix)
+}
+
+// isCheckpointHolder is IsCheckpointHolder, unexported for this package's
+// own call sites.
+func isCheckpointHolder(holder string) bool {
+	return IsCheckpointHolder(holder)
 }
 
 // leaseTTL is LeaseTTL, or DefaultLeaseTTL when it is not set.
@@ -108,7 +108,7 @@ const checkpointAcquireAttempts = 2
 // before that acquire writes (store.AcquireLeaseRefIf), so a refusal writes
 // nothing, and a writer that moves the ref after the check fails the
 // acquire's compare-and-swap. A failed acquire write is settled by
-// re-reading the ref:
+// re-reading the ref (SettleAcquire, which session.Open shares):
 //
 //   - our own holder means the acquire landed though it reported failure:
 //     the S3 SDK's retry answering 412 to its own landed first attempt
@@ -169,16 +169,16 @@ func (w *Workspace) acquireCheckpointLease(db, branch, holder string, ttl time.D
 		if !readOK {
 			break
 		}
-		cur, _, gerr := w.Store.GetRef(db, branch)
-		if gerr != nil {
+		adoptedLease, cur, adopted, serr := w.SettleAcquire(db, branch, holder, aerr)
+		if serr != nil {
 			break
 		}
-		if cur.LeaseHolder == holder {
+		if adopted {
 			if cerr := check(cur); cerr != nil {
-				w.releaseCheckpointLease(leaseOn(db, branch, holder, cur))
+				w.releaseCheckpointLease(adoptedLease)
 				return store.Lease{}, store.Ref{}, cerr
 			}
-			return leaseOn(db, branch, holder, cur), cur, nil
+			return adoptedLease, cur, nil
 		}
 		if rerr := refuseIfHeld(db, branch, cur, "checkpoint", false); rerr != nil {
 			return store.Lease{}, store.Ref{}, rerr
@@ -192,6 +192,33 @@ func (w *Workspace) acquireCheckpointLease(db, branch, holder string, ttl time.D
 		break
 	}
 	return store.Lease{}, store.Ref{}, fmt.Errorf("ops: checkpoint %s@%s: %w", db, branch, err)
+}
+
+// SettleAcquire settles an acquire of db@branch's lease for holder that
+// returned acquireErr, by re-reading the ref. A failed acquire write can
+// still have landed: the S3 SDK's retry answering 412 to its own first
+// attempt that landed (reported as a lost acquisition race), or a timeout
+// that lost the response. holder must be unique to this acquire
+// (NewSessionHolder, newCheckpointHolder), since nothing else writes it:
+//
+//   - the ref names holder: the acquire landed, and the lease, under the
+//     epoch and expiry the ref records, is the caller's (adopted is true);
+//   - the ref names any other holder, or none: the acquire did not land,
+//     and the caller decides what that ref means for it (adopted is
+//     false, err nil);
+//   - the re-read failed: whether the acquire landed is unknown, and err
+//     says why. A lease that did land lapses at its expiry.
+//
+// It compares the holder exactly; a prefix never decides ownership.
+func (w *Workspace) SettleAcquire(db, branch, holder string, acquireErr error) (lease store.Lease, ref store.Ref, adopted bool, err error) {
+	ref, _, err = w.Store.GetRef(db, branch)
+	if err != nil {
+		return store.Lease{}, store.Ref{}, false, fmt.Errorf("ops: %s@%s: re-reading the ref after a failed lease acquire (%v): %w", db, branch, acquireErr, err)
+	}
+	if ref.LeaseHolder == holder {
+		return leaseOn(db, branch, holder, ref), ref, true, nil
+	}
+	return store.Lease{}, ref, false, nil
 }
 
 // leaseOn is holder's lease on db@branch as ref records it.

@@ -132,6 +132,10 @@ func TestReopenDuringCloseWaitsAndGetsAFreshEpoch(t *testing.T) {
 	if cur.Epoch <= old.Epoch {
 		t.Fatalf("reopened at epoch %d, want above the closed session's %d", cur.Epoch, old.Epoch)
 	}
+	// Each session holds its lease under its own holder.
+	if cur.Holder == old.Holder {
+		t.Fatalf("reopened under the closed session's holder %q, want a new one", old.Holder)
+	}
 	ref, _, err := w.Store.GetRef("app", "main")
 	if err != nil {
 		t.Fatal(err)
@@ -367,24 +371,47 @@ func TestCloseOnClosingSlotWaits(t *testing.T) {
 			t.Fatalf("a failed close left the slot %+v", sl)
 		}
 		// The daemon has let go of the branch even though the release failed:
-		// its map no longer refuses an open. Under this daemon's one holder,
-		// AcquireLease renews the unreleased lease in place, so the reopen
-		// keeps the closed session's holder and epoch, as reference.md's
-		// `session open` and events table say. That is also why its `session
-		// close` errors warn against `offshoot lease release` here: the lease
-		// it would free is now the reopened session's. Per-session holders
-		// will make this open wait out the lease instead; update those docs
-		// then.
+		// its map no longer refuses an open, but the unreleased lease does.
+		// Its holder is the closed session's own (ops.NewSessionHolder), so
+		// the reopen is refused rather than renewing it in place, with the
+		// refusal that names that exact holder, when it lapses, and the
+		// `lease release --holder` that frees only it; the lease is left
+		// alone.
+		r := call(t, sock, Request{Op: "open", DB: "app", Branch: "main"})
+		held, _, err := w.Store.GetRef("app", "main")
+		if err != nil {
+			t.Fatal(err)
+		}
+		if held.LeaseHolder != old.LeaseHolder || held.Epoch != old.Epoch {
+			t.Fatalf("the refused reopen moved the lease: %q@%d -> %q@%d", old.LeaseHolder, old.Epoch, held.LeaseHolder, held.Epoch)
+		}
+		expiry, _ := time.Parse(time.RFC3339Nano, held.LeaseExpiry)
+		// The close's own error named the same holder and expiry, and the
+		// release that frees exactly that lease.
+		wantClose := fmt.Sprintf("session app@main closed but its lease release failed: store: release lease on app@main: test: injected release failure; the lease (holder %s) lapses at %s, or 'offshoot lease release app@main --holder %s' frees it now",
+			old.LeaseHolder, ops.LapseTime(expiry), old.LeaseHolder)
+		if first.Error != wantClose {
+			t.Fatalf("first close's error = %q, want %q", first.Error, wantClose)
+		}
+		want := fmt.Sprintf("daemon: app@main is held by an earlier session of this daemon whose lease release failed (holder %s); it lapses at %s; free it now with 'offshoot lease release app@main --holder %s'",
+			old.LeaseHolder, ops.LapseTime(expiry), old.LeaseHolder)
+		if r.OK || r.Error != want {
+			t.Fatalf("open after a failed close = %+v, want the error %q", r, want)
+		}
+		// Freed by its exact holder and epoch, the branch reopens under a
+		// new holder and a new epoch.
+		if err := w.ReleaseLease(store.Lease{DB: "app", Branch: "main", Holder: old.LeaseHolder, Epoch: old.Epoch}); err != nil {
+			t.Fatal(err)
+		}
 		if r := call(t, sock, Request{Op: "open", DB: "app", Branch: "main"}); !r.OK {
-			t.Fatalf("open after a failed close = %+v", r)
+			t.Fatalf("open after the orphaned lease was released = %+v", r)
 		}
 		cur := getStatus(t, sock, "app", "main")
-		if cur.Holder != old.LeaseHolder || cur.Epoch != old.Epoch {
-			t.Fatalf("reopen after a failed release is %q@%d, want the closed session's %q@%d renewed in place",
+		if cur.Holder == old.LeaseHolder || cur.Epoch <= old.Epoch {
+			t.Fatalf("reopen is %q@%d, want a new holder above the closed session's %q@%d",
 				cur.Holder, cur.Epoch, old.LeaseHolder, old.Epoch)
 		}
-		// `offshoot lease release` frees the lease this listing reports for
-		// the branch, and that is now the reopened session's live lease.
+		// The only lease on the branch is the reopened session's.
 		leases, err := w.Leases()
 		if err != nil {
 			t.Fatal(err)
@@ -537,17 +564,25 @@ func TestStaleCloseLeavesTheReopenedSessionOpen(t *testing.T) {
 		fr := &failReleases{Backend: w.Store.B}
 		w.Store.B = fr // before any session exists
 		a := open(t, sock)
-		aEpoch := getStatus(t, sock, "app", "main").Epoch
+		aInfo := getStatus(t, sock, "app", "main")
 		fr.arm(3) // every attempt Close's release makes
-		if r := call(t, sock, closeReq(a.SessionID)); r.OK || !strings.Contains(r.Error, "injected release failure") {
-			t.Fatalf("A's close = %+v, want the injected release failure", r)
+		if r := call(t, sock, closeReq(a.SessionID)); r.OK || !strings.Contains(r.Error, "session app@main closed but its lease release failed: ") ||
+			!strings.Contains(r.Error, "injected release failure; the lease (holder "+aInfo.Holder+") lapses at ") ||
+			!strings.HasSuffix(r.Error, "or 'offshoot lease release app@main --holder "+aInfo.Holder+"' frees it now") {
+			t.Fatalf("A's close = %+v, want the injected release failure naming A's holder %s", r, aInfo.Holder)
 		}
-		// The release failed, so B's open renews A's lease in place, epoch
-		// and all (daemon sessions share one holder).
+		// The release failed, so A's lease, under A's own holder, refuses
+		// B's open until it lapses or is freed by that exact holder.
+		if r := call(t, sock, Request{Op: "open", DB: "app", Branch: "main"}); r.OK || !strings.Contains(r.Error, "earlier session of this daemon") {
+			t.Fatalf("open under A's unreleased lease = %+v, want the orphaned-lease refusal", r)
+		}
+		if err := w.ReleaseLease(store.Lease{DB: "app", Branch: "main", Holder: aInfo.Holder, Epoch: aInfo.Epoch}); err != nil {
+			t.Fatal(err)
+		}
 		b := open(t, sock)
 		cur := getStatus(t, sock, "app", "main")
-		if cur.Epoch != aEpoch {
-			t.Fatalf("B opened at epoch %d, want A's %d again: the case this subtest covers", cur.Epoch, aEpoch)
+		if cur.Holder == aInfo.Holder || cur.Epoch <= aInfo.Epoch {
+			t.Fatalf("B opened as %q@%d, want a new holder above A's %q@%d", cur.Holder, cur.Epoch, aInfo.Holder, aInfo.Epoch)
 		}
 		if b.SessionID == a.SessionID {
 			t.Fatalf("B's session id %s repeats A's", b.SessionID)

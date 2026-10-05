@@ -317,8 +317,9 @@ Longer: [core concepts (glossary)](docs/concepts.md), [architecture](docs/archit
   unreferenced object, because the ref update that commits is always
   last (an at-rest checkpoint also takes the branch lease first, and a
   crash leaves that lease on the branch until it lapses after 30 s or
-  `offshoot lease release` frees it); a fenced writer cannot advance a
-  ref; fuzzing covers the decoder, the sidecar and the wire protocol.
+  `offshoot lease release --holder <holder>` frees it); a fenced writer
+  cannot advance a ref; fuzzing covers the decoder, the sidecar and the
+  wire protocol.
 - **Also proven by test, nightly:** the capture engine itself survives
   `SIGKILL`. A second harness runs the capturer in a child process, kills
   it with `SIGKILL` mid-traffic every round, restarts it on the same state

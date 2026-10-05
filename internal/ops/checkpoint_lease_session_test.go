@@ -63,8 +63,12 @@ func TestForceCannotTakeOverLiveLease(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	want := fmt.Sprintf("ops: app@main has a live lease held by %q until %s (an open daemon session, or 'offshoot lease acquire'); --force cannot take over a live lease; close the session and retry, or, if the process that holds it has exited, free it with 'offshoot lease release app@main' (never while that daemon still runs: a session it reopened may hold the lease)",
-		held.LeaseHolder, held.LeaseExpiry)
+	heldUntil, err := time.Parse(time.RFC3339Nano, held.LeaseExpiry)
+	if err != nil {
+		t.Fatal(err)
+	}
+	want := fmt.Sprintf("ops: app@main has a live lease held by %q until %s (an open daemon session); --force cannot take over a live lease; close the session and retry, or, if the daemon that held it has exited, free it with 'offshoot lease release app@main --holder %s'",
+		held.LeaseHolder, ops.LapseTime(heldUntil), held.LeaseHolder)
 	_, err = w.CheckpointWith("app", "main", "forced", nil, ops.CheckpointOptions{Force: true})
 	if !errors.Is(err, store.ErrLeaseHeld) || err.Error() != want {
 		t.Fatalf("checkpoint --force under a session: %v\nwant: %s", err, want)

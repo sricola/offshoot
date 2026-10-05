@@ -2,12 +2,15 @@ package daemon
 
 import (
 	"context"
+	"regexp"
 	"strings"
+	"sync"
 	"testing"
 	"time"
 
 	"github.com/sricola/offshoot/internal/ops"
 	"github.com/sricola/offshoot/internal/session"
+	"github.com/sricola/offshoot/internal/store"
 )
 
 // TestOpBranchesReportsPendingForInFlightOpen exercises the daemon-only
@@ -163,12 +166,13 @@ func TestBranchesReportsAnAtRestCheckpointAsActive(t *testing.T) {
 	}
 }
 
-// TestOpenRefusedWhileACheckpointHoldsTheBranch is a wiring pin: the
+// TestOpenRefusedByCheckpointHolderSaysInProgress is a wiring pin: the
 // daemon's open op (what an SDK session uses) on a branch held under a
 // checkpoint: holder (acquired by hand here; the real checkpoint is
-// internal/ops's TestSessionOpenDuringAtRestCheckpointIsRefused) fails
-// with the lease-held error naming the holder, and leaves the lease alone.
-func TestOpenRefusedWhileACheckpointHoldsTheBranch(t *testing.T) {
+// internal/ops's TestSessionOpenDuringAtRestCheckpointIsRefused) says a
+// checkpoint is in progress and to retry, since that lease clears within
+// seconds, and leaves the lease alone.
+func TestOpenRefusedByCheckpointHolderSaysInProgress(t *testing.T) {
 	srv, w := newServer(t)
 	holder := "checkpoint:" + ops.LocalHolder() + "/0123abcd"
 	l, err := w.AcquireLease("app", "main", holder, time.Minute)
@@ -179,8 +183,8 @@ func TestOpenRefusedWhileACheckpointHoldsTheBranch(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if resp.OK || !strings.Contains(resp.Error, "lease is held") || !strings.Contains(resp.Error, holder) {
-		t.Fatalf("open during a checkpoint = %+v, want a lease-held refusal naming %s", resp, holder)
+	if want := "daemon: a checkpoint is in progress on app@main; retry in a few seconds"; resp.OK || resp.Error != want {
+		t.Fatalf("open during a checkpoint = %+v, want the error %q", resp, want)
 	}
 	ref, _, err := w.Store.GetRef("app", "main")
 	if err != nil {
@@ -188,6 +192,134 @@ func TestOpenRefusedWhileACheckpointHoldsTheBranch(t *testing.T) {
 	}
 	if ref.LeaseHolder != holder || ref.Epoch != l.Epoch {
 		t.Fatalf("the refused open changed the checkpoint's lease: %q@%d", ref.LeaseHolder, ref.Epoch)
+	}
+}
+
+// orphanWant is the refusal of an open under ref's lease when ref's holder
+// is the one this daemon recorded as orphaned on app@main.
+func orphanWant(ref store.Ref) string {
+	expiry, _ := time.Parse(time.RFC3339Nano, ref.LeaseExpiry)
+	return "daemon: app@main is held by an earlier session of this daemon whose lease release failed (holder " + ref.LeaseHolder +
+		"); it lapses at " + ops.LapseTime(expiry) +
+		"; free it now with 'offshoot lease release app@main --holder " + ref.LeaseHolder + "'"
+}
+
+// orphanAppMain opens app@main on srv and closes it with every release
+// attempt failing (fr armed), so the daemon records that session's holder
+// as orphaned, and returns the ref the close left behind.
+func orphanAppMain(t *testing.T, sock string, w *ops.Workspace, fr *failReleases) store.Ref {
+	t.Helper()
+	if r := call(t, sock, Request{Op: "open", DB: "app", Branch: "main"}); !r.OK {
+		t.Fatalf("open = %+v", r)
+	}
+	holder := getStatus(t, sock, "app", "main").Holder
+	fr.arm(3) // every attempt Close's release makes
+	if r := call(t, sock, Request{Op: "close", DB: "app", Branch: "main"}); r.OK || !strings.Contains(r.Error, "injected release failure") {
+		t.Fatalf("close = %+v, want the injected release failure", r)
+	}
+	ref, _, err := w.Store.GetRef("app", "main")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if ref.LeaseHolder != holder || !store.LeaseLive(ref, time.Now()) {
+		t.Fatalf("after the failed close the ref holds %q (live %v), want the closed session's %q", ref.LeaseHolder, store.LeaseLive(ref, time.Now()), holder)
+	}
+	return ref
+}
+
+// TestOpenRefusedByOwnOrphanedLeaseNamesTheHolder: a session of this
+// daemon whose close could not release its lease leaves it live under the
+// session's own holder, which the daemon records. An open of the branch is
+// refused with the wording for exactly that lease: an earlier session of
+// this daemon, its exact holder, when it lapses (rounded up), and the
+// `lease release --holder` that frees only it. Once it is freed, the next
+// open succeeds under a new holder.
+func TestOpenRefusedByOwnOrphanedLeaseNamesTheHolder(t *testing.T) {
+	srv, w := newServer(t)
+	sock := srv.SocketPath()
+	fr := &failReleases{Backend: w.Store.B}
+	w.Store.B = fr // before any session exists
+	orphan := orphanAppMain(t, sock, w, fr)
+
+	resp, err := rawCall(sock, Request{Op: "open", DB: "app", Branch: "main"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if want := orphanWant(orphan); resp.OK || resp.Error != want {
+		t.Fatalf("open under this daemon's orphaned lease = %+v, want the error %q", resp, want)
+	}
+	ref, _, err := w.Store.GetRef("app", "main")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if ref.LeaseHolder != orphan.LeaseHolder || ref.Epoch != orphan.Epoch {
+		t.Fatalf("the refused open changed the orphaned lease: %q@%d", ref.LeaseHolder, ref.Epoch)
+	}
+
+	if err := w.ReleaseLeaseByHolder("app", "main", orphan.LeaseHolder); err != nil {
+		t.Fatal(err)
+	}
+	if r := call(t, sock, Request{Op: "open", DB: "app", Branch: "main"}); !r.OK {
+		t.Fatalf("open after the orphan was freed = %+v", r)
+	}
+	if h := getStatus(t, sock, "app", "main").Holder; h == orphan.LeaseHolder {
+		t.Fatalf("the reopen holds as the orphan's holder %s", h)
+	}
+}
+
+// TestTwinDaemonPrefixGetsGenericAdvice: a live session: holder that this
+// daemon never minted is not its orphan, even when it carries this
+// daemon's own session:<host>/<pid>/ prefix, as the holders of a second
+// daemon in a look-alike container (same hostname, offshoot at PID 1) do.
+// That session may be live, so the refusal is ops.LeaseHeldAdvice's: close
+// it, or, if its daemon has exited, free it by its exact holder; never
+// "an earlier session of this daemon ... free it now". A bare holder (a
+// `lease acquire`) keeps the plain lease-held error.
+func TestTwinDaemonPrefixGetsGenericAdvice(t *testing.T) {
+	srv, w := newServer(t)
+	sock := srv.SocketPath()
+	twin := "session:" + ops.LocalHolder() + "/deadbeef"
+	l, err := w.AcquireLease("app", "main", twin, time.Minute)
+	if err != nil {
+		t.Fatal(err)
+	}
+	resp, err := rawCall(sock, Request{Op: "open", DB: "app", Branch: "main"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	ref, _, err := w.Store.GetRef("app", "main")
+	if err != nil {
+		t.Fatal(err)
+	}
+	want := "daemon: " + ops.LeaseHeldAdvice("app", "main", ref)
+	if resp.OK || resp.Error != want || strings.Contains(resp.Error, "earlier session of this daemon") {
+		t.Fatalf("open under a twin daemon's lease = %+v, want the error %q", resp, want)
+	}
+	for _, part := range []string{
+		`held by "` + twin + `"`, "(an open daemon session)", "close the session",
+		"if the daemon that held it has exited, free it with 'offshoot lease release app@main --holder " + twin + "'",
+	} {
+		if !strings.Contains(resp.Error, part) {
+			t.Fatalf("twin refusal %q lacks %q", resp.Error, part)
+		}
+	}
+	if ref.LeaseHolder != twin || ref.Epoch != l.Epoch {
+		t.Fatalf("the refused open changed the twin's lease: %q@%d", ref.LeaseHolder, ref.Epoch)
+	}
+
+	if err := w.ReleaseLease(l); err != nil {
+		t.Fatal(err)
+	}
+	bare := ops.LocalHolder()
+	if _, err := w.AcquireLease("app", "main", bare, time.Minute); err != nil {
+		t.Fatal(err)
+	}
+	resp, err = rawCall(sock, Request{Op: "open", DB: "app", Branch: "main"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if resp.OK || strings.Contains(resp.Error, "earlier session of this daemon") || !strings.Contains(resp.Error, "lease is held") || !strings.Contains(resp.Error, bare) {
+		t.Fatalf("open under a bare holder's lease = %+v, want the plain lease-held refusal naming %s", resp, bare)
 	}
 }
 
@@ -212,5 +344,69 @@ func TestRollbackAndCompactRefusalsOfferNoForce(t *testing.T) {
 		if resp.OK || !strings.Contains(resp.Error, holder) || !strings.Contains(resp.Error, "retry when it finishes") || strings.Contains(resp.Error, "--force") {
 			t.Fatalf("%s during a checkpoint = %+v, want a refusal that says to retry and offers no --force", req.Op, resp)
 		}
+	}
+}
+
+// TestOrphanedHolderRefusalNeverNamesALiveSession: the orphaned-holder
+// refusal reads the ref while the failed open's reservation still stands.
+// Read after the reservation is released, it could see a session another
+// open of this daemon took in between, and its `lease release --holder`
+// advice would fence that live session. openRefusedReleased runs such an
+// open in exactly that window.
+func TestOrphanedHolderRefusalNeverNamesALiveSession(t *testing.T) {
+	srv, w := newServer(t)
+	sock := srv.SocketPath()
+	fr := &failReleases{Backend: w.Store.B}
+	w.Store.B = fr // before any session exists
+	orphanRef := orphanAppMain(t, sock, w, fr)
+	orphan := orphanRef.LeaseHolder
+	var once sync.Once
+	var other Response
+	var otherErr error
+	openRefusedReleased = func() {
+		once.Do(func() {
+			if otherErr = w.ReleaseLeaseByHolder("app", "main", orphan); otherErr == nil {
+				other, otherErr = rawCall(sock, Request{Op: "open", DB: "app", Branch: "main"})
+			}
+		})
+	}
+	t.Cleanup(func() { openRefusedReleased = nil })
+
+	resp, err := rawCall(sock, Request{Op: "open", DB: "app", Branch: "main"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if otherErr != nil || !other.OK {
+		t.Fatalf("the open in the window = %+v, %v; want it to succeed", other, otherErr)
+	}
+	live := getStatus(t, sock, "app", "main").Holder
+	if strings.Contains(resp.Error, live) {
+		t.Fatalf("the refusal names the live session's holder %s: %q", live, resp.Error)
+	}
+	if want := orphanWant(orphanRef); resp.OK || resp.Error != want {
+		t.Fatalf("open refused by the orphaned lease = %+v, want the error %q", resp, want)
+	}
+}
+
+// TestStatusHolderIsTheSessionsOwn: status reports an open session's
+// holder as session:<host>/<pid>/<8 hex>, the holder its session.Open
+// generated.
+func TestStatusHolderIsTheSessionsOwn(t *testing.T) {
+	srv, w := newServer(t)
+	sock := srv.SocketPath()
+	if r := call(t, sock, Request{Op: "open", DB: "app", Branch: "main"}); !r.OK {
+		t.Fatalf("open = %+v", r)
+	}
+	st := getStatus(t, sock, "app", "main")
+	shape := regexp.MustCompile(`^session:` + regexp.QuoteMeta(ops.LocalHolder()) + `/[0-9a-f]{8}$`)
+	if !shape.MatchString(st.Holder) {
+		t.Fatalf("status holder %q, want it to match %s", st.Holder, shape)
+	}
+	ref, _, err := w.Store.GetRef("app", "main")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if ref.LeaseHolder != st.Holder {
+		t.Fatalf("status holder %q, ref holder %q", st.Holder, ref.LeaseHolder)
 	}
 }

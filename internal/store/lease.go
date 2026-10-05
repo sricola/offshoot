@@ -37,7 +37,19 @@ var (
 	// (see Ref.Deleting's doc comment). Retrying shortly is always the
 	// right move, same as ErrReaping.
 	ErrDeleting = errors.New("store: branch is being deleted")
+	// ErrHolderMismatch reports that ReleaseLeaseByHolder found db@branch
+	// not leased to the holder it was asked to free (another holder, or no
+	// lease at all) and wrote nothing. The error's own text says which;
+	// errors.Is tells it apart from a store failure.
+	ErrHolderMismatch = errors.New("lease release: the branch is not leased to that holder")
 )
+
+// holderMismatchError is ReleaseLeaseByHolder's refusal: its message names
+// what the ref holds instead, and it unwraps to ErrHolderMismatch.
+type holderMismatchError struct{ msg string }
+
+func (e *holderMismatchError) Error() string { return e.msg }
+func (e *holderMismatchError) Unwrap() error { return ErrHolderMismatch }
 
 // Lease is a claim on a branch, valid until Expiry unless renewed.
 type Lease struct {
@@ -232,14 +244,51 @@ func (s *Store) ReleaseLease(l Lease) error {
 		return fmt.Errorf("%w: %s@%s now held by %q at epoch %d",
 			ErrLeaseLost, l.DB, l.Branch, ref.LeaseHolder, ref.Epoch)
 	}
+	return s.clearLease(l.DB, l.Branch, ref, etag)
+}
+
+// ReleaseLeaseByHolder clears db@branch's lease iff ref.LeaseHolder is
+// exactly holder — a compare-and-swap on the holder alone, unlike
+// ReleaseLease's holder+epoch match, which suits a caller (`lease release
+// --holder H`) that only has the holder string a refusal named and no
+// epoch to go with it. An empty ref.LeaseHolder ("not held") never equals a
+// caller's non-empty holder, so releasing an unleased ref is refused rather
+// than silently succeeding. Either refusal unwraps to ErrHolderMismatch
+// and writes nothing. An empty holder names no lease and is an error
+// before the ref is read: matched against an unleased ref it would "free"
+// nothing and report success.
+func (s *Store) ReleaseLeaseByHolder(db, branch, holder string) error {
+	if holder == "" {
+		return fmt.Errorf("lease release: %s@%s: an empty holder names no lease; nothing released", db, branch)
+	}
+	ref, etag, err := s.GetRef(db, branch)
+	if err != nil {
+		return err
+	}
+	if ref.LeaseHolder == "" {
+		return &holderMismatchError{fmt.Sprintf("lease release: %s@%s is not leased; nothing released", db, branch)}
+	}
+	if ref.LeaseHolder != holder {
+		return &holderMismatchError{fmt.Sprintf("lease release: %s@%s is held by %s, not %s; nothing released",
+			db, branch, ref.LeaseHolder, holder)}
+	}
+	return s.clearLease(db, branch, ref, etag)
+}
+
+// clearLease is the shared tail of ReleaseLease and ReleaseLeaseByHolder,
+// once each has confirmed the caller may release: clear the holder/expiry,
+// stamp the activity clock and write the ref back at etag. The epoch is
+// left alone — a clean release means the holder's own objects stay
+// reachable.
+func (s *Store) clearLease(db, branch string, ref Ref, etag string) error {
 	ref.LeaseHolder = ""
 	ref.LeaseExpiry = ""
 	// A lease that was just live counts as activity: stamping the clock here
 	// means a branch isn't instantly eligible for reaping the moment its
 	// session closes.
 	ref.Touch(time.Now())
-	if _, err := s.PutRef(l.DB, l.Branch, ref, etag); err != nil {
-		return fmt.Errorf("store: release lease on %s@%s: %w", l.DB, l.Branch, err)
+	if _, err := s.PutRef(db, branch, ref, etag); err != nil {
+		return fmt.Errorf("store: release lease on %s@%s: %w", db, branch, err)
 	}
 	return nil
 }

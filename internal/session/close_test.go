@@ -5,7 +5,6 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
-	"strings"
 	"sync"
 	"sync/atomic"
 	"testing"
@@ -197,10 +196,22 @@ func TestCloseRetriesRelease(t *testing.T) {
 				t.Fatal(err)
 			}
 			f.n.Store(tc.n)
+			l := s.Lease()
 			err = s.Close()
 			if tc.wantErr != "" {
-				if err == nil || !strings.Contains(err.Error(), tc.wantErr) {
-					t.Fatalf("close = %v, want an error containing %q", err, tc.wantErr)
+				// The lease is left behind under this session's own holder:
+				// the error says when it lapses and gives the release that
+				// frees exactly that holder.
+				ref, _, rerr := w.Store.GetRef("app", "main")
+				if rerr != nil {
+					t.Fatal(rerr)
+				}
+				expiry, _ := time.Parse(time.RFC3339Nano, ref.LeaseExpiry)
+				want := fmt.Sprintf("session app@main closed but its lease release failed: store: release lease on app@main: test: %s; the lease (holder %s) lapses at %s, or 'offshoot lease release app@main --holder %s' frees it now",
+					tc.wantErr, l.Holder, ops.LapseTime(expiry), l.Holder)
+				var lre *LeaseReleaseError
+				if err == nil || err.Error() != want || !errors.As(err, &lre) || lre.Lease.Holder != l.Holder || ref.LeaseHolder != l.Holder {
+					t.Fatalf("close = %v\nwant %s", err, want)
 				}
 				return
 			}

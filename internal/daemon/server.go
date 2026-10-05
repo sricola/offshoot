@@ -40,9 +40,23 @@ type Server struct {
 	// takes it over until that session's Close has returned. The closing
 	// state keeps the branch claimed through the whole close. Freeing the
 	// key any earlier let an open take the lease the closing session still
-	// held — same holder, so AcquireLease renewed it in place under the same
-	// epoch — and then lose it to that session's release.
+	// held — when every session shared one holder, AcquireLease renewed it
+	// in place under the same epoch — and then lose it to that session's
+	// release. Per-session holders (ops.NewSessionHolder) now make such an
+	// open fail on the live lease instead; the closing state is what makes
+	// it wait for the close and succeed.
 	sessions map[string]*slot
+	// orphaned maps "db@branch" to the exact lease holder of the latest
+	// session of this daemon on that key whose lease release failed: a
+	// close (closeSlot) or a failed open (session.Open's release after a
+	// failed checkout or checksum baseline) returned a
+	// session.LeaseReleaseError, and that lease lives on under a holder no
+	// session holds any more. openRefusal says "an earlier session of this
+	// daemon" only for a lease whose holder is exactly this one; a holder
+	// that merely looks like this daemon's (the same session:<host>/<pid>/
+	// prefix, as two daemons in look-alike containers share) is never
+	// treated as its own. Cleared when an open of the key succeeds.
+	orphaned map[string]string
 	closing  bool
 	// flushEvery is passed as Options.FlushEvery to every session opOpen
 	// opens, so every session this daemon serves gets the same background-
@@ -206,6 +220,7 @@ func (s *Server) closeSlot(k string, m *slot) (err error) {
 		if s.sessions[k] == m {
 			delete(s.sessions, k)
 		}
+		s.recordOrphanLocked(k, err)
 		// Published after the key is free, so a client acting on it is not
 		// refused as closing, and before done closes and s.mu is released,
 		// so it reaches subscribers ahead of anything a waiter or a fresh
@@ -219,6 +234,18 @@ func (s *Server) closeSlot(k string, m *slot) (err error) {
 		s.mu.Unlock()
 	}()
 	return m.sess.Close()
+}
+
+// recordOrphanLocked records, for k, the exact holder of a lease that err
+// says a session of this daemon failed to release (a
+// session.LeaseReleaseError from Close or from a failed Open), so
+// openRefusal can later recognise that lease as this daemon's own orphan.
+// Any other err records nothing. The caller holds s.mu.
+func (s *Server) recordOrphanLocked(k string, err error) {
+	var lre *session.LeaseReleaseError
+	if errors.As(err, &lre) && lre.Lease.Holder != "" {
+		s.orphaned[k] = lre.Lease.Holder
+	}
 }
 
 // closeWaitBudget bounds how long an open, or a duplicate close, waits for
@@ -283,6 +310,7 @@ func NewServer(ws *ops.Workspace, socketPath string) (*Server, error) {
 	}
 	srv := &Server{ws: ws, ln: ln, sock: socketPath,
 		sessions:     map[string]*slot{},
+		orphaned:     map[string]string{},
 		conns:        map[net.Conn]struct{}{},
 		janitorStop:  make(chan struct{}),
 		shutdownDone: make(chan struct{}),
@@ -528,7 +556,7 @@ func (s *Server) dispatch(req Request) Response {
 func errResp(err error) Response { return Response{Error: err.Error()} }
 
 // opOpen claims db@branch, or refuses if it is already open here (or leased
-// elsewhere, surfaced as session.Open's error).
+// elsewhere, surfaced as session.Open's error, reworded by openRefusal).
 //
 // Race structure: a naive "check the map, unlock, call session.Open, lock,
 // recheck the map" would let two concurrent opens for the SAME key both pass
@@ -537,12 +565,12 @@ func errResp(err error) Response { return Response{Error: err.Error()} }
 // fixed file per db@branch (ops.Workspace.CheckoutPath), so two concurrent
 // Opens would materialize over the same file and then run two independent
 // capture engines against it at once — a real on-disk race, not just a
-// duplicate lease. It also isn't fenced by the lease itself: both Opens use
-// the same holder identity (ops.LocalHolder(), constant for this whole
-// process), and store.AcquireLease treats a re-acquisition by the same live
-// holder as an idempotent self-renew rather than a conflict (see
-// internal/store/lease.go), so the second Open's AcquireLease call can
-// succeed too instead of failing fast.
+// duplicate lease. The lease alone would fence the second Open too, since
+// each session.Open acquires under its own holder (ops.NewSessionHolder)
+// and the first's live lease refuses the second's acquire before it
+// materializes anything; but the reservation decides it in memory, with no
+// store round trip, and refuses with "already open here" rather than a
+// lease-held error naming this daemon's own session.
 //
 // This function avoids the race by reserving the map slot (writing a
 // reserved slot under s.mu) before releasing the lock and calling
@@ -620,16 +648,33 @@ func (s *Server) opOpen(req Request) Response {
 		openDelay() // test hook; nil (a no-op) in production
 	}
 
+	// The holder is minted here, not left to session.Open's default, so
+	// this daemon knows it exactly: if the open fails after its acquire and
+	// the release fails too, that holder is recorded as this daemon's
+	// orphan (s.orphaned), and only a lease held by exactly it is ever
+	// called "an earlier session of this daemon".
 	sess, err := session.Open(context.Background(), session.Options{
-		WS: s.ws, DB: req.DB, Branch: branch, FlushEvery: flushEvery,
-		SnapshotEvery: snapshotEvery,
+		WS: s.ws, DB: req.DB, Branch: branch, Holder: ops.NewSessionHolder(),
+		FlushEvery: flushEvery, SnapshotEvery: snapshotEvery,
 	})
+
+	var refusal error
+	if err != nil {
+		// Worded while the reservation still stands (see openRefusal), and
+		// outside s.mu, since it may read the ref.
+		refusal = s.openRefusal(req.DB, branch, err)
+	}
 
 	s.mu.Lock()
 	if err != nil {
+		s.recordOrphanLocked(k, err)
+		err = refusal
 		delete(s.sessions, k) // release the reservation
 		s.openWG.Done()
 		s.mu.Unlock()
+		if openRefusedReleased != nil {
+			openRefusedReleased() // test hook; nil (a no-op) in production
+		}
 		return errResp(err)
 	}
 	if s.closing {
@@ -649,18 +694,68 @@ func (s *Server) opOpen(req Request) Response {
 	}
 	sl := &slot{sess: sess, id: newSessionID()}
 	s.sessions[k] = sl
+	// This open's acquire landed, so no earlier lease is live on k: any
+	// orphan recorded for it has lapsed or been released.
+	delete(s.orphaned, k)
 	s.openWG.Done()
 	s.mu.Unlock()
 	return Response{OK: true, Checkout: sess.CheckoutPath(), SessionID: sl.id}
 }
 
+// openRefusal is how opOpen reports session.Open's err on db@branch:
+//
+//   - a live lease held by an at-rest checkpoint (ops.CheckpointInProgress)
+//     clears within seconds, so the refusal says to retry;
+//   - a lease-held refusal whose holder is exactly the one this daemon
+//     recorded for db@branch in s.orphaned is a lease an earlier session
+//     of this daemon left behind when its release retries ran out
+//     (session.Close, or Open's release after a failed checkout or
+//     checksum baseline). No session holds as that holder any more, so the
+//     refusal says so, names it, says when its lease lapses, and gives the
+//     `lease release --holder` that frees only it, unconditionally;
+//   - any other live session: holder may be a live session of another
+//     daemon, including one in a look-alike container whose holders share
+//     this daemon's session:<host>/<pid>/ prefix, so the prefix decides
+//     nothing here. The refusal is ops.LeaseHeldAdvice's, the same text as
+//     a checkpoint's refusal: close that session, or, if its daemon has
+//     exited, `lease release --holder` that exact holder.
+//
+// opOpen calls this while its reservation of db@branch still stands, so no
+// session of this daemon can take the branch between the refusal and the
+// ref this reads. Anything else (a bare holder, a failed or lapsed read)
+// is err unchanged.
+func (s *Server) openRefusal(db, branch string, err error) error {
+	if ops.CheckpointInProgress(err) {
+		return fmt.Errorf("daemon: a checkpoint is in progress on %s@%s; retry in a few seconds", db, branch)
+	}
+	if !errors.Is(err, store.ErrLeaseHeld) {
+		return err
+	}
+	ref, _, gerr := s.ws.Store.GetRef(db, branch)
+	if gerr != nil || !store.LeaseLive(ref, time.Now()) {
+		return err
+	}
+	s.mu.Lock()
+	orphan := s.orphaned[key(db, branch)]
+	s.mu.Unlock()
+	switch {
+	case orphan != "" && ref.LeaseHolder == orphan:
+		expiry, _ := time.Parse(time.RFC3339Nano, ref.LeaseExpiry)
+		return fmt.Errorf("daemon: %s@%s is held by an earlier session of this daemon whose lease release failed (holder %s); it lapses at %s; free it now with 'offshoot lease release %s@%s --holder %s'",
+			db, branch, ref.LeaseHolder, ops.LapseTime(expiry), db, branch, ref.LeaseHolder)
+	case ops.IsSessionHolder(ref.LeaseHolder):
+		return fmt.Errorf("daemon: %s", ops.LeaseHeldAdvice(db, branch, ref))
+	}
+	return err
+}
+
 // newSessionID mints the id opOpen returns for a session and a close
 // sends back to name it: 128 random bits, so no two sessions share one, in
-// this daemon or any other. The session's lease cannot name it. Daemon
-// sessions share one holder, so a reopen after a close whose release failed
-// renews that lease in place and keeps its epoch. And rollback, promote and
-// compact restart a branch's epoch, as does destroying it and creating it
-// again, so the next open gets an epoch an earlier session already had.
+// this daemon or any other. The session's lease is a weaker name for it:
+// its holder (ops.NewSessionHolder) carries only a 32-bit nonce, and
+// rollback, promote and compact restart a branch's epoch, as does
+// destroying it and creating it again, so the next open can get an epoch
+// an earlier session already had.
 func newSessionID() string {
 	var b [16]byte
 	rand.Read(b[:]) // never returns an error: it crashes the program instead
@@ -673,6 +768,12 @@ func newSessionID() string {
 // opens can be exercised deterministically instead of relying on timing. Nil
 // (the default) is a no-op and imposes no cost in production.
 var openDelay func()
+
+// openRefusedReleased, when non-nil, is invoked by opOpen after a failed
+// session.Open's reservation has been released and before the refusal is
+// returned. Tests use it to run a concurrent open of the same branch in
+// that window. Nil (the default) is a no-op in production.
+var openRefusedReleased func()
 
 // closeWaitEntered, when non-nil, is called by opOpen, opClose and Shutdown
 // as each starts waiting on a closing slot, with that wait's deadline

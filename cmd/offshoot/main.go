@@ -96,7 +96,14 @@ Usage:
                                      not persisted anywhere)
   offshoot lease list                       list every branch's lease
   offshoot lease acquire <db>[@branch] [--ttl 30s]   claim or renew a lease
-  offshoot lease release <db>[@branch]      release a lease
+  offshoot lease release <db>[@branch] [--holder H]
+                                     release a lease; with --holder, a
+                                     compare-and-swap that frees only H,
+                                     refusing (and writing nothing) if the
+                                     branch is held by someone else or not
+                                     leased at all; without it, frees
+                                     whatever the ref holds and prints the
+                                     holder it freed
   offshoot serve [-socket PATH] [-reap-every d] [-gc-grace d] [-flush-every d]
                  [-snapshot-every N] [-ro-cache-budget BYTES] [-fd-budget N] [-http ADDR] [-token TOKEN] [-http-allow-non-loopback]
                                              run the daemon until SIGINT/SIGTERM;
@@ -1112,12 +1119,29 @@ func run(args []string) error {
 				" long-running holder renews it")
 			return nil
 		case "release":
-			if len(rest) != 2 {
-				return fmt.Errorf("usage: offshoot lease release <db>[@branch]")
-			}
-			db, branch, err := ops.ParseTarget(rest[1])
+			args := rest[1:]
+			holder, args, holderGiven, err := extractFlag(args, "--holder")
 			if err != nil {
 				return err
+			}
+			if holderGiven && holder == "" {
+				// An empty holder names no lease; against an unleased ref it
+				// would match and "release" nothing.
+				return fmt.Errorf("usage: offshoot lease release <db>[@branch] [--holder H]: --holder requires a non-empty holder")
+			}
+			if len(args) != 1 {
+				return fmt.Errorf("usage: offshoot lease release <db>[@branch] [--holder H]")
+			}
+			db, branch, err := ops.ParseTarget(args[0])
+			if err != nil {
+				return err
+			}
+			if holderGiven {
+				if err := w.ReleaseLeaseByHolder(db, branch, holder); err != nil {
+					return err
+				}
+				fmt.Printf("released %s@%s held by %s\n", db, branch, holder)
+				return nil
 			}
 			infos, err := w.Leases()
 			if err != nil {
@@ -1125,9 +1149,13 @@ func run(args []string) error {
 			}
 			for _, in := range infos {
 				if in.DB == db && in.Branch == branch {
-					return w.ReleaseLease(store.Lease{
+					if err := w.ReleaseLease(store.Lease{
 						DB: db, Branch: branch, Holder: in.Holder, Epoch: in.Epoch,
-					})
+					}); err != nil {
+						return err
+					}
+					fmt.Printf("released %s@%s held by %s\n", db, branch, in.Holder)
+					return nil
 				}
 			}
 			return fmt.Errorf("offshoot: no lease on %s@%s", db, branch)
