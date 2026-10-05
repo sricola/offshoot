@@ -232,14 +232,43 @@ func (s *Store) ReleaseLease(l Lease) error {
 		return fmt.Errorf("%w: %s@%s now held by %q at epoch %d",
 			ErrLeaseLost, l.DB, l.Branch, ref.LeaseHolder, ref.Epoch)
 	}
+	return s.clearLease(l.DB, l.Branch, ref, etag)
+}
+
+// ReleaseLeaseByHolder clears db@branch's lease iff ref.LeaseHolder is
+// exactly holder — a compare-and-swap on the holder alone, unlike
+// ReleaseLease's holder+epoch match, which suits a caller (`lease release
+// --holder H`) that only has the holder string a refusal named and no
+// epoch to go with it. An empty ref.LeaseHolder ("not held") never equals a
+// caller's non-empty holder, so releasing an unleased ref is refused the
+// same as any other mismatch rather than silently succeeding. On a
+// mismatch nothing is written.
+func (s *Store) ReleaseLeaseByHolder(db, branch, holder string) error {
+	ref, etag, err := s.GetRef(db, branch)
+	if err != nil {
+		return err
+	}
+	if ref.LeaseHolder != holder {
+		return fmt.Errorf("%w: %s@%s is held by %q, not %q; nothing released",
+			ErrLeaseLost, db, branch, ref.LeaseHolder, holder)
+	}
+	return s.clearLease(db, branch, ref, etag)
+}
+
+// clearLease is the shared tail of ReleaseLease and ReleaseLeaseByHolder,
+// once each has confirmed the caller may release: clear the holder/expiry,
+// stamp the activity clock and write the ref back at etag. The epoch is
+// left alone — a clean release means the holder's own objects stay
+// reachable.
+func (s *Store) clearLease(db, branch string, ref Ref, etag string) error {
 	ref.LeaseHolder = ""
 	ref.LeaseExpiry = ""
 	// A lease that was just live counts as activity: stamping the clock here
 	// means a branch isn't instantly eligible for reaping the moment its
 	// session closes.
 	ref.Touch(time.Now())
-	if _, err := s.PutRef(l.DB, l.Branch, ref, etag); err != nil {
-		return fmt.Errorf("store: release lease on %s@%s: %w", l.DB, l.Branch, err)
+	if _, err := s.PutRef(db, branch, ref, etag); err != nil {
+		return fmt.Errorf("store: release lease on %s@%s: %w", db, branch, err)
 	}
 	return nil
 }

@@ -79,6 +79,12 @@ func (w *Workspace) RenewLease(l store.Lease, ttl time.Duration) (store.Lease, e
 
 func (w *Workspace) ReleaseLease(l store.Lease) error { return w.Store.ReleaseLease(l) }
 
+// ReleaseLeaseByHolder releases db@branch's lease iff its exact holder is
+// holder — see store.ReleaseLeaseByHolder.
+func (w *Workspace) ReleaseLeaseByHolder(db, branch, holder string) error {
+	return w.Store.ReleaseLeaseByHolder(db, branch, holder)
+}
+
 // LeaseInfo describes a branch's current lease for display.
 type LeaseInfo struct {
 	DB, Branch, Holder string
