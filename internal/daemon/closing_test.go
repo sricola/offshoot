@@ -386,8 +386,15 @@ func TestCloseOnClosingSlotWaits(t *testing.T) {
 			t.Fatalf("the refused reopen moved the lease: %q@%d -> %q@%d", old.LeaseHolder, old.Epoch, held.LeaseHolder, held.Epoch)
 		}
 		expiry, _ := time.Parse(time.RFC3339Nano, held.LeaseExpiry)
+		// The close's own error named the same holder and expiry, and the
+		// release that frees exactly that lease.
+		wantClose := fmt.Sprintf("session app@main closed but its lease release failed: store: release lease on app@main: test: injected release failure; the lease (holder %s) lapses at %s, or 'offshoot lease release app@main --holder %s' frees it now",
+			old.LeaseHolder, ops.LapseTime(expiry), old.LeaseHolder)
+		if first.Error != wantClose {
+			t.Fatalf("first close's error = %q, want %q", first.Error, wantClose)
+		}
 		want := fmt.Sprintf("daemon: app@main is held by an earlier session of this daemon whose lease release failed (holder %s); it lapses at %s; free it now with 'offshoot lease release app@main --holder %s'",
-			old.LeaseHolder, expiry.Format(time.RFC3339), old.LeaseHolder)
+			old.LeaseHolder, ops.LapseTime(expiry), old.LeaseHolder)
 		if r.OK || r.Error != want {
 			t.Fatalf("open after a failed close = %+v, want the error %q", r, want)
 		}
@@ -559,8 +566,10 @@ func TestStaleCloseLeavesTheReopenedSessionOpen(t *testing.T) {
 		a := open(t, sock)
 		aInfo := getStatus(t, sock, "app", "main")
 		fr.arm(3) // every attempt Close's release makes
-		if r := call(t, sock, closeReq(a.SessionID)); r.OK || !strings.Contains(r.Error, "injected release failure") {
-			t.Fatalf("A's close = %+v, want the injected release failure", r)
+		if r := call(t, sock, closeReq(a.SessionID)); r.OK || !strings.Contains(r.Error, "session app@main closed but its lease release failed: ") ||
+			!strings.Contains(r.Error, "injected release failure; the lease (holder "+aInfo.Holder+") lapses at ") ||
+			!strings.HasSuffix(r.Error, "or 'offshoot lease release app@main --holder "+aInfo.Holder+"' frees it now") {
+			t.Fatalf("A's close = %+v, want the injected release failure naming A's holder %s", r, aInfo.Holder)
 		}
 		// The release failed, so A's lease, under A's own holder, refuses
 		// B's open until it lapses or is freed by that exact holder.

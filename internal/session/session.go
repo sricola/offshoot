@@ -421,11 +421,11 @@ func settleAcquire(o Options, acquireErr error) (store.Lease, error) {
 	case adopted:
 		return lease, nil
 	case err != nil && !errors.Is(err, store.ErrNotFound):
-		if t := latest.Truncate(time.Second); !t.Equal(latest) {
-			latest = t.Add(time.Second) // RFC3339 drops the fraction; round up so this stays the latest
-		}
+		// The --holder advice is safe even though the lease may not have
+		// landed: o.Holder is this failed Open's own, so the release frees
+		// that lease if it exists and refuses, writing nothing, otherwise.
 		return store.Lease{}, fmt.Errorf("session: acquire %s@%s: the acquire may have landed though it reported failure, and the ref could not be re-read to tell; if it did, the lease (holder %s) lapses by %s, or 'offshoot lease release %s@%s --holder %s' frees it now: %w",
-			o.DB, o.Branch, o.Holder, latest.Format(time.RFC3339), o.DB, o.Branch, o.Holder, err)
+			o.DB, o.Branch, o.Holder, ops.LapseTime(latest), o.DB, o.Branch, o.Holder, err)
 	case err == nil && ops.IsCheckpointHolder(ref.LeaseHolder) && store.LeaseLive(ref, time.Now()):
 		return store.Lease{}, fmt.Errorf("session: acquire %s@%s: %w", o.DB, o.Branch, ops.CheckpointHeldError(o.DB, o.Branch, ref))
 	}
@@ -482,7 +482,7 @@ func Open(ctx context.Context, o Options) (*Session, error) {
 		relErr := releaseLease(o.WS.ReleaseLease, lease)
 		cleanup()
 		if relErr != nil {
-			return nil, errors.Join(err, fmt.Errorf("session: also failed to release the lease after checkout failed: %w", relErr))
+			return nil, errors.Join(err, newLeaseReleaseError("session: also failed to release the lease after checkout failed", lease, relErr))
 		}
 		return nil, err
 	}
@@ -566,12 +566,12 @@ func Open(ctx context.Context, o Options) (*Session, error) {
 			cancel()
 			renewCancel() // renewLoop has not started; this only frees rctx
 			<-s.engDone
-			relErr := o.WS.ReleaseLease(lease)
+			relErr := releaseLease(o.WS.ReleaseLease, lease)
 			cleanup()
 			err := fmt.Errorf("session: establish checksum baseline after clean resume: %w", rerr)
 			if relErr != nil {
 				return nil, errors.Join(err,
-					fmt.Errorf("session: also failed to release the lease: %w", relErr))
+					newLeaseReleaseError("session: also failed to release the lease", lease, relErr))
 			}
 			return nil, err
 		}
@@ -941,15 +941,57 @@ func (s *Session) Close() error {
 		s.flushMu.Unlock()
 	}
 	// holder and epoch name the lease this close released, or failed to,
-	// as "opened" named it. A later session can repeat the pair (see the
-	// daemon's session_closed), so they do not identify the session.
+	// as "opened" named it. The holder is unique to this session's Open
+	// (ops.NewSessionHolder) unless a caller passed its own; a later
+	// session can repeat the epoch (see the daemon's session_closed), so
+	// the epoch alone does not identify the session.
 	if relErr != nil {
 		s.logTransition("closed", "holder", lease.Holder, "epoch", lease.Epoch, "error", relErr.Error())
 	} else {
 		s.logTransition("closed", "holder", lease.Holder, "epoch", lease.Epoch)
 	}
+	if relErr != nil && !errors.Is(relErr, store.ErrNotFound) {
+		// The lease outlives this session until it lapses. The advice names
+		// this session's own holder, which nothing else holds as, so the
+		// release it suggests frees only this lease. A branch that is gone
+		// (ErrNotFound) took its lease with it: Close returns that error
+		// as it always has.
+		return newLeaseReleaseError(fmt.Sprintf("session %s@%s closed but its lease release failed", s.db, s.branch), lease, relErr)
+	}
 	return relErr
 }
+
+// LeaseReleaseError reports that a session's lease could not be released,
+// by Close or by an Open that failed after its acquire, once the bounded
+// retry (releaseLease) ran out. Lease is the lease left behind, under the
+// session's own holder (ops.NewSessionHolder), which now belongs to no
+// live session, with the last expiry it was renewed to. The message says
+// when that lease lapses and gives the `offshoot lease release --holder`
+// that frees exactly it; a daemon uses Lease.Holder to recognise that
+// lease later as one it orphaned. Unwrap returns the release's error.
+type LeaseReleaseError struct {
+	Lease store.Lease
+	Err   error
+	what  string
+}
+
+// newLeaseReleaseError returns the error, prefixed by what, for a release
+// of l that failed with err: a LeaseReleaseError, or, when the branch is
+// gone (ErrNotFound) and took its lease with it, err with no advice.
+func newLeaseReleaseError(what string, l store.Lease, err error) error {
+	if errors.Is(err, store.ErrNotFound) {
+		return fmt.Errorf("%s: %w", what, err)
+	}
+	return &LeaseReleaseError{Lease: l, Err: err, what: what}
+}
+
+func (e *LeaseReleaseError) Error() string {
+	l := e.Lease
+	return fmt.Sprintf("%s: %v; the lease (holder %s) lapses at %s, or 'offshoot lease release %s@%s --holder %s' frees it now",
+		e.what, e.Err, l.Holder, ops.LapseTime(l.Expiry), l.DB, l.Branch, l.Holder)
+}
+
+func (e *LeaseReleaseError) Unwrap() error { return e.Err }
 
 // prepareSidecarRefresh and commitSidecarRefresh together re-stamp the
 // checkout's .sum sidecar (via ops.StampSumHashOnly) on a CLEAN Close, so the next

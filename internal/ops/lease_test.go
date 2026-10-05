@@ -389,3 +389,50 @@ func TestRefuseIfHeldNamesTheHolderKind(t *testing.T) {
 		t.Fatalf("CheckpointInProgress(checkpoint holder refusal) = false: %v", err)
 	}
 }
+
+// TestLapseTimeRoundsUp: a lease expiry is printed rounded up to the next
+// whole second, never truncated, so the time a refusal names is never
+// before the lease actually lapses.
+func TestLapseTimeRoundsUp(t *testing.T) {
+	for _, tc := range []struct {
+		in   time.Time
+		want string
+	}{
+		{time.Date(2026, 10, 5, 12, 0, 0, 0, time.UTC), "2026-10-05T12:00:00Z"},
+		{time.Date(2026, 10, 5, 12, 0, 0, 1, time.UTC), "2026-10-05T12:00:01Z"},
+		{time.Date(2026, 10, 5, 12, 0, 59, 999999999, time.UTC), "2026-10-05T12:01:00Z"},
+		{time.Date(2026, 10, 5, 14, 0, 0, 500, time.FixedZone("x", 2*3600)), "2026-10-05T12:00:01Z"},
+	} {
+		if got := LapseTime(tc.in); got != tc.want {
+			t.Errorf("LapseTime(%v) = %s, want %s", tc.in, got, tc.want)
+		}
+	}
+}
+
+// TestLeaseHeldAdviceIsTheCheckpointRefusalsAdvice: LeaseHeldAdvice (the
+// daemon's open refusal) and refuseIfHeld's checkpoint refusal are one
+// text: the same holder clause, the same rounded-up expiry, and the same
+// conditional `lease release --holder` advice, for a session: holder and a
+// bare one.
+func TestLeaseHeldAdviceIsTheCheckpointRefusalsAdvice(t *testing.T) {
+	expiry := time.Now().Add(time.Minute).Truncate(time.Second).Add(250 * time.Millisecond)
+	lapses := expiry.UTC().Truncate(time.Second).Add(time.Second).Format(time.RFC3339)
+	for _, tc := range []struct {
+		holder, want string
+	}{
+		{"session:host/1/0123abcd", `app@main has a live lease held by "session:host/1/0123abcd" until ` + lapses +
+			` (an open daemon session); close the session and retry, or, if the daemon that held it has exited, free it with 'offshoot lease release app@main --holder session:host/1/0123abcd'`},
+		{"host/1", `app@main has a live lease held by "host/1" until ` + lapses +
+			` (an open daemon session, or 'offshoot lease acquire'); close the session and retry, or, if the process that holds it has exited, free it with 'offshoot lease release app@main --holder host/1' (never while that daemon still runs: a session it reopened may hold the lease)`},
+	} {
+		ref := store.Ref{LeaseHolder: tc.holder, LeaseExpiry: expiry.Format(time.RFC3339Nano)}
+		if got := LeaseHeldAdvice("app", "main", ref); got != tc.want {
+			t.Fatalf("LeaseHeldAdvice(%s):\n got %s\nwant %s", tc.holder, got, tc.want)
+		}
+		err := refuseIfHeld("app", "main", ref, "checkpoint", true)
+		want := "ops: " + strings.Replace(tc.want, "; close the session", "; --force cannot take over a live lease; close the session", 1)
+		if err == nil || err.Error() != want {
+			t.Fatalf("refuseIfHeld(%s, checkpoint):\n got %v\nwant %s", tc.holder, err, want)
+		}
+	}
+}

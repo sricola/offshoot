@@ -238,7 +238,7 @@ var claimSettleEvery = 700 * time.Millisecond
 // destroyLeaseRefusal is Destroy's refusal, without --force, of a branch
 // whose lease ref shows live.
 func destroyLeaseRefusal(db, branch string, ref store.Ref) error {
-	held := fmt.Sprintf("ops: %s@%s has a live lease held by %q until %s", db, branch, ref.LeaseHolder, ref.LeaseExpiry)
+	held := fmt.Sprintf("ops: %s@%s has a live lease held by %q until %s", db, branch, ref.LeaseHolder, refExpiryText(ref))
 	if isCheckpointHolder(ref.LeaseHolder) {
 		// It ends on its own within seconds: say so first, so an agent or
 		// script retries instead of fetching a human for --force, which

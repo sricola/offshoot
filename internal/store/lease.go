@@ -37,7 +37,19 @@ var (
 	// (see Ref.Deleting's doc comment). Retrying shortly is always the
 	// right move, same as ErrReaping.
 	ErrDeleting = errors.New("store: branch is being deleted")
+	// ErrHolderMismatch reports that ReleaseLeaseByHolder found db@branch
+	// not leased to the holder it was asked to free (another holder, or no
+	// lease at all) and wrote nothing. The error's own text says which;
+	// errors.Is tells it apart from a store failure.
+	ErrHolderMismatch = errors.New("lease release: the branch is not leased to that holder")
 )
+
+// holderMismatchError is ReleaseLeaseByHolder's refusal: its message names
+// what the ref holds instead, and it unwraps to ErrHolderMismatch.
+type holderMismatchError struct{ msg string }
+
+func (e *holderMismatchError) Error() string { return e.msg }
+func (e *holderMismatchError) Unwrap() error { return ErrHolderMismatch }
 
 // Lease is a claim on a branch, valid until Expiry unless renewed.
 type Lease struct {
@@ -240,17 +252,25 @@ func (s *Store) ReleaseLease(l Lease) error {
 // ReleaseLease's holder+epoch match, which suits a caller (`lease release
 // --holder H`) that only has the holder string a refusal named and no
 // epoch to go with it. An empty ref.LeaseHolder ("not held") never equals a
-// caller's non-empty holder, so releasing an unleased ref is refused the
-// same as any other mismatch rather than silently succeeding. On a
-// mismatch nothing is written.
+// caller's non-empty holder, so releasing an unleased ref is refused rather
+// than silently succeeding. Either refusal unwraps to ErrHolderMismatch
+// and writes nothing. An empty holder names no lease and is an error
+// before the ref is read: matched against an unleased ref it would "free"
+// nothing and report success.
 func (s *Store) ReleaseLeaseByHolder(db, branch, holder string) error {
+	if holder == "" {
+		return fmt.Errorf("lease release: %s@%s: an empty holder names no lease; nothing released", db, branch)
+	}
 	ref, etag, err := s.GetRef(db, branch)
 	if err != nil {
 		return err
 	}
+	if ref.LeaseHolder == "" {
+		return &holderMismatchError{fmt.Sprintf("lease release: %s@%s is not leased; nothing released", db, branch)}
+	}
 	if ref.LeaseHolder != holder {
-		return fmt.Errorf("%w: %s@%s is held by %q, not %q; nothing released",
-			ErrLeaseLost, db, branch, ref.LeaseHolder, holder)
+		return &holderMismatchError{fmt.Sprintf("lease release: %s@%s is held by %s, not %s; nothing released",
+			db, branch, ref.LeaseHolder, holder)}
 	}
 	return s.clearLease(db, branch, ref, etag)
 }

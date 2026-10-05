@@ -932,12 +932,56 @@ func TestLeaseReleaseWithHolderMismatchExitsNonZero(t *testing.T) {
 	if err == nil {
 		t.Fatal("lease release --holder with a mismatched holder must exit non-zero")
 	}
-	if !strings.Contains(err.Error(), fmt.Sprintf("is held by %q, not %q", holder, "someone-else")) ||
-		!strings.Contains(err.Error(), "nothing released") {
-		t.Fatalf("lease release --holder mismatch: got %v", err)
+	want := fmt.Sprintf("lease release: app@main is held by %s, not someone-else; nothing released", holder)
+	if err.Error() != want {
+		t.Fatalf("lease release --holder mismatch: got %v, want %q", err, want)
 	}
 	if list := call(t, store, "lease", "list"); !strings.Contains(list, "app@main") {
 		t.Fatalf("a refused release must leave the lease held: %q", list)
+	}
+	// Once the lease is gone, the same command says the branch is not
+	// leased, rather than that it is held by an empty holder.
+	call(t, store, "lease", "release", "app", "--holder", holder)
+	_, err = callErr(t, store, "lease", "release", "app", "--holder", holder)
+	if want := "lease release: app@main is not leased; nothing released"; err == nil || err.Error() != want {
+		t.Fatalf("lease release --holder on an unleased branch: got %v, want %q", err, want)
+	}
+}
+
+// TestLeaseReleaseHolderFlagParsing: --holder with no value or an empty
+// value is a usage error that releases nothing (an empty holder names no
+// lease), and --holder before the target parses the same as after it.
+func TestLeaseReleaseHolderFlagParsing(t *testing.T) {
+	store := filepath.Join(t.TempDir(), "s")
+	call(t, store, "init")
+	call(t, store, "create", "app")
+	call(t, store, "lease", "acquire", "app", "--ttl", "1m")
+	holder := ops.LocalHolder()
+	for _, c := range []struct {
+		args []string
+		want string
+	}{
+		{[]string{"lease", "release", "app", "--holder"}, "--holder requires a value"},
+		{[]string{"lease", "release", "app", "--holder="}, "--holder requires a non-empty holder"},
+		{[]string{"lease", "release", "app", "--holder", ""}, "--holder requires a non-empty holder"},
+		{[]string{"lease", "release", "--holder", "", "app"}, "--holder requires a non-empty holder"},
+	} {
+		if _, err := callErr(t, store, c.args...); err == nil || !strings.Contains(err.Error(), c.want) {
+			t.Fatalf("offshoot %q: got %v, want an error containing %q", c.args, err, c.want)
+		}
+		if list := call(t, store, "lease", "list"); !strings.Contains(list, "app@main") {
+			t.Fatalf("offshoot %q released the lease: %q", c.args, list)
+		}
+	}
+	out, err := callErr(t, store, "lease", "release", "--holder", holder, "app")
+	if err != nil {
+		t.Fatalf("lease release --holder %s app (flag before the target): %v", holder, err)
+	}
+	if want := fmt.Sprintf("released app@main held by %s\n", holder); out != want {
+		t.Fatalf("lease release with --holder before the target printed %q, want %q", out, want)
+	}
+	if list := call(t, store, "lease", "list"); strings.Contains(list, "app@main") {
+		t.Fatalf("lease still listed after release: %q", list)
 	}
 }
 

@@ -66,9 +66,13 @@ func IsSessionHolder(holder string) bool {
 	return strings.HasPrefix(holder, sessionHolderPrefix)
 }
 
-// AcquireLease claims db@branch for this process. holder identifies the
-// claimant in diagnostics and in the ref; pass ops.LocalHolder() for the
-// conventional "<hostname>/<pid>" form.
+// AcquireLease claims db@branch for holder, which identifies the claimant
+// in diagnostics and in the ref. A holder that acquires again while its
+// lease is live renews it in place under the same epoch, so two writers
+// must never share one: a daemon session passes its own NewSessionHolder()
+// and an at-rest checkpoint its own newCheckpointHolder(). The bare
+// LocalHolder() ("<hostname>/<pid>") is only for `offshoot lease acquire`
+// and tests, where that sharing is accepted.
 func (w *Workspace) AcquireLease(db, branch, holder string, ttl time.Duration) (store.Lease, error) {
 	return w.Store.AcquireLease(db, branch, holder, ttl, time.Now())
 }
@@ -179,6 +183,80 @@ func WithoutForceAdvice(err error) error {
 	return &leaseHeldError{msg: msg, checkpoint: lhe.checkpoint}
 }
 
+// LapseTime formats a lease expiry for a refusal or an error: RFC3339 in
+// UTC, rounded up to the next whole second, so the time it names is never
+// before the lease actually lapses (RFC3339 drops the fraction).
+func LapseTime(t time.Time) string {
+	t = t.UTC()
+	if r := t.Truncate(time.Second); !r.Equal(t) {
+		t = r.Add(time.Second)
+	}
+	return t.Format(time.RFC3339)
+}
+
+// refExpiryText is ref's lease expiry as LapseTime formats it, or the raw
+// field when it does not parse.
+func refExpiryText(ref store.Ref) string {
+	t, err := time.Parse(time.RFC3339Nano, ref.LeaseExpiry)
+	if err != nil {
+		return ref.LeaseExpiry
+	}
+	return LapseTime(t)
+}
+
+// leaseHeldText is the first clause of every refusal of db@branch under
+// ref's live lease: who holds it, until when, and (kind) what sort of
+// holder that is. refuseIfHeld, destroy and LeaseHeldAdvice all build on
+// it, so the CLI's, MCP's and the daemon's refusals say it the same way.
+func leaseHeldText(db, branch string, ref store.Ref, kind string) string {
+	return fmt.Sprintf("%s@%s has a live lease held by %q until %s (%s)", db, branch, ref.LeaseHolder, refExpiryText(ref), kind)
+}
+
+// leaseHolderKind names the kind of holder a lease has, for leaseHeldText.
+// A bare holder (no session: or checkpoint: prefix) may be an `offshoot
+// lease acquire` or an older daemon's session; the two cannot be told
+// apart.
+func leaseHolderKind(holder string) string {
+	switch {
+	case isCheckpointHolder(holder):
+		return "another checkpoint is in progress"
+	case IsSessionHolder(holder):
+		return "an open daemon session"
+	default:
+		return "an open daemon session, or 'offshoot lease acquire'"
+	}
+}
+
+// leaseFreeAdvice is what to do about a live lease held by a session: or a
+// bare holder: close the session, or, once the process that held it has
+// exited, free it with `lease release --holder` naming that exact holder.
+// A session: holder is unique to one session.Open, so that release can
+// never free a different session; a bare holder is shared by every session
+// of an older daemon and every `lease acquire` on one host/pid, hence the
+// caveat.
+func leaseFreeAdvice(db, branch string, ref store.Ref) string {
+	if IsSessionHolder(ref.LeaseHolder) {
+		return fmt.Sprintf("close the session and retry, or, if the daemon that held it has exited, free it with 'offshoot lease release %s@%s --holder %s'",
+			db, branch, ref.LeaseHolder)
+	}
+	return fmt.Sprintf("close the session and retry, or, if the process that holds it has exited, free it with 'offshoot lease release %s@%s --holder %s' (never while that daemon still runs: a session it reopened may hold the lease)",
+		db, branch, ref.LeaseHolder)
+}
+
+// LeaseHeldAdvice is the refusal text for a caller that wanted db@branch
+// and found ref's live lease held by a session: or a bare holder: who holds
+// it, until when, and what frees it (leaseFreeAdvice). It claims nothing
+// about whose session holds it, and its `lease release --holder` is
+// conditional on that daemon having exited, since the session may be live
+// (another daemon, perhaps one in a look-alike container with the same
+// hostname and pid). refuseIfHeld's checkpoint refusal and the daemon's
+// open refusal both use it, so the two cannot drift. A checkpoint: holder's
+// lease clears on its own within seconds, so its refusals say to retry
+// instead (CheckpointHeldError, refuseIfHeld) and never use this.
+func LeaseHeldAdvice(db, branch string, ref store.Ref) string {
+	return leaseHeldText(db, branch, ref, leaseHolderKind(ref.LeaseHolder)) + "; " + leaseFreeAdvice(db, branch, ref)
+}
+
 // CheckpointHeldError is the refusal of a caller that wanted db@branch's
 // lease and found ref holding a live one for an at-rest checkpoint
 // (IsCheckpointHolder): a lease-held error (store.ErrLeaseHeld) that
@@ -188,7 +266,7 @@ func WithoutForceAdvice(err error) error {
 func CheckpointHeldError(db, branch string, ref store.Ref) error {
 	return &leaseHeldError{
 		msg: fmt.Sprintf("ops: %s@%s: branch lease is held by %q until %s (a checkpoint is in progress); %s",
-			db, branch, ref.LeaseHolder, ref.LeaseExpiry, checkpointRetryAdvice),
+			db, branch, ref.LeaseHolder, refExpiryText(ref), checkpointRetryAdvice),
 		checkpoint: true,
 	}
 }

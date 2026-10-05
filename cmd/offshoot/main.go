@@ -1124,6 +1124,11 @@ func run(args []string) error {
 			if err != nil {
 				return err
 			}
+			if holderGiven && holder == "" {
+				// An empty holder names no lease; against an unleased ref it
+				// would match and "release" nothing.
+				return fmt.Errorf("usage: offshoot lease release <db>[@branch] [--holder H]: --holder requires a non-empty holder")
+			}
 			if len(args) != 1 {
 				return fmt.Errorf("usage: offshoot lease release <db>[@branch] [--holder H]")
 			}

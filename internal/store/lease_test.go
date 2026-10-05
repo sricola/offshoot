@@ -595,7 +595,8 @@ func TestReleaseLeaseByHolderMatches(t *testing.T) {
 }
 
 // TestReleaseLeaseByHolderMismatchWritesNothing: a holder that does not
-// match the ref's current holder is refused with ErrLeaseLost and writes
+// match the ref's current holder is refused with ErrHolderMismatch, in its
+// own words (which holder the ref has, which one was named), and writes
 // nothing at all — not even an untouched ref re-written at a new etag.
 func TestReleaseLeaseByHolderMismatchWritesNothing(t *testing.T) {
 	s := newStore(t)
@@ -609,8 +610,9 @@ func TestReleaseLeaseByHolderMismatchWritesNothing(t *testing.T) {
 		t.Fatal(err)
 	}
 	err = s.ReleaseLeaseByHolder("app", "main", "daemon-b")
-	if !errors.Is(err, ErrLeaseLost) || !strings.Contains(err.Error(), "nothing released") {
-		t.Fatalf("mismatched holder release: got %v, want ErrLeaseLost mentioning \"nothing released\"", err)
+	want := "lease release: app@main is held by daemon-a, not daemon-b; nothing released"
+	if !errors.Is(err, ErrHolderMismatch) || errors.Is(err, ErrLeaseLost) || err.Error() != want {
+		t.Fatalf("mismatched holder release: got %v, want ErrHolderMismatch %q", err, want)
 	}
 	after, afterEtag, err := s.GetRef("app", "main")
 	if err != nil {
@@ -624,13 +626,44 @@ func TestReleaseLeaseByHolderMismatchWritesNothing(t *testing.T) {
 
 // TestReleaseLeaseByHolderOnUnleasedRefRefuses: an unleased ref has
 // LeaseHolder == "", which never equals a caller's non-empty holder, so the
-// release is refused the same way as any other mismatch rather than
-// silently succeeding as a no-op.
+// release is refused (ErrHolderMismatch, saying the branch is not leased)
+// rather than silently succeeding as a no-op.
 func TestReleaseLeaseByHolderOnUnleasedRefRefuses(t *testing.T) {
 	s := newStore(t)
 	seedBranch(t, s)
 	err := s.ReleaseLeaseByHolder("app", "main", "daemon-a")
-	if !errors.Is(err, ErrLeaseLost) || !strings.Contains(err.Error(), "nothing released") {
-		t.Fatalf("release on an unleased ref: got %v, want ErrLeaseLost mentioning \"nothing released\"", err)
+	want := "lease release: app@main is not leased; nothing released"
+	if !errors.Is(err, ErrHolderMismatch) || err.Error() != want {
+		t.Fatalf("release on an unleased ref: got %v, want ErrHolderMismatch %q", err, want)
+	}
+}
+
+// TestReleaseLeaseByHolderRejectsAnEmptyHolder: an empty holder names no
+// lease. It is an error, never a write, whether the ref is leased or not;
+// on an unleased ref it would otherwise match "" and report a release.
+func TestReleaseLeaseByHolderRejectsAnEmptyHolder(t *testing.T) {
+	s := newStore(t)
+	seedBranch(t, s)
+	for _, leased := range []bool{false, true} {
+		if leased {
+			if _, err := s.AcquireLease("app", "main", "daemon-a", time.Minute, time.Now()); err != nil {
+				t.Fatal(err)
+			}
+		}
+		before, beforeEtag, err := s.GetRef("app", "main")
+		if err != nil {
+			t.Fatal(err)
+		}
+		err = s.ReleaseLeaseByHolder("app", "main", "")
+		if err == nil || !strings.Contains(err.Error(), "empty holder") || !strings.Contains(err.Error(), "nothing released") {
+			t.Fatalf("release by an empty holder (leased=%v): got %v, want an empty-holder error", leased, err)
+		}
+		after, afterEtag, err := s.GetRef("app", "main")
+		if err != nil {
+			t.Fatal(err)
+		}
+		if !reflect.DeepEqual(before, after) || beforeEtag != afterEtag {
+			t.Fatalf("release by an empty holder (leased=%v) wrote the ref", leased)
+		}
 	}
 }

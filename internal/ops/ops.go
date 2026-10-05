@@ -1000,9 +1000,8 @@ func refuseIfHeld(db, branch string, ref store.Ref, verb string, force bool) err
 	if !store.LeaseLive(ref, time.Now()) {
 		return nil
 	}
-	held := fmt.Sprintf("ops: %s@%s has a live lease held by %q until %s", db, branch, ref.LeaseHolder, ref.LeaseExpiry)
+	held := "ops: " + leaseHeldText(db, branch, ref, leaseHolderKind(ref.LeaseHolder))
 	if isCheckpointHolder(ref.LeaseHolder) {
-		held += " (another checkpoint is in progress)"
 		if verb == "checkpoint" {
 			return &leaseHeldError{msg: held + "; --force cannot take over a live lease; " + checkpointRetryAdvice, checkpoint: true}
 		}
@@ -1012,36 +1011,18 @@ func refuseIfHeld(db, branch string, ref store.Ref, verb string, force bool) err
 		refusal := fmt.Sprintf("%s; a %s now would make that checkpoint fail without committing — %s", held, verb, checkpointRetryAdvice)
 		return &leaseHeldError{msg: refusal + ", or pass --force", noForce: refusal, checkpoint: true}
 	}
-	// A session: holder (NewSessionHolder) is unique to one session.Open
-	// call, so `lease release --holder <that exact holder>` can never free
-	// a different session the same daemon later reopens: the exact holder
-	// says so on its own, with no need for LocalHolder's parenthetical ("or
-	// 'offshoot lease acquire'") or the "never while that daemon still
-	// runs" caveat below, both of which exist only because a bare holder is
-	// shared by every session (and every `lease acquire`) on one host/pid.
-	if IsSessionHolder(ref.LeaseHolder) {
-		held += " (an open daemon session)"
-		if verb == "checkpoint" {
-			return &leaseHeldError{msg: fmt.Sprintf("%s; --force cannot take over a live lease; close the session and retry, or, if the daemon that held it has exited, free it with 'offshoot lease release %s@%s --holder %s'",
-				held, db, branch, ref.LeaseHolder)}
-		}
-	} else {
-		held += " (an open daemon session, or 'offshoot lease acquire')"
-		if verb == "checkpoint" {
-			// --force used to be the way past a holder that would not let go
-			// (a killed daemon, a forgotten `lease acquire`); name the one
-			// that is left, so the refusal is not a dead end for a whole TTL.
-			// "Gone" means the holding process has exited, not that its
-			// session closed: after a close whose lease release failed, a
-			// daemon that is still running renews that same lease for a
-			// session it reopens, and `lease release` would fence that
-			// session (see reference.md's `session close`). --holder names
-			// the exact holder this refusal saw, but a bare holder is still
-			// shared across every session (and `lease acquire`) on this
-			// host/pid, so the caveat still applies to it.
-			return &leaseHeldError{msg: fmt.Sprintf("%s; --force cannot take over a live lease; close the session and retry, or, if the process that holds it has exited, free it with 'offshoot lease release %s@%s --holder %s' (never while that daemon still runs: a session it reopened may hold the lease)",
-				held, db, branch, ref.LeaseHolder)}
-		}
+	// A session: or bare holder. --force used to be the way past a holder
+	// that would not let go (a killed daemon, a forgotten `lease acquire`);
+	// name the one that is left, so the refusal is not a dead end for a
+	// whole TTL: `lease release --holder <that exact holder>`, once the
+	// process holding it has exited (leaseFreeAdvice, shared with the
+	// daemon's open refusal through LeaseHeldAdvice). A session: holder is
+	// unique to one session.Open, so that release can never free a session
+	// opened since; a bare holder is shared by every session of an older
+	// daemon (and every `lease acquire`) on one host/pid, so its advice
+	// keeps the "never while that daemon still runs" caveat.
+	if verb == "checkpoint" {
+		return &leaseHeldError{msg: held + "; --force cannot take over a live lease; " + leaseFreeAdvice(db, branch, ref)}
 	}
 	if force {
 		return nil
