@@ -95,9 +95,10 @@ Pin an exact version if you depend on format stability. The full contract:
   keeps its branch until the close has released the lease. An `open` waits
   up to 15 s for it and then takes a fresh epoch, or fails with
   `daemon: <db>@<branch> is still closing; retry`. If the close failed to
-  release the lease, the reopen still renews that lease in place under the
-  same holder and epoch; that ends once each daemon session has a lease
-  holder of its own.
+  release the lease, the reopen is refused instead of renewing that lease
+  in place: each daemon session now has a lease holder of its own (see
+  this release's Changed and Added entries, below), so a reopen can never
+  be granted under a closed session's holder and epoch.
 - **A close retried after its session had closed could close another
   client's session.** A `close` named only `db@branch`. A client that
   retried its close after the branch had been reopened closed the reopened
@@ -216,6 +217,21 @@ Pin an exact version if you depend on format stability. The full contract:
   key is private to the call and nothing else writes it; an object an
   earlier writer left at the same txid sits under an older epoch, never
   anchors the head, and is reclaimed by GC.
+- **A daemon restarted in a container with the same hostname and PID 1
+  renewed its dead predecessor's live lease in place and shared its
+  epoch.** Every daemon session shared one holder, bare `<host>/<pid>`,
+  so a reopen after a close whose lease release failed renewed that same
+  lease under that same holder — and, in a container, PID 1 and the
+  hostname are both fixed, so a daemon that crashed and restarted could
+  reopen the branch and pick its own dead predecessor's lease back up as
+  if it had never left, with no new epoch to fence the old process's
+  stragglers from the new one (two writers effectively sharing an
+  epoch). Each session now mints its own holder (see Changed, below), so
+  a restarted daemon's session can never match the orphaned one: the
+  reopen is refused instead, naming the orphaned holder, when its lease
+  lapses, and `offshoot lease release <db>@<branch> --holder <holder>`
+  to free it now, until the operator frees it or its TTL (30 s default)
+  runs out.
 
 ### Changed
 
@@ -250,9 +266,13 @@ Pin an exact version if you depend on format stability. The full contract:
   inside the close; it now fires after the daemon has let go of the branch,
   so acting on it never meets a `closing` refusal, and always before the
   `session_opened` of a reopen of the same branch. It and `fenced` carry the
-  session's `holder` and `epoch`. These match it to the session's
-  `session_opened`, except after a close whose lease release failed: a
-  reopen then keeps the same pair (see Fixed).
+  session's `holder` and `epoch`. `holder` is now unique per session (see
+  the lease-holder entry further down in this section), so it never
+  repeats across sessions, including a reopen after a close whose lease
+  release failed: that reopen is refused rather than reopening under the
+  closed session's pair (see Fixed, above). Only `epoch` can repeat it,
+  since rollback, promote, compact, and destroying and recreating the
+  branch all restart it.
 - **`/healthz` and `offshoot_sessions_open` count open sessions only**; a
   closing session is not counted, and reports no
   `offshoot_capture_lag_bytes` or `offshoot_durable_age_seconds`.
@@ -364,6 +384,19 @@ Pin an exact version if you depend on format stability. The full contract:
   object and the newer checkpoint can then commit a head that names it,
   after which `checkout`, `checkout --at` and `fork` of the branch fail
   until it is rolled back to an earlier checkpoint.
+- **A daemon session's lease holder is now unique per session, not one
+  bare `<host>/<pid>` shared by every session (and every reopen) on the
+  same host and pid.** Each `session.Open` mints
+  `session:<host>/<pid>/<8 hex nonce>`; `offshoot lease list`, `offshoot
+  status` and the daemon's `branches` op show it in place of the old
+  `<host>/<pid>`. A script that matches a lease holder against
+  `"<host>/<pid>"` to recognize a daemon session needs to match the
+  `session:` prefix instead. `offshoot lease acquire` is unaffected — it
+  still claims the bare `<host>/<pid>` holder, as does an at-rest
+  checkpoint's `checkpoint:<host>/<pid>/<8 hex>` (unchanged). A reopen
+  after a close whose lease release failed is refused for up to the
+  lease TTL instead of renewing that lease in place under the closed
+  session's holder and epoch (see Fixed, above).
 
 ### Added
 
@@ -394,6 +427,17 @@ Pin an exact version if you depend on format stability. The full contract:
   `checkpoint:<host>/<pid>/<nonce>`. The per-call nonce keeps two
   checkpoints in one process (an MCP server, a script) from sharing an
   epoch.
+- **`offshoot lease release <db>[@branch] --holder H`** releases a lease
+  only if its current holder is exactly `H` — a compare-and-swap, not a
+  blind release: a mismatch (including an unleased ref, which never
+  equals a non-empty `H`) refuses with `<db>@<branch> is held by
+  "<current>", not "H"; nothing released` and writes nothing. This is the
+  safe way to free a holder a refusal already named (a `session:` or
+  `checkpoint:` holder, unique to one session or checkpoint), since the
+  exact match can never free a different session or checkpoint the same
+  host and pid later holds. `offshoot lease release`, with or without
+  `--holder`, now prints `released <db>@<branch> held by <holder>` on
+  success.
 
 ## [0.2.16] - 2026-10-03
 

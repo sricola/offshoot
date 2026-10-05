@@ -60,9 +60,13 @@ and, since an at-rest checkpoint takes the branch lease, `checkpoint`
 too, but three pieces of groundwork for shared-store fleets haven't
 landed: the at-rest repoints (`rollback`, `promote`, `compact`) still
 write without taking the branch lease — they refuse a live one instead
-(below), which is a same-host courtesy, not a cross-host protocol; lease
-holder identity is hostname+pid, which containers can collide; and lease
-expiry is judged against the claimant's wall clock, so large clock skew
+(below), which is a same-host courtesy, not a cross-host protocol; `lease
+acquire`'s holder identity is bare hostname+pid, which containers can
+collide on (a daemon session's holder adds a per-open nonce,
+`session:<host>/<pid>/<8 hex>`, so two containers sharing a hostname and
+pid never collide there, though two full daemons sharing both still are
+not otherwise distinguished); and lease expiry is judged against the
+claimant's wall clock, so large clock skew
 between machines could steal a live lease. Each is fixable — the fencing
 core is designed for this — and multi-daemon safety is the named first
 step of any future fleet work ([non-goals](../ROADMAP.md#non-goals-v1)).
@@ -81,7 +85,8 @@ progress fails without committing. `checkpoint --force` never overrides a
 lease: `checkpoint` takes the lease itself, so it waits its turn behind a
 session or another checkpoint; a lease whose holder is gone (a killed
 daemon, a forgotten `lease acquire`) is freed with `offshoot lease
-release`. `checkpoint` also refuses a *detached*
+release --holder <that holder>` (the one the refusal names). `checkpoint`
+also refuses a *detached*
 checkout (one whose sidecar lineage no longer matches the ref, because the
 branch was repointed after it was materialized) unless `--force`, since
 checkpointing it would silently revert the repoint. `destroy` already

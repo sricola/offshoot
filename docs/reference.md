@@ -406,8 +406,9 @@ after its process dies. Under a session's, close the session and retry;
 a session that is already closing holds its lease until its close
 releases it, and `session close` then waits for that close. If the holder
 is gone (a daemon that was killed with a session open, a `lease acquire`
-nobody will release), `offshoot lease release <db>@<branch>` frees the
-lease at once, as the refusal says. A session whose close failed to
+nobody will release), `offshoot lease release <db>@<branch> --holder
+<holder>` frees the lease at once, naming the exact holder the refusal
+gave, as the refusal says. A session whose close failed to
 release its lease is not such a holder: that lease lapses at its expiry,
 and once the branch is reopened it is the new session's (see [`session
 close`](#offshoot-session-close-dbbranch--socket-path)). An expired lease
@@ -438,7 +439,7 @@ lease (a session, `lease acquire`, or another checkpoint; `--force` does
 not override it); detached checkout without `--force`; branch mid-destroy or
 mid-reap; `--meta` over a cap (key count, key length, or value length).
 After the lease is taken: the lease ended while the checkpoint ran (a
-forced repoint, `lease release`, a reclaim after it expired, or
+forced repoint, `lease release --holder`, a reclaim after it expired, or
 `destroy --force`, whose claim the head write also refuses to write
 over), in which case nothing was committed and the checkpoint deletes its
 own object; the head write lost three compare-and-swaps to concurrent
@@ -1134,11 +1135,13 @@ offshoot lease list
 ```
 
 Lists every branch currently carrying a lease record: holder identity
-(`<hostname>/<pid>` by convention; `checkpoint:<hostname>/<pid>/<nonce>`
-for an at-rest checkpoint in progress), state (`held` or `expired`), epoch, and
-expiry timestamp. A lease with a corrupt (unparseable) expiry is listed as
-expired with a warning to stderr, rather than hiding the branch or crashing
-the listing.
+(`<hostname>/<pid>` by convention for `offshoot lease acquire`;
+`session:<hostname>/<pid>/<8 hex>` for an open daemon session, a fresh
+nonce minted per `session.Open` call; `checkpoint:<hostname>/<pid>/<8
+hex>` for an at-rest checkpoint in progress, a fresh nonce per call),
+state (`held` or `expired`), epoch, and expiry timestamp. A lease with a
+corrupt (unparseable) expiry is listed as expired with a warning to
+stderr, rather than hiding the branch or crashing the listing.
 
 ## `offshoot lease acquire <db>[@branch] [--ttl 30s]`
 
@@ -1160,22 +1163,36 @@ takes the lease itself, so it waits for this one to be released or to
 expire), and `rollback`, `promote --onto`, `compact` and `destroy` refuse
 it unless `--force`.
 
-## `offshoot lease release <db>[@branch]`
+## `offshoot lease release <db>[@branch] [--holder H]`
 
 ```
 offshoot lease release app@main
+offshoot lease release app@main --holder session:host.local/4242/deadbeef
 ```
 
-Releases the branch's current lease (looked up first via the same listing
-`lease list` uses), whoever holds it. It is meant for a holder that is
-gone. Released under a live holder, the lease's next use fails: a daemon
+Releases the branch's current lease. Without `--holder`, it looks the
+lease up first via the same listing `lease list` uses and releases
+whoever holds it — meant for a holder that is gone. With `--holder H`, it
+is instead a compare-and-swap on the exact holder: it releases only if
+the ref's current holder is exactly `H`, and otherwise refuses with
+`<db>@<branch> is held by "<current holder>", not "H"; nothing released`
+and writes nothing — including when the branch carries no lease at all
+(an empty current holder never matches a non-empty `H`). `--holder` is
+the safe way to free a holder a refusal already named: a `session:` or
+`checkpoint:` holder carries a nonce unique to that one session or
+checkpoint, so matching it exactly can never free a *different* session
+or checkpoint the same host/pid later holds. Released under a live
+holder (with or without `--holder`), the lease's next use fails: a daemon
 session is fenced (its next renewal or flush fails, and whatever it had
 not flushed never reaches the store), and an at-rest checkpoint fails
 without committing and deletes its object. A checkpoint's lease
-(`checkpoint:<host>/<pid>/<nonce>`) never needs this: it ends with the
-checkpoint, or lapses on its own 30 s after its process dies.
+(`checkpoint:<host>/<pid>/<8 hex>`) never needs this: it ends with the
+checkpoint, or lapses on its own 30 s after its process dies. On success,
+either form prints `released <db>@<branch> held by <holder>`.
 
-**Errors:** no lease currently held on that branch.
+**Errors:** no lease currently held on that branch (without `--holder`);
+with `--holder`, the current holder does not match `H` exactly, including
+an unheld lease (`nothing released`, nothing written).
 
 ## `offshoot serve [-socket PATH] [-reap-every DURATION] [-gc-grace DURATION] [-flush-every DURATION] [-snapshot-every N] [-ro-cache-budget BYTES] [-fd-budget N] [-http ADDR] [-token TOKEN] [-http-allow-non-loopback]`
 
@@ -1514,16 +1531,19 @@ sees events published *after* it subscribes.
 | `evicted` | The janitor evicts a `checkouts-ro` entry over `-ro-cache-budget` | `checkpoint`, `bytes` (a by-chain entry reports branch `~by-chain` and its chain ID as `checkpoint`) |
 | `dropped_slow_consumer` | Sent to a subscriber being dropped (see below), never to anyone else | *(none)* |
 
-`holder` and `epoch` name a session's lease, not the session, and a later
-session of the branch can carry the same pair. When a close fails to
-release its lease, a reopen of the branch by the same daemon renews that
-lease in place, so its `session_opened` repeats the `holder` and `epoch` of
-the `session_closed` (with `error`) just before it. And rollback, promote
-and compact restart a branch's epoch, as does destroying the branch and
-creating it again, so the next session's `epoch` can equal an earlier
-one's. To match a `session_closed` or `fenced` to its `session_opened`, take
-the latest `session_opened` for the same `db` and `branch`: a session's
-`session_closed` always arrives before the `session_opened` of a reopen.
+`holder` and `epoch` name a session's lease, not the session. `holder` is
+unique per session (`session:<host>/<pid>/<8 hex>`, a fresh nonce minted
+by every `session.Open`), so it never repeats across sessions — including
+a reopen after a close whose lease release failed: that reopen is refused,
+not granted under the closed session's holder, until the orphaned lease
+lapses on its own or is freed by its exact holder (see [`session
+open`](#offshoot-session-open-dbbranch--socket-path) below). `epoch` can
+still repeat: rollback, promote and compact restart a branch's epoch, as
+does destroying the branch and creating it again, so a later session's
+`epoch` can equal an earlier one's. To match a `session_closed` or
+`fenced` to its `session_opened`, take the latest `session_opened` for the
+same `db` and `branch`: a session's `session_closed` always arrives before
+the `session_opened` of a reopen.
 
 **Slow-subscriber drop:** publishing never blocks the daemon (a session
 transition or the janitor). A subscriber whose bounded buffer (64 events)
@@ -1780,16 +1800,27 @@ this session, which a `close` can send back to close only this session
 
 If a session on the branch is closing (another client's `close`, or one a
 killed client left running), `open` waits up to 15 s for that close to
-finish, then opens with a fresh lease epoch. The one exception: if that
-close failed to release its lease, the daemon renews the lease in place,
-and the new session keeps the closed one's holder and epoch. That lasts
-until each daemon session has a lease holder of its own.
+finish, then opens with a fresh lease epoch. If that close failed to
+release its lease, the reopen is refused instead of renewing the lease in
+place: each daemon session holds its own lease holder
+(`session:<host>/<pid>/<8 hex>`, a fresh nonce per `session.Open`), so a
+new session can never be granted the orphaned one. The refusal names the
+exact orphaned holder, when its lease lapses on its own (its TTL, 30 s by
+default), and `offshoot lease release <db>@<branch> --holder <that
+holder>` to free it now — safe to run even if this daemon has since
+opened a different session elsewhere, since the nonce means that release
+can only ever match the orphaned holder.
 
 **Errors:** the branch is already open by this daemon; the branch is still
 closing after 15 s (`daemon: <db>@<branch> is still closing; retry`); the
 branch's lease is held elsewhere (an at-rest checkpoint's,
-`checkpoint:<host>/<pid>/<nonce>`, ends within seconds: retry); the daemon
-is shutting down; no daemon reachable at the socket.
+`checkpoint:<host>/<pid>/<8 hex>`, ends within seconds: retry); the lease
+was left by an earlier session of this same daemon whose close failed to
+release it (`daemon: <db>@<branch> is held by an earlier session of this
+daemon whose lease release failed (holder <holder>); it lapses at
+<time>; free it now with 'offshoot lease release <db>@<branch> --holder
+<holder>'`); the daemon is shutting down; no daemon reachable at the
+socket.
 
 ## `offshoot session flush <db>[@branch] [name] [-socket PATH]`
 
@@ -1869,13 +1900,15 @@ with `session_id`, it fails with `is not open`.
 **Errors:** `db@branch` is not open here (it was never opened, or its close
 has finished); with `session_id`, that session is neither open nor closing
 here; the session closed but its lease release failed. In that last case
-the lease lapses at its expiry unless the branch is reopened first: a
-reopen by this daemon renews that lease in place (see `session open`
-above), and the reopened session holds it from then on. Do not free it with
-`offshoot lease release`. That command releases whatever lease the branch
-carries without asking who holds it, so once the branch has been reopened
-it releases the reopened session's lease: that session is fenced, and its
-writes since its last flush are never shipped.
+the lease is orphaned: a reopen of the branch is refused (see `session
+open` above) for as long as that lease stays live, so nothing else can
+hold it in the meantime. Free it now with `offshoot lease release
+<db>@<branch> --holder <that exact holder>` (the one the close's error, or
+a later `session open` refusal, names) — the exact-holder match means this
+can never fence a different session, unlike a bare `offshoot lease
+release`, which releases whatever lease the branch carries without asking
+who holds it. Left alone, the lease lapses on its own at its expiry and
+the next `session open` proceeds normally.
 
 ## `offshoot session shutdown [-socket PATH]`
 
