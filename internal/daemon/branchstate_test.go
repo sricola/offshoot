@@ -163,12 +163,13 @@ func TestBranchesReportsAnAtRestCheckpointAsActive(t *testing.T) {
 	}
 }
 
-// TestOpenRefusedWhileACheckpointHoldsTheBranch is a wiring pin: the
+// TestOpenRefusedByCheckpointHolderSaysInProgress is a wiring pin: the
 // daemon's open op (what an SDK session uses) on a branch held under a
 // checkpoint: holder (acquired by hand here; the real checkpoint is
-// internal/ops's TestSessionOpenDuringAtRestCheckpointIsRefused) fails
-// with the lease-held error naming the holder, and leaves the lease alone.
-func TestOpenRefusedWhileACheckpointHoldsTheBranch(t *testing.T) {
+// internal/ops's TestSessionOpenDuringAtRestCheckpointIsRefused) says a
+// checkpoint is in progress and to retry, since that lease clears within
+// seconds, and leaves the lease alone.
+func TestOpenRefusedByCheckpointHolderSaysInProgress(t *testing.T) {
 	srv, w := newServer(t)
 	holder := "checkpoint:" + ops.LocalHolder() + "/0123abcd"
 	l, err := w.AcquireLease("app", "main", holder, time.Minute)
@@ -179,8 +180,8 @@ func TestOpenRefusedWhileACheckpointHoldsTheBranch(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if resp.OK || !strings.Contains(resp.Error, "lease is held") || !strings.Contains(resp.Error, holder) {
-		t.Fatalf("open during a checkpoint = %+v, want a lease-held refusal naming %s", resp, holder)
+	if want := "daemon: a checkpoint is in progress on app@main; retry in a few seconds"; resp.OK || resp.Error != want {
+		t.Fatalf("open during a checkpoint = %+v, want the error %q", resp, want)
 	}
 	ref, _, err := w.Store.GetRef("app", "main")
 	if err != nil {
@@ -188,6 +189,54 @@ func TestOpenRefusedWhileACheckpointHoldsTheBranch(t *testing.T) {
 	}
 	if ref.LeaseHolder != holder || ref.Epoch != l.Epoch {
 		t.Fatalf("the refused open changed the checkpoint's lease: %q@%d", ref.LeaseHolder, ref.Epoch)
+	}
+}
+
+// TestOpenRefusedByOwnOrphanedLeaseNamesTheHolder: a live lease held by a
+// session: holder under this daemon's <host>/<pid>, with no slot for the
+// branch, is what a session whose release retries ran out leaves behind.
+// The refusal says so, names that exact holder and when it lapses, and
+// gives the `lease release --holder` that frees only it.
+func TestOpenRefusedByOwnOrphanedLeaseNamesTheHolder(t *testing.T) {
+	srv, w := newServer(t)
+	holder := "session:" + ops.LocalHolder() + "/deadbeef"
+	l, err := w.AcquireLease("app", "main", holder, time.Minute)
+	if err != nil {
+		t.Fatal(err)
+	}
+	resp, err := rawCall(srv.SocketPath(), Request{Op: "open", DB: "app", Branch: "main"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	want := "daemon: app@main is held by an earlier session of this daemon whose lease release failed (holder " + holder +
+		"); it lapses at " + l.Expiry.Format(time.RFC3339) +
+		"; free it now with 'offshoot lease release app@main --holder " + holder + "'"
+	if resp.OK || resp.Error != want {
+		t.Fatalf("open under this daemon's orphaned lease = %+v, want the error %q", resp, want)
+	}
+	ref, _, err := w.Store.GetRef("app", "main")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if ref.LeaseHolder != holder || ref.Epoch != l.Epoch {
+		t.Fatalf("the refused open changed the orphaned lease: %q@%d", ref.LeaseHolder, ref.Epoch)
+	}
+
+	// Another daemon's session (another pid) is not this daemon's: its
+	// refusal is the plain lease-held error.
+	if err := w.ReleaseLease(l); err != nil {
+		t.Fatal(err)
+	}
+	other := "session:" + ops.LocalHolder() + "0/deadbeef"
+	if _, err := w.AcquireLease("app", "main", other, time.Minute); err != nil {
+		t.Fatal(err)
+	}
+	resp, err = rawCall(srv.SocketPath(), Request{Op: "open", DB: "app", Branch: "main"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if resp.OK || strings.Contains(resp.Error, "earlier session of this daemon") || !strings.Contains(resp.Error, "lease is held") || !strings.Contains(resp.Error, other) {
+		t.Fatalf("open under another daemon's lease = %+v, want the plain lease-held refusal naming %s", resp, other)
 	}
 }
 

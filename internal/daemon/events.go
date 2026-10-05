@@ -282,10 +282,9 @@ func sessionEventType(event string) (typ string, ok bool) {
 // self-close after its Close returns. A client acting on the event then
 // finds the branch free; one acting on the session's own "closed"
 // transition would be refused by every path that refuses a closing
-// branch. holder and epoch name the session's lease, not the session: a
-// reopen after a close whose release failed renews that lease in place and
-// repeats the pair, and rollback, promote, compact and a re-created branch
-// restart the epoch. Published before any reopen's session_opened, it
+// branch. holder and epoch name the session's lease: the holder is unique
+// to the session (ops.NewSessionHolder), while rollback, promote, compact
+// and a re-created branch restart the epoch. Published before any reopen's session_opened, it
 // belongs to the latest session_opened of its branch. It takes the
 // session's own lock to read the lease, so closeSlot builds it before
 // taking s.mu.

@@ -16,6 +16,7 @@ import (
 	"os"
 	"path/filepath"
 	"sort"
+	"strings"
 	"sync"
 	"syscall"
 	"time"
@@ -40,8 +41,11 @@ type Server struct {
 	// takes it over until that session's Close has returned. The closing
 	// state keeps the branch claimed through the whole close. Freeing the
 	// key any earlier let an open take the lease the closing session still
-	// held — same holder, so AcquireLease renewed it in place under the same
-	// epoch — and then lose it to that session's release.
+	// held — when every session shared one holder, AcquireLease renewed it
+	// in place under the same epoch — and then lose it to that session's
+	// release. Per-session holders (ops.NewSessionHolder) now make such an
+	// open fail on the live lease instead; the closing state is what makes
+	// it wait for the close and succeed.
 	sessions map[string]*slot
 	closing  bool
 	// flushEvery is passed as Options.FlushEvery to every session opOpen
@@ -528,7 +532,7 @@ func (s *Server) dispatch(req Request) Response {
 func errResp(err error) Response { return Response{Error: err.Error()} }
 
 // opOpen claims db@branch, or refuses if it is already open here (or leased
-// elsewhere, surfaced as session.Open's error).
+// elsewhere, surfaced as session.Open's error, reworded by openRefusal).
 //
 // Race structure: a naive "check the map, unlock, call session.Open, lock,
 // recheck the map" would let two concurrent opens for the SAME key both pass
@@ -537,12 +541,12 @@ func errResp(err error) Response { return Response{Error: err.Error()} }
 // fixed file per db@branch (ops.Workspace.CheckoutPath), so two concurrent
 // Opens would materialize over the same file and then run two independent
 // capture engines against it at once — a real on-disk race, not just a
-// duplicate lease. It also isn't fenced by the lease itself: both Opens use
-// the same holder identity (ops.LocalHolder(), constant for this whole
-// process), and store.AcquireLease treats a re-acquisition by the same live
-// holder as an idempotent self-renew rather than a conflict (see
-// internal/store/lease.go), so the second Open's AcquireLease call can
-// succeed too instead of failing fast.
+// duplicate lease. The lease alone would fence the second Open too, since
+// each session.Open acquires under its own holder (ops.NewSessionHolder)
+// and the first's live lease refuses the second's acquire before it
+// materializes anything; but the reservation decides it in memory, with no
+// store round trip, and refuses with "already open here" rather than a
+// lease-held error naming this daemon's own session.
 //
 // This function avoids the race by reserving the map slot (writing a
 // reserved slot under s.mu) before releasing the lock and calling
@@ -630,7 +634,7 @@ func (s *Server) opOpen(req Request) Response {
 		delete(s.sessions, k) // release the reservation
 		s.openWG.Done()
 		s.mu.Unlock()
-		return errResp(err)
+		return errResp(s.openRefusal(req.DB, branch, err))
 	}
 	if s.closing {
 		// Shutdown started while this open was in flight and is, right now,
@@ -654,13 +658,44 @@ func (s *Server) opOpen(req Request) Response {
 	return Response{OK: true, Checkout: sess.CheckoutPath(), SessionID: sl.id}
 }
 
+// openRefusal is how opOpen reports session.Open's err on db@branch:
+//
+//   - a live lease held by an at-rest checkpoint (ops.CheckpointInProgress)
+//     clears within seconds, so the refusal says to retry;
+//   - a lease-held refusal whose holder is a session: holder under this
+//     daemon's own <host>/<pid> is a lease an earlier session of this
+//     daemon left behind when its release retries ran out (session.Close,
+//     or Open's release after a failed checkout): opOpen reserved db@branch's
+//     slot and found no other, so no live session here holds it. The
+//     refusal names that exact holder, when its lease lapses, and the
+//     `lease release --holder` that frees only that holder. The prefix match
+//     chooses this wording and nothing else: no ownership decision rests on
+//     it, and the release it suggests compares the exact holder.
+//
+// Anything else is err unchanged.
+func (s *Server) openRefusal(db, branch string, err error) error {
+	if ops.CheckpointInProgress(err) {
+		return fmt.Errorf("daemon: a checkpoint is in progress on %s@%s; retry in a few seconds", db, branch)
+	}
+	if !errors.Is(err, store.ErrLeaseHeld) {
+		return err
+	}
+	ref, _, gerr := s.ws.Store.GetRef(db, branch)
+	if gerr != nil || !store.LeaseLive(ref, time.Now()) || !strings.HasPrefix(ref.LeaseHolder, "session:"+ops.LocalHolder()+"/") {
+		return err
+	}
+	expiry, _ := time.Parse(time.RFC3339Nano, ref.LeaseExpiry)
+	return fmt.Errorf("daemon: %s@%s is held by an earlier session of this daemon whose lease release failed (holder %s); it lapses at %s; free it now with 'offshoot lease release %s@%s --holder %s'",
+		db, branch, ref.LeaseHolder, expiry.UTC().Format(time.RFC3339), db, branch, ref.LeaseHolder)
+}
+
 // newSessionID mints the id opOpen returns for a session and a close
 // sends back to name it: 128 random bits, so no two sessions share one, in
-// this daemon or any other. The session's lease cannot name it. Daemon
-// sessions share one holder, so a reopen after a close whose release failed
-// renews that lease in place and keeps its epoch. And rollback, promote and
-// compact restart a branch's epoch, as does destroying it and creating it
-// again, so the next open gets an epoch an earlier session already had.
+// this daemon or any other. The session's lease is a weaker name for it:
+// its holder (ops.NewSessionHolder) carries only a 32-bit nonce, and
+// rollback, promote and compact restart a branch's epoch, as does
+// destroying it and creating it again, so the next open can get an epoch
+// an earlier session already had.
 func newSessionID() string {
 	var b [16]byte
 	rand.Read(b[:]) // never returns an error: it crashes the program instead

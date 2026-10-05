@@ -173,6 +173,20 @@ func WithoutForceAdvice(err error) error {
 	return &leaseHeldError{msg: msg, checkpoint: lhe.checkpoint}
 }
 
+// CheckpointHeldError is the refusal of a caller that wanted db@branch's
+// lease and found ref holding a live one for an at-rest checkpoint
+// (IsCheckpointHolder): a lease-held error (store.ErrLeaseHeld) that
+// CheckpointInProgress recognizes. session.Open returns it when its
+// acquire is refused that way, so the daemon's open can say to retry
+// rather than name a holder nobody can close.
+func CheckpointHeldError(db, branch string, ref store.Ref) error {
+	return &leaseHeldError{
+		msg: fmt.Sprintf("ops: %s@%s: branch lease is held by %q until %s (a checkpoint is in progress); %s",
+			db, branch, ref.LeaseHolder, ref.LeaseExpiry, checkpointRetryAdvice),
+		checkpoint: true,
+	}
+}
+
 // CheckpointInProgress reports whether err is a live-lease refusal whose
 // holder is an at-rest checkpoint (holder "checkpoint:<host>/<pid>/<nonce>").
 // That lease clears on its own when the checkpoint ends, within seconds,
