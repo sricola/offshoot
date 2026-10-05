@@ -629,12 +629,21 @@ func (s *Server) opOpen(req Request) Response {
 		SnapshotEvery: snapshotEvery,
 	})
 
+	if err != nil {
+		// Worded while the reservation still stands (see openRefusal), and
+		// outside s.mu, since it may read the ref.
+		err = s.openRefusal(req.DB, branch, err)
+	}
+
 	s.mu.Lock()
 	if err != nil {
 		delete(s.sessions, k) // release the reservation
 		s.openWG.Done()
 		s.mu.Unlock()
-		return errResp(s.openRefusal(req.DB, branch, err))
+		if openRefusedReleased != nil {
+			openRefusedReleased() // test hook; nil (a no-op) in production
+		}
+		return errResp(err)
 	}
 	if s.closing {
 		// Shutdown started while this open was in flight and is, right now,
@@ -665,8 +674,12 @@ func (s *Server) opOpen(req Request) Response {
 //   - a lease-held refusal whose holder is a session: holder under this
 //     daemon's own <host>/<pid> is a lease an earlier session of this
 //     daemon left behind when its release retries ran out (session.Close,
-//     or Open's release after a failed checkout): opOpen reserved db@branch's
-//     slot and found no other, so no live session here holds it. The
+//     or Open's release after a failed checkout). opOpen calls this while
+//     its reservation of db@branch still stands, and only opOpen mints this
+//     daemon's session: holders, so no live session here can hold the lease
+//     it reads. Read after the reservation is released, a concurrent open
+//     could have taken the branch, and the advice would name that live
+//     session's holder. The
 //     refusal names that exact holder, when its lease lapses, and the
 //     `lease release --holder` that frees only that holder. The prefix match
 //     chooses this wording and nothing else: no ownership decision rests on
@@ -708,6 +721,12 @@ func newSessionID() string {
 // opens can be exercised deterministically instead of relying on timing. Nil
 // (the default) is a no-op and imposes no cost in production.
 var openDelay func()
+
+// openRefusedReleased, when non-nil, is invoked by opOpen after a failed
+// session.Open's reservation has been released and before the refusal is
+// returned. Tests use it to run a concurrent open of the same branch in
+// that window. Nil (the default) is a no-op in production.
+var openRefusedReleased func()
 
 // closeWaitEntered, when non-nil, is called by opOpen, opClose and Shutdown
 // as each starts waiting on a closing slot, with that wait's deadline

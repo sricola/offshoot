@@ -2,7 +2,9 @@ package daemon
 
 import (
 	"context"
+	"regexp"
 	"strings"
+	"sync"
 	"testing"
 	"time"
 
@@ -261,5 +263,73 @@ func TestRollbackAndCompactRefusalsOfferNoForce(t *testing.T) {
 		if resp.OK || !strings.Contains(resp.Error, holder) || !strings.Contains(resp.Error, "retry when it finishes") || strings.Contains(resp.Error, "--force") {
 			t.Fatalf("%s during a checkpoint = %+v, want a refusal that says to retry and offers no --force", req.Op, resp)
 		}
+	}
+}
+
+// TestOrphanedHolderRefusalNeverNamesALiveSession: the orphaned-holder
+// refusal reads the ref while the failed open's reservation still stands.
+// Read after the reservation is released, it could see a session another
+// open of this daemon took in between, and its `lease release --holder`
+// advice would fence that live session. openRefusedReleased runs such an
+// open in exactly that window.
+func TestOrphanedHolderRefusalNeverNamesALiveSession(t *testing.T) {
+	srv, w := newServer(t)
+	sock := srv.SocketPath()
+	orphan := "session:" + ops.LocalHolder() + "/deadbeef"
+	l, err := w.AcquireLease("app", "main", orphan, time.Minute)
+	if err != nil {
+		t.Fatal(err)
+	}
+	var once sync.Once
+	var other Response
+	var otherErr error
+	openRefusedReleased = func() {
+		once.Do(func() {
+			if otherErr = w.ReleaseLease(l); otherErr == nil {
+				other, otherErr = rawCall(sock, Request{Op: "open", DB: "app", Branch: "main"})
+			}
+		})
+	}
+	t.Cleanup(func() { openRefusedReleased = nil })
+
+	resp, err := rawCall(sock, Request{Op: "open", DB: "app", Branch: "main"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if otherErr != nil || !other.OK {
+		t.Fatalf("the open in the window = %+v, %v; want it to succeed", other, otherErr)
+	}
+	live := getStatus(t, sock, "app", "main").Holder
+	if strings.Contains(resp.Error, live) {
+		t.Fatalf("the refusal names the live session's holder %s: %q", live, resp.Error)
+	}
+	want := "daemon: app@main is held by an earlier session of this daemon whose lease release failed (holder " + orphan +
+		"); it lapses at " + l.Expiry.Format(time.RFC3339) +
+		"; free it now with 'offshoot lease release app@main --holder " + orphan + "'"
+	if resp.OK || resp.Error != want {
+		t.Fatalf("open refused by the orphaned lease = %+v, want the error %q", resp, want)
+	}
+}
+
+// TestStatusHolderIsTheSessionsOwn: status reports an open session's
+// holder as session:<host>/<pid>/<8 hex>, the holder its session.Open
+// generated.
+func TestStatusHolderIsTheSessionsOwn(t *testing.T) {
+	srv, w := newServer(t)
+	sock := srv.SocketPath()
+	if r := call(t, sock, Request{Op: "open", DB: "app", Branch: "main"}); !r.OK {
+		t.Fatalf("open = %+v", r)
+	}
+	st := getStatus(t, sock, "app", "main")
+	shape := regexp.MustCompile(`^session:` + regexp.QuoteMeta(ops.LocalHolder()) + `/[0-9a-f]{8}$`)
+	if !shape.MatchString(st.Holder) {
+		t.Fatalf("status holder %q, want it to match %s", st.Holder, shape)
+	}
+	ref, _, err := w.Store.GetRef("app", "main")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if ref.LeaseHolder != st.Holder {
+		t.Fatalf("status holder %q, ref holder %q", st.Holder, ref.LeaseHolder)
 	}
 }

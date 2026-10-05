@@ -132,6 +132,10 @@ func TestReopenDuringCloseWaitsAndGetsAFreshEpoch(t *testing.T) {
 	if cur.Epoch <= old.Epoch {
 		t.Fatalf("reopened at epoch %d, want above the closed session's %d", cur.Epoch, old.Epoch)
 	}
+	// Each session holds its lease under its own holder.
+	if cur.Holder == old.Holder {
+		t.Fatalf("reopened under the closed session's holder %q, want a new one", old.Holder)
+	}
 	ref, _, err := w.Store.GetRef("app", "main")
 	if err != nil {
 		t.Fatal(err)
