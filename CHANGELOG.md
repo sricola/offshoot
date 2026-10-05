@@ -17,6 +17,18 @@ Pin an exact version if you depend on format stability. The full contract:
 
 ## [Unreleased]
 
+Nothing yet.
+
+## [0.2.17] - 2026-10-05
+
+The daemon's descriptors are pinned and budgeted so a garbage-collected
+handle can no longer drop a SQLite lock; a closing session keeps its branch
+and the daemon says so; the at-rest checkpoint takes the branch lease, so
+two checkpoints on one branch are refused instead of racing; and every
+daemon session holds its lease under a holder unique to that session, so
+twin containers can no longer renew each other's leases, with
+`lease release --holder` as the exact, safe way to free an orphaned one.
+
 ### Fixed
 
 - **A re-materialized checkout's old descriptor could be closed by the

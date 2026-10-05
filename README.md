@@ -11,7 +11,7 @@
 
 [Install](#install) · [Quickstart](#quickstart) · [Why not X](#why-not-cp-litestream-litefs-turso-dolt-or-neon) · [For agents](#for-ai-agents-mcp) · [For tests and evals](#for-tests-and-eval-harnesses) · [How it works](#how-it-works) · [Limits](#what-it-does-not-do) · [Docs](#docs)
 
-`v0.2.16` pre-1.0 · `377 B` per shared fork of a 100 MB database · every checkout a stock `.db` file · writer `kill -9` tested
+`v0.2.17` pre-1.0 · `377 B` per shared fork of a 100 MB database · every checkout a stock `.db` file · writer `kill -9` tested
 
 </div>
 
@@ -338,7 +338,7 @@ Longer: [core concepts (glossary)](docs/concepts.md), [architecture](docs/archit
 
 ## Status
 
-**v0.2.16, pre-1.0.** What is shipped and exercised by tests that would
+**v0.2.17, pre-1.0.** What is shipped and exercised by tests that would
 fail if it broke:
 
 - local and S3-compatible stores behind a shared conformance suite

@@ -584,7 +584,7 @@ workflow wall time in total (1 min 52 s for the whole run, including a seed
 build per workflow), no CAS retries, nothing aborted or timed out.
 
 **Since the table: at-rest checkpoints take the branch lease
-(unreleased).** An at-rest checkpoint now writes the ref twice instead of
+(v0.2.17).** An at-rest checkpoint now writes the ref twice instead of
 once: it acquires the branch lease before it uploads, and releases it in
 the write that advances the head ([reference](reference.md)). On a local
 store every ref write is fsynced (`F_FULLFSYNC` on macOS), so that is one
