@@ -691,27 +691,35 @@ func (w *Workspace) checkpointLeased(db, branch, name string, meta map[string]st
 	var checksum uint64
 	// The head's chain is resolved here, once, and only when a segment is
 	// locally possible (segmentShadow); planSegment uses this resolution
-	// and never re-resolves. A failed resolve leaves members nil, which
-	// planSegment answers with a snapshot. No probe for an object an
-	// earlier attempt left at txid is needed: that attempt wrote under an
-	// older epoch, and chain resolution prefers our higher one
+	// and never re-resolves. headChain takes it from the chain the
+	// sidecar recorded at the head's identity when it can (cachedChain),
+	// and lists the lineage otherwise. A failed resolve leaves members
+	// nil, which planSegment answers with a snapshot. No probe for an
+	// object an earlier attempt left at txid is needed: that attempt wrote
+	// under an older epoch, and chain resolution prefers our higher one
 	// (store.keepHighestEpoch), whichever kind either object is.
 	var members []store.ChainMember
 	if _, _, ok := segmentShadow(path, ref, opts); ok {
-		members, _ = w.Store.Chain(ref.Lineage, ref.HeadTXID)
+		members, _ = w.headChain(path, ref)
 	}
+	// chain is the new head's chain, which the trusted stamp below records
+	// for the next checkpoint: the head's chain plus our segment, or our
+	// snapshot alone.
+	var chain []string
 	if d, ok := w.planSegment(path, ref, members, opts); ok {
 		if err := ltxio.EncodeSegment(d.pageSize, d.commit, txid, txid, d.pre, d.post, d.pages, &buf); err != nil {
 			return CheckpointResult{}, err
 		}
 		key, checksum = store.SegmentKey(ref.Lineage, epoch, txid, txid), d.post
 		res.Kind, res.Pages = "segment", len(d.pages)
+		chain = chainKeys(members, key)
 	} else {
 		var err error
 		if checksum, err = ltxio.EncodeSnapshot(path, txid, &buf); err != nil {
 			return CheckpointResult{}, err
 		}
 		key = store.SnapshotKey(ref.Lineage, epoch, txid)
+		chain = []string{key}
 	}
 	res.Bytes = int64(buf.Len())
 	c := checkpointCommit{db: db, branch: branch, name: name, meta: meta, kind: res.Kind, lease: lease, lineage: ref.Lineage, txid: txid}
@@ -761,7 +769,7 @@ func (w *Workspace) checkpointLeased(db, branch, name string, meta map[string]st
 	if (!headKnown || headSum != checksum) && ObserveCheckpointOverwrite != nil {
 		ObserveCheckpointOverwrite()
 	}
-	trusted, err := stampCheckpoint(path, ref.Lineage, epoch, txid, headSum, headKnown, checksum, fpEncode, encodeNS, fpEncodeErr == nil)
+	trusted, err := stampCheckpoint(path, ref.Lineage, epoch, txid, headSum, headKnown, checksum, fpEncode, encodeNS, fpEncodeErr == nil, chain)
 	if err != nil {
 		return CheckpointResult{}, fmt.Errorf("ops: checkpoint %q committed (txid %d), but the checkout fingerprint could not be refreshed: %w", name, txid, err)
 	}
@@ -1380,7 +1388,14 @@ func (w *Workspace) forkWith(db, srcBranch, newBranch, at string, ttl time.Durat
 	txid := cp.TXID
 	// Fork-time snapshot-floor decision on the fork point's fully-resolved
 	// chain: SHARE below the bound, MATERIALIZE at it — see newLineageAt.
-	baseMembers, err := w.Store.Chain(src.Lineage, cp.TXID)
+	// At head, the source checkout's sidecar may have recorded that chain
+	// (headChain, cachedChain); anywhere else the lineage is listed.
+	var baseMembers []store.ChainMember
+	if cp.TXID == src.HeadTXID {
+		baseMembers, err = w.headChain(w.CheckoutPath(db, srcBranch), src)
+	} else {
+		baseMembers, err = w.Store.Chain(src.Lineage, cp.TXID)
+	}
 	if err != nil {
 		return 0, fmt.Errorf("ops: resolving chain for lineage %s to txid %d: %w", src.Lineage, cp.TXID, err)
 	}

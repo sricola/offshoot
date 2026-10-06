@@ -4,6 +4,7 @@ import (
 	"encoding/json"
 	"os"
 	"path/filepath"
+	"reflect"
 	"testing"
 )
 
@@ -36,6 +37,7 @@ func FuzzReadSidecar(f *testing.F) {
 	for _, s := range []string{
 		"", "{}", `{"hash":""}`, "e3b0c44298fc1c149afbf4c8996fb924", // legacy bare hash
 		`{"hash":"x","epoch":-1}`, `{"hash":"x","txid":1e30}`, `{"hash":"x","shadow":"yes"}`,
+		`{"hash":"x","chain":[]}`, `{"hash":"x","chain":["data/l/1/snapshot-0000000000000001.ltx"]}`, `{"hash":"x","chain":"k"}`,
 		`{"hash":"x","mtime_ns":9223372036854775807,"stamped_ns":-9223372036854775808}`,
 		`[1,2,3]`, `{"hash":"x"} trailing`, "\xff\xfe",
 	} {
@@ -52,7 +54,7 @@ func FuzzReadSidecar(f *testing.F) {
 		}
 		rec, ok := readSidecar(p)
 		if !ok {
-			if rec != (sumRecord{}) {
+			if !reflect.DeepEqual(rec, sumRecord{}) {
 				t.Fatalf("ok=false with a non-zero record %+v", rec)
 			}
 			return
@@ -71,7 +73,7 @@ func FuzzReadSidecar(f *testing.F) {
 			t.Fatal(err)
 		}
 		rec2, ok2 := readSidecar(p)
-		if !ok2 || rec2 != rec {
+		if !ok2 || !reflect.DeepEqual(rec2, rec) {
 			t.Fatalf("record is not a fixed point of the format: %+v -> %s -> %+v (ok=%v)", rec, again, rec2, ok2)
 		}
 	})

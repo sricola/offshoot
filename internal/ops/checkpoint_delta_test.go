@@ -385,8 +385,9 @@ func TestDestroyRemovesShadowAndItsTemp(t *testing.T) {
 // TestCheckpointResolvesChainOnce: an at-rest checkpoint resolves the
 // head's chain (one List of the lineage prefix on a remote backend) at most
 // once — CheckpointWith resolves it and hands it to planSegment, which
-// never re-resolves — and not at all when no segment is possible (a forced
-// snapshot, or no shadow because the filesystem cannot clone).
+// never re-resolves — not at all when the sidecar recorded the head's
+// chain (cachedChain), and not at all when no segment is possible (a
+// forced snapshot, or no shadow because the filesystem cannot clone).
 func TestCheckpointResolvesChainOnce(t *testing.T) {
 	countResolves := func(t *testing.T, w *Workspace, name string, opts CheckpointOptions) (CheckpointResult, int) {
 		t.Helper()
@@ -404,6 +405,8 @@ func TestCheckpointResolvesChainOnce(t *testing.T) {
 		requireClone(t, w)
 		path := seedRows(t, w, "app", 1<<20, 4000)
 		mustCheckpointWith(t, w, "app", "main", "a", CheckpointOptions{})
+		// Without a recorded chain the checkpoint resolves it.
+		editSidecar(t, path, func(m map[string]any) { delete(m, "chain") })
 		mustSQL(t, path, "INSERT INTO t (v) VALUES (randomblob(100));")
 		res, n := countResolves(t, w, "b", CheckpointOptions{})
 		if res.Kind != "segment" {
@@ -413,7 +416,11 @@ func TestCheckpointResolvesChainOnce(t *testing.T) {
 			t.Fatalf("segment checkpoint resolved the chain %d times, want exactly 1", n)
 		}
 		mustSQL(t, path, "INSERT INTO t (v) VALUES (randomblob(100));")
-		if _, n := countResolves(t, w, "c", CheckpointOptions{Snapshot: true}); n != 0 {
+		if res, n := countResolves(t, w, "c", CheckpointOptions{}); res.Kind != "segment" || n != 0 {
+			t.Fatalf("segment checkpoint on b's recorded chain: kind %q, resolved the chain %d times, want a segment and 0", res.Kind, n)
+		}
+		mustSQL(t, path, "INSERT INTO t (v) VALUES (randomblob(100));")
+		if _, n := countResolves(t, w, "d", CheckpointOptions{Snapshot: true}); n != 0 {
 			t.Fatalf("forced snapshot resolved the chain %d times, want 0", n)
 		}
 	})
