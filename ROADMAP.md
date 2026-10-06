@@ -410,11 +410,13 @@ open wart (its own spec said "N materialized forks cost up to N×G").
   resolves as before, re-recording the chain) — this removes the List
   from a segment checkpoint's own resolve, which now grows only
   25.5 → 30.3 ms across 1 → 1,000 checkpoints where it used to grow
-  26.3 → 36.4 ms (a smaller climb, not a flat one — about half the
-  remaining +4.8 ms is a separately measured, real cost from the ref's
-  own `Checkpoints` map growing by one entry per named checkpoint; the
-  other half is not yet isolated — [benchmarks, "Diagnostic: what the
-  remaining +4.8 ms is"](docs/benchmarks.md)), and drops a segment
+  26.3 → 36.4 ms (a smaller climb, not a flat one). A separate
+  diagnostic run found the largest measured contributor to what remains:
+  the ref's own `Checkpoints` map, which grows by one entry per named
+  checkpoint; part of that diagnostic's own climb is still unexplained,
+  and its absolute numbers were not reconciled against this benchmark's
+  ([benchmarks, "Diagnostic: isolating the ref's own
+  cost"](docs/benchmarks.md)). It also drops a segment
   checkpoint's S3 request count by one `LIST`. Separately, the local
   backend now removes an epoch directory, then its lineage directory,
   once a delete empties it, bounding the directories a GC sweep or a
@@ -439,11 +441,13 @@ open wart (its own spec said "N materialized forks cost up to N×G").
   per at-rest checkpoint (the lease acquire, then the head write); it
   never shrinks on its own (there is no "delete a checkpoint" op).
   `BenchmarkSegmentCheckpointRefGrowth` measured this as a real,
-  separate cost — holding the map at one entry instead of letting it
-  grow to 1,000 saves about 3.5 ms per checkpoint at that count, roughly
-  half of the residual climb left after the recorded-chain cache above
-  ([benchmarks](docs/benchmarks.md)) — but did not isolate the other
-  half, which does not depend on the map's size. A smaller or
+  separate cost: in that diagnostic run, one more checkpoint after
+  1,000 prior checkpoints costs about 7.3 ms more than after 1, and
+  holding the map at one entry throughout removes about 3.5 ms of that
+  — the largest measured contributor, though not all of it
+  ([benchmarks](docs/benchmarks.md)); the remaining ~3.8 ms of the
+  diagnostic's own climb does not depend on the map's size and was not
+  isolated further. A smaller or
   separately-stored checkpoint index (a side file listing names →
   `{txid,epoch}`, read lazily by name/rollback/prune instead of
   decoded whole on every checkpoint; or a bound on how many named

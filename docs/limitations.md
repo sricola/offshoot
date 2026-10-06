@@ -349,14 +349,16 @@ milliseconds don't):
   particular cost: it reuses the chain its `.sum` sidecar recorded at the
   last checkpoint instead of re-listing, growing only 25.5 → 30.3 ms from
   1 to 1,000 checkpoints on the lineage where it used to grow 26.3 →
-  36.4 ms — a smaller climb, not a flat one. About half of what remains
-  (~3.5 ms of the ~4.8 ms) is a real, separately measured cost: the ref's
-  own `Checkpoints` map, which grows by one entry per named checkpoint
-  and is read and written on every at-rest checkpoint afterward; the
-  other half is not yet isolated (candidates: the checkout/shadow a
-  segment diff reads growing by one row per checkpoint, or the sidecar's
-  own per-checkpoint write) ([benchmarks, "Diagnostic: what the
-  remaining +4.8 ms is"](benchmarks.md#branchbench-topologies-v0212)). A
+  36.4 ms — a smaller climb, not a flat one. A separate diagnostic run
+  (its own absolute numbers not reconciled against this table's) found
+  the largest measured contributor to what remains: the ref's own
+  `Checkpoints` map, which grows by one entry per named checkpoint and
+  is read and written on every at-rest checkpoint afterward; part of
+  that diagnostic's own climb is still unexplained (candidates: the
+  checkout/shadow a segment diff reads growing by one row per
+  checkpoint, or the sidecar's own per-checkpoint write) ([benchmarks,
+  "Diagnostic: isolating the ref's own
+  cost"](benchmarks.md#branchbench-topologies-v0212)). A
   branch that checkpoints after every step of a long run still slows its
   `checkout`/`fork` path until a `compact` starts a fresh lineage (or,
   for the default shared `rollback`/`promote`, until the new lineage

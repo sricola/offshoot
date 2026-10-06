@@ -32,12 +32,14 @@ Pin an exact version if you depend on format stability. The full contract:
   chain (one `LIST` fewer per checkpoint on S3; on a local store the
   listing grew with the epoch count — 26.3 → 36.4 ms from 1 to 1,000
   checkpoints on one lineage, now 25.5 → 30.3 ms, a smaller climb, not a
-  flat one). About half of what remains is a separately measured, real
-  cost from the ref's own `Checkpoints` map growing by one entry per
-  named checkpoint, not yet addressed; the other half is not yet
-  isolated. `Store.Chain` itself is unchanged for `checkout`, a fork
-  below head and materialize, which still list every epoch directory a
-  *kept* checkpoint left ([benchmarks](docs/benchmarks.md)).
+  flat one). A separate diagnostic run found the largest measured
+  contributor to what remains: the ref's own `Checkpoints` map, which
+  grows by one entry per named checkpoint and is read and written on
+  every at-rest checkpoint afterward, not yet addressed; part of that
+  diagnostic's own climb is still unexplained
+  ([benchmarks](docs/benchmarks.md)). `Store.Chain` itself is unchanged
+  for `checkout`, a fork below head and materialize, which still list
+  every epoch directory a *kept* checkpoint left.
 
 ## [0.2.17] - 2026-10-05
 

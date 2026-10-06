@@ -714,17 +714,17 @@ Before, the segment checkpoint's own cost grew 26.3 → 36.4 ms as n went
 as the table above. After, it grows only 25.5 → 30.3 ms — a smaller
 climb (+4.8 ms, against +10.1 ms before), not a flat one.
 
-**Diagnostic: what the remaining +4.8 ms is.** `BenchmarkSegmentCheckpointRefGrowth`
-isolates whether the ref's own `Checkpoints` map — which grows by one
+**Diagnostic: isolating the ref's own cost.** `BenchmarkSegmentCheckpointRefGrowth`
+checks whether the ref's own `Checkpoints` map — which grows by one
 entry per checkpoint named uniquely, and is read, json-decoded, mutated
 and written back twice per at-rest checkpoint (the lease acquire, then
-the head write) — accounts for it. It seeds n checkpoints exactly as
-the benchmark above does (so epoch directories and checkout size match
-at each n), then times one more checkpoint twice: once letting the ref
-keep growing ("grown", as every other benchmark here does), and once
-forcing the ref's map back to empty immediately before each timed
-checkpoint via `store.Store.PutRef` directly, outside the timed region
-("trimmed").
+the head write) — explains any of a segment checkpoint's growth with n.
+It seeds n checkpoints exactly as the benchmark above does (so epoch
+directories and checkout size match at each n), then times one more
+checkpoint twice: once letting the ref keep growing ("grown", as every
+other benchmark here does), and once forcing the ref's map back to
+empty immediately before each timed checkpoint via `store.Store.PutRef`
+directly, outside the timed region ("trimmed").
 
 Machine/date: darwin/arm64, Apple M5, macOS 27.0, Go 1.27.1, local APFS,
 load average 2 to 3, 2026-10-06.
@@ -738,25 +738,29 @@ load average 2 to 3, 2026-10-06.
 | 1,000 | grown | 31.17 ms |
 | 1,000 | trimmed | 25.88 ms |
 
-**Not fully isolated.** `trimmed` is not flat: it still grows 22.08 →
-25.88 ms (+3.80 ms, +17%) from n=1 to n=1,000, even though its ref never
-holds more than the one entry it just added — so the ref's own size is
-not the sole cause. But the gap between `grown` and `trimmed` widens
-with n (1.77 ms at n=1, 5.29 ms at n=1,000, with epoch-directory count
-and checkout size held equal between the two variants at each n): a
-~3.5 ms incremental cost that tracks specifically with the ref's
-`Checkpoints` map carrying ~1,000 entries instead of ~1. That is a real,
-measured, partial contributor — a ref that grows by one entry per named
-checkpoint is a real product cost, read and written on every at-rest
-checkpoint afterward, not a benchmark artifact — but it accounts for
-roughly half the remaining climb, not all of it. The other ~3.8 ms
-(`trimmed`'s own growth) is unexplained by this experiment; candidates:
-the checkout and its reflinked `.shadow`, which the segment diff reads
-in full and which grows by one 200-byte row per seeded checkpoint here
-(documented as O(size) local I/O); or the `.sum` sidecar's own
-per-checkpoint write, including the `chain` field Task 1 added (though
-its length should be bounded by the snapshot cadence, not by n, so this
-is the weaker of the two candidates). Neither was isolated further.
+**Attributed within this diagnostic run.** One more checkpoint after
+1,000 prior checkpoints costs about 7.3 ms more than after 1 (`grown`:
+23.85 → 31.17 ms). Keeping the ref's map at one entry throughout
+(`trimmed`: 22.08 → 25.88 ms) removes about 3.5 ms of that — the gap
+between `grown` and `trimmed` widens from 1.77 ms at n=1 to 5.29 ms at
+n=1,000, with epoch-directory count and checkout size held equal
+between the two variants at each n. The growing ref is the largest
+measured contributor to this diagnostic's own climb — a ref that grows
+by one entry per named checkpoint is a real product cost, read and
+written on every at-rest checkpoint afterward, not a benchmark artifact
+— and roughly 3.8 ms of the diagnostic's own +7.3 ms remains
+unexplained; candidates: the checkout and its reflinked `.shadow`,
+which the segment diff reads in full and which grows by one 200-byte
+row per seeded checkpoint here (documented as O(size) local I/O); or
+the `.sum` sidecar's own per-checkpoint write, including the `chain`
+field Task 1 added (though its length should be bounded by the
+snapshot cadence, not by n, making this the weaker candidate). Neither
+was isolated further.
+
+This diagnostic's own climb (+7.3 ms, `grown`, 1 → 1,000) and the main
+benchmark's residual above (+4.8 ms, 25.5 → 30.3 ms) come from separate
+runs — their absolute levels were not reconciled against each other;
+only each benchmark's own n=1 → n=1,000 delta is used in this section.
 
 On S3, `TestAtRestCheckpointStoreRequests`
 (`internal/ops/rpc_count_test.go`) counts backend calls against a local
