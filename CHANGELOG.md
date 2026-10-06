@@ -17,7 +17,26 @@ Pin an exact version if you depend on format stability. The full contract:
 
 ## [Unreleased]
 
-Nothing yet.
+### Changed
+
+- At-rest checkpoints and forks at head no longer list the lineage to
+  resolve their chain when the `.sum` sidecar already records the head's
+  chain (any mismatch — a repoint, a session flush, an old or corrupt
+  sidecar — still resolves by listing, as before).
+- A local store removes an epoch directory, then its lineage directory,
+  once a delete empties it, instead of leaving it behind forever.
+
+### Fixed
+
+- The seeding slowdown and the growing per-checkpoint cost that
+  v0.2.17's benchmarks measured as at-rest checkpoints accumulated on one
+  lineage: a segment checkpoint's own resolve no longer grows with the
+  epoch count (flat at 25.5–30.3 ms from 1 to 1,000 checkpoints on the
+  lineage, where it used to climb 26.3–36.4 ms), and drops a segment
+  checkpoint's S3 request count by one `LIST`. `Store.Chain` itself is
+  unchanged for `checkout`, a fork below head and materialize, which
+  still list every epoch directory a *kept* checkpoint left
+  ([benchmarks](docs/benchmarks.md)).
 
 ## [0.2.17] - 2026-10-05
 

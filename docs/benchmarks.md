@@ -654,6 +654,65 @@ epoch directory once GC or a failed checkpoint empties it would bound
 the count for objects that are gone, but not for checkpoints the branch
 keeps.
 
+**What changed in this work (the two candidates named above).** The
+`.sum` sidecar now records the resolved chain's member keys at the head
+identity it stamps; a segment checkpoint and a fork at head reuse that
+recorded chain instead of calling `Store.Chain` when the sidecar matches
+the ref's head, is snapshot-anchored, contiguous and ends at the head
+(any mismatch resolves as before). Separately, the local backend now
+removes an epoch directory, then its lineage directory, once a delete
+empties it, so a directory GC or a failed checkpoint attempt leaves
+behind no longer survives to be listed next time. Neither change touches
+what `Store.Chain` itself walks: `checkout`, a fork below head,
+materialize, and every descendant resolving through the lineage as a
+base still list every epoch directory a *kept* checkpoint left, so the
+table above is unchanged by this work, confirmed by re-running the same
+benchmark on this branch:
+
+Machine/date: darwin/arm64, Apple M5, macOS 27.0, Go 1.27.1, local APFS,
+load average 2 to 3, 2026-10-06. Before = main `9aca5e3`, same machine,
+same day, in a throwaway worktree.
+
+`go test ./internal/ops -run '^$' -bench ChainAfterCheckpoints -benchtime=50x`:
+
+| Checkpoints on the lineage | `Store.Chain` at the head, before → after |
+|---|---|
+| 1 | 0.116 → 0.237 ms |
+| 100 | 1.99 → 2.36 ms |
+| 1,000 | 14.2 → 14.4 ms |
+
+Unchanged within noise at every n: caching the chain a checkpoint or a
+fork at head needs does not change what `Store.Chain` itself walks for
+everyone else, and removing an emptied directory does not touch a
+directory a kept checkpoint still holds.
+
+What does change is the segment checkpoint's *own* resolve, since it is
+now one of the callers that skips `Store.Chain` when the recorded chain
+applies:
+
+`go test ./internal/ops -run '^$' -bench SegmentCheckpointAfterCheckpoints -benchtime=20x`:
+
+| Checkpoints on the lineage | Segment checkpoint, before → after |
+|---|---|
+| 1 | 26.3 → 25.5 ms |
+| 100 | 28.7 → 28.2 ms |
+| 1,000 | 36.4 → 30.3 ms |
+
+Before, the segment checkpoint's own cost climbed from 26.3 ms to
+36.4 ms as n went 1 → 1,000, because it listed the lineage to resolve its
+own chain, same as the table above. After, it climbs only from 25.5 ms
+to 30.3 ms — the checkpoint's own cost no longer grows with the epoch
+count; the small residual climb tracks the benchmark's own seeding (each
+of the n sequential checkpoints inserts one more 200-byte row first, so
+the file `CheckpointWith` quiesces and fsyncs is larger at n=1,000 than
+at n=1), not the lineage listing.
+
+On S3, `TestAtRestCheckpointStoreRequests`
+(`internal/ops/rpc_count_test.go`) pins the request count directly: a
+segment checkpoint's lineage prefix is listed 0 times, "want 0 (the
+recorded chain)" — one fewer `LIST` per at-rest segment checkpoint than
+before this work, which listed it once.
+
 **What changed in v0.2.12.** The before is the same target run at
 `97320cc` (the commit before this work) on the same machine the same day;
 its wall times reproduce the v0.2.11 table this section used to carry to

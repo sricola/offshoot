@@ -340,11 +340,18 @@ milliseconds don't):
 - **An at-rest `checkpoint` takes the branch lease, which costs one more
   durable ref write** (checkpoint p50 about 3 ms higher one at a time, 11
   ms eight at a time). *Caveat:* each one writes under its own epoch, so
-  on a local store each leaves one more directory under its lineage, and
-  resolving that lineage's chain (a segment checkpoint, `checkout`,
-  `fork`) reads them all: 1.6 ms after 100 checkpoints on one lineage, 16
-  ms after 1,000. A branch that checkpoints after every step of a long
-  run slows down until a `compact` starts a fresh lineage
+  on a local store each leaves one more directory under its lineage.
+  `checkout` and a fork below head still resolve that lineage's chain by
+  listing every one of those directories: 1.6 ms after 100 checkpoints on
+  one lineage, 16 ms after 1,000 — unchanged by this work, since a
+  directory a *kept* checkpoint still holds is still listed. A segment
+  checkpoint's own resolve no longer pays this cost: it reuses the chain
+  its `.sum` sidecar recorded at the last checkpoint instead of
+  re-listing, flat at 25.5–30.3 ms from 1 to 1,000 checkpoints on the
+  lineage where it used to climb 26.3–36.4 ms
+  ([benchmarks](benchmarks.md#branchbench-topologies-v0212)). A branch
+  that checkpoints after every step of a long run still slows
+  its `checkout`/`fork` path until a `compact` starts a fresh lineage
   ([the numbers](benchmarks.md#branchbench-topologies-v0212)).
 
 ## Smaller edges worth knowing
