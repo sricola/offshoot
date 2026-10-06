@@ -1,7 +1,9 @@
 package ops
 
 import (
+	"encoding/json"
 	"errors"
+	"os"
 	"sync"
 	"testing"
 
@@ -74,7 +76,9 @@ func (b *rpcCountBackend) putIfCount(key string) int {
 // Fork, the SOURCE lineage's prefix is Listed exactly once. (The one other
 // List a materializing fork issues is of the CHILD's fresh prefix, by
 // tryFastForkCopy's verification resolve — a different prefix, counted
-// separately.)
+// separately.) The checkpoint's recorded chain is stripped from the
+// source checkout's sidecar first, so the fork resolves; with it in place,
+// a fork at head lists the source prefix not at all.
 func TestForkMaterializeResolvesSourceChainOnce(t *testing.T) {
 	testutil.RequireSQLite3(t)
 	w := newWS(t)
@@ -99,6 +103,14 @@ func TestForkMaterializeResolvesSourceChainOnce(t *testing.T) {
 	forkMaterializeForTest = true
 	t.Cleanup(func() { forkMaterializeForTest = false })
 
+	rec, ok := readSidecar(path)
+	if !ok || len(rec.Chain) == 0 {
+		t.Fatalf("the checkpoint recorded no chain: %+v", rec)
+	}
+	chain := rec.Chain
+	rec.Chain = nil
+	writeSidecarRecord(t, path, rec)
+
 	cb := newRPCCountBackend(w.Store.B)
 	w.Store.B = cb
 	if _, err := w.Fork("app", "main", "child", "", 0, nil); err != nil {
@@ -106,6 +118,29 @@ func TestForkMaterializeResolvesSourceChainOnce(t *testing.T) {
 	}
 	if n := cb.listCount(store.LineagePrefix(src.Lineage)); n != 1 {
 		t.Fatalf("materializing Fork Listed the source prefix %d times, want exactly 1 (floor decision's resolution must be reused)", n)
+	}
+
+	rec.Chain = chain
+	writeSidecarRecord(t, path, rec)
+	cb = newRPCCountBackend(cb.Backend)
+	w.Store.B = cb
+	if _, err := w.Fork("app", "main", "child2", "", 0, nil); err != nil {
+		t.Fatal(err)
+	}
+	if n := cb.listCount(store.LineagePrefix(src.Lineage)); n != 0 {
+		t.Fatalf("materializing Fork at head on a recorded chain Listed the source prefix %d times, want 0", n)
+	}
+}
+
+// writeSidecarRecord replaces path's sidecar with rec, exactly as given.
+func writeSidecarRecord(t *testing.T, path string, rec sumRecord) {
+	t.Helper()
+	data, err := json.Marshal(rec)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(path+".sum", data, 0o644); err != nil {
+		t.Fatal(err)
 	}
 }
 
@@ -180,10 +215,11 @@ func TestSharedForksGetManifestOnce(t *testing.T) {
 // An at-rest checkpoint's store requests are pinned: on the ref, one read
 // and one write (the lease acquire, whose read the refusals also run on),
 // and one read and one write (the head write, which also releases the
-// lease), with no renewal inside a short checkpoint. A segment checkpoint lists the
-// head's lineage once (the chain resolve) and never lists a snapshot key:
-// the probes for another checkpoint's snapshot at its txid went away with
-// the private epoch.
+// lease), with no renewal inside a short checkpoint. A segment checkpoint
+// after an at-rest checkpoint lists the head's lineage not at all (the
+// chain comes from the one the previous checkpoint recorded in the
+// sidecar) and never lists a snapshot key: the probes for another
+// checkpoint's snapshot at its txid went away with the private epoch.
 func TestAtRestCheckpointStoreRequests(t *testing.T) {
 	w := newWS(t)
 	requireClone(t, w)
@@ -205,8 +241,8 @@ func TestAtRestCheckpointStoreRequests(t *testing.T) {
 	if n := cb.putIfCount(refKey); n != 2 {
 		t.Fatalf("the ref was written %d times, want 2: acquire, head write", n)
 	}
-	if n := cb.listCount(store.LineagePrefix(before.Lineage)); n != 1 {
-		t.Fatalf("the lineage was listed %d times, want 1 (the chain resolve)", n)
+	if n := cb.listCount(store.LineagePrefix(before.Lineage)); n != 0 {
+		t.Fatalf("the lineage was listed %d times, want 0 (the recorded chain)", n)
 	}
 	for _, epoch := range []uint64{before.Epoch, before.Epoch + 1} {
 		if n := cb.listCount(store.SnapshotKey(before.Lineage, epoch, res.TXID)); n != 0 {

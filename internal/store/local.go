@@ -147,10 +147,7 @@ func (l *Local) GetReader(key string) (io.ReadCloser, string, error) {
 // lands with its etag attached and Head need not re-read it.
 func (l *Local) write(p string, data []byte) (etag string, err error) {
 	dir := filepath.Dir(p)
-	if err := os.MkdirAll(dir, 0o700); err != nil {
-		return "", err
-	}
-	f, err := os.CreateTemp(dir, filepath.Base(p)+".tmp-*")
+	f, err := createTempIn(dir, filepath.Base(p)+".tmp-*")
 	if err != nil {
 		return "", err
 	}
@@ -217,11 +214,7 @@ func (l *Local) writeReader(p string, r io.Reader, size int64) (etag string, err
 // longer than lock()'s 30 s stale-lock horizon) BEFORE it takes the
 // per-key lock, and hold the lock only around the compare and the rename.
 func (l *Local) writeReaderTemp(p string, r io.Reader, size int64) (tmp, etag string, err error) {
-	dir := filepath.Dir(p)
-	if err := os.MkdirAll(dir, 0o700); err != nil {
-		return "", "", err
-	}
-	f, err := os.CreateTemp(dir, filepath.Base(p)+".tmp-*")
+	f, err := createTempIn(filepath.Dir(p), filepath.Base(p)+".tmp-*")
 	if err != nil {
 		return "", "", err
 	}
@@ -250,6 +243,44 @@ func (l *Local) writeReaderTemp(p string, r io.Reader, size int64) (tmp, etag st
 		return "", "", err
 	}
 	return tmp, etag, nil
+}
+
+// inDir makes sure dir exists and runs create in it. A delete in another
+// process can empty dir and remove it (removeEmptyParents) between the
+// MkdirAll and the create, which then fails with ENOENT. MkdirAll itself
+// can fail with ENOENT the same way: a single delete's upward walk removes
+// the epoch and then the lineage, so a writer can lose the epoch before
+// its create and the lineage inside its next MkdirAll. One retry is not
+// enough, so inDir re-creates the directory and retries while the error is
+// ENOENT, up to maxDirVanishedRetries attempts. That cannot livelock short
+// of an endless delete stream: each ENOENT needs some deleter's rmdir to
+// have succeeded, which needs a fresh unlink that emptied the directory.
+// A directory that keeps vanishing past the cap surfaces the error.
+func inDir(dir string, create func() error) error {
+	var err error
+	for attempt := 0; attempt < maxDirVanishedRetries; attempt++ {
+		err = os.MkdirAll(dir, 0o700)
+		if err == nil {
+			if afterMkdirHook != nil {
+				afterMkdirHook(dir)
+			}
+			err = create()
+		}
+		if err == nil || !errors.Is(err, fs.ErrNotExist) {
+			return err
+		}
+	}
+	return err
+}
+
+// createTempIn is os.CreateTemp(dir, pattern) under inDir's
+// directory-vanished retry.
+func createTempIn(dir, pattern string) (f *os.File, err error) {
+	err = inDir(dir, func() error {
+		f, err = os.CreateTemp(dir, pattern)
+		return err
+	})
+	return f, err
 }
 
 // commitTemp renames a fully written temp file into place at p and syncs
@@ -340,17 +371,29 @@ func (l *Local) PutReaderIf(key string, r io.Reader, size int64, ifMatch string)
 
 func (l *Local) lock(p string) (release func(), err error) {
 	lockPath := p + ".lock"
-	if err := os.MkdirAll(filepath.Dir(p), 0o700); err != nil {
-		return nil, err
-	}
 	deadline := time.Now().Add(5 * time.Second)
+	// vanished tracks whether the most recent failed attempt lost to a
+	// vanishing directory (fs.ErrNotExist) rather than a held lock file
+	// (os.IsExist), so a timeout can name which case occurred instead of
+	// always blaming a stale lock file.
+	vanished := false
 	for {
-		f, err := os.OpenFile(lockPath, os.O_CREATE|os.O_EXCL|os.O_WRONLY, 0o644)
+		// inDir: the directory can vanish between MkdirAll and the O_EXCL
+		// create when a delete elsewhere has just emptied it.
+		err := inDir(filepath.Dir(p), func() error {
+			f, err := os.OpenFile(lockPath, os.O_CREATE|os.O_EXCL|os.O_WRONLY, 0o644)
+			if err == nil {
+				f.Close()
+			}
+			return err
+		})
 		if err == nil {
-			f.Close()
 			return func() { os.Remove(lockPath) }, nil
 		}
-		if !os.IsExist(err) {
+		// A directory still vanishing after inDir's retries is waited out
+		// like a held lock, so lock's deadline (not inDir's cap) bounds it.
+		vanished = errors.Is(err, fs.ErrNotExist)
+		if !os.IsExist(err) && !vanished {
 			return nil, err
 		}
 		// A healthy CAS holds the lock for milliseconds. If it's been sitting
@@ -366,6 +409,9 @@ func (l *Local) lock(p string) (release func(), err error) {
 			}
 		}
 		if time.Now().After(deadline) {
+			if vanished {
+				return nil, fmt.Errorf("store: lock timeout on %s (its directory kept vanishing underneath the retry, not a stale lock file; nothing to delete)", lockPath)
+			}
 			return nil, fmt.Errorf("store: lock timeout on %s (if no offshoot process is running, delete this file)", lockPath)
 		}
 		time.Sleep(2 * time.Millisecond)
@@ -408,10 +454,24 @@ func (l *Local) List(prefix string) ([]string, error) {
 	start := l.listStart(prefix)
 	err := filepath.WalkDir(start, func(p string, d fs.DirEntry, err error) error {
 		if err != nil {
-			if p == start && errors.Is(err, fs.ErrNotExist) {
-				return fs.SkipAll // nothing stored under this prefix
+			if errors.Is(err, fs.ErrNotExist) {
+				if p == start {
+					return fs.SkipAll // nothing stored under this prefix
+				}
+				// A concurrent delete emptied and removed this directory
+				// (removeEmptyParents) after WalkDir listed its parent and
+				// before it read the directory itself. It held only deleted
+				// objects, so skipping it is the answer a List ordered after
+				// that delete gives.
+				if d != nil && d.IsDir() {
+					return fs.SkipDir
+				}
+				return nil
 			}
 			return err
+		}
+		if listVisitHook != nil {
+			listVisitHook(p)
 		}
 		if d.IsDir() {
 			return nil
@@ -507,18 +567,28 @@ func (l *Local) CopyObject(dst, src string) error {
 		return err
 	}
 	dir := filepath.Dir(dstPath)
-	if err := os.MkdirAll(dir, 0o700); err != nil {
-		return err
-	}
-	tmp, err := tempName(dir, filepath.Base(dstPath))
-	if err != nil {
-		return err
-	}
-	if _, err := reflink.CopyFile(tmp, srcPath); err != nil {
-		os.Remove(tmp)
-		if os.IsNotExist(err) {
-			return ErrNotFound
+	// tempName leaves dir momentarily empty (it removes the file it made),
+	// so a racing delete can remove dir before the clone lands in it, and
+	// the clone then fails ENOENT just as for a missing source. Only a
+	// missing source maps to ErrNotFound; a vanished dir is retried by inDir.
+	var tmp string
+	err = inDir(dir, func() error {
+		var err error
+		if tmp, err = tempName(dir, filepath.Base(dstPath)); err != nil {
+			return err
 		}
+		if _, err := reflink.CopyFile(tmp, srcPath); err != nil {
+			os.Remove(tmp)
+			if os.IsNotExist(err) {
+				if _, serr := os.Stat(srcPath); os.IsNotExist(serr) {
+					return ErrNotFound
+				}
+			}
+			return err
+		}
+		return nil
+	})
+	if err != nil {
 		return err
 	}
 	if err := os.Rename(tmp, dstPath); err != nil {
@@ -529,15 +599,73 @@ func (l *Local) CopyObject(dst, src string) error {
 	return nil
 }
 
+// removeEmptyParentsHook, when non-nil (tests only), runs between a
+// delete's unlink and its first directory removal, so a test can interleave
+// a write into the directory being emptied.
+var removeEmptyParentsHook func()
+
+// afterMkdirHook, when non-nil (tests only), runs after every successful
+// MkdirAll a writer does before creating its temp or lock file, so a test
+// can remove the directory the way a racing delete in another process could.
+var afterMkdirHook func(dir string)
+
+// listVisitHook, when non-nil (tests only), runs for every entry List's
+// walk visits without error, so a test can delete mid-walk.
+var listVisitHook func(p string)
+
+// maxDirVanishedRetries bounds inDir's attempts (see inDir).
+const maxDirVanishedRetries = 32
+
 func (l *Local) Delete(key string) error {
 	p, err := l.path(key)
 	if err != nil {
 		return err
 	}
-	if err := os.Remove(p); err != nil && !os.IsNotExist(err) {
+	if err := os.Remove(p); err != nil {
+		if os.IsNotExist(err) {
+			return nil
+		}
 		return err
 	}
+	l.removeEmptyParents(p)
 	return nil
+}
+
+// removeEmptyParents removes the directories a delete of the object at p
+// left empty: its own directory (an epoch, data/<lineage>/<epoch>), then,
+// if that went, the next one up (the lineage), and so on, stopping below
+// the store root's top-level directories, so the root, data/, refs/ and
+// any other top-level directory (each a prefix root listStart walks from)
+// are never removed. Every at-rest checkpoint mints an epoch, and List
+// walks every directory under its prefix, so without this a lineage's
+// listing cost grew with every epoch it ever had, live or GC'd. A removed
+// directory is re-created by the next write into it (inDir), and a List
+// whose start directory is gone answers empty (see List).
+//
+// It is best-effort and never fails the delete. os.Remove on a directory is
+// rmdir(2), which removes only an empty directory and otherwise fails
+// ENOTEMPTY/EEXIST; the first failure of any kind, including ENOENT
+// (already removed), stops the walk. So a directory still holding another
+// object, a live per-key lock (lock() puts p+".lock" beside the object) or
+// an in-flight writer's temp file (write and writeReaderTemp create theirs
+// in the object's directory) survives, and the removal is safe against
+// lock and temp files without inspecting them: a writer's file either
+// exists when rmdir runs, and the rmdir fails harmlessly, or does not yet
+// exist, and the writer's O_CREAT finds the directory gone (ENOENT) and
+// inDir re-creates it and retries. No interleaving loses a write or a
+// lock. DeleteIf calls this only after releasing its own lock, which would
+// otherwise keep the directory non-empty.
+func (l *Local) removeEmptyParents(p string) {
+	if removeEmptyParentsHook != nil {
+		removeEmptyParentsHook()
+	}
+	root := filepath.Clean(l.root)
+	inside := root + string(filepath.Separator)
+	for dir := filepath.Dir(p); strings.HasPrefix(dir, inside) && filepath.Dir(dir) != root; dir = filepath.Dir(dir) {
+		if err := os.Remove(dir); err != nil {
+			return
+		}
+	}
 }
 
 // DeleteObjects implements store.BatchDeleter as a plain sequential loop
@@ -576,24 +704,39 @@ func (l *Local) DeleteIf(key, ifMatch string) error {
 	if err != nil {
 		return err
 	}
+	removed, err := l.deleteIfLocked(p, ifMatch)
+	if removed {
+		// Only after the lock is released: its file sits in the directory
+		// removeEmptyParents would remove.
+		l.removeEmptyParents(p)
+	}
+	return err
+}
+
+// deleteIfLocked is DeleteIf's compare-and-unlink under p's lock; removed
+// reports whether this call unlinked the object.
+func (l *Local) deleteIfLocked(p, ifMatch string) (removed bool, err error) {
 	release, err := l.lock(p)
 	if err != nil {
-		return err
+		return false, err
 	}
 	defer release()
 
 	cur, err := os.ReadFile(p)
 	if os.IsNotExist(err) {
-		return fmt.Errorf("%w: key absent, expected etag %s", ErrCAS, ifMatch)
+		return false, fmt.Errorf("%w: key absent, expected etag %s", ErrCAS, ifMatch)
 	}
 	if err != nil {
-		return err
+		return false, err
 	}
 	if etagOf(cur) != ifMatch {
-		return fmt.Errorf("%w: etag mismatch", ErrCAS)
+		return false, fmt.Errorf("%w: etag mismatch", ErrCAS)
 	}
-	if err := os.Remove(p); err != nil && !os.IsNotExist(err) {
-		return err
+	if err := os.Remove(p); err != nil {
+		if os.IsNotExist(err) {
+			return false, nil
+		}
+		return false, err
 	}
-	return nil
+	return true, nil
 }

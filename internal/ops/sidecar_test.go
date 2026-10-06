@@ -638,7 +638,7 @@ func TestStampCheckpointDistrustsSameTickWriteWithinMargin(t *testing.T) {
 	encodeNS := fpEncode.mtimeNS
 	overwriteSameSizeSameTick(t, path, fpEncode)
 
-	trusted, err := stampCheckpoint(path, "lin", 1, 2, encSum, true, encSum, fpEncode, encodeNS, true)
+	trusted, err := stampCheckpoint(path, "lin", 1, 2, encSum, true, encSum, fpEncode, encodeNS, true, nil)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -669,7 +669,7 @@ func TestStampCheckpointShortcutTakenOnceSettled(t *testing.T) {
 		sentinel = 1
 	}
 
-	trusted, err := stampCheckpoint(path, "lin", 1, 2, sentinel, true, sentinel, fpEncode, encodeNS, true)
+	trusted, err := stampCheckpoint(path, "lin", 1, 2, sentinel, true, sentinel, fpEncode, encodeNS, true, nil)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -694,7 +694,7 @@ func TestStampCheckpointWithinMarginFallsBackToHashAndStillTrusts(t *testing.T) 
 	path, fpEncode, encSum := stampRaceCheckout(t)
 	encodeNS := fpEncode.mtimeNS
 
-	trusted, err := stampCheckpoint(path, "lin", 1, 2, encSum, true, encSum, fpEncode, encodeNS, true)
+	trusted, err := stampCheckpoint(path, "lin", 1, 2, encSum, true, encSum, fpEncode, encodeNS, true, nil)
 	if err != nil {
 		t.Fatal(err)
 	}

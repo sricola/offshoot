@@ -396,20 +396,81 @@ open wart (its own spec said "N materialized forks cost up to N×G").
     the only update path; no `apt-get upgrade` at build time, because an
     unpinned upgrade would make the image non-reproducible and silently
     diverge from the digest the SLSA provenance names.
-- ⏭ **A local lineage listing that does not grow with its epochs.** Since
-  at-rest checkpoints take the branch lease, each one writes under its own
-  epoch, and a local store keeps one directory per epoch, so resolving a
-  lineage's chain reads one more directory per checkpoint it has taken:
-  16 ms after 1,000 checkpoints on one lineage, against 1.2 ms when they
-  shared an epoch ([benchmarks](docs/benchmarks.md)). A `compact` resets
-  it, and S3 is unaffected. Candidates, cheapest first: let a segment
-  checkpoint reuse the chain it resolved last time plus its own object
-  instead of re-listing; remove an epoch directory once it is empty (this
-  bounds GC'd and failed attempts, not kept checkpoints); a local layout
-  that lists a lineage in one directory read, behind a store migration.
-  Not reusing an epoch: `lease release` and forced repoints clear a live
-  checkpoint's lease without bumping it, so two checkpoints could then
-  share a key.
+- ✅ **A local lineage listing that does not grow with its epochs —
+  shipped, two candidates.** Since at-rest checkpoints take the branch
+  lease, each one writes under its own epoch, and a local store keeps one
+  directory per epoch, so resolving a lineage's chain used to read one
+  more directory per checkpoint it has taken: 16 ms after 1,000
+  checkpoints on one lineage, against 1.2 ms when they shared an epoch
+  ([benchmarks](docs/benchmarks.md)). The `.sum` sidecar now records the
+  resolved chain's member keys at the head identity it stamps; a segment
+  checkpoint and a fork at head reuse that recorded chain instead of
+  calling `Store.Chain` when the sidecar matches the ref's head, is
+  snapshot-anchored, contiguous and ends at the head (any mismatch
+  resolves as before, re-recording the chain) — this removes the List
+  from a segment checkpoint's own resolve, which now grows only
+  25.5 → 30.3 ms across 1 → 1,000 checkpoints where it used to grow
+  26.3 → 36.4 ms (a smaller climb, not a flat one). A separate
+  diagnostic run found the largest measured contributor to what remains:
+  the ref's own `Checkpoints` map, which grows by one entry per named
+  checkpoint; part of that diagnostic's own climb is still unexplained,
+  and its absolute numbers were not reconciled against this benchmark's
+  ([benchmarks, "Diagnostic: isolating the ref's own
+  cost"](docs/benchmarks.md)). It also drops a segment
+  checkpoint's S3 request count by one `LIST`. Separately, the local
+  backend now removes an epoch directory, then its lineage directory,
+  once a delete empties it, bounding the directories a GC sweep or a
+  failed checkpoint attempt leaves behind. **Residual, by design:**
+  `Store.Chain` itself is unchanged — `checkout`, a fork below head,
+  materialize, and every descendant resolving through the lineage as a
+  base still list every epoch directory a *kept* checkpoint left (the
+  table above, unmoved by this work). `compact` still resets the count
+  by making its result self-contained; `rollback` and `promote`, which
+  share via a base pointer by default since v0.2.12, start a new
+  lineage ID but keep resolving through the old lineage's directories
+  until the new one writes its own snapshot or `--materialize` copies it
+  forward — the count moves, it does not reset, in that default case.
+  S3 is still unaffected (its listing is flat). A local layout that
+  lists a lineage in one directory read would remove the `Store.Chain`
+  residual outright, but it is a store-format migration and is left to
+  the maintainer to decide against the format-stability contract
+  ([docs/stability.md](docs/stability.md)).
+- ⏭ **A checkpoint index that does not grow the ref.** The ref's
+  `Checkpoints` map holds one entry per named checkpoint a branch has
+  ever taken and is read, json-decoded, mutated and written back twice
+  per at-rest checkpoint (the lease acquire, then the head write); it
+  never shrinks on its own (there is no "delete a checkpoint" op).
+  `BenchmarkSegmentCheckpointRefGrowth` measured this as a real,
+  separate cost: in that diagnostic run, one more checkpoint after
+  1,000 prior checkpoints costs about 7.3 ms more than after 1, and
+  holding the map at one entry throughout removes about 3.5 ms of that
+  — the largest measured contributor, though not all of it
+  ([benchmarks](docs/benchmarks.md)); the remaining ~3.8 ms of the
+  diagnostic's own climb does not depend on the map's size and was not
+  isolated further. A smaller or
+  separately-stored checkpoint index (a side file listing names →
+  `{txid,epoch}`, read lazily by name/rollback/prune instead of
+  decoded whole on every checkpoint; or a bound on how many named
+  checkpoints `Checkpoints` keeps, with older ones falling back to a
+  slower listing) would close this, at the cost of a format change.
+- ⏭ **Extend the recorded-chain cache to shared child lineages.** A
+  lineage that still resolves through a base pointer (a fresh fork or a
+  promote/rollback that kept the base spine) records a chain whose first
+  keys name the base lineage, which the binding check above rejects (it
+  requires every key on `ref.Lineage`), so such a lineage keeps listing
+  until it writes its own snapshot. The shortcut can extend to it without
+  any store read: key the cache on the base spine, and validate a
+  recorded chain against `ref.Base` alone — the child's own keys must be
+  a contiguous segment suffix starting at `ref.Base.TXID + 1`, and the
+  prefix (the keys on the base lineage) must end exactly at
+  `ref.Base.TXID` and start with a snapshot. Promote and Rollback's head
+  resolve should adopt the same shortcut once it exists, since they
+  resolve a head the same way a checkout does. Test matrix: a shared
+  child checkpointing before it has its own snapshot, and again after;
+  a pass-through spine (base-of-a-base) read against an old store; the
+  base lineage destroyed and GC'd while the child keeps checkpointing;
+  and a corrupt seam (the suffix does not actually start at
+  `ref.Base.TXID + 1`, or the prefix does not end there).
 
 ## Launch track (parallel to v0.1–v0.3)
 

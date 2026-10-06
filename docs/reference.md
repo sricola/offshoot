@@ -166,7 +166,13 @@ materialized from: `hash` (SHA-256 of the file), `lineage`/`epoch`/`txid`,
 entry it was cloned from, when there was one), `size`, `mtime_ns` and
 `change_counter` (SQLite's header counter) as a fingerprint, `stamped_ns`
 (when the record was written), and `shadow` (whether a checkpoint shadow
-is current). A repeat `checkout` of an unchanged branch proves the file
+is current). It also records `chain` (the resolved chain's member object
+keys at the head identity this stamp names, omitted when empty): a
+segment checkpoint and a fork at head reuse it instead of re-listing the
+lineage when it matches the ref's head and is snapshot-anchored,
+contiguous and ends there; any mismatch resolves and re-records it as
+before, and an older binary's sidecar simply lacks the field. A repeat
+`checkout` of an unchanged branch proves the file
 clean from the fingerprint alone, without hashing it, when three things
 hold: the recorded identity matches the ref, size, mtime and change
 counter all match, and the file's mtime is more than **1 s** older than

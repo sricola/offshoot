@@ -17,7 +17,34 @@ Pin an exact version if you depend on format stability. The full contract:
 
 ## [Unreleased]
 
-Nothing yet.
+### Changed
+
+- At-rest checkpoints and forks at head no longer list the lineage to
+  resolve their chain when the `.sum` sidecar already records the head's
+  chain (any mismatch — a repoint, a session flush, an old or corrupt
+  sidecar — still resolves by listing, as before).
+- A local store removes an epoch directory, then its lineage directory,
+  once a delete empties it, instead of leaving it behind forever.
+
+### Fixed
+
+- An at-rest checkpoint no longer lists the lineage to resolve its own
+  chain when the `.sum` sidecar already recorded the head's chain (one
+  `LIST` fewer per checkpoint on S3 in that case; on a local store the
+  listing grew with the epoch count — 26.3 → 36.4 ms from 1 to 1,000
+  checkpoints on one lineage, now 25.5 → 30.3 ms, a smaller climb, not a
+  flat one). A first checkpoint after a fresh checkout, a daemon
+  session, a repoint, or a distrusted stamp still lists once, before the
+  sidecar has a recorded chain to reuse; a shared child lineage still
+  lists until it writes its own snapshot (tracked as a ROADMAP
+  follow-up). A separate diagnostic run found the largest measured
+  contributor to what remains: the ref's own `Checkpoints` map, which
+  grows by one entry per named checkpoint and is read and written on
+  every at-rest checkpoint afterward, not yet addressed; part of that
+  diagnostic's own climb is still unexplained
+  ([benchmarks](docs/benchmarks.md)). `Store.Chain` itself is unchanged
+  for `checkout`, a fork below head and materialize, which still list
+  every epoch directory a *kept* checkpoint left.
 
 ## [0.2.17] - 2026-10-05
 

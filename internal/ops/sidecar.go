@@ -179,7 +179,7 @@ func StampSum(path, hash, lineage string, epoch, txid, postApplyChecksum uint64,
 	if err != nil {
 		return err
 	}
-	return stampSumWithFingerprint(path, hash, lineage, epoch, txid, postApplyChecksum, chainID, fp, statNS, true, false)
+	return stampSumWithFingerprint(path, hash, lineage, epoch, txid, postApplyChecksum, chainID, fp, statNS, true, false, nil)
 }
 
 // StampSumHashOnly writes path's .sum sidecar from a hash and identity the
@@ -202,7 +202,7 @@ func StampSum(path, hash, lineage string, epoch, txid, postApplyChecksum uint64,
 // avoids, and commitSidecarRefresh's own doc comment for why re-deriving a
 // hash at that call site is specifically undesirable.
 func StampSumHashOnly(path, hash, lineage string, epoch, txid, postApplyChecksum uint64, chainID string) error {
-	return stampSumWithFingerprint(path, hash, lineage, epoch, txid, postApplyChecksum, chainID, fingerprint{}, 0, false, false)
+	return stampSumWithFingerprint(path, hash, lineage, epoch, txid, postApplyChecksum, chainID, fingerprint{}, 0, false, false, nil)
 }
 
 // stampSumWithFingerprint writes path's .sum sidecar from a hash, identity,
@@ -229,10 +229,15 @@ func StampSumHashOnly(path, hash, lineage string, epoch, txid, postApplyChecksum
 // refreshShadow, after re-cloning, sets it again. checkoutState's
 // hash-verified re-stamp is the one caller that passes the record's own
 // value through, since it re-stamps the same identity and content.
-func stampSumWithFingerprint(path, hash, lineage string, epoch, txid, postApplyChecksum uint64, chainID string, fp fingerprint, stampedNS int64, ok, shadow bool) error {
+//
+// chain is sumRecord.Chain: nil from every caller but a trusted
+// checkpoint stamp (stampCheckpoint) and checkoutState's re-stamp, which
+// passes the record's own through for the same reason as shadow.
+func stampSumWithFingerprint(path, hash, lineage string, epoch, txid, postApplyChecksum uint64, chainID string, fp fingerprint, stampedNS int64, ok, shadow bool, chain []string) error {
 	rec := sumRecord{
 		Hash: hash, Lineage: lineage, Epoch: epoch, TXID: txid,
 		PostApplyChecksum: postApplyChecksum, ChainID: chainID, Shadow: shadow,
+		Chain: chain,
 	}
 	if ok {
 		rec.Size, rec.ModTimeNS, rec.ChangeCounter = fp.size, fp.mtimeNS, fp.changeCounter
@@ -308,6 +313,15 @@ func stampSumWithFingerprint(path, hash, lineage string, epoch, txid, postApplyC
 // against to write a segment (see planSegment). Additive: a sidecar
 // without it decodes as false, which only means "no shadow; snapshot".
 //
+// Chain is the store keys of the head's resolved chain (store.Chain at
+// (Lineage, TXID): the anchoring snapshot, then segments ascending), as
+// the at-rest checkpoint that stamped this identity wrote it: the chain it
+// resolved plus its own segment, or its snapshot alone. Only a trusted
+// checkpoint stamp records it, and checkoutState's re-stamp of the same
+// identity carries it; every other stamp leaves it out. cachedChain uses
+// it in place of listing the lineage, under its own conditions. Additive:
+// a sidecar without it (or with an empty one) only means "resolve".
+//
 // All four fingerprint fields are additive and omitted (zero value) together on a
 // pre-this-field sidecar; a real checked-out SQLite file always has a
 // non-empty header and a real mtime, so an all-zero fingerprint can never
@@ -317,17 +331,18 @@ func stampSumWithFingerprint(path, hash, lineage string, epoch, txid, postApplyC
 // "clean" for content that changed, because the hash comparison it falls
 // back to is the same one this package always trusted.
 type sumRecord struct {
-	Hash              string `json:"hash"`
-	Lineage           string `json:"lineage"`
-	Epoch             uint64 `json:"epoch"`
-	TXID              uint64 `json:"txid"`
-	PostApplyChecksum uint64 `json:"post_apply_checksum,omitempty"`
-	ChainID           string `json:"chain_id,omitempty"`
-	Size              int64  `json:"size,omitempty"`
-	ModTimeNS         int64  `json:"mtime_ns,omitempty"`
-	ChangeCounter     uint32 `json:"change_counter,omitempty"`
-	StampedNS         int64  `json:"stamped_ns,omitempty"`
-	Shadow            bool   `json:"shadow,omitempty"`
+	Hash              string   `json:"hash"`
+	Lineage           string   `json:"lineage"`
+	Epoch             uint64   `json:"epoch"`
+	TXID              uint64   `json:"txid"`
+	PostApplyChecksum uint64   `json:"post_apply_checksum,omitempty"`
+	ChainID           string   `json:"chain_id,omitempty"`
+	Size              int64    `json:"size,omitempty"`
+	ModTimeNS         int64    `json:"mtime_ns,omitempty"`
+	ChangeCounter     uint32   `json:"change_counter,omitempty"`
+	StampedNS         int64    `json:"stamped_ns,omitempty"`
+	Shadow            bool     `json:"shadow,omitempty"`
+	Chain             []string `json:"chain,omitempty"`
 }
 
 // fingerprintMatches reports whether fp — a LIVE fingerprint, just read —
@@ -384,7 +399,7 @@ func writeSum(path string, lineage string, epoch, txid, postApplyChecksum uint64
 	if err != nil {
 		return err
 	}
-	return stampSumWithFingerprint(path, sum, lineage, epoch, txid, postApplyChecksum, chainID, fp, beforeNS, ok, false)
+	return stampSumWithFingerprint(path, sum, lineage, epoch, txid, postApplyChecksum, chainID, fp, beforeNS, ok, false, nil)
 }
 
 // untrustedHash is the Hash a checkpoint stamps when it cannot vouch that
@@ -437,7 +452,13 @@ func untrustedHash(txid uint64) string {
 // now, or either side is unknown) it records checksum 0 and untrustedHash
 // with no fingerprint, so checkoutState reads "modified" and the next
 // checkpoint writes a snapshot.
-func stampCheckpoint(path, lineage string, epoch, txid, headSum uint64, headKnown bool, encSum uint64, fpEncode fingerprint, encodeNS int64, fpEncodeOK bool) (bool, error) {
+//
+// chain (sumRecord.Chain) is the new head's chain as the checkpoint wrote
+// it. Only the trusted stamp records it: a distrusted one records none, so
+// the next checkpoint and a fork at head resolve the chain from the store.
+// Recording it changes nothing above: the hash, fingerprint and checksum
+// are stamped exactly as without it.
+func stampCheckpoint(path, lineage string, epoch, txid, headSum uint64, headKnown bool, encSum uint64, fpEncode fingerprint, encodeNS int64, fpEncodeOK bool, chain []string) (bool, error) {
 	sum, fp, beforeNS, ok, err := sandwichedSum(path)
 	if err != nil {
 		return false, err
@@ -453,7 +474,7 @@ func stampCheckpoint(path, lineage string, epoch, txid, headSum uint64, headKnow
 			}
 		}
 		if liveKnown && liveSum == headSum {
-			return true, stampSumWithFingerprint(path, sum, lineage, epoch, txid, headSum, "", fp, beforeNS, true, false)
+			return true, stampSumWithFingerprint(path, sum, lineage, epoch, txid, headSum, "", fp, beforeNS, true, false, chain)
 		}
 	}
 	return false, StampSumHashOnly(path, untrustedHash(txid), lineage, epoch, txid, 0, "")
@@ -554,9 +575,9 @@ func checkoutState(path string, ref store.Ref) (string, uint64) {
 		return "modified", 0
 	}
 	if fpAfter, err2 := stampFingerprint(path); fpErr == nil && err2 == nil && fpBefore == fpAfter {
-		_ = stampSumWithFingerprint(path, got, ref.Lineage, ref.HeadEpoch, ref.HeadTXID, rec.PostApplyChecksum, rec.ChainID, fpAfter, beforeNS, true, rec.Shadow)
+		_ = stampSumWithFingerprint(path, got, ref.Lineage, ref.HeadEpoch, ref.HeadTXID, rec.PostApplyChecksum, rec.ChainID, fpAfter, beforeNS, true, rec.Shadow, rec.Chain)
 	} else {
-		_ = stampSumWithFingerprint(path, got, ref.Lineage, ref.HeadEpoch, ref.HeadTXID, rec.PostApplyChecksum, rec.ChainID, fingerprint{}, 0, false, rec.Shadow)
+		_ = stampSumWithFingerprint(path, got, ref.Lineage, ref.HeadEpoch, ref.HeadTXID, rec.PostApplyChecksum, rec.ChainID, fingerprint{}, 0, false, rec.Shadow, rec.Chain)
 	}
 	return "clean", rec.PostApplyChecksum
 }
@@ -580,6 +601,11 @@ func readSidecar(path string) (sumRecord, bool) {
 	var rec sumRecord
 	if err := json.Unmarshal(raw, &rec); err != nil || rec.Hash == "" {
 		return sumRecord{}, false
+	}
+	// An empty chain is no chain: "chain":[] and an absent field read alike,
+	// so the record is a fixed point of the format (omitempty drops both).
+	if len(rec.Chain) == 0 {
+		rec.Chain = nil
 	}
 	return rec, true
 }

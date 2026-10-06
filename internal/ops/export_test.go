@@ -1,5 +1,7 @@
 package ops
 
+import "github.com/sricola/offshoot/internal/store"
+
 // This file exists only in test binaries (export_test.go is never compiled
 // into non-test builds). It exposes the internal fork fast-path test knobs
 // (forkSlowPathForTest, forkFastPathHits — see copySnapshotToNewLineage's
@@ -40,3 +42,14 @@ func SetCheckpointBeforeAcquireForTest(f func()) { checkpointBeforeAcquireForTes
 // before it plans; see checkpointAfterQuiesceForTest. Process-global:
 // restore via t.Cleanup.
 func SetCheckpointAfterQuiesceForTest(f func()) { checkpointAfterQuiesceForTest = f }
+
+// SetObserveChainSourceForTest installs (nil removes) observeChainSource,
+// the hook reporting whether a checkpoint or fork took the head's chain
+// from the sidecar ("cache") or listed the lineage ("resolve").
+// Process-global: restore via t.Cleanup.
+func SetObserveChainSourceForTest(f func(kind string)) { observeChainSource = f }
+
+// CachedChainForTest is Workspace.cachedChain for the external tests.
+func (w *Workspace) CachedChainForTest(path string, ref store.Ref) ([]store.ChainMember, bool) {
+	return w.cachedChain(path, ref)
+}

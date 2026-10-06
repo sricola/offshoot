@@ -340,12 +340,30 @@ milliseconds don't):
 - **An at-rest `checkpoint` takes the branch lease, which costs one more
   durable ref write** (checkpoint p50 about 3 ms higher one at a time, 11
   ms eight at a time). *Caveat:* each one writes under its own epoch, so
-  on a local store each leaves one more directory under its lineage, and
-  resolving that lineage's chain (a segment checkpoint, `checkout`,
-  `fork`) reads them all: 1.6 ms after 100 checkpoints on one lineage, 16
-  ms after 1,000. A branch that checkpoints after every step of a long
-  run slows down until a `compact` starts a fresh lineage
-  ([the numbers](benchmarks.md#branchbench-topologies-v0212)).
+  on a local store each leaves one more directory under its lineage.
+  `checkout` and a fork below head still resolve that lineage's chain by
+  listing every one of those directories: 2.36 ms after 100 checkpoints
+  on one lineage, 14.4 ms after 1,000 (one run, 2026-10-06) — unchanged
+  by this work, since a directory a *kept* checkpoint still holds is
+  still listed. A segment checkpoint's own resolve no longer pays this
+  particular cost: it reuses the chain its `.sum` sidecar recorded at the
+  last checkpoint instead of re-listing, growing only 25.5 → 30.3 ms from
+  1 to 1,000 checkpoints on the lineage where it used to grow 26.3 →
+  36.4 ms — a smaller climb, not a flat one. A separate diagnostic run
+  (its own absolute numbers not reconciled against this table's) found
+  the largest measured contributor to what remains: the ref's own
+  `Checkpoints` map, which grows by one entry per named checkpoint and
+  is read and written on every at-rest checkpoint afterward; part of
+  that diagnostic's own climb is still unexplained (candidates: the
+  checkout/shadow a segment diff reads growing by one row per
+  checkpoint, or the sidecar's own per-checkpoint write) ([benchmarks,
+  "Diagnostic: isolating the ref's own
+  cost"](benchmarks.md#branchbench-topologies-v0212)). A
+  branch that checkpoints after every step of a long run still slows its
+  `checkout`/`fork` path until a `compact` starts a fresh lineage (or,
+  for the default shared `rollback`/`promote`, until the new lineage
+  writes its own snapshot — a shared repoint moves the cost, it does not
+  reset it) ([the numbers](benchmarks.md#branchbench-topologies-v0212)).
 
 ## Smaller edges worth knowing
 
