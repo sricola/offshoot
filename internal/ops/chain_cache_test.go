@@ -3,6 +3,7 @@ package ops
 import (
 	"bytes"
 	"encoding/json"
+	"errors"
 	"os"
 	"reflect"
 	"sync"
@@ -199,13 +200,18 @@ func TestCachedChainSurvivesGC(t *testing.T) {
 	w := newWS(t)
 	path := chainCacheSeed(t, w)
 	ref := refOf(t, w, "app", "main")
-	// A fenced attempt's leftovers: a snapshot and a segment at the next
-	// txid under the lineage's first epoch, which the next checkpoint's
-	// higher epoch supersedes.
-	for _, key := range []string{
-		store.SnapshotKey(ref.Lineage, 1, ref.HeadTXID+1),
-		store.SegmentKey(ref.Lineage, 1, ref.HeadTXID+1, ref.HeadTXID+1),
-	} {
+	// A fenced attempt's leftovers: a snapshot and a segment at the head's
+	// txid under the lineage's first epoch, which the live head's higher
+	// epoch supersedes (store.keepHighestEpoch). Unreachable, so GC sweeps
+	// them around the recorded members.
+	if ref.HeadEpoch <= 1 {
+		t.Fatalf("head epoch %d: the orphans' epoch 1 would not be lower", ref.HeadEpoch)
+	}
+	orphans := []string{
+		store.SnapshotKey(ref.Lineage, 1, ref.HeadTXID),
+		store.SegmentKey(ref.Lineage, 1, ref.HeadTXID, ref.HeadTXID),
+	}
+	for _, key := range orphans {
 		if err := w.Store.B.Put(key, []byte("orphan")); err != nil {
 			t.Fatal(err)
 		}
@@ -213,6 +219,11 @@ func TestCachedChainSurvivesGC(t *testing.T) {
 	for i := 0; i < 2; i++ {
 		if _, _, err := w.GC(0); err != nil {
 			t.Fatal(err)
+		}
+	}
+	for _, key := range orphans {
+		if _, _, err := w.Store.B.Get(key); !errors.Is(err, store.ErrNotFound) {
+			t.Fatalf("orphan %s not swept by GC: Get err = %v", key, err)
 		}
 	}
 	sources := recordChainSources(t)
@@ -246,6 +257,15 @@ func TestOldSidecarWithoutChainResolves(t *testing.T) {
 func TestCorruptRecordedChainResolves(t *testing.T) {
 	cases := map[string]func(chain []any, ref store.Ref) []any{
 		"last key dropped": func(chain []any, _ store.Ref) []any { return chain[:len(chain)-1] },
+		"middle key dropped": func(chain []any, _ store.Ref) []any {
+			return append(append([]any(nil), chain[0]), chain[2:]...)
+		},
+		"second snapshot": func(chain []any, ref store.Ref) []any {
+			return append(append([]any(nil), chain[:2]...), store.SnapshotKey(ref.Lineage, ref.HeadEpoch, ref.HeadTXID))
+		},
+		"segments out of order": func(chain []any, _ store.Ref) []any {
+			return []any{chain[0], chain[2], chain[1], chain[2]}
+		},
 		"other lineage": func(chain []any, ref store.Ref) []any {
 			out := append([]any(nil), chain...)
 			out[0] = store.SnapshotKey(ref.Lineage+"x", ref.HeadEpoch, 1)
@@ -261,11 +281,16 @@ func TestCorruptRecordedChainResolves(t *testing.T) {
 		t.Run(name, func(t *testing.T) {
 			w := newWS(t)
 			path := chainCacheSeed(t, w)
+			// A third member, so a middle key can be dropped.
+			mustSQL(t, path, "INSERT INTO t (v) VALUES (randomblob(100));")
+			if res := mustCheckpointWith(t, w, "app", "main", "b2", CheckpointOptions{}); res.Kind != "segment" {
+				t.Fatalf("b2: kind %q, want segment", res.Kind)
+			}
 			ref := refOf(t, w, "app", "main")
 			editSidecar(t, path, func(m map[string]any) {
 				chain, ok := m["chain"].([]any)
-				if !ok || len(chain) != 2 {
-					t.Fatalf("sidecar chain %v, want two keys", m["chain"])
+				if !ok || len(chain) != 3 {
+					t.Fatalf("sidecar chain %v, want three keys", m["chain"])
 				}
 				m["chain"] = corrupt(chain, ref)
 			})

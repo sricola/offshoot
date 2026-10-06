@@ -26,15 +26,21 @@ var observeChainSource func(kind string)
 //     (Lineage, HeadEpoch, HeadTXID);
 //   - the recorded chain is non-empty, and every key parses as a member
 //     key (store.ParseMemberKey) under ref.Lineage's prefix;
-//   - the first member is a snapshot, and the last one ends at HeadTXID.
+//   - the first member is a snapshot, every later one is a segment that
+//     starts right after the previous member ends (MinTXID == previous
+//     MaxTXID + 1, so strictly ascending with no hole), and the last one
+//     ends at HeadTXID.
 //
 // That is sound because nothing changes a head's chain without changing
 // the head's identity: the lease fences every other writer of the lineage,
 // and a daemon session's flushes advance the head without restamping the
 // sidecar, so the identity stops matching; a rollback, promote or compact
 // repoints the branch at another lineage; an orphan a fenced writer left
-// is under a lower epoch at a txid above the head, which resolution never
-// picks over the live chain; and GC never deletes a reachable member. A
+// is under a lower epoch, either above the head (which resolution to the
+// head never reaches) or at a txid at or below it (which
+// store.keepHighestEpoch collapses in favour of the live, higher-epoch
+// member), so it never displaces a member of the live chain; and GC never
+// deletes a reachable member. A
 // sidecar from before this field (no chain), a distrusted stamp (which
 // records none), a materialize or a session's close (which record none)
 // all resolve. A chain that crosses into a base lineage is recorded but
@@ -56,6 +62,11 @@ func (w *Workspace) cachedChain(path string, ref store.Ref) ([]store.ChainMember
 	}
 	if !members[0].Snapshot || members[len(members)-1].MaxTXID != ref.HeadTXID {
 		return nil, false
+	}
+	for i := 1; i < len(members); i++ {
+		if members[i].Snapshot || members[i].MinTXID != members[i-1].MaxTXID+1 {
+			return nil, false
+		}
 	}
 	return members, true
 }
