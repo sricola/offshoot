@@ -28,15 +28,16 @@ Pin an exact version if you depend on format stability. The full contract:
 
 ### Fixed
 
-- The seeding slowdown and the growing per-checkpoint cost that
-  v0.2.17's benchmarks measured as at-rest checkpoints accumulated on one
-  lineage: a segment checkpoint's own resolve no longer grows with the
-  epoch count (flat at 25.5–30.3 ms from 1 to 1,000 checkpoints on the
-  lineage, where it used to climb 26.3–36.4 ms), and drops a segment
-  checkpoint's S3 request count by one `LIST`. `Store.Chain` itself is
-  unchanged for `checkout`, a fork below head and materialize, which
-  still list every epoch directory a *kept* checkpoint left
-  ([benchmarks](docs/benchmarks.md)).
+- An at-rest checkpoint no longer lists the lineage to resolve its own
+  chain (one `LIST` fewer per checkpoint on S3; on a local store the
+  listing grew with the epoch count — 26.3 → 36.4 ms from 1 to 1,000
+  checkpoints on one lineage, now 25.5 → 30.3 ms, a smaller climb, not a
+  flat one). About half of what remains is a separately measured, real
+  cost from the ref's own `Checkpoints` map growing by one entry per
+  named checkpoint, not yet addressed; the other half is not yet
+  isolated. `Store.Chain` itself is unchanged for `checkout`, a fork
+  below head and materialize, which still list every epoch directory a
+  *kept* checkpoint left ([benchmarks](docs/benchmarks.md)).
 
 ## [0.2.17] - 2026-10-05
 

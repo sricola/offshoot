@@ -342,17 +342,26 @@ milliseconds don't):
   ms eight at a time). *Caveat:* each one writes under its own epoch, so
   on a local store each leaves one more directory under its lineage.
   `checkout` and a fork below head still resolve that lineage's chain by
-  listing every one of those directories: 1.6 ms after 100 checkpoints on
-  one lineage, 16 ms after 1,000 — unchanged by this work, since a
-  directory a *kept* checkpoint still holds is still listed. A segment
-  checkpoint's own resolve no longer pays this cost: it reuses the chain
-  its `.sum` sidecar recorded at the last checkpoint instead of
-  re-listing, flat at 25.5–30.3 ms from 1 to 1,000 checkpoints on the
-  lineage where it used to climb 26.3–36.4 ms
-  ([benchmarks](benchmarks.md#branchbench-topologies-v0212)). A branch
-  that checkpoints after every step of a long run still slows
-  its `checkout`/`fork` path until a `compact` starts a fresh lineage
-  ([the numbers](benchmarks.md#branchbench-topologies-v0212)).
+  listing every one of those directories: 2.36 ms after 100 checkpoints
+  on one lineage, 14.4 ms after 1,000 (one run, 2026-10-06) — unchanged
+  by this work, since a directory a *kept* checkpoint still holds is
+  still listed. A segment checkpoint's own resolve no longer pays this
+  particular cost: it reuses the chain its `.sum` sidecar recorded at the
+  last checkpoint instead of re-listing, growing only 25.5 → 30.3 ms from
+  1 to 1,000 checkpoints on the lineage where it used to grow 26.3 →
+  36.4 ms — a smaller climb, not a flat one. About half of what remains
+  (~3.5 ms of the ~4.8 ms) is a real, separately measured cost: the ref's
+  own `Checkpoints` map, which grows by one entry per named checkpoint
+  and is read and written on every at-rest checkpoint afterward; the
+  other half is not yet isolated (candidates: the checkout/shadow a
+  segment diff reads growing by one row per checkpoint, or the sidecar's
+  own per-checkpoint write) ([benchmarks, "Diagnostic: what the
+  remaining +4.8 ms is"](benchmarks.md#branchbench-topologies-v0212)). A
+  branch that checkpoints after every step of a long run still slows its
+  `checkout`/`fork` path until a `compact` starts a fresh lineage (or,
+  for the default shared `rollback`/`promote`, until the new lineage
+  writes its own snapshot — a shared repoint moves the cost, it does not
+  reset it) ([the numbers](benchmarks.md#branchbench-topologies-v0212)).
 
 ## Smaller edges worth knowing
 

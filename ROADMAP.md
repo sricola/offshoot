@@ -408,22 +408,47 @@ open wart (its own spec said "N materialized forks cost up to N×G").
   calling `Store.Chain` when the sidecar matches the ref's head, is
   snapshot-anchored, contiguous and ends at the head (any mismatch
   resolves as before, re-recording the chain) — this removes the List
-  from a segment checkpoint's own resolve, flat at 25.5 → 30.3 ms across
-  1 → 1,000 checkpoints where it used to climb 26.3 → 36.4 ms
-  ([benchmarks](docs/benchmarks.md)), and drops a segment checkpoint's S3
-  request count by one `LIST`. Separately, the local backend now removes
-  an epoch directory, then its lineage directory, once a delete empties
-  it, bounding the directories a GC sweep or a failed checkpoint attempt
-  leaves behind. **Residual, by design:** `Store.Chain` itself is
-  unchanged — `checkout`, a fork below head, materialize, and every
-  descendant resolving through the lineage as a base still list every
-  epoch directory a *kept* checkpoint left (the table above, unmoved by
-  this work). A `compact`, `rollback` or `promote` still resets the count
-  by starting a fresh lineage; S3 is still unaffected (its listing is
-  flat). A local layout that lists a lineage in one directory read would
-  remove this residual outright, but it is a store-format migration and
-  is left to the maintainer to decide against the format-stability
-  contract ([docs/stability.md](docs/stability.md)).
+  from a segment checkpoint's own resolve, which now grows only
+  25.5 → 30.3 ms across 1 → 1,000 checkpoints where it used to grow
+  26.3 → 36.4 ms (a smaller climb, not a flat one — about half the
+  remaining +4.8 ms is a separately measured, real cost from the ref's
+  own `Checkpoints` map growing by one entry per named checkpoint; the
+  other half is not yet isolated — [benchmarks, "Diagnostic: what the
+  remaining +4.8 ms is"](docs/benchmarks.md)), and drops a segment
+  checkpoint's S3 request count by one `LIST`. Separately, the local
+  backend now removes an epoch directory, then its lineage directory,
+  once a delete empties it, bounding the directories a GC sweep or a
+  failed checkpoint attempt leaves behind. **Residual, by design:**
+  `Store.Chain` itself is unchanged — `checkout`, a fork below head,
+  materialize, and every descendant resolving through the lineage as a
+  base still list every epoch directory a *kept* checkpoint left (the
+  table above, unmoved by this work). `compact` still resets the count
+  by making its result self-contained; `rollback` and `promote`, which
+  share via a base pointer by default since v0.2.12, start a new
+  lineage ID but keep resolving through the old lineage's directories
+  until the new one writes its own snapshot or `--materialize` copies it
+  forward — the count moves, it does not reset, in that default case.
+  S3 is still unaffected (its listing is flat). A local layout that
+  lists a lineage in one directory read would remove the `Store.Chain`
+  residual outright, but it is a store-format migration and is left to
+  the maintainer to decide against the format-stability contract
+  ([docs/stability.md](docs/stability.md)).
+- ⏭ **A checkpoint index that does not grow the ref.** The ref's
+  `Checkpoints` map holds one entry per named checkpoint a branch has
+  ever taken and is read, json-decoded, mutated and written back twice
+  per at-rest checkpoint (the lease acquire, then the head write); it
+  never shrinks on its own (there is no "delete a checkpoint" op).
+  `BenchmarkSegmentCheckpointRefGrowth` measured this as a real,
+  separate cost — holding the map at one entry instead of letting it
+  grow to 1,000 saves about 3.5 ms per checkpoint at that count, roughly
+  half of the residual climb left after the recorded-chain cache above
+  ([benchmarks](docs/benchmarks.md)) — but did not isolate the other
+  half, which does not depend on the map's size. A smaller or
+  separately-stored checkpoint index (a side file listing names →
+  `{txid,epoch}`, read lazily by name/rollback/prune instead of
+  decoded whole on every checkpoint; or a bound on how many named
+  checkpoints `Checkpoints` keeps, with older ones falling back to a
+  slower listing) would close this, at the cost of a format change.
 - ⏭ **Extend the recorded-chain cache to shared child lineages.** A
   lineage that still resolves through a base pointer (a fresh fork or a
   promote/rollback that kept the base spine) records a chain whose first
