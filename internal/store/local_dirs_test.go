@@ -231,11 +231,11 @@ func TestPutIfRacingDirectoryRemovalSucceeds(t *testing.T) {
 	}
 }
 
-// TestPutRetriesOnceWhenItsDirectoryVanishes: a delete in another process
-// can empty and remove a directory between a writer's MkdirAll and its
-// create. Every writer re-creates the directory and retries once; a
-// directory that keeps vanishing still errors.
-func TestPutRetriesOnceWhenItsDirectoryVanishes(t *testing.T) {
+// TestPutRetriesWhenItsDirectoryVanishes: a delete in another process can
+// empty and remove a directory between a writer's MkdirAll and its create.
+// Every writer re-creates the directory and retries; a directory that
+// vanishes on every one of maxDirVanishedRetries attempts still errors.
+func TestPutRetriesWhenItsDirectoryVanishes(t *testing.T) {
 	l, _ := newLocalAt(t)
 	vanishOnce := func() {
 		done := false
@@ -281,11 +281,15 @@ func TestPutRetriesOnceWhenItsDirectoryVanishes(t *testing.T) {
 		}
 	}
 
-	afterMkdirHook = func(dir string) { os.Remove(dir) }
+	calls := 0
+	afterMkdirHook = func(dir string) { calls++; os.Remove(dir) }
 	if err := l.Put(SnapshotKey("lin", 99, 1), []byte("x")); err == nil {
 		t.Fatal("Put succeeded although its directory vanished on every attempt")
 	}
 	afterMkdirHook = nil
+	if calls != maxDirVanishedRetries {
+		t.Fatalf("Put tried %d times, want the cap %d", calls, maxDirVanishedRetries)
+	}
 	if keys, err := l.List("data/lin/99/"); err != nil || len(keys) != 0 {
 		t.Fatalf("List after failed put = %v, %v", keys, err)
 	}
@@ -320,5 +324,90 @@ func TestListAfterDirectoryRemovalIsCorrect(t *testing.T) {
 	}
 	if keys, err := l.List("data/a/1/"); err != nil || len(keys) != 0 {
 		t.Fatalf("List(data/a/1/) = %v, %v; want empty", keys, err)
+	}
+}
+
+// TestWriteSurvivesEpochAndLineageVanishingRepeatedly: one deleter's walk
+// removes the epoch directory and then the lineage directory, so a writer
+// can see ENOENT on its create and then again inside its MkdirAll. More
+// than one retry is needed; every writer keeps re-creating its directory
+// (bounded by maxDirVanishedRetries) and succeeds.
+func TestWriteSurvivesEpochAndLineageVanishingRepeatedly(t *testing.T) {
+	l, _ := newLocalAt(t)
+	t.Cleanup(func() { afterMkdirHook = nil })
+	for i, put := range []func(k string) error{
+		func(k string) error { return l.Put(k, []byte("x")) },
+		func(k string) error { _, err := l.PutIf(k, []byte("x"), ""); return err },
+	} {
+		k := SnapshotKey("lin", uint64(i+1), 1)
+		left := 5
+		afterMkdirHook = func(dir string) {
+			if left == 0 {
+				return
+			}
+			left--
+			os.Remove(dir)
+			os.Remove(filepath.Dir(dir))
+		}
+		if err := put(k); err != nil {
+			t.Fatalf("writer %d after its epoch and lineage vanished 5 times: %v", i, err)
+		}
+		afterMkdirHook = nil
+		if data, _, err := l.Get(k); err != nil || string(data) != "x" {
+			t.Fatalf("writer %d: Get = %q, %v", i, data, err)
+		}
+	}
+}
+
+// TestLockOutlastsTheRetryCapUntilItsDeadline: inside lock(), a directory
+// that keeps vanishing is waited out like a held lock, bounded by lock's
+// deadline rather than by inDir's retry cap.
+func TestLockOutlastsTheRetryCapUntilItsDeadline(t *testing.T) {
+	l, _ := newLocalAt(t)
+	left := maxDirVanishedRetries + 8
+	afterMkdirHook = func(dir string) {
+		if left > 0 {
+			left--
+			os.Remove(dir)
+		}
+	}
+	t.Cleanup(func() { afterMkdirHook = nil })
+	if _, err := l.PutIf(SnapshotKey("lin", 1, 1), []byte("x"), ""); err != nil {
+		t.Fatalf("PutIf whose directory vanished %d times: %v", maxDirVanishedRetries+8, err)
+	}
+}
+
+// TestListSkipsADirectoryRemovedMidWalk: a concurrent delete can empty and
+// remove a directory after WalkDir has listed its parent but before it
+// reads the directory itself. That directory held only deleted objects, so
+// List skips it and answers the surviving keys without error.
+func TestListSkipsADirectoryRemovedMidWalk(t *testing.T) {
+	l, root := newLocalAt(t)
+	keep1, gone, keep3 := SnapshotKey("lin", 1, 1), SnapshotKey("lin", 2, 1), SnapshotKey("lin", 3, 1)
+	for _, k := range []string{keep1, gone, keep3} {
+		if err := l.Put(k, []byte("x")); err != nil {
+			t.Fatal(err)
+		}
+	}
+	first := filepath.Join(root, "data", "lin", "1")
+	fired := false
+	listVisitHook = func(p string) {
+		if p == first && !fired {
+			fired = true
+			if err := l.Delete(gone); err != nil {
+				t.Errorf("delete mid-walk: %v", err)
+			}
+		}
+	}
+	t.Cleanup(func() { listVisitHook = nil })
+	keys, err := l.List("data/lin/")
+	if !fired {
+		t.Fatal("listVisitHook never saw data/lin/1")
+	}
+	if dirExists(t, root, "data/lin/2") {
+		t.Fatal("the delete did not remove data/lin/2; the test does not exercise the race")
+	}
+	if err != nil || len(keys) != 2 || keys[0] != keep1 || keys[1] != keep3 {
+		t.Fatalf("List = %v, %v; want [%s %s]", keys, err, keep1, keep3)
 	}
 }
