@@ -372,6 +372,11 @@ func (l *Local) PutReaderIf(key string, r io.Reader, size int64, ifMatch string)
 func (l *Local) lock(p string) (release func(), err error) {
 	lockPath := p + ".lock"
 	deadline := time.Now().Add(5 * time.Second)
+	// vanished tracks whether the most recent failed attempt lost to a
+	// vanishing directory (fs.ErrNotExist) rather than a held lock file
+	// (os.IsExist), so a timeout can name which case occurred instead of
+	// always blaming a stale lock file.
+	vanished := false
 	for {
 		// inDir: the directory can vanish between MkdirAll and the O_EXCL
 		// create when a delete elsewhere has just emptied it.
@@ -387,7 +392,7 @@ func (l *Local) lock(p string) (release func(), err error) {
 		}
 		// A directory still vanishing after inDir's retries is waited out
 		// like a held lock, so lock's deadline (not inDir's cap) bounds it.
-		vanished := errors.Is(err, fs.ErrNotExist)
+		vanished = errors.Is(err, fs.ErrNotExist)
 		if !os.IsExist(err) && !vanished {
 			return nil, err
 		}
@@ -404,6 +409,9 @@ func (l *Local) lock(p string) (release func(), err error) {
 			}
 		}
 		if time.Now().After(deadline) {
+			if vanished {
+				return nil, fmt.Errorf("store: lock timeout on %s (its directory kept vanishing underneath the retry, not a stale lock file; nothing to delete)", lockPath)
+			}
 			return nil, fmt.Errorf("store: lock timeout on %s (if no offshoot process is running, delete this file)", lockPath)
 		}
 		time.Sleep(2 * time.Millisecond)

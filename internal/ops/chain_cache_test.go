@@ -276,6 +276,23 @@ func TestCorruptRecordedChainResolves(t *testing.T) {
 		},
 		"no snapshot first": func(chain []any, _ store.Ref) []any { return chain[1:] },
 		"empty":             func([]any, store.Ref) []any { return []any{} },
+		"last key epoch rewritten": func(chain []any, ref store.Ref) []any {
+			last, ok := chain[len(chain)-1].(string)
+			if !ok {
+				panic("last chain entry is not a string")
+			}
+			m, ok := store.ParseMemberKey(last)
+			if !ok {
+				panic("last chain entry does not parse as a member key")
+			}
+			var rewritten string
+			if m.Snapshot {
+				rewritten = store.SnapshotKey(ref.Lineage, m.Epoch+1, m.MaxTXID)
+			} else {
+				rewritten = store.SegmentKey(ref.Lineage, m.Epoch+1, m.MinTXID, m.MaxTXID)
+			}
+			return append(append([]any(nil), chain[:len(chain)-1]...), rewritten)
+		},
 	}
 	for name, corrupt := range cases {
 		t.Run(name, func(t *testing.T) {

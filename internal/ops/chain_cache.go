@@ -29,7 +29,10 @@ var observeChainSource func(kind string)
 //   - the first member is a snapshot, every later one is a segment that
 //     starts right after the previous member ends (MinTXID == previous
 //     MaxTXID + 1, so strictly ascending with no hole), and the last one
-//     ends at HeadTXID.
+//     ends at HeadTXID under ref.HeadEpoch (the checkpoint key is always
+//     written under the lease epoch the head records, so this holds by
+//     construction; checked anyway in case a future stamp bug decouples
+//     the two).
 //
 // That is sound because nothing changes a head's chain without changing
 // the head's identity: the lease fences every other writer of the lineage,
@@ -60,7 +63,7 @@ func (w *Workspace) cachedChain(path string, ref store.Ref) ([]store.ChainMember
 		}
 		members = append(members, m)
 	}
-	if !members[0].Snapshot || members[len(members)-1].MaxTXID != ref.HeadTXID {
+	if !members[0].Snapshot || members[len(members)-1].MaxTXID != ref.HeadTXID || members[len(members)-1].Epoch != ref.HeadEpoch {
 		return nil, false
 	}
 	for i := 1; i < len(members); i++ {
