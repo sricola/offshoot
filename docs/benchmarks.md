@@ -710,9 +710,15 @@ applies:
 | 1,000 | 36.4 → 30.3 ms |
 
 Before, the segment checkpoint's own cost grew 26.3 → 36.4 ms as n went
-1 → 1,000, because it listed the lineage to resolve its own chain, same
-as the table above. After, it grows only 25.5 → 30.3 ms — a smaller
-climb (+4.8 ms, against +10.1 ms before), not a flat one.
+1 → 1,000 (+10.1 ms), partly because it listed the lineage to resolve
+its own chain. After the recorded-chain cache removed that listing, the
+same growth became 25.5 → 30.3 ms (+4.8 ms) — a 6.1 ms saving at
+n=1,000 (36.4 → 30.3 ms). That 6.1 ms saving is smaller than the
+14.2 ms a standalone `Store.Chain` walk costs at n=1,000 in the Chain
+table above; the two numbers come from separate runs over different
+operations and are not reconciled against each other. A smaller climb
+(+4.8 ms, against +10.1 ms before), not a flat one, is what the listing
+removal bought here.
 
 **Diagnostic: isolating the ref's own cost.** `BenchmarkSegmentCheckpointRefGrowth`
 checks whether the ref's own `Checkpoints` map — which grows by one

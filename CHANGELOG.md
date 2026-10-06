@@ -29,10 +29,15 @@ Pin an exact version if you depend on format stability. The full contract:
 ### Fixed
 
 - An at-rest checkpoint no longer lists the lineage to resolve its own
-  chain (one `LIST` fewer per checkpoint on S3; on a local store the
+  chain when the `.sum` sidecar already recorded the head's chain (one
+  `LIST` fewer per checkpoint on S3 in that case; on a local store the
   listing grew with the epoch count — 26.3 → 36.4 ms from 1 to 1,000
   checkpoints on one lineage, now 25.5 → 30.3 ms, a smaller climb, not a
-  flat one). A separate diagnostic run found the largest measured
+  flat one). A first checkpoint after a fresh checkout, a daemon
+  session, a repoint, or a distrusted stamp still lists once, before the
+  sidecar has a recorded chain to reuse; a shared child lineage still
+  lists until it writes its own snapshot (tracked as a ROADMAP
+  follow-up). A separate diagnostic run found the largest measured
   contributor to what remains: the ref's own `Checkpoints` map, which
   grows by one entry per named checkpoint and is read and written on
   every at-rest checkpoint afterward, not yet addressed; part of that
