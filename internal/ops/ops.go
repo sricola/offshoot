@@ -2134,12 +2134,13 @@ var compactBeforeCASForTest func()
 // distinct checkpoint txid (checkpoints sharing a txid share a copy, as
 // Rollback's `done` set does for its head).
 //
-// The ref CAS is the point of no return, exactly as in Promote: a CAS
-// loss (a concurrent flush advanced the head) deletes the orphan snapshots
-// when settleRepoint's re-read finds the ref still on the old lineage
-// (otherwise GC reclaims them), and returns a retry error — no internal retry loop, which would orphan
-// a lineage per attempt. The checkout refresh that follows is best-effort
-// and reports partial success on failure, same as Promote.
+// The ref CAS is the point of no return, exactly as in Promote: a CAS loss
+// (a concurrent flush advanced the head) deletes the orphan snapshots when
+// settleRepoint's re-read finds the ref still on the old lineage
+// (otherwise GC reclaims them), and returns a retry error — no internal
+// retry loop, which would orphan a lineage per attempt. The checkout
+// refresh that follows is best-effort and reports partial success on
+// failure, same as Promote.
 func (w *Workspace) Compact(db, branch string) (uint64, error) {
 	return w.CompactWith(db, branch, CompactOptions{})
 }

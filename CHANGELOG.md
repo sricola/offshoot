@@ -17,6 +17,44 @@ Pin an exact version if you depend on format stability. The full contract:
 
 ## [Unreleased]
 
+### Fixed
+
+- **A rollback, promote, compact or fork whose ref write landed but came
+  back as an error no longer deletes the new lineage it just wrote.** The
+  S3 SDK's retry answering 412 to its own first attempt, or a timeout that
+  loses the response, used to make the verb treat its own successful write
+  as a lost race and delete the new lineage's base pointer or copied
+  snapshots, leaving the branch that now named that lineage unreadable
+  until something rewrote it. Each of the four now re-reads the ref and
+  compares it against the lineage ID it minted: a match proves the write
+  landed and the verb finishes as success; the ref still naming the lineage
+  it named before the write proves the write did not land, and only then
+  does today's cleanup run; anything else (a third lineage, no ref, or, for
+  fork, any existing ref) leaves the objects for reachability GC to reclaim
+  instead of deleting them, and the error — including one from a re-read
+  that itself fails — names the kept lineage and points at `offshoot
+  status`. A fork whose destination name is already taken now reads the
+  destination ref before copying a snapshot on the materialize path, so it
+  writes nothing there at all; the shared path still has no such pre-check
+  and relies on its ref write's compare-and-swap to settle the race. The
+  error texts for a genuine lost race are unchanged. Consequence: a genuine
+  lost race in `rollback`, `promote` or `compact`, and a shared `fork` onto
+  a taken name, now leave a small orphan (a base pointer, or copied
+  snapshots) for `offshoot gc` to reclaim instead of deleting it at once.
+  Tests: `internal/ops/repoint_landed_test.go`'s
+  `TestForkLandedWriteKeepsBaseAndIsReadable`,
+  `TestForkLostRaceLeavesOrphanForGC`,
+  `TestRollbackLandedWriteKeepsObjects`,
+  `TestPromoteLandedWriteKeepsObjects`,
+  `TestCompactLandedWriteKeepsCopies`,
+  `TestRepointSettleUnknownKeepsObjects`,
+  `TestRollbackLandedThenRepointedAwayKeepsObjects`,
+  `TestRollbackLostRaceLeavesObjectsForGC`,
+  `TestRollbackLostToRefWriteRemovesObjects`,
+  `TestForkLandedThenDestroyedKeepsObjects`,
+  `TestRollbackSettleUnknownKeepsObjects`, and
+  `TestForkMaterializeOntoTakenNameWritesNothing`.
+
 ### Changed
 
 - **A checkpoint's stamp reads the checkout once again.** The stamp now
