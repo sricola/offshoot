@@ -550,6 +550,47 @@ That is 2,310 forks in all (one per worker-step). The whole table takes
   20-live-branch ceiling quoted below.
 
 **Machine:** as the header line below reports — darwin/arm64, Apple M5, macOS
+27.0.1, local APFS disk, local-directory store backend, no network, measured
+2026-10-08. The machine was not idle: the desktop's other applications were
+running, and `uptime` read load averages 3.39 3.79 3.48 just before the run
+and 4.03 3.94 3.58 just after it. Raw stdout of `make bench-branchbench`
+with its defaults (all five workflows, concurrency 8, 10 warehouses, 2h
+per-workflow cap), pasted verbatim, minus the two lines make prints first
+(the target's notice and its echoed `go run` line) and the per-workflow
+progress lines on stderr:
+
+darwin/arm64, Apple M5, 10 cores, Go 1.27.1, offshoot v0.2.18-5-ge503ddf, measured 2026-10-08, seed 17 MiB, concurrency 8
+
+| Workflow | Steps | Wall | Branch overhead | Fork p50/p99 (d=1 → d=max) | Checkout p50/p99 (d=1 → d=max) | Checkpoint p50/p99 (d=1 → d=max) | Eval p50/p99 (d=1 → d=max) | Peak live | Store peak |
+|---|---|---|---|---|---|---|---|---|---|
+| simulation | 1000/1000 | 47.0 s | 59% | 31.0/52.2 → (d=1 is max) | 37.8/73.3 → (d=1 is max) | 121.8/179.7 → (d=1 is max) | 55.6/74.9 → (d=1 is max) | 8 | 647 MiB |
+| data_cleaning | 200/200 | 10.7 s | 42% | 29.9/63.7 → 29.8/52.7 | 61.1/399.7 → 33.8/166.5 | 90.4/112.2 → 82.7/126.0 | 51.9/107.9 → 71.9/135.7 | 200 | 8.3 GiB |
+| software_dev | 100/100 | 5.9 s | 47% | 33.1/45.1 → 22.2/41.2 | 245.0/253.1 → 28.5/85.3 | 81.0/82.0 → 61.5/94.9 | 16.0/52.0 → 13.3/97.1 | 84 | 3.7 GiB |
+| mcts | 1000/1000 | 49.2 s | 69% | 62.8/75.0 → 34.6/60.7 | 418.2/452.0 → 81.0/763.0 | 129.3/141.9 → 84.4/151.2 | 97.2/115.5 → 109.2/135.9 | 890 | 30.8 GiB |
+| failure_repro | 10/10 | 1.7 s | 49% | 15.3/16.2 → (d=1 is max) | 9.0/61.2 → (d=1 is max) | 51.4/54.3 → (d=1 is max) | 5.1/5.2 → (d=1 is max) | 1 | 82 MiB |
+
+Latencies are milliseconds. p99 is the maximum sample wherever a cell has fewer than 100 samples at that depth, which is most of them — the per-workflow lines below give the counts. Branch overhead is fork+checkout+checkpoint+destroy time summed over workers, over wall x effective concurrency (min(-concurrency, T workers)). Peak live counts live forked branches, excluding the root.
+
+- `simulation` (flat star; T=1000, S=1, F_r=1000, F_i=0, D=1, C=1, γ=1.0, M_s=0, M_d=50, Q_v=1): max depth reached 1; 1 cross-branch query over 1 live branch (the root included) in 3 ms; all 1000 steps landed at d=1; store ended at 429 MiB of which 17 MiB is the seed; branch-management time 220.9 s summed over workers (4.7x wall at effective concurrency 8 of 8 requested); 0 CAS retries; store sizes approximate: 6 entries vanished or were unreadable during the size walks
+- `data_cleaning` (wide shallow; T=10, S=20, F_r=10, F_i=3, D=3, C=2, γ=0.0, M_s=1, M_d=1, Q_v=1): max depth reached 3; 2 cross-branch queries over 201 live branches (the root included) in 2.7 s; 17 steps landed at d=1 and 132 at d=3 (the sample counts behind those two p50/p99 pairs); store ended at 8.3 GiB of which 17 MiB is the seed; 7 forks fell back to the root after the tree filled; branch-management time 36.0 s summed over workers (3.4x wall at effective concurrency 8 of 8 requested); 0 CAS retries; store sizes approximate: 1 entries vanished or were unreadable during the size walks
+- `software_dev` (bushy; T=5, S=20, F_r=5, F_i=3, D=4, C=1, γ=0.1, M_s=1, M_d=1, Q_v=2): max depth reached 4; 1 cross-branch query over 84 live branches (the root included) in 886 ms; 5 steps landed at d=1 and 51 at d=4 (the sample counts behind those two p50/p99 pairs); store ended at 3.7 GiB of which 17 MiB is the seed; branch-management time 14.1 s summed over workers (2.4x wall at effective concurrency 5 of 8 requested); 0 CAS retries
+- `mcts` (deep narrow; T=10, S=100, F_r=10, F_i=10, D=25, C=0, γ=0.1, M_s=0, M_d=1, Q_v=1): max depth reached 25; no cross-branch queries (C=0); 10 steps landed at d=1 and 73 at d=25 (the sample counts behind those two p50/p99 pairs); store ended at 30.8 GiB of which 17 MiB is the seed; branch-management time 271.9 s summed over workers (5.5x wall at effective concurrency 8 of 8 requested); 0 CAS retries; store sizes approximate: 11 entries vanished or were unreadable during the size walks
+- `failure_repro` (flat, 1 worker; T=1, S=10, F_r=10, F_i=0, D=1, C=0, γ=1.0, M_s=5, M_d=45, Q_v=1): max depth reached 1; no cross-branch queries (C=0); all 10 steps landed at d=1; store ended at 82 MiB of which 17 MiB is the seed; branch-management time 829 ms summed over workers (0.5x wall at effective concurrency 1 of 8 requested); 0 CAS retries
+
+(`v0.2.18-5-ge503ddf` is `git describe` for the branch that makes the
+checkpoint's stamp hash once, five commits past the v0.2.18 tag, with a
+clean tree; "The stamp hashes once again", below, is that change.)
+
+Every workflow completed every step: 2,310/2,310 worker-steps, 114.5 s of
+workflow wall time in total (the five Wall cells summed: 47.0 + 10.7 + 5.9
++ 49.2 + 1.7), about 1 min 58 s for the whole run including `go run`'s
+build and a seed build per workflow (from the output file's creation and
+last-write times, 04:15:25 to 04:17:23), no CAS retries, nothing aborted or
+timed out.
+
+### Previous run (v0.2.13-11-gf182bb4, 2026-10-02)
+
+**Machine:** as the header line below reports — darwin/arm64, Apple M5, macOS
 27.0, local APFS disk, local-directory store backend, no other load, no
 network, measured 2026-10-02. Raw stdout of `make bench-branchbench` with its
 defaults (all five workflows, concurrency 8, 10 warehouses, 2h per-workflow
@@ -583,12 +624,33 @@ Every workflow completed every step: 2,310/2,310 worker-steps, 107.9 s of
 workflow wall time in total (1 min 52 s for the whole run, including a seed
 build per workflow), no CAS retries, nothing aborted or timed out.
 
-**Since the table: at-rest checkpoints take the branch lease
+Against that run, the checkpoint column is the one that moved in the same
+direction everywhere: every p50 is higher, at depth 1 (`simulation` 109.2 →
+121.8 ms, `data_cleaning` 73.4 → 90.4, `software_dev` 50.8 → 81.0, `mcts`
+82.9 → 129.3, `failure_repro` 48.3 → 51.4) and at the deepest depth
+(`data_cleaning` 63.1 → 82.7, `software_dev` 53.4 → 61.5, `mcts` 64.6 →
+84.4), and every p99 is higher except `data_cleaning`'s at depth 1 (117.4 →
+112.2). Wall time rose in four workflows (`simulation` 46.7 → 47.0 s,
+`data_cleaning` 9.7 → 10.7, `software_dev` 5.2 → 5.9, `mcts` 44.6 → 49.2)
+and held at 1.7 s in `failure_repro`. The fork, checkout and eval columns
+moved both ways (`simulation`'s fork p50 41.1 → 31.0 ms, `mcts`'s depth-1
+fork p50 53.9 → 62.8 ms), and the stamp change below does not touch those
+operations. Between the two builds lie v0.2.14 through v0.2.18, including
+the checkpoint lease below (one more durable ref write per checkpoint), as
+well as the stamp change. The two runs were also on different days under
+different load, the earlier recorded as having no other load and this one
+at load average 3 to 4, so no single change accounts for the difference
+between the two tables: only the alternating pairs below are a controlled
+comparison.
+
+### Measured changes and context
+
+**Since the 2026-10-02 table: at-rest checkpoints take the branch lease
 (v0.2.17).** An at-rest checkpoint now writes the ref twice instead of
 once: it acquires the branch lease before it uploads, and releases it in
 the write that advances the head ([reference](reference.md)). On a local
 store every ref write is fsynced (`F_FULLFSYNC` on macOS), so that is one
-more flush per checkpoint, and the table's checkpoint column reads low for
+more flush per checkpoint, and that table's checkpoint column reads low for
 code with the lease. Measured 2026-10-03 on the machine above, alternating
 a build of `c9ca45d` (before) with one of the change (after) run by run,
 at load average 2 to 6 (other processes were running):
@@ -611,8 +673,9 @@ durable to fence a concurrent writer, while a ref read costs 0.06 to
 0.16 ms there (timed per request in an eight-way burst). The build
 measured above also read the ref once more, before the acquire; the
 checkpoint now runs its refusals on the acquire's own read, which saves
-nothing measurable locally. The table will carry it from its next
-quiet-machine run.
+nothing measurable locally. The 2026-10-08 table at the head of this
+section was measured on a build with the lease, and with the one-pass stamp
+below, so it carries both.
 
 On S3 every request is a round trip, so there the request count is the
 cost. Before the lease, an at-rest checkpoint read and wrote the ref once
@@ -624,6 +687,65 @@ segment checkpoint makes the same number of requests as before, with a
 `GET` and a durable `PUT` in place of the two `LIST`s. A renewal adds a
 `GET` and a `PUT` per 10 s of upload. This was not measured against a
 real S3 endpoint.
+
+**The stamp hashes once again.** After its head write, an at-rest
+checkpoint stamps the checkout's `.sum` sidecar, and the stamp is trusted
+only when the checkout holds what the store's head holds. Until v0.2.16 it
+took that from a shortcut: the encode's checksum, whenever the checkout's
+size/mtime fingerprint still matched the one taken right after quiesce. A
+same-size write in the same mtime tick could keep that match with the
+content changed, so v0.2.16 (`6714394`) applied `checkout`'s 1 s
+racily-clean margin to the shortcut and, inside the margin, checksummed
+the live database instead ([changelog](../CHANGELOG.md)). A checkout
+written within the second before its checkpoint — every BranchBench
+checkpoint, which follows its step's writes — is inside the margin, so
+those stamps read the whole checkout twice: once for the sidecar's
+SHA-256 and once more for `ltxio.ChecksumDatabase`. Measured the same day
+as the pairs below, alternating builds: single-worker `failure_repro`
+checkpoint p50 was 45.5 / 45.5 / 45.7 ms on v0.2.15 and 56.2 / 55.5 /
+56.7 ms on v0.2.16, and 45.9 / 46.4 / 45.1 ms on `6714394`'s parent
+`160cc8c` against 57.4 / 55.3 / 56.7 ms on `6714394`; eight-way
+`simulation` checkpoint p50 was 110.9 and 98.4 ms on v0.2.13 against 126.2
+and 126.2 ms on v0.2.18 (wall 47.1 / 43.6 s against 47.0 / 47.6 s), a span
+that also includes the lease above. The stamp now reads the checkout once:
+`ltxio.StreamChecksum` folds the LTX page checksum over the same read that
+feeds the sidecar's SHA-256, the two digests computed concurrently, and the
+stamp is trusted only when that checksum equals the head's and no WAL
+frames sit beside the file. There is no shortcut on the stamp any more, so
+no margin either (`checkout`'s fingerprint fast path keeps its margin), and
+the content check runs on every stamp. Measured 2026-10-08 on the machine
+above, alternating a build of `d8c81f8` (v0.2.18, before) with one of
+`e503ddf` (after) run by run. `uptime` read load averages 4.30 3.89 3.39
+before and 3.94 3.83 3.38 after the `failure_repro` series, and 3.79 3.79
+3.37 before and 3.82 3.88 3.51 after the `simulation` series:
+
+| Run | Checkpoint p50, before → after | Checkpoint p99, before → after | Wall, before → after |
+|---|---|---|---|
+| `failure_repro`, concurrency 1, round 1 | 60.8 → 51.8 ms | 68.4 → 54.6 ms | 1.8 → 1.7 s |
+| `failure_repro`, concurrency 1, round 2 | 60.5 → 51.3 ms | 63.2 → 56.0 ms | 1.8 → 1.7 s |
+| `failure_repro`, concurrency 1, round 3 | 60.3 → 52.2 ms | 63.2 → 54.2 ms | 1.8 → 1.7 s |
+| `simulation`, concurrency 8, round 1 | 143.6 → 137.5 ms | 213.9 → 188.9 ms | 53.6 → 52.7 s |
+| `simulation`, concurrency 8, round 2 | 125.8 → 125.4 ms | 181.2 → 173.0 ms | 46.5 → 47.8 s |
+
+One at a time, every after run's checkpoint p50 sits below every before
+run's: by the medians, 60.5 → 51.8 ms, 8.7 ms lower (about 14%: 8.7 /
+60.5), and the p99 is lower in every round. For scale, the same-day
+medians above put what v0.2.16 added at 10.7 ms (45.5 → 56.2) and what
+`6714394` itself added at 10.8 ms (45.9 → 56.7); those come from a
+different series than these pairs, so the deltas are not directly
+comparable, and neither is the after build's 51.8 ms with v0.2.15's
+45.5 ms, with the lease between them besides. Eight at a time, these two
+rounds do not resolve the change: each after run's p50 is below its before
+run's (by 6.1 ms and 0.4 ms), but the two before runs differ from each
+other by 17.8 ms, far more than either pair, and round 2's wall time went
+the wrong way (46.5 → 47.8 s). What remains is one pass: the stamp still
+reads the whole checkout for the sidecar's hash, now carrying both digests
+concurrently. In memory, that pass is slower than the SHA-256-only pass the
+stamp made when it took the shortcut before v0.2.16: in a 64 MiB
+micro-benchmark measured the same day,
+SHA-256 alone ran at 3.5 GB/s, the LTX page checksum alone at 2.4 GB/s,
+the two one after the other at 1.4 GB/s and the two concurrently at 2.36
+GB/s.
 
 **On a local store, chain resolution slows as at-rest checkpoints
 accumulate on one lineage.** Each checkpoint writes under the epoch its
