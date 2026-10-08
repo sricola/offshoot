@@ -45,6 +45,11 @@ type Workspace struct {
 	SnapshotEvery int
 }
 
+// observeNewLineage, when non-nil, is told every lineage ID a repoint mints
+// (newLineageAt's shared path and the materialize copy,
+// copySnapshotToNewLineageFromChain). A test-only seam; nil in production.
+var observeNewLineage func(id string)
+
 // bestEffortDelete removes key from the backend, logging to stderr (never
 // failing) on error. It exists for orphan cleanup after a failed ref
 // write: every caller deletes a key no ref can name, in a freshly-minted
@@ -59,6 +64,28 @@ func (w *Workspace) bestEffortDelete(key string) {
 			"offshoot: best-effort cleanup of %s failed (reachability GC will reclaim it): %v\n",
 			key, err)
 	}
+}
+
+// settleRepoint settles a repoint's ref write for db@branch that returned
+// putErr, by re-reading the ref. A failed write can still have landed: the
+// S3 SDK's retry answering 412 to its own first attempt that landed
+// (reported as ErrCAS), or a timeout that lost the response. lineage is the
+// fresh ID this call minted (store.NewLineageID), which nothing else writes,
+// so a ref naming it proves the write landed; a ref naming any other
+// lineage, or no ref at all (the branch was never created, or was destroyed
+// since), proves it did not. When the re-read fails, the fate of the write
+// is unknown: the caller must keep the lineage's objects (GC reclaims them
+// if no ref ever names the lineage) and return the error, which says so.
+// It costs one GetRef, and only on the error path.
+func (w *Workspace) settleRepoint(db, branch, lineage string, putErr error) (landed bool, err error) {
+	ref, _, gerr := w.Store.GetRef(db, branch)
+	if gerr != nil {
+		if errors.Is(gerr, store.ErrNotFound) {
+			return false, nil
+		}
+		return false, fmt.Errorf("ops: %s@%s: the ref write failed (%v) and the ref could not be re-read (%v); the write may have landed, so lineage %s's objects were kept for GC to reclaim if it did not", db, branch, putErr, gerr, lineage)
+	}
+	return ref.Lineage == lineage, nil
 }
 
 // Metadata caps (design spec § Metadata; Milestone 3 Global Constraints):
@@ -1276,6 +1303,9 @@ func (w *Workspace) copySnapshotToNewLineage(src store.Ref, cp store.Checkpoint)
 // through the wrapper above.
 func (w *Workspace) copySnapshotToNewLineageFromChain(src store.Ref, cp store.Checkpoint, members []store.ChainMember) (string, bool, error) {
 	lineage := store.NewLineageID()
+	if observeNewLineage != nil {
+		observeNewLineage(lineage)
+	}
 	if !forkSlowPathForTest {
 		ok, err := w.tryFastForkCopy(members, cp, lineage)
 		if err != nil {
@@ -1409,18 +1439,26 @@ func (w *Workspace) forkWith(db, srcBranch, newBranch, at string, ttl time.Durat
 	child.Touch(time.Now())
 	child.SetCheckpoint("fork", store.Checkpoint{TXID: txid, Epoch: 1, CreatedAt: nowStamp()})
 	if _, err := w.Store.PutRef(db, newBranch, child, ""); err != nil {
-		// Branch already exists (or lost a race): remove the orphan — the
-		// base object on the shared path (there is no snapshot to delete),
-		// the snapshot on the materialize path.
-		if base != nil {
-			w.bestEffortDelete(store.BaseKey(childLineage))
-		} else {
-			w.bestEffortDelete(store.SnapshotKey(childLineage, 1, txid))
+		landed, serr := w.settleRepoint(db, newBranch, childLineage, err)
+		if serr != nil {
+			return 0, serr
 		}
-		if errors.Is(err, store.ErrCAS) {
-			return 0, fmt.Errorf("ops: branch %s@%s already exists (offshoot status lists branches)", db, newBranch)
+		if !landed {
+			// The re-read shows the write did not land: the branch already
+			// exists, or another writer won. Remove the orphan: the base
+			// object on the shared path (there is no snapshot to delete),
+			// the snapshot on the materialize path.
+			if base != nil {
+				w.bestEffortDelete(store.BaseKey(childLineage))
+			} else {
+				w.bestEffortDelete(store.SnapshotKey(childLineage, 1, txid))
+			}
+			if errors.Is(err, store.ErrCAS) {
+				return 0, fmt.Errorf("ops: branch %s@%s already exists (offshoot status lists branches)", db, newBranch)
+			}
+			return 0, fmt.Errorf("ops: fork %s@%s: %w", db, newBranch, err)
 		}
-		return 0, fmt.Errorf("ops: fork %s@%s: %w", db, newBranch, err)
+		// The write landed and only its response was lost: the fork is done.
 	}
 	if ObserveFork != nil {
 		// A shared fork reports fast=false: the fast/slow split was defined
@@ -1463,8 +1501,9 @@ func (w *Workspace) shareBound() int {
 // transitively): sharing adds zero members of its own, so sharing below the
 // bound can never push a resolved chain past it, and materializing at the
 // bound resets the spine's depth to one. what names the caller in errors
-// ("fork db@branch"). On a lost ref CAS afterwards the caller removes the
-// orphan: BaseKey(lineage) when base != nil, else the copied snapshot.
+// ("fork db@branch"). On a failed ref write afterwards the caller removes
+// the orphan (BaseKey(lineage) when base != nil, else the copied snapshot)
+// only once settleRepoint's re-read shows the write did not land.
 func (w *Workspace) newLineageAt(src store.Ref, cp store.Checkpoint, members []store.ChainMember, materialize bool, what string) (lineage string, base *store.BasePointer, fast bool, err error) {
 	if materialize || len(members) >= w.shareBound() {
 		lineage, fast, err = w.copySnapshotToNewLineageFromChain(src, cp, members)
@@ -1478,6 +1517,9 @@ func (w *Workspace) newLineageAt(src store.Ref, cp store.Checkpoint, members []s
 		return "", nil, false, fmt.Errorf("ops: %s: resolving base for lineage %s at txid %d: %w", what, src.Lineage, cp.TXID, err)
 	}
 	lineage = store.NewLineageID()
+	if observeNewLineage != nil {
+		observeNewLineage(lineage)
+	}
 	// A base pointer must never land in a store an old (layout v1) binary
 	// could still open — its lineage-granular GC would sweep the shared
 	// ancestor out from under the new lineage. Bump the manifest first.
@@ -1687,8 +1729,18 @@ func (w *Workspace) RollbackWith(db, branch, to string, opts RollbackOptions) (R
 	next.LeaseHolder, next.LeaseExpiry = "", ""
 	next.Touch(time.Now())
 	if _, err := w.Store.PutRef(db, branch, next, etag); err != nil {
-		cleanup()
-		return RollbackResult{}, fmt.Errorf("ops: rollback lost a race (retry): %w", err)
+		landed, serr := w.settleRepoint(db, branch, lineage, err)
+		if serr != nil {
+			return RollbackResult{}, serr
+		}
+		if !landed {
+			// The re-read shows the write did not land: remove the new
+			// lineage's objects and report the lost race.
+			cleanup()
+			return RollbackResult{}, fmt.Errorf("ops: rollback lost a race (retry): %w", err)
+		}
+		// The write landed and only its response was lost: the branch has
+		// repointed, so the checkout refresh below runs as on any success.
 	}
 
 	// The branch has repointed. Everything below is a best-effort refresh of
@@ -1941,12 +1993,22 @@ func (w *Workspace) PromoteWith(db, source, target string, opts PromoteOptions) 
 	next.LeaseHolder, next.LeaseExpiry = "", ""
 	next.Touch(time.Now())
 	if _, err := w.Store.PutRef(db, target, next, tgtEtag); err != nil {
-		if base != nil {
-			w.bestEffortDelete(store.BaseKey(lineage))
-		} else {
-			w.bestEffortDelete(store.SnapshotKey(lineage, 1, txid))
+		landed, serr := w.settleRepoint(db, target, lineage, err)
+		if serr != nil {
+			return PromoteResult{}, serr
 		}
-		return PromoteResult{}, fmt.Errorf("ops: promote lost a race (retry): %w", err)
+		if !landed {
+			// The re-read shows the write did not land: remove the new
+			// lineage's object and report the lost race.
+			if base != nil {
+				w.bestEffortDelete(store.BaseKey(lineage))
+			} else {
+				w.bestEffortDelete(store.SnapshotKey(lineage, 1, txid))
+			}
+			return PromoteResult{}, fmt.Errorf("ops: promote lost a race (retry): %w", err)
+		}
+		// The write landed and only its response was lost: the target has
+		// repointed, so the checkout refresh below runs as on any success.
 	}
 	if ObservePromote != nil {
 		ObservePromote(base != nil)
@@ -2007,8 +2069,9 @@ var compactBeforeCASForTest func()
 // Rollback's `done` set does for its head).
 //
 // The ref CAS is the point of no return, exactly as in Promote: a CAS
-// loss (a concurrent flush advanced the head) deletes the orphan snapshot
-// and returns a retry error — no internal retry loop, which would orphan
+// loss (a concurrent flush advanced the head) deletes the orphan snapshots
+// once settleRepoint's re-read shows the write did not land, and returns a
+// retry error — no internal retry loop, which would orphan
 // a lineage per attempt. The checkout refresh that follows is best-effort
 // and reports partial success on failure, same as Promote.
 func (w *Workspace) Compact(db, branch string) (uint64, error) {
@@ -2106,8 +2169,18 @@ func (w *Workspace) CompactWith(db, branch string, opts CompactOptions) (uint64,
 		compactBeforeCASForTest()
 	}
 	if _, err := w.Store.PutRef(db, branch, next, etag); err != nil {
-		cleanup()
-		return 0, fmt.Errorf("ops: compact lost a race (retry): %w", err)
+		landed, serr := w.settleRepoint(db, branch, lineage, err)
+		if serr != nil {
+			return 0, serr
+		}
+		if !landed {
+			// The re-read shows the write did not land: remove the copies
+			// and report the lost race.
+			cleanup()
+			return 0, fmt.Errorf("ops: compact lost a race (retry): %w", err)
+		}
+		// The write landed and only its response was lost: the branch has
+		// repointed, so the checkout refresh below runs as on any success.
 	}
 	// Refresh the checkout if one exists and is quiescible.
 	path := w.CheckoutPath(db, branch)
