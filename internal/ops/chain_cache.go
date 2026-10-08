@@ -18,8 +18,10 @@ var observeChainSource func(kind string)
 // checkpoint records its new head's chain in the trusted stamp it writes
 // after its head write: the chain it resolved (or took from here) plus the
 // object it just wrote, or that object alone when it wrote a snapshot. So
-// the next checkpoint, and a fork at head, skip listing the lineage, which
-// on a local store grows with every epoch the lineage's checkpoints minted.
+// the next checkpoint, a fork at head, a promote (which always resolves
+// its source's head) and a rollback to the head's own checkpoint skip
+// listing the lineage, which on a local store grows with every epoch the
+// lineage's checkpoints minted.
 //
 // It is used only when all of these hold:
 //   - the sidecar's identity (Lineage, Epoch, TXID) is the ref's head

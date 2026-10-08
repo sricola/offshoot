@@ -774,3 +774,47 @@ func TestForkAfterOwnSnapshotFirstResolvesThenHits(t *testing.T) {
 	}
 	assertHeadIsCheckout(t, w, "app", "grandchild", "g2", gpath)
 }
+
+// TestPromoteAtHeadUsesTheRecordedChain: promote resolves the source's
+// head; with a valid record on the source's checkout it takes the cache,
+// and the promoted target reads the same bytes as a resolve would give.
+func TestPromoteAtHeadUsesTheRecordedChain(t *testing.T) {
+	w := newWS(t)
+	path := sharedChildSeed(t, w)
+	mustSQL(t, path, "INSERT INTO t (v) VALUES (randomblob(100));")
+	mustCheckpointWith(t, w, "app", "child", "c1", CheckpointOptions{})
+	sources := recordChainSources(t)
+	if _, err := w.PromoteWith("app", "child", "main", PromoteOptions{Force: true, NoBackup: true}); err != nil {
+		t.Fatal(err)
+	}
+	assertSources(t, "promote of a shared child", sources(), "cache")
+	assertHeadIsCheckout(t, w, "app", "main", "promote", path)
+}
+
+// TestRollbackToHeadUsesTheRecordedChain: a rollback to the head's own
+// checkpoint resolves at the head and takes the cache; a rollback below
+// the head still lists.
+func TestRollbackToHeadUsesTheRecordedChain(t *testing.T) {
+	w := newWS(t)
+	path := chainCacheSeed(t, w)
+	sources := recordChainSources(t)
+	if _, err := w.RollbackWith("app", "main", "b", RollbackOptions{NoBackup: true}); err != nil {
+		t.Fatal(err)
+	}
+	assertSources(t, "rollback to the head's checkpoint", sources(), "cache")
+	// Rollback keeps every checkpoint at or below the target by name
+	// rather than renaming the target to "rollback" (unlike promote, which
+	// always resets its target's checkpoint map to {"promote": txid}), so
+	// the target's own name ("b") still names the head.
+	assertHeadIsCheckout(t, w, "app", "main", "b", path)
+
+	sources = recordChainSources(t)
+	if _, err := w.RollbackWith("app", "main", "a", RollbackOptions{NoBackup: true}); err != nil {
+		t.Fatal(err)
+	}
+	// Below the head, RollbackWith calls Store.Chain directly (as Fork's
+	// below-floor branch does; see TestForkAtHeadUsesTheRecordedChain's
+	// "fork at an older checkpoint" case), which does not go through
+	// headChain and so never calls observeChainSource.
+	assertSources(t, "rollback below the head", sources())
+}
