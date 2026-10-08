@@ -10,6 +10,7 @@ import (
 	"bytes"
 	"errors"
 	"fmt"
+	"reflect"
 	"strings"
 	"sync/atomic"
 	"testing"
@@ -513,5 +514,38 @@ func TestRollbackSettleUnknownKeepsObjects(t *testing.T) {
 	}
 	if got := checkpointBytes(t, w, "app", "main", "b"); !bytes.Equal(got, want) {
 		t.Fatal("main at b differs from b before the rollback")
+	}
+}
+
+// TestForkMaterializeOntoTakenNameWritesNothing: a fork that would copy a
+// snapshot refuses a taken name before minting a lineage or writing any
+// object, and leaves the existing branch untouched.
+func TestForkMaterializeOntoTakenNameWritesNothing(t *testing.T) {
+	w := newWS(t)
+	chainCacheSeed(t, w)
+	prevMat := forkMaterializeForTest
+	forkMaterializeForTest = true
+	t.Cleanup(func() { forkMaterializeForTest = prevMat })
+	if _, err := w.Fork("app", "main", "child", "", 0, nil); err != nil {
+		t.Fatal(err)
+	}
+	before := refOf(t, w, "app", "child")
+	keys := dataKeys(t, w)
+	var minted []string
+	prevNew := observeNewLineage
+	observeNewLineage = func(id string) { minted = append(minted, id) }
+	t.Cleanup(func() { observeNewLineage = prevNew })
+	_, err := w.Fork("app", "main", "child", "", 0, nil)
+	if err == nil || !strings.Contains(err.Error(), "already exists (offshoot status lists branches)") {
+		t.Fatalf("materialized fork onto a taken name: err = %v, want already exists", err)
+	}
+	if len(minted) != 0 {
+		t.Fatalf("a lineage was minted for a fork onto a taken name: %v", minted)
+	}
+	if got := dataKeys(t, w); !reflect.DeepEqual(got, keys) {
+		t.Fatalf("a fork onto a taken name wrote objects: before %v, after %v", keys, got)
+	}
+	if after := refOf(t, w, "app", "child"); !reflect.DeepEqual(after, before) {
+		t.Fatalf("the existing branch changed: before %+v, after %+v", before, after)
 	}
 }

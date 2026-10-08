@@ -1464,6 +1464,20 @@ func (w *Workspace) forkWith(db, srcBranch, newBranch, at string, ttl time.Durat
 		return 0, fmt.Errorf("ops: resolving chain for lineage %s to txid %d: %w", src.Lineage, cp.TXID, err)
 	}
 	materialize := forkMaterializeForTest || forkSlowPathForTest
+	if w.materializes(baseMembers, materialize) {
+		// A materialized fork copies a full snapshot before its create-only
+		// ref write, and a write that fails leaves that copy for GC (see
+		// settleRepoint). Refuse a taken name before copying anything. The
+		// ref write's compare-and-swap stays the authority for a branch
+		// created after this read; this only avoids the common orphan. A
+		// shared fork skips the read: its orphan is one small base.json.
+		switch _, _, err := w.Store.GetRef(db, newBranch); {
+		case err == nil:
+			return 0, fmt.Errorf("ops: branch %s@%s already exists (offshoot status lists branches)", db, newBranch)
+		case !errors.Is(err, store.ErrNotFound):
+			return 0, fmt.Errorf("ops: fork %s@%s: %w", db, newBranch, err)
+		}
+	}
 	childLineage, base, fast, err := w.newLineageAt(src, cp, baseMembers, materialize, fmt.Sprintf("fork %s@%s", db, newBranch))
 	if err != nil {
 		return 0, err
@@ -1519,6 +1533,13 @@ func (w *Workspace) shareBound() int {
 	return ForkShareMaxDepth
 }
 
+// materializes reports whether newLineageAt, given a fork point's resolved
+// chain (members) and the caller's materialize request, copies a snapshot
+// into the new lineage instead of sharing through a base pointer.
+func (w *Workspace) materializes(members []store.ChainMember, materialize bool) bool {
+	return materialize || len(members) >= w.shareBound()
+}
+
 // newLineageAt mints the fresh lineage a new or repointed branch starts on
 // at cp of src, given src's already-resolved chain at cp (members). It is
 // the share-versus-materialize decision Fork, Rollback and Promote all take:
@@ -1543,7 +1564,7 @@ func (w *Workspace) shareBound() int {
 // only when settleRepoint's re-read finds the ref still on the lineage it
 // named before the write; otherwise GC reclaims it.
 func (w *Workspace) newLineageAt(src store.Ref, cp store.Checkpoint, members []store.ChainMember, materialize bool, what string) (lineage string, base *store.BasePointer, fast bool, err error) {
-	if materialize || len(members) >= w.shareBound() {
+	if w.materializes(members, materialize) {
 		lineage, fast, err = w.copySnapshotToNewLineageFromChain(src, cp, members)
 		return lineage, nil, fast, err
 	}
