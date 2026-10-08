@@ -17,6 +17,16 @@ Pin an exact version if you depend on format stability. The full contract:
 
 ## [Unreleased]
 
+Nothing yet.
+
+## [0.2.18] - 2026-10-08
+
+The at-rest checkpoint no longer lists its lineage to resolve its own chain
+when the sidecar recorded the head's chain, so a local store's per-checkpoint
+cost stops growing with the epochs the checkpoint lease mints (and S3 makes
+one `LIST` fewer per segment checkpoint); emptied epoch and lineage
+directories are removed as deletes empty them.
+
 ### Changed
 
 - At-rest checkpoints and forks at head no longer list the lineage to
