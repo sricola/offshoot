@@ -49,7 +49,8 @@ Pin an exact version if you depend on format stability. The full contract:
   lineage's own must start at `ref.Base.TXID + 1`. Promote and a
   rollback to the head's own checkpoint now take the recorded chain for
   every branch, shared or not, as a checkpoint and a fork at head already
-  did. They therefore read the source checkout's `.sum` sidecar, and
+  did. They therefore read the `.sum` sidecar of the checkout they
+  resolve (promote's source, or the branch a rollback repoints), and
   fall back to listing the lineage when it records no usable chain. The
   first checkpoint after a checkout still lists, since no chain is
   recorded yet, as do `checkout`, a fork below head and materialize.
