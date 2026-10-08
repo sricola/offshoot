@@ -476,6 +476,96 @@ func applySegments(f *os.File, pageSize uint32, prevMaxTXID uint64, prevCommit u
 	return prevMaxTXID, uint64(runningChecksum), nil
 }
 
+// streamBlockSize is the number of bytes StreamChecksum reads at a time.
+// Every SQLite page size (512 to 65536) divides 1 MiB, so a page never
+// straddles two blocks. Tests lower it to cross block boundaries cheaply.
+var streamBlockSize = 1 << 20
+
+// ErrNotWholeDatabase is wrapped by every StreamChecksum error that is a
+// verdict on the bytes (a header that does not parse, a file shorter than
+// its header's page count) rather than a failure to read or tee them; by
+// the time it is returned the tee has received the whole file.
+var ErrNotWholeDatabase = errors.New("ltxio: not a whole database")
+
+// StreamChecksum reads a SQLite database from r to EOF and returns its LTX
+// rolling checksum, the same value ChecksumDatabase computes for the file
+// (pages 1..nPages, the lock page skipped, ltx.ChecksumFlag set). Every byte
+// it reads is also written to tee, in order, so one read of the file serves
+// both this checksum and whatever digest tee computes; the two run
+// concurrently, each block's tee write on its own goroutine while its pages
+// are folded here.
+//
+// The tee receives the whole of r in every case but a read or tee error: a
+// file whose header does not parse (readDBHeader, which covers files shorter
+// than 100 bytes) and a file that ends before the header's nPages*pageSize
+// bytes are both drained into tee before their error is returned, so a
+// caller hashing the tee always holds the hash of the whole file. Bytes past
+// nPages*pageSize are written to tee and not folded, as ChecksumDatabase
+// ignores them.
+func StreamChecksum(r io.Reader, tee io.Writer) (uint64, error) {
+	buf := make([]byte, streamBlockSize)
+	h := ltx.NewHasher()
+	chksum := ltx.ChecksumFlag
+	var (
+		pageSize, nPages uint32
+		lockPgno         uint32
+		headerErr        error
+		headerRead       bool
+		folded           int64 // bytes folded into chksum so far
+		seen             int64 // bytes read so far
+	)
+	for {
+		n, rerr := io.ReadFull(r, buf)
+		if rerr != nil && rerr != io.EOF && rerr != io.ErrUnexpectedEOF {
+			return 0, rerr
+		}
+		block := buf[:n]
+		// The header is parsed from the first block read, even an empty one
+		// (an empty file never satisfies readDBHeader's 100-byte minimum, so
+		// this is where an empty file's error comes from; without it, a
+		// reader that returns n=0 on its very first call would never have
+		// its header checked at all).
+		if !headerRead {
+			headerRead = true
+			pageSize, nPages, headerErr = readDBHeader(bytes.NewReader(block))
+			if headerErr == nil {
+				lockPgno = ltx.LockPgno(pageSize)
+			}
+		}
+		if n > 0 {
+			done := make(chan error, 1)
+			go func() {
+				_, err := tee.Write(block)
+				done <- err
+			}()
+			if headerErr == nil {
+				limit := int64(nPages) * int64(pageSize)
+				for off := int64(0); off+int64(pageSize) <= int64(n) && seen+off < limit; off += int64(pageSize) {
+					pgno := uint32((seen+off)/int64(pageSize)) + 1
+					if pgno != lockPgno {
+						chksum = ltx.ChecksumFlag | (chksum ^ ltx.ChecksumPageWithHasher(h, pgno, block[off:off+int64(pageSize)]))
+					}
+					folded += int64(pageSize)
+				}
+			}
+			seen += int64(n)
+			if err := <-done; err != nil {
+				return 0, err
+			}
+		}
+		if rerr != nil { // io.EOF or io.ErrUnexpectedEOF: r is exhausted
+			break
+		}
+	}
+	if headerErr != nil {
+		return 0, fmt.Errorf("%w: %v", ErrNotWholeDatabase, headerErr)
+	}
+	if want := int64(nPages) * int64(pageSize); folded < want {
+		return 0, fmt.Errorf("%w: truncated: %d bytes, header says %d pages of %d", ErrNotWholeDatabase, seen, nPages, pageSize)
+	}
+	return uint64(chksum), nil
+}
+
 // ErrUncarriedGrowth reports a commit that grows the database past pages
 // the segment (or, in session, the transaction) does not carry.
 var ErrUncarriedGrowth = errors.New("commit grows the database beyond the pages it carries")
