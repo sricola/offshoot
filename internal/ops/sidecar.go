@@ -211,9 +211,9 @@ func StampSumHashOnly(path, hash, lineage string, epoch, txid, postApplyChecksum
 // writer behind StampSum (single stat, ok always true), StampSumHashOnly
 // (ok always false), and the sandwiched stamps in writeSum,
 // checkoutState and stampCheckpoint (ok reflects whether a fingerprint
-// taken just before hashing still matched one taken just after). ok=false omits Size,
-// ModTimeNS and ChangeCounter from the record (StampedNS along with them),
-// exactly like a pre-fingerprint sidecar.
+// taken just before hashing still matched one taken just after). ok=false
+// omits Size, ModTimeNS and ChangeCounter from the record (StampedNS along
+// with them), exactly like a pre-fingerprint sidecar.
 //
 // stampedNS (meaningful only when ok) is recorded as StampedNS: the wall
 // clock read just BEFORE fp's stat, never the time of this write. The

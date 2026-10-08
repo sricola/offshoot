@@ -260,7 +260,9 @@ func checkStreamHeader(hdr []byte, pageSize uint32) error {
 // page skipped, ltx.ChecksumFlag set). Every byte it reads is also written
 // to tee, in order, so one read of the file serves both this checksum and
 // whatever digest tee computes; the two run concurrently, each block's tee
-// write on its own goroutine while its pages are folded here.
+// write on its own goroutine while its pages are folded here. A panic in
+// tee.Write therefore ends the process rather than unwinding to the
+// caller; the hash writers this package is used with do not panic.
 //
 // The header check a block must pass before any page of it is folded is:
 // at least 100 bytes (readDBHeader's own minimum), the 16-byte

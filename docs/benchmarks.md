@@ -707,10 +707,9 @@ Earlier the same day, on the machine described under the 2026-10-08 table,
 each tag (and `6714394` and its parent `160cc8c`) was built from a
 `git archive` of it into a clean directory and run with alternating builds
 within each series; the figures below are the checkpoint column of the
-harness's own rows. The raw rows and their `uptime` readings are kept at
-`.superpowers/bench-raw/2026-10-08-stamp-single-pass/same-day-tag-series.txt`,
-a git-ignored path in the maintainer's checkout, not in the repository.
-Single-worker
+harness's own rows. The raw rows and their `uptime` readings are archived
+outside the repository, with the other raw benchmark outputs, and are not
+part of what this document publishes. Single-worker
 `failure_repro` checkpoint p50 was 45.5 / 45.5 / 45.7 ms on v0.2.15 and
 56.2 / 55.5 / 56.7 ms on v0.2.16, alternating with v0.2.14 in the same
 series, at load averages 2.04 before and 2.50 after it; and 45.9 / 46.4 /
@@ -725,8 +724,9 @@ span also includes the lease above.
 
 The stamp now reads the checkout once: `ltxio.StreamChecksum` folds the LTX
 page checksum over the same read that feeds the sidecar's SHA-256, the two
-digests computed concurrently, and the stamp is trusted only when that
-checksum equals the head's and no WAL frames sit beside the file. There is
+digests computed concurrently, and the stamp is trusted only when the
+file's fingerprint did not change across that read, that checksum equals
+the head's, and no WAL frames sit beside the file. There is
 no shortcut on the stamp any more, so no margin either (`checkout`'s
 fingerprint fast path keeps its margin), and the content check runs on
 every stamp. Measured 2026-10-08 on the machine described under the
