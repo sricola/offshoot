@@ -33,7 +33,9 @@ func randomPagesDB(t *testing.T, nPages int) (string, []byte) {
 // count from 1 to 40 with 64 KiB blocks (16 pages per block), so blocks
 // with an odd number of pages, a single page, and a short last block of
 // every size split and recombine correctly, and the tee still sees every
-// byte.
+// byte. The lock page sits at a 1 GiB offset, beyond what this test writes;
+// foldPages skips it by page number in whichever half it falls, the same
+// test checksumPages applies.
 func TestStreamChecksumSplitFoldMatchesForEveryPageCount(t *testing.T) {
 	withStreamBlockSize(t, 65536)
 	for nPages := 1; nPages <= 40; nPages++ {

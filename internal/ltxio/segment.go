@@ -324,8 +324,9 @@ func StreamChecksum(r io.Reader, tee io.Writer) (uint64, error) {
 					// fold in two halves on two hashers, concurrently with
 					// each other and with the tee write, and the halves XOR
 					// together; the order never matters. CRC-64 is the
-					// slower digest on this path, so splitting it is what
-					// brings the pass down to the tee's own speed.
+					// slower digest on this path, so splitting it brings the
+					// pass to within a few milliseconds per 64 MiB of the
+					// tee's own speed (docs/benchmarks.md has the numbers).
 					mid := k / 2
 					var upper uint64
 					upperDone := make(chan struct{})
@@ -359,11 +360,12 @@ func StreamChecksum(r io.Reader, tee io.Writer) (uint64, error) {
 
 // foldPages XORs together the per-page checksums (ltx.ChecksumPageWithHasher
 // on h) of block's pages with indexes [from, to), where index i holds page
-// number firstPgno+i-from at byte offset i*pageSize, skipping lockPgno. The
-// result carries ltx.ChecksumFlag whenever at least one page was folded; the
-// caller re-ORs the flag after combining, so the value's top bit does not
-// matter. StreamChecksum calls it for the two halves of a block on two
-// hashers at once.
+// number firstPgno+i-from at byte offset i*pageSize, skipping lockPgno. Each
+// page checksum carries ltx.ChecksumFlag, so the result's top bit is set
+// after an odd number of pages and clear after an even number; the caller
+// re-ORs the flag after combining, so that bit does not matter.
+// StreamChecksum calls it for the two halves of a block on two hashers at
+// once.
 func foldPages(h hash.Hash64, block []byte, pageSize uint32, firstPgno, lockPgno uint32, from, to int64) uint64 {
 	var acc uint64
 	for i := from; i < to; i++ {

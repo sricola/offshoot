@@ -108,7 +108,7 @@ Pin an exact version if you depend on format stability. The full contract:
   slower of the two digests, so `StreamChecksum` folds each block's pages
   in two halves on two hashers at once (the rolling checksum is an XOR
   fold, so the halves recombine in any order): the one pass over a 64 MiB
-  file in the page cache went from 32.4 to 24.5 ms by the medians of three
+  file in the page cache went from 32.5 to 24.5 ms by the medians of three
   runs, against 22.1 ms for a SHA-256-only read of the same file
   (`BenchmarkStreamChecksum`, `BenchmarkStreamChecksumSHAOnly`;
   `TestStreamChecksumSplitFoldMatchesForEveryPageCount` pins the fold

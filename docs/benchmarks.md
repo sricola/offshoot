@@ -763,8 +763,8 @@ alone, 2389.76 MB/s for the LTX page checksum alone, 1413.46 MB/s for the
 two one after the other and 2357.63 MB/s for the two concurrently. The
 page checksum is the slower digest, so `StreamChecksum` now folds each
 block's pages in two halves on two hashers at once (the rolling checksum
-is an XOR fold, so the halves recombine in any order). Measured the same
-way afterwards on a 64 MiB file read from the page cache
+is an XOR fold, so the halves recombine in any order). Measured afterwards
+on a 64 MiB file read from the page cache rather than in memory
 (`BenchmarkStreamChecksum`, `go test ./internal/ltxio -run '^$' -bench
 StreamChecksum -benchtime=20x -count=3`, load average 2.9 to 3.4): the one
 pass with both digests went from 32955077 / 32452812 / 32356846 ns/op
@@ -772,8 +772,8 @@ pass with both digests went from 32955077 / 32452812 / 32356846 ns/op
 (2723.70 / 2734.91 / 2742.77 MB/s), against a SHA-256-only read of the
 same file at 22491600 / 22384619 / 22415335 ns/op before and 22064252 /
 22031402 / 22104710 ns/op after (`BenchmarkStreamChecksumSHAOnly`). The
-pass now sits about 2.4 ms per 64 MiB above the SHA-256-only floor
-(24.5 ms against 22.1 ms by the medians) instead of about 10 ms.
+pass now sits about 2.5 ms per 64 MiB above the SHA-256-only floor
+(24.54 ms against 22.06 ms by the medians) instead of about 10 ms.
 
 **On a local store, chain resolution slows as at-rest checkpoints
 accumulate on one lineage.** Each checkpoint writes under the epoch its
