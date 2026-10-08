@@ -17,7 +17,25 @@ Pin an exact version if you depend on format stability. The full contract:
 
 ## [Unreleased]
 
-Nothing yet.
+### Changed
+
+- **A checkpoint's stamp reads the checkout once again.** The stamp now
+  verifies the checkout's content from the one read it already makes for
+  the sidecar hash: `ltxio.StreamChecksum` folds the LTX page checksum
+  over that read while it feeds the SHA-256, the two computed
+  concurrently, and the stamp is trusted only when the file's fingerprint
+  did not change across that read, that checksum equals the head's, and
+  no WAL frames sit beside the file. v0.2.16 applied the
+  1 s racily-clean margin to the stamp's matching-fingerprint shortcut,
+  and a checkout written within that second, as one checkpointed right
+  after its writes is, was then read a second time to checksum it; that
+  second pass is gone, and the margin no longer applies to the stamp (it
+  still governs `checkout`'s fingerprint fast path). The content check now
+  runs on every stamp; through v0.2.18 a matching fingerprint (from
+  v0.2.16, only a settled one) was trusted without it. BranchBench's
+  single-worker `failure_repro` checkpoint p50 went from 60.8 / 60.5 /
+  60.3 ms to 51.8 / 51.3 / 52.2 ms, alternating v0.2.18 with this change
+  run by run ([benchmarks](docs/benchmarks.md)).
 
 ## [0.2.18] - 2026-10-08
 

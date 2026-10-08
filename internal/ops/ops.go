@@ -582,21 +582,23 @@ func (w *Workspace) Checkpoint(db, branch, name string, meta map[string]string) 
 //
 // The sidecar and shadow are refreshed after the head write.
 //
-// NOT SAFE against a live in-process connection on the checkout: it
-// raw-opens (and closes) the checkout path to encode it (snapshot), to diff
-// it against the shadow (segment, diffPages) and to checksum it for the
-// stamp (stampCheckpoint), and each close drops every SQLite lock this
+// NOT SAFE against a live in-process connection on the checkout: before
+// the head write it raw-opens (and closes) the checkout path to encode it
+// (snapshot, ltxio.EncodeSnapshot) and to diff it against the shadow
+// (segment, diffPages), and each close drops every SQLite lock this
 // process holds on it — the POSIX (process, inode) lock-drop hazard, see
 // internal/dbfile. Today only the CLI (cmd/offshoot) and MCP
 // (internal/mcp) reach this, both of which are separate processes from the
 // daemon that runs sessions, so no in-process session can be holding that
-// checkout. In offshoot mcp the reaper goroutine still can, though only
-// after the head write: until then the lease keeps reaping off the branch
-// (a reap's destroy refuses a live lease, and the acquire refuses a reap
-// or destroy claim), and the head write stamps the activity clock. So only
-// a fork whose TTL runs out before the stamp is done can be reaped with
-// Destroy's quiesce connection open on it, whose locks the stamp's closes
-// drop (a known, narrow hazard: see internal/dbfile's package doc).
+// checkout. In offshoot mcp the reaper goroutine could, but not during
+// those raw opens: from the acquire to the head write the lease keeps
+// reaping off the branch (a reap's destroy refuses a live lease, and the
+// acquire refuses a reap or destroy claim). After the head write nothing
+// here raw-opens the checkout: the stamp (stampCheckpoint) and the shadow
+// clone (refreshShadow) read it only through dbfile.Reader, whose
+// descriptor is cached and closed only when no pin or Hold covers the
+// inode, so a fork reaped then, with Destroy's Hold-covered quiesce
+// connection open on it, keeps its locks.
 // The daemon conspicuously has no checkpoint op; if one is
 // ever added it MUST NOT call this directly — route the snapshot through
 // the session's own engine, or through dbfile.
@@ -671,15 +673,6 @@ func (w *Workspace) checkpointLeased(db, branch, name string, meta map[string]st
 	if err := quiesce(path); err != nil {
 		return CheckpointResult{}, retryHint("checkpoint", db, branch, err)
 	}
-	// The checkout's fingerprint right after quiesce, before the encode:
-	// stampCheckpoint compares it with the file it stamps, so a write
-	// landing between the encode and the stamp cannot get our checksum
-	// attributed to bytes we never encoded. encodeNS is the wall clock
-	// read just BEFORE that stat (the same anchoring sandwichedSum uses
-	// for StampedNS): stampCheckpoint trusts the comparison only when the
-	// fingerprint's mtime is a racily-clean margin older than this instant.
-	encodeNS := time.Now().UnixNano()
-	fpEncode, fpEncodeErr := stampFingerprint(path)
 	if checkpointAfterQuiesceForTest != nil {
 		checkpointAfterQuiesceForTest()
 	}
@@ -769,7 +762,7 @@ func (w *Workspace) checkpointLeased(db, branch, name string, meta map[string]st
 	if (!headKnown || headSum != checksum) && ObserveCheckpointOverwrite != nil {
 		ObserveCheckpointOverwrite()
 	}
-	trusted, err := stampCheckpoint(path, ref.Lineage, epoch, txid, headSum, headKnown, checksum, fpEncode, encodeNS, fpEncodeErr == nil, chain)
+	trusted, err := stampCheckpoint(path, ref.Lineage, epoch, txid, headSum, headKnown, chain)
 	if err != nil {
 		return CheckpointResult{}, fmt.Errorf("ops: checkpoint %q committed (txid %d), but the checkout fingerprint could not be refreshed: %w", name, txid, err)
 	}

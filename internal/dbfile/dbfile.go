@@ -183,21 +183,17 @@
 //
 //   - reflink.Clone opens and closes its source on Linux, so a checkout is
 //     cloned only through Section.CloneTo, never through reflink.Clone.
-//   - ops.CheckpointWith raw-opens and closes the checkout in three places:
-//     its snapshot encode (ltxio.EncodeSnapshot), its segment diff
-//     (diffPages) and its stamp's checksum (ltxio.ChecksumDatabase). Only
+//   - ops.CheckpointWith raw-opens and closes the checkout in two places,
+//     both before its head write: its snapshot encode
+//     (ltxio.EncodeSnapshot) and its segment diff (diffPages). Its stamp
+//     and shadow clone, after the head write, read through Reader. Only
 //     the CLI and offshoot mcp call it, and the daemon must never (see its
 //     doc comment), so no session's capture engine shares its process. That
-//     is the only containment. In offshoot mcp, the reaper goroutine runs
-//     beside tool calls, so a TTL fork reaped while it is being checkpointed
-//     has destroy's quiesce connection open on the checkout, and any of
-//     those closes drops that connection's locks. The checkpoint's branch
-//     lease narrows this to its stamp: from its acquire to its head write
-//     the lease keeps a reap off the branch, and the head write stamps the
-//     activity clock, so only a fork whose TTL runs out during the stamp
-//     is reaped under it. This predates the package and is left in place:
-//     the connection only folds the WAL of a branch that is being
-//     destroyed.
+//     is the only containment against a session. In offshoot mcp, the
+//     reaper goroutine runs beside tool calls, and destroy's quiesce
+//     connection on a reaped fork would lose its locks to either close; the
+//     checkpoint's branch lease keeps a reap off the branch from its
+//     acquire to its head write, which covers both raw opens.
 //
 // # What is NOT covered
 //
