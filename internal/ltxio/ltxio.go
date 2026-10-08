@@ -5,6 +5,7 @@
 package ltxio
 
 import (
+	"bytes"
 	"encoding/binary"
 	"fmt"
 	"github.com/sricola/offshoot/internal/fsutil"
@@ -26,9 +27,13 @@ func ReadDBHeader(r io.Reader) (pageSize, nPages uint32, err error) {
 }
 
 // readDBHeader reads a quiesced SQLite database's page size and page count
-// (database size in pages) from its 100-byte header. r must be positioned at
-// the start of the file. Shared by EncodeSnapshot and ChecksumDatabase, which
-// both need exactly this parse.
+// (database size in pages) from its 100-byte header, and refuses a header
+// that is not a SQLite database's (checkDBHeader). r must be positioned at
+// the start of the file. Shared by EncodeSnapshot, ChecksumDatabase,
+// StreamChecksum, ApplySegments and ReadDBHeader, so every reader of a
+// database header applies the same verdict: a file something overwrote with
+// zeros or with another format is an error here, never a page size of 0
+// reaching ltx.LockPgno's division further down.
 func readDBHeader(r io.Reader) (pageSize, nPages uint32, err error) {
 	hdr := make([]byte, dbHeaderSize)
 	if _, err := io.ReadFull(r, hdr); err != nil {
@@ -38,8 +43,33 @@ func readDBHeader(r io.Reader) (pageSize, nPages uint32, err error) {
 	if pageSize == 1 {
 		pageSize = 65536
 	}
+	if err := checkDBHeader(hdr, pageSize); err != nil {
+		return 0, 0, fmt.Errorf("ltxio: %w", err)
+	}
 	nPages = binary.BigEndian.Uint32(hdr[28:32])
 	return pageSize, nPages, nil
+}
+
+// checkDBHeader rejects a 100-byte header that parses syntactically (any
+// file of at least 100 bytes does) but is not a legitimate SQLite database
+// header: hdr's first 16 bytes must equal dbHeaderMagic, and pageSize (the
+// decoded value, with 1 already mapped to 65536) must be a power of two in
+// [512, 65536]. Without this check a page size of 0, which any all-zero
+// header produces, divides by zero in ltx.LockPgno, and any other
+// out-of-range or non-power-of-two page size misaligns a per-block page fold
+// against the page boundaries the file actually has. The errors carry no
+// package prefix so a caller that wraps them under its own verdict
+// (StreamChecksum's ErrNotWholeDatabase) does not repeat it.
+//
+// hdr must hold at least 100 bytes, which readDBHeader guarantees.
+func checkDBHeader(hdr []byte, pageSize uint32) error {
+	if !bytes.Equal(hdr[:len(dbHeaderMagic)], dbHeaderMagic) {
+		return fmt.Errorf("header: missing the %q magic", dbHeaderMagic)
+	}
+	if pageSize < 512 || pageSize > 65536 || pageSize&(pageSize-1) != 0 {
+		return fmt.Errorf("header: page size %d is not a power of two in [512, 65536]", pageSize)
+	}
+	return nil
 }
 
 // EncodeSnapshot writes a full-snapshot LTX of the SQLite main database at

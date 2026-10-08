@@ -209,50 +209,26 @@ func ChecksumDatabase(dbPath string) (uint64, error) {
 
 // streamBlockSize is the number of bytes StreamChecksum reads at a time. It
 // must stay a positive multiple of 65536 (and so, trivially, at least 100
-// bytes): every valid SQLite page size (a power of two from 512 to 65536,
-// the range checkStreamHeader enforces below) then divides it evenly, so a
-// page never straddles two blocks, and the first block always holds the
-// whole 100-byte file header. Tests lower it, while preserving that
-// property, to cross block boundaries cheaply.
+// bytes): every valid SQLite page size, a power of two from 512 to 65536 as
+// checkDBHeader enforces, then divides it evenly, so a page never straddles
+// two blocks, and the first block always holds the whole 100-byte file
+// header. Tests lower it, while preserving that property, to cross block
+// boundaries cheaply.
 var streamBlockSize = 1 << 20
 
 // ErrNotWholeDatabase is wrapped by every StreamChecksum error that is a
 // verdict on the bytes themselves, rather than a failure to read or tee
 // them: a header that is too short for readDBHeader's 100-byte minimum, a
-// header whose magic or page size fails checkStreamHeader, or a file that
+// header whose magic or page size fails readDBHeader's check, or a file that
 // ends before its header's nPages*pageSize bytes. By the time it is
 // returned, the tee has already received the whole file.
 var ErrNotWholeDatabase = errors.New("ltxio: not a whole database")
 
 // dbHeaderMagic is the fixed byte string every valid SQLite database file
 // begins with, including the trailing NUL. Checking it is the cheapest real
-// test for "this is not a database at all"; StreamChecksum applies it
-// itself because readDBHeader does not.
+// test for "this is not a database at all"; readDBHeader applies it
+// (checkDBHeader) for every reader of a database header.
 var dbHeaderMagic = []byte("SQLite format 3\x00")
-
-// checkStreamHeader rejects a header that readDBHeader parsed syntactically
-// (any file of at least 100 bytes satisfies that parse; readDBHeader never
-// looks at the magic bytes, and treats every 16-bit value as a page size)
-// but that is not a legitimate SQLite database header: hdr's first 16 bytes
-// must equal dbHeaderMagic, and pageSize must be a power of two in [512,
-// 65536]. Without this check, a page size of 0 — which any all-zero header
-// produces — sends ltx.LockPgno(pageSize) into a division by zero below,
-// and any other out-of-range or non-power-of-two page size misaligns
-// StreamChecksum's per-block page fold against the page boundaries
-// ChecksumDatabase uses, producing either a wrong checksum with a nil error
-// or a false truncation error instead of a header verdict.
-//
-// hdr must hold at least 100 bytes, which readDBHeader already guarantees
-// whenever it returns a nil error, so indexing hdr[:16] here is always safe.
-func checkStreamHeader(hdr []byte, pageSize uint32) error {
-	if !bytes.Equal(hdr[:len(dbHeaderMagic)], dbHeaderMagic) {
-		return fmt.Errorf("header: missing the %q magic", dbHeaderMagic)
-	}
-	if pageSize < 512 || pageSize > 65536 || pageSize&(pageSize-1) != 0 {
-		return fmt.Errorf("header: page size %d is not a power of two in [512, 65536]", pageSize)
-	}
-	return nil
-}
 
 // StreamChecksum reads a SQLite database from r to EOF, in blocks of
 // streamBlockSize bytes, and returns its LTX rolling checksum, the same
@@ -267,7 +243,7 @@ func checkStreamHeader(hdr []byte, pageSize uint32) error {
 // The header check a block must pass before any page of it is folded is:
 // at least 100 bytes (readDBHeader's own minimum), the 16-byte
 // "SQLite format 3\x00" magic, and a page size that is a power of two in
-// [512, 65536] (checkStreamHeader). Failing any part of that, or a file
+// [512, 65536] (checkDBHeader). Failing any part of that, or a file
 // that ends before the header's nPages*pageSize bytes, is a verdict on the
 // bytes: StreamChecksum keeps draining r into tee regardless, and returns
 // the verdict wrapped in ErrNotWholeDatabase only once r is exhausted, so a
@@ -304,13 +280,17 @@ func StreamChecksum(r io.Reader, tee io.Writer) (uint64, error) {
 			headerRead = true
 			pageSize, nPages, headerErr = readDBHeader(bytes.NewReader(block))
 			if headerErr != nil {
-				// The only way readDBHeader fails on an in-memory block is a
-				// short one. Its message carries its own "ltxio: " prefix,
-				// which would repeat the one ErrNotWholeDatabase gives the
-				// wrapped verdict, so the verdict is restated here.
-				headerErr = fmt.Errorf("header: %d bytes, shorter than the %d-byte header", n, dbHeaderSize)
-			} else {
-				headerErr = checkStreamHeader(block, pageSize)
+				// readDBHeader fails on an in-memory block for a short
+				// block, or for a header checkDBHeader refuses. Its message
+				// carries its own "ltxio: " prefix, which would repeat the
+				// one ErrNotWholeDatabase gives the wrapped verdict, so the
+				// short case is restated and the check's own un-prefixed
+				// error (the one readDBHeader wrapped) is used for the rest.
+				if inner := errors.Unwrap(headerErr); inner != nil && !errors.Is(headerErr, io.ErrUnexpectedEOF) && !errors.Is(headerErr, io.EOF) {
+					headerErr = inner
+				} else {
+					headerErr = fmt.Errorf("header: %d bytes, shorter than the %d-byte header", n, dbHeaderSize)
+				}
 			}
 			if headerErr == nil {
 				lockPgno = ltx.LockPgno(pageSize)

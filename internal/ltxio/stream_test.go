@@ -154,7 +154,7 @@ func TestStreamChecksumTruncatedDatabase(t *testing.T) {
 // database of nPages pages of pageSize bytes each — the correct 16-byte
 // magic, pageSize and nPages encoded at their header offsets, and a file
 // length that genuinely matches nPages*pageSize — but whose page size is
-// one SQLite itself never produces. checkStreamHeader (the fix for C1)
+// one SQLite itself never produces. readDBHeader's check (checkDBHeader)
 // must reject this from the header alone, before StreamChecksum reads or
 // folds a single page; without that check the per-block fold misaligns
 // against pageSize and produces a wrong checksum or a false truncation
@@ -169,7 +169,7 @@ func buildOddHeaderDB(pageSize uint16, nPages uint32) []byte {
 
 // TestStreamChecksumNotADatabase: garbage, a too-short file, an empty file,
 // an all-zero file and a file whose header declares an invalid page size
-// all fail the header check — checkStreamHeader's magic or page-size test,
+// all fail the header check — readDBHeader's magic or page-size test,
 // or readDBHeader's own 100-byte minimum for the too-short and empty cases
 // — rather than being folded as if they were real pages or mistaken for a
 // truncated database. The tee holds exactly the bytes in every case. Run at
@@ -179,14 +179,14 @@ func buildOddHeaderDB(pageSize uint16, nPages uint32) []byte {
 func TestStreamChecksumNotADatabase(t *testing.T) {
 	cases := map[string][]byte{
 		// "not a database " (repeated) does not match the 16-byte SQLite
-		// magic, so this fails checkStreamHeader's magic check, not the
+		// magic, so this fails readDBHeader's magic check, not the
 		// truncation path a large decoded nPages might otherwise suggest.
 		"garbage": bytes.Repeat([]byte("not a database "), 40),
 		// 34 bytes: short of readDBHeader's own 100-byte minimum.
 		"short": []byte("SQLite format 3\x00 but far too short"),
 		"empty": nil,
 		// A 200-byte all-zero file decodes to page size 0 (C1): without
-		// checkStreamHeader this reaches ltx.LockPgno(0), a division by
+		// checkDBHeader this reaches ltx.LockPgno(0), a division by
 		// zero. It also fails the magic check on its own, independently.
 		"zero page size (all-zero file)": make([]byte, 200),
 		// The right magic, a file length that matches nPages*pageSize, but
