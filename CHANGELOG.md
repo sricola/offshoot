@@ -104,7 +104,16 @@ Pin an exact version if you depend on format stability. The full contract:
   v0.2.16, only a settled one) was trusted without it. BranchBench's
   single-worker `failure_repro` checkpoint p50 went from 60.8 / 60.5 /
   60.3 ms to 51.8 / 51.3 / 52.2 ms, alternating v0.2.18 with this change
-  run by run ([benchmarks](docs/benchmarks.md)).
+  run by run ([benchmarks](docs/benchmarks.md)). The page checksum is the
+  slower of the two digests, so `StreamChecksum` folds each block's pages
+  in two halves on two hashers at once (the rolling checksum is an XOR
+  fold, so the halves recombine in any order): the one pass over a 64 MiB
+  file in the page cache went from 32.4 to 24.5 ms by the medians of three
+  runs, against 22.1 ms for a SHA-256-only read of the same file
+  (`BenchmarkStreamChecksum`, `BenchmarkStreamChecksumSHAOnly`;
+  `TestStreamChecksumSplitFoldMatchesForEveryPageCount` pins the fold
+  against `ChecksumDatabase` for every page count from 1 to 40 with
+  16-page blocks).
 - **A shared child lineage reuses its recorded chain.** A lineage that
   still resolves through a base pointer (a fresh fork, or a shared
   `rollback` or `promote`) used to list its base lineage's epoch
