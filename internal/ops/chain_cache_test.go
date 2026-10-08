@@ -6,6 +6,7 @@ import (
 	"errors"
 	"os"
 	"reflect"
+	"strings"
 	"sync"
 	"testing"
 
@@ -380,4 +381,277 @@ func TestCheckpointStampRecordsChainOnlyWhenTrusted(t *testing.T) {
 			t.Fatalf("distrusted stamp recorded chain %q", rec.Chain)
 		}
 	})
+}
+
+// sharedChildSeed seeds app@main with a snapshot checkpoint "a" and a
+// segment checkpoint "b" (chainCacheSeed), forks app@child at main's head
+// (a shared child: base pointer at b's txid, zero own objects), checks it
+// out and returns the child's checkout path. The child's sidecar records no
+// chain yet: a checkout stamps through writeSum, which records none.
+func sharedChildSeed(t *testing.T, w *Workspace) string {
+	t.Helper()
+	chainCacheSeed(t, w)
+	if _, err := w.Fork("app", "main", "child", "", 0, nil); err != nil {
+		t.Fatal(err)
+	}
+	path, err := w.Checkout("app", "child")
+	if err != nil {
+		t.Fatal(err)
+	}
+	ref := refOf(t, w, "app", "child")
+	if ref.Base == nil {
+		t.Fatal("child has no base pointer; the fork materialized instead of sharing")
+	}
+	return path
+}
+
+// TestSharedChildSecondCheckpointUsesTheRecordedChain: a shared child's
+// first segment checkpoint resolves (its sidecar has no chain), records
+// the chain it built — main's snapshot and segment, then its own segment —
+// and the second checkpoint takes that record although its first keys
+// name main's lineage.
+func TestSharedChildSecondCheckpointUsesTheRecordedChain(t *testing.T) {
+	w := newWS(t)
+	path := sharedChildSeed(t, w)
+	sources := recordChainSources(t)
+
+	mustSQL(t, path, "INSERT INTO t (v) VALUES (randomblob(100));")
+	if res := mustCheckpointWith(t, w, "app", "child", "c1", CheckpointOptions{}); res.Kind != "segment" {
+		t.Fatalf("c1: kind %q, want segment", res.Kind)
+	}
+	assertSources(t, "first child checkpoint", sources(), "resolve")
+	members := assertCachedChainIsResolved(t, w, path, "app", "child")
+	child := refOf(t, w, "app", "child")
+	if !strings.HasPrefix(members[0].Key, store.LineagePrefix(child.Base.Lineage)) {
+		t.Fatalf("recorded chain does not begin on the base lineage: %s", members[0].Key)
+	}
+
+	mustSQL(t, path, "INSERT INTO t (v) VALUES (randomblob(100));")
+	if res := mustCheckpointWith(t, w, "app", "child", "c2", CheckpointOptions{}); res.Kind != "segment" {
+		t.Fatalf("c2: kind %q, want segment", res.Kind)
+	}
+	assertSources(t, "second child checkpoint", sources(), "cache")
+	assertCachedChainIsResolved(t, w, path, "app", "child")
+	assertHeadIsCheckout(t, w, "app", "child", "c2", path)
+}
+
+// TestSharedChildAfterOwnSnapshotUsesOwnChain: once the child writes its
+// own snapshot (CheckpointOptions{Snapshot: true}), the record is the
+// single-lineage shape again and is taken as before.
+func TestSharedChildAfterOwnSnapshotUsesOwnChain(t *testing.T) {
+	w := newWS(t)
+	path := sharedChildSeed(t, w)
+	mustSQL(t, path, "INSERT INTO t (v) VALUES (randomblob(100));")
+	if res := mustCheckpointWith(t, w, "app", "child", "s", CheckpointOptions{Snapshot: true}); res.Kind != "snapshot" {
+		t.Fatalf("s: kind %q, want snapshot", res.Kind)
+	}
+	sources := recordChainSources(t)
+	mustSQL(t, path, "INSERT INTO t (v) VALUES (randomblob(100));")
+	if res := mustCheckpointWith(t, w, "app", "child", "c", CheckpointOptions{}); res.Kind != "segment" {
+		t.Fatalf("c: kind %q, want segment", res.Kind)
+	}
+	assertSources(t, "checkpoint after own snapshot", sources(), "cache")
+	members := assertCachedChainIsResolved(t, w, path, "app", "child")
+	child := refOf(t, w, "app", "child")
+	for _, m := range members {
+		if !strings.HasPrefix(m.Key, store.LineagePrefix(child.Lineage)) {
+			t.Fatalf("chain after an own snapshot still names another lineage: %s", m.Key)
+		}
+	}
+	assertHeadIsCheckout(t, w, "app", "child", "c", path)
+}
+
+// TestPassThroughSpineUsesTheRecordedChain: a fork of a shared child that
+// has not diverged (grandchild forked at child's head, child's head still
+// at the seam). The fork collapses the base (store.CollapseBase names the
+// nearest lineage that owns the seam txid), so the grandchild's base
+// pointer names main directly, not the pass-through child: the spine is
+// one hop, pinned below. After the grandchild's first checkpoint its
+// record spans main's keys then its own, with the child contributing
+// none, and the second checkpoint takes it.
+func TestPassThroughSpineUsesTheRecordedChain(t *testing.T) {
+	w := newWS(t)
+	sharedChildSeed(t, w)
+	if _, err := w.Fork("app", "child", "grandchild", "", 0, nil); err != nil {
+		t.Fatal(err)
+	}
+	main, gcRef := refOf(t, w, "app", "main"), refOf(t, w, "app", "grandchild")
+	if gcRef.Base == nil || gcRef.Base.Lineage != main.Lineage {
+		t.Fatalf("grandchild base %+v, want main's lineage %s (collapsed past the pass-through child)", gcRef.Base, main.Lineage)
+	}
+	path, err := w.Checkout("app", "grandchild")
+	if err != nil {
+		t.Fatal(err)
+	}
+	sources := recordChainSources(t)
+	mustSQL(t, path, "INSERT INTO t (v) VALUES (randomblob(100));")
+	mustCheckpointWith(t, w, "app", "grandchild", "g1", CheckpointOptions{})
+	assertSources(t, "first grandchild checkpoint", sources(), "resolve")
+	mustSQL(t, path, "INSERT INTO t (v) VALUES (randomblob(100));")
+	if res := mustCheckpointWith(t, w, "app", "grandchild", "g2", CheckpointOptions{}); res.Kind != "segment" {
+		t.Fatalf("g2: kind %q, want segment", res.Kind)
+	}
+	assertSources(t, "second grandchild checkpoint", sources(), "cache")
+	assertCachedChainIsResolved(t, w, path, "app", "grandchild")
+	assertHeadIsCheckout(t, w, "app", "grandchild", "g2", path)
+}
+
+// TestSharedChildCacheSurvivesBaseDestroyAndGC: with the base branch
+// destroyed and GC run twice, the ancestor members the child's record names
+// are still reachable through the child's own resolution, so the cache
+// keeps hitting and the content is intact.
+func TestSharedChildCacheSurvivesBaseDestroyAndGC(t *testing.T) {
+	w := newWS(t)
+	path := sharedChildSeed(t, w)
+	mustSQL(t, path, "INSERT INTO t (v) VALUES (randomblob(100));")
+	mustCheckpointWith(t, w, "app", "child", "c1", CheckpointOptions{})
+	if err := w.Destroy("app", "main", true); err != nil {
+		t.Fatal(err)
+	}
+	for i := 0; i < 2; i++ {
+		if _, _, err := w.GC(0); err != nil {
+			t.Fatal(err)
+		}
+	}
+	sources := recordChainSources(t)
+	mustSQL(t, path, "INSERT INTO t (v) VALUES (randomblob(100));")
+	if res := mustCheckpointWith(t, w, "app", "child", "c2", CheckpointOptions{}); res.Kind != "segment" {
+		t.Fatalf("c2: kind %q, want segment", res.Kind)
+	}
+	assertSources(t, "child checkpoint after base destroy + GC", sources(), "cache")
+	assertCachedChainIsResolved(t, w, path, "app", "child")
+	assertHeadIsCheckout(t, w, "app", "child", "c2", path)
+}
+
+// TestSharedChildCorruptSeamResolves: a record whose seam does not match
+// ref.Base is rejected and the checkpoint resolves instead. Three
+// corruptions: the suffix starts one past the seam (a hole), the prefix
+// ends one before the seam (the ancestor half is short), and an own key
+// moved in front of a foreign one (interleaved).
+func TestSharedChildCorruptSeamResolves(t *testing.T) {
+	cases := []struct {
+		name string
+		edit func(child store.Ref, chain []string) []string
+	}{
+		{"suffix starts past the seam", func(child store.Ref, chain []string) []string {
+			i := len(chain) - 1 // the child's own segment
+			m, _ := store.ParseMemberKey(chain[i])
+			chain[i] = store.SegmentKey(child.Lineage, m.Epoch, m.MinTXID+1, m.MaxTXID)
+			return chain
+		}},
+		{"prefix ends before the seam", func(child store.Ref, chain []string) []string {
+			i := len(chain) - 2 // main's segment, which ends at the seam
+			m, _ := store.ParseMemberKey(chain[i])
+			chain[i] = store.SegmentKey(child.Base.Lineage, m.Epoch, m.MinTXID, m.MaxTXID-1)
+			return chain
+		}},
+		{"interleaved", func(child store.Ref, chain []string) []string {
+			n := len(chain)
+			chain[n-1], chain[n-2] = chain[n-2], chain[n-1]
+			return chain
+		}},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			w := newWS(t)
+			path := sharedChildSeed(t, w)
+			mustSQL(t, path, "INSERT INTO t (v) VALUES (randomblob(100));")
+			mustCheckpointWith(t, w, "app", "child", "c1", CheckpointOptions{})
+			child := refOf(t, w, "app", "child")
+			editSidecar(t, path, func(m map[string]any) {
+				raw := m["chain"].([]any)
+				chain := make([]string, len(raw))
+				for i, k := range raw {
+					chain[i] = k.(string)
+				}
+				chain = tc.edit(child, chain)
+				out := make([]any, len(chain))
+				for i, k := range chain {
+					out[i] = k
+				}
+				m["chain"] = out
+			})
+			if _, ok := w.cachedChain(path, child); ok {
+				t.Fatal("cachedChain accepted a record whose seam does not match ref.Base")
+			}
+			sources := recordChainSources(t)
+			mustSQL(t, path, "INSERT INTO t (v) VALUES (randomblob(100));")
+			mustCheckpointWith(t, w, "app", "child", "c2", CheckpointOptions{})
+			assertSources(t, "checkpoint over a corrupt seam", sources(), "resolve")
+			assertHeadIsCheckout(t, w, "app", "child", "c2", path)
+		})
+	}
+}
+
+// TestForeignKeysWithoutBaseResolve: a record with foreign keys on a ref
+// that has no base pointer is rejected, as today.
+func TestForeignKeysWithoutBaseResolve(t *testing.T) {
+	w := newWS(t)
+	path := sharedChildSeed(t, w)
+	mustSQL(t, path, "INSERT INTO t (v) VALUES (randomblob(100));")
+	mustCheckpointWith(t, w, "app", "child", "c1", CheckpointOptions{})
+	child := refOf(t, w, "app", "child")
+	child.Base = nil
+	if _, ok := w.cachedChain(path, child); ok {
+		t.Fatal("cachedChain accepted foreign keys on a ref without a base pointer")
+	}
+}
+
+// TestForkOfSharedChildAtHeadUsesTheRecordedChain: a fork at a shared
+// child's head takes the child's record for its share/materialize
+// decision instead of listing two lineages.
+func TestForkOfSharedChildAtHeadUsesTheRecordedChain(t *testing.T) {
+	w := newWS(t)
+	path := sharedChildSeed(t, w)
+	mustSQL(t, path, "INSERT INTO t (v) VALUES (randomblob(100));")
+	mustCheckpointWith(t, w, "app", "child", "c1", CheckpointOptions{})
+	sources := recordChainSources(t)
+	if _, err := w.Fork("app", "child", "grandchild", "", 0, nil); err != nil {
+		t.Fatal(err)
+	}
+	assertSources(t, "fork at a shared child's head", sources(), "cache")
+	gc := refOf(t, w, "app", "grandchild")
+	if gc.Base == nil {
+		t.Fatal("grandchild did not share")
+	}
+	assertHeadIsCheckout(t, w, "app", "grandchild", "fork", path)
+}
+
+// TestForkAfterOwnSnapshotFirstResolvesThenHits: a shared child that wrote
+// its own snapshot (its record's foreign run is empty) is forked again at
+// head; the grandchild shares the child's lineage, its first checkpoint
+// resolves (its checkout's sidecar records no chain) and its second takes
+// the record, whose foreign run is now the child's keys.
+func TestForkAfterOwnSnapshotFirstResolvesThenHits(t *testing.T) {
+	w := newWS(t)
+	path := sharedChildSeed(t, w)
+	mustSQL(t, path, "INSERT INTO t (v) VALUES (randomblob(100));")
+	if res := mustCheckpointWith(t, w, "app", "child", "s", CheckpointOptions{Snapshot: true}); res.Kind != "snapshot" {
+		t.Fatalf("s: kind %q, want snapshot", res.Kind)
+	}
+	if _, err := w.Fork("app", "child", "grandchild", "", 0, nil); err != nil {
+		t.Fatal(err)
+	}
+	child, gcRef := refOf(t, w, "app", "child"), refOf(t, w, "app", "grandchild")
+	if gcRef.Base == nil || gcRef.Base.Lineage != child.Lineage {
+		t.Fatalf("grandchild base %+v, want the child's lineage %s", gcRef.Base, child.Lineage)
+	}
+	gpath, err := w.Checkout("app", "grandchild")
+	if err != nil {
+		t.Fatal(err)
+	}
+	sources := recordChainSources(t)
+	mustSQL(t, gpath, "INSERT INTO t (v) VALUES (randomblob(100));")
+	mustCheckpointWith(t, w, "app", "grandchild", "g1", CheckpointOptions{})
+	assertSources(t, "first grandchild checkpoint", sources(), "resolve")
+	mustSQL(t, gpath, "INSERT INTO t (v) VALUES (randomblob(100));")
+	if res := mustCheckpointWith(t, w, "app", "grandchild", "g2", CheckpointOptions{}); res.Kind != "segment" {
+		t.Fatalf("g2: kind %q, want segment", res.Kind)
+	}
+	assertSources(t, "second grandchild checkpoint", sources(), "cache")
+	members := assertCachedChainIsResolved(t, w, gpath, "app", "grandchild")
+	if !strings.HasPrefix(members[0].Key, store.LineagePrefix(child.Lineage)) {
+		t.Fatalf("grandchild's record does not begin on the child's lineage: %s", members[0].Key)
+	}
+	assertHeadIsCheckout(t, w, "app", "grandchild", "g2", gpath)
 }

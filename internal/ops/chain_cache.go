@@ -25,7 +25,12 @@ var observeChainSource func(kind string)
 //   - the sidecar's identity (Lineage, Epoch, TXID) is the ref's head
 //     (Lineage, HeadEpoch, HeadTXID);
 //   - the recorded chain is non-empty, and every key parses as a member
-//     key (store.ParseMemberKey) under ref.Lineage's prefix;
+//     key (store.ParseMemberKey);
+//   - the keys are a run on other lineages (possibly empty) followed by a
+//     run under ref.Lineage's prefix (non-empty), never interleaved; when
+//     the first run is non-empty the ref has a base pointer, the first run
+//     ends at ref.Base.TXID and the second starts at ref.Base.TXID + 1 with
+//     a segment;
 //   - the first member is a snapshot, every later one is a segment that
 //     starts right after the previous member ends (MinTXID == previous
 //     MaxTXID + 1, so strictly ascending with no hole), and the last one
@@ -46,22 +51,63 @@ var observeChainSource func(kind string)
 // deletes a reachable member. A
 // sidecar from before this field (no chain), a distrusted stamp (which
 // records none), a materialize or a session's close (which record none)
-// all resolve. A chain that crosses into a base lineage is recorded but
-// never used here (its keys name another lineage), so a shared lineage
-// resolves until it writes its own snapshot.
+// all resolve.
+//
+// A shared child's chain begins with members on its base spine, below the
+// fork point, and those cannot change under an unchanged child head
+// either. A lineage's base pointer is immutable (written create-only) and
+// ref.Base mirrors it, so the seam a record was built against is the seam
+// the ref still names. No writer writes an object at a txid at or below a
+// lineage's head (a checkpoint writes at HeadTXID + 1, a session flushes
+// above the head, and a rollback, promote or compact mints a new lineage),
+// so no member below the seam is superseded after the fork. GC marks what
+// every ref's head resolves to, which for the child follows the same base
+// pointer to the same ancestor members, so destroying the base branch does
+// not delete them while the child reaches them. A spine of several hops
+// obeys the same facts per hop, so the first run may span several
+// lineages and the check does not need to know which. What this does not
+// prove is that the first run's keys name lineages on this child's spine:
+// the sidecar's keys are trusted structurally, as they are for a single
+// lineage, because the sidecar is a local file in the checkout's own
+// directory, the same trust domain as the checkout itself.
 func (w *Workspace) cachedChain(path string, ref store.Ref) ([]store.ChainMember, bool) {
 	rec, ok := readSidecar(path)
 	if !ok || rec.Lineage != ref.Lineage || rec.Epoch != ref.HeadEpoch || rec.TXID != ref.HeadTXID || len(rec.Chain) == 0 {
 		return nil, false
 	}
-	prefix := store.LineagePrefix(ref.Lineage)
+	own := store.LineagePrefix(ref.Lineage)
 	members := make([]store.ChainMember, 0, len(rec.Chain))
-	for _, key := range rec.Chain {
+	// seam is the index of the first key under ref.Lineage: every key
+	// before it is on another lineage (the base spine), every key from it
+	// on is the lineage's own.
+	seam := -1
+	for i, key := range rec.Chain {
 		m, ok := store.ParseMemberKey(key)
-		if !ok || !strings.HasPrefix(key, prefix) {
+		if !ok {
 			return nil, false
 		}
+		if strings.HasPrefix(key, own) {
+			if seam < 0 {
+				seam = i
+			}
+		} else if seam >= 0 {
+			return nil, false // an ancestor key after an own key is never a chain
+		}
 		members = append(members, m)
+	}
+	if seam < 0 {
+		return nil, false // no own key: nothing this head wrote
+	}
+	if seam > 0 {
+		// A shared child: the first run is the base spine's half of the
+		// chain and must end exactly at the fork point the ref names, with
+		// the lineage's own half starting right after it.
+		if ref.Base == nil || members[seam-1].MaxTXID != ref.Base.TXID || members[seam].MinTXID != ref.Base.TXID+1 {
+			return nil, false
+		}
+		if members[seam].Snapshot {
+			return nil, false // an own snapshot never follows ancestor keys
+		}
 	}
 	if !members[0].Snapshot || members[len(members)-1].MaxTXID != ref.HeadTXID || members[len(members)-1].Epoch != ref.HeadEpoch {
 		return nil, false
