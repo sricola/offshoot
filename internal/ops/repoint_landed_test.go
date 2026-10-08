@@ -549,3 +549,181 @@ func TestForkMaterializeOntoTakenNameWritesNothing(t *testing.T) {
 		t.Fatalf("the existing branch changed: before %+v, after %+v", before, after)
 	}
 }
+
+// TestForkMaterializeOntoFreeNameReadsRefOnce: the pre-check of a fork
+// that would copy a snapshot probes the destination ref key directly, so
+// a free name costs exactly one GET and no LIST of the database's refs.
+func TestForkMaterializeOntoFreeNameReadsRefOnce(t *testing.T) {
+	w := newWS(t)
+	chainCacheSeed(t, w)
+	prevMat := forkMaterializeForTest
+	forkMaterializeForTest = true
+	t.Cleanup(func() { forkMaterializeForTest = prevMat })
+	real := w.Store.B
+	counter := newRPCCountBackend(real)
+	w.Store.B = counter
+	_, err := w.Fork("app", "main", "child", "", 0, nil)
+	w.Store.B = real
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got := counter.getCount(store.RefKey("app", "child")); got != 1 {
+		t.Fatalf("a materialized fork onto a free name read its ref %d times, want 1", got)
+	}
+	counter.mu.Lock()
+	defer counter.mu.Unlock()
+	for prefix, n := range counter.lists {
+		if strings.HasPrefix(prefix, "refs/") {
+			t.Fatalf("a materialized fork onto a free name listed %s %d times, want none", prefix, n)
+		}
+	}
+}
+
+// TestCreateLandedWriteKeepsSnapshotAndIsReadable: a create whose
+// create-only ref write landed but reported a failure succeeds, keeps the
+// database's snapshot, and main materializes.
+func TestCreateLandedWriteKeepsSnapshotAndIsReadable(t *testing.T) {
+	for name, perr := range landedErrors {
+		t.Run(name, func(t *testing.T) {
+			w := newWS(t)
+			real := w.Store.B
+			w.Store.B = &landsThenFails{Backend: real, match: refPutOf("app", "main"), err: perr}
+			err := w.Create("app")
+			w.Store.B = real
+			if err != nil {
+				t.Fatalf("create whose ref write landed returned %v", err)
+			}
+			ref := refOf(t, w, "app", "main")
+			if _, _, err := w.Store.B.Get(store.SnapshotKey(ref.Lineage, 1, 1)); err != nil {
+				t.Fatalf("the landed create's snapshot was deleted: %v", err)
+			}
+			if _, err := w.Checkout("app", "main"); err != nil {
+				t.Fatalf("checkout of the landed create: %v", err)
+			}
+		})
+	}
+}
+
+// TestCreateOntoTakenNameLeavesSnapshotForGC: a second create of the same
+// database returns the existing error, leaves the existing database
+// untouched, and leaves its own snapshot for GC, which reclaims it.
+func TestCreateOntoTakenNameLeavesSnapshotForGC(t *testing.T) {
+	w := newWS(t)
+	if err := w.Create("app"); err != nil {
+		t.Fatal(err)
+	}
+	before := refOf(t, w, "app", "main")
+	keys := dataKeys(t, w)
+	err := w.Create("app")
+	if err == nil || err.Error() != `ops: database "app" already exists (offshoot status lists databases)` {
+		t.Fatalf("second create: err = %v, want the already-exists error", err)
+	}
+	seen := map[string]bool{}
+	for _, k := range keys {
+		seen[k] = true
+	}
+	var orphans []string
+	for _, k := range dataKeys(t, w) {
+		if !seen[k] {
+			orphans = append(orphans, k)
+		}
+	}
+	if len(orphans) != 1 || !strings.HasSuffix(orphans[0], "/1/snapshot-0000000000000001.ltx") {
+		t.Fatalf("the losing create left %v, want its one snapshot", orphans)
+	}
+	if after := refOf(t, w, "app", "main"); !reflect.DeepEqual(after, before) {
+		t.Fatalf("the existing database changed: before %+v, after %+v", before, after)
+	}
+	gcTwice(t, w)
+	if _, _, err := w.Store.B.Get(orphans[0]); !errors.Is(err, store.ErrNotFound) {
+		t.Fatalf("orphan snapshot %s not reclaimed by GC: %v", orphans[0], err)
+	}
+	if _, _, err := w.Store.B.Get(store.SnapshotKey(before.Lineage, 1, 1)); err != nil {
+		t.Fatalf("GC removed the existing database's snapshot: %v", err)
+	}
+	if _, err := w.Checkout("app", "main"); err != nil {
+		t.Fatalf("checkout of the existing database: %v", err)
+	}
+}
+
+// TestPromoteLostToRefWriteRemovesObjects: a ref write that keeps the
+// target's lineage (a touch, as a flush or a lease renewal would write)
+// lands before the promote's write. The re-read finds the target still on
+// its old lineage, which proves the promote's write did not land, so the
+// new lineage's object is removed at once.
+func TestPromoteLostToRefWriteRemovesObjects(t *testing.T) {
+	for _, materialize := range []bool{false, true} {
+		t.Run(fmt.Sprintf("materialize=%v", materialize), func(t *testing.T) {
+			w := newWS(t)
+			path := sharedChildSeed(t, w)
+			mustSQL(t, path, "INSERT INTO t (v) VALUES (randomblob(100));")
+			mustCheckpointWith(t, w, "app", "child", "c1", CheckpointOptions{})
+			txid := refOf(t, w, "app", "child").Checkpoints["c1"].TXID
+			before := refOf(t, w, "app", "main")
+			var minted string
+			prevNew := observeNewLineage
+			observeNewLineage = func(id string) { minted = id }
+			t.Cleanup(func() { observeNewLineage = prevNew })
+			var key string
+			real := w.Store.B
+			w.Store.B = &runBeforeRefPut{Backend: real, refKey: store.RefKey("app", "main"), run: func() {
+				key = newLineageObject(w, minted, txid)
+				r, etag, err := w.Store.GetRef("app", "main")
+				if err != nil {
+					t.Errorf("rival read: %v", err)
+					return
+				}
+				r.Touch(time.Now().Add(time.Second))
+				if _, err := w.Store.PutRef("app", "main", r, etag); err != nil {
+					t.Errorf("rival touch: %v", err)
+				}
+			}}
+			_, err := w.PromoteWith("app", "child", "main", PromoteOptions{NoBackup: true, Force: true, Materialize: materialize})
+			w.Store.B = real
+			if err == nil || !strings.Contains(err.Error(), "promote lost a race (retry)") || !errors.Is(err, store.ErrCAS) {
+				t.Fatalf("promote that lost to a touch: err = %v, want the lost-race error", err)
+			}
+			if minted == "" || key == "" {
+				t.Fatal("precondition: the promote minted no lineage before its ref write")
+			}
+			if _, _, err := w.Store.B.Get(key); !errors.Is(err, store.ErrNotFound) {
+				t.Fatalf("%s not removed although the target stayed on its old lineage: %v", key, err)
+			}
+			if got := refOf(t, w, "app", "main").Lineage; got != before.Lineage {
+				t.Fatalf("main moved to %s, want %s", got, before.Lineage)
+			}
+		})
+	}
+}
+
+// TestPromoteSettleUnknownKeepsObjects: when the target's ref cannot be
+// re-read after the promote's failed write, the promote says the write may
+// have landed, names the kept lineage, wraps the write's error, and keeps
+// the new lineage's object; here the write did land, so the target names
+// the new lineage.
+func TestPromoteSettleUnknownKeepsObjects(t *testing.T) {
+	w := newWS(t)
+	path := sharedChildSeed(t, w)
+	mustSQL(t, path, "INSERT INTO t (v) VALUES (randomblob(100));")
+	mustCheckpointWith(t, w, "app", "child", "c1", CheckpointOptions{})
+	txid := refOf(t, w, "app", "child").Checkpoints["c1"].TXID
+	real := w.Store.B
+	inner := &landsThenFails{Backend: real, match: refPutOf("app", "main"), err: store.ErrCAS}
+	w.Store.B = &failingGetAfterPut{landsThenFails: inner, refKey: store.RefKey("app", "main")}
+	var minted string
+	prevNew := observeNewLineage
+	observeNewLineage = func(id string) { minted = id }
+	t.Cleanup(func() { observeNewLineage = prevNew })
+	_, err := w.PromoteWith("app", "child", "main", PromoteOptions{NoBackup: true, Force: true})
+	w.Store.B = real
+	if err == nil || !strings.Contains(err.Error(), "may have landed") || minted == "" || !strings.Contains(err.Error(), minted) || !errors.Is(err, store.ErrCAS) || !strings.Contains(err.Error(), "offshoot status") {
+		t.Fatalf("promote with an unreadable ref after a failed write: err = %v, want the may-have-landed error naming %s", err, minted)
+	}
+	if _, _, err := w.Store.B.Get(newLineageObject(w, minted, txid)); err != nil {
+		t.Fatalf("the new lineage's object was deleted although the write's fate was unknown: %v", err)
+	}
+	if ref := refOf(t, w, "app", "main"); ref.Lineage != minted {
+		t.Fatalf("main names %s, want the landed lineage %s", ref.Lineage, minted)
+	}
+	assertHeadIsCheckout(t, w, "app", "main", "promote", path)
+}

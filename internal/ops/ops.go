@@ -91,7 +91,8 @@ const (
 // lineage is the fresh ID this call minted (store.NewLineageID), which
 // nothing else writes, so a ref naming it proves the write landed.
 // prevLineage is the lineage the ref named when the caller read it ("" for
-// Fork, whose create-only write has no previous ref). A ref still naming
+// Fork and Create, whose create-only writes have no previous ref). A ref
+// still naming
 // prevLineage proves the write did not land: had it landed, every later
 // conditional write would be built on the version naming lineage, and no
 // writer mints an old lineage again. That is the only verdict under which
@@ -103,12 +104,12 @@ const (
 // another writer may have forked the branch, leaving a base pointer into
 // the new lineage that a delete would break. A missing ref cannot be told
 // apart from "our fork landed, then the branch was destroyed", with a fork
-// of it taken in between. And for Fork, an existing ref naming another
-// lineage is the everyday "already exists", which is still unknown here,
-// since that ref could be a recreation of a branch our write created. The
-// cost of keeping is storage until GC, including after a genuine lost race
-// to another repoint and after Fork's "already exists"; the cost of a wrong
-// delete is an unreadable branch.
+// of it taken in between. And for Fork and Create, an existing ref naming
+// another lineage is the everyday "already exists", which is still unknown
+// here, since that ref could be a recreation of a branch our write
+// created. The cost of keeping is storage until GC, including after a
+// genuine lost race to another repoint and after Fork's or Create's
+// "already exists"; the cost of a wrong delete is an unreadable branch.
 //
 // err is non-nil only when the re-read itself failed: it wraps putErr,
 // names the lineage kept, and tells the user how to check the outcome. It
@@ -353,13 +354,23 @@ func (w *Workspace) createFromQuiesced(db, quiescedPath string) error {
 	}
 	ref.SetCheckpoint("init", store.Checkpoint{TXID: 1, Epoch: 1, CreatedAt: nowStamp(), Kind: "snapshot"})
 	if _, err := w.Store.PutRef(db, "main", ref, ""); err != nil {
-		// Freshly-minted lineage no rival can reference: safe to delete the
-		// orphaned snapshot (mirrors Fork's cleanup on the same failure).
-		w.bestEffortDelete(store.SnapshotKey(lineage, 1, 1))
-		if errors.Is(err, store.ErrCAS) {
-			return fmt.Errorf("ops: database %q already exists (offshoot status lists databases)", db)
+		// Settled exactly as Fork settles its create-only write: with no
+		// previous lineage, nothing proves the write did not land, so the
+		// snapshot is never deleted here. A ref naming the fresh lineage
+		// means the write landed and only its response was lost, so the
+		// create is done. Any other ref (the database already exists, or
+		// was recreated after our write), no ref, or a failed re-read
+		// leaves the snapshot for GC to reclaim (see settleRepoint).
+		verdict, serr := w.settleRepoint(db, "main", lineage, "", err)
+		if serr != nil {
+			return serr
 		}
-		return fmt.Errorf("ops: create %s: %w", db, err)
+		if verdict != repointLanded {
+			if errors.Is(err, store.ErrCAS) {
+				return fmt.Errorf("ops: database %q already exists (offshoot status lists databases)", db)
+			}
+			return fmt.Errorf("ops: create %s: %w", db, err)
+		}
 	}
 	return nil
 }
@@ -1471,7 +1482,10 @@ func (w *Workspace) forkWith(db, srcBranch, newBranch, at string, ttl time.Durat
 		// ref write's compare-and-swap stays the authority for a branch
 		// created after this read; this only avoids the common orphan. A
 		// shared fork skips the read: its orphan is one small base.json.
-		switch _, _, err := w.Store.GetRef(db, newBranch); {
+		// The read probes the ref key directly, not through GetRef, whose
+		// miss path lists the database's refs to describe the absence: a
+		// free name, the common case, costs exactly one GET.
+		switch _, _, err := w.Store.B.Get(store.RefKey(db, newBranch)); {
 		case err == nil:
 			return 0, fmt.Errorf("ops: branch %s@%s already exists (offshoot status lists branches)", db, newBranch)
 		case !errors.Is(err, store.ErrNotFound):
