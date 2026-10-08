@@ -595,8 +595,8 @@ func stampRaceCheckout(t *testing.T) (path string, fpEncode fingerprint, encSum 
 // stat that produced fpEncode, reproduced deterministically with
 // os.Chtimes instead of a 1 s-resolution filesystem. It asserts that the
 // live fingerprint still equals fpEncode afterwards, so a test that then
-// sees stampCheckpoint distrust the stamp knows the margin, not a
-// fingerprint mismatch, is what stopped the shortcut.
+// sees stampCheckpoint distrust the stamp knows the content check, not a
+// fingerprint mismatch, is what distrusted it.
 func overwriteSameSizeSameTick(t *testing.T, path string, fpEncode fingerprint) {
 	t.Helper()
 	fi, err := os.Stat(path)
@@ -624,26 +624,22 @@ func overwriteSameSizeSameTick(t *testing.T, path string, fpEncode fingerprint) 
 	}
 }
 
-// TestStampCheckpointDistrustsSameTickWriteWithinMargin pins the
-// racily-clean margin on stampCheckpoint's matching-fingerprint shortcut:
-// fpEncode was taken at an instant (encodeNS) no older than its own mtime —
-// the same coarse mtime tick — and a foreign same-size write then changed
-// the content and left the fingerprint identical. The store holds the
-// bytes that were encoded (headSum == encSum), the checkout does not, and
-// the stamp must say so: trusted=false, untrustedHash, no checksum. Before
-// the margin was applied here, fp == fpEncode alone was enough to stamp
-// encSum against bytes it does not describe.
-func TestStampCheckpointDistrustsSameTickWriteWithinMargin(t *testing.T) {
+// TestStampCheckpointDistrustsSameTickWrite: a foreign same-size write that
+// leaves the fingerprint identical to the one the encode saw changes the
+// content, and the stamp verifies content on every call, so it is
+// distrusted: untrustedHash, no checksum, no fingerprint. Before v0.2.16 a
+// matching fingerprint alone was trusted; v0.2.16 hashed a second time
+// inside a 1 s margin; now the one hash the stamp always makes decides.
+func TestStampCheckpointDistrustsSameTickWrite(t *testing.T) {
 	path, fpEncode, encSum := stampRaceCheckout(t)
-	encodeNS := fpEncode.mtimeNS
 	overwriteSameSizeSameTick(t, path, fpEncode)
 
-	trusted, err := stampCheckpoint(path, "lin", 1, 2, encSum, true, encSum, fpEncode, encodeNS, true, nil)
+	trusted, err := stampCheckpoint(path, "lin", 1, 2, encSum, true, nil)
 	if err != nil {
 		t.Fatal(err)
 	}
 	if trusted {
-		t.Fatal("stamp trusted: a same-size write inside the encode fingerprint's mtime tick was stamped as the store's content")
+		t.Fatal("stamp trusted: a same-size write that kept the fingerprint was stamped as the store's content")
 	}
 	rec, ok := readSidecar(path)
 	if !ok {
@@ -654,52 +650,23 @@ func TestStampCheckpointDistrustsSameTickWriteWithinMargin(t *testing.T) {
 	}
 }
 
-// TestStampCheckpointShortcutTakenOnceSettled proves the fast path is not
-// lost: with encodeNS a comfortable fingerprintSafetyMargin past fpEncode's
-// mtime and the content unchanged, stampCheckpoint trusts encSum without
-// hashing the database. encSum and headSum are a sentinel that no hash of
-// the file equals, so only the shortcut can produce trusted=true here —
-// the ChecksumDatabase fallback would compute the real checksum, find it
-// differs from headSum, and distrust the stamp.
-func TestStampCheckpointShortcutTakenOnceSettled(t *testing.T) {
+// TestStampCheckpointTrustsUnchangedContentInOnePass: unchanged content is
+// stamped trusted with the real hash, fingerprint and checksum, and the
+// stamp read the file once: fileSum's hook fires once, because the LTX
+// checksum came from the same read.
+func TestStampCheckpointTrustsUnchangedContentInOnePass(t *testing.T) {
 	path, fpEncode, encSum := stampRaceCheckout(t)
-	encodeNS := fpEncode.mtimeNS + int64(2*time.Second)
-	sentinel := encSum ^ 0xDEADBEEF
-	if sentinel == 0 {
-		sentinel = 1
-	}
+	n := countFileSum(t)
 
-	trusted, err := stampCheckpoint(path, "lin", 1, 2, sentinel, true, sentinel, fpEncode, encodeNS, true, nil)
+	trusted, err := stampCheckpoint(path, "lin", 1, 2, encSum, true, nil)
 	if err != nil {
 		t.Fatal(err)
 	}
 	if !trusted {
-		t.Fatal("stamp distrusted with a settled, matching encode fingerprint: the shortcut was not taken")
+		t.Fatal("stamp distrusted for unchanged content")
 	}
-	rec, ok := readSidecar(path)
-	if !ok {
-		t.Fatal("no sidecar after the stamp")
-	}
-	if rec.PostApplyChecksum != sentinel || rec.Size != fpEncode.size || rec.ModTimeNS != fpEncode.mtimeNS {
-		t.Fatalf("sidecar checksum %016x size %d mtime %d, want %016x %d %d", rec.PostApplyChecksum, rec.Size, rec.ModTimeNS, sentinel, fpEncode.size, fpEncode.mtimeNS)
-	}
-}
-
-// TestStampCheckpointWithinMarginFallsBackToHashAndStillTrusts: when the
-// margin is not met but nothing actually wrote to the checkout, the
-// fallback costs one ChecksumDatabase pass and nothing else — the real
-// checksum equals headSum, so the stamp is trusted with the real hash,
-// fingerprint and checksum, exactly as the shortcut would have stamped it.
-func TestStampCheckpointWithinMarginFallsBackToHashAndStillTrusts(t *testing.T) {
-	path, fpEncode, encSum := stampRaceCheckout(t)
-	encodeNS := fpEncode.mtimeNS
-
-	trusted, err := stampCheckpoint(path, "lin", 1, 2, encSum, true, encSum, fpEncode, encodeNS, true, nil)
-	if err != nil {
-		t.Fatal(err)
-	}
-	if !trusted {
-		t.Fatal("stamp distrusted for unchanged content: the fallback hash should have matched headSum")
+	if got := n(); got != 1 {
+		t.Fatalf("the stamp hashed the checkout %d times, want 1", got)
 	}
 	rec, ok := readSidecar(path)
 	if !ok {
@@ -707,5 +674,45 @@ func TestStampCheckpointWithinMarginFallsBackToHashAndStillTrusts(t *testing.T) 
 	}
 	if rec.Hash == untrustedHash(2) || rec.PostApplyChecksum != encSum || rec.Size != fpEncode.size || rec.ModTimeNS != fpEncode.mtimeNS {
 		t.Fatalf("sidecar hash %q checksum %016x size %d mtime %d, want a real hash, %016x %d %d", rec.Hash, rec.PostApplyChecksum, rec.Size, rec.ModTimeNS, encSum, fpEncode.size, fpEncode.mtimeNS)
+	}
+}
+
+// TestStampCheckpointDistrustsNonEmptyWAL: with frames in the checkout's
+// WAL the main file's pages are not the database's content, so even when
+// those pages checksum to headSum the stamp is distrusted.
+func TestStampCheckpointDistrustsNonEmptyWAL(t *testing.T) {
+	path, _, encSum := stampRaceCheckout(t)
+	if err := os.WriteFile(path+"-wal", []byte("one frame's worth of not-yet-checkpointed bytes"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	trusted, err := stampCheckpoint(path, "lin", 1, 2, encSum, true, nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if trusted {
+		t.Fatal("stamp trusted with a non-empty WAL beside the checkout")
+	}
+	rec, ok := readSidecar(path)
+	if !ok || rec.Hash != untrustedHash(2) {
+		t.Fatalf("sidecar ok=%v hash %q, want %q", ok, rec.Hash, untrustedHash(2))
+	}
+}
+
+// TestStampCheckpointGarbageCheckoutHashesLikeFileSum: a checkout path
+// holding something that is not a database is distrusted, and the sidecar
+// the distrusted stamp writes carries untrustedHash, exactly as before; the
+// hash of the garbage is what checkoutState computes when it next hashes,
+// so this pins that stamping does not error on it.
+func TestStampCheckpointGarbageCheckoutHashesLikeFileSum(t *testing.T) {
+	path, _, encSum := stampRaceCheckout(t)
+	if err := os.WriteFile(path, []byte("not a database at all, and not 100 bytes"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	trusted, err := stampCheckpoint(path, "lin", 1, 2, encSum, true, nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if trusted {
+		t.Fatal("stamp trusted a checkout that is not a database")
 	}
 }

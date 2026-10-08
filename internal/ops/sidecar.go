@@ -417,65 +417,31 @@ func untrustedHash(txid uint64) string {
 // (only then may the caller refresh the shadow).
 //
 // headSum is the post-apply checksum of the content the store resolves the
-// head to (headKnown false when it could not be established), and encSum
-// the checksum of the bytes this checkpoint encoded, whose fingerprint
-// (taken right after quiesce, before the encode) is fpEncode (fpEncodeOK
-// false when that stat failed), read at wall-clock instant encodeNS. The
-// live checkout is hashed between two fingerprints as in writeSum; its
-// post-apply checksum is encSum when that fingerprint still equals
-// fpEncode AND fpEncode is settled (below), and otherwise
-// ltxio.ChecksumDatabase read under the same fingerprint.
-//
-// fpEncode is settled when its mtime is at least fingerprintSafetyMargin
-// older than encodeNS — the racily-clean guard (see
-// fingerprintSafetyMargin's doc comment), applied here to the encode
-// fingerprint exactly as fingerprintMatches applies it to a sidecar's. A
-// matching fingerprint is only evidence that nothing wrote to the checkout
-// between the encode and now if a write COULD NOT have left the fingerprint
-// unchanged: a checkout is WAL mode, where the change counter is not
-// evidence (see sumRecord's doc comment), so size and mtime alone carry
-// the match, and on a filesystem with coarse mtime resolution a foreign
-// same-size write landing in the same mtime tick as the stat that produced
-// fpEncode (the tick the quiesce itself wrote in) leaves fp == fpEncode
-// with the content changed. Taking the shortcut then would stamp encSum —
-// what the store holds — as the checksum of bytes it does not describe,
-// refresh the shadow from them, and leave checkoutState reading "clean"
-// for content that was never checkpointed. When the margin is not met the
-// shortcut is simply not taken: ChecksumDatabase hashes the live content
-// under its own fingerprint sandwich, which costs one pass over the file
-// and cannot be fooled by the tick.
-//
-// The stamp is trusted — the real hash, fingerprint and headSum — only
-// when the live checkout's checksum is known and equals headSum: the store
-// holds exactly what the checkout holds. Otherwise (an object replaced out
-// of band resolves the head, the checkout changed between the encode and
-// now, or either side is unknown) it records checksum 0 and untrustedHash
-// with no fingerprint, so checkoutState reads "modified" and the next
-// checkpoint writes a snapshot.
+// head to (headKnown false when it could not be established). The stamp
+// reads the live checkout once, between two fingerprints (sandwichedSums),
+// and computes from that one read both the sidecar's SHA-256 and the
+// database's LTX checksum. It is trusted — the real hash, fingerprint and
+// headSum — only when both fingerprints agree, the file parsed as a
+// complete database with an empty WAL beside it, and that live checksum
+// equals headSum: the store holds exactly what the checkout holds.
+// Otherwise (an object replaced out of band resolves the head, the
+// checkout changed since the encode, even by a same-size write that kept
+// its fingerprint, or either side is unknown) it records checksum 0 and
+// untrustedHash with no fingerprint, so checkoutState reads "modified" and
+// the next checkpoint writes a snapshot.
 //
 // chain (sumRecord.Chain) is the new head's chain as the checkpoint wrote
 // it. Only the trusted stamp records it: a distrusted one records none, so
 // the next checkpoint and a fork at head resolve the chain from the store.
 // Recording it changes nothing above: the hash, fingerprint and checksum
 // are stamped exactly as without it.
-func stampCheckpoint(path, lineage string, epoch, txid, headSum uint64, headKnown bool, encSum uint64, fpEncode fingerprint, encodeNS int64, fpEncodeOK bool, chain []string) (bool, error) {
-	sum, fp, beforeNS, ok, err := sandwichedSum(path)
+func stampCheckpoint(path, lineage string, epoch, txid, headSum uint64, headKnown bool, chain []string) (bool, error) {
+	sum, live, liveKnown, fp, beforeNS, ok, err := sandwichedSums(path)
 	if err != nil {
 		return false, err
 	}
-	if headKnown && ok {
-		settled := fpEncode.mtimeNS <= encodeNS-int64(fingerprintSafetyMargin)
-		liveSum, liveKnown := encSum, fpEncodeOK && settled && fp == fpEncode
-		if !liveKnown {
-			if c, cerr := ltxio.ChecksumDatabase(path); cerr == nil {
-				if fpAfter, ferr := stampFingerprint(path); ferr == nil && fpAfter == fp {
-					liveSum, liveKnown = c, true
-				}
-			}
-		}
-		if liveKnown && liveSum == headSum {
-			return true, stampSumWithFingerprint(path, sum, lineage, epoch, txid, headSum, "", fp, beforeNS, true, false, chain)
-		}
+	if headKnown && ok && liveKnown && live == headSum {
+		return true, stampSumWithFingerprint(path, sum, lineage, epoch, txid, headSum, "", fp, beforeNS, true, false, chain)
 	}
 	return false, StampSumHashOnly(path, untrustedHash(txid), lineage, epoch, txid, 0, "")
 }
@@ -496,6 +462,54 @@ func sandwichedSum(path string) (sum string, fp fingerprint, beforeNS int64, ok 
 		return sum, fpAfter, beforeNS, true, nil
 	}
 	return sum, fingerprint{}, 0, false, nil
+}
+
+// sandwichedSums is sandwichedSum with the live LTX checksum computed from
+// the same read: fileSum's SHA-256 and the database's rolling page checksum
+// (ltxio.StreamChecksum) both come from one pass over path between the two
+// fingerprint reads. liveKnown is false, and live meaningless, when the
+// file is not a well-formed database (StreamChecksum errors) or when a
+// non-empty WAL sits beside it, since then the main file's pages are not
+// the database's content. ok, fp and beforeNS are as in sandwichedSum.
+func sandwichedSums(path string) (sum string, live uint64, liveKnown bool, fp fingerprint, beforeNS int64, ok bool, err error) {
+	beforeNS = time.Now().UnixNano()
+	fpBefore, errBefore := stampFingerprint(path)
+	sum, live, liveKnown, err = fileSums(path)
+	if err != nil {
+		return "", 0, false, fingerprint{}, 0, false, err
+	}
+	if fi, serr := os.Stat(path + "-wal"); serr == nil && fi.Size() > 0 {
+		liveKnown = false
+	}
+	fpAfter, errAfter := stampFingerprint(path)
+	if errBefore == nil && errAfter == nil && fpBefore == fpAfter {
+		return sum, live, liveKnown, fpAfter, beforeNS, true, nil
+	}
+	return sum, live, liveKnown, fingerprint{}, 0, false, nil
+}
+
+// fileSums is fileSum with the LTX rolling checksum folded over the same
+// read (ltxio.StreamChecksum teeing into the SHA-256). sum is exactly what
+// fileSum returns for the file; liveKnown reports whether the file parsed
+// as a complete database, so live is its checksum.
+func fileSums(path string) (sum string, live uint64, liveKnown bool, err error) {
+	if observeFileSum != nil {
+		observeFileSum()
+	}
+	r, err := dbfile.Reader(path)
+	if err != nil {
+		return "", 0, false, err
+	}
+	defer r.Close()
+	h := sha256.New()
+	live, lerr := ltxio.StreamChecksum(r, h)
+	if lerr != nil && !errors.Is(lerr, ltxio.ErrNotWholeDatabase) {
+		// A read or tee error: h is incomplete and there is no sum to record.
+		return "", 0, false, lerr
+	}
+	// On ErrNotWholeDatabase the tee has the whole file, so sum is fileSum's
+	// value; the file is not a database whose checksum means anything.
+	return hex.EncodeToString(h.Sum(nil)), live, lerr == nil, nil
 }
 
 // checkoutState reports how the checkout at path relates to ref, and — only

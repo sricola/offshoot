@@ -8,7 +8,6 @@ import (
 	"reflect"
 	"sync"
 	"testing"
-	"time"
 
 	"github.com/sricola/offshoot/internal/store"
 )
@@ -362,8 +361,8 @@ func TestForkAtHeadUsesTheRecordedChain(t *testing.T) {
 func TestCheckpointStampRecordsChainOnlyWhenTrusted(t *testing.T) {
 	chain := []string{"data/lin/1/snapshot-0000000000000002.ltx"}
 	t.Run("trusted", func(t *testing.T) {
-		path, fpEncode, encSum := stampRaceCheckout(t)
-		trusted, err := stampCheckpoint(path, "lin", 1, 2, encSum, true, encSum, fpEncode, fpEncode.mtimeNS+int64(2*time.Second), true, chain)
+		path, _, encSum := stampRaceCheckout(t)
+		trusted, err := stampCheckpoint(path, "lin", 1, 2, encSum, true, chain)
 		if err != nil || !trusted {
 			t.Fatalf("trusted=%v err=%v, want a trusted stamp", trusted, err)
 		}
@@ -372,8 +371,8 @@ func TestCheckpointStampRecordsChainOnlyWhenTrusted(t *testing.T) {
 		}
 	})
 	t.Run("distrusted", func(t *testing.T) {
-		path, fpEncode, encSum := stampRaceCheckout(t)
-		trusted, err := stampCheckpoint(path, "lin", 1, 2, encSum^1, true, encSum, fpEncode, fpEncode.mtimeNS+int64(2*time.Second), true, chain)
+		path, _, encSum := stampRaceCheckout(t)
+		trusted, err := stampCheckpoint(path, "lin", 1, 2, encSum^1, true, chain)
 		if err != nil || trusted {
 			t.Fatalf("trusted=%v err=%v, want a distrusted stamp", trusted, err)
 		}

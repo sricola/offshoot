@@ -208,11 +208,11 @@ func ChecksumDatabase(dbPath string) (uint64, error) {
 }
 
 // streamBlockSize is the number of bytes StreamChecksum reads at a time. It
-// must stay a multiple of 65536 (and so, trivially, at least 100 bytes):
-// every valid SQLite page size (a power of two from 512 to 65536, the range
-// checkStreamHeader enforces below) then divides it evenly, so a page never
-// straddles two blocks, and the first block always holds the whole 100-byte
-// file header. Tests lower it, while preserving that property, to cross
+// must stay a positive multiple of 65536 (and so, trivially, at least 100
+// bytes): every valid SQLite page size (a power of two from 512 to 65536,
+// the range checkStreamHeader enforces below) then divides it evenly, so a
+// page never straddles two blocks, and the first block always holds the
+// whole 100-byte file header. Tests lower it, while preserving that property, to cross
 // block boundaries cheaply.
 var streamBlockSize = 1 << 20
 
@@ -222,7 +222,7 @@ var streamBlockSize = 1 << 20
 // header whose magic or page size fails checkStreamHeader, or a file that
 // ends before its header's nPages*pageSize bytes. By the time it is
 // returned, the tee has already received the whole file.
-var ErrNotWholeDatabase = errors.New("not a whole database")
+var ErrNotWholeDatabase = errors.New("ltxio: not a whole database")
 
 // dbHeaderMagic is the fixed byte string every valid SQLite database file
 // begins with, including the trailing NUL. Checking it is the cheapest real
@@ -301,7 +301,13 @@ func StreamChecksum(r io.Reader, tee io.Writer) (uint64, error) {
 		if !headerRead {
 			headerRead = true
 			pageSize, nPages, headerErr = readDBHeader(bytes.NewReader(block))
-			if headerErr == nil {
+			if headerErr != nil {
+				// The only way readDBHeader fails on an in-memory block is a
+				// short one. Its message carries its own "ltxio: " prefix,
+				// which would repeat the one ErrNotWholeDatabase gives the
+				// wrapped verdict, so the verdict is restated here.
+				headerErr = fmt.Errorf("header: %d bytes, shorter than the %d-byte header", n, dbHeaderSize)
+			} else {
 				headerErr = checkStreamHeader(block, pageSize)
 			}
 			if headerErr == nil {
