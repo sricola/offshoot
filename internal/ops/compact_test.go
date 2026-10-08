@@ -77,7 +77,11 @@ func TestCompactNonSharedBranchIsNoOp(t *testing.T) {
 // return the retry error — leaving the branch exactly as the winner left
 // it. The hook lands the same ref write session flush performs (GetRef,
 // advance HeadTXID, PutRef) rather than a full session, which package ops
-// cannot import (session imports ops).
+// cannot import (session imports ops). The cleanup is immediate because
+// the winner's write keeps the branch's lineage: settleRepoint's re-read
+// finds the ref still on the old lineage, which proves Compact's write did
+// not land. A winner that repoints the branch to another lineage would
+// instead leave the orphan for GC (TestRollbackLostRaceLeavesObjectsForGC).
 func TestCompactCASRaceCleansOrphan(t *testing.T) {
 	w := newWS(t)
 	if err := w.Create("app"); err != nil {

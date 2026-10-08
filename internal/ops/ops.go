@@ -66,26 +66,67 @@ func (w *Workspace) bestEffortDelete(key string) {
 	}
 }
 
+// repointVerdict is what settleRepoint learned about a repoint's ref
+// write that returned an error.
+type repointVerdict int
+
+const (
+	// repointNotLanded: the ref still names the lineage it named before the
+	// write, so the write did not land and the new lineage's objects are
+	// the caller's to delete.
+	repointNotLanded repointVerdict = iota
+	// repointLanded: the ref names the fresh lineage, so the write landed
+	// and only its response was lost.
+	repointLanded
+	// repointUnknown: the ref names neither, or is gone, or could not be
+	// read. The caller keeps the new lineage's objects for GC to reclaim.
+	repointUnknown
+)
+
 // settleRepoint settles a repoint's ref write for db@branch that returned
 // putErr, by re-reading the ref. A failed write can still have landed: the
 // S3 SDK's retry answering 412 to its own first attempt that landed
-// (reported as ErrCAS), or a timeout that lost the response. lineage is the
-// fresh ID this call minted (store.NewLineageID), which nothing else writes,
-// so a ref naming it proves the write landed; a ref naming any other
-// lineage, or no ref at all (the branch was never created, or was destroyed
-// since), proves it did not. When the re-read fails, the fate of the write
-// is unknown: the caller must keep the lineage's objects (GC reclaims them
-// if no ref ever names the lineage) and return the error, which says so.
-// It costs one GetRef, and only on the error path.
-func (w *Workspace) settleRepoint(db, branch, lineage string, putErr error) (landed bool, err error) {
+// (reported as ErrCAS), or a timeout that lost the response.
+//
+// lineage is the fresh ID this call minted (store.NewLineageID), which
+// nothing else writes, so a ref naming it proves the write landed.
+// prevLineage is the lineage the ref named when the caller read it ("" for
+// Fork, whose create-only write has no previous ref). A ref still naming
+// prevLineage proves the write did not land: had it landed, every later
+// conditional write would be built on the version naming lineage, and no
+// writer mints an old lineage again. That is the only verdict under which
+// the caller deletes the new lineage's objects.
+//
+// Anything else is repointUnknown, and the caller keeps the objects for GC
+// to reclaim. A ref naming a third lineage cannot be told apart from "our
+// write landed, then the branch was repointed away", and in that window
+// another writer may have forked the branch, leaving a base pointer into
+// the new lineage that a delete would break. A missing ref cannot be told
+// apart from "our fork landed, then the branch was destroyed", with a fork
+// of it taken in between. And for Fork, an existing ref naming another
+// lineage is the everyday "already exists", which is still unknown here,
+// since that ref could be a recreation of a branch our write created. The
+// cost of keeping is storage until GC, including after a genuine lost race
+// to another repoint and after Fork's "already exists"; the cost of a wrong
+// delete is an unreadable branch.
+//
+// err is non-nil only when the re-read itself failed: it wraps putErr,
+// names the lineage kept, and tells the user how to check the outcome. It
+// costs one GetRef, and only on the error path.
+func (w *Workspace) settleRepoint(db, branch, lineage, prevLineage string, putErr error) (repointVerdict, error) {
 	ref, _, gerr := w.Store.GetRef(db, branch)
-	if gerr != nil {
-		if errors.Is(gerr, store.ErrNotFound) {
-			return false, nil
-		}
-		return false, fmt.Errorf("ops: %s@%s: the ref write failed (%v) and the ref could not be re-read (%v); the write may have landed, so lineage %s's objects were kept for GC to reclaim if it did not", db, branch, putErr, gerr, lineage)
+	switch {
+	case errors.Is(gerr, store.ErrNotFound):
+		return repointUnknown, nil
+	case gerr != nil:
+		return repointUnknown, fmt.Errorf("ops: %s@%s: the ref write failed (%w) and the ref could not be re-read (%v); the write may have landed, so lineage %s's objects were kept for GC to reclaim if it did not; run 'offshoot status' to see whether %s@%s names lineage %s before retrying", db, branch, putErr, gerr, lineage, db, branch, lineage)
+	case ref.Lineage == lineage:
+		return repointLanded, nil
+	case prevLineage != "" && ref.Lineage == prevLineage:
+		return repointNotLanded, nil
+	default:
+		return repointUnknown, nil
 	}
-	return ref.Lineage == lineage, nil
 }
 
 // Metadata caps (design spec § Metadata; Milestone 3 Global Constraints):
@@ -1439,20 +1480,16 @@ func (w *Workspace) forkWith(db, srcBranch, newBranch, at string, ttl time.Durat
 	child.Touch(time.Now())
 	child.SetCheckpoint("fork", store.Checkpoint{TXID: txid, Epoch: 1, CreatedAt: nowStamp()})
 	if _, err := w.Store.PutRef(db, newBranch, child, ""); err != nil {
-		landed, serr := w.settleRepoint(db, newBranch, childLineage, err)
+		verdict, serr := w.settleRepoint(db, newBranch, childLineage, "", err)
 		if serr != nil {
 			return 0, serr
 		}
-		if !landed {
-			// The re-read shows the write did not land: the branch already
-			// exists, or another writer won. Remove the orphan: the base
-			// object on the shared path (there is no snapshot to delete),
-			// the snapshot on the materialize path.
-			if base != nil {
-				w.bestEffortDelete(store.BaseKey(childLineage))
-			} else {
-				w.bestEffortDelete(store.SnapshotKey(childLineage, 1, txid))
-			}
+		if verdict != repointLanded {
+			// The branch already exists, or another writer won, or the
+			// fate of the write cannot be told from the ref: Fork has no
+			// previous lineage to prove it did not land, so the new
+			// lineage's base object or snapshot is left for GC to reclaim
+			// (see settleRepoint).
 			if errors.Is(err, store.ErrCAS) {
 				return 0, fmt.Errorf("ops: branch %s@%s already exists (offshoot status lists branches)", db, newBranch)
 			}
@@ -1503,7 +1540,8 @@ func (w *Workspace) shareBound() int {
 // bound resets the spine's depth to one. what names the caller in errors
 // ("fork db@branch"). On a failed ref write afterwards the caller removes
 // the orphan (BaseKey(lineage) when base != nil, else the copied snapshot)
-// only once settleRepoint's re-read shows the write did not land.
+// only when settleRepoint's re-read finds the ref still on the lineage it
+// named before the write; otherwise GC reclaims it.
 func (w *Workspace) newLineageAt(src store.Ref, cp store.Checkpoint, members []store.ChainMember, materialize bool, what string) (lineage string, base *store.BasePointer, fast bool, err error) {
 	if materialize || len(members) >= w.shareBound() {
 		lineage, fast, err = w.copySnapshotToNewLineageFromChain(src, cp, members)
@@ -1729,14 +1767,17 @@ func (w *Workspace) RollbackWith(db, branch, to string, opts RollbackOptions) (R
 	next.LeaseHolder, next.LeaseExpiry = "", ""
 	next.Touch(time.Now())
 	if _, err := w.Store.PutRef(db, branch, next, etag); err != nil {
-		landed, serr := w.settleRepoint(db, branch, lineage, err)
+		verdict, serr := w.settleRepoint(db, branch, lineage, ref.Lineage, err)
 		if serr != nil {
 			return RollbackResult{}, serr
 		}
-		if !landed {
-			// The re-read shows the write did not land: remove the new
-			// lineage's objects and report the lost race.
-			cleanup()
+		if verdict != repointLanded {
+			// The ref still naming the old lineage proves the write did not
+			// land: remove the new lineage's objects. Otherwise its fate is
+			// unknown and they are left for GC (see settleRepoint).
+			if verdict == repointNotLanded {
+				cleanup()
+			}
 			return RollbackResult{}, fmt.Errorf("ops: rollback lost a race (retry): %w", err)
 		}
 		// The write landed and only its response was lost: the branch has
@@ -1993,17 +2034,21 @@ func (w *Workspace) PromoteWith(db, source, target string, opts PromoteOptions) 
 	next.LeaseHolder, next.LeaseExpiry = "", ""
 	next.Touch(time.Now())
 	if _, err := w.Store.PutRef(db, target, next, tgtEtag); err != nil {
-		landed, serr := w.settleRepoint(db, target, lineage, err)
+		verdict, serr := w.settleRepoint(db, target, lineage, tgt.Lineage, err)
 		if serr != nil {
 			return PromoteResult{}, serr
 		}
-		if !landed {
-			// The re-read shows the write did not land: remove the new
-			// lineage's object and report the lost race.
-			if base != nil {
-				w.bestEffortDelete(store.BaseKey(lineage))
-			} else {
-				w.bestEffortDelete(store.SnapshotKey(lineage, 1, txid))
+		if verdict != repointLanded {
+			// The ref still naming the target's old lineage proves the
+			// write did not land: remove the new lineage's object.
+			// Otherwise its fate is unknown and the object is left for GC
+			// (see settleRepoint).
+			if verdict == repointNotLanded {
+				if base != nil {
+					w.bestEffortDelete(store.BaseKey(lineage))
+				} else {
+					w.bestEffortDelete(store.SnapshotKey(lineage, 1, txid))
+				}
 			}
 			return PromoteResult{}, fmt.Errorf("ops: promote lost a race (retry): %w", err)
 		}
@@ -2070,8 +2115,8 @@ var compactBeforeCASForTest func()
 //
 // The ref CAS is the point of no return, exactly as in Promote: a CAS
 // loss (a concurrent flush advanced the head) deletes the orphan snapshots
-// once settleRepoint's re-read shows the write did not land, and returns a
-// retry error — no internal retry loop, which would orphan
+// when settleRepoint's re-read finds the ref still on the old lineage
+// (otherwise GC reclaims them), and returns a retry error — no internal retry loop, which would orphan
 // a lineage per attempt. The checkout refresh that follows is best-effort
 // and reports partial success on failure, same as Promote.
 func (w *Workspace) Compact(db, branch string) (uint64, error) {
@@ -2169,14 +2214,17 @@ func (w *Workspace) CompactWith(db, branch string, opts CompactOptions) (uint64,
 		compactBeforeCASForTest()
 	}
 	if _, err := w.Store.PutRef(db, branch, next, etag); err != nil {
-		landed, serr := w.settleRepoint(db, branch, lineage, err)
+		verdict, serr := w.settleRepoint(db, branch, lineage, ref.Lineage, err)
 		if serr != nil {
 			return 0, serr
 		}
-		if !landed {
-			// The re-read shows the write did not land: remove the copies
-			// and report the lost race.
-			cleanup()
+		if verdict != repointLanded {
+			// The ref still naming the old lineage proves the write did not
+			// land: remove the copies. Otherwise their fate is unknown and
+			// they are left for GC (see settleRepoint).
+			if verdict == repointNotLanded {
+				cleanup()
+			}
 			return 0, fmt.Errorf("ops: compact lost a race (retry): %w", err)
 		}
 		// The write landed and only its response was lost: the branch has
