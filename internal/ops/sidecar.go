@@ -209,9 +209,9 @@ func StampSumHashOnly(path, hash, lineage string, epoch, txid, postApplyChecksum
 // and a fingerprint the caller already captured (fp, meaningful only when
 // ok) rather than one derived from a fresh stat of its own — the shared
 // writer behind StampSum (single stat, ok always true), StampSumHashOnly
-// (ok always false), and the sandwiched stamps in writeSum and
-// checkoutState (ok reflects whether a fingerprint taken just before
-// hashing still matched one taken just after). ok=false omits Size,
+// (ok always false), and the sandwiched stamps in writeSum,
+// checkoutState and stampCheckpoint (ok reflects whether a fingerprint
+// taken just before hashing still matched one taken just after). ok=false omits Size,
 // ModTimeNS and ChangeCounter from the record (StampedNS along with them),
 // exactly like a pre-fingerprint sidecar.
 //
@@ -467,10 +467,12 @@ func sandwichedSum(path string) (sum string, fp fingerprint, beforeNS int64, ok 
 // sandwichedSums is sandwichedSum with the live LTX checksum computed from
 // the same read: fileSum's SHA-256 and the database's rolling page checksum
 // (ltxio.StreamChecksum) both come from one pass over path between the two
-// fingerprint reads. liveKnown is false, and live meaningless, when the
-// file is not a well-formed database (StreamChecksum errors) or when a
-// non-empty WAL sits beside it, since then the main file's pages are not
-// the database's content. ok, fp and beforeNS are as in sandwichedSum.
+// fingerprint reads. liveKnown is false, and live meaningless, when
+// StreamChecksum's verdict is that the file is not a whole database
+// (ltxio.ErrNotWholeDatabase) or when a non-empty WAL sits beside it, since
+// then the main file's pages are not the database's content; any other
+// StreamChecksum error, a read error, is returned as err. ok, fp and
+// beforeNS are as in sandwichedSum.
 func sandwichedSums(path string) (sum string, live uint64, liveKnown bool, fp fingerprint, beforeNS int64, ok bool, err error) {
 	beforeNS = time.Now().UnixNano()
 	fpBefore, errBefore := stampFingerprint(path)

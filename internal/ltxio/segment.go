@@ -212,8 +212,8 @@ func ChecksumDatabase(dbPath string) (uint64, error) {
 // bytes): every valid SQLite page size (a power of two from 512 to 65536,
 // the range checkStreamHeader enforces below) then divides it evenly, so a
 // page never straddles two blocks, and the first block always holds the
-// whole 100-byte file header. Tests lower it, while preserving that property, to cross
-// block boundaries cheaply.
+// whole 100-byte file header. Tests lower it, while preserving that
+// property, to cross block boundaries cheaply.
 var streamBlockSize = 1 << 20
 
 // ErrNotWholeDatabase is wrapped by every StreamChecksum error that is a

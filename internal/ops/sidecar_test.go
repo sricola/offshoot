@@ -553,15 +553,16 @@ func TestSandwichedStampAnchorsStampedNSBeforeTheHash(t *testing.T) {
 // checkout, so the test can find the row's bytes in the file and change one
 // in place — a same-size write that keeps the file a valid database (the
 // header, page size and page count are untouched, which is all
-// ltxio.ChecksumDatabase reads before hashing the pages).
+// ltxio.ChecksumDatabase and ltxio.StreamChecksum read before hashing the
+// pages).
 var stampRaceBlob = bytes.Repeat([]byte{0xA5, 0x5A, 0xC3, 0x3C}, 16)
 
 // stampRaceCheckout materializes a WAL-mode checkout holding one
 // stampRaceBlob row and quiesces it, exactly as CheckpointWith leaves the
-// file before it takes fpEncode. It returns the path, the fingerprint
-// CheckpointWith would take as fpEncode, and the post-apply checksum of
-// exactly those bytes — the encSum the encode would compute, and the
-// headSum the store resolves the head to once that checkpoint wins its CAS.
+// file before it encodes. It returns the path, the fingerprint of the file
+// as the encode sees it (fpEncode), and the post-apply checksum of exactly
+// those bytes — the encSum the encode computes, and the headSum the store
+// resolves the head to once that checkpoint wins its CAS.
 func stampRaceCheckout(t *testing.T) (path string, fpEncode fingerprint, encSum uint64) {
 	t.Helper()
 	testutil.RequireSQLite3(t)
@@ -699,10 +700,11 @@ func TestStampCheckpointDistrustsNonEmptyWAL(t *testing.T) {
 }
 
 // TestStampCheckpointGarbageCheckoutHashesLikeFileSum: a checkout path
-// holding something that is not a database is distrusted, and the sidecar
-// the distrusted stamp writes carries untrustedHash, exactly as before; the
-// hash of the garbage is what checkoutState computes when it next hashes,
-// so this pins that stamping does not error on it.
+// holding something that is not a database is distrusted without an error,
+// and the sidecar the distrusted stamp writes carries untrustedHash. The
+// stamp's one read (fileSums) still hashes the garbage exactly as fileSum
+// does, which is what checkoutState computes when it next hashes, and
+// reports the live checksum unknown.
 func TestStampCheckpointGarbageCheckoutHashesLikeFileSum(t *testing.T) {
 	path, _, encSum := stampRaceCheckout(t)
 	if err := os.WriteFile(path, []byte("not a database at all, and not 100 bytes"), 0o644); err != nil {
@@ -714,5 +716,20 @@ func TestStampCheckpointGarbageCheckoutHashesLikeFileSum(t *testing.T) {
 	}
 	if trusted {
 		t.Fatal("stamp trusted a checkout that is not a database")
+	}
+	rec, ok := readSidecar(path)
+	if !ok || rec.Hash != untrustedHash(2) {
+		t.Fatalf("sidecar ok=%v hash %q, want %q", ok, rec.Hash, untrustedHash(2))
+	}
+	sum, _, liveKnown, err := fileSums(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	want, err := fileSum(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if sum != want || liveKnown {
+		t.Fatalf("fileSums = %q, liveKnown %v; want fileSum's %q and liveKnown false", sum, liveKnown, want)
 	}
 }
