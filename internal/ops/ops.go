@@ -1613,7 +1613,16 @@ func (w *Workspace) RollbackWith(db, branch, to string, opts RollbackOptions) (R
 		}
 	}
 
-	members, err := w.Store.Chain(ref.Lineage, txid)
+	// A rollback to the head's own checkpoint resolves the head, which the
+	// checkout's record serves (headChain); anywhere below, the lineage is
+	// listed. headChain falls back to Store.Chain when the checkout has no
+	// usable sidecar, so this introduces no new error path.
+	var members []store.ChainMember
+	if txid == ref.HeadTXID {
+		members, err = w.headChain(w.CheckoutPath(db, branch), ref)
+	} else {
+		members, err = w.Store.Chain(ref.Lineage, txid)
+	}
 	if err != nil {
 		return RollbackResult{}, fmt.Errorf("ops: resolving chain for lineage %s to txid %d: %w", ref.Lineage, txid, err)
 	}
@@ -1903,7 +1912,12 @@ func (w *Workspace) PromoteWith(db, source, target string, opts PromoteOptions) 
 	}
 	cp := headCheckpoint(src)
 	txid := cp.TXID
-	members, err := w.Store.Chain(src.Lineage, txid)
+	// Promote always resolves src's head, so the source checkout's record
+	// serves it exactly as it serves a fork at head (headChain, cachedChain).
+	// headChain falls back to Store.Chain when the checkout has no usable
+	// sidecar (a source branch that was never checked out), so this
+	// introduces no new error path.
+	members, err := w.headChain(w.CheckoutPath(db, source), src)
 	if err != nil {
 		return PromoteResult{}, fmt.Errorf("ops: resolving chain for lineage %s to txid %d: %w", src.Lineage, txid, err)
 	}

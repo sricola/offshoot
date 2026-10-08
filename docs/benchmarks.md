@@ -788,10 +788,17 @@ Seeding the 1,000 took about 25 s before and about 45 s after, the
 difference being the growing resolve inside each segment checkpoint plus
 the extra fsync. `compact` makes its result self-contained, so it truly
 starts fresh. `rollback` and `promote`, which share via a base pointer by
-default since v0.2.12, start a new lineage ID but keep resolving through
-the old lineage's directories (the base pointer `Store.Chain` follows)
-until the new lineage writes its own snapshot or `--materialize` copies
-it forward — the count moves, it does not reset, in that default case. A
+default since v0.2.12, start a new lineage ID that `Store.Chain` still
+resolves through the old lineage's directories (the base pointer it
+follows) until the new lineage writes its own snapshot or `--materialize`
+copies it forward, so for `checkout`, a fork below head and materialize
+the count moves, it does not reset, in that default case. Resolving a
+shared lineage's own head no longer pays that listing every time: the
+first checkpoint after a checkout lists once and records the chain across
+both lineages in the sidecar, and a later segment checkpoint, a fork at
+its head, a promote of it and a rollback to its head reuse that record,
+checked against the ref's base pointer with no store read ("A shared
+child's checkpoints", below). A
 daemon session, which writes all of its flushes under one epoch, adds
 one directory per session, as before. An S3 listing of a lineage is
 flat, so the count does not slow it. Removing an epoch directory once GC
@@ -809,7 +816,10 @@ empties it, so a directory GC or a failed checkpoint attempt leaves
 behind no longer survives to be listed next time. Neither change touches
 what `Store.Chain` itself walks: `checkout`, a fork below head,
 materialize, and every descendant resolving through the lineage as a
-base still list every epoch directory a *kept* checkpoint left, so the
+base (a descendant's own checkpoints only until its recorded chain
+serves them, from its second checkpoint after a checkout to its own
+snapshot, "A shared child's checkpoints" below) still list every epoch
+directory a *kept* checkpoint left, so the
 table above is unchanged by this work, confirmed by re-running the same
 benchmark on this branch:
 
@@ -856,6 +866,66 @@ table above; the two numbers come from separate runs over different
 operations and are not reconciled against each other. A smaller climb
 (+4.8 ms, against +10.1 ms before), not a flat one, is what the listing
 removal bought here.
+
+**A shared child's checkpoints.** Until this change the recorded chain
+served only a lineage whose every key was its own, so a shared child (a
+fresh fork, or a lineage a shared `rollback` or `promote` started)
+listed its base lineage's epoch directories and its own on every
+segment checkpoint until it wrote its own snapshot. The recorded chain
+now serves it too: the keys on other lineages must start with a
+snapshot and end exactly at `ref.Base.TXID`, and the child's own keys
+must be a contiguous run of segments starting at `ref.Base.TXID + 1`,
+which the ref alone can confirm.
+`BenchmarkSharedChildCheckpointAfterParentCheckpoints` seeds n at-rest
+checkpoints on `app@main` and then, per iteration and untimed, forks a
+fresh child at main's head, checks it out and takes the child's first
+checkpoint; it times the child's second checkpoint, a one-row segment.
+It uses a fresh child per iteration because one child checkpointing over
+and over writes its own snapshot within the snapshot cadence (after
+main's 1,000 checkpoints, at its 8th checkpoint, since main's head chain
+is 9 deep), after which both builds resolve only the child's lineage. A
+first version of the benchmark that timed 50 checkpoints on one child
+measured mostly that path and was discarded.
+
+Machine/date: darwin/arm64, Apple M5, macOS 27.0.1, Go 1.27.1, local
+APFS, 2026-10-08. Before = `8da5121` (the branch's merge-base with main),
+extracted with `git archive` into a scratch directory with the benchmark
+file copied in. The machine was not idle. Four series ran one after
+another, not alternating, in this order, with one-minute load averages
+read just before and just after each: after 1 (3.01, 4.19), before 1
+(4.19, 2.96), before 2 (2.62, 2.72), after 2 (2.70, 4.54).
+
+`go test ./internal/ops -run '^$' -bench SharedChildCheckpointAfterParentCheckpoints -benchtime=50x`
+(`ns/op` as printed, and divided by 1,000,000 for ms):
+
+| Checkpoints on main | Before 1 | Before 2 | After 1 | After 2 |
+|---|---|---|---|---|
+| 1 | 68675662 ns (68.68 ms) | 23869159 ns (23.87 ms) | 22361420 ns (22.36 ms) | 24699280 ns (24.70 ms) |
+| 100 | 77074640 ns (77.07 ms) | 28114897 ns (28.11 ms) | 24240112 ns (24.24 ms) | 25395637 ns (25.40 ms) |
+| 1,000 | 34230223 ns (34.23 ms) | 34871543 ns (34.87 ms) | 24844883 ns (24.84 ms) | 19985346 ns (19.99 ms) |
+
+Every timed checkpoint in every series wrote a segment (`segments`
+1.000). From n=1 to n=1,000, using the ms values in the table, each
+series changes by: before 1, 34.23 − 68.68 = −34.45 ms; before 2,
+34.87 − 23.87 = +11.00 ms (+4.24 ms from 1 to 100, 28.11 − 23.87, then
++6.76 ms from 100 to 1,000, 34.87 − 28.11); after 1, 24.84 − 22.36 =
++2.48 ms (22.36 → 24.24 → 24.84 ms, rising at each step); after 2,
+19.99 − 24.70 = −4.71 ms (24.70 → 25.40 → 19.99 ms). At n=1,000 the two
+before series read 34.23 and 34.87 ms and the two after series 24.84 and
+19.99 ms. Before 1's n=1 and n=100 points (68.68 and 77.07 ms) are 2.88
+and 2.74 times before 2's (68.68 / 23.87 and 77.07 / 28.11) and did not
+recur in before 2; they were not investigated, and before 1's n=1,000
+point agrees with before 2's. The saving is bounded. A shared child's
+first checkpoint after a checkout still lists, since its sidecar holds no
+recorded chain yet. The checkpoints that take the recorded chain instead
+run from the second up to and including the one that writes the child's
+own snapshot, because a checkpoint resolves its head chain before it
+decides between a segment and a snapshot. That snapshot comes when the
+chain reaches the bound, which is `SnapshotEvery` when a daemon sets it
+and `ForkShareMaxDepth` (16) otherwise, so the deeper the parent's head
+chain, the fewer such checkpoints there are: after main's 1,000
+checkpoints, the child's 2nd through 8th. Once that snapshot exists a
+child's checkpoints took the recorded chain before this change too.
 
 **Diagnostic: isolating the ref's own cost.** `BenchmarkSegmentCheckpointRefGrowth`
 checks whether the ref's own `Checkpoints` map — which grows by one

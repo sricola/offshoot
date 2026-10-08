@@ -6,10 +6,10 @@ import (
 	"github.com/sricola/offshoot/internal/store"
 )
 
-// observeChainSource, when non-nil, is told where a checkpoint or a fork at
-// head got the head's chain: "cache" (the sidecar's recorded chain, see
-// cachedChain) or "resolve" (store.Chain, which lists the lineage). A
-// test-only seam; nil in production.
+// observeChainSource, when non-nil, is told where a checkpoint, a fork at
+// head, a promote or a rollback at head got the head's chain: "cache" (the
+// sidecar's recorded chain, see cachedChain) or "resolve" (store.Chain,
+// which lists the lineage). A test-only seam; nil in production.
 var observeChainSource func(kind string)
 
 // cachedChain returns the head chain the checkout's sidecar recorded
@@ -18,14 +18,22 @@ var observeChainSource func(kind string)
 // checkpoint records its new head's chain in the trusted stamp it writes
 // after its head write: the chain it resolved (or took from here) plus the
 // object it just wrote, or that object alone when it wrote a snapshot. So
-// the next checkpoint, and a fork at head, skip listing the lineage, which
-// on a local store grows with every epoch the lineage's checkpoints minted.
+// the next checkpoint, a fork at head, a promote (which always resolves
+// its source's head) and a rollback to the head's own checkpoint skip
+// listing the lineage, which on a local store grows with every epoch the
+// lineage's checkpoints minted.
 //
 // It is used only when all of these hold:
 //   - the sidecar's identity (Lineage, Epoch, TXID) is the ref's head
 //     (Lineage, HeadEpoch, HeadTXID);
 //   - the recorded chain is non-empty, and every key parses as a member
-//     key (store.ParseMemberKey) under ref.Lineage's prefix;
+//     key (store.ParseMemberKey);
+//   - the keys are a run on other lineages (possibly empty) followed by a
+//     run under ref.Lineage's prefix (non-empty), never interleaved; when
+//     the first run is non-empty the ref has a base pointer, the first
+//     run's last key is under ref.Base.Lineage's prefix and ends at
+//     ref.Base.TXID, and the second run starts at ref.Base.TXID + 1 with a
+//     segment;
 //   - the first member is a snapshot, every later one is a segment that
 //     starts right after the previous member ends (MinTXID == previous
 //     MaxTXID + 1, so strictly ascending with no hole), and the last one
@@ -43,25 +51,78 @@ var observeChainSource func(kind string)
 // head never reaches) or at a txid at or below it (which
 // store.keepHighestEpoch collapses in favour of the live, higher-epoch
 // member), so it never displaces a member of the live chain; and GC never
-// deletes a reachable member. A
-// sidecar from before this field (no chain), a distrusted stamp (which
-// records none), a materialize or a session's close (which record none)
-// all resolve. A chain that crosses into a base lineage is recorded but
-// never used here (its keys name another lineage), so a shared lineage
-// resolves until it writes its own snapshot.
+// deletes a reachable member. A sidecar from before this field (no chain),
+// a distrusted stamp (which records none), a materialize or a session's
+// close (which record none) all resolve.
+//
+// A shared child's chain begins with members on its base spine, below the
+// fork point, and those cannot change under an unchanged child head
+// either. A lineage's base pointer is immutable (written create-only) and
+// ref.Base mirrors it, so the seam a record was built against is the seam
+// the ref still names. A writer holding the lease writes no object at a
+// txid at or below the head of a lineage a ref already names: a checkpoint
+// writes at HeadTXID + 1, a session flushes above the head, and a
+// rollback, promote or compact writes into a new lineage before any ref
+// names it. A writer whose lease was taken over can still upload at a txid
+// at or below a later head, but under an older epoch, which
+// store.keepHighestEpoch loses to the live member. So no object a current
+// writer can add displaces a member of the live chain, and no member below
+// the seam is superseded after the fork. GC marks what every ref's head
+// resolves to, which for the child follows the same base pointer to the
+// same ancestor members, so destroying the base branch does not delete
+// them while the child reaches them. A spine of several hops
+// obeys the same facts per hop, so the first run may span several
+// lineages and the check does not need to know which. Its last key must
+// be on ref.Base.Lineage, a check with no store read: every record current
+// code writes meets it, since the member just below the seam belongs to
+// the lineage that owns the seam txid, and Store.CollapseBase names that
+// lineage as the base. What this does not prove is that the first run's
+// earlier keys, on a spine of several hops, name lineages on this child's
+// spine. Unlike a single-lineage record, whose keys must all be the ref's
+// own, those keys may name any lineage in the store, and they are trusted
+// structurally because the sidecar is a local file in the checkout's own
+// directory, the same trust domain as the checkout itself.
 func (w *Workspace) cachedChain(path string, ref store.Ref) ([]store.ChainMember, bool) {
 	rec, ok := readSidecar(path)
 	if !ok || rec.Lineage != ref.Lineage || rec.Epoch != ref.HeadEpoch || rec.TXID != ref.HeadTXID || len(rec.Chain) == 0 {
 		return nil, false
 	}
-	prefix := store.LineagePrefix(ref.Lineage)
+	own := store.LineagePrefix(ref.Lineage)
 	members := make([]store.ChainMember, 0, len(rec.Chain))
-	for _, key := range rec.Chain {
+	// seam is the index of the first key under ref.Lineage: every key
+	// before it is on another lineage (the base spine), every key from it
+	// on is the lineage's own.
+	seam := -1
+	for i, key := range rec.Chain {
 		m, ok := store.ParseMemberKey(key)
-		if !ok || !strings.HasPrefix(key, prefix) {
+		if !ok {
 			return nil, false
 		}
+		if strings.HasPrefix(key, own) {
+			if seam < 0 {
+				seam = i
+			}
+		} else if seam >= 0 {
+			return nil, false // an ancestor key after an own key is never a chain
+		}
 		members = append(members, m)
+	}
+	if seam < 0 {
+		return nil, false // no own key: nothing this head wrote
+	}
+	if seam > 0 {
+		// A shared child: the first run is the base spine's half of the
+		// chain and must end exactly at the fork point the ref names, with
+		// the lineage's own half starting right after it.
+		if ref.Base == nil || members[seam-1].MaxTXID != ref.Base.TXID || members[seam].MinTXID != ref.Base.TXID+1 {
+			return nil, false
+		}
+		if !strings.HasPrefix(rec.Chain[seam-1], store.LineagePrefix(ref.Base.Lineage)) {
+			return nil, false // the member just below the seam is the base lineage's own
+		}
+		if members[seam].Snapshot {
+			return nil, false // an own snapshot never follows ancestor keys
+		}
 	}
 	if !members[0].Snapshot || members[len(members)-1].MaxTXID != ref.HeadTXID || members[len(members)-1].Epoch != ref.HeadEpoch {
 		return nil, false
@@ -74,8 +135,11 @@ func (w *Workspace) cachedChain(path string, ref store.Ref) ([]store.ChainMember
 	return members, true
 }
 
-// headChain is the head's chain for a checkpoint or a fork at head: the
-// sidecar's recorded chain when cachedChain accepts it, else store.Chain.
+// headChain resolves the chain at a ref's head for every caller that
+// resolves exactly the head: a segment checkpoint, a fork at head, a
+// promote (which always resolves its source's head) and a rollback to the
+// head's own checkpoint. It returns the sidecar's recorded chain when
+// cachedChain accepts it, and otherwise falls back to store.Chain.
 func (w *Workspace) headChain(path string, ref store.Ref) ([]store.ChainMember, error) {
 	if members, ok := w.cachedChain(path, ref); ok {
 		if observeChainSource != nil {

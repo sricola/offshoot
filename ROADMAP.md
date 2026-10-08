@@ -423,13 +423,16 @@ open wart (its own spec said "N materialized forks cost up to N×G").
   failed checkpoint attempt leaves behind. **Residual, by design:**
   `Store.Chain` itself is unchanged — `checkout`, a fork below head,
   materialize, and every descendant resolving through the lineage as a
-  base still list every epoch directory a *kept* checkpoint left (the
-  table above, unmoved by this work). `compact` still resets the count
-  by making its result self-contained; `rollback` and `promote`, which
-  share via a base pointer by default since v0.2.12, start a new
-  lineage ID but keep resolving through the old lineage's directories
-  until the new one writes its own snapshot or `--materialize` copies it
-  forward — the count moves, it does not reset, in that default case.
+  base (a descendant's own checkpoints only until its recorded chain
+  serves them; see the shared-child bullet below) still list every epoch
+  directory a *kept* checkpoint left (the table above, unmoved by this
+  work). `compact` still resets the count by making its result
+  self-contained; `rollback` and `promote`, which share via a base
+  pointer by default since v0.2.12, start a new lineage ID that
+  `checkout`, a fork below head and materialize keep resolving through
+  the old lineage's directories until the new one writes its own
+  snapshot or `--materialize` copies it forward — the count moves, it
+  does not reset, in that default case.
   S3 is still unaffected (its listing is flat). A local layout that
   lists a lineage in one directory read would remove the `Store.Chain`
   residual outright, but it is a store-format migration and is left to
@@ -453,24 +456,55 @@ open wart (its own spec said "N materialized forks cost up to N×G").
   decoded whole on every checkpoint; or a bound on how many named
   checkpoints `Checkpoints` keeps, with older ones falling back to a
   slower listing) would close this, at the cost of a format change.
-- ⏭ **Extend the recorded-chain cache to shared child lineages.** A
-  lineage that still resolves through a base pointer (a fresh fork or a
-  promote/rollback that kept the base spine) records a chain whose first
-  keys name the base lineage, which the binding check above rejects (it
-  requires every key on `ref.Lineage`), so such a lineage keeps listing
-  until it writes its own snapshot. The shortcut can extend to it without
-  any store read: key the cache on the base spine, and validate a
-  recorded chain against `ref.Base` alone — the child's own keys must be
-  a contiguous segment suffix starting at `ref.Base.TXID + 1`, and the
-  prefix (the keys on the base lineage) must end exactly at
-  `ref.Base.TXID` and start with a snapshot. Promote and Rollback's head
-  resolve should adopt the same shortcut once it exists, since they
-  resolve a head the same way a checkout does. Test matrix: a shared
-  child checkpointing before it has its own snapshot, and again after;
-  a pass-through spine (base-of-a-base) read against an old store; the
-  base lineage destroyed and GC'd while the child keeps checkpointing;
-  and a corrupt seam (the suffix does not actually start at
-  `ref.Base.TXID + 1`, or the prefix does not end there).
+- ✅ **Extend the recorded-chain cache to shared child lineages —
+  shipped.** A lineage that still resolves through a base pointer (a
+  fresh fork, or a promote or rollback that kept the base spine) records
+  a chain whose first keys name the base lineages, which the binding
+  check above used to reject, so such a lineage listed on every segment
+  checkpoint until it wrote its own snapshot. The recorded chain now
+  serves it with no store read: the keys on other lineages must start
+  with a snapshot and end exactly at `ref.Base.TXID`, the last of them on
+  `ref.Base.Lineage`, and the lineage's own keys must be a contiguous run
+  of segments starting at `ref.Base.TXID + 1`. Promote and a rollback to
+  the head's own checkpoint now resolve the head through the same
+  shortcut as a checkpoint and a fork at head. The test matrix that pins
+  it, in `internal/ops/chain_cache_test.go`:
+  `TestSharedChildSecondCheckpointUsesTheRecordedChain` and
+  `TestSharedChildAfterOwnSnapshotUsesOwnChain` (a shared child
+  checkpointing before its own snapshot, and after),
+  `TestPassThroughSpineUsesTheRecordedChain` and
+  `TestTwoHopSpineUsesTheRecordedChain` (a base-of-a-base spine),
+  `TestSharedChildCacheSurvivesBaseDestroyAndGC` (the base branch
+  destroyed and GC'd while the child keeps checkpointing),
+  `TestSharedChildCorruptSeamResolves` (a suffix that does not start at
+  `ref.Base.TXID + 1`, a prefix that does not end there, or an own key
+  in front of an ancestor's), `TestSharedChildSeamMustMatchRefBase` (an
+  intact record against `ref.Base.TXID` shifted by one either way),
+  `TestForeignKeysWithoutBaseResolve`,
+  `TestForkOfSharedChildAtHeadUsesTheRecordedChain`,
+  `TestForkAfterOwnSnapshotFirstResolvesThenHits`,
+  `TestPromoteAtHeadUsesTheRecordedChain`,
+  `TestRollbackToHeadUsesTheRecordedChain`,
+  `TestSharedChildPrefixMustEndOnBaseLineage` (the last ancestor key
+  moved onto another lineage), and
+  `TestPromoteMaterializeFromRecordedChain` and
+  `TestRollbackMaterializeAtHeadFromRecordedChain` (a materializing
+  promote and rollback at head copying a record that spans two
+  lineages). Measured with
+  `BenchmarkSharedChildCheckpointAfterParentCheckpoints` (a fresh child's
+  second checkpoint after n checkpoints on its parent; two before and two
+  after series, run one after another at one-minute load averages 2.62
+  to 4.54), the series read, at n = 1, 100 and 1,000: before 1, 68.68 /
+  77.07 / 34.23 ms (−34.45 ms from n = 1 to 1,000; its two high points
+  did not recur); before 2, 23.87 / 28.11 / 34.87 ms (+11.00 ms); after
+  1, 22.36 / 24.24 / 24.84 ms (+2.48 ms); after 2, 24.70 / 25.40 /
+  19.99 ms (−4.71 ms) ([benchmarks, "A shared child's
+  checkpoints"](docs/benchmarks.md)). The saving is bounded: a shared
+  child's first checkpoint after a checkout still lists, and the
+  checkpoints served run from the second up to and including the one
+  that writes the child's own snapshot, which comes when the chain
+  reaches `SnapshotEvery` if set, else `ForkShareMaxDepth` (16); after
+  1,000 checkpoints on the parent, that is the child's 2nd through 8th.
 
 ## Launch track (parallel to v0.1–v0.3)
 
