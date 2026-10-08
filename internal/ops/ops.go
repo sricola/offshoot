@@ -92,11 +92,10 @@ const (
 // nothing else writes, so a ref naming it proves the write landed.
 // prevLineage is the lineage the ref named when the caller read it ("" for
 // Fork and Create, whose create-only writes have no previous ref). A ref
-// still naming
-// prevLineage proves the write did not land: had it landed, every later
-// conditional write would be built on the version naming lineage, and no
-// writer mints an old lineage again. That is the only verdict under which
-// the caller deletes the new lineage's objects.
+// still naming prevLineage proves the write did not land: had it landed,
+// every later conditional write would be built on the version naming
+// lineage, and no writer mints an old lineage again. That is the only
+// verdict under which the caller deletes the new lineage's objects.
 //
 // Anything else is repointUnknown, and the caller keeps the objects for GC
 // to reclaim. A ref naming a third lineage cannot be told apart from "our
