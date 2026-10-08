@@ -818,3 +818,98 @@ func TestRollbackToHeadUsesTheRecordedChain(t *testing.T) {
 	// headChain and so never calls observeChainSource.
 	assertSources(t, "rollback below the head", sources())
 }
+
+// TestSharedChildPrefixMustEndOnBaseLineage: the record's last ancestor
+// key is moved onto another lineage ID, keeping its epoch and txids, so
+// the record stays contiguous and its seam still matches ref.Base.TXID.
+// Only the check that the member just below the seam is on
+// ref.Base.Lineage rejects it, and the next checkpoint resolves with the
+// right content.
+func TestSharedChildPrefixMustEndOnBaseLineage(t *testing.T) {
+	w := newWS(t)
+	path := sharedChildSeed(t, w)
+	mustSQL(t, path, "INSERT INTO t (v) VALUES (randomblob(100));")
+	mustCheckpointWith(t, w, "app", "child", "c1", CheckpointOptions{})
+	child := refOf(t, w, "app", "child")
+	if _, ok := w.cachedChain(path, child); !ok {
+		t.Fatal("cachedChain rejected the unedited record")
+	}
+	base, other := store.LineagePrefix(child.Base.Lineage), store.LineagePrefix(store.NewLineageID())
+	editSidecar(t, path, func(m map[string]any) {
+		chain := m["chain"].([]any)
+		i := len(chain) - 2 // the last ancestor key, just below the child's own segment
+		key := chain[i].(string)
+		if !strings.HasPrefix(key, base) {
+			t.Fatalf("last ancestor key %s is not on the base lineage %s", key, child.Base.Lineage)
+		}
+		chain[i] = other + strings.TrimPrefix(key, base)
+	})
+	if _, ok := w.cachedChain(path, child); ok {
+		t.Fatal("cachedChain accepted a record whose last ancestor key is off ref.Base.Lineage")
+	}
+	sources := recordChainSources(t)
+	mustSQL(t, path, "INSERT INTO t (v) VALUES (randomblob(100));")
+	mustCheckpointWith(t, w, "app", "child", "c2", CheckpointOptions{})
+	assertSources(t, "checkpoint over a prefix ending off the base lineage", sources(), "resolve")
+	assertHeadIsCheckout(t, w, "app", "child", "c2", path)
+}
+
+// twoLineageRecordSeed takes two segment checkpoints, c1 and c2, on a
+// shared child (sharedChildSeed), so its sidecar records a chain on two
+// lineages: main's snapshot and segment, then the child's two segments.
+// It returns the child's checkout path.
+func twoLineageRecordSeed(t *testing.T, w *Workspace) string {
+	t.Helper()
+	path := sharedChildSeed(t, w)
+	for _, name := range []string{"c1", "c2"} {
+		mustSQL(t, path, "INSERT INTO t (v) VALUES (randomblob(100));")
+		if res := mustCheckpointWith(t, w, "app", "child", name, CheckpointOptions{}); res.Kind != "segment" {
+			t.Fatalf("%s: kind %q, want segment", name, res.Kind)
+		}
+	}
+	child := refOf(t, w, "app", "child")
+	members := assertCachedChainIsResolved(t, w, path, "app", "child")
+	if !strings.HasPrefix(members[0].Key, store.LineagePrefix(child.Base.Lineage)) {
+		t.Fatalf("child's record does not begin on the base lineage: %v", members)
+	}
+	return path
+}
+
+// TestPromoteMaterializeFromRecordedChain: a materializing promote of a
+// shared child whose record spans two lineages takes the record and copies
+// every member it names into the target's new lineage. The target has no
+// base pointer and reads the same bytes as the child's checkout, so the
+// record's members, not merely their count, are what live resolution
+// would give.
+func TestPromoteMaterializeFromRecordedChain(t *testing.T) {
+	w := newWS(t)
+	path := twoLineageRecordSeed(t, w)
+	sources := recordChainSources(t)
+	if _, err := w.PromoteWith("app", "child", "main", PromoteOptions{Force: true, NoBackup: true, Materialize: true}); err != nil {
+		t.Fatal(err)
+	}
+	assertSources(t, "materializing promote of a shared child", sources(), "cache")
+	if base := refOf(t, w, "app", "main").Base; base != nil {
+		t.Fatalf("promoted target still has a base pointer %+v; it did not materialize", base)
+	}
+	assertHeadIsCheckout(t, w, "app", "main", "promote", path)
+}
+
+// TestRollbackMaterializeAtHeadFromRecordedChain: a materializing
+// rollback to a shared child's head checkpoint takes the record, which
+// spans two lineages, and copies every member it names into the branch's
+// new lineage. The branch has no base pointer afterwards and reads the
+// same bytes as its checkout.
+func TestRollbackMaterializeAtHeadFromRecordedChain(t *testing.T) {
+	w := newWS(t)
+	path := twoLineageRecordSeed(t, w)
+	sources := recordChainSources(t)
+	if _, err := w.RollbackWith("app", "child", "c2", RollbackOptions{NoBackup: true, Materialize: true}); err != nil {
+		t.Fatal(err)
+	}
+	assertSources(t, "materializing rollback to a shared child's head", sources(), "cache")
+	if base := refOf(t, w, "app", "child").Base; base != nil {
+		t.Fatalf("rolled-back branch still has a base pointer %+v; it did not materialize", base)
+	}
+	assertHeadIsCheckout(t, w, "app", "child", "c2", path)
+}

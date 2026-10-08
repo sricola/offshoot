@@ -430,8 +430,9 @@ open wart (its own spec said "N materialized forks cost up to N×G").
   self-contained; `rollback` and `promote`, which share via a base
   pointer by default since v0.2.12, start a new lineage ID that
   `checkout`, a fork below head and materialize keep resolving through
-  the old lineage's directories until the new one writes its own snapshot or `--materialize` copies it
-  forward — the count moves, it does not reset, in that default case.
+  the old lineage's directories until the new one writes its own
+  snapshot or `--materialize` copies it forward — the count moves, it
+  does not reset, in that default case.
   S3 is still unaffected (its listing is flat). A local layout that
   lists a lineage in one directory read would remove the `Store.Chain`
   residual outright, but it is a store-format migration and is left to
@@ -462,12 +463,12 @@ open wart (its own spec said "N materialized forks cost up to N×G").
   check above used to reject, so such a lineage listed on every segment
   checkpoint until it wrote its own snapshot. The recorded chain now
   serves it with no store read: the keys on other lineages must start
-  with a snapshot and end exactly at `ref.Base.TXID`, and the lineage's
-  own keys must be a contiguous run of segments starting at
-  `ref.Base.TXID + 1`. Promote and a rollback to the head's own
-  checkpoint now resolve the head through the same shortcut as a
-  checkpoint and a fork at head. The test matrix that pins it, in
-  `internal/ops/chain_cache_test.go`:
+  with a snapshot and end exactly at `ref.Base.TXID`, the last of them on
+  `ref.Base.Lineage`, and the lineage's own keys must be a contiguous run
+  of segments starting at `ref.Base.TXID + 1`. Promote and a rollback to
+  the head's own checkpoint now resolve the head through the same
+  shortcut as a checkpoint and a fork at head. The test matrix that pins
+  it, in `internal/ops/chain_cache_test.go`:
   `TestSharedChildSecondCheckpointUsesTheRecordedChain` and
   `TestSharedChildAfterOwnSnapshotUsesOwnChain` (a shared child
   checkpointing before its own snapshot, and after),
@@ -482,8 +483,14 @@ open wart (its own spec said "N materialized forks cost up to N×G").
   `TestForeignKeysWithoutBaseResolve`,
   `TestForkOfSharedChildAtHeadUsesTheRecordedChain`,
   `TestForkAfterOwnSnapshotFirstResolvesThenHits`,
-  `TestPromoteAtHeadUsesTheRecordedChain` and
-  `TestRollbackToHeadUsesTheRecordedChain`. Measured with
+  `TestPromoteAtHeadUsesTheRecordedChain`,
+  `TestRollbackToHeadUsesTheRecordedChain`,
+  `TestSharedChildPrefixMustEndOnBaseLineage` (the last ancestor key
+  moved onto another lineage), and
+  `TestPromoteMaterializeFromRecordedChain` and
+  `TestRollbackMaterializeAtHeadFromRecordedChain` (a materializing
+  promote and rollback at head copying a record that spans two
+  lineages). Measured with
   `BenchmarkSharedChildCheckpointAfterParentCheckpoints` (a fresh child's
   second checkpoint after n checkpoints on its parent; two before and two
   after series, run one after another at one-minute load averages 2.62

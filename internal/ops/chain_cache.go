@@ -6,10 +6,10 @@ import (
 	"github.com/sricola/offshoot/internal/store"
 )
 
-// observeChainSource, when non-nil, is told where a checkpoint or a fork at
-// head got the head's chain: "cache" (the sidecar's recorded chain, see
-// cachedChain) or "resolve" (store.Chain, which lists the lineage). A
-// test-only seam; nil in production.
+// observeChainSource, when non-nil, is told where a checkpoint, a fork at
+// head, a promote or a rollback at head got the head's chain: "cache" (the
+// sidecar's recorded chain, see cachedChain) or "resolve" (store.Chain,
+// which lists the lineage). A test-only seam; nil in production.
 var observeChainSource func(kind string)
 
 // cachedChain returns the head chain the checkout's sidecar recorded
@@ -30,9 +30,10 @@ var observeChainSource func(kind string)
 //     key (store.ParseMemberKey);
 //   - the keys are a run on other lineages (possibly empty) followed by a
 //     run under ref.Lineage's prefix (non-empty), never interleaved; when
-//     the first run is non-empty the ref has a base pointer, the first run
-//     ends at ref.Base.TXID and the second starts at ref.Base.TXID + 1 with
-//     a segment;
+//     the first run is non-empty the ref has a base pointer, the first
+//     run's last key is under ref.Base.Lineage's prefix and ends at
+//     ref.Base.TXID, and the second run starts at ref.Base.TXID + 1 with a
+//     segment;
 //   - the first member is a snapshot, every later one is a segment that
 //     starts right after the previous member ends (MinTXID == previous
 //     MaxTXID + 1, so strictly ascending with no hole), and the last one
@@ -58,19 +59,28 @@ var observeChainSource func(kind string)
 // fork point, and those cannot change under an unchanged child head
 // either. A lineage's base pointer is immutable (written create-only) and
 // ref.Base mirrors it, so the seam a record was built against is the seam
-// the ref still names. No writer writes an object at a txid at or below
-// the head of a lineage a ref already names (a checkpoint writes at
-// HeadTXID + 1, a session flushes above the head, and a rollback, promote
-// or compact writes into a new lineage before any ref names it), so no
-// member below the seam is superseded after the fork. GC marks what
-// every ref's head resolves to, which for the child follows the same base
-// pointer to the same ancestor members, so destroying the base branch does
-// not delete them while the child reaches them. A spine of several hops
+// the ref still names. A writer holding the lease writes no object at a
+// txid at or below the head of a lineage a ref already names: a checkpoint
+// writes at HeadTXID + 1, a session flushes above the head, and a
+// rollback, promote or compact writes into a new lineage before any ref
+// names it. A writer whose lease was taken over can still upload at a txid
+// at or below a later head, but under an older epoch, which
+// store.keepHighestEpoch loses to the live member. So no object a current
+// writer can add displaces a member of the live chain, and no member below
+// the seam is superseded after the fork. GC marks what every ref's head
+// resolves to, which for the child follows the same base pointer to the
+// same ancestor members, so destroying the base branch does not delete
+// them while the child reaches them. A spine of several hops
 // obeys the same facts per hop, so the first run may span several
-// lineages and the check does not need to know which. What this does not
-// prove is that the first run's keys name lineages on this child's spine:
-// the sidecar's keys are trusted structurally, as they are for a single
-// lineage, because the sidecar is a local file in the checkout's own
+// lineages and the check does not need to know which. Its last key must
+// be on ref.Base.Lineage, a check with no store read: every record current
+// code writes meets it, since the member just below the seam belongs to
+// the lineage that owns the seam txid, and Store.CollapseBase names that
+// lineage as the base. What this does not prove is that the first run's
+// earlier keys, on a spine of several hops, name lineages on this child's
+// spine. Unlike a single-lineage record, whose keys must all be the ref's
+// own, those keys may name any lineage in the store, and they are trusted
+// structurally because the sidecar is a local file in the checkout's own
 // directory, the same trust domain as the checkout itself.
 func (w *Workspace) cachedChain(path string, ref store.Ref) ([]store.ChainMember, bool) {
 	rec, ok := readSidecar(path)
@@ -106,6 +116,9 @@ func (w *Workspace) cachedChain(path string, ref store.Ref) ([]store.ChainMember
 		// the lineage's own half starting right after it.
 		if ref.Base == nil || members[seam-1].MaxTXID != ref.Base.TXID || members[seam].MinTXID != ref.Base.TXID+1 {
 			return nil, false
+		}
+		if !strings.HasPrefix(rec.Chain[seam-1], store.LineagePrefix(ref.Base.Lineage)) {
+			return nil, false // the member just below the seam is the base lineage's own
 		}
 		if members[seam].Snapshot {
 			return nil, false // an own snapshot never follows ancestor keys
