@@ -17,6 +17,57 @@ Pin an exact version if you depend on format stability. The full contract:
 
 ## [Unreleased]
 
+### Fixed
+
+- **A create, rollback, promote, compact or fork whose ref write landed
+  but came back as an error no longer deletes the new lineage it just
+  wrote.** The S3 SDK's retry answering 412 to its own first attempt, or a
+  timeout that loses the response, used to make the verb treat its own
+  successful write as a lost race and delete the new lineage's base
+  pointer or snapshots, leaving the branch that now named that lineage
+  unreadable until something rewrote it (for `create` and `create --from`,
+  `db@main` named a lineage with no snapshot, and the user was told the
+  database already existed). Each of the five now re-reads the ref and
+  compares it against the lineage ID it minted. A match proves the write
+  landed, and the verb finishes as success. The ref still naming the
+  lineage it named before the write proves the write did not land; only
+  then does today's cleanup run. Anything else (a third lineage, no ref,
+  or, for `fork` and `create`, any existing ref) leaves the objects for
+  reachability GC to reclaim instead of deleting them. Which error comes
+  back: a re-read that itself fails returns a new error, which says the
+  write may have landed, names the kept lineage and tells the user to run
+  `offshoot status` before retrying; every other outcome returns the same
+  error text as before, byte for byte ("already exists", "fork db@branch:
+  err", "create db: err", or "… lost a race (retry): …"). A race lost to a
+  write that keeps the branch's lineage (a flush, a touch, a lease
+  renewal) still deletes the new lineage's objects at once. A race lost to
+  another repoint, a fork onto a taken name on the shared path, and a
+  create onto a taken name instead leave the new lineage's objects (one
+  `base.json` on the shared path; full snapshot copies on a materialize or
+  create path) until the next `offshoot gc`. A fork that materializes now
+  reads the destination ref once (one GET of the ref key, no LIST) before
+  copying a snapshot, so forking onto a taken name on that path writes
+  nothing at all; the shared path still has no such pre-check and relies
+  on its ref write's compare-and-swap to settle the race.
+  Tests: `internal/ops/repoint_landed_test.go`'s
+  `TestForkLandedWriteKeepsBaseAndIsReadable`,
+  `TestForkLostRaceLeavesOrphanForGC`,
+  `TestRollbackLandedWriteKeepsObjects`,
+  `TestPromoteLandedWriteKeepsObjects`,
+  `TestCompactLandedWriteKeepsCopies`,
+  `TestRepointSettleUnknownKeepsObjects`,
+  `TestRollbackLandedThenRepointedAwayKeepsObjects`,
+  `TestRollbackLostRaceLeavesObjectsForGC`,
+  `TestRollbackLostToRefWriteRemovesObjects`,
+  `TestForkLandedThenDestroyedKeepsObjects`,
+  `TestRollbackSettleUnknownKeepsObjects`,
+  `TestPromoteLostToRefWriteRemovesObjects`,
+  `TestPromoteSettleUnknownKeepsObjects`,
+  `TestCreateLandedWriteKeepsSnapshotAndIsReadable`,
+  `TestCreateOntoTakenNameLeavesSnapshotForGC`,
+  `TestForkMaterializeOntoFreeNameReadsRefOnce`, and
+  `TestForkMaterializeOntoTakenNameWritesNothing`.
+
 ### Changed
 
 - **A checkpoint's stamp reads the checkout once again.** The stamp now
