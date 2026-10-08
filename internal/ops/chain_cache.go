@@ -48,19 +48,19 @@ var observeChainSource func(kind string)
 // head never reaches) or at a txid at or below it (which
 // store.keepHighestEpoch collapses in favour of the live, higher-epoch
 // member), so it never displaces a member of the live chain; and GC never
-// deletes a reachable member. A
-// sidecar from before this field (no chain), a distrusted stamp (which
-// records none), a materialize or a session's close (which record none)
-// all resolve.
+// deletes a reachable member. A sidecar from before this field (no chain),
+// a distrusted stamp (which records none), a materialize or a session's
+// close (which record none) all resolve.
 //
 // A shared child's chain begins with members on its base spine, below the
 // fork point, and those cannot change under an unchanged child head
 // either. A lineage's base pointer is immutable (written create-only) and
 // ref.Base mirrors it, so the seam a record was built against is the seam
-// the ref still names. No writer writes an object at a txid at or below a
-// lineage's head (a checkpoint writes at HeadTXID + 1, a session flushes
-// above the head, and a rollback, promote or compact mints a new lineage),
-// so no member below the seam is superseded after the fork. GC marks what
+// the ref still names. No writer writes an object at a txid at or below
+// the head of a lineage a ref already names (a checkpoint writes at
+// HeadTXID + 1, a session flushes above the head, and a rollback, promote
+// or compact writes into a new lineage before any ref names it), so no
+// member below the seam is superseded after the fork. GC marks what
 // every ref's head resolves to, which for the child follows the same base
 // pointer to the same ancestor members, so destroying the base branch does
 // not delete them while the child reaches them. A spine of several hops

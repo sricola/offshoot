@@ -465,10 +465,12 @@ func TestSharedChildAfterOwnSnapshotUsesOwnChain(t *testing.T) {
 // has not diverged (grandchild forked at child's head, child's head still
 // at the seam). The fork collapses the base (store.CollapseBase names the
 // nearest lineage that owns the seam txid), so the grandchild's base
-// pointer names main directly, not the pass-through child: the spine is
-// one hop, pinned below. After the grandchild's first checkpoint its
-// record spans main's keys then its own, with the child contributing
-// none, and the second checkpoint takes it.
+// pointer names main directly, not the pass-through child: this spine is
+// one hop, pinned below. (A child that has diverged is not collapsed past;
+// TestTwoHopSpineUsesTheRecordedChain covers that real two-hop spine.)
+// After the grandchild's first checkpoint its record spans main's keys
+// then its own, with the child contributing none, and the second
+// checkpoint takes it.
 func TestPassThroughSpineUsesTheRecordedChain(t *testing.T) {
 	w := newWS(t)
 	sharedChildSeed(t, w)
@@ -494,6 +496,87 @@ func TestPassThroughSpineUsesTheRecordedChain(t *testing.T) {
 	assertSources(t, "second grandchild checkpoint", sources(), "cache")
 	assertCachedChainIsResolved(t, w, path, "app", "grandchild")
 	assertHeadIsCheckout(t, w, "app", "grandchild", "g2", path)
+}
+
+// TestTwoHopSpineUsesTheRecordedChain: a shared child that has diverged
+// (one segment checkpoint of its own above the seam) is forked at head.
+// CollapseBase stops at the child, which owns that txid, so the
+// grandchild's base pointer names the child and the spine has two hops:
+// grandchild to child, child to main. The grandchild's first checkpoint
+// resolves and records a chain on three lineages in order (main's
+// snapshot and segment, the child's segment, its own segment); the second
+// takes that record. With both ancestor branches destroyed and GC run
+// twice, the ancestor members stay reachable through the grandchild's own
+// resolution, so a third checkpoint still takes the record.
+func TestTwoHopSpineUsesTheRecordedChain(t *testing.T) {
+	w := newWS(t)
+	path := sharedChildSeed(t, w)
+	mustSQL(t, path, "INSERT INTO t (v) VALUES (randomblob(100));")
+	if res := mustCheckpointWith(t, w, "app", "child", "c1", CheckpointOptions{}); res.Kind != "segment" {
+		t.Fatalf("c1: kind %q, want segment", res.Kind)
+	}
+	if _, err := w.Fork("app", "child", "grandchild", "", 0, nil); err != nil {
+		t.Fatal(err)
+	}
+	main, child, gcRef := refOf(t, w, "app", "main"), refOf(t, w, "app", "child"), refOf(t, w, "app", "grandchild")
+	if gcRef.Base == nil || gcRef.Base.Lineage != child.Lineage {
+		t.Fatalf("grandchild base %+v, want the child's lineage %s", gcRef.Base, child.Lineage)
+	}
+	gpath, err := w.Checkout("app", "grandchild")
+	if err != nil {
+		t.Fatal(err)
+	}
+	sources := recordChainSources(t)
+
+	mustSQL(t, gpath, "INSERT INTO t (v) VALUES (randomblob(100));")
+	mustCheckpointWith(t, w, "app", "grandchild", "g1", CheckpointOptions{})
+	assertSources(t, "first grandchild checkpoint", sources(), "resolve")
+	members := assertCachedChainIsResolved(t, w, gpath, "app", "grandchild")
+	// Each member's position on the spine (0 main, 1 child, 2 grandchild)
+	// must never decrease, and all three must appear.
+	spine := []string{main.Lineage, child.Lineage, gcRef.Lineage}
+	seen, last := map[int]bool{}, 0
+	for _, m := range members {
+		at := -1
+		for i, l := range spine {
+			if strings.HasPrefix(m.Key, store.LineagePrefix(l)) {
+				at = i
+			}
+		}
+		if at < last {
+			t.Fatalf("record key %s is off the spine or out of order: %v", m.Key, members)
+		}
+		seen[at], last = true, at
+	}
+	if len(seen) != len(spine) {
+		t.Fatalf("record spans %d of the spine's %d lineages: %v", len(seen), len(spine), members)
+	}
+
+	mustSQL(t, gpath, "INSERT INTO t (v) VALUES (randomblob(100));")
+	if res := mustCheckpointWith(t, w, "app", "grandchild", "g2", CheckpointOptions{}); res.Kind != "segment" {
+		t.Fatalf("g2: kind %q, want segment", res.Kind)
+	}
+	assertSources(t, "second grandchild checkpoint", sources(), "cache")
+	assertCachedChainIsResolved(t, w, gpath, "app", "grandchild")
+	assertHeadIsCheckout(t, w, "app", "grandchild", "g2", gpath)
+
+	for _, branch := range []string{"child", "main"} {
+		if err := w.Destroy("app", branch, true); err != nil {
+			t.Fatal(err)
+		}
+	}
+	for i := 0; i < 2; i++ {
+		if _, _, err := w.GC(0); err != nil {
+			t.Fatal(err)
+		}
+	}
+	mustSQL(t, gpath, "INSERT INTO t (v) VALUES (randomblob(100));")
+	if res := mustCheckpointWith(t, w, "app", "grandchild", "g3", CheckpointOptions{}); res.Kind != "segment" {
+		t.Fatalf("g3: kind %q, want segment", res.Kind)
+	}
+	assertSources(t, "grandchild checkpoint after both ancestors destroyed + GC", sources(), "cache")
+	assertCachedChainIsResolved(t, w, gpath, "app", "grandchild")
+	assertHeadIsCheckout(t, w, "app", "grandchild", "g3", gpath)
 }
 
 // TestSharedChildCacheSurvivesBaseDestroyAndGC: with the base branch
@@ -523,11 +606,14 @@ func TestSharedChildCacheSurvivesBaseDestroyAndGC(t *testing.T) {
 	assertHeadIsCheckout(t, w, "app", "child", "c2", path)
 }
 
-// TestSharedChildCorruptSeamResolves: a record whose seam does not match
-// ref.Base is rejected and the checkpoint resolves instead. Three
-// corruptions: the suffix starts one past the seam (a hole), the prefix
-// ends one before the seam (the ancestor half is short), and an own key
-// moved in front of a foreign one (interleaved).
+// TestSharedChildCorruptSeamResolves: a record corrupted at its seam is
+// rejected and the checkpoint resolves instead, with the right content.
+// Three corruptions: the suffix starts one past the seam (a hole), the
+// prefix ends one before the seam (the ancestor half is short), and an
+// own key moved in front of a foreign one (interleaved). The first two
+// also break the record's own contiguity, so they do not isolate the
+// comparison with ref.Base (TestSharedChildSeamMustMatchRefBase does);
+// the third isolates the interleaving rule.
 func TestSharedChildCorruptSeamResolves(t *testing.T) {
 	cases := []struct {
 		name string
@@ -579,6 +665,39 @@ func TestSharedChildCorruptSeamResolves(t *testing.T) {
 			mustCheckpointWith(t, w, "app", "child", "c2", CheckpointOptions{})
 			assertSources(t, "checkpoint over a corrupt seam", sources(), "resolve")
 			assertHeadIsCheckout(t, w, "app", "child", "c2", path)
+		})
+	}
+}
+
+// TestSharedChildSeamMustMatchRefBase: the record is left intact and the
+// ref's base pointer is shifted by one either way in memory. The record is
+// contiguous, so this is the only case the comparison of its seam with
+// ref.Base.TXID alone catches: it ties the record to the fork point the
+// ref names, not merely to a well-formed chain.
+func TestSharedChildSeamMustMatchRefBase(t *testing.T) {
+	w := newWS(t)
+	path := sharedChildSeed(t, w)
+	mustSQL(t, path, "INSERT INTO t (v) VALUES (randomblob(100));")
+	mustCheckpointWith(t, w, "app", "child", "c1", CheckpointOptions{})
+	child := refOf(t, w, "app", "child")
+	if _, ok := w.cachedChain(path, child); !ok {
+		t.Fatal("cachedChain rejected the unshifted record")
+	}
+	for _, tc := range []struct {
+		name string
+		txid uint64
+	}{
+		{"base one above the seam", child.Base.TXID + 1},
+		{"base one below the seam", child.Base.TXID - 1},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			shifted := child
+			base := *child.Base
+			base.TXID = tc.txid
+			shifted.Base = &base
+			if _, ok := w.cachedChain(path, shifted); ok {
+				t.Fatalf("cachedChain accepted a record whose seam is at %d with ref.Base.TXID %d", child.Base.TXID, tc.txid)
+			}
 		})
 	}
 }
