@@ -46,12 +46,15 @@ Pin an exact version if you depend on format stability. The full contract:
   the chain the sidecar recorded, validated against the ref's base
   pointer with no store read: the ancestor keys must end exactly at
   `ref.Base.TXID` and the lineage's own must start at
-  `ref.Base.TXID + 1`. `checkout`, a fork below head and materialize
-  still list. A fresh child's second checkpoint after 1,000 checkpoints
-  on its parent read 34.23 and 34.87 ms in two before series and 24.84
-  and 19.99 ms in two after series, run one after another, not
-  alternating ([benchmarks](docs/benchmarks.md)); the saving covers
-  only the checkpoints before the child's first own snapshot.
+  `ref.Base.TXID + 1`. The first checkpoint after a checkout still
+  lists, since no chain is recorded yet, as do `checkout`, a fork below
+  head and materialize. The saving covers the checkpoints from the second
+  up to and including the one that writes the child's own snapshot, which
+  comes when the chain reaches `SnapshotEvery` if set, else
+  `ForkShareMaxDepth` (16). A fresh child's second checkpoint after 1,000
+  checkpoints on its parent read 34.23 and 34.87 ms in two before series
+  and 24.84 and 19.99 ms in two after series, run one after another, not
+  alternating ([benchmarks](docs/benchmarks.md)).
 
 ## [0.2.18] - 2026-10-08
 

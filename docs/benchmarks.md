@@ -816,7 +816,10 @@ empties it, so a directory GC or a failed checkpoint attempt leaves
 behind no longer survives to be listed next time. Neither change touches
 what `Store.Chain` itself walks: `checkout`, a fork below head,
 materialize, and every descendant resolving through the lineage as a
-base still list every epoch directory a *kept* checkpoint left, so the
+base (a descendant's own checkpoints only until its recorded chain
+serves them, from its second checkpoint after a checkout to its own
+snapshot, "A shared child's checkpoints" below) still list every epoch
+directory a *kept* checkpoint left, so the
 table above is unchanged by this work, confirmed by re-running the same
 benchmark on this branch:
 
@@ -902,18 +905,26 @@ read just before and just after each: after 1 (3.01, 4.19), before 1
 | 1,000 | 34230223 ns (34.23 ms) | 34871543 ns (34.87 ms) | 24844883 ns (24.84 ms) | 19985346 ns (19.99 ms) |
 
 Every timed checkpoint in every series wrote a segment (`segments`
-1.000). Before 2 climbs with n, 23.87 → 28.11 → 34.87 ms (+11.0 ms from
-1 to 1,000 checkpoints), the shape of the `Store.Chain` table above.
-Neither after series climbs: after 1 reads 22.36 → 24.24 → 24.84 ms and
-after 2 reads 24.70 → 25.40 → 19.99 ms, its lowest point at n=1,000. At
-n=1,000 the two before series read 34.23 and 34.87 ms and the two after
-series 24.84 and 19.99 ms. Before 1's n=1 and n=100 points (68.68 and
-77.07 ms) are about three times before 2's and did not recur in before
-2; they were not investigated, and before 1's n=1,000 point agrees with
-before 2's. The saving applies only to a shared child's checkpoints
-before its first own snapshot, of which there are fewer than
-`SnapshotEvery` (16 by default) per fork or shared repoint, and fewer
-still the deeper the parent's head chain is; once that snapshot exists a
+1.000). From n=1 to n=1,000, using the ms values in the table, each
+series changes by: before 1, 34.23 − 68.68 = −34.45 ms; before 2,
+34.87 − 23.87 = +11.00 ms (+4.24 ms from 1 to 100, 28.11 − 23.87, then
++6.76 ms from 100 to 1,000, 34.87 − 28.11); after 1, 24.84 − 22.36 =
++2.48 ms (22.36 → 24.24 → 24.84 ms, rising at each step); after 2,
+19.99 − 24.70 = −4.71 ms (24.70 → 25.40 → 19.99 ms). At n=1,000 the two
+before series read 34.23 and 34.87 ms and the two after series 24.84 and
+19.99 ms. Before 1's n=1 and n=100 points (68.68 and 77.07 ms) are 2.88
+and 2.74 times before 2's (68.68 / 23.87 and 77.07 / 28.11) and did not
+recur in before 2; they were not investigated, and before 1's n=1,000
+point agrees with before 2's. The saving is bounded. A shared child's
+first checkpoint after a checkout still lists, since its sidecar holds no
+recorded chain yet. The checkpoints that take the recorded chain instead
+run from the second up to and including the one that writes the child's
+own snapshot, because a checkpoint resolves its head chain before it
+decides between a segment and a snapshot. That snapshot comes when the
+chain reaches the bound, which is `SnapshotEvery` when a daemon sets it
+and `ForkShareMaxDepth` (16) otherwise, so the deeper the parent's head
+chain, the fewer such checkpoints there are: after main's 1,000
+checkpoints, the child's 2nd through 8th. Once that snapshot exists a
 child's checkpoints took the recorded chain before this change too.
 
 **Diagnostic: isolating the ref's own cost.** `BenchmarkSegmentCheckpointRefGrowth`

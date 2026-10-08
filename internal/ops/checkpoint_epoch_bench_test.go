@@ -65,7 +65,9 @@ func seedAtRestCheckpoints(b *testing.B, n int) (*ops.Workspace, string, *sql.DB
 // BenchmarkChainAfterCheckpoints measures resolving a branch's head chain
 // (store.Store.Chain, which checkout, materialize and a fork below head
 // each run, as does every descendant resolving through the lineage as a
-// base) after n sequential at-rest checkpoints on the branch. Each at-rest
+// base, whose own checkpoints list only until its recorded chain serves
+// them, from its second checkpoint after a checkout to its own snapshot)
+// after n sequential at-rest checkpoints on the branch. Each at-rest
 // checkpoint writes under the epoch its lease acquire minted, so on a
 // local store it leaves one more data/<lineage>/<epoch>/ directory, and
 // Local.List walks them all: the cost grows with the checkpoints a lineage
@@ -152,9 +154,10 @@ func BenchmarkSegmentCheckpointAfterCheckpoints(b *testing.B) {
 // did before the recorded chain served one, until the child wrote its own
 // snapshot. A fresh child per iteration keeps every timed checkpoint ahead
 // of that snapshot: one child checkpointing over and over writes its own
-// snapshot within SnapshotEvery checkpoints of the fork (at n=1000 main's
-// head chain is 9 deep, so the child's 8th), after which both paths read
-// only the child's lineage. segments reports the fraction of timed
+// snapshot once its chain reaches the bound (Workspace.SnapshotEvery,
+// else ForkShareMaxDepth; at n=1000 main's head chain is 9 deep, so at the
+// child's 8th checkpoint), after which both paths read only the child's
+// lineage. segments reports the fraction of timed
 // checkpoints that wrote a segment. Only checkpoints=1 runs under -short.
 //
 //	go test ./internal/ops -run '^$' -bench SharedChildCheckpointAfterParentCheckpoints -benchtime=50x

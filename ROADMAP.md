@@ -423,12 +423,14 @@ open wart (its own spec said "N materialized forks cost up to N×G").
   failed checkpoint attempt leaves behind. **Residual, by design:**
   `Store.Chain` itself is unchanged — `checkout`, a fork below head,
   materialize, and every descendant resolving through the lineage as a
-  base still list every epoch directory a *kept* checkpoint left (the
-  table above, unmoved by this work). `compact` still resets the count
-  by making its result self-contained; `rollback` and `promote`, which
-  share via a base pointer by default since v0.2.12, start a new
-  lineage ID but keep resolving through the old lineage's directories
-  until the new one writes its own snapshot or `--materialize` copies it
+  base (a descendant's own checkpoints only until its recorded chain
+  serves them; see the shared-child bullet below) still list every epoch
+  directory a *kept* checkpoint left (the table above, unmoved by this
+  work). `compact` still resets the count by making its result
+  self-contained; `rollback` and `promote`, which share via a base
+  pointer by default since v0.2.12, start a new lineage ID that
+  `checkout`, a fork below head and materialize keep resolving through
+  the old lineage's directories until the new one writes its own snapshot or `--materialize` copies it
   forward — the count moves, it does not reset, in that default case.
   S3 is still unaffected (its listing is flat). A local layout that
   lists a lineage in one directory read would remove the `Store.Chain`
@@ -485,14 +487,17 @@ open wart (its own spec said "N materialized forks cost up to N×G").
   `BenchmarkSharedChildCheckpointAfterParentCheckpoints` (a fresh child's
   second checkpoint after n checkpoints on its parent; two before and two
   after series, run one after another at one-minute load averages 2.62
-  to 4.54): before climbed 23.87 → 28.11 → 34.87 ms at n = 1, 100,
-  1,000 in the second before series, and the two after series read 22.36 /
-  24.24 / 24.84 ms and 24.70 / 25.40 / 19.99 ms, with no climb; the
-  other before series read 68.68 / 77.07 / 34.23 ms, and its two high
-  points did not recur ([benchmarks, "A shared child's
-  checkpoints"](docs/benchmarks.md)). The saving covers only a shared
-  child's checkpoints before its first own snapshot, fewer than
-  `SnapshotEvery` per fork or shared repoint.
+  to 4.54), the series read, at n = 1, 100 and 1,000: before 1, 68.68 /
+  77.07 / 34.23 ms (−34.45 ms from n = 1 to 1,000; its two high points
+  did not recur); before 2, 23.87 / 28.11 / 34.87 ms (+11.00 ms); after
+  1, 22.36 / 24.24 / 24.84 ms (+2.48 ms); after 2, 24.70 / 25.40 /
+  19.99 ms (−4.71 ms) ([benchmarks, "A shared child's
+  checkpoints"](docs/benchmarks.md)). The saving is bounded: a shared
+  child's first checkpoint after a checkout still lists, and the
+  checkpoints served run from the second up to and including the one
+  that writes the child's own snapshot, which comes when the chain
+  reaches `SnapshotEvery` if set, else `ForkShareMaxDepth` (16); after
+  1,000 checkpoints on the parent, that is the child's 2nd through 8th.
 
 ## Launch track (parallel to v0.1–v0.3)
 
