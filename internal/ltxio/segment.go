@@ -4,6 +4,7 @@ import (
 	"bytes"
 	"errors"
 	"fmt"
+	"hash"
 	"io"
 	"os"
 	"path/filepath"
@@ -236,9 +237,12 @@ var dbHeaderMagic = []byte("SQLite format 3\x00")
 // page skipped, ltx.ChecksumFlag set). Every byte it reads is also written
 // to tee, in order, so one read of the file serves both this checksum and
 // whatever digest tee computes; the two run concurrently, each block's tee
-// write on its own goroutine while its pages are folded here. A panic in
-// tee.Write therefore ends the process rather than unwinding to the
-// caller; the hash writers this package is used with do not panic.
+// write on its own goroutine while its pages are folded in two halves on
+// two more (foldPages; the rolling checksum is an XOR fold, so the halves
+// recombine in any order), which brings the pass down to the slower of the
+// tee's digest and half the page checksum. A panic in tee.Write or in a
+// fold therefore ends the process rather than unwinding to the caller; the
+// hash writers this package is used with do not panic.
 //
 // The header check a block must pass before any page of it is folded is:
 // at least 100 bytes (readDBHeader's own minimum), the 16-byte
@@ -254,7 +258,7 @@ var dbHeaderMagic = []byte("SQLite format 3\x00")
 // folded, as ChecksumDatabase ignores them too.
 func StreamChecksum(r io.Reader, tee io.Writer) (uint64, error) {
 	buf := make([]byte, streamBlockSize)
-	h := ltx.NewHasher()
+	h, h2 := ltx.NewHasher(), ltx.NewHasher()
 	chksum := ltx.ChecksumFlag
 	var (
 		pageSize, nPages uint32
@@ -306,13 +310,34 @@ func StreamChecksum(r io.Reader, tee io.Writer) (uint64, error) {
 				done <- err
 			}()
 			if headerErr == nil {
+				// The pages of this block that the header accounts for:
+				// whole pages within the block, up to nPages overall.
 				limit := int64(nPages) * int64(pageSize)
-				for off := int64(0); off+int64(pageSize) <= int64(n) && seen+off < limit; off += int64(pageSize) {
-					pgno := uint32((seen+off)/int64(pageSize)) + 1
-					if pgno != lockPgno {
-						chksum = ltx.ChecksumFlag | (chksum ^ ltx.ChecksumPageWithHasher(h, pgno, block[off:off+int64(pageSize)]))
-					}
-					folded += int64(pageSize)
+				k := int64(n) / int64(pageSize)
+				if remaining := (limit - seen) / int64(pageSize); remaining < k {
+					k = remaining
+				}
+				if k > 0 {
+					firstPgno := uint32(seen/int64(pageSize)) + 1
+					// The rolling checksum is an XOR fold of per-page
+					// checksums (see UpdateChecksum), so the block's pages
+					// fold in two halves on two hashers, concurrently with
+					// each other and with the tee write, and the halves XOR
+					// together; the order never matters. CRC-64 is the
+					// slower digest on this path, so splitting it brings the
+					// pass to within a few milliseconds per 64 MiB of the
+					// tee's own speed (docs/benchmarks.md has the numbers).
+					mid := k / 2
+					var upper uint64
+					upperDone := make(chan struct{})
+					go func() {
+						upper = foldPages(h2, block, pageSize, firstPgno+uint32(mid), lockPgno, mid, k)
+						close(upperDone)
+					}()
+					lower := foldPages(h, block, pageSize, firstPgno, lockPgno, 0, mid)
+					<-upperDone
+					chksum = ltx.ChecksumFlag | (chksum ^ ltx.Checksum(lower) ^ ltx.Checksum(upper))
+					folded += k * int64(pageSize)
 				}
 			}
 			seen += int64(n)
@@ -331,6 +356,27 @@ func StreamChecksum(r io.Reader, tee io.Writer) (uint64, error) {
 		return 0, fmt.Errorf("%w: truncated: %d bytes, header says %d pages of %d", ErrNotWholeDatabase, seen, nPages, pageSize)
 	}
 	return uint64(chksum), nil
+}
+
+// foldPages XORs together the per-page checksums (ltx.ChecksumPageWithHasher
+// on h) of block's pages with indexes [from, to), where index i holds page
+// number firstPgno+i-from at byte offset i*pageSize, skipping lockPgno. Each
+// page checksum carries ltx.ChecksumFlag, so the result's top bit is set
+// after an odd number of pages and clear after an even number; the caller
+// re-ORs the flag after combining, so that bit does not matter.
+// StreamChecksum calls it for the two halves of a block on two hashers at
+// once.
+func foldPages(h hash.Hash64, block []byte, pageSize uint32, firstPgno, lockPgno uint32, from, to int64) uint64 {
+	var acc uint64
+	for i := from; i < to; i++ {
+		pgno := firstPgno + uint32(i-from)
+		if pgno == lockPgno {
+			continue
+		}
+		off := i * int64(pageSize)
+		acc ^= uint64(ltx.ChecksumPageWithHasher(h, pgno, block[off:off+int64(pageSize)]))
+	}
+	return acc
 }
 
 // checksumPages computes the LTX rolling checksum over pages [1, nPages] read
