@@ -19,6 +19,24 @@ Pin an exact version if you depend on format stability. The full contract:
 
 ### Fixed
 
+- **Every reader of a SQLite database header applies one verdict.** The
+  shared header parser (`readDBHeader`, behind `ChecksumDatabase`,
+  `EncodeSnapshot`, `StreamChecksum`, `ApplySegments` and the segment
+  planner's compare of the checkout's header with the shadow's) now
+  refuses a header without the `SQLite format 3` magic or with a page size
+  that is not a power of two in [512, 65536]. Before, that check lived only
+  in `StreamChecksum`: `ChecksumDatabase`, which a daemon session runs over
+  its replica, divided by zero in the lock-page computation on a file whose
+  header decoded to a page size of 0 (any all-zero file), and so did the
+  segment planner when both the checkout and its shadow had been
+  overwritten after the quiesce; a page size that is not a power of two
+  gave `ChecksumDatabase` a wrong checksum with no error. `EncodeSnapshot`
+  already failed on such a header, through the LTX encoder, with a less
+  specific message. An at-rest `checkpoint` of an overwritten checkout
+  already failed before any of this, when SQLite refused to open the file
+  (`TestReadDBHeaderValidatesMagicAndPageSize`,
+  `TestChecksumDatabaseRejectsBadHeader`, `TestEncodeSnapshotRejectsBadHeader`,
+  `TestApplySegmentsRejectsBadStartHeader`).
 - **A create, rollback, promote, compact or fork whose ref write landed
   but came back as an error no longer deletes the new lineage it just
   wrote.** The S3 SDK's retry answering 412 to its own first attempt, or a
