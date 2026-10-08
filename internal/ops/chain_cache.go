@@ -122,8 +122,11 @@ func (w *Workspace) cachedChain(path string, ref store.Ref) ([]store.ChainMember
 	return members, true
 }
 
-// headChain is the head's chain for a checkpoint or a fork at head: the
-// sidecar's recorded chain when cachedChain accepts it, else store.Chain.
+// headChain resolves the chain at a ref's head for every caller that
+// resolves exactly the head: a segment checkpoint, a fork at head, a
+// promote (which always resolves its source's head) and a rollback to the
+// head's own checkpoint. It returns the sidecar's recorded chain when
+// cachedChain accepts it, and otherwise falls back to store.Chain.
 func (w *Workspace) headChain(path string, ref store.Ref) ([]store.ChainMember, error) {
 	if members, ok := w.cachedChain(path, ref); ok {
 		if observeChainSource != nil {

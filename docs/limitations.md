@@ -362,10 +362,14 @@ milliseconds don't):
   "Diagnostic: isolating the ref's own
   cost"](benchmarks.md#branchbench-topologies-v0212)). A
   branch that checkpoints after every step of a long run still slows its
-  `checkout`/`fork` path until a `compact` starts a fresh lineage (or,
-  for the default shared `rollback`/`promote`, until the new lineage
-  writes its own snapshot — a shared repoint moves the cost, it does not
-  reset it) ([the numbers](benchmarks.md#branchbench-topologies-v0212)).
+  `checkout` and fork-below-head path until a `compact` starts a fresh
+  lineage (or, for the default shared `rollback`/`promote`, until the new
+  lineage writes its own snapshot — a shared repoint moves the cost, it
+  does not reset it) ([the numbers](benchmarks.md#branchbench-topologies-v0212)).
+  The shared lineage's own checkpoints no longer pay it each time: only
+  its first checkpoint after a checkout lists, and later ones, a fork at
+  its head, a promote of it and a rollback to its head reuse the chain
+  that checkpoint recorded.
 
 ## Smaller edges worth knowing
 

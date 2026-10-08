@@ -453,24 +453,46 @@ open wart (its own spec said "N materialized forks cost up to N×G").
   decoded whole on every checkpoint; or a bound on how many named
   checkpoints `Checkpoints` keeps, with older ones falling back to a
   slower listing) would close this, at the cost of a format change.
-- ⏭ **Extend the recorded-chain cache to shared child lineages.** A
-  lineage that still resolves through a base pointer (a fresh fork or a
-  promote/rollback that kept the base spine) records a chain whose first
-  keys name the base lineage, which the binding check above rejects (it
-  requires every key on `ref.Lineage`), so such a lineage keeps listing
-  until it writes its own snapshot. The shortcut can extend to it without
-  any store read: key the cache on the base spine, and validate a
-  recorded chain against `ref.Base` alone — the child's own keys must be
-  a contiguous segment suffix starting at `ref.Base.TXID + 1`, and the
-  prefix (the keys on the base lineage) must end exactly at
-  `ref.Base.TXID` and start with a snapshot. Promote and Rollback's head
-  resolve should adopt the same shortcut once it exists, since they
-  resolve a head the same way a checkout does. Test matrix: a shared
-  child checkpointing before it has its own snapshot, and again after;
-  a pass-through spine (base-of-a-base) read against an old store; the
-  base lineage destroyed and GC'd while the child keeps checkpointing;
-  and a corrupt seam (the suffix does not actually start at
-  `ref.Base.TXID + 1`, or the prefix does not end there).
+- ✅ **Extend the recorded-chain cache to shared child lineages —
+  shipped.** A lineage that still resolves through a base pointer (a
+  fresh fork, or a promote or rollback that kept the base spine) records
+  a chain whose first keys name the base lineages, which the binding
+  check above used to reject, so such a lineage listed on every segment
+  checkpoint until it wrote its own snapshot. The recorded chain now
+  serves it with no store read: the keys on other lineages must start
+  with a snapshot and end exactly at `ref.Base.TXID`, and the lineage's
+  own keys must be a contiguous run of segments starting at
+  `ref.Base.TXID + 1`. Promote and a rollback to the head's own
+  checkpoint now resolve the head through the same shortcut as a
+  checkpoint and a fork at head. The test matrix that pins it, in
+  `internal/ops/chain_cache_test.go`:
+  `TestSharedChildSecondCheckpointUsesTheRecordedChain` and
+  `TestSharedChildAfterOwnSnapshotUsesOwnChain` (a shared child
+  checkpointing before its own snapshot, and after),
+  `TestPassThroughSpineUsesTheRecordedChain` and
+  `TestTwoHopSpineUsesTheRecordedChain` (a base-of-a-base spine),
+  `TestSharedChildCacheSurvivesBaseDestroyAndGC` (the base branch
+  destroyed and GC'd while the child keeps checkpointing),
+  `TestSharedChildCorruptSeamResolves` (a suffix that does not start at
+  `ref.Base.TXID + 1`, a prefix that does not end there, or an own key
+  in front of an ancestor's), `TestSharedChildSeamMustMatchRefBase` (an
+  intact record against `ref.Base.TXID` shifted by one either way),
+  `TestForeignKeysWithoutBaseResolve`,
+  `TestForkOfSharedChildAtHeadUsesTheRecordedChain`,
+  `TestForkAfterOwnSnapshotFirstResolvesThenHits`,
+  `TestPromoteAtHeadUsesTheRecordedChain` and
+  `TestRollbackToHeadUsesTheRecordedChain`. Measured with
+  `BenchmarkSharedChildCheckpointAfterParentCheckpoints` (a fresh child's
+  second checkpoint after n checkpoints on its parent; two before and two
+  after series, run one after another at one-minute load averages 2.62
+  to 4.54): before climbed 23.87 → 28.11 → 34.87 ms at n = 1, 100,
+  1,000 in the second before series, and the two after series read 22.36 /
+  24.24 / 24.84 ms and 24.70 / 25.40 / 19.99 ms, with no climb; the
+  other before series read 68.68 / 77.07 / 34.23 ms, and its two high
+  points did not recur ([benchmarks, "A shared child's
+  checkpoints"](docs/benchmarks.md)). The saving covers only a shared
+  child's checkpoints before its first own snapshot, fewer than
+  `SnapshotEvery` per fork or shared repoint.
 
 ## Launch track (parallel to v0.1–v0.3)
 

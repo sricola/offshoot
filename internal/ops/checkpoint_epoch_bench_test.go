@@ -138,6 +138,80 @@ func BenchmarkSegmentCheckpointAfterCheckpoints(b *testing.B) {
 	}
 }
 
+// BenchmarkSharedChildCheckpointAfterParentCheckpoints measures a shared
+// child's second at-rest segment checkpoint (of a one-row insert) after its
+// parent took n sequential at-rest checkpoints. Each iteration forks a fresh
+// child at main's head, checks it out and takes the child's first
+// checkpoint, all untimed, and then times the child's second checkpoint.
+// The fork shares main's lineage as its base, so the child's chain spans
+// two lineages: main's (n+1 epoch directories on a local store) and the
+// child's own. The first checkpoint records that chain in the child
+// checkout's sidecar; the second takes it from there when the recorded
+// chain is accepted for a shared child lineage, and otherwise lists main's
+// epoch directories and the child's, as every checkpoint of a shared child
+// did before the recorded chain served one, until the child wrote its own
+// snapshot. A fresh child per iteration keeps every timed checkpoint ahead
+// of that snapshot: one child checkpointing over and over writes its own
+// snapshot within SnapshotEvery checkpoints of the fork (at n=1000 main's
+// head chain is 9 deep, so the child's 8th), after which both paths read
+// only the child's lineage. segments reports the fraction of timed
+// checkpoints that wrote a segment. Only checkpoints=1 runs under -short.
+//
+//	go test ./internal/ops -run '^$' -bench SharedChildCheckpointAfterParentCheckpoints -benchtime=50x
+func BenchmarkSharedChildCheckpointAfterParentCheckpoints(b *testing.B) {
+	for _, n := range epochBenchCounts {
+		b.Run(fmt.Sprintf("checkpoints=%d", n), func(b *testing.B) {
+			w, _, mainDB := seedAtRestCheckpoints(b, n)
+			if err := mainDB.Close(); err != nil {
+				b.Fatal(err)
+			}
+			segments := 0
+			b.ResetTimer()
+			for i := 0; i < b.N; i++ {
+				b.StopTimer()
+				child := fmt.Sprintf("child%d", i)
+				if _, err := w.Fork("app", "main", child, "", 0, nil); err != nil {
+					b.Fatal(err)
+				}
+				path, err := w.Checkout("app", child)
+				if err != nil {
+					b.Fatal(err)
+				}
+				db, err := sql.Open("sqlite3", path)
+				if err != nil {
+					b.Fatal(err)
+				}
+				db.SetMaxOpenConns(1)
+				db.SetMaxIdleConns(0)
+				if _, err := db.Exec("INSERT INTO t (v) VALUES (randomblob(200))"); err != nil {
+					b.Fatal(err)
+				}
+				if _, err := w.CheckpointWith("app", child, "first", nil, ops.CheckpointOptions{}); err != nil {
+					b.Fatal(err)
+				}
+				if _, err := db.Exec("INSERT INTO t (v) VALUES (randomblob(200))"); err != nil {
+					b.Fatal(err)
+				}
+				b.StartTimer()
+				res, err := w.CheckpointWith("app", child, "second", nil, ops.CheckpointOptions{})
+				b.StopTimer()
+				if err != nil {
+					b.Fatal(err)
+				}
+				if res.Kind == "segment" {
+					segments++
+				}
+				if err := db.Close(); err != nil {
+					b.Fatal(err)
+				}
+				b.StartTimer()
+			}
+			b.StopTimer()
+			b.ReportMetric(float64(segments)/float64(b.N), "segments")
+		})
+	}
+}
+
 // BenchmarkSegmentCheckpointRefGrowth isolates whether
 // BenchmarkSegmentCheckpointAfterCheckpoints's small residual climb across
 // n (25.5 -> 30.3 ms, 1 -> 1,000 checkpoints, 2026-10-06) comes from the

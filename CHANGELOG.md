@@ -36,6 +36,22 @@ Pin an exact version if you depend on format stability. The full contract:
   single-worker `failure_repro` checkpoint p50 went from 60.8 / 60.5 /
   60.3 ms to 51.8 / 51.3 / 52.2 ms, alternating v0.2.18 with this change
   run by run ([benchmarks](docs/benchmarks.md)).
+- **A shared child lineage reuses its recorded chain.** A lineage that
+  still resolves through a base pointer (a fresh fork, or a shared
+  `rollback` or `promote`) used to list its base lineage's epoch
+  directories and its own on every segment checkpoint until it wrote its
+  own snapshot, because the sidecar's recorded chain was accepted only
+  when every key was the lineage's own. Its checkpoints, a fork at its
+  head, a promote and a rollback to the head's own checkpoint now reuse
+  the chain the sidecar recorded, validated against the ref's base
+  pointer with no store read: the ancestor keys must end exactly at
+  `ref.Base.TXID` and the lineage's own must start at
+  `ref.Base.TXID + 1`. `checkout`, a fork below head and materialize
+  still list. A fresh child's second checkpoint after 1,000 checkpoints
+  on its parent read 34.23 and 34.87 ms in two before series and 24.84
+  and 19.99 ms in two after series, run one after another, not
+  alternating ([benchmarks](docs/benchmarks.md)); the saving covers
+  only the checkpoints before the child's first own snapshot.
 
 ## [0.2.18] - 2026-10-08
 
