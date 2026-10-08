@@ -207,6 +207,144 @@ func ChecksumDatabase(dbPath string) (uint64, error) {
 	return uint64(chksum), nil
 }
 
+// streamBlockSize is the number of bytes StreamChecksum reads at a time. It
+// must stay a multiple of 65536 (and so, trivially, at least 100 bytes):
+// every valid SQLite page size (a power of two from 512 to 65536, the range
+// checkStreamHeader enforces below) then divides it evenly, so a page never
+// straddles two blocks, and the first block always holds the whole 100-byte
+// file header. Tests lower it, while preserving that property, to cross
+// block boundaries cheaply.
+var streamBlockSize = 1 << 20
+
+// ErrNotWholeDatabase is wrapped by every StreamChecksum error that is a
+// verdict on the bytes themselves, rather than a failure to read or tee
+// them: a header that is too short for readDBHeader's 100-byte minimum, a
+// header whose magic or page size fails checkStreamHeader, or a file that
+// ends before its header's nPages*pageSize bytes. By the time it is
+// returned, the tee has already received the whole file.
+var ErrNotWholeDatabase = errors.New("not a whole database")
+
+// dbHeaderMagic is the fixed byte string every valid SQLite database file
+// begins with, including the trailing NUL. Checking it is the cheapest real
+// test for "this is not a database at all"; StreamChecksum applies it
+// itself because readDBHeader does not.
+var dbHeaderMagic = []byte("SQLite format 3\x00")
+
+// checkStreamHeader rejects a header that readDBHeader parsed syntactically
+// (any file of at least 100 bytes satisfies that parse; readDBHeader never
+// looks at the magic bytes, and treats every 16-bit value as a page size)
+// but that is not a legitimate SQLite database header: hdr's first 16 bytes
+// must equal dbHeaderMagic, and pageSize must be a power of two in [512,
+// 65536]. Without this check, a page size of 0 — which any all-zero header
+// produces — sends ltx.LockPgno(pageSize) into a division by zero below,
+// and any other out-of-range or non-power-of-two page size misaligns
+// StreamChecksum's per-block page fold against the page boundaries
+// ChecksumDatabase uses, producing either a wrong checksum with a nil error
+// or a false truncation error instead of a header verdict.
+//
+// hdr must hold at least 100 bytes, which readDBHeader already guarantees
+// whenever it returns a nil error, so indexing hdr[:16] here is always safe.
+func checkStreamHeader(hdr []byte, pageSize uint32) error {
+	if !bytes.Equal(hdr[:len(dbHeaderMagic)], dbHeaderMagic) {
+		return fmt.Errorf("header: missing the %q magic", dbHeaderMagic)
+	}
+	if pageSize < 512 || pageSize > 65536 || pageSize&(pageSize-1) != 0 {
+		return fmt.Errorf("header: page size %d is not a power of two in [512, 65536]", pageSize)
+	}
+	return nil
+}
+
+// StreamChecksum reads a SQLite database from r to EOF, in blocks of
+// streamBlockSize bytes, and returns its LTX rolling checksum, the same
+// value ChecksumDatabase computes for the file (pages 1..nPages, the lock
+// page skipped, ltx.ChecksumFlag set). Every byte it reads is also written
+// to tee, in order, so one read of the file serves both this checksum and
+// whatever digest tee computes; the two run concurrently, each block's tee
+// write on its own goroutine while its pages are folded here.
+//
+// The header check a block must pass before any page of it is folded is:
+// at least 100 bytes (readDBHeader's own minimum), the 16-byte
+// "SQLite format 3\x00" magic, and a page size that is a power of two in
+// [512, 65536] (checkStreamHeader). Failing any part of that, or a file
+// that ends before the header's nPages*pageSize bytes, is a verdict on the
+// bytes: StreamChecksum keeps draining r into tee regardless, and returns
+// the verdict wrapped in ErrNotWholeDatabase only once r is exhausted, so a
+// caller hashing the tee always ends up holding the hash of the whole file.
+// A read error from r or a write error from tee, by contrast, returns at
+// once, unwrapped, since there is no point draining towards a tee that is
+// itself broken. Bytes past nPages*pageSize are written to tee and not
+// folded, as ChecksumDatabase ignores them too.
+func StreamChecksum(r io.Reader, tee io.Writer) (uint64, error) {
+	buf := make([]byte, streamBlockSize)
+	h := ltx.NewHasher()
+	chksum := ltx.ChecksumFlag
+	var (
+		pageSize, nPages uint32
+		lockPgno         uint32
+		headerErr        error
+		headerRead       bool
+		folded           int64 // bytes folded into chksum so far
+		seen             int64 // bytes read so far
+	)
+	for {
+		n, rerr := io.ReadFull(r, buf)
+		if rerr != nil && rerr != io.EOF && rerr != io.ErrUnexpectedEOF {
+			return 0, rerr
+		}
+		block := buf[:n]
+		// The header is parsed and validated from the first block read,
+		// even an empty one (an empty file never satisfies readDBHeader's
+		// 100-byte minimum, so this is where an empty file's error comes
+		// from; without checking here regardless of n, a reader that
+		// returns n=0 on its very first call would never have its header
+		// checked at all).
+		if !headerRead {
+			headerRead = true
+			pageSize, nPages, headerErr = readDBHeader(bytes.NewReader(block))
+			if headerErr == nil {
+				headerErr = checkStreamHeader(block, pageSize)
+			}
+			if headerErr == nil {
+				lockPgno = ltx.LockPgno(pageSize)
+			}
+		}
+		if n > 0 {
+			done := make(chan error, 1)
+			go func() {
+				wn, err := tee.Write(block)
+				if err == nil && wn != len(block) {
+					err = io.ErrShortWrite
+				}
+				done <- err
+			}()
+			if headerErr == nil {
+				limit := int64(nPages) * int64(pageSize)
+				for off := int64(0); off+int64(pageSize) <= int64(n) && seen+off < limit; off += int64(pageSize) {
+					pgno := uint32((seen+off)/int64(pageSize)) + 1
+					if pgno != lockPgno {
+						chksum = ltx.ChecksumFlag | (chksum ^ ltx.ChecksumPageWithHasher(h, pgno, block[off:off+int64(pageSize)]))
+					}
+					folded += int64(pageSize)
+				}
+			}
+			seen += int64(n)
+			if err := <-done; err != nil {
+				return 0, err
+			}
+		}
+		if rerr != nil { // io.EOF or io.ErrUnexpectedEOF: r is exhausted
+			break
+		}
+	}
+	if headerErr != nil {
+		return 0, fmt.Errorf("%w: %w", ErrNotWholeDatabase, headerErr)
+	}
+	if want := int64(nPages) * int64(pageSize); folded < want {
+		return 0, fmt.Errorf("%w: truncated: %d bytes, header says %d pages of %d", ErrNotWholeDatabase, seen, nPages, pageSize)
+	}
+	return uint64(chksum), nil
+}
+
 // checksumPages computes the LTX rolling checksum over pages [1, nPages] read
 // from src, skipping the lock page — the same convention EncodeSnapshot uses
 // when it computes a snapshot's post-apply checksum. src must have at least
@@ -474,96 +612,6 @@ func applySegments(f *os.File, pageSize uint32, prevMaxTXID uint64, prevCommit u
 	}
 
 	return prevMaxTXID, uint64(runningChecksum), nil
-}
-
-// streamBlockSize is the number of bytes StreamChecksum reads at a time.
-// Every SQLite page size (512 to 65536) divides 1 MiB, so a page never
-// straddles two blocks. Tests lower it to cross block boundaries cheaply.
-var streamBlockSize = 1 << 20
-
-// ErrNotWholeDatabase is wrapped by every StreamChecksum error that is a
-// verdict on the bytes (a header that does not parse, a file shorter than
-// its header's page count) rather than a failure to read or tee them; by
-// the time it is returned the tee has received the whole file.
-var ErrNotWholeDatabase = errors.New("ltxio: not a whole database")
-
-// StreamChecksum reads a SQLite database from r to EOF and returns its LTX
-// rolling checksum, the same value ChecksumDatabase computes for the file
-// (pages 1..nPages, the lock page skipped, ltx.ChecksumFlag set). Every byte
-// it reads is also written to tee, in order, so one read of the file serves
-// both this checksum and whatever digest tee computes; the two run
-// concurrently, each block's tee write on its own goroutine while its pages
-// are folded here.
-//
-// The tee receives the whole of r in every case but a read or tee error: a
-// file whose header does not parse (readDBHeader, which covers files shorter
-// than 100 bytes) and a file that ends before the header's nPages*pageSize
-// bytes are both drained into tee before their error is returned, so a
-// caller hashing the tee always holds the hash of the whole file. Bytes past
-// nPages*pageSize are written to tee and not folded, as ChecksumDatabase
-// ignores them.
-func StreamChecksum(r io.Reader, tee io.Writer) (uint64, error) {
-	buf := make([]byte, streamBlockSize)
-	h := ltx.NewHasher()
-	chksum := ltx.ChecksumFlag
-	var (
-		pageSize, nPages uint32
-		lockPgno         uint32
-		headerErr        error
-		headerRead       bool
-		folded           int64 // bytes folded into chksum so far
-		seen             int64 // bytes read so far
-	)
-	for {
-		n, rerr := io.ReadFull(r, buf)
-		if rerr != nil && rerr != io.EOF && rerr != io.ErrUnexpectedEOF {
-			return 0, rerr
-		}
-		block := buf[:n]
-		// The header is parsed from the first block read, even an empty one
-		// (an empty file never satisfies readDBHeader's 100-byte minimum, so
-		// this is where an empty file's error comes from; without it, a
-		// reader that returns n=0 on its very first call would never have
-		// its header checked at all).
-		if !headerRead {
-			headerRead = true
-			pageSize, nPages, headerErr = readDBHeader(bytes.NewReader(block))
-			if headerErr == nil {
-				lockPgno = ltx.LockPgno(pageSize)
-			}
-		}
-		if n > 0 {
-			done := make(chan error, 1)
-			go func() {
-				_, err := tee.Write(block)
-				done <- err
-			}()
-			if headerErr == nil {
-				limit := int64(nPages) * int64(pageSize)
-				for off := int64(0); off+int64(pageSize) <= int64(n) && seen+off < limit; off += int64(pageSize) {
-					pgno := uint32((seen+off)/int64(pageSize)) + 1
-					if pgno != lockPgno {
-						chksum = ltx.ChecksumFlag | (chksum ^ ltx.ChecksumPageWithHasher(h, pgno, block[off:off+int64(pageSize)]))
-					}
-					folded += int64(pageSize)
-				}
-			}
-			seen += int64(n)
-			if err := <-done; err != nil {
-				return 0, err
-			}
-		}
-		if rerr != nil { // io.EOF or io.ErrUnexpectedEOF: r is exhausted
-			break
-		}
-	}
-	if headerErr != nil {
-		return 0, fmt.Errorf("%w: %v", ErrNotWholeDatabase, headerErr)
-	}
-	if want := int64(nPages) * int64(pageSize); folded < want {
-		return 0, fmt.Errorf("%w: truncated: %d bytes, header says %d pages of %d", ErrNotWholeDatabase, seen, nPages, pageSize)
-	}
-	return uint64(chksum), nil
 }
 
 // ErrUncarriedGrowth reports a commit that grows the database past pages
