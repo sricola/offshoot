@@ -17,6 +17,19 @@ Pin an exact version if you depend on format stability. The full contract:
 
 ## [Unreleased]
 
+Nothing yet.
+
+## [0.2.19] - 2026-10-08
+
+The at-rest checkpoint's stamp verifies the checkout's content from the one
+read it already makes, which removes the second pass v0.2.16 added and
+brings the single-worker checkpoint back to about v0.2.15's cost with the
+content checked every time; a shared child lineage reuses its recorded
+chain until it writes its own snapshot; a repoint or create whose ref write
+landed but reported a failure keeps its lineage's objects instead of
+deleting them; and every reader of a SQLite database header refuses a
+header that is not one.
+
 ### Fixed
 
 - **Every reader of a SQLite database header applies one verdict.** The
