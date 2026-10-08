@@ -551,13 +551,12 @@ That is 2,310 forks in all (one per worker-step). The whole table takes
 
 **Machine:** as the header line below reports — darwin/arm64, Apple M5, macOS
 27.0.1, local APFS disk, local-directory store backend, no network, measured
-2026-10-08. The machine was not idle: the desktop's other applications were
-running, and `uptime` read load averages 3.39 3.79 3.48 just before the run
-and 4.03 3.94 3.58 just after it. Raw stdout of `make bench-branchbench`
-with its defaults (all five workflows, concurrency 8, 10 warehouses, 2h
-per-workflow cap), pasted verbatim, minus the two lines make prints first
-(the target's notice and its echoed `go run` line) and the per-workflow
-progress lines on stderr:
+2026-10-08. The machine was not idle: `uptime` read load averages 3.39 3.79
+3.48 just before the run and 4.03 3.94 3.58 just after it. Raw stdout of
+`make bench-branchbench` with its defaults (all five workflows,
+concurrency 8, 10 warehouses, 2h per-workflow cap), pasted verbatim, minus
+the two lines make prints first (the target's notice and its echoed
+`go run` line) and the per-workflow progress lines on stderr:
 
 darwin/arm64, Apple M5, 10 cores, Go 1.27.1, offshoot v0.2.18-5-ge503ddf, measured 2026-10-08, seed 17 MiB, concurrency 8
 
@@ -639,9 +638,9 @@ operations. Between the two builds lie v0.2.14 through v0.2.18, including
 the checkpoint lease below (one more durable ref write per checkpoint), as
 well as the stamp change. The two runs were also on different days under
 different load, the earlier recorded as having no other load and this one
-at load average 3 to 4, so no single change accounts for the difference
-between the two tables: only the alternating pairs below are a controlled
-comparison.
+at one-minute load averages of 3.39 before it and 4.03 after it, so no
+single change accounts for the difference between the two tables: only
+the alternating pairs below are a controlled comparison.
 
 ### Measured changes and context
 
@@ -690,34 +689,51 @@ real S3 endpoint.
 
 **The stamp hashes once again.** After its head write, an at-rest
 checkpoint stamps the checkout's `.sum` sidecar, and the stamp is trusted
-only when the checkout holds what the store's head holds. Until v0.2.16 it
-took that from a shortcut: the encode's checksum, whenever the checkout's
-size/mtime fingerprint still matched the one taken right after quiesce. A
-same-size write in the same mtime tick could keep that match with the
-content changed, so v0.2.16 (`6714394`) applied `checkout`'s 1 s
-racily-clean margin to the shortcut and, inside the margin, checksummed
-the live database instead ([changelog](../CHANGELOG.md)). A checkout
-written within the second before its checkpoint — every BranchBench
-checkpoint, which follows its step's writes — is inside the margin, so
-those stamps read the whole checkout twice: once for the sidecar's
-SHA-256 and once more for `ltxio.ChecksumDatabase`. Measured the same day
-as the pairs below, alternating builds: single-worker `failure_repro`
-checkpoint p50 was 45.5 / 45.5 / 45.7 ms on v0.2.15 and 56.2 / 55.5 /
-56.7 ms on v0.2.16, and 45.9 / 46.4 / 45.1 ms on `6714394`'s parent
-`160cc8c` against 57.4 / 55.3 / 56.7 ms on `6714394`; eight-way
-`simulation` checkpoint p50 was 110.9 and 98.4 ms on v0.2.13 against 126.2
-and 126.2 ms on v0.2.18 (wall 47.1 / 43.6 s against 47.0 / 47.6 s), a span
-that also includes the lease above. The stamp now reads the checkout once:
-`ltxio.StreamChecksum` folds the LTX page checksum over the same read that
-feeds the sidecar's SHA-256, the two digests computed concurrently, and the
-stamp is trusted only when that checksum equals the head's and no WAL
-frames sit beside the file. There is no shortcut on the stamp any more, so
-no margin either (`checkout`'s fingerprint fast path keeps its margin), and
-the content check runs on every stamp. Measured 2026-10-08 on the machine
-above, alternating a build of `d8c81f8` (v0.2.18, before) with one of
-`e503ddf` (after) run by run. `uptime` read load averages 4.30 3.89 3.39
-before and 3.94 3.83 3.38 after the `failure_repro` series, and 3.79 3.79
-3.37 before and 3.82 3.88 3.51 after the `simulation` series:
+only when the checkout holds what the store's head holds. Before v0.2.16
+it took that from a shortcut: the encode's checksum, whenever the
+checkout's size/mtime fingerprint still matched the one taken right after
+quiesce. A same-size write in the same mtime tick could keep that match
+with the content changed, so v0.2.16 (`6714394`) applied `checkout`'s 1 s
+racily-clean margin to the shortcut: from v0.2.16 through v0.2.18 the stamp
+trusted a matching fingerprint only once it was settled, and otherwise
+checksummed the live database a second time
+([changelog](../CHANGELOG.md)). A checkout written within the second
+before its checkpoint — every BranchBench checkpoint, which follows its
+step's writes — is not settled, so those stamps read the whole checkout
+twice: once for the sidecar's SHA-256 and once more for
+`ltxio.ChecksumDatabase`.
+
+Earlier the same day, on the machine described under the 2026-10-08 table,
+each tag (and `6714394` and its parent `160cc8c`) was built from a
+`git archive` of it into a clean directory and run with alternating builds
+within each series; the figures below are the checkpoint column of the
+harness's own rows. The raw rows and their `uptime` readings are kept at
+`.superpowers/bench-raw/2026-10-08-stamp-single-pass/same-day-tag-series.txt`,
+a git-ignored path in the maintainer's checkout, not in the repository.
+Single-worker
+`failure_repro` checkpoint p50 was 45.5 / 45.5 / 45.7 ms on v0.2.15 and
+56.2 / 55.5 / 56.7 ms on v0.2.16, alternating with v0.2.14 in the same
+series, at load averages 2.04 before and 2.50 after it; and 45.9 / 46.4 /
+45.1 ms on `160cc8c` against 57.4 / 55.3 / 56.7 ms on `6714394`, in a
+series run directly after it for which no `uptime` was recorded. By the
+medians, v0.2.16 added 10.7 ms (56.2 − 45.5) and `6714394` alone added
+10.8 ms (56.7 − 45.9). Eight-way `simulation` checkpoint p50 was 110.9 and
+98.4 ms on v0.2.13 against 126.2 and 126.2 ms on v0.2.18 (wall 47.1 /
+43.6 s against 47.0 / 47.6 s), at load averages that read 2.97 before the
+first run, 3.30, 5.00 and 5.35 between runs, and 4.57 after the last; that
+span also includes the lease above.
+
+The stamp now reads the checkout once: `ltxio.StreamChecksum` folds the LTX
+page checksum over the same read that feeds the sidecar's SHA-256, the two
+digests computed concurrently, and the stamp is trusted only when that
+checksum equals the head's and no WAL frames sit beside the file. There is
+no shortcut on the stamp any more, so no margin either (`checkout`'s
+fingerprint fast path keeps its margin), and the content check runs on
+every stamp. Measured 2026-10-08 on the machine described under the
+2026-10-08 table, alternating a build of `d8c81f8` (v0.2.18, before) with
+one of `e503ddf` (after) run by run. `uptime` read load averages 4.30 3.89
+3.39 before and 3.94 3.83 3.38 after the `failure_repro` series, and 3.79
+3.79 3.37 before and 3.82 3.88 3.51 after the `simulation` series:
 
 | Run | Checkpoint p50, before → after | Checkpoint p99, before → after | Wall, before → after |
 |---|---|---|---|
@@ -728,24 +744,23 @@ before and 3.94 3.83 3.38 after the `failure_repro` series, and 3.79 3.79
 | `simulation`, concurrency 8, round 2 | 125.8 → 125.4 ms | 181.2 → 173.0 ms | 46.5 → 47.8 s |
 
 One at a time, every after run's checkpoint p50 sits below every before
-run's: by the medians, 60.5 → 51.8 ms, 8.7 ms lower (about 14%: 8.7 /
-60.5), and the p99 is lower in every round. For scale, the same-day
-medians above put what v0.2.16 added at 10.7 ms (45.5 → 56.2) and what
-`6714394` itself added at 10.8 ms (45.9 → 56.7); those come from a
-different series than these pairs, so the deltas are not directly
-comparable, and neither is the after build's 51.8 ms with v0.2.15's
-45.5 ms, with the lease between them besides. Eight at a time, these two
-rounds do not resolve the change: each after run's p50 is below its before
-run's (by 6.1 ms and 0.4 ms), but the two before runs differ from each
-other by 17.8 ms, far more than either pair, and round 2's wall time went
-the wrong way (46.5 → 47.8 s). What remains is one pass: the stamp still
-reads the whole checkout for the sidecar's hash, now carrying both digests
-concurrently. In memory, that pass is slower than the SHA-256-only pass the
-stamp made when it took the shortcut before v0.2.16: in a 64 MiB
-micro-benchmark measured the same day,
-SHA-256 alone ran at 3.5 GB/s, the LTX page checksum alone at 2.4 GB/s,
-the two one after the other at 1.4 GB/s and the two concurrently at 2.36
-GB/s.
+run's: by the medians, 51.8 ms against 60.5 ms, 8.7 ms lower (60.5 − 51.8;
+about 14%: 8.7 / 60.5), and the p99 is lower in every round. The 10.7 and
+10.8 ms above come from different series than these pairs, so the deltas
+are not directly comparable, and neither is the after build's 51.8 ms
+with v0.2.15's 45.5 ms, with the lease between them besides. Eight at a
+time, these two rounds do not resolve the change: each after run's p50 is
+below its before run's (by 6.1 ms and 0.4 ms), but the two before runs
+differ from each other by 17.8 ms, far more than either pair, and round
+2's wall time went the wrong way (46.5 → 47.8 s). What remains is one
+pass: the stamp still reads the whole checkout for the sidecar's hash, now
+carrying both digests concurrently. In memory, that pass is slower than
+the SHA-256-only pass the stamp made when it took the shortcut (before
+v0.2.16 on any matching fingerprint, from v0.2.16 through v0.2.18 on a
+settled one): a 64 MiB micro-benchmark run the same day (random bytes,
+4 KiB pages, archived in the same file) printed 3484.77 MB/s for SHA-256
+alone, 2389.76 MB/s for the LTX page checksum alone, 1413.46 MB/s for the
+two one after the other and 2357.63 MB/s for the two concurrently.
 
 **On a local store, chain resolution slows as at-rest checkpoints
 accumulate on one lineage.** Each checkpoint writes under the epoch its
@@ -1066,7 +1081,10 @@ Finishing all five in minutes is not evidence that offshoot "beats" Dolt or
 Neon at anything they were measured on; it is what these five topologies cost
 on a local copy-on-write SQLite store.
 
-**What the numbers do and do not show.**
+**What the numbers do and do not show.** These bullets were written
+against the 2026-09-30 run of this table (`v0.2.11-15-g67cc6b1-dirty`),
+which neither table above replaces cell for cell: the cells they quote,
+and "the table" and "this run" in them, are that run's.
 
 - **Reads do not get slower with depth.** That is the axis BranchBench's
   "5-4000x slower reads as branches deepen" finding lives on, and it is why

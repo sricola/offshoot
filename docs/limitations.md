@@ -43,8 +43,9 @@ catches something outside offshoot replacing the object; and the one read
 that hashes the checkout for its sidecar stamp also computes the
 checkout's LTX checksum, which must equal the head's, so a write to the
 checkout between the encode and the stamp is caught, even a same-size one
-that leaves its size and mtime unchanged. When either finds the store's head may differ from the checkout,
-it stamps no checksum and a hash no file can match: the checkout reads as
+that leaves its size and mtime unchanged. When either finds the store's
+head may differ from the checkout, it stamps no checksum and a hash no
+file can match: the checkout reads as
 having un-checkpointed changes, so `fork` warns and `checkout` says it is
 overwriting them, the shadow is dropped, the next checkpoint writes a full
 snapshot, and `offshoot_checkpoint_overwrite_detected_total` counts it.
