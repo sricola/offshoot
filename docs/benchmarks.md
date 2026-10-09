@@ -549,6 +549,28 @@ That is 2,310 forks in all (one per worker-step). The whole table takes
   concurrency rather than accumulation — worth keeping in mind next to Neon's
   20-live-branch ceiling quoted below.
 
+**A single pasted run doesn't catch drift between releases; `make bench-ab`
+does.** `make bench-ab [BEFORE=<ref>]` (`cmd/bench-ab`) builds
+`cmd/branchbench` twice — once from `git archive <ref>` (default: the
+latest release tag), once from the working tree — and alternates the two
+binaries for 4 rounds per workflow on one machine, with one discarded
+warm-up run of the after build first, so drift during the series
+(thermal state, background load, page cache) moves both sides together
+instead of separating one `make bench-branchbench` run from the last one
+pasted below. It flags a regression only on a gating metric's depth-1 p50
+(fork, checkout, checkpoint — wall and eval are informational and never
+affect the exit code) when the after median exceeds the before median by
+more than 15% and every after sample exceeds every before sample; the
+mirrored rule reports an improvement. The nightly `perf-ab` job
+(`.github/workflows/nightly.yml`) runs the same comparison against
+`git describe --tags --abbrev=0 --match 'v[0-9]*'` on every day main
+moves, with `-workflows failure_repro:1,simulation:8`. As of this writing
+the first nightly run has not happened yet, so the shared runner's own
+noise is unmeasured; the rule was tuned on the maintainer's machine, where
+the v0.2.15 → v0.2.16 per-checkpoint regression below measured +23% with
+non-overlapping before/after samples, while noise within a series stayed
+under 5%.
+
 **Machine:** as the header line below reports — darwin/arm64, Apple M5, macOS
 27.0.1, local APFS disk, local-directory store backend, no network, measured
 2026-10-08. The machine was not idle: `uptime` read load averages 3.39 3.79
@@ -707,9 +729,12 @@ Earlier the same day, on the machine described under the 2026-10-08 table,
 each tag (and `6714394` and its parent `160cc8c`) was built from a
 `git archive` of it into a clean directory and run with alternating builds
 within each series; the figures below are the checkpoint column of the
-harness's own rows. The raw rows and their `uptime` readings are archived
-outside the repository, with the other raw benchmark outputs, and are not
-part of what this document publishes. Single-worker
+harness's own rows. This alternating-build comparison is now the nightly
+`perf-ab` job's, run automatically by `cmd/bench-ab` instead of by hand
+(see the BranchBench method notes above). The raw rows and their
+`uptime` readings are archived outside the repository, with the other
+raw benchmark outputs, and are not part of what this document publishes.
+Single-worker
 `failure_repro` checkpoint p50 was 45.5 / 45.5 / 45.7 ms on v0.2.15 and
 56.2 / 55.5 / 56.7 ms on v0.2.16, alternating with v0.2.14 in the same
 series, at load averages 2.04 before and 2.50 after it; and 45.9 / 46.4 /

@@ -136,6 +136,29 @@ depends on — CAS behavior, create-only puts, list/delete edge cases:
   re-verified; other S3-compatible providers are same-code-path only (see
   [stability.md](stability.md#proposed-v10-criteria)).
 
+## Performance regression, against the latest release
+
+`cmd/bench-ab` builds `cmd/branchbench` from two refs — the latest
+release tag and the working tree — and alternates the two binaries for 4
+rounds per workflow on one machine (one discarded warm-up run of the
+after build first), so a regression has to clear a bar past ordinary
+run-to-run noise: the after median must exceed the before median by more
+than 15% AND every after sample must exceed every before sample, and only
+on a gating metric (fork, checkout or checkpoint depth-1 p50 — wall and
+eval are informational and never affect the exit code). `nightly.yml`'s
+`perf-ab` job runs this comparison against
+`git describe --tags --abbrev=0 --match 'v[0-9]*'` every day main moves
+(`-workflows failure_repro:1,simulation:8`), uploads the raw per-run
+output and the rendered report for 30 days, and exits 0 with a notice
+when no release tag is reachable yet. `make bench-ab [BEFORE=<ref>]` runs
+the identical comparison locally, about 10 minutes with the defaults. As
+of this writing the job has not yet run on the shared runner, so its
+noise there is unmeasured; the 15% threshold was tuned on the
+maintainer's machine, where the v0.2.15 → v0.2.16 per-checkpoint
+regression measured +23% with non-overlapping before/after samples while
+noise within a series stayed under 5%
+([benchmarks.md](benchmarks.md#branchbench-topologies-v0212)).
+
 ## Fuzzing the parsers that read untrusted bytes
 
 Five Go native fuzz targets cover every parser that reads bytes offshoot
