@@ -59,6 +59,7 @@ import (
 	"runtime"
 	"strconv"
 	"strings"
+	"syscall"
 	"time"
 )
 
@@ -441,7 +442,9 @@ func goBuild(dir, bin string) error {
 // out, so a failed run or a parse failure can be diagnosed from the
 // artifact; the error also carries the last lines of stderr, so a CI log is
 // readable without the artifact. branchbench gets -timeout runTimeout, and
-// the process is killed one minute after that if it has not exited.
+// one minute after that, if it has not exited, it is sent SIGTERM rather
+// than killed outright, so it has WaitDelay (below) to remove its store
+// before the hard kill fires.
 func runBench(bin string, sp spec, out, side, round string, runTimeout time.Duration) (sample, error) {
 	ctx, cancel := context.WithTimeout(context.Background(), runTimeout+time.Minute)
 	defer cancel()
@@ -450,6 +453,13 @@ func runBench(bin string, sp spec, out, side, round string, runTimeout time.Dura
 		"-timeout", runTimeout.String())
 	cmd.Stdout = &stdout
 	cmd.Stderr = &stderr
+	// Ask nicely first: SIGTERM instead of CommandContext's default Kill,
+	// so branchbench's own cleanup (removing its store) gets a chance to
+	// run before WaitDelay expires and the hard kill follows.
+	cmd.Cancel = func() error {
+		return cmd.Process.Signal(syscall.SIGTERM)
+	}
+	cmd.WaitDelay = 30 * time.Second
 	runErr := cmd.Run()
 	raw := filepath.Join(out, fmt.Sprintf("raw-%s-%s-%s.txt", sp.Name, side, round))
 	content := stdout.String() + "\n--- stderr ---\n" + stderr.String()

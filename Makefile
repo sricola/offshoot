@@ -1,7 +1,7 @@
 .PHONY: test test-torture fuzz build test-s3 bench bench-cow bench-s3 check-python-version test-python-sdk test-ts-sdk test-sdks test-python-langgraph \
 	check-sdk-versions dry-run-python-sdk dry-run-ts-sdk dry-run-sdks test-pytest-plugin \
 	ci-local ci-local-host ci-local-linux ci-local-s3 ci-local-minio ci-local-sdks lint \
-	check-plugin bench-isolation bench-branchbench example-pass-k
+	check-plugin bench-isolation bench-branchbench bench-ab example-pass-k
 
 # Override with `make PYTHON=python3.14 ...` when the platform's unversioned
 # python3 is older than the SDKs' declared Python 3.10 minimum.
@@ -256,6 +256,13 @@ bench-isolation: check-python-version
 bench-branchbench:
 	@echo "branchbench: needs ~30 GB free in TMPDIR and ~2 minutes; Ctrl-C removes the store. Smoke run: go run ./cmd/branchbench -quick"
 	go run ./cmd/branchbench
+
+# bench-ab alternates branchbench built from BEFORE (default: the latest
+# tag) with one built from the working tree, four rounds per workflow
+# (cmd/bench-ab's default), and prints per-metric medians with a
+# regressed/ok verdict. About 6 minutes with the default workflows.
+bench-ab:
+	go run ./cmd/bench-ab -before "$${BEFORE:-$$(git describe --tags --abbrev=0)}" -run-timeout 10m
 
 # example-pass-k runs examples/eval-pass-k/run.py: a runnable pass^k eval
 # loop over offshoot (see docs/recipes/eval-harnesses.md's "tau2-style
