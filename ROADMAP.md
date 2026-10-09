@@ -530,10 +530,15 @@ provenance, an SPDX SBOM, a signed and attested GHCR image) with a
 verification recipe in `docs/installation.md`; an OpenSSF Scorecard workflow
 runs on push to `main`, weekly, and on demand, with a badge on the README;
 `cmd/branchbench` reproduces BranchBench's five agentic-branching topologies
-against a local store, pasted in `docs/benchmarks.md`; `docs/testing.md`
-gained an "At a glance" evidence table naming what's proven and what isn't;
-and the README's first screen now leads with install and a recording before
-the quickstart. None of this changes phase 4's gate: **Announce** is still
+against a local store, pasted in `docs/benchmarks.md`; a nightly `perf-ab`
+job (`.github/workflows/nightly.yml`, backed by `cmd/bench-ab`) alternates
+`cmd/branchbench` between the latest release tag and the day's main to
+catch a regression before it ships three releases unnoticed, the way the
+v0.2.16 per-checkpoint regression did (its first run is pending);
+`docs/testing.md` gained an "At a
+glance" evidence table naming what's proven and what isn't; and the
+README's first screen now leads with install and a recording before the
+quickstart. None of this changes phase 4's gate: **Announce** is still
 blocked on phase 3's external user succeeding, not on further engineering —
 see [docs/status.md](docs/status.md#not-yet-done) for the remaining
 out-of-band items.

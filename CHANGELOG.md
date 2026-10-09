@@ -17,6 +17,42 @@ Pin an exact version if you depend on format stability. The full contract:
 
 ## [Unreleased]
 
+### Added
+
+- `cmd/bench-ab`, a tool that builds `cmd/branchbench` from a git ref
+  given as `-before` (required; the tool has no default and exits 0 with
+  a line when none is given) and from the working tree, then alternates
+  the two binaries for 4 rounds per workflow on one machine (default
+  workflows `failure_repro:1,simulation:8`) and reports per-metric
+  medians with a verdict. Only a gating metric (fork, checkout or
+  checkpoint depth-1 p50) can fail the run: it regressed when the after
+  median exceeds the before median by more than 15% AND every after
+  sample exceeds every before sample; wall and eval are informational
+  only. The built binary exits 0 (no `-before` ref, or nothing
+  regressed), 1 (a gating metric regressed) or 2 (bad flags, unknown
+  ref, a build, run or parse failure); `go run` folds any non-zero
+  status into its own 1 and `make` into its own 2, so `make bench-ab`
+  and the nightly build `bench-ab` first and run the binary, and under
+  `make` a regression shows as make's exit 2 (the report tells the two
+  apart). Each raw per-run file starts with a `# bench-ab side=<side>
+  ref=<short rev> round=<n>` line. `make bench-ab [BEFORE=<ref>]` runs
+  it locally and, like the new `perf-ab` job in
+  `.github/workflows/nightly.yml`, supplies the latest release tag (`git
+  describe --tags --abbrev=0 --match 'v[0-9]*'`) when no ref is given;
+  the job runs on days main moves, on the Sunday leg and on manual
+  dispatch, and its first run is pending. 19 tests in `cmd/bench-ab`:
+  `TestParseRowDepthOne`, `TestParseRowDeeperTreeReadsTheDepthOneP50`,
+  `TestParseRowWallInMinutes`, `TestParseRowWallInMilliseconds`,
+  `TestParseRowRejectsGarbage`, `TestParseRowRejectsAMalformedNumber`,
+  `TestParseRowRejectsATimedOutRun`, `TestFindRowPicksTheWorkflow`,
+  `TestMedian`, `TestVerdictRequiresEveryAfterAboveEveryBefore`,
+  `TestVerdictRejectsTooFewRounds`,
+  `TestImprovedMirrorsTheRegressionRule`,
+  `TestExtractTarKeepsModesAndRefusesEscapes`, `TestRunOrderAlternates`,
+  `TestTailLines`, `TestRawHeaderNamesSideAndRefAndKeepsTheRowFindable`,
+  `TestOnlyGatingMetricsDecide`, `TestGatingRegressionStillFailsTheRun`,
+  `TestParseSpecs`.
+
 ### Changed
 
 - Dependency bumps (Dependabot PRs 87 and 88): `aws-sdk-go-v2/service/s3`
