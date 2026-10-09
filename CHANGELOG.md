@@ -17,7 +17,12 @@ Pin an exact version if you depend on format stability. The full contract:
 
 ## [Unreleased]
 
-Nothing yet.
+### Changed
+
+- Dependency bumps (Dependabot PRs 87 and 88): `aws-sdk-go-v2/service/s3`
+  1.113.4 to 1.114.0, `pierrec/lz4/v4` 4.1.31 to 4.1.33 (the LTX frame
+  fixtures and fuzz oracles in `internal/ltxio` pass unchanged against it);
+  `anchore/sbom-action` 0.24.2 to 0.24.3 in `release.yml`.
 
 ## [0.2.19] - 2026-10-08
 
