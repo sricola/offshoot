@@ -453,9 +453,17 @@ func extractTar(r io.Reader, dest string) error {
 		if err != nil {
 			return fmt.Errorf("bench-ab: reading git archive: %w", err)
 		}
+		// filepath.Join cleans the entry's name, so a name with ".."
+		// components resolves to wherever it points; the extraction
+		// proceeds only when the cleaned target is strictly inside dest
+		// (the prefix check against dest plus a separator is the shape
+		// CodeQL's zip-slip query recognises as the sanitiser).
+		root := filepath.Clean(dest)
 		target := filepath.Join(dest, hdr.Name)
-		rel, err := filepath.Rel(dest, target)
-		if err != nil || rel == ".." || strings.HasPrefix(rel, ".."+string(filepath.Separator)) || filepath.IsAbs(hdr.Name) {
+		if target == root {
+			continue // the archive's own root directory entry
+		}
+		if filepath.IsAbs(hdr.Name) || !strings.HasPrefix(target, root+string(filepath.Separator)) {
 			return fmt.Errorf("bench-ab: archive entry %q escapes %s", hdr.Name, dest)
 		}
 		mode := os.FileMode(hdr.Mode).Perm()
