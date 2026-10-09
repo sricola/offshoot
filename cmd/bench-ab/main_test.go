@@ -81,6 +81,37 @@ func TestTailLines(t *testing.T) {
 	}
 }
 
+func TestOnlyGatingMetricsDecide(t *testing.T) {
+	// wall and eval look regressed (every after run well above every before
+	// run, past the 15% threshold); fork, checkout and checkpoint are
+	// identical before and after. Only the gating metrics may set
+	// anyRegressed, so the overall result must be false, and every
+	// non-gating row must read "info" rather than "regressed".
+	before := []sample{
+		{WallS: 45, ForkP50: 10, CheckoutP50: 20, CheckpointP50: 30, EvalP50: 5},
+		{WallS: 45, ForkP50: 10, CheckoutP50: 20, CheckpointP50: 30, EvalP50: 5},
+	}
+	after := []sample{
+		{WallS: 60, ForkP50: 10, CheckoutP50: 20, CheckpointP50: 30, EvalP50: 7},
+		{WallS: 60, ForkP50: 10, CheckoutP50: 20, CheckpointP50: 30, EvalP50: 7},
+	}
+	rows, anyRegressed, err := evaluateMetrics(metrics, before, after, 0.15)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if anyRegressed {
+		t.Fatal("a non-gating regression (wall, eval) set anyRegressed")
+	}
+	for _, row := range rows {
+		if !row.Metric.Gating && row.Verdict != "info" {
+			t.Fatalf("%s: non-gating verdict = %q, want info", row.Metric.Name, row.Verdict)
+		}
+		if row.Metric.Gating && row.Verdict != "ok" {
+			t.Fatalf("%s: gating verdict = %q, want ok", row.Metric.Name, row.Verdict)
+		}
+	}
+}
+
 func TestParseSpecs(t *testing.T) {
 	specs, err := parseSpecs("failure_repro:1,simulation:8")
 	if err != nil || len(specs) != 2 || specs[1] != (spec{"simulation", 8}) {

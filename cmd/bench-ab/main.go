@@ -18,15 +18,19 @@
 // before then after, even rounds after then before, because the second run
 // of a pair was observed to be a few percent faster on identical code. The
 // default of 4 rounds balances the two orders; an odd -rounds leaves one
-// round unbalanced. Every branchbench run gets -timeout set to -run-timeout,
-// and the process is killed one minute after that.
+// round unbalanced. Every branchbench run gets -timeout set to -run-timeout;
+// one minute after that, if it has not exited, it is sent SIGTERM, and if it
+// still has not exited 30s after that, it is killed outright.
 //
 // For each workflow it compares wall time and the depth-1 p50 of fork,
-// checkout, checkpoint and eval. A metric regressed when the after median
-// exceeds the before median by more than -threshold AND the smallest after
-// sample exceeds the largest before sample; the mirrored rule labels a metric
-// improved. The wall cell has 0.1 s resolution, so its verdict is coarse for
-// short workflows and the p50 columns are the signal.
+// checkout, checkpoint and eval, but only fork, checkout and checkpoint p50
+// gate the verdict (and so the exit code): a metric regressed when the after
+// median exceeds the before median by more than -threshold AND the smallest
+// after sample exceeds the largest before sample; the mirrored rule labels a
+// metric improved. wall and eval are informational only and always report
+// "info", never regressed or improved, because the wall cell has 0.1 s
+// resolution (coarse for short workflows) and eval times the workload's own
+// query rather than offshoot's.
 //
 // Exit status: 0 when no -before ref is given or nothing regressed; 1 when at
 // least one metric regressed; 2 on bad flags, an unknown ref, a build
@@ -70,18 +74,62 @@ type spec struct {
 	Concurrency int
 }
 
-// metric names one figure of a sample and how to read it.
+// metric names one figure of a sample, how to read it, and whether it
+// gates the overall verdict. Only a gating metric can turn a regression
+// into exit code 1; a non-gating metric is informational and always
+// reports "info" in the verdict column, regardless of what compareRounds
+// found for it.
 type metric struct {
-	Name string
-	Get  func(sample) float64
+	Name   string
+	Get    func(sample) float64
+	Gating bool
 }
 
 var metrics = []metric{
-	{"wall (s)", func(s sample) float64 { return s.WallS }},
-	{"fork p50 (ms)", func(s sample) float64 { return s.ForkP50 }},
-	{"checkout p50 (ms)", func(s sample) float64 { return s.CheckoutP50 }},
-	{"checkpoint p50 (ms)", func(s sample) float64 { return s.CheckpointP50 }},
-	{"eval p50 (ms)", func(s sample) float64 { return s.EvalP50 }},
+	{"wall (s)", func(s sample) float64 { return s.WallS }, false},
+	{"fork p50 (ms)", func(s sample) float64 { return s.ForkP50 }, true},
+	{"checkout p50 (ms)", func(s sample) float64 { return s.CheckoutP50 }, true},
+	{"checkpoint p50 (ms)", func(s sample) float64 { return s.CheckpointP50 }, true},
+	{"eval p50 (ms)", func(s sample) float64 { return s.EvalP50 }, false},
+}
+
+// reportRow is one line of the report table: a metric's comparison result
+// plus the verdict label that is actually printed, which is "info" for a
+// non-gating metric no matter what compareRounds found.
+type reportRow struct {
+	Metric  metric
+	Result  result
+	Verdict string // "ok", "regressed", "improved", or "info"
+}
+
+// evaluateMetrics compares every metric in metrics between beforeSamples and
+// afterSamples for one workflow and returns one reportRow per metric, plus
+// whether any gating metric regressed. Only fork, checkout and checkpoint
+// p50 gate the overall verdict (and so the exit code); wall and eval are
+// informational, always reporting "info" and never setting anyRegressed,
+// because wall is rounded to 0.1s and eval times the workload's own query
+// rather than offshoot's.
+func evaluateMetrics(metrics []metric, beforeSamples, afterSamples []sample, threshold float64) (rows []reportRow, anyRegressed bool, err error) {
+	for _, m := range metrics {
+		res, err := compareRounds(values(beforeSamples, m), values(afterSamples, m), threshold)
+		if err != nil {
+			return nil, false, err
+		}
+		label := "ok"
+		switch {
+		case res.Regressed:
+			label = "regressed"
+		case res.Improved:
+			label = "improved"
+		}
+		if !m.Gating {
+			label = "info"
+		} else if label == "regressed" {
+			anyRegressed = true
+		}
+		rows = append(rows, reportRow{Metric: m, Result: res, Verdict: label})
+	}
+	return rows, anyRegressed, nil
 }
 
 func main() {
@@ -209,7 +257,9 @@ func run() (int, error) {
 	fmt.Fprintf(&b, "### bench-ab: before `%s` (%s) vs after %s\n\n", *before, beforeShort, afterShort)
 	fmt.Fprintf(&b, "%d alternating rounds per workflow on one machine, threshold %.0f%%. "+
 		"A metric regressed when the after median exceeds the before median by more than the threshold "+
-		"and every after run is slower than every before run; improved is the mirror of that rule.\n\n",
+		"and every after run is slower than every before run; improved is the mirror of that rule. "+
+		"Only fork, checkout and checkpoint p50 gate the verdict and the exit code; wall and eval are "+
+		"informational and always read \"info\" below, never regressed or improved.\n\n",
 		*rounds, *threshold*100)
 	fmt.Fprintf(&b, "Order: one discarded warm-up run of the after build per workflow, then odd rounds before → after "+
 		"and even rounds after → before%s.\n\n", orderNote(*rounds))
@@ -218,24 +268,18 @@ func run() (int, error) {
 	b.WriteString("|---|---|---|---|---|---|---|---|\n")
 	anyRegressed := false
 	for _, sp := range specs {
-		for _, m := range metrics {
-			bv := values(samples[sp.Name]["before"], m)
-			av := values(samples[sp.Name]["after"], m)
-			res, err := compareRounds(bv, av, *threshold)
-			if err != nil {
-				return 2, err
-			}
-			v := "ok"
-			switch {
-			case res.Regressed:
-				v = "regressed"
-				anyRegressed = true
-			case res.Improved:
-				v = "improved"
-			}
+		rows, regressed, err := evaluateMetrics(metrics, samples[sp.Name]["before"], samples[sp.Name]["after"], *threshold)
+		if err != nil {
+			return 2, err
+		}
+		if regressed {
+			anyRegressed = true
+		}
+		for _, row := range rows {
 			fmt.Fprintf(&b, "| %s:%d | %s | %s | %s | %.1f | %.1f | %s | %s |\n",
-				sp.Name, sp.Concurrency, m.Name, join(bv), join(av), res.BeforeMedian, res.AfterMedian,
-				change(res.BeforeMedian, res.AfterMedian), v)
+				sp.Name, sp.Concurrency, row.Metric.Name, join(row.Result.Before), join(row.Result.After),
+				row.Result.BeforeMedian, row.Result.AfterMedian,
+				change(row.Result.BeforeMedian, row.Result.AfterMedian), row.Verdict)
 		}
 	}
 	fmt.Fprintf(&b, "\nLoad average after the series: %s\n", loadAfter)

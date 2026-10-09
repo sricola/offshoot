@@ -258,11 +258,14 @@ bench-branchbench:
 	go run ./cmd/branchbench
 
 # bench-ab alternates branchbench built from BEFORE (default: the latest
-# tag) with one built from the working tree, four rounds per workflow
-# (cmd/bench-ab's default), and prints per-metric medians with a
-# regressed/ok verdict. About 6 minutes with the default workflows.
+# release tag) with one built from the working tree, four rounds per
+# workflow (cmd/bench-ab's default), and prints per-metric medians with a
+# regressed/ok verdict; only fork, checkout and checkpoint p50 gate that
+# verdict. About 10 minutes with the default rounds and workflows.
+# --match 'v[0-9]*' keeps a stray non-release tag from becoming the
+# baseline (see nightly.yml's perf-ab job).
 bench-ab:
-	go run ./cmd/bench-ab -before "$${BEFORE:-$$(git describe --tags --abbrev=0)}" -run-timeout 10m
+	go run ./cmd/bench-ab -before "$${BEFORE:-$$(git describe --tags --abbrev=0 --match 'v[0-9]*')}" -run-timeout 10m
 
 # example-pass-k runs examples/eval-pass-k/run.py: a runnable pass^k eval
 # loop over offshoot (see docs/recipes/eval-harnesses.md's "tau2-style
