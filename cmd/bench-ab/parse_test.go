@@ -75,6 +75,13 @@ func TestParseRowWallInMilliseconds(t *testing.T) {
 	}
 }
 
+func TestParseRowRejectsAMalformedNumber(t *testing.T) {
+	line := "| failure_repro | 10/10 | 1.7 s | 50% | 14.4/14.7 → (d=1 is max) | 8.3/60.1 → (d=1 is max) | 1.2.3/57.6 → (d=1 is max) | 5.0/5.1 → (d=1 is max) | 1 | 82 MiB |"
+	if s, err := parseRow(line); err == nil {
+		t.Fatalf("a p50 of 1.2.3 parsed as %+v", s)
+	}
+}
+
 func TestParseRowRejectsATimedOutRun(t *testing.T) {
 	line := "| mcts | 400/1000 (timed out) | 30.0 s | 67% | 51.7/62.8 → 31.4/66.6 | 399.7/419.6 → 75.4/317.7 | 111.2/145.0 → 90.9/130.3 | 76.2/119.5 → 109.5/245.5 | 890 | 30.7 GiB |"
 	if _, err := parseRow(line); err == nil {

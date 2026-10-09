@@ -7,15 +7,31 @@
 //
 // It builds cmd/branchbench twice — once from `git archive <before>`,
 // extracted into the out directory and built against that tree's own go.mod,
-// and once from the working tree — then runs the two binaries alternately,
-// round by round, on the same machine, so drift during the series (thermal
-// state, background load, page cache) moves both sides together.
+// and once from the module root of the working tree — then runs the two
+// binaries alternately, round by round, on the same machine, so drift during
+// the series (thermal state, background load, page cache) moves both sides
+// together. The tool may be started from any directory inside the module.
+//
+// Before the measured rounds of each workflow, one warm-up run of the after
+// binary is made and discarded, so no measured run directly follows the two
+// CPU-heavy builds. The order inside a round alternates: odd rounds run
+// before then after, even rounds after then before, because the second run
+// of a pair was observed to be a few percent faster on identical code. The
+// default of 4 rounds balances the two orders; an odd -rounds leaves one
+// round unbalanced. Every branchbench run gets -timeout set to -run-timeout,
+// and the process is killed one minute after that.
 //
 // For each workflow it compares wall time and the depth-1 p50 of fork,
 // checkout, checkpoint and eval. A metric regressed when the after median
 // exceeds the before median by more than -threshold AND the smallest after
 // sample exceeds the largest before sample; the mirrored rule labels a metric
-// improved. Any regression makes the exit status 1.
+// improved. The wall cell has 0.1 s resolution, so its verdict is coarse for
+// short workflows and the p50 columns are the signal.
+//
+// Exit status: 0 when no -before ref is given or nothing regressed; 1 when at
+// least one metric regressed; 2 on bad flags, an unknown ref, a build
+// failure, or a branchbench run that failed, timed out or printed no
+// parsable row.
 //
 // The default workflows are failure_repro at concurrency 1 and simulation at
 // concurrency 8. failure_repro at concurrency 1 is the sensitive one: with a
@@ -32,6 +48,7 @@ package main
 import (
 	"archive/tar"
 	"bytes"
+	"context"
 	"errors"
 	"flag"
 	"fmt"
@@ -42,6 +59,7 @@ import (
 	"runtime"
 	"strconv"
 	"strings"
+	"time"
 )
 
 // spec is one item of -workflows: a branchbench workflow and the
@@ -78,7 +96,8 @@ func main() {
 
 func run() (int, error) {
 	before := flag.String("before", "", "git ref to compare the working tree against (required; empty means nothing to compare)")
-	rounds := flag.Int("rounds", 3, "alternating rounds per workflow; each round runs before then after")
+	rounds := flag.Int("rounds", 4, "measured rounds per workflow; odd rounds run before then after, even rounds after then before, so an even count balances the order")
+	runTimeout := flag.Duration("run-timeout", 15*time.Minute, "branchbench -timeout for each run; the run is killed one minute after it")
 	threshold := flag.Float64("threshold", 0.15, "fraction by which the after median must exceed the before median to count as a regression")
 	workflowsFlag := flag.String("workflows", "failure_repro:1,simulation:8", "comma-separated <workflow>:<concurrency> items")
 	outFlag := flag.String("out", "", "directory for the builds, raw outputs and report.md (default: a new temp dir)")
@@ -95,24 +114,31 @@ func run() (int, error) {
 	if *threshold <= 0 || *threshold >= 1 {
 		return 2, fmt.Errorf("bench-ab: -threshold must be between 0 and 1, got %v", *threshold)
 	}
+	if *runTimeout <= 0 {
+		return 2, fmt.Errorf("bench-ab: -run-timeout must be positive, got %v", *runTimeout)
+	}
 	specs, err := parseSpecs(*workflowsFlag)
 	if err != nil {
 		return 2, err
 	}
 
-	commit, err := gitOutput("rev-parse", "--verify", *before+"^{commit}")
+	root, err := moduleRoot()
+	if err != nil {
+		return 2, err
+	}
+	commit, err := gitOutput(root, "rev-parse", "--verify", *before+"^{commit}")
 	if err != nil {
 		return 2, fmt.Errorf("bench-ab: %q is not a commit: %w", *before, err)
 	}
-	beforeShort, err := gitOutput("rev-parse", "--short", commit)
+	beforeShort, err := gitOutput(root, "rev-parse", "--short", commit)
 	if err != nil {
 		return 2, err
 	}
-	afterShort, err := gitOutput("rev-parse", "--short", "HEAD")
+	afterShort, err := gitOutput(root, "rev-parse", "--short", "HEAD")
 	if err != nil {
 		return 2, err
 	}
-	if porcelain, err := gitOutput("status", "--porcelain"); err != nil {
+	if porcelain, err := gitOutput(root, "status", "--porcelain"); err != nil {
 		return 2, err
 	} else if porcelain != "" {
 		afterShort += "-dirty"
@@ -140,7 +166,7 @@ func run() (int, error) {
 		return 2, err
 	}
 	fmt.Fprintf(os.Stderr, "bench-ab: extracting %s (%s) into %s\n", *before, beforeShort, srcBefore)
-	if err := gitArchive(commit, srcBefore); err != nil {
+	if err := gitArchive(root, commit, srcBefore); err != nil {
 		return 2, err
 	}
 	bins := map[string]string{
@@ -152,7 +178,7 @@ func run() (int, error) {
 		return 2, err
 	}
 	fmt.Fprintln(os.Stderr, "bench-ab: building the after branchbench from the working tree")
-	if err := goBuild("", bins["after"]); err != nil {
+	if err := goBuild(root, bins["after"]); err != nil {
 		return 2, err
 	}
 
@@ -161,10 +187,14 @@ func run() (int, error) {
 	samples := map[string]map[string][]sample{}
 	for _, sp := range specs {
 		samples[sp.Name] = map[string][]sample{}
+		fmt.Fprintf(os.Stderr, "bench-ab: %s c=%d warm-up (after, discarded)\n", sp.Name, sp.Concurrency)
+		if _, err := runBench(bins["after"], sp, out, "after", "warmup", *runTimeout); err != nil {
+			return 2, err
+		}
 		for round := 1; round <= *rounds; round++ {
-			for _, side := range []string{"before", "after"} {
+			for _, side := range runOrder(round) {
 				fmt.Fprintf(os.Stderr, "bench-ab: %s c=%d round %d/%d %s\n", sp.Name, sp.Concurrency, round, *rounds, side)
-				s, err := runBench(bins[side], sp, out, side, round)
+				s, err := runBench(bins[side], sp, out, side, strconv.Itoa(round), *runTimeout)
 				if err != nil {
 					return 2, err
 				}
@@ -180,6 +210,8 @@ func run() (int, error) {
 		"A metric regressed when the after median exceeds the before median by more than the threshold "+
 		"and every after run is slower than every before run; improved is the mirror of that rule.\n\n",
 		*rounds, *threshold*100)
+	fmt.Fprintf(&b, "Order: one discarded warm-up run of the after build per workflow, then odd rounds before → after "+
+		"and even rounds after → before%s.\n\n", orderNote(*rounds))
 	fmt.Fprintf(&b, "Load average before the series: %s\n\n", loadBefore)
 	b.WriteString("| workflow | metric | before (rounds) | after (rounds) | before median | after median | change | verdict |\n")
 	b.WriteString("|---|---|---|---|---|---|---|---|\n")
@@ -263,11 +295,52 @@ func parseSpecs(s string) ([]spec, error) {
 	return specs, nil
 }
 
-// gitOutput runs git in the current directory and returns its trimmed
-// stdout, folding stderr into the error.
-func gitOutput(args ...string) (string, error) {
+// runOrder returns the order of the two sides in a round: odd rounds run
+// before then after, even rounds after then before, so with an even number
+// of rounds each side runs first equally often.
+func runOrder(round int) []string {
+	if round%2 == 1 {
+		return []string{"before", "after"}
+	}
+	return []string{"after", "before"}
+}
+
+// orderNote is the report's remark on whether the round count balances the
+// two orders.
+func orderNote(rounds int) string {
+	if rounds%2 == 0 {
+		return " (balanced)"
+	}
+	return " (an odd round count leaves one round unbalanced, with before first)"
+}
+
+// moduleRoot returns the directory of the main module that holds
+// cmd/branchbench, resolved from the current directory, so the tool runs
+// from any subdirectory of the repository.
+func moduleRoot() (string, error) {
+	var stderr bytes.Buffer
+	cmd := exec.Command("go", "list", "-m", "-f", "{{.Dir}}")
+	cmd.Stderr = &stderr
+	out, err := cmd.Output()
+	dir := strings.TrimSpace(string(out))
+	if err != nil {
+		return "", fmt.Errorf("bench-ab: run inside the offshoot module: go list -m failed: %w: %s", err, strings.TrimSpace(stderr.String()))
+	}
+	if dir == "" || strings.Contains(dir, "\n") {
+		return "", fmt.Errorf("bench-ab: run inside the offshoot module: go list -m found no single main module from the current directory")
+	}
+	if fi, err := os.Stat(filepath.Join(dir, "cmd", "branchbench")); err != nil || !fi.IsDir() {
+		return "", fmt.Errorf("bench-ab: module root %s has no cmd/branchbench; run inside the offshoot module", dir)
+	}
+	return dir, nil
+}
+
+// gitOutput runs git in dir and returns its trimmed stdout, folding stderr
+// into the error.
+func gitOutput(dir string, args ...string) (string, error) {
 	var stderr bytes.Buffer
 	cmd := exec.Command("git", args...)
+	cmd.Dir = dir
 	cmd.Stderr = &stderr
 	out, err := cmd.Output()
 	if err != nil {
@@ -280,10 +353,11 @@ func gitOutput(args ...string) (string, error) {
 // the tool needs no tar binary. Only directories and regular files are
 // created; every other entry type (the pax global header git writes, and
 // symlinks, of which the repository has none) is skipped. An entry whose
-// cleaned path leaves dest is an error.
-func gitArchive(commit, dest string) error {
+// cleaned path leaves dest is an error. git runs in dir.
+func gitArchive(dir, commit, dest string) error {
 	var stderr bytes.Buffer
 	cmd := exec.Command("git", "archive", "--format=tar", commit)
+	cmd.Dir = dir
 	cmd.Stderr = &stderr
 	stdout, err := cmd.StdoutPipe()
 	if err != nil {
@@ -348,46 +422,63 @@ func extractTar(r io.Reader, dest string) error {
 	}
 }
 
-// goBuild builds ./cmd/branchbench into the absolute path bin, in dir (the
-// current directory when dir is empty), so the build uses that tree's go.mod.
+// goBuild builds ./cmd/branchbench into the absolute path bin, in dir, so
+// the build uses that tree's go.mod.
 func goBuild(dir, bin string) error {
 	cmd := exec.Command("go", "build", "-o", bin, "./cmd/branchbench")
 	cmd.Dir = dir
 	cmd.Stdout = os.Stderr
 	cmd.Stderr = os.Stderr
 	if err := cmd.Run(); err != nil {
-		where := dir
-		if where == "" {
-			where = "the working tree"
-		}
-		return fmt.Errorf("bench-ab: go build ./cmd/branchbench in %s: %w", where, err)
+		return fmt.Errorf("bench-ab: go build ./cmd/branchbench in %s: %w", dir, err)
 	}
 	return nil
 }
 
-// runBench runs one branchbench and returns its table row for sp. The run's
-// stdout, then a "--- stderr ---" line, then its stderr, are kept in
-// raw-<workflow>-<side>-<round>.txt under out, so a failed run or a parse
-// failure can be diagnosed from the artifact.
-func runBench(bin string, sp spec, out, side string, round int) (sample, error) {
+// runBench runs one branchbench and returns its table row for sp. round is
+// a round number or "warmup". The run's stdout, then a "--- stderr ---"
+// line, then its stderr, are kept in raw-<workflow>-<side>-<round>.txt under
+// out, so a failed run or a parse failure can be diagnosed from the
+// artifact; the error also carries the last lines of stderr, so a CI log is
+// readable without the artifact. branchbench gets -timeout runTimeout, and
+// the process is killed one minute after that if it has not exited.
+func runBench(bin string, sp spec, out, side, round string, runTimeout time.Duration) (sample, error) {
+	ctx, cancel := context.WithTimeout(context.Background(), runTimeout+time.Minute)
+	defer cancel()
 	var stdout, stderr bytes.Buffer
-	cmd := exec.Command(bin, "-workflows", sp.Name, "-concurrency", strconv.Itoa(sp.Concurrency))
+	cmd := exec.CommandContext(ctx, bin, "-workflows", sp.Name, "-concurrency", strconv.Itoa(sp.Concurrency),
+		"-timeout", runTimeout.String())
 	cmd.Stdout = &stdout
 	cmd.Stderr = &stderr
 	runErr := cmd.Run()
-	raw := filepath.Join(out, fmt.Sprintf("raw-%s-%s-%d.txt", sp.Name, side, round))
+	raw := filepath.Join(out, fmt.Sprintf("raw-%s-%s-%s.txt", sp.Name, side, round))
 	content := stdout.String() + "\n--- stderr ---\n" + stderr.String()
 	if err := os.WriteFile(raw, []byte(content), 0o644); err != nil {
 		return sample{}, err
 	}
+	tail := tailLines(stderr.String(), 20)
+	if ctx.Err() == context.DeadlineExceeded {
+		return sample{}, fmt.Errorf("bench-ab: %s branchbench %s round %s was killed after %v (see %s); stderr tail:\n%s",
+			side, sp.Name, round, runTimeout+time.Minute, raw, tail)
+	}
 	if runErr != nil {
-		return sample{}, fmt.Errorf("bench-ab: %s branchbench %s round %d failed: %w (see %s)", side, sp.Name, round, runErr, raw)
+		return sample{}, fmt.Errorf("bench-ab: %s branchbench %s round %s failed: %w (see %s); stderr tail:\n%s",
+			side, sp.Name, round, runErr, raw, tail)
 	}
 	s, err := findRow(stdout.String(), sp.Name)
 	if err != nil {
-		return sample{}, fmt.Errorf("%w (see %s)", err, raw)
+		return sample{}, fmt.Errorf("%w (see %s); stderr tail:\n%s", err, raw, tail)
 	}
 	return s, nil
+}
+
+// tailLines returns the last n lines of s.
+func tailLines(s string, n int) string {
+	lines := strings.Split(strings.TrimRight(s, "\n"), "\n")
+	if len(lines) > n {
+		lines = lines[len(lines)-n:]
+	}
+	return strings.Join(lines, "\n")
 }
 
 // loadAverage returns the 1, 5 and 15 minute load averages as text, or a

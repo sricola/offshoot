@@ -52,6 +52,35 @@ func TestExtractTarKeepsModesAndRefusesEscapes(t *testing.T) {
 	}
 }
 
+func TestRunOrderAlternates(t *testing.T) {
+	want := map[int][2]string{
+		1: {"before", "after"},
+		2: {"after", "before"},
+		3: {"before", "after"},
+		4: {"after", "before"},
+	}
+	first := map[string]int{}
+	for round := 1; round <= 4; round++ {
+		got := runOrder(round)
+		if len(got) != 2 || got[0] != want[round][0] || got[1] != want[round][1] {
+			t.Fatalf("round %d order %v, want %v", round, got, want[round])
+		}
+		first[got[0]]++
+	}
+	if first["before"] != first["after"] {
+		t.Fatalf("four rounds are unbalanced: %v", first)
+	}
+}
+
+func TestTailLines(t *testing.T) {
+	if got := tailLines("a\nb\nc\n", 2); got != "b\nc" {
+		t.Fatalf("tailLines = %q", got)
+	}
+	if got := tailLines("a\n", 20); got != "a" {
+		t.Fatalf("tailLines short = %q", got)
+	}
+}
+
 func TestParseSpecs(t *testing.T) {
 	specs, err := parseSpecs("failure_repro:1,simulation:8")
 	if err != nil || len(specs) != 2 || specs[1] != (spec{"simulation", 8}) {

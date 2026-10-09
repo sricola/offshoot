@@ -65,8 +65,15 @@ func parseRow(line string) (sample, error) {
 	if err != nil {
 		return sample{}, err
 	}
-	f := func(s string) float64 { v, _ := strconv.ParseFloat(s, 64); return v }
-	return sample{Workflow: m[1], WallS: wall, ForkP50: f(m[3]), CheckoutP50: f(m[4]), CheckpointP50: f(m[5]), EvalP50: f(m[6])}, nil
+	var p50 [4]float64
+	for i := range p50 {
+		v, err := strconv.ParseFloat(m[3+i], 64)
+		if err != nil {
+			return sample{}, fmt.Errorf("bench-ab: p50 %q in %q is not a number: %w", m[3+i], line, err)
+		}
+		p50[i] = v
+	}
+	return sample{Workflow: m[1], WallS: wall, ForkP50: p50[0], CheckoutP50: p50[1], CheckpointP50: p50[2], EvalP50: p50[3]}, nil
 }
 
 // findRow returns the table row for workflow in one branchbench run's
