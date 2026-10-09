@@ -151,7 +151,7 @@ eval are informational and never affect the exit code). `nightly.yml`'s
 `perf-ab` job runs this comparison against
 `git describe --tags --abbrev=0 --match 'v[0-9]*'` on days main moves,
 on its Sunday leg and on manual dispatch
-(`-workflows failure_repro:1,simulation:8`), uploads the raw per-run
+(`-workflows failure_repro:1,simulation:4`), uploads the raw per-run
 output and the rendered report for 30 days, and exits 0 with a notice
 when no release tag is reachable yet. `make bench-ab [BEFORE=<ref>]` runs
 the identical comparison locally, about 10 minutes with the defaults.
@@ -159,12 +159,14 @@ The exit codes (0, 1 for a gating regression, 2 for a tool error) are
 the built binary's: `go run` and `make` fold them into their own, so both
 the job and `make bench-ab` build `bench-ab` first and run it, and under
 `make` a regression shows as make's exit 2 (the report tells the two
-apart). As
-of this writing the job has not yet run on the shared runner, so its
-noise there is unmeasured; the 15% threshold was tuned on the
-maintainer's machine, where the v0.2.15 → v0.2.16 per-checkpoint
-regression measured +23% with non-overlapping before/after samples while
-noise within a series stayed under 5%
+apart). The 15% threshold was tuned on the maintainer's machine, where
+the v0.2.15 → v0.2.16 per-checkpoint regression measured +23% with
+non-overlapping before/after samples while noise within a series stayed
+under 5%. The job's first run on the shared runner (a manual dispatch on
+2026-10-09, with `simulation` still at eight workers) took 29 min 21 s,
+exited 0, and resolved two improvements against v0.2.19 with every other
+gating row "ok"; eight workers oversubscribed the four-vCPU runner, so
+the job now runs `simulation` at four
 ([benchmarks.md](benchmarks.md#branchbench-topologies-v0212)).
 
 ## Fuzzing the parsers that read untrusted bytes
