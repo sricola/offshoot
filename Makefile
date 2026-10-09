@@ -263,9 +263,15 @@ bench-branchbench:
 # regressed/ok verdict; only fork, checkout and checkpoint p50 gate that
 # verdict. About 10 minutes with the default rounds and workflows.
 # --match 'v[0-9]*' keeps a stray non-release tag from becoming the
-# baseline (see nightly.yml's perf-ab job).
+# baseline (see nightly.yml's perf-ab job). The tool is built to
+# bin/bench-ab and run from there because its exit codes (0 ok, 1 a gating
+# regression, 2 a tool error) are the binary's: go run would fold them all
+# into 1. make still folds a failing recipe into its own exit 2, so read
+# the report (or run ./bin/bench-ab directly) to tell a regression from a
+# tool error.
 bench-ab:
-	go run ./cmd/bench-ab -before "$${BEFORE:-$$(git describe --tags --abbrev=0 --match 'v[0-9]*')}" -run-timeout 10m
+	go build -o bin/bench-ab ./cmd/bench-ab
+	./bin/bench-ab -before "$${BEFORE:-$$(git describe --tags --abbrev=0 --match 'v[0-9]*')}" -run-timeout 10m
 
 # example-pass-k runs examples/eval-pass-k/run.py: a runnable pass^k eval
 # loop over offshoot (see docs/recipes/eval-harnesses.md's "tau2-style

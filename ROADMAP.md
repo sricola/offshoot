@@ -534,7 +534,8 @@ against a local store, pasted in `docs/benchmarks.md`; a nightly `perf-ab`
 job (`.github/workflows/nightly.yml`, backed by `cmd/bench-ab`) alternates
 `cmd/branchbench` between the latest release tag and the day's main to
 catch a regression before it ships three releases unnoticed, the way the
-v0.2.16 per-checkpoint regression did; `docs/testing.md` gained an "At a
+v0.2.16 per-checkpoint regression did (its first run is pending);
+`docs/testing.md` gained an "At a
 glance" evidence table naming what's proven and what isn't; and the
 README's first screen now leads with install and a recording before the
 quickstart. None of this changes phase 4's gate: **Announce** is still

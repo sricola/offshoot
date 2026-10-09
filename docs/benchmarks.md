@@ -549,10 +549,14 @@ That is 2,310 forks in all (one per worker-step). The whole table takes
   concurrency rather than accumulation — worth keeping in mind next to Neon's
   20-live-branch ceiling quoted below.
 
-**A single pasted run doesn't catch drift between releases; `make bench-ab`
-does.** `make bench-ab [BEFORE=<ref>]` (`cmd/bench-ab`) builds
-`cmd/branchbench` twice — once from `git archive <ref>` (default: the
-latest release tag), once from the working tree — and alternates the two
+**A single pasted run can't separate a release-to-release shift from
+run-to-run noise; `make bench-ab` can, for a large enough shift:** it
+reports a shift of more than 15% on fork, checkout or checkpoint p50 when
+none of the before and after runs overlap. `make bench-ab [BEFORE=<ref>]`
+(`cmd/bench-ab`) builds `cmd/branchbench` twice — once from
+`git archive <ref>` (`make` supplies the latest release tag when `BEFORE`
+is unset; the tool itself has no default), once from the working tree —
+and alternates the two
 binaries for 4 rounds per workflow on one machine, with one discarded
 warm-up run of the after build first, so drift during the series
 (thermal state, background load, page cache) moves both sides together
@@ -561,10 +565,14 @@ pasted below. It flags a regression only on a gating metric's depth-1 p50
 (fork, checkout, checkpoint — wall and eval are informational and never
 affect the exit code) when the after median exceeds the before median by
 more than 15% and every after sample exceeds every before sample; the
-mirrored rule reports an improvement. The nightly `perf-ab` job
-(`.github/workflows/nightly.yml`) runs the same comparison against
-`git describe --tags --abbrev=0 --match 'v[0-9]*'` on every day main
-moves, with `-workflows failure_repro:1,simulation:8`. As of this writing
+mirrored rule reports an improvement. The built binary exits 0, 1 (a
+gating regression) or 2 (a tool error); `go run` and `make` fold those
+codes into their own, so under `make bench-ab` a regression shows as
+make's exit 2 and the report tells the two apart. The nightly `perf-ab`
+job (`.github/workflows/nightly.yml`) builds the binary and runs the same
+comparison against `git describe --tags --abbrev=0 --match 'v[0-9]*'` on
+days main moves (and on its Sunday leg and manual dispatch), with
+`-workflows failure_repro:1,simulation:8`. As of this writing
 the first nightly run has not happened yet, so the shared runner's own
 noise is unmeasured; the rule was tuned on the maintainer's machine, where
 the v0.2.15 → v0.2.16 per-checkpoint regression below measured +23% with
@@ -730,8 +738,8 @@ each tag (and `6714394` and its parent `160cc8c`) was built from a
 `git archive` of it into a clean directory and run with alternating builds
 within each series; the figures below are the checkpoint column of the
 harness's own rows. This alternating-build comparison is now the nightly
-`perf-ab` job's, run automatically by `cmd/bench-ab` instead of by hand
-(see the BranchBench method notes above). The raw rows and their
+`perf-ab` job's to run, through `cmd/bench-ab` instead of by hand; its
+first run is pending (see the BranchBench method notes above). The raw rows and their
 `uptime` readings are archived outside the repository, with the other
 raw benchmark outputs, and are not part of what this document publishes.
 Single-worker

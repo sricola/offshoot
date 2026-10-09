@@ -72,6 +72,22 @@ func TestRunOrderAlternates(t *testing.T) {
 	}
 }
 
+func TestRawHeaderNamesSideAndRefAndKeepsTheRowFindable(t *testing.T) {
+	h := rawHeader("before", "8aee810", "1")
+	if h != "# bench-ab side=before ref=8aee810 round=1\n" {
+		t.Fatalf("rawHeader = %q", h)
+	}
+	if got := rawHeader("after", "8aee810-dirty", "warmup"); got != "# bench-ab side=after ref=8aee810-dirty round=warmup\n" {
+		t.Fatalf("rawHeader after = %q", got)
+	}
+	// A raw file read back from its first line must still yield the row.
+	content := h + "offshoot v0.2.19-11-g8aee810\n| failure_repro | 10/10 | 1.7 s | 50% | 14.4/14.7 → (d=1 is max) | 8.3/60.1 → (d=1 is max) | 56.4/57.6 → (d=1 is max) | 5.0/5.1 → (d=1 is max) | 1 | 82 MiB |\n"
+	s, err := findRow(content, "failure_repro")
+	if err != nil || s.CheckpointP50 != 56.4 {
+		t.Fatalf("findRow after the header: %+v %v", s, err)
+	}
+}
+
 func TestTailLines(t *testing.T) {
 	if got := tailLines("a\nb\nc\n", 2); got != "b\nc" {
 		t.Fatalf("tailLines = %q", got)

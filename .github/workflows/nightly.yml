@@ -210,15 +210,18 @@ jobs:
 
   # perf-ab alternates cmd/branchbench built from the latest tag with one
   # built from this commit on the same runner, four rounds per workflow
-  # (cmd/bench-ab's default), and fails only on fork, checkout or checkpoint
-  # p50 (wall and eval are informational and never fail the job): a gating
-  # metric regressed when its after median exceeds its before median by more
-  # than 15% AND every after run sits above every before run — two separate
-  # conditions, both required. This is how the v0.2.16 per-checkpoint
-  # regression was found by hand three releases late; the nightly runs the
-  # same comparison against the last release every day main moves. Also
-  # runnable by workflow_dispatch on any branch, so a change to this job can
-  # be proven before it lands on main (same shape as linux-reflink above).
+  # (cmd/bench-ab's default). The job fails on a gating regression (exit 1:
+  # fork, checkout or checkpoint p50; wall and eval are informational and
+  # never fail it) or on a tool error (exit 2: bad flags, unknown ref, a
+  # build, run, parse or timeout failure). A gating metric regressed when
+  # its after median exceeds its before median by more than 15% AND every
+  # after run sits above every before run — two separate conditions, both
+  # required. This is how the v0.2.16 per-checkpoint regression was found by
+  # hand three releases late; the job runs the same comparison against the
+  # last release on fresh weekdays, on the Sunday leg (fresh is forced true)
+  # and on manual dispatches. Also runnable by workflow_dispatch on any
+  # branch, so a change to this job can be proven before it lands on main
+  # (same shape as linux-reflink above).
   perf-ab:
     needs: activity
     if: ${{ !cancelled() && ((github.ref == 'refs/heads/main' && needs.activity.outputs.fresh == 'true') || github.event_name == 'workflow_dispatch') }}
@@ -246,7 +249,12 @@ jobs:
             echo "::notice::no release tag reachable; bench-ab has nothing to compare against"
           fi
           mkdir -p bench-ab-out
-          go run ./cmd/bench-ab -before "$before" -run-timeout 10m -out bench-ab-out
+          # Build, then run the binary: go run folds every non-zero exit
+          # into 1, which would hide the 1 (regression) / 2 (tool error)
+          # split. RUNNER_TEMP keeps the binary out of the checkout, so it
+          # cannot mark the after side -dirty.
+          go build -o "$RUNNER_TEMP/bench-ab" ./cmd/bench-ab
+          "$RUNNER_TEMP/bench-ab" -before "$before" -run-timeout 10m -out bench-ab-out
 
       # Keep the raw per-run output even when the job above failed or timed
       # out, so a regression or a stuck run can be diagnosed from the

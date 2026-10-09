@@ -32,10 +32,19 @@
 // resolution (coarse for short workflows) and eval times the workload's own
 // query rather than offshoot's.
 //
-// Exit status: 0 when no -before ref is given or nothing regressed; 1 when at
-// least one metric regressed; 2 on bad flags, an unknown ref, a build
-// failure, or a branchbench run that failed, timed out or printed no
-// parsable row.
+// Exit status, of the built binary: 0 when no -before ref is given or
+// nothing regressed; 1 when at least one gating metric regressed; 2 on bad
+// flags, an unknown ref, a build failure, or a branchbench run that failed,
+// timed out or printed no parsable row. `go run` folds any non-zero status
+// into its own exit 1 (printing "exit status N"), and make folds a failing
+// recipe into make's exit 2, so make bench-ab and the nightly build the
+// binary first and run that (bin/bench-ab, $RUNNER_TEMP/bench-ab). Under
+// make, a regression still shows as make's exit 2; the report tells a
+// regression from a tool error.
+//
+// The tool has no default before ref: without -before it prints a line and
+// exits 0. make bench-ab and the nightly supply the latest release tag
+// (git describe --tags --abbrev=0 --match 'v[0-9]*').
 //
 // The default workflows are failure_repro at concurrency 1 and simulation at
 // concurrency 8. failure_repro at concurrency 1 is the sensitive one: with a
@@ -45,8 +54,14 @@
 //
 // Usage:
 //
-//	go run ./cmd/bench-ab -before v0.2.19
-//	go run ./cmd/bench-ab -before HEAD -rounds 2 -workflows failure_repro:1
+//	go build -o bin/bench-ab ./cmd/bench-ab
+//	./bin/bench-ab -before v0.2.19
+//	./bin/bench-ab -before HEAD -rounds 2 -workflows failure_repro:1
+//
+// Each raw file starts with a line written by bench-ab naming the side, the
+// ref it was built from and the round (see rawHeader), because branchbench's
+// own header takes its version from the cwd's git describe, which is the
+// after side's for both binaries.
 package main
 
 import (
@@ -146,7 +161,7 @@ func main() {
 func run() (int, error) {
 	before := flag.String("before", "", "git ref to compare the working tree against (required; empty means nothing to compare)")
 	rounds := flag.Int("rounds", 4, "measured rounds per workflow; odd rounds run before then after, even rounds after then before, so an even count balances the order")
-	runTimeout := flag.Duration("run-timeout", 15*time.Minute, "branchbench -timeout for each run; the run is killed one minute after it")
+	runTimeout := flag.Duration("run-timeout", 15*time.Minute, "branchbench -timeout for each run; one minute after it the run is sent SIGTERM, and 30s later it is killed")
 	threshold := flag.Float64("threshold", 0.15, "fraction by which the after median must exceed the before median to count as a regression")
 	workflowsFlag := flag.String("workflows", "failure_repro:1,simulation:8", "comma-separated <workflow>:<concurrency> items")
 	outFlag := flag.String("out", "", "directory for the builds, raw outputs and report.md (default: a new temp dir)")
@@ -218,6 +233,7 @@ func run() (int, error) {
 	if err := gitArchive(root, commit, srcBefore); err != nil {
 		return 2, err
 	}
+	refs := map[string]string{"before": beforeShort, "after": afterShort}
 	bins := map[string]string{
 		"before": filepath.Join(out, "bb-before"),
 		"after":  filepath.Join(out, "bb-after"),
@@ -237,13 +253,13 @@ func run() (int, error) {
 	for _, sp := range specs {
 		samples[sp.Name] = map[string][]sample{}
 		fmt.Fprintf(os.Stderr, "bench-ab: %s c=%d warm-up (after, discarded)\n", sp.Name, sp.Concurrency)
-		if _, err := runBench(bins["after"], sp, out, "after", "warmup", *runTimeout); err != nil {
+		if _, err := runBench(bins["after"], sp, out, "after", refs["after"], "warmup", *runTimeout); err != nil {
 			return 2, err
 		}
 		for round := 1; round <= *rounds; round++ {
 			for _, side := range runOrder(round) {
 				fmt.Fprintf(os.Stderr, "bench-ab: %s c=%d round %d/%d %s\n", sp.Name, sp.Concurrency, round, *rounds, side)
-				s, err := runBench(bins[side], sp, out, side, strconv.Itoa(round), *runTimeout)
+				s, err := runBench(bins[side], sp, out, side, refs[side], strconv.Itoa(round), *runTimeout)
 				if err != nil {
 					return 2, err
 				}
@@ -480,8 +496,9 @@ func goBuild(dir, bin string) error {
 	return nil
 }
 
-// runBench runs one branchbench and returns its table row for sp. round is
-// a round number or "warmup". The run's stdout, then a "--- stderr ---"
+// runBench runs one branchbench and returns its table row for sp. ref is
+// the short revision the binary was built from, round a round number or
+// "warmup". A rawHeader line, then the run's stdout, then a "--- stderr ---"
 // line, then its stderr, are kept in raw-<workflow>-<side>-<round>.txt under
 // out, so a failed run or a parse failure can be diagnosed from the
 // artifact; the error also carries the last lines of stderr, so a CI log is
@@ -489,7 +506,7 @@ func goBuild(dir, bin string) error {
 // one minute after that, if it has not exited, it is sent SIGTERM rather
 // than killed outright, so it has WaitDelay (below) to remove its store
 // before the hard kill fires.
-func runBench(bin string, sp spec, out, side, round string, runTimeout time.Duration) (sample, error) {
+func runBench(bin string, sp spec, out, side, ref, round string, runTimeout time.Duration) (sample, error) {
 	ctx, cancel := context.WithTimeout(context.Background(), runTimeout+time.Minute)
 	defer cancel()
 	var stdout, stderr bytes.Buffer
@@ -506,7 +523,7 @@ func runBench(bin string, sp spec, out, side, round string, runTimeout time.Dura
 	cmd.WaitDelay = 30 * time.Second
 	runErr := cmd.Run()
 	raw := filepath.Join(out, fmt.Sprintf("raw-%s-%s-%s.txt", sp.Name, side, round))
-	content := stdout.String() + "\n--- stderr ---\n" + stderr.String()
+	content := rawHeader(side, ref, round) + stdout.String() + "\n--- stderr ---\n" + stderr.String()
 	if err := os.WriteFile(raw, []byte(content), 0o644); err != nil {
 		return sample{}, err
 	}
@@ -524,6 +541,15 @@ func runBench(bin string, sp spec, out, side, round string, runTimeout time.Dura
 		return sample{}, fmt.Errorf("%w (see %s); stderr tail:\n%s", err, raw, tail)
 	}
 	return s, nil
+}
+
+// rawHeader is the first line of each raw file: the side, the short ref its
+// binary was built from, and the round. branchbench's own header carries
+// the cwd's git describe, the after side's for both binaries, so without
+// this line a before file would carry the after build's version
+// unexplained.
+func rawHeader(side, ref, round string) string {
+	return fmt.Sprintf("# bench-ab side=%s ref=%s round=%s\n", side, ref, round)
 }
 
 // tailLines returns the last n lines of s.
