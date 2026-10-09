@@ -572,12 +572,30 @@ make's exit 2 and the report tells the two apart. The nightly `perf-ab`
 job (`.github/workflows/nightly.yml`) builds the binary and runs the same
 comparison against `git describe --tags --abbrev=0 --match 'v[0-9]*'` on
 days main moves (and on its Sunday leg and manual dispatch), with
-`-workflows failure_repro:1,simulation:8`. As of this writing
-the first nightly run has not happened yet, so the shared runner's own
-noise is unmeasured; the rule was tuned on the maintainer's machine, where
-the v0.2.15 → v0.2.16 per-checkpoint regression below measured +23% with
-non-overlapping before/after samples, while noise within a series stayed
-under 5%.
+`-workflows failure_repro:1,simulation:4`. The rule was tuned on the
+maintainer's machine, where the v0.2.15 → v0.2.16 per-checkpoint
+regression below measured +23% with non-overlapping before/after samples,
+while noise within a series stayed under 5%. The first run on the shared
+runner (a manual dispatch on 2026-10-09, run 37931344620, `ubuntu-latest`,
+v0.2.19 against main at 58ece9b, then still with `simulation:8`) took
+29 min 21 s for the job and exited 0: on `failure_repro` the checkpoint
+p50 read 204.3 / 203.7 / 174.5 / 204.6 ms before and 173.9 / 159.9 /
+159.7 / 170.6 ms after (medians 204.0 → 165.2 ms, −19.0%, "improved");
+`simulation`'s fork p50 read 17.1 → 14.4 ms (−15.7%, "improved"); every
+other gating row read "ok". The only runtime change between v0.2.19 and
+58ece9b is the dependency bump of `pierrec/lz4/v4` 4.1.31 → 4.1.33 and
+`aws-sdk-go-v2/service/s3` (the rest is the A/B tool itself and docs), so
+the two improvements are either the LZ4 bump, which the checkpoint's
+segment encoding exercises, or drift on the shared runner across the
+series; this run does not separate the two. The runner's checkpoint p50
+is about four times the maintainer machine's for the same workflow. `failure_repro`'s fork p50
+before samples were 1.5 / 14.7 / 14.1 / 15.6 ms against 1.8 / 1.5 / 1.6 /
+1.6 ms after, which the rule reports "ok" because one before run sits
+below the after runs, the conservatism it is meant to have. The eight
+simulation runs took 172 to 194 s each and drove the one-minute load
+average from 0.96 to 9.05 on the four-vCPU runner, so the job now runs
+`simulation` at four workers; its timing at four has not been measured
+yet.
 
 **Machine:** as the header line below reports — darwin/arm64, Apple M5, macOS
 27.0.1, local APFS disk, local-directory store backend, no network, measured

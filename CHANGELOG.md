@@ -40,7 +40,11 @@ Pin an exact version if you depend on format stability. The full contract:
   `.github/workflows/nightly.yml`, supplies the latest release tag (`git
   describe --tags --abbrev=0 --match 'v[0-9]*'`) when no ref is given;
   the job runs on days main moves, on the Sunday leg and on manual
-  dispatch, and its first run is pending. 19 tests in `cmd/bench-ab`:
+  dispatch, with `simulation` at four workers to fit the four-vCPU
+  runner. Its first run (a manual dispatch on 2026-10-09, still at eight
+  workers) took 29 min 21 s, exited 0, and reported two improvements
+  against v0.2.19 with every other gating row "ok"
+  ([benchmarks](docs/benchmarks.md)). 19 tests in `cmd/bench-ab`:
   `TestParseRowDepthOne`, `TestParseRowDeeperTreeReadsTheDepthOneP50`,
   `TestParseRowWallInMinutes`, `TestParseRowWallInMilliseconds`,
   `TestParseRowRejectsGarbage`, `TestParseRowRejectsAMalformedNumber`,

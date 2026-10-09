@@ -221,7 +221,10 @@ jobs:
   # last release on fresh weekdays, on the Sunday leg (fresh is forced true)
   # and on manual dispatches. Also runnable by workflow_dispatch on any
   # branch, so a change to this job can be proven before it lands on main
-  # (same shape as linux-reflink above).
+  # (same shape as linux-reflink above). The simulation workflow runs at
+  # four workers here, not the tool's default eight: the first run
+  # (2026-10-09) at eight drove the four-vCPU runner's load average to 9
+  # with runs of about three minutes each and took 29 minutes in all.
   perf-ab:
     needs: activity
     if: ${{ !cancelled() && ((github.ref == 'refs/heads/main' && needs.activity.outputs.fresh == 'true') || github.event_name == 'workflow_dispatch') }}
@@ -254,7 +257,7 @@ jobs:
           # split. RUNNER_TEMP keeps the binary out of the checkout, so it
           # cannot mark the after side -dirty.
           go build -o "$RUNNER_TEMP/bench-ab" ./cmd/bench-ab
-          "$RUNNER_TEMP/bench-ab" -before "$before" -run-timeout 10m -out bench-ab-out
+          "$RUNNER_TEMP/bench-ab" -before "$before" -workflows failure_repro:1,simulation:4 -run-timeout 10m -out bench-ab-out
 
       # Keep the raw per-run output even when the job above failed or timed
       # out, so a regression or a stuck run can be diagnosed from the
