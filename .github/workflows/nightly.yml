@@ -101,6 +101,32 @@ jobs:
   # runs even after one fails, and the job then fails. A crasher is written
   # under the package's testdata/fuzz/<Target>/ and uploaded so it can be
   # reproduced locally with `go test ./internal/<pkg> -run '<Target>/<id>'`.
+  # govulncheck against the pinned toolchain and the module graph. Not
+  # gated on `fresh`: a new Go point release or advisory arrives without
+  # any commit here, and this is the job that notices. It fails only on a
+  # vulnerability whose function the binary actually reaches, which is the
+  # signal to bump go.mod's `toolchain` line (Dependabot bumps modules, not
+  # that line). The 2026-10-10 sweep found v0.2.19 was built with go1.26.0
+  # (go.mod's floor, with no toolchain line) and carried 29 reachable
+  # stdlib fixes from 1.26.1 onward; this job is the guard against a repeat.
+  vulncheck:
+    if: github.ref == 'refs/heads/main'
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+
+      - uses: actions/setup-go@b7ad1dad31e06c5925ef5d2fc7ad053ef454303e # v7.0.0
+        with:
+          go-version-file: go.mod
+
+      - name: govulncheck
+        run: |
+          go version
+          go run golang.org/x/vuln/cmd/govulncheck@v1.8.0 ./...
+
   fuzz:
     needs: activity
     if: github.ref == 'refs/heads/main' && needs.activity.outputs.fresh == 'true'
@@ -111,15 +137,16 @@ jobs:
         with:
           persist-credentials: false
 
-      # Fuzzing runs on the newest Go minor, not go.mod's 1.26.0 floor (ci.yml
-      # keeps testing the floor). Go 1.26's fuzz coordinator can report
-      # "context deadline exceeded" as the test's failure when -fuzztime
-      # expires while a worker is mid-input (go.dev/issue/75804, fixed in
-      # 1.27.0); the 2026-10-03 run failed FuzzDecodeSnapshot that way with no
-      # crasher.
+      # go.mod's `toolchain` line (1.27.x) is what every job builds with;
+      # setup-go v7 reads it ahead of the `go 1.26.0` language floor. Fuzzing
+      # in particular must not fall back to 1.26: its fuzz coordinator can
+      # report "context deadline exceeded" as the test's failure when
+      # -fuzztime expires while a worker is mid-input (go.dev/issue/75804,
+      # fixed in 1.27.0); the 2026-10-03 run failed FuzzDecodeSnapshot that
+      # way with no crasher.
       - uses: actions/setup-go@b7ad1dad31e06c5925ef5d2fc7ad053ef454303e # v7.0.0
         with:
-          go-version: '1.27.x'
+          go-version-file: go.mod
 
       # Same loop as `make fuzz` (30s there). -fuzzminimizetime caps how
       # long each new corpus entry is minimized, which otherwise eats most
