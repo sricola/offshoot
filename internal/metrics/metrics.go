@@ -367,25 +367,40 @@ func (r *Registry) NewCounterVec(name, help string, labelNames ...string) *Count
 	}
 	r.register(name, help, "counter", func(w *strings.Builder) {
 		v.mu.Lock()
-		keys := make([]string, 0, len(v.counts))
-		for k := range v.counts {
-			keys = append(keys, k)
-		}
-		sort.Strings(keys)
-		type row struct {
-			labels []string
-			val    float64
-		}
-		rows := make([]row, 0, len(keys))
-		for _, k := range keys {
-			rows = append(rows, row{v.values[k], v.counts[k].Value()})
-		}
+		rows := vecRows(v.values, v.counts, (*Counter).Value)
 		v.mu.Unlock()
-		for _, rw := range rows {
-			fmt.Fprintf(w, "%s{%s} %s\n", name, labelPairs(v.labelNames, rw.labels), formatFloat(rw.val))
-		}
+		writeVecRows(w, name, v.labelNames, rows)
 	})
 	return v
+}
+
+// vecRow is one labelled sample of a Vec metric, copied out under the Vec's
+// lock so the Prometheus text can be formatted after it is released.
+type vecRow struct {
+	labels []string
+	val    float64
+}
+
+// vecRows snapshots a Vec's children in sorted key order. Called with the
+// Vec's mutex held; value reads each child's current value.
+func vecRows[T any](values map[string][]string, children map[string]*T, value func(*T) float64) []vecRow {
+	keys := make([]string, 0, len(children))
+	for k := range children {
+		keys = append(keys, k)
+	}
+	sort.Strings(keys)
+	rows := make([]vecRow, 0, len(keys))
+	for _, k := range keys {
+		rows = append(rows, vecRow{values[k], value(children[k])})
+	}
+	return rows
+}
+
+// writeVecRows renders one `name{labels} value` line per row.
+func writeVecRows(w *strings.Builder, name string, labelNames []string, rows []vecRow) {
+	for _, rw := range rows {
+		fmt.Fprintf(w, "%s{%s} %s\n", name, labelPairs(labelNames, rw.labels), formatFloat(rw.val))
+	}
 }
 
 // GaugeVec is CounterVec's Gauge counterpart, with one addition: Reset,
@@ -446,23 +461,9 @@ func (r *Registry) NewGaugeVec(name, help string, labelNames ...string) *GaugeVe
 	}
 	r.register(name, help, "gauge", func(w *strings.Builder) {
 		v.mu.Lock()
-		keys := make([]string, 0, len(v.gauges))
-		for k := range v.gauges {
-			keys = append(keys, k)
-		}
-		sort.Strings(keys)
-		type row struct {
-			labels []string
-			val    float64
-		}
-		rows := make([]row, 0, len(keys))
-		for _, k := range keys {
-			rows = append(rows, row{v.values[k], v.gauges[k].Value()})
-		}
+		rows := vecRows(v.values, v.gauges, (*Gauge).Value)
 		v.mu.Unlock()
-		for _, rw := range rows {
-			fmt.Fprintf(w, "%s{%s} %s\n", name, labelPairs(v.labelNames, rw.labels), formatFloat(rw.val))
-		}
+		writeVecRows(w, name, v.labelNames, rows)
 	})
 	return v
 }
