@@ -6,6 +6,7 @@ compiled StateGraph (or raw BaseCheckpointSaver calls with LangGraph's own
 checkpoint types). Nothing is mocked. Skips (locally) / fails (under CI /
 OFFSHOOT_REQUIRE_LANGGRAPH) when langgraph isn't installed — see conftest.
 """
+
 from __future__ import annotations
 
 from typing import TypedDict
@@ -19,7 +20,7 @@ import pytest
 # failure before collection gets this far.
 pytest.importorskip("langgraph.checkpoint.sqlite")
 
-from langgraph_checkpoint_offshoot import OffshootSaver  # noqa: E402
+from langgraph_checkpoint_offshoot import OffshootSaver
 
 
 class S(TypedDict):
@@ -120,6 +121,7 @@ def test_fork_thread_isolates_parent_from_child(daemon):
 
             # The fork carries its TTL (self-reaping attempt branch).
             import offshoot
+
             with offshoot.connect(daemon.sock) as c:
                 info = {b.branch: b for b in c.branches("forkdb")}
             assert info["attempt-1"].ttl == "1h0m0s"
@@ -177,12 +179,14 @@ def test_destroy_deletes_branch(daemon):
     child = parent.fork_thread("doomed")
     child.destroy()  # unprotected fork: the force=False default suffices
     import offshoot
+
     with offshoot.connect(daemon.sock) as c:
         names = {b.branch for b in c.branches("destroydb")}
     assert "doomed" not in names
     parent.close()
     # Closed-saver guards: ops raise; destroy is a documented silent no-op.
     from offshoot.client import OffshootError
+
     with pytest.raises(OffshootError):
         parent.checkpoint("nope")
     parent.destroy()  # no-op, no raise

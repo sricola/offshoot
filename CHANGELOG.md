@@ -56,8 +56,77 @@ Pin an exact version if you depend on format stability. The full contract:
   `TestTailLines`, `TestRawHeaderNamesSideAndRefAndKeepsTheRowFindable`,
   `TestOnlyGatingMetricsDecide`, `TestGatingRegressionStillFailsTheRun`,
   `TestParseSpecs`.
+- A `vulncheck` job in `.github/workflows/nightly.yml` runs `govulncheck
+  ./...` (v1.8.0) against the toolchain go.mod pins and the module graph.
+  It is deliberately not gated on the `fresh` output the other nightly
+  jobs share: a Go point release that fixes a function the binary reaches
+  arrives without any commit here, and this job is what notices it
+  (Dependabot bumps modules, never the `toolchain` line).
+- `make lint-python` and a matching step in ci.yml's `sdks` job run
+  `ruff check` and `ruff format --check` (ruff 0.17.0, rules in the new
+  `ruff.toml`: pyflakes/pycodestyle core, isort, pyupgrade for the 3.10
+  floor, bugbear, unused-noqa) over both Python SDKs, `scripts/`,
+  `examples/` and the pytest plugin's tests. Until now no Python file in
+  the repo was linted or format-checked anywhere; the first run
+  reformatted 16 files and fixed 63 findings (quoted annotations left
+  over from before `from __future__ import annotations`, unsorted
+  imports, nine stale `# noqa` directives, one `typing` import `collections.abc`
+  replaces), none of which changed behaviour — the unit, pytest-plugin and
+  LangGraph suites pass unchanged. Markdown is excluded: ruff 0.17 would
+  otherwise reformat the Python blocks in the docs, whose trailing
+  comments are aligned by hand.
+- `.gitignore` covers `/offshoot`, the binary `go build ./cmd/offshoot`
+  (and CONTRIBUTING's `-o offshoot` form) leaves at the repo root.
 
 ### Changed
+
+- `cmd/offshoot`'s `run` is now a dispatch table: each of the twenty
+  commands (`create` … `session`) is its own `cmd<Name>(w, rest)`
+  function (plus `spec` for the three — `mcp`, `serve`, `session` — that
+  need the store path), instead of a 946-line `switch` whose `serve` arm
+  alone ran 218 lines. Mechanical move, no behaviour change; the command
+  suite in `main_test.go` passes unchanged.
+- `internal/metrics`: `NewCounterVec` and `NewGaugeVec` share one
+  `vecRows`/`writeVecRows` pair instead of two identical 25-line render
+  closures.
+- `internal/ops`: `copyFile`, used only by the clone, export and
+  materialize tests, lives in `copyfile_test.go` now rather than in
+  `ops.go`.
+- `make lint` pins staticcheck to a master commit
+  (`v0.7.0-0.dev.0.20261009230814-452d5bb86b45`): the latest release,
+  v0.8.1, cannot read Go 1.27 export data (`export data version 5 is
+  greater than maximum supported version 4`) and the target's
+  non-blocking `||` had hidden that on every run since the local
+  toolchain moved to 1.27. The clean result is real again (zero findings
+  across `./...`).
+- `scripts/check_sdk_versions.py`, `scripts/check_sdk_tag_version.py`,
+  `scripts/bench-isolation.py`, `examples/eval-pass-k/run.py` and
+  `examples/langgraph-rewind/agent.py` carry the executable bit their
+  shebang lines implied.
+- `scripts/ci-local.sh` initialises the two summary variables its `eval`
+  assigns, so `shellcheck -S warning` is clean over every tracked shell
+  script.
+- Dependency bumps (Dependabot PRs 87 and 88): `aws-sdk-go-v2/service/s3`
+  1.113.4 to 1.114.0, `pierrec/lz4/v4` 4.1.31 to 4.1.33 (the LTX frame
+  fixtures and fuzz oracles in `internal/ltxio` pass unchanged against it);
+  `anchore/sbom-action` 0.24.2 to 0.24.3 in `release.yml`.
+
+### Fixed
+
+- Release binaries were built with go1.26.0. `go.mod` declared `go
+  1.26.0` with no `toolchain` line, and `actions/setup-go` honours that
+  literally, so every `release.yml` build since the 1.26 move (the
+  v0.2.19 run of 2026-10-08 included) shipped a toolchain against which
+  `govulncheck` reports 29 reachable standard-library vulnerabilities
+  fixed in 1.26.1 through 1.26.9 (`net/url`, `crypto/x509`, `net/http`
+  and friends, all on the S3 and daemon HTTP paths). `go.mod` and
+  `site/gen/go.mod` now pin `toolchain go1.27.2`, which setup-go v7
+  reads ahead of the language floor; the `go 1.26.0` floor itself is
+  unchanged, so `go install ...@latest` still works from a 1.26 host
+  (Go downloads the pinned toolchain on demand). The Docker image was
+  never affected: its build stage already pinned `golang:1.27`. The
+  nightly `fuzz` job's hand-written `go-version: '1.27.x'` is gone with
+  it — every job reads the one pin from go.mod.
 
 - Dependency bumps (Dependabot PRs 87 and 88): `aws-sdk-go-v2/service/s3`
   1.113.4 to 1.114.0, `pierrec/lz4/v4` 4.1.31 to 4.1.33 (the LTX frame

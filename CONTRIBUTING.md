@@ -58,7 +58,8 @@ python3 -m venv .venv-langgraph
 
 ```
 go build -o offshoot ./cmd/offshoot
-make lint   # gofmt + go vet + staticcheck (staticcheck is advisory locally)
+make lint          # gofmt + go vet + staticcheck (staticcheck is advisory locally)
+make lint-python   # ruff check + ruff format --check over the SDKs, scripts and examples
 ```
 
 ### Refreshing the hash-pinned CI requirements

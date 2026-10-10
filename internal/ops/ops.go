@@ -15,7 +15,6 @@ import (
 	"encoding/hex"
 	"errors"
 	"fmt"
-	"io"
 	"net/url"
 	"os"
 	"path/filepath"
@@ -564,23 +563,6 @@ func (w *Workspace) materializeAt(ref store.Ref, cp store.Checkpoint, dst string
 // headCheckpoint is the ref's current head as a Checkpoint.
 func headCheckpoint(ref store.Ref) store.Checkpoint {
 	return store.Checkpoint{TXID: ref.HeadTXID, Epoch: ref.HeadEpoch}
-}
-
-func copyFile(from, to string) error {
-	in, err := os.Open(from)
-	if err != nil {
-		return err
-	}
-	defer in.Close()
-	out, err := os.Create(to)
-	if err != nil {
-		return err
-	}
-	if _, err := io.Copy(out, in); err != nil {
-		out.Close()
-		return err
-	}
-	return out.Close()
 }
 
 // checkpointBeforeAcquireForTest, when non-nil, runs in CheckpointWith

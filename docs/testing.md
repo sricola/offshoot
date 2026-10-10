@@ -208,7 +208,13 @@ From `.github/workflows/ci.yml` and the `Makefile`:
   tradeoff as the torture matrix above).
 - **`gofmt` and `go vet`** as hard CI steps; `staticcheck` via `make lint`
   (best-effort there only so offline runs don't fail the two gates that
-  already passed).
+  already passed). `make lint-python` is the same gate for every Python
+  file (ruff lint + format, rules in `ruff.toml`); ci.yml's sdks job runs
+  it on every PR.
+- **`govulncheck` nightly** against the toolchain go.mod pins and the
+  module graph, not gated on fresh commits: a Go point release that fixes
+  a reachable stdlib function is what it exists to catch, and that
+  arrives without any commit here.
 - **No silent skips in CI.** Integration tests that need `sqlite3` or
   `sqldiff` hard-fail in CI when the binary is missing
   (`testutil.RequireExec`, armed by `CI=true`) instead of skipping green —

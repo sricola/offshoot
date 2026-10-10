@@ -2,6 +2,8 @@ module github.com/sricola/offshoot/site/gen
 
 go 1.25.0
 
+toolchain go1.27.2
+
 require (
 	github.com/alecthomas/chroma/v2 v2.27.0
 	github.com/yuin/goldmark v1.8.5

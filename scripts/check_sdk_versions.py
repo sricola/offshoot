@@ -14,6 +14,7 @@ that missed a spot fails loudly instead of silently drifting.
 Both SDKs are published in lockstep from one `sdk-v<version>` tag (see
 CONTRIBUTING.md) — there is deliberately one version number, not two.
 """
+
 from __future__ import annotations
 
 import json
@@ -36,7 +37,9 @@ def read_pyproject_version() -> str:
     # simplicity wins over TOML rigor for a single well-known key.
     m = re.search(r'(?m)^version\s*=\s*"([^"]+)"', text)
     if not m:
-        raise SystemExit("sdk/python/pyproject.toml: no top-level version = \"...\" line found")
+        raise SystemExit(
+            'sdk/python/pyproject.toml: no top-level version = "..." line found'
+        )
     return m.group(1)
 
 

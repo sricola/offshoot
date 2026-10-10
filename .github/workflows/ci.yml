@@ -213,6 +213,15 @@ jobs:
       - name: Verify system python3 is present
         run: python3 --version
 
+      # ruff over every tracked Python file (both SDKs, scripts/, examples/),
+      # with the rule set in ruff.toml — the same two commands as
+      # `make lint-python`. pipx is preinstalled on ubuntu-latest, so this
+      # needs no venv and leaves the system python alone.
+      - name: ruff (lint + format check)
+        run: |
+          pipx run ruff==0.17.0 check .
+          pipx run ruff==0.17.0 format --check .
+
       # No sqldiff: the SDK suites drive the daemon, never offshoot diff.
       - uses: ./.github/actions/setup-sqlite
 

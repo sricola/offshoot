@@ -6,16 +6,17 @@ import shutil
 import socket
 import sqlite3
 import subprocess
+import sys
 import tempfile
 import threading
 import time
 import unittest
 from pathlib import Path
 
-import sys
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
-import offshoot
 from datetime import timedelta
+
+import offshoot
 from offshoot.client import OffshootError, _ttl_str
 
 REPO = Path(__file__).resolve().parents[3]
@@ -68,23 +69,29 @@ class TestBranchesWireCompat(unittest.TestCase):
         # fabricate a value; Branch.state must default to "" (additive,
         # backward-compatible field; see docs/reference.md's Branch states
         # section).
-        client = self._client_with_response({
-            "ok": True,
-            "branches": [{
-                "branch": "main",
-                "head_txid": 1,
-                # deliberately no "state" key -- pre-Milestone-4 daemon shape.
-            }],
-        })
+        client = self._client_with_response(
+            {
+                "ok": True,
+                "branches": [
+                    {
+                        "branch": "main",
+                        "head_txid": 1,
+                        # deliberately no "state" key -- pre-Milestone-4 daemon shape.
+                    }
+                ],
+            }
+        )
         branches = client.branches("app")
         self.assertEqual(len(branches), 1)
         self.assertEqual(branches[0].state, "")
 
     def test_present_state_key_is_passed_through(self):
-        client = self._client_with_response({
-            "ok": True,
-            "branches": [{"branch": "main", "head_txid": 1, "state": "active"}],
-        })
+        client = self._client_with_response(
+            {
+                "ok": True,
+                "branches": [{"branch": "main", "head_txid": 1, "state": "active"}],
+            }
+        )
         branches = client.branches("app")
         self.assertEqual(branches[0].state, "active")
 
@@ -111,10 +118,15 @@ class TestDaemonStatusWireCompat(unittest.TestCase):
         self.assertEqual(st.dbfile_descriptors, 0)
 
     def test_status_passes_session_state_through(self):
-        sessions = self._client_with_response({"ok": True, "sessions": [
-            {"db": "app", "branch": "main", "state": "closing"},
-            {"db": "app", "branch": "b"},
-        ]}).status()
+        sessions = self._client_with_response(
+            {
+                "ok": True,
+                "sessions": [
+                    {"db": "app", "branch": "main", "state": "closing"},
+                    {"db": "app", "branch": "b"},
+                ],
+            }
+        ).status()
         self.assertEqual(sessions[0]["state"], "closing")
         # An older daemon sends no state; callers read that as "open".
         self.assertEqual(sessions[1].get("state", "open"), "open")
@@ -172,10 +184,15 @@ class TestMaterializeWireField(unittest.TestCase):
         client.rollback("app", "main", "v1", materialize=True)
         client.promote("app", "attempt", "main")
         client.promote("app", "attempt", "main", materialize=True)
-        self.assertEqual([(op, f["materialize"]) for op, f in calls], [
-            ("rollback", False), ("rollback", True),
-            ("promote", False), ("promote", True),
-        ])
+        self.assertEqual(
+            [(op, f["materialize"]) for op, f in calls],
+            [
+                ("rollback", False),
+                ("rollback", True),
+                ("promote", False),
+                ("promote", True),
+            ],
+        )
 
 
 def build_binary(tmp: Path) -> Path:
@@ -183,8 +200,9 @@ def build_binary(tmp: Path) -> Path:
     if binpath:
         return Path(binpath)
     out = tmp / "offshoot"
-    subprocess.run(["go", "build", "-o", str(out), "./cmd/offshoot"],
-                   cwd=REPO, check=True)
+    subprocess.run(
+        ["go", "build", "-o", str(out), "./cmd/offshoot"], cwd=REPO, check=True
+    )
     return out
 
 
@@ -203,18 +221,25 @@ class DaemonFixture:
         # The store must exist before `serve` will open it (ops.Open refuses
         # an uninitialized store — see cmd/offshoot/main.go); mirrors
         # TestSessionHonorsServeSocketOverride in cmd/offshoot/main_test.go.
-        subprocess.run([str(self.bin), "-store", str(self.store), "init"],
-                        check=True, stdout=subprocess.DEVNULL, stderr=subprocess.PIPE)
+        subprocess.run(
+            [str(self.bin), "-store", str(self.store), "init"],
+            check=True,
+            stdout=subprocess.DEVNULL,
+            stderr=subprocess.PIPE,
+        )
         self.sock = str(self.dir / "d.sock")
         self.proc = subprocess.Popen(
-            [str(self.bin), "-store", str(self.store), "serve",
-             "-socket", self.sock],
-            stdout=subprocess.DEVNULL, stderr=subprocess.PIPE)
+            [str(self.bin), "-store", str(self.store), "serve", "-socket", self.sock],
+            stdout=subprocess.DEVNULL,
+            stderr=subprocess.PIPE,
+        )
         deadline = time.time() + 10
         while not os.path.exists(self.sock):
             if time.time() > deadline:
-                raise RuntimeError("daemon did not start: " +
-                                   self.proc.stderr.peek().decode(errors="replace"))
+                raise RuntimeError(
+                    "daemon did not start: "
+                    + self.proc.stderr.peek().decode(errors="replace")
+                )
             if self.proc.poll() is not None:
                 raise RuntimeError(self.proc.stderr.read().decode(errors="replace"))
             time.sleep(0.05)
@@ -227,7 +252,9 @@ class DaemonFixture:
 
 
 @contextlib.contextmanager
-def fake_subscribe_daemon(lines: list[str], ack: dict | None = None, close_without_ack: bool = False):
+def fake_subscribe_daemon(
+    lines: list[str], ack: dict | None = None, close_without_ack: bool = False
+):
     """A minimal one-shot fake daemon: accepts exactly one connection on a
     fresh temp unix socket, discards the `{"op":"subscribe"}` request line
     it's sent, writes `ack` (default `{"ok": true}`) then each of `lines`
@@ -300,9 +327,19 @@ class TestEventsDecodePath(unittest.TestCase):
 
     def test_dropped_slow_consumer_is_yielded_then_stream_ends(self):
         lines = [
-            json.dumps({"v": 1, "ts": "2026-08-07T00:00:00Z", "type": "session_opened",
-                        "db": "app", "branch": "main", "detail": {"holder": "h1", "epoch": 1}}),
-            json.dumps({"v": 1, "ts": "2026-08-07T00:00:01Z", "type": "dropped_slow_consumer"}),
+            json.dumps(
+                {
+                    "v": 1,
+                    "ts": "2026-08-07T00:00:00Z",
+                    "type": "session_opened",
+                    "db": "app",
+                    "branch": "main",
+                    "detail": {"holder": "h1", "epoch": 1},
+                }
+            ),
+            json.dumps(
+                {"v": 1, "ts": "2026-08-07T00:00:01Z", "type": "dropped_slow_consumer"}
+            ),
         ]
         with fake_subscribe_daemon(lines) as sock_path:
             got = list(fake_events_client(sock_path).events())
@@ -375,14 +412,19 @@ class TestSessionCloseSessionID(unittest.TestCase):
         def _call(op, **fields):
             calls.append((op, fields))
             return open_resp if op == "open" else {"ok": True}
+
         client._call = _call
         return client, calls
 
     def test_close_sends_the_open_session_id(self):
         sid = "0123456789abcdef0123456789abcdef"
-        client, calls = self._client_capturing_call({"ok": True, "checkout": "/c", "session_id": sid})
+        client, calls = self._client_capturing_call(
+            {"ok": True, "checkout": "/c", "session_id": sid}
+        )
         client.open("app").close()
-        self.assertEqual(calls[-1], ("close", {"db": "app", "branch": "main", "session_id": sid}))
+        self.assertEqual(
+            calls[-1], ("close", {"db": "app", "branch": "main", "session_id": sid})
+        )
 
     def test_close_sends_no_session_id_to_an_older_daemon(self):
         # An older daemon's open carries no session_id; _call drops a None field.
@@ -454,7 +496,9 @@ class TestClient(unittest.TestCase):
         with offshoot.connect(self.d.sock) as c:
             c.create("rp")
             s = c.open("rp")
-            mine = [st for st in c.status() if st["db"] == "rp" and st["branch"] == "main"]
+            mine = [
+                st for st in c.status() if st["db"] == "rp" and st["branch"] == "main"
+            ]
             self.assertEqual(len(mine), 1)
             self.assertEqual(mine[0]["state"], "open")
 
@@ -499,8 +543,11 @@ class TestClient(unittest.TestCase):
         # case reopens the branch at the closed session's lease epoch, so
         # only the session id tells the two sessions apart.
         for db, rollback in (("stale", False), ("stalerb", True)):
-            with self.subTest(rollback=rollback), \
-                    offshoot.connect(self.d.sock) as a, offshoot.connect(self.d.sock) as b:
+            with (
+                self.subTest(rollback=rollback),
+                offshoot.connect(self.d.sock) as a,
+                offshoot.connect(self.d.sock) as b,
+            ):
                 a.create(db)
                 first = a.open(db)
                 first.close()
@@ -510,8 +557,15 @@ class TestClient(unittest.TestCase):
                 try:
                     with self.assertRaises(OffshootError) as cm:
                         first.close()
-                    self.assertRegex(str(cm.exception), rf"session [0-9a-f]{{32}} on {db}@main is not open")
-                    mine = [st for st in b.status() if st["db"] == db and st["branch"] == "main"]
+                    self.assertRegex(
+                        str(cm.exception),
+                        rf"session [0-9a-f]{{32}} on {db}@main is not open",
+                    )
+                    mine = [
+                        st
+                        for st in b.status()
+                        if st["db"] == db and st["branch"] == "main"
+                    ]
                     self.assertEqual(len(mine), 1)
                     self.assertEqual(mine[0]["state"], "open")
                     second.flush()  # raises if the stale close had closed it
@@ -525,7 +579,9 @@ class TestClient(unittest.TestCase):
             try:
                 st = c.daemon_status()
                 self.assertIsInstance(st, offshoot.DaemonStatus)
-                self.assertTrue(any(x["db"] == "ds" and x["branch"] == "main" for x in st.sessions))
+                self.assertTrue(
+                    any(x["db"] == "ds" and x["branch"] == "main" for x in st.sessions)
+                )
                 self.assertIsNotNone(st.dbfile_descriptors)
                 self.assertGreaterEqual(st.dbfile_descriptors or 0, 1)
                 # status() is unchanged: still the bare session list. Not
@@ -662,7 +718,9 @@ class TestClient(unittest.TestCase):
             conn = sqlite3.connect(out)
             rows = conn.execute("SELECT count(*) FROM t").fetchone()[0]
             conn.close()
-            self.assertEqual(rows, 1, "export must not include a session's unflushed write")
+            self.assertEqual(
+                rows, 1, "export must not include a session's unflushed write"
+            )
 
             s.flush()  # now durable
             out2 = os.path.join(self.d.dir, "export-after-flush.db")
@@ -695,8 +753,9 @@ class TestClient(unittest.TestCase):
 
         with open(src, "rb") as f:
             after = hashlib.sha256(f.read()).hexdigest()
-        self.assertEqual(before, after,
-                          "create(from_path=...) must never modify the source file")
+        self.assertEqual(
+            before, after, "create(from_path=...) must never modify the source file"
+        )
 
     def test_diff_is_content_aware_and_needs_no_sqldiff(self):
         with offshoot.connect(self.d.sock) as c:
@@ -704,7 +763,9 @@ class TestClient(unittest.TestCase):
             s = c.open("diffdb")
             db = sqlite3.connect(s.path)
             db.execute("CREATE TABLE results (id INTEGER PRIMARY KEY, passed INT)")
-            db.executemany("INSERT INTO results VALUES (?, ?)", [(1, 1), (2, 1), (3, 1)])
+            db.executemany(
+                "INSERT INTO results VALUES (?, ?)", [(1, 1), (2, 1), (3, 1)]
+            )
             db.commit()
             s.flush("v1")
             db.execute("UPDATE results SET passed=0 WHERE id=2")
@@ -714,11 +775,15 @@ class TestClient(unittest.TestCase):
             s.close()
 
             res = c.diff("diffdb@main@v1", "diffdb@main@v2")
-            self.assertEqual((res.left, res.right), ("diffdb@main@v1", "diffdb@main@v2"))
+            self.assertEqual(
+                (res.left, res.right), ("diffdb@main@v1", "diffdb@main@v2")
+            )
             self.assertEqual(len(res.tables), 1)
             t = res.tables[0]
-            self.assertEqual((t.table, t.left_rows, t.right_rows, t.changed, t.status),
-                             ("results", 3, 3, 1, "changed"))
+            self.assertEqual(
+                (t.table, t.left_rows, t.right_rows, t.changed, t.status),
+                ("results", 3, 3, 1, "changed"),
+            )
             self.assertEqual(res.totals["changed"], 1)
             self.assertEqual(res.full, "")
             self.assertFalse(res.truncated)
@@ -797,8 +862,9 @@ class TestClient(unittest.TestCase):
         """
         if not shutil.which("lsof"):
             return None
-        out = subprocess.run(["lsof", "-p", str(self.d.proc.pid)],
-                              capture_output=True, text=True)
+        out = subprocess.run(
+            ["lsof", "-p", str(self.d.proc.pid)], capture_output=True, text=True
+        )
         return sum(1 for line in out.stdout.splitlines() if "unix" in line.split())
 
     @staticmethod
@@ -858,7 +924,9 @@ class TestClient(unittest.TestCase):
         """
         th.join(timeout)
         if th.is_alive():
-            return None  # timed out; thread + gen's connection abandoned, see doc comment
+            return (
+                None  # timed out; thread + gen's connection abandoned, see doc comment
+            )
         return result[0] if result else None
 
     def test_events_sees_session_lifecycle_in_order(self):
@@ -887,7 +955,9 @@ class TestClient(unittest.TestCase):
                 opened = None
                 while opened is None:
                     if time.time() > deadline:
-                        self.fail("events() never observed session_opened before the retry deadline")
+                        self.fail(
+                            "events() never observed session_opened before the retry deadline"
+                        )
                     if s is not None:
                         s.close()
                     gen = c.events()
@@ -940,7 +1010,9 @@ class TestClient(unittest.TestCase):
                 opened = None
                 while opened is None:
                     if time.time() > deadline:
-                        self.fail("events() never observed session_opened before the retry deadline")
+                        self.fail(
+                            "events() never observed session_opened before the retry deadline"
+                        )
                     if s is not None:
                         s.close()
                     gen = c.events()
@@ -975,9 +1047,11 @@ class TestClient(unittest.TestCase):
                             break
                         time.sleep(0.1)
                     self.assertLessEqual(
-                        after, baseline,
+                        after,
+                        baseline,
                         f"daemon fd count did not return to baseline after events().close() "
-                        f"(baseline={baseline}, after={after}) -- possible leaked subscriber fd")
+                        f"(baseline={baseline}, after={after}) -- possible leaked subscriber fd",
+                    )
 
                 s.close()
 

@@ -2,6 +2,8 @@
 *.db-wal
 *.db-shm
 /bin/
+# `go build ./cmd/offshoot` (and CONTRIBUTING's `-o offshoot`) drop the binary here.
+/offshoot
 /.offshoot/
 /reports/
 /research_notes/

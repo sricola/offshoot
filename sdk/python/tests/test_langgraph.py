@@ -1,6 +1,6 @@
 import shutil
-import subprocess
 import sqlite3
+import subprocess
 import sys
 import tempfile
 import unittest
@@ -233,14 +233,19 @@ class TestAgentExampleSmoke(unittest.TestCase):
     def test_agent_example_prints_two_diverged_world_states(self):
         proc = subprocess.run(
             [sys.executable, str(AGENT_PY), "--socket", self.d.sock],
-            cwd=REPO, capture_output=True, text=True, timeout=60)
+            cwd=REPO,
+            capture_output=True,
+            text=True,
+            timeout=60,
+        )
         self.assertEqual(proc.returncode, 0, proc.stderr)
         self.assertIn(
             "original thread, after 3 turns: ['widget', 'gadget', 'gizmo-oops']",
-            proc.stdout)
+            proc.stdout,
+        )
         self.assertIn(
-            "rewound thread, after retrying turn 2: ['widget', 'sprocket']",
-            proc.stdout)
+            "rewound thread, after retrying turn 2: ['widget', 'sprocket']", proc.stdout
+        )
 
 
 if __name__ == "__main__":

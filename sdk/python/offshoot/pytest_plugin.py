@@ -157,6 +157,7 @@ sees it and skips the auto-wrap entirely — or to remove the seed's own
 `BEGIN`/`COMMIT` and let `_run_seed`'s wrap own the whole script's
 transaction boundary instead.
 """
+
 from __future__ import annotations
 
 import collections
@@ -169,10 +170,10 @@ import tempfile
 import threading
 import time
 import warnings
-from collections.abc import Generator, Mapping
+from collections.abc import Callable, Generator, Mapping
 from dataclasses import dataclass, field
 from pathlib import Path
-from typing import Callable, TypeAlias
+from typing import TypeAlias
 
 try:
     import pytest
@@ -219,6 +220,7 @@ _MAX_WORKER_LEN = 20  # bounds _branch_name's worker segment; see its docstring
 # byte-compare two SQLite files; compare their `.dump` text instead).
 # --------------------------------------------------------------------------
 
+
 def offshoot_dump(path: str | Path) -> str:
     """Return ``sqlite3 <path> .dump``'s text output.
 
@@ -241,7 +243,8 @@ def offshoot_dump(path: str | Path) -> str:
     try:
         proc = subprocess.run(
             ["sqlite3", str(path), ".dump"],
-            capture_output=True, text=True,
+            capture_output=True,
+            text=True,
         )
     except FileNotFoundError as e:
         raise OffshootError(
@@ -251,7 +254,8 @@ def offshoot_dump(path: str | Path) -> str:
         ) from e
     if proc.returncode != 0:
         raise OffshootError(
-            f"offshoot_dump: `sqlite3 {path} .dump` failed: {proc.stderr.strip()}")
+            f"offshoot_dump: `sqlite3 {path} .dump` failed: {proc.stderr.strip()}"
+        )
     return proc.stdout
 
 
@@ -271,6 +275,7 @@ def _offshoot_dump_fixture() -> Callable[[str | Path], str]:
 # going through pytest's fixture machinery.
 # --------------------------------------------------------------------------
 
+
 class BinaryMisconfigured(Exception):
     """`OFFSHOOT_BIN` is set but doesn't point at a usable binary (missing,
     or not a regular file — e.g. a directory). Distinct from "no binary
@@ -289,12 +294,11 @@ def _locate_binary(env: Mapping[str, str] | None = None) -> Path | None:
     if explicit:
         p = Path(explicit)
         if not p.exists():
-            raise BinaryMisconfigured(
-                f"OFFSHOOT_BIN={explicit!r} does not exist.")
+            raise BinaryMisconfigured(f"OFFSHOOT_BIN={explicit!r} does not exist.")
         if not p.is_file():
             raise BinaryMisconfigured(
-                f"OFFSHOOT_BIN={explicit!r} is not a file "
-                "(is it a directory?).")
+                f"OFFSHOOT_BIN={explicit!r} is not a file (is it a directory?)."
+            )
         return p
     found = shutil.which("offshoot", path=resolved_env.get("PATH"))
     return Path(found) if found else None
@@ -309,7 +313,7 @@ _INSTALL_INSTRUCTIONS = (
 )
 
 
-def _drain_stderr(proc: subprocess.Popen[bytes], tail: "collections.deque[str]") -> None:
+def _drain_stderr(proc: subprocess.Popen[bytes], tail: collections.deque[str]) -> None:
     assert proc.stderr is not None
     try:
         for raw in iter(proc.stderr.readline, b""):
@@ -329,9 +333,10 @@ class DaemonHandle:
         self.sock = sock
         self.store = store
         self.proc = proc
-        self._tail: "collections.deque[str]" = collections.deque(maxlen=200)
+        self._tail: collections.deque[str] = collections.deque(maxlen=200)
         self._drain_thread = threading.Thread(
-            target=_drain_stderr, args=(proc, self._tail), daemon=True)
+            target=_drain_stderr, args=(proc, self._tail), daemon=True
+        )
         self._drain_thread.start()
 
     def stderr_tail(self, n: int = 20) -> str:
@@ -358,27 +363,34 @@ def _start_daemon(binpath: Path, workdir: Path, timeout: float = 10.0) -> Daemon
     store = workdir / "store"
     init = subprocess.run(
         [str(binpath), "-store", str(store), "init"],
-        stdout=subprocess.DEVNULL, stderr=subprocess.PIPE)
+        stdout=subprocess.DEVNULL,
+        stderr=subprocess.PIPE,
+    )
     if init.returncode != 0:
         raise RuntimeError(
             f"offshoot -store {store} init failed: "
-            f"{init.stderr.decode(errors='replace')}")
+            f"{init.stderr.decode(errors='replace')}"
+        )
     sock = str(workdir / "d.sock")
     proc = subprocess.Popen(
         [str(binpath), "-store", str(store), "serve", "-socket", sock],
-        stdout=subprocess.DEVNULL, stderr=subprocess.PIPE)
+        stdout=subprocess.DEVNULL,
+        stderr=subprocess.PIPE,
+    )
     handle = DaemonHandle(sock, store, proc)
     deadline = time.time() + timeout
     while not os.path.exists(sock):
         if proc.poll() is not None:
             raise RuntimeError(
                 "offshoot serve exited before it started listening:\n"
-                + handle.stderr_tail())
+                + handle.stderr_tail()
+            )
         if time.time() > deadline:
             handle.stop()
             raise RuntimeError(
                 f"offshoot serve did not start listening within {timeout}s:\n"
-                + handle.stderr_tail())
+                + handle.stderr_tail()
+            )
         time.sleep(0.02)
     return handle
 
@@ -407,7 +419,9 @@ def _connect(sock: str, stderr_tail: Callable[[], str] = lambda: "") -> Client:
 
 
 @pytest.fixture(scope="session")
-def offshoot_daemon(request: pytest.FixtureRequest) -> Generator[DaemonHandle, None, None]:
+def offshoot_daemon(
+    request: pytest.FixtureRequest,
+) -> Generator[DaemonHandle, None, None]:
     """Session-scoped `offshoot serve` on a fresh temp store + socket.
 
     See the module docstring's "xdist stance" section: under xdist this
@@ -426,7 +440,9 @@ def offshoot_daemon(request: pytest.FixtureRequest) -> Generator[DaemonHandle, N
         if require:
             pytest.fail(
                 f"{_INSTALL_INSTRUCTIONS} (offshoot_require_binary is set, "
-                "so this is a failure, not a skip.)", pytrace=False)
+                "so this is a failure, not a skip.)",
+                pytrace=False,
+            )
         pytest.skip(_INSTALL_INSTRUCTIONS)
     workdir = Path(tempfile.mkdtemp(prefix=f"offshoot-pytest-{_worker_id()}-"))
     handle = _start_daemon(binpath, workdir)
@@ -440,6 +456,7 @@ def offshoot_daemon(request: pytest.FixtureRequest) -> Generator[DaemonHandle, N
 # --------------------------------------------------------------------------
 # offshoot_db: the named-seed factory.
 # --------------------------------------------------------------------------
+
 
 @dataclass
 class SeedHandle:
@@ -496,7 +513,7 @@ def _skip_leading_noise(text: str) -> str:
             end = text.find("*/", i + 2)
             i = n if end == -1 else end + 2
             continue
-        if text[i:i + 6].upper() == "PRAGMA":
+        if text[i : i + 6].upper() == "PRAGMA":
             semi = text.find(";", i)
             i = n if semi == -1 else semi + 1
             continue
@@ -510,7 +527,9 @@ def _seed_opens_own_transaction(seed: str) -> bool:
     and must NOT be wrapped in another one (SQLite rejects a nested BEGIN)."""
     rest = _skip_leading_noise(seed)
     head = rest[:5].upper()
-    return head == "BEGIN" and (len(rest) == 5 or not (rest[5].isalnum() or rest[5] == "_"))
+    return head == "BEGIN" and (
+        len(rest) == 5 or not (rest[5].isalnum() or rest[5] == "_")
+    )
 
 
 def _run_seed(session: Session, seed: _Seed) -> None:
@@ -614,7 +633,9 @@ class _SeedFactory:
     def __call__(self, name: str = "default", seed: _Seed | None = None) -> SeedHandle:
         cached = self._seeded.get(name)
         if cached is not None:
-            if seed is not None and _fingerprint_seed(seed) != self._fingerprints.get(name):
+            if seed is not None and _fingerprint_seed(seed) != self._fingerprints.get(
+                name
+            ):
                 raise OffshootError(
                     f"offshoot_db(name={name!r}): called again with a "
                     f"DIFFERENT seed than the one that already seeded "
@@ -622,7 +643,8 @@ class _SeedFactory:
                     "memoizes by name, not by seed content — pass a "
                     f"different name= for a different seed, or omit seed= "
                     f"(or pass the identical one) on every call for "
-                    f"{name!r}.")
+                    f"{name!r}."
+                )
             return cached
         effective_seed = seed
         if effective_seed is None:
@@ -633,7 +655,8 @@ class _SeedFactory:
                     "seed=<callable-or-sql-string-or-db-file-path>, or set "
                     "`offshoot_seed = path/to/seed.sql-or-.db` under "
                     "[tool.pytest.ini_options] (pyproject.toml) or "
-                    "[pytest] (pytest.ini/setup.cfg).")
+                    "[pytest] (pytest.ini/setup.cfg)."
+                )
             # The ini default path is itself either a .sql script (read as
             # text, as before) or an existing SQLite database file (kept as
             # a path — detected by content, never by extension — and
@@ -668,7 +691,9 @@ class _SeedFactory:
 
 
 @pytest.fixture(scope="session")
-def offshoot_db(offshoot_daemon: DaemonHandle, request: pytest.FixtureRequest) -> Generator[_SeedFactory, None, None]:
+def offshoot_db(
+    offshoot_daemon: DaemonHandle, request: pytest.FixtureRequest
+) -> Generator[_SeedFactory, None, None]:
     """Session-scoped named-seed factory: `offshoot_db(name="default",
     seed=None)`. See the module docstring for the full contract."""
     client = _connect(offshoot_daemon.sock, offshoot_daemon.stderr_tail)
@@ -685,6 +710,7 @@ def offshoot_db(offshoot_daemon: DaemonHandle, request: pytest.FixtureRequest) -
 # --------------------------------------------------------------------------
 # offshoot_fork: the function-scoped fork-per-test factory.
 # --------------------------------------------------------------------------
+
 
 @dataclass
 class ForkedSession:
@@ -722,7 +748,9 @@ def _branch_name(worker: str, nodeid: str, n: int) -> str:
     truncation, this is a readability bound, not a uniqueness one (the
     testname-hash segment is what actually guarantees distinctness).
     """
-    safe_worker = _UNSAFE_RUN.sub("-", worker.lower()).strip("-")[:_MAX_WORKER_LEN] or "w"
+    safe_worker = (
+        _UNSAFE_RUN.sub("-", worker.lower()).strip("-")[:_MAX_WORKER_LEN] or "w"
+    )
     return f"t-{safe_worker}-{_sanitize(nodeid)}-{n}"
 
 
@@ -732,8 +760,15 @@ class _ForkFactory:
     direct-testability reason as `_SeedFactory`.
     """
 
-    def __init__(self, client: Client, seed_factory: _SeedFactory, worker: str,
-                 nodeid: str, ttl: str, stderr_tail: Callable[[], str] = lambda: ""):
+    def __init__(
+        self,
+        client: Client,
+        seed_factory: _SeedFactory,
+        worker: str,
+        nodeid: str,
+        ttl: str,
+        stderr_tail: Callable[[], str] = lambda: "",
+    ):
         self._client = client
         self._seed_factory = seed_factory
         self._worker = worker
@@ -751,17 +786,28 @@ class _ForkFactory:
         branch = _branch_name(self._worker, self._nodeid, self._n)
         self._n += 1
         try:
-            self._client.fork(seed_handle.db, "main", branch,
-                               from_checkpoint=seed_handle.checkpoint, ttl=self._ttl)
+            self._client.fork(
+                seed_handle.db,
+                "main",
+                branch,
+                from_checkpoint=seed_handle.checkpoint,
+                ttl=self._ttl,
+            )
             session = self._client.open(seed_handle.db, branch)
         except OffshootError as e:
             tail = self._stderr_tail()
             if tail:
                 raise OffshootError(
-                    f"{e}\n--- offshoot_daemon stderr tail ---\n{tail}") from e
+                    f"{e}\n--- offshoot_daemon stderr tail ---\n{tail}"
+                ) from e
             raise
-        forked = ForkedSession(path=session.path, client=self._client,
-                                db=seed_handle.db, branch=branch, _session=session)
+        forked = ForkedSession(
+            path=session.path,
+            client=self._client,
+            db=seed_handle.db,
+            branch=branch,
+            _session=session,
+        )
         self.created.append(forked)
         return forked
 
@@ -793,26 +839,36 @@ class _ForkFactory:
             except Exception as e:
                 self._warn(
                     f"offshoot_fork: closing the session on "
-                    f"{forked.db}@{forked.branch} failed during teardown: {e}")
+                    f"{forked.db}@{forked.branch} failed during teardown: {e}"
+                )
             try:
                 self._client.destroy(forked.db, forked.branch, force=True)
             except Exception as e:
                 self._warn(
                     f"offshoot_fork: destroying branch "
                     f"{forked.db}@{forked.branch} failed during teardown "
-                    f"(it will leak until its TTL expires): {e}")
+                    f"(it will leak until its TTL expires): {e}"
+                )
 
 
 @pytest.fixture
 def offshoot_fork(
-    offshoot_daemon: DaemonHandle, offshoot_db: _SeedFactory, request: pytest.FixtureRequest,
+    offshoot_daemon: DaemonHandle,
+    offshoot_db: _SeedFactory,
+    request: pytest.FixtureRequest,
 ) -> Generator[_ForkFactory, None, None]:
     """Function-scoped fork-per-test factory: `offshoot_fork(seed_handle=
     None)`. See the module docstring for the full contract."""
     client = _connect(offshoot_daemon.sock, offshoot_daemon.stderr_tail)
     ttl = request.config.getini("offshoot_ttl") or _DEFAULT_TTL
-    factory = _ForkFactory(client, offshoot_db, _worker_id(), request.node.nodeid, ttl,
-                            stderr_tail=offshoot_daemon.stderr_tail)
+    factory = _ForkFactory(
+        client,
+        offshoot_db,
+        _worker_id(),
+        request.node.nodeid,
+        ttl,
+        stderr_tail=offshoot_daemon.stderr_tail,
+    )
     try:
         yield factory
     finally:
@@ -830,19 +886,26 @@ def offshoot_fork(
 
 def pytest_addoption(parser: pytest.Parser) -> None:
     parser.addini(
-        "offshoot_seed", default="",
+        "offshoot_seed",
+        default="",
         help="Path to a .sql file (resolved against rootdir) run (via "
-             "sqlite3), OR a path to an existing SQLite database file "
-             "(imported via `create --from` and forked from its `init` "
-             "checkpoint instead), as offshoot_db's zero-code default seed "
-             "when a call omits seed=.")
+        "sqlite3), OR a path to an existing SQLite database file "
+        "(imported via `create --from` and forked from its `init` "
+        "checkpoint instead), as offshoot_db's zero-code default seed "
+        "when a call omits seed=.",
+    )
     parser.addini(
-        "offshoot_ttl", default=_DEFAULT_TTL,
+        "offshoot_ttl",
+        default=_DEFAULT_TTL,
         help="TTL applied to every offshoot_fork branch, as a Go duration "
-             f"string (e.g. '1h', '30m'). Default: {_DEFAULT_TTL}.")
+        f"string (e.g. '1h', '30m'). Default: {_DEFAULT_TTL}.",
+    )
     parser.addini(
-        "offshoot_require_binary", type="bool", default=False,
+        "offshoot_require_binary",
+        type="bool",
+        default=False,
         help="If true, a missing offshoot binary FAILS the session instead "
-             "of skipping it — CI strict mode, so a misconfigured "
-             "environment (offshoot never installed) doesn't just silently "
-             "skip every offshoot test.")
+        "of skipping it — CI strict mode, so a misconfigured "
+        "environment (offshoot never installed) doesn't just silently "
+        "skip every offshoot test.",
+    )

@@ -283,6 +283,7 @@ run_job() {
 	printf 'ci-local: %s\n' "$job_label"
 	printf '============================================================\n'
 
+	# shellcheck disable=SC2034 # read inside the eval two lines down
 	job_start=$SECONDS
 	if "$job_fn"; then
 		eval "${job_key}_status=pass"
@@ -310,6 +311,7 @@ cmd_all() {
 	printf '============================================================\n'
 	printf '%-14s %-6s %10s\n' "job" "result" "time"
 	for key in host linux s3 sdks; do
+		st=; sec=   # assigned by the evals (run_job stores <key>_status/<key>_secs)
 		eval "st=\${${key}_status}"
 		eval "sec=\${${key}_secs}"
 		total_secs=$((total_secs + sec))

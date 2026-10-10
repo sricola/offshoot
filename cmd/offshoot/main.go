@@ -627,887 +627,1007 @@ func run(args []string) error {
 	}
 	switch cmd {
 	case "create":
-		switch {
-		case len(rest) == 1:
-			if err := w.Create(rest[0]); err != nil {
-				return err
-			}
-			fmt.Printf("created %s (branch main)\n", rest[0])
-			return nil
-		case len(rest) == 3 && rest[1] == "--from":
-			if err := w.CreateFrom(rest[0], rest[2]); err != nil {
-				return err
-			}
-			fmt.Printf("created %s (branch main, imported from %s)\n", rest[0], rest[2])
-			return nil
-		default:
-			return fmt.Errorf("usage: offshoot create <db> [--from file]")
-		}
+		return cmdCreate(w, rest)
 	case "checkpoint":
-		snapshot, rest := extractBoolFlag(rest, "--snapshot")
-		force, rest := extractBoolFlag(rest, "--force")
-		meta, rest, err := extractMetaFlags(rest)
-		if err != nil {
-			return fmt.Errorf("usage: offshoot checkpoint <db>[@branch] <name> [--snapshot] [--meta k=v ...] [--force]: %w", err)
-		}
-		if len(rest) != 2 {
-			return fmt.Errorf("usage: offshoot checkpoint <db>[@branch] <name> [--snapshot] [--meta k=v ...] [--force]")
-		}
-		db, branch, err := ops.ParseTarget(rest[0])
-		if err != nil {
-			return err
-		}
-		res, err := w.CheckpointWith(db, branch, rest[1], meta, ops.CheckpointOptions{Snapshot: snapshot, Force: force})
-		if err != nil {
-			return err
-		}
-		fmt.Println(checkpointLine(rest[1], res))
-		return nil
+		return cmdCheckpoint(w, rest)
 	case "fork":
-		fs := rest
-		at, fs, _, err := extractFlag(fs, "--at")
-		if err != nil {
-			return fmt.Errorf("usage: offshoot fork <db>[@branch] <new-branch> [--at checkpoint] [--ttl duration] [--meta k=v ...]: %w", err)
-		}
-		ttlRaw, fs, hasTTL, err := extractFlag(fs, "--ttl")
-		if err != nil {
-			return fmt.Errorf("usage: offshoot fork <db>[@branch] <new-branch> [--at checkpoint] [--ttl duration] [--meta k=v ...]: %w", err)
-		}
-		meta, fs, err := extractMetaFlags(fs)
-		if err != nil {
-			return fmt.Errorf("usage: offshoot fork <db>[@branch] <new-branch> [--at checkpoint] [--ttl duration] [--meta k=v ...]: %w", err)
-		}
-		ttl := time.Duration(0)
-		if hasTTL {
-			// fork has no "none" sentinel the way touch does (a brand-new
-			// branch has no existing TTL to explicitly clear), and a
-			// non-positive duration is refused rather than silently treated
-			// as no TTL — see parseForkTTLFlag.
-			ttl, err = parseForkTTLFlag(ttlRaw)
-			if err != nil {
-				return err
-			}
-		}
-		if len(fs) != 2 {
-			return fmt.Errorf("usage: offshoot fork <db>[@branch] <new-branch> [--at checkpoint] [--ttl duration] [--meta k=v ...]")
-		}
-		db, branch, err := ops.ParseTarget(fs[0])
-		if err != nil {
-			return err
-		}
-		txid, err := w.Fork(db, branch, fs[1], at, ttl, meta)
-		if err != nil {
-			return err
-		}
-		fmt.Printf("forked %s@%s -> %s@%s at txid %d\n", db, branch, db, fs[1], txid)
-		return nil
+		return cmdFork(w, rest)
 	case "touch":
-		fs := rest
-		ttlRaw, fs, hasTTL, err := extractFlag(fs, "--ttl")
-		if err != nil {
-			return fmt.Errorf("usage: offshoot touch <db>[@branch] [--ttl duration|none]: %w", err)
-		}
-		if len(fs) != 1 {
-			return fmt.Errorf("usage: offshoot touch <db>[@branch] [--ttl duration|none]")
-		}
-		db, branch, err := ops.ParseTarget(fs[0])
-		if err != nil {
-			return err
-		}
-		var ttl *time.Duration
-		if hasTTL {
-			d, err := parseTTLFlag(ttlRaw)
-			if err != nil {
-				return err
-			}
-			ttl = &d
-		}
-		ref, err := w.Touch(db, branch, ttl, time.Now())
-		if err != nil {
-			return err
-		}
-		out := ref.TTL
-		if out == "" {
-			out = "none"
-		}
-		fmt.Printf("touched %s@%s ttl=%s touched_at=%s\n", db, branch, out, ref.TouchedAt)
-		return nil
+		return cmdTouch(w, rest)
 	case "protect":
-		if len(rest) != 1 {
-			return fmt.Errorf("usage: offshoot protect <db>[@branch]")
-		}
-		db, branch, err := ops.ParseTarget(rest[0])
-		if err != nil {
-			return err
-		}
-		if _, err := w.SetProtected(db, branch, true); err != nil {
-			return err
-		}
-		fmt.Printf("protected %s@%s\n", db, branch)
-		return nil
+		return cmdProtect(w, rest)
 	case "unprotect":
-		if len(rest) != 1 {
-			return fmt.Errorf("usage: offshoot unprotect <db>[@branch]")
-		}
-		db, branch, err := ops.ParseTarget(rest[0])
-		if err != nil {
-			return err
-		}
-		if _, err := w.SetProtected(db, branch, false); err != nil {
-			return err
-		}
-		fmt.Printf("unprotected %s@%s\n", db, branch)
-		return nil
+		return cmdUnprotect(w, rest)
 	case "rollback":
-		const usage = "usage: offshoot rollback <db>[@branch] --to <checkpoint> [--force] [--no-backup] [--backup-ttl DUR] [--materialize]"
-		var opts ops.RollbackOptions
-		fs := rest[:0]
-		for i := 0; i < len(rest); i++ {
-			switch a := rest[i]; a {
-			case "--force":
-				opts.Force = true
-			case "--no-backup":
-				opts.NoBackup = true
-			case "--materialize":
-				opts.Materialize = true
-			case "--backup-ttl":
-				if i+1 >= len(rest) {
-					return fmt.Errorf("%s", usage)
-				}
-				i++
-				d, err := time.ParseDuration(rest[i])
-				if err != nil || d <= 0 {
-					return fmt.Errorf("--backup-ttl must be a positive Go duration (e.g. 2h), got %q", rest[i])
-				}
-				opts.BackupTTL = d
-			default:
-				fs = append(fs, a)
-			}
-		}
-		if len(fs) != 3 || fs[1] != "--to" {
-			return fmt.Errorf("%s", usage)
-		}
-		db, branch, err := ops.ParseTarget(fs[0])
-		if err != nil {
-			return err
-		}
-		res, err := w.RollbackWith(db, branch, fs[2], opts)
-		if err != nil {
-			return err
-		}
-		fmt.Println(res.Path)
-		fmt.Printf("rolled back %s@%s to %q %s\n", db, branch, fs[2], storageMode(res.Shared))
-		if res.Backup != "" {
-			ttl := opts.BackupTTL
-			if ttl <= 0 {
-				ttl = ops.DefaultPromoteBackupTTL
-			}
-			if res.BackupIsTarget {
-				// The head already sat at the target checkpoint, so the
-				// safety fork holds the same committed state; the only thing
-				// this rollback changed is the checkout itself. Say so rather
-				// than offering an undo that would restore nothing.
-				fmt.Printf("kept the previous %s@%s head as %s@%s (expires in %s) — it is the same committed state as %q; only un-checkpointed edits to the checkout were discarded\n",
-					db, branch, db, res.Backup, ttl, fs[2])
-			} else {
-				fmt.Printf("kept the previous %s@%s head as %s@%s (expires in %s; undo with: offshoot promote %s@%s --onto %s --force)\n",
-					db, branch, db, res.Backup, ttl, db, res.Backup, branch)
-			}
-		}
-		return nil
+		return cmdRollback(w, rest)
 	case "promote":
-		const usage = "usage: offshoot promote <db>@<source> --onto <target> [--force] [--no-backup] [--backup-ttl DUR] [--materialize]"
-		var opts ops.PromoteOptions
-		fs := rest[:0]
-		for i := 0; i < len(rest); i++ {
-			switch a := rest[i]; a {
-			case "--force":
-				opts.Force = true
-			case "--materialize":
-				opts.Materialize = true
-			case "--no-backup":
-				opts.NoBackup = true
-			case "--backup-ttl":
-				if i+1 >= len(rest) {
-					return fmt.Errorf("%s", usage)
-				}
-				i++
-				d, err := time.ParseDuration(rest[i])
-				if err != nil || d <= 0 {
-					return fmt.Errorf("--backup-ttl must be a positive Go duration (e.g. 2h), got %q", rest[i])
-				}
-				opts.BackupTTL = d
-			default:
-				fs = append(fs, a)
-			}
-		}
-		if len(fs) != 3 || fs[1] != "--onto" {
-			return fmt.Errorf("%s", usage)
-		}
-		db, srcBranch, err := ops.ParseTarget(fs[0])
-		if err != nil {
-			return err
-		}
-		res, err := w.PromoteWith(db, srcBranch, fs[2], opts)
-		if err != nil {
-			return err
-		}
-		fmt.Printf("promoted %s@%s -> %s@%s at txid %d %s\n", db, srcBranch, db, fs[2], res.TXID, storageMode(res.Shared))
-		if res.Backup != "" {
-			ttl := opts.BackupTTL
-			if ttl <= 0 {
-				ttl = ops.DefaultPromoteBackupTTL
-			}
-			fmt.Printf("kept the previous %s@%s head as %s@%s (expires in %s; undo with: offshoot promote %s@%s --onto %s --force)\n",
-				db, fs[2], db, res.Backup, ttl, db, res.Backup, fs[2])
-		}
-		return nil
+		return cmdPromote(w, rest)
 	case "compact":
-		force, rest := extractBoolFlag(rest, "--force")
-		if len(rest) != 1 {
-			return fmt.Errorf("usage: offshoot compact <db>[@branch] [--force]")
-		}
-		db, branch, err := ops.ParseTarget(rest[0])
-		if err != nil {
-			return err
-		}
-		txid, err := w.CompactWith(db, branch, ops.CompactOptions{Force: force})
-		if err != nil {
-			return err
-		}
-		fmt.Printf("compacted %s@%s to txid %d\n", db, branch, txid)
-		return nil
+		return cmdCompact(w, rest)
 	case "path":
-		if len(rest) != 1 {
-			return fmt.Errorf("usage: offshoot path <db>[@branch]")
-		}
-		db, branch, err := ops.ParseTarget(rest[0])
-		if err != nil {
-			return err
-		}
-		fmt.Println(w.CheckoutPath(db, branch))
-		return nil
+		return cmdPath(w, rest)
 	case "checkout":
-		usageErr := fmt.Errorf("usage: offshoot checkout <db>[@branch] [--at checkpoint --read-only [--force]]")
-		fs := rest
-		at, fs, _, err := extractFlag(fs, "--at")
-		if err != nil {
-			return fmt.Errorf("usage: offshoot checkout <db>[@branch] [--at checkpoint --read-only [--force]]: %w", err)
-		}
-		readOnly, fs := extractBoolFlag(fs, "--read-only")
-		force, fs := extractBoolFlag(fs, "--force")
-		if len(fs) != 1 {
-			return usageErr
-		}
-		db, branch, err := ops.ParseTarget(fs[0])
-		if err != nil {
-			return err
-		}
-		switch {
-		case at != "" && readOnly:
-			path, err := w.CheckoutAt(db, branch, at, force)
-			if err != nil {
-				return err
-			}
-			fmt.Println(path)
-			return nil
-		case at != "" || readOnly:
-			return fmt.Errorf("offshoot checkout: --at and --read-only must be given together")
-		case force:
-			return fmt.Errorf("offshoot checkout: --force only applies alongside --at --read-only")
-		default:
-			path, err := w.Checkout(db, branch)
-			if err != nil {
-				return err
-			}
-			fmt.Println(path)
-			return nil
-		}
+		return cmdCheckout(w, rest)
 	case "export":
-		force, rest := extractBoolFlag(rest, "--force")
-		if len(rest) != 2 {
-			return fmt.Errorf("usage: offshoot export <db>[@branch[@checkpoint]] <out.db> [--force]")
-		}
-		db, branch, checkpoint, err := ops.ParseExportTarget(rest[0])
-		if err != nil {
-			return err
-		}
-		if err := w.Export(db, branch, checkpoint, rest[1], force); err != nil {
-			return err
-		}
-		fmt.Println(rest[1])
-		return nil
+		return cmdExport(w, rest)
 	case "diff":
-		summary, rest := extractBoolFlag(rest, "--summary")
-		table, rest, _, err := extractFlag(rest, "--table")
-		if err != nil {
-			return fmt.Errorf("usage: offshoot diff <db>[@branch[@checkpoint]] <db>[@branch[@checkpoint]] [--summary] [--table T]: %w", err)
-		}
-		if len(rest) != 2 {
-			return fmt.Errorf("usage: offshoot diff <db>[@branch[@checkpoint]] <db>[@branch[@checkpoint]] [--summary] [--table T]")
-		}
-		return runDiff(w, os.Stdout, rest[0], rest[1], summary, table)
+		return cmdDiff(w, rest)
 	case "destroy":
-		force := false
-		fs := rest[:0]
-		for _, a := range rest {
-			if a == "--force" {
-				force = true
-				continue
-			}
-			fs = append(fs, a)
-		}
-		if len(fs) != 1 {
-			return fmt.Errorf("usage: offshoot destroy <db>[@branch] [--force]")
-		}
-		db, branch, err := ops.ParseTarget(fs[0])
-		if err != nil {
-			return err
-		}
-		if err := w.Destroy(db, branch, force); err != nil {
-			return err
-		}
-		fmt.Printf("destroyed %s@%s\n", db, branch)
-		return nil
+		return cmdDestroy(w, rest)
 	case "gc":
-		grace := time.Hour
-		if len(rest) == 2 && rest[0] == "--grace" {
-			d, err := parseDurationFlag("--grace", rest[1])
-			if err != nil {
-				return err
-			}
-			grace = d
-		}
-		// A reap failure on one branch (e.g. its checkout has an open
-		// connection, "database is busy") must not stop GC from running:
-		// GC is independent lineage cleanup, and skipping it entirely would
-		// let one unreapable branch wedge garbage collection forever.
-		// Report the failure and press on.
-		reaped, reapErr := w.Reap(time.Now())
-		if len(reaped) > 0 {
-			fmt.Printf("gc: reaped %v\n", reaped)
-		}
-		if reapErr != nil {
-			fmt.Fprintf(os.Stderr, "offshoot: gc: reap: %v\n", reapErr)
-		}
-		// Milestone 4 Task 6b: self-heal any Destroy claim (Ref.Deleting)
-		// stranded by a crashed `destroy`/`gc` call, same "report and press
-		// on" convention as the reap failure above — this is at-rest cleanup
-		// independent of everything else `gc` does, so one branch's stale
-		// claim must not block it either.
-		healed, healErr := w.ClearStaleDeleteClaims(time.Now())
-		if len(healed) > 0 {
-			fmt.Printf("gc: cleared stale delete claim(s) %v\n", healed)
-		}
-		if healErr != nil {
-			fmt.Fprintf(os.Stderr, "offshoot: gc: clear stale delete claims: %v\n", healErr)
-		}
-		tombstoned, deleted, err := w.GC(grace)
-		if err != nil {
-			return err
-		}
-		fmt.Printf("gc: tombstoned %d, deleted %d objects\n", tombstoned, deleted)
-		return nil
+		return cmdGc(w, rest)
 	case "status":
-		// -ro-cache-budget is purely for DISPLAY here — like every other
-		// serve-time tuning knob (-reap-every, -gc-grace, -flush-every), the
-		// budget itself is never persisted to the store, so this at-rest
-		// command (no daemon involved — see below) has no other way to know
-		// what a running daemon was actually started with. Passing the same
-		// value here as the daemon's own -ro-cache-budget lets an operator
-		// see usage against it without a live daemon connection; omitted
-		// (the common case) just reports usage with no budget context.
-		roCacheBudgetStr, rest, _, err := extractFlag(rest, "-ro-cache-budget")
-		if err != nil {
-			return err
-		}
-		roCacheBudget, err := parseByteSize(roCacheBudgetStr)
-		if err != nil {
-			return fmt.Errorf("-ro-cache-budget: %w", err)
-		}
-		if len(rest) != 0 {
-			return fmt.Errorf("usage: offshoot status [-ro-cache-budget BYTES]")
-		}
-		sts, err := w.Status()
-		if err != nil {
-			return err
-		}
-		for _, s := range sts {
-			flags := ""
-			if s.Protected {
-				flags += " protected"
-			}
-			if s.CheckedOut {
-				flags += " checked-out"
-			}
-			// storage= is the copy-on-write cost class, reported honestly on
-			// every line: "shared" means this branch is a base-pointer fork
-			// (near-zero added storage, reading through an ancestor's durable
-			// objects); "materialized" means a fully self-contained lineage.
-			// fork, rollback and promote share below the snapshot floor;
-			// compact (and --materialize) make a full copy.
-			storage := "materialized"
-			if s.Shared {
-				storage = "shared"
-			}
-			line := fmt.Sprintf("%s@%s state=%s storage=%s txid=%d checkpoints=[%s]%s",
-				s.DB, s.Branch, s.State, storage, s.HeadTXID, strings.Join(s.Checkpoints, ","), flags)
-			if s.TTL != "" {
-				line += fmt.Sprintf(" ttl=%s remaining=%s", s.TTL, s.TTLRemaining)
-			}
-			fmt.Println(line)
-		}
-		// Milestone 4 Task 5: ro-cache usage summary. Computed directly off
-		// checkouts-ro (ops.Workspace.ROCacheUsage), the same at-rest read
-		// every other line above already uses — no daemon required, exactly
-		// like the rest of this command.
-		roBytes, roCount, err := w.ROCacheUsage()
-		if err != nil {
-			return err
-		}
-		if roCacheBudget > 0 {
-			fmt.Printf("ro-cache: %d entries, %d bytes used, budget %d bytes\n", roCount, roBytes, roCacheBudget)
-		} else {
-			fmt.Printf("ro-cache: %d entries, %d bytes used (budget: unlimited)\n", roCount, roBytes)
-		}
-		return nil
+		return cmdStatus(w, rest)
 	case "lease":
-		if len(rest) == 0 {
-			return fmt.Errorf("usage: offshoot lease list|acquire|release [args]")
-		}
-		switch rest[0] {
-		case "list":
-			infos, err := w.Leases()
-			if err != nil {
-				return err
-			}
-			for _, in := range infos {
-				state := "held"
-				if in.Expired {
-					state = "expired"
-				}
-				fmt.Printf("%s@%s %s by %s epoch=%d until %s\n",
-					in.DB, in.Branch, state, in.Holder, in.Epoch,
-					in.Expiry.Format(time.RFC3339))
-			}
-			return nil
-		case "acquire":
-			args := rest[1:]
-			ttl := ops.DefaultLeaseTTL
-			if len(args) == 3 && args[1] == "--ttl" {
-				d, err := time.ParseDuration(args[2])
-				if err != nil {
-					return err
-				}
-				ttl = d
-				args = args[:1]
-			}
-			if len(args) != 1 {
-				return fmt.Errorf("usage: offshoot lease acquire <db>[@branch] [--ttl 30s]")
-			}
-			db, branch, err := ops.ParseTarget(args[0])
-			if err != nil {
-				return err
-			}
-			l, err := w.AcquireLease(db, branch, ops.LocalHolder(), ttl)
-			if err != nil {
-				return err
-			}
-			fmt.Printf("acquired %s@%s as %s (epoch %d) until %s\n",
-				db, branch, l.Holder, l.Epoch, l.Expiry.Format(time.RFC3339))
-			fmt.Println("note: this command exits immediately; the lease expires unless a" +
-				" long-running holder renews it")
-			return nil
-		case "release":
-			args := rest[1:]
-			holder, args, holderGiven, err := extractFlag(args, "--holder")
-			if err != nil {
-				return err
-			}
-			if holderGiven && holder == "" {
-				// An empty holder names no lease; against an unleased ref it
-				// would match and "release" nothing.
-				return fmt.Errorf("usage: offshoot lease release <db>[@branch] [--holder H]: --holder requires a non-empty holder")
-			}
-			if len(args) != 1 {
-				return fmt.Errorf("usage: offshoot lease release <db>[@branch] [--holder H]")
-			}
-			db, branch, err := ops.ParseTarget(args[0])
-			if err != nil {
-				return err
-			}
-			if holderGiven {
-				if err := w.ReleaseLeaseByHolder(db, branch, holder); err != nil {
-					return err
-				}
-				fmt.Printf("released %s@%s held by %s\n", db, branch, holder)
-				return nil
-			}
-			infos, err := w.Leases()
-			if err != nil {
-				return err
-			}
-			for _, in := range infos {
-				if in.DB == db && in.Branch == branch {
-					if err := w.ReleaseLease(store.Lease{
-						DB: db, Branch: branch, Holder: in.Holder, Epoch: in.Epoch,
-					}); err != nil {
-						return err
-					}
-					fmt.Printf("released %s@%s held by %s\n", db, branch, in.Holder)
-					return nil
-				}
-			}
-			return fmt.Errorf("offshoot: no lease on %s@%s", db, branch)
-		default:
-			return fmt.Errorf("unknown lease subcommand %q", rest[0])
-		}
+		return cmdLease(w, rest)
 	case "mcp":
-		const mcpUsage = "usage: offshoot mcp [-default-ttl DURATION|none] [-socket PATH] [-allow-force] [-reap-every DURATION|none]"
-		sock, rest, err := socketOverride(rest)
-		if err != nil {
-			return fmt.Errorf("%s: %w", mcpUsage, err)
-		}
-		defaultTTL, rest, err := parseDefaultTTLFlag(rest)
-		if err != nil {
-			return fmt.Errorf("%s: %w", mcpUsage, err)
-		}
-		allowForce, rest := extractBoolFlag(rest, "-allow-force")
-		reapEvery, rest, err := parseReapEveryFlag(rest)
-		if err != nil {
-			return fmt.Errorf("%s: %w", mcpUsage, err)
-		}
-		if len(rest) != 0 {
-			return fmt.Errorf("%s", mcpUsage)
-		}
-		// sock == "" here (the common case: no -socket given) is resolved by
-		// NewOffshootTools itself via daemon.DefaultSocketPath(spec) — the
-		// same default `offshoot serve` binds to for this store — so a bare
-		// `offshoot mcp` and a bare `offshoot serve` against the same store
-		// agree on where to look without either side hardcoding the path.
-		ts := mcp.NewOffshootTools(w, spec, defaultTTL, sock)
-		// -allow-force is off by default: without it, an agent's force:true
-		// against a PROTECTED branch (main, by default) is refused by
-		// offshoot_promote/offshoot_destroy before any mutation — see
-		// OffshootTools.SetAllowForce. Force against an unprotected branch
-		// never needed this flag.
-		ts.SetAllowForce(allowForce)
-		// The reaper's context is cancelled the moment the server loop
-		// below returns (this function's own srv.Serve(ctx), whether it
-		// exits via stdin EOF or an error) — the reaper must never keep
-		// running past the process's own MCP-serving lifetime, since
-		// nothing would ever stop it otherwise. reapEvery <= 0 (0 or
-		// "none") starts no goroutine at all (see StartReaper).
-		ctx, cancel := context.WithCancel(context.Background())
-		defer cancel()
-		// StartReaper's returned channel is a test hook (see its own doc
-		// comment) for proving the reaper's goroutine actually stopped
-		// after cancellation — this process's own teardown once srv.Serve
-		// returns already ensures that, so there's nothing more to wait on
-		// here.
-		_ = ts.StartReaper(ctx, reapEvery)
-		mcp.SetServerVersion(version)
-		srv := mcp.NewServer(os.Stdin, os.Stdout, ts)
-		return srv.Serve(ctx)
+		return cmdMcp(w, spec, rest)
 	case "serve":
-		const serveUsage = "usage: offshoot serve [-socket PATH] [-reap-every DURATION] [-gc-grace DURATION] " +
-			"[-flush-every DURATION] [-snapshot-every N] [-ro-cache-budget BYTES] [-fd-budget N] [-http ADDR] [-token TOKEN | -token-file PATH] [-http-allow-non-loopback]"
-		sock, rest, err := socketOverride(rest)
-		if err != nil {
-			return fmt.Errorf("%s: %w", serveUsage, err)
-		}
-		reapEveryStr, rest, _, err := extractFlag(rest, "-reap-every")
-		if err != nil {
-			return err
-		}
-		if reapEveryStr == "" {
-			reapEveryStr = "1m"
-		}
-		reapEvery, err := time.ParseDuration(reapEveryStr)
-		if err != nil {
-			return fmt.Errorf("-reap-every: %w", err)
-		}
-		gcGraceStr, rest, _, err := extractFlag(rest, "-gc-grace")
-		if err != nil {
-			return err
-		}
-		if gcGraceStr == "" {
-			gcGraceStr = "15m"
-		}
-		gcGrace, err := time.ParseDuration(gcGraceStr)
-		if err != nil {
-			return fmt.Errorf("-gc-grace: %w", err)
-		}
-		flushEveryStr, rest, _, err := extractFlag(rest, "-flush-every")
-		if err != nil {
-			return err
-		}
-		if flushEveryStr == "" {
-			flushEveryStr = "30s"
-		}
-		flushEvery, err := time.ParseDuration(flushEveryStr)
-		if err != nil {
-			return fmt.Errorf("-flush-every: %w", err)
-		}
-		if flushEvery < 0 {
-			return fmt.Errorf("-flush-every %q must be zero or positive; zero disables auto-flush "+
-				"(there is no \"none\" alias — a negative value is almost certainly a mistake)", flushEveryStr)
-		}
-		snapshotEveryStr, rest, snapshotEveryGiven, err := extractFlag(rest, "-snapshot-every")
-		if err != nil {
-			return err
-		}
-		var snapshotEvery int
-		if snapshotEveryGiven {
-			n, err := strconv.Atoi(snapshotEveryStr)
-			if err != nil {
-				return fmt.Errorf("-snapshot-every: %w", err)
-			}
-			if n < 1 {
-				return fmt.Errorf("-snapshot-every %d must be >= 1 (there is no \"unlimited\" — "+
-					"omit the flag for the default of %d)", n, session.DefaultSnapshotEvery)
-			}
-			snapshotEvery = n
-		}
-		roCacheBudgetStr, rest, _, err := extractFlag(rest, "-ro-cache-budget")
-		if err != nil {
-			return err
-		}
-		roCacheBudget, err := parseByteSize(roCacheBudgetStr)
-		if err != nil {
-			return fmt.Errorf("-ro-cache-budget: %w", err)
-		}
-		fdBudget, rest, err := fdBudgetFlag(rest)
-		if err != nil {
-			return err
-		}
-		httpAddr, rest, _, err := extractFlag(rest, "-http")
-		if err != nil {
-			return err
-		}
-		tokenFlag, rest, _, err := extractFlag(rest, "-token")
-		if err != nil {
-			return err
-		}
-		tokenFile, rest, _, err := extractFlag(rest, "-token-file")
-		if err != nil {
-			return err
-		}
-		allowNonLoopback, rest := extractBoolFlag(rest, "-http-allow-non-loopback")
-		if len(rest) != 0 {
-			return errors.New(serveUsage)
-		}
-		// -token/-http-allow-non-loopback only mean anything alongside
-		// -http; given without it, they'd otherwise be silently ignored —
-		// almost certainly a mistake (e.g. a typo'd or dropped -http ADDR
-		// in a script), and one that would be surprising to notice only by
-		// its ABSENCE (no auth, no HTTP listener at all) rather than an
-		// explicit error at startup.
-		if httpAddr == "" {
-			if tokenFlag != "" {
-				return fmt.Errorf("-token given without -http; it has no effect unless -http ADDR is also set")
-			}
-			if tokenFile != "" {
-				return fmt.Errorf("-token-file given without -http; it has no effect unless -http ADDR is also set")
-			}
-			if allowNonLoopback {
-				return fmt.Errorf("-http-allow-non-loopback given without -http; it has no effect unless -http ADDR is also set")
-			}
-		}
-
-		// Milestone 4 Task 3: HTTP is off by default (httpAddr == ""); when
-		// requested, validate the bind BEFORE touching the socket/daemon at
-		// all, so a misconfigured -http fails fast as a startup error and
-		// never leaves a half-started daemon behind. Token precedence:
-		// -token, then OFFSHOOT_TOKEN, else auto-generated (loopback binds
-		// only — see daemon.ValidateHTTPBind, called both here and again,
-		// defensively, inside StartHTTP itself).
-		if tokenFlag != "" && tokenFile != "" {
-			return fmt.Errorf("-token and -token-file are mutually exclusive")
-		}
-		// Token precedence: -token, then -token-file, then OFFSHOOT_TOKEN,
-		// else auto-generated. -token-file is the recommended form for a
-		// non-loopback bind: a flag value is visible to every local user in
-		// `ps`, while a 0600 file is not.
-		token := tokenFlag
-		if token == "" && tokenFile != "" {
-			b, err := os.ReadFile(tokenFile)
-			if err != nil {
-				return fmt.Errorf("-token-file %s: %w", tokenFile, err)
-			}
-			token = strings.TrimSpace(string(b))
-			if token == "" {
-				return fmt.Errorf("-token-file %s is empty", tokenFile)
-			}
-		}
-		if token == "" {
-			token = os.Getenv("OFFSHOOT_TOKEN")
-		}
-		hasExplicitToken := token != ""
-		autoGenerated := false
-		if httpAddr != "" {
-			if err := daemon.ValidateHTTPBind(httpAddr, allowNonLoopback, hasExplicitToken); err != nil {
-				return err
-			}
-			if !hasExplicitToken {
-				t, err := daemon.GenerateToken()
-				if err != nil {
-					return err
-				}
-				token = t
-				autoGenerated = true
-			}
-		}
-
-		if sock == "" {
-			p, err := daemon.DefaultSocketPath(spec)
-			if err != nil {
-				return err
-			}
-			sock = p
-		}
-		srv, err := daemon.NewServer(w, sock)
-		if err != nil {
-			return err
-		}
-		srv.SetVersion(version)
-		srv.StartJanitor(reapEvery, gcGrace)
-		// safe-by-default cadence: the daemon ships work on a cadence even
-		// if the agent it's serving never calls flush; -flush-every 0
-		// disables this, restoring manual-only (session.Options' own
-		// default).
-		srv.SetFlushEvery(flushEvery)
-		// Milestone 4 Task 6a: 0 (the default, -snapshot-every not given)
-		// means "let session.Open apply its own default" — see
-		// Server.SetSnapshotEvery's doc comment. Only set when the flag was
-		// actually given (snapshotEveryGiven), so a bare `offshoot serve`
-		// keeps behaving exactly as it did before this flag existed.
-		if snapshotEveryGiven {
-			srv.SetSnapshotEvery(snapshotEvery)
-		}
-		// Milestone 4 Task 5: 0 (the default, unset) means unlimited — the
-		// janitor still computes and reports checkouts-ro usage every pass,
-		// it just never evicts. See SetROCacheBudget's doc comment.
-		srv.SetROCacheBudget(roCacheBudget)
-		// 0 means unlimited (no budget pass); stranded descriptors are
-		// reclaimed either way. See SetFDBudget's doc comment.
-		srv.SetFDBudget(fdBudget)
-		if httpAddr != "" {
-			if err := srv.StartHTTP(daemon.HTTPConfig{
-				Addr:             httpAddr,
-				Token:            token,
-				AllowNonLoopback: allowNonLoopback,
-				AutoGenerated:    autoGenerated,
-			}); err != nil {
-				return err
-			}
-		}
-		fmt.Println("offshoot serving on", sock)
-		sigc := make(chan os.Signal, 1)
-		signal.Notify(sigc, os.Interrupt, syscall.SIGTERM)
-		errc := make(chan error, 1)
-		go func() { errc <- srv.Serve() }()
-		select {
-		case <-sigc:
-			fmt.Println("offshoot: shutting down, releasing leases")
-			ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
-			defer cancel()
-			return srv.Shutdown(ctx)
-		case err := <-errc:
-			if err != nil {
-				return err
-			}
-			// Serve returns nil only once a Shutdown has begun, which here
-			// means the shutdown op (socket or HTTP) started one on a
-			// goroutine of its own. Returning now would exit the process
-			// while that Shutdown is still closing sessions and releasing
-			// their leases, so wait for it, bounded like the signal path.
-			ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
-			defer cancel()
-			return srv.WaitShutdown(ctx)
-		}
+		return cmdServe(w, spec, rest)
 	case "session":
-		sock, rest, err := socketOverride(rest)
-		if err != nil {
-			return fmt.Errorf("usage: offshoot session open|flush|status|close|shutdown ... [-socket PATH]: %w", err)
-		}
-		if len(rest) == 0 {
-			return fmt.Errorf("usage: offshoot session open|flush|status|close|shutdown ... [-socket PATH]")
-		}
-		if sock == "" {
-			p, err := daemon.DefaultSocketPath(spec)
-			if err != nil {
-				return err
-			}
-			sock = p
-		}
-		sub, args := rest[0], rest[1:]
-		target := func() (string, string, error) {
-			if len(args) < 1 {
-				return "", "", fmt.Errorf("usage: offshoot session %s <db>[@branch]", sub)
-			}
-			return ops.ParseTarget(args[0])
-		}
-		switch sub {
-		case "open":
-			db, branch, err := target()
-			if err != nil {
-				return err
-			}
-			resp, err := daemon.Call(sock, daemon.Request{Op: "open", DB: db, Branch: branch})
-			if err != nil {
-				return err
-			}
-			fmt.Println(resp.Checkout)
-			return nil
-		case "flush":
-			db, branch, err := target()
-			if err != nil {
-				return err
-			}
-			name := ""
-			if len(args) == 2 {
-				name = args[1]
-			}
-			resp, err := daemon.Call(sock, daemon.Request{Op: "flush", DB: db, Branch: branch, Name: name})
-			if err != nil {
-				return err
-			}
-			fmt.Printf("durable through txid %d\n", resp.TXID)
-			return nil
-		case "status":
-			resp, err := daemon.Call(sock, daemon.Request{Op: "status"})
-			if err != nil {
-				return err
-			}
-			for _, in := range resp.Sessions {
-				fmt.Println(sessionStatusLine(in))
-			}
-			return nil
-		case "close":
-			db, branch, err := target()
-			if err != nil {
-				return err
-			}
-			_, err = daemon.Call(sock, daemon.Request{Op: "close", DB: db, Branch: branch})
-			return err
-		case "shutdown":
-			_, err := daemon.Call(sock, daemon.Request{Op: "shutdown"})
-			return err
-		case "dbs":
-			resp, err := daemon.Call(sock, daemon.Request{Op: "dbs"})
-			if err != nil {
-				return err
-			}
-			for _, db := range resp.Databases {
-				fmt.Println(db)
-			}
-			return nil
-		default:
-			return fmt.Errorf("unknown session subcommand %q", sub)
-		}
+		return cmdSession(w, spec, rest)
 	default:
 		return fmt.Errorf("unknown command %q (run 'offshoot help')", cmd)
+	}
+}
+
+// cmdCreate implements `offshoot create`. w is the store run already opened;
+// rest is everything after the command word.
+func cmdCreate(w *ops.Workspace, rest []string) error {
+	switch {
+	case len(rest) == 1:
+		if err := w.Create(rest[0]); err != nil {
+			return err
+		}
+		fmt.Printf("created %s (branch main)\n", rest[0])
+		return nil
+	case len(rest) == 3 && rest[1] == "--from":
+		if err := w.CreateFrom(rest[0], rest[2]); err != nil {
+			return err
+		}
+		fmt.Printf("created %s (branch main, imported from %s)\n", rest[0], rest[2])
+		return nil
+	default:
+		return fmt.Errorf("usage: offshoot create <db> [--from file]")
+	}
+}
+
+// cmdCheckpoint implements `offshoot checkpoint`. w is the store run already opened;
+// rest is everything after the command word.
+func cmdCheckpoint(w *ops.Workspace, rest []string) error {
+	snapshot, rest := extractBoolFlag(rest, "--snapshot")
+	force, rest := extractBoolFlag(rest, "--force")
+	meta, rest, err := extractMetaFlags(rest)
+	if err != nil {
+		return fmt.Errorf("usage: offshoot checkpoint <db>[@branch] <name> [--snapshot] [--meta k=v ...] [--force]: %w", err)
+	}
+	if len(rest) != 2 {
+		return fmt.Errorf("usage: offshoot checkpoint <db>[@branch] <name> [--snapshot] [--meta k=v ...] [--force]")
+	}
+	db, branch, err := ops.ParseTarget(rest[0])
+	if err != nil {
+		return err
+	}
+	res, err := w.CheckpointWith(db, branch, rest[1], meta, ops.CheckpointOptions{Snapshot: snapshot, Force: force})
+	if err != nil {
+		return err
+	}
+	fmt.Println(checkpointLine(rest[1], res))
+	return nil
+}
+
+// cmdFork implements `offshoot fork`. w is the store run already opened;
+// rest is everything after the command word.
+func cmdFork(w *ops.Workspace, rest []string) error {
+	fs := rest
+	at, fs, _, err := extractFlag(fs, "--at")
+	if err != nil {
+		return fmt.Errorf("usage: offshoot fork <db>[@branch] <new-branch> [--at checkpoint] [--ttl duration] [--meta k=v ...]: %w", err)
+	}
+	ttlRaw, fs, hasTTL, err := extractFlag(fs, "--ttl")
+	if err != nil {
+		return fmt.Errorf("usage: offshoot fork <db>[@branch] <new-branch> [--at checkpoint] [--ttl duration] [--meta k=v ...]: %w", err)
+	}
+	meta, fs, err := extractMetaFlags(fs)
+	if err != nil {
+		return fmt.Errorf("usage: offshoot fork <db>[@branch] <new-branch> [--at checkpoint] [--ttl duration] [--meta k=v ...]: %w", err)
+	}
+	ttl := time.Duration(0)
+	if hasTTL {
+		// fork has no "none" sentinel the way touch does (a brand-new
+		// branch has no existing TTL to explicitly clear), and a
+		// non-positive duration is refused rather than silently treated
+		// as no TTL — see parseForkTTLFlag.
+		ttl, err = parseForkTTLFlag(ttlRaw)
+		if err != nil {
+			return err
+		}
+	}
+	if len(fs) != 2 {
+		return fmt.Errorf("usage: offshoot fork <db>[@branch] <new-branch> [--at checkpoint] [--ttl duration] [--meta k=v ...]")
+	}
+	db, branch, err := ops.ParseTarget(fs[0])
+	if err != nil {
+		return err
+	}
+	txid, err := w.Fork(db, branch, fs[1], at, ttl, meta)
+	if err != nil {
+		return err
+	}
+	fmt.Printf("forked %s@%s -> %s@%s at txid %d\n", db, branch, db, fs[1], txid)
+	return nil
+}
+
+// cmdTouch implements `offshoot touch`. w is the store run already opened;
+// rest is everything after the command word.
+func cmdTouch(w *ops.Workspace, rest []string) error {
+	fs := rest
+	ttlRaw, fs, hasTTL, err := extractFlag(fs, "--ttl")
+	if err != nil {
+		return fmt.Errorf("usage: offshoot touch <db>[@branch] [--ttl duration|none]: %w", err)
+	}
+	if len(fs) != 1 {
+		return fmt.Errorf("usage: offshoot touch <db>[@branch] [--ttl duration|none]")
+	}
+	db, branch, err := ops.ParseTarget(fs[0])
+	if err != nil {
+		return err
+	}
+	var ttl *time.Duration
+	if hasTTL {
+		d, err := parseTTLFlag(ttlRaw)
+		if err != nil {
+			return err
+		}
+		ttl = &d
+	}
+	ref, err := w.Touch(db, branch, ttl, time.Now())
+	if err != nil {
+		return err
+	}
+	out := ref.TTL
+	if out == "" {
+		out = "none"
+	}
+	fmt.Printf("touched %s@%s ttl=%s touched_at=%s\n", db, branch, out, ref.TouchedAt)
+	return nil
+}
+
+// cmdProtect implements `offshoot protect`. w is the store run already opened;
+// rest is everything after the command word.
+func cmdProtect(w *ops.Workspace, rest []string) error {
+	if len(rest) != 1 {
+		return fmt.Errorf("usage: offshoot protect <db>[@branch]")
+	}
+	db, branch, err := ops.ParseTarget(rest[0])
+	if err != nil {
+		return err
+	}
+	if _, err := w.SetProtected(db, branch, true); err != nil {
+		return err
+	}
+	fmt.Printf("protected %s@%s\n", db, branch)
+	return nil
+}
+
+// cmdUnprotect implements `offshoot unprotect`. w is the store run already opened;
+// rest is everything after the command word.
+func cmdUnprotect(w *ops.Workspace, rest []string) error {
+	if len(rest) != 1 {
+		return fmt.Errorf("usage: offshoot unprotect <db>[@branch]")
+	}
+	db, branch, err := ops.ParseTarget(rest[0])
+	if err != nil {
+		return err
+	}
+	if _, err := w.SetProtected(db, branch, false); err != nil {
+		return err
+	}
+	fmt.Printf("unprotected %s@%s\n", db, branch)
+	return nil
+}
+
+// cmdRollback implements `offshoot rollback`. w is the store run already opened;
+// rest is everything after the command word.
+func cmdRollback(w *ops.Workspace, rest []string) error {
+	const usage = "usage: offshoot rollback <db>[@branch] --to <checkpoint> [--force] [--no-backup] [--backup-ttl DUR] [--materialize]"
+	var opts ops.RollbackOptions
+	fs := rest[:0]
+	for i := 0; i < len(rest); i++ {
+		switch a := rest[i]; a {
+		case "--force":
+			opts.Force = true
+		case "--no-backup":
+			opts.NoBackup = true
+		case "--materialize":
+			opts.Materialize = true
+		case "--backup-ttl":
+			if i+1 >= len(rest) {
+				return fmt.Errorf("%s", usage)
+			}
+			i++
+			d, err := time.ParseDuration(rest[i])
+			if err != nil || d <= 0 {
+				return fmt.Errorf("--backup-ttl must be a positive Go duration (e.g. 2h), got %q", rest[i])
+			}
+			opts.BackupTTL = d
+		default:
+			fs = append(fs, a)
+		}
+	}
+	if len(fs) != 3 || fs[1] != "--to" {
+		return fmt.Errorf("%s", usage)
+	}
+	db, branch, err := ops.ParseTarget(fs[0])
+	if err != nil {
+		return err
+	}
+	res, err := w.RollbackWith(db, branch, fs[2], opts)
+	if err != nil {
+		return err
+	}
+	fmt.Println(res.Path)
+	fmt.Printf("rolled back %s@%s to %q %s\n", db, branch, fs[2], storageMode(res.Shared))
+	if res.Backup != "" {
+		ttl := opts.BackupTTL
+		if ttl <= 0 {
+			ttl = ops.DefaultPromoteBackupTTL
+		}
+		if res.BackupIsTarget {
+			// The head already sat at the target checkpoint, so the
+			// safety fork holds the same committed state; the only thing
+			// this rollback changed is the checkout itself. Say so rather
+			// than offering an undo that would restore nothing.
+			fmt.Printf("kept the previous %s@%s head as %s@%s (expires in %s) — it is the same committed state as %q; only un-checkpointed edits to the checkout were discarded\n",
+				db, branch, db, res.Backup, ttl, fs[2])
+		} else {
+			fmt.Printf("kept the previous %s@%s head as %s@%s (expires in %s; undo with: offshoot promote %s@%s --onto %s --force)\n",
+				db, branch, db, res.Backup, ttl, db, res.Backup, branch)
+		}
+	}
+	return nil
+}
+
+// cmdPromote implements `offshoot promote`. w is the store run already opened;
+// rest is everything after the command word.
+func cmdPromote(w *ops.Workspace, rest []string) error {
+	const usage = "usage: offshoot promote <db>@<source> --onto <target> [--force] [--no-backup] [--backup-ttl DUR] [--materialize]"
+	var opts ops.PromoteOptions
+	fs := rest[:0]
+	for i := 0; i < len(rest); i++ {
+		switch a := rest[i]; a {
+		case "--force":
+			opts.Force = true
+		case "--materialize":
+			opts.Materialize = true
+		case "--no-backup":
+			opts.NoBackup = true
+		case "--backup-ttl":
+			if i+1 >= len(rest) {
+				return fmt.Errorf("%s", usage)
+			}
+			i++
+			d, err := time.ParseDuration(rest[i])
+			if err != nil || d <= 0 {
+				return fmt.Errorf("--backup-ttl must be a positive Go duration (e.g. 2h), got %q", rest[i])
+			}
+			opts.BackupTTL = d
+		default:
+			fs = append(fs, a)
+		}
+	}
+	if len(fs) != 3 || fs[1] != "--onto" {
+		return fmt.Errorf("%s", usage)
+	}
+	db, srcBranch, err := ops.ParseTarget(fs[0])
+	if err != nil {
+		return err
+	}
+	res, err := w.PromoteWith(db, srcBranch, fs[2], opts)
+	if err != nil {
+		return err
+	}
+	fmt.Printf("promoted %s@%s -> %s@%s at txid %d %s\n", db, srcBranch, db, fs[2], res.TXID, storageMode(res.Shared))
+	if res.Backup != "" {
+		ttl := opts.BackupTTL
+		if ttl <= 0 {
+			ttl = ops.DefaultPromoteBackupTTL
+		}
+		fmt.Printf("kept the previous %s@%s head as %s@%s (expires in %s; undo with: offshoot promote %s@%s --onto %s --force)\n",
+			db, fs[2], db, res.Backup, ttl, db, res.Backup, fs[2])
+	}
+	return nil
+}
+
+// cmdCompact implements `offshoot compact`. w is the store run already opened;
+// rest is everything after the command word.
+func cmdCompact(w *ops.Workspace, rest []string) error {
+	force, rest := extractBoolFlag(rest, "--force")
+	if len(rest) != 1 {
+		return fmt.Errorf("usage: offshoot compact <db>[@branch] [--force]")
+	}
+	db, branch, err := ops.ParseTarget(rest[0])
+	if err != nil {
+		return err
+	}
+	txid, err := w.CompactWith(db, branch, ops.CompactOptions{Force: force})
+	if err != nil {
+		return err
+	}
+	fmt.Printf("compacted %s@%s to txid %d\n", db, branch, txid)
+	return nil
+}
+
+// cmdPath implements `offshoot path`. w is the store run already opened;
+// rest is everything after the command word.
+func cmdPath(w *ops.Workspace, rest []string) error {
+	if len(rest) != 1 {
+		return fmt.Errorf("usage: offshoot path <db>[@branch]")
+	}
+	db, branch, err := ops.ParseTarget(rest[0])
+	if err != nil {
+		return err
+	}
+	fmt.Println(w.CheckoutPath(db, branch))
+	return nil
+}
+
+// cmdCheckout implements `offshoot checkout`. w is the store run already opened;
+// rest is everything after the command word.
+func cmdCheckout(w *ops.Workspace, rest []string) error {
+	usageErr := fmt.Errorf("usage: offshoot checkout <db>[@branch] [--at checkpoint --read-only [--force]]")
+	fs := rest
+	at, fs, _, err := extractFlag(fs, "--at")
+	if err != nil {
+		return fmt.Errorf("usage: offshoot checkout <db>[@branch] [--at checkpoint --read-only [--force]]: %w", err)
+	}
+	readOnly, fs := extractBoolFlag(fs, "--read-only")
+	force, fs := extractBoolFlag(fs, "--force")
+	if len(fs) != 1 {
+		return usageErr
+	}
+	db, branch, err := ops.ParseTarget(fs[0])
+	if err != nil {
+		return err
+	}
+	switch {
+	case at != "" && readOnly:
+		path, err := w.CheckoutAt(db, branch, at, force)
+		if err != nil {
+			return err
+		}
+		fmt.Println(path)
+		return nil
+	case at != "" || readOnly:
+		return fmt.Errorf("offshoot checkout: --at and --read-only must be given together")
+	case force:
+		return fmt.Errorf("offshoot checkout: --force only applies alongside --at --read-only")
+	default:
+		path, err := w.Checkout(db, branch)
+		if err != nil {
+			return err
+		}
+		fmt.Println(path)
+		return nil
+	}
+}
+
+// cmdExport implements `offshoot export`. w is the store run already opened;
+// rest is everything after the command word.
+func cmdExport(w *ops.Workspace, rest []string) error {
+	force, rest := extractBoolFlag(rest, "--force")
+	if len(rest) != 2 {
+		return fmt.Errorf("usage: offshoot export <db>[@branch[@checkpoint]] <out.db> [--force]")
+	}
+	db, branch, checkpoint, err := ops.ParseExportTarget(rest[0])
+	if err != nil {
+		return err
+	}
+	if err := w.Export(db, branch, checkpoint, rest[1], force); err != nil {
+		return err
+	}
+	fmt.Println(rest[1])
+	return nil
+}
+
+// cmdDiff implements `offshoot diff`. w is the store run already opened;
+// rest is everything after the command word.
+func cmdDiff(w *ops.Workspace, rest []string) error {
+	summary, rest := extractBoolFlag(rest, "--summary")
+	table, rest, _, err := extractFlag(rest, "--table")
+	if err != nil {
+		return fmt.Errorf("usage: offshoot diff <db>[@branch[@checkpoint]] <db>[@branch[@checkpoint]] [--summary] [--table T]: %w", err)
+	}
+	if len(rest) != 2 {
+		return fmt.Errorf("usage: offshoot diff <db>[@branch[@checkpoint]] <db>[@branch[@checkpoint]] [--summary] [--table T]")
+	}
+	return runDiff(w, os.Stdout, rest[0], rest[1], summary, table)
+}
+
+// cmdDestroy implements `offshoot destroy`. w is the store run already opened;
+// rest is everything after the command word.
+func cmdDestroy(w *ops.Workspace, rest []string) error {
+	force := false
+	fs := rest[:0]
+	for _, a := range rest {
+		if a == "--force" {
+			force = true
+			continue
+		}
+		fs = append(fs, a)
+	}
+	if len(fs) != 1 {
+		return fmt.Errorf("usage: offshoot destroy <db>[@branch] [--force]")
+	}
+	db, branch, err := ops.ParseTarget(fs[0])
+	if err != nil {
+		return err
+	}
+	if err := w.Destroy(db, branch, force); err != nil {
+		return err
+	}
+	fmt.Printf("destroyed %s@%s\n", db, branch)
+	return nil
+}
+
+// cmdGc implements `offshoot gc`. w is the store run already opened;
+// rest is everything after the command word.
+func cmdGc(w *ops.Workspace, rest []string) error {
+	grace := time.Hour
+	if len(rest) == 2 && rest[0] == "--grace" {
+		d, err := parseDurationFlag("--grace", rest[1])
+		if err != nil {
+			return err
+		}
+		grace = d
+	}
+	// A reap failure on one branch (e.g. its checkout has an open
+	// connection, "database is busy") must not stop GC from running:
+	// GC is independent lineage cleanup, and skipping it entirely would
+	// let one unreapable branch wedge garbage collection forever.
+	// Report the failure and press on.
+	reaped, reapErr := w.Reap(time.Now())
+	if len(reaped) > 0 {
+		fmt.Printf("gc: reaped %v\n", reaped)
+	}
+	if reapErr != nil {
+		fmt.Fprintf(os.Stderr, "offshoot: gc: reap: %v\n", reapErr)
+	}
+	// Milestone 4 Task 6b: self-heal any Destroy claim (Ref.Deleting)
+	// stranded by a crashed `destroy`/`gc` call, same "report and press
+	// on" convention as the reap failure above — this is at-rest cleanup
+	// independent of everything else `gc` does, so one branch's stale
+	// claim must not block it either.
+	healed, healErr := w.ClearStaleDeleteClaims(time.Now())
+	if len(healed) > 0 {
+		fmt.Printf("gc: cleared stale delete claim(s) %v\n", healed)
+	}
+	if healErr != nil {
+		fmt.Fprintf(os.Stderr, "offshoot: gc: clear stale delete claims: %v\n", healErr)
+	}
+	tombstoned, deleted, err := w.GC(grace)
+	if err != nil {
+		return err
+	}
+	fmt.Printf("gc: tombstoned %d, deleted %d objects\n", tombstoned, deleted)
+	return nil
+}
+
+// cmdStatus implements `offshoot status`. w is the store run already opened;
+// rest is everything after the command word.
+func cmdStatus(w *ops.Workspace, rest []string) error {
+	// -ro-cache-budget is purely for DISPLAY here — like every other
+	// serve-time tuning knob (-reap-every, -gc-grace, -flush-every), the
+	// budget itself is never persisted to the store, so this at-rest
+	// command (no daemon involved — see below) has no other way to know
+	// what a running daemon was actually started with. Passing the same
+	// value here as the daemon's own -ro-cache-budget lets an operator
+	// see usage against it without a live daemon connection; omitted
+	// (the common case) just reports usage with no budget context.
+	roCacheBudgetStr, rest, _, err := extractFlag(rest, "-ro-cache-budget")
+	if err != nil {
+		return err
+	}
+	roCacheBudget, err := parseByteSize(roCacheBudgetStr)
+	if err != nil {
+		return fmt.Errorf("-ro-cache-budget: %w", err)
+	}
+	if len(rest) != 0 {
+		return fmt.Errorf("usage: offshoot status [-ro-cache-budget BYTES]")
+	}
+	sts, err := w.Status()
+	if err != nil {
+		return err
+	}
+	for _, s := range sts {
+		flags := ""
+		if s.Protected {
+			flags += " protected"
+		}
+		if s.CheckedOut {
+			flags += " checked-out"
+		}
+		// storage= is the copy-on-write cost class, reported honestly on
+		// every line: "shared" means this branch is a base-pointer fork
+		// (near-zero added storage, reading through an ancestor's durable
+		// objects); "materialized" means a fully self-contained lineage.
+		// fork, rollback and promote share below the snapshot floor;
+		// compact (and --materialize) make a full copy.
+		storage := "materialized"
+		if s.Shared {
+			storage = "shared"
+		}
+		line := fmt.Sprintf("%s@%s state=%s storage=%s txid=%d checkpoints=[%s]%s",
+			s.DB, s.Branch, s.State, storage, s.HeadTXID, strings.Join(s.Checkpoints, ","), flags)
+		if s.TTL != "" {
+			line += fmt.Sprintf(" ttl=%s remaining=%s", s.TTL, s.TTLRemaining)
+		}
+		fmt.Println(line)
+	}
+	// Milestone 4 Task 5: ro-cache usage summary. Computed directly off
+	// checkouts-ro (ops.Workspace.ROCacheUsage), the same at-rest read
+	// every other line above already uses — no daemon required, exactly
+	// like the rest of this command.
+	roBytes, roCount, err := w.ROCacheUsage()
+	if err != nil {
+		return err
+	}
+	if roCacheBudget > 0 {
+		fmt.Printf("ro-cache: %d entries, %d bytes used, budget %d bytes\n", roCount, roBytes, roCacheBudget)
+	} else {
+		fmt.Printf("ro-cache: %d entries, %d bytes used (budget: unlimited)\n", roCount, roBytes)
+	}
+	return nil
+}
+
+// cmdLease implements `offshoot lease`. w is the store run already opened;
+// rest is everything after the command word.
+func cmdLease(w *ops.Workspace, rest []string) error {
+	if len(rest) == 0 {
+		return fmt.Errorf("usage: offshoot lease list|acquire|release [args]")
+	}
+	switch rest[0] {
+	case "list":
+		infos, err := w.Leases()
+		if err != nil {
+			return err
+		}
+		for _, in := range infos {
+			state := "held"
+			if in.Expired {
+				state = "expired"
+			}
+			fmt.Printf("%s@%s %s by %s epoch=%d until %s\n",
+				in.DB, in.Branch, state, in.Holder, in.Epoch,
+				in.Expiry.Format(time.RFC3339))
+		}
+		return nil
+	case "acquire":
+		args := rest[1:]
+		ttl := ops.DefaultLeaseTTL
+		if len(args) == 3 && args[1] == "--ttl" {
+			d, err := time.ParseDuration(args[2])
+			if err != nil {
+				return err
+			}
+			ttl = d
+			args = args[:1]
+		}
+		if len(args) != 1 {
+			return fmt.Errorf("usage: offshoot lease acquire <db>[@branch] [--ttl 30s]")
+		}
+		db, branch, err := ops.ParseTarget(args[0])
+		if err != nil {
+			return err
+		}
+		l, err := w.AcquireLease(db, branch, ops.LocalHolder(), ttl)
+		if err != nil {
+			return err
+		}
+		fmt.Printf("acquired %s@%s as %s (epoch %d) until %s\n",
+			db, branch, l.Holder, l.Epoch, l.Expiry.Format(time.RFC3339))
+		fmt.Println("note: this command exits immediately; the lease expires unless a" +
+			" long-running holder renews it")
+		return nil
+	case "release":
+		args := rest[1:]
+		holder, args, holderGiven, err := extractFlag(args, "--holder")
+		if err != nil {
+			return err
+		}
+		if holderGiven && holder == "" {
+			// An empty holder names no lease; against an unleased ref it
+			// would match and "release" nothing.
+			return fmt.Errorf("usage: offshoot lease release <db>[@branch] [--holder H]: --holder requires a non-empty holder")
+		}
+		if len(args) != 1 {
+			return fmt.Errorf("usage: offshoot lease release <db>[@branch] [--holder H]")
+		}
+		db, branch, err := ops.ParseTarget(args[0])
+		if err != nil {
+			return err
+		}
+		if holderGiven {
+			if err := w.ReleaseLeaseByHolder(db, branch, holder); err != nil {
+				return err
+			}
+			fmt.Printf("released %s@%s held by %s\n", db, branch, holder)
+			return nil
+		}
+		infos, err := w.Leases()
+		if err != nil {
+			return err
+		}
+		for _, in := range infos {
+			if in.DB == db && in.Branch == branch {
+				if err := w.ReleaseLease(store.Lease{
+					DB: db, Branch: branch, Holder: in.Holder, Epoch: in.Epoch,
+				}); err != nil {
+					return err
+				}
+				fmt.Printf("released %s@%s held by %s\n", db, branch, in.Holder)
+				return nil
+			}
+		}
+		return fmt.Errorf("offshoot: no lease on %s@%s", db, branch)
+	default:
+		return fmt.Errorf("unknown lease subcommand %q", rest[0])
+	}
+}
+
+// cmdMcp implements `offshoot mcp`. w is the store run already opened,
+// spec its -store path, rest everything after the command word.
+func cmdMcp(w *ops.Workspace, spec string, rest []string) error {
+	const mcpUsage = "usage: offshoot mcp [-default-ttl DURATION|none] [-socket PATH] [-allow-force] [-reap-every DURATION|none]"
+	sock, rest, err := socketOverride(rest)
+	if err != nil {
+		return fmt.Errorf("%s: %w", mcpUsage, err)
+	}
+	defaultTTL, rest, err := parseDefaultTTLFlag(rest)
+	if err != nil {
+		return fmt.Errorf("%s: %w", mcpUsage, err)
+	}
+	allowForce, rest := extractBoolFlag(rest, "-allow-force")
+	reapEvery, rest, err := parseReapEveryFlag(rest)
+	if err != nil {
+		return fmt.Errorf("%s: %w", mcpUsage, err)
+	}
+	if len(rest) != 0 {
+		return fmt.Errorf("%s", mcpUsage)
+	}
+	// sock == "" here (the common case: no -socket given) is resolved by
+	// NewOffshootTools itself via daemon.DefaultSocketPath(spec) — the
+	// same default `offshoot serve` binds to for this store — so a bare
+	// `offshoot mcp` and a bare `offshoot serve` against the same store
+	// agree on where to look without either side hardcoding the path.
+	ts := mcp.NewOffshootTools(w, spec, defaultTTL, sock)
+	// -allow-force is off by default: without it, an agent's force:true
+	// against a PROTECTED branch (main, by default) is refused by
+	// offshoot_promote/offshoot_destroy before any mutation — see
+	// OffshootTools.SetAllowForce. Force against an unprotected branch
+	// never needed this flag.
+	ts.SetAllowForce(allowForce)
+	// The reaper's context is cancelled the moment the server loop
+	// below returns (this function's own srv.Serve(ctx), whether it
+	// exits via stdin EOF or an error) — the reaper must never keep
+	// running past the process's own MCP-serving lifetime, since
+	// nothing would ever stop it otherwise. reapEvery <= 0 (0 or
+	// "none") starts no goroutine at all (see StartReaper).
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	// StartReaper's returned channel is a test hook (see its own doc
+	// comment) for proving the reaper's goroutine actually stopped
+	// after cancellation — this process's own teardown once srv.Serve
+	// returns already ensures that, so there's nothing more to wait on
+	// here.
+	_ = ts.StartReaper(ctx, reapEvery)
+	mcp.SetServerVersion(version)
+	srv := mcp.NewServer(os.Stdin, os.Stdout, ts)
+	return srv.Serve(ctx)
+}
+
+// cmdServe implements `offshoot serve`. w is the store run already opened,
+// spec its -store path, rest everything after the command word.
+func cmdServe(w *ops.Workspace, spec string, rest []string) error {
+	const serveUsage = "usage: offshoot serve [-socket PATH] [-reap-every DURATION] [-gc-grace DURATION] " +
+		"[-flush-every DURATION] [-snapshot-every N] [-ro-cache-budget BYTES] [-fd-budget N] [-http ADDR] [-token TOKEN | -token-file PATH] [-http-allow-non-loopback]"
+	sock, rest, err := socketOverride(rest)
+	if err != nil {
+		return fmt.Errorf("%s: %w", serveUsage, err)
+	}
+	reapEveryStr, rest, _, err := extractFlag(rest, "-reap-every")
+	if err != nil {
+		return err
+	}
+	if reapEveryStr == "" {
+		reapEveryStr = "1m"
+	}
+	reapEvery, err := time.ParseDuration(reapEveryStr)
+	if err != nil {
+		return fmt.Errorf("-reap-every: %w", err)
+	}
+	gcGraceStr, rest, _, err := extractFlag(rest, "-gc-grace")
+	if err != nil {
+		return err
+	}
+	if gcGraceStr == "" {
+		gcGraceStr = "15m"
+	}
+	gcGrace, err := time.ParseDuration(gcGraceStr)
+	if err != nil {
+		return fmt.Errorf("-gc-grace: %w", err)
+	}
+	flushEveryStr, rest, _, err := extractFlag(rest, "-flush-every")
+	if err != nil {
+		return err
+	}
+	if flushEveryStr == "" {
+		flushEveryStr = "30s"
+	}
+	flushEvery, err := time.ParseDuration(flushEveryStr)
+	if err != nil {
+		return fmt.Errorf("-flush-every: %w", err)
+	}
+	if flushEvery < 0 {
+		return fmt.Errorf("-flush-every %q must be zero or positive; zero disables auto-flush "+
+			"(there is no \"none\" alias — a negative value is almost certainly a mistake)", flushEveryStr)
+	}
+	snapshotEveryStr, rest, snapshotEveryGiven, err := extractFlag(rest, "-snapshot-every")
+	if err != nil {
+		return err
+	}
+	var snapshotEvery int
+	if snapshotEveryGiven {
+		n, err := strconv.Atoi(snapshotEveryStr)
+		if err != nil {
+			return fmt.Errorf("-snapshot-every: %w", err)
+		}
+		if n < 1 {
+			return fmt.Errorf("-snapshot-every %d must be >= 1 (there is no \"unlimited\" — "+
+				"omit the flag for the default of %d)", n, session.DefaultSnapshotEvery)
+		}
+		snapshotEvery = n
+	}
+	roCacheBudgetStr, rest, _, err := extractFlag(rest, "-ro-cache-budget")
+	if err != nil {
+		return err
+	}
+	roCacheBudget, err := parseByteSize(roCacheBudgetStr)
+	if err != nil {
+		return fmt.Errorf("-ro-cache-budget: %w", err)
+	}
+	fdBudget, rest, err := fdBudgetFlag(rest)
+	if err != nil {
+		return err
+	}
+	httpAddr, rest, _, err := extractFlag(rest, "-http")
+	if err != nil {
+		return err
+	}
+	tokenFlag, rest, _, err := extractFlag(rest, "-token")
+	if err != nil {
+		return err
+	}
+	tokenFile, rest, _, err := extractFlag(rest, "-token-file")
+	if err != nil {
+		return err
+	}
+	allowNonLoopback, rest := extractBoolFlag(rest, "-http-allow-non-loopback")
+	if len(rest) != 0 {
+		return errors.New(serveUsage)
+	}
+	// -token/-http-allow-non-loopback only mean anything alongside
+	// -http; given without it, they'd otherwise be silently ignored —
+	// almost certainly a mistake (e.g. a typo'd or dropped -http ADDR
+	// in a script), and one that would be surprising to notice only by
+	// its ABSENCE (no auth, no HTTP listener at all) rather than an
+	// explicit error at startup.
+	if httpAddr == "" {
+		if tokenFlag != "" {
+			return fmt.Errorf("-token given without -http; it has no effect unless -http ADDR is also set")
+		}
+		if tokenFile != "" {
+			return fmt.Errorf("-token-file given without -http; it has no effect unless -http ADDR is also set")
+		}
+		if allowNonLoopback {
+			return fmt.Errorf("-http-allow-non-loopback given without -http; it has no effect unless -http ADDR is also set")
+		}
+	}
+
+	// Milestone 4 Task 3: HTTP is off by default (httpAddr == ""); when
+	// requested, validate the bind BEFORE touching the socket/daemon at
+	// all, so a misconfigured -http fails fast as a startup error and
+	// never leaves a half-started daemon behind. Token precedence:
+	// -token, then OFFSHOOT_TOKEN, else auto-generated (loopback binds
+	// only — see daemon.ValidateHTTPBind, called both here and again,
+	// defensively, inside StartHTTP itself).
+	if tokenFlag != "" && tokenFile != "" {
+		return fmt.Errorf("-token and -token-file are mutually exclusive")
+	}
+	// Token precedence: -token, then -token-file, then OFFSHOOT_TOKEN,
+	// else auto-generated. -token-file is the recommended form for a
+	// non-loopback bind: a flag value is visible to every local user in
+	// `ps`, while a 0600 file is not.
+	token := tokenFlag
+	if token == "" && tokenFile != "" {
+		b, err := os.ReadFile(tokenFile)
+		if err != nil {
+			return fmt.Errorf("-token-file %s: %w", tokenFile, err)
+		}
+		token = strings.TrimSpace(string(b))
+		if token == "" {
+			return fmt.Errorf("-token-file %s is empty", tokenFile)
+		}
+	}
+	if token == "" {
+		token = os.Getenv("OFFSHOOT_TOKEN")
+	}
+	hasExplicitToken := token != ""
+	autoGenerated := false
+	if httpAddr != "" {
+		if err := daemon.ValidateHTTPBind(httpAddr, allowNonLoopback, hasExplicitToken); err != nil {
+			return err
+		}
+		if !hasExplicitToken {
+			t, err := daemon.GenerateToken()
+			if err != nil {
+				return err
+			}
+			token = t
+			autoGenerated = true
+		}
+	}
+
+	if sock == "" {
+		p, err := daemon.DefaultSocketPath(spec)
+		if err != nil {
+			return err
+		}
+		sock = p
+	}
+	srv, err := daemon.NewServer(w, sock)
+	if err != nil {
+		return err
+	}
+	srv.SetVersion(version)
+	srv.StartJanitor(reapEvery, gcGrace)
+	// safe-by-default cadence: the daemon ships work on a cadence even
+	// if the agent it's serving never calls flush; -flush-every 0
+	// disables this, restoring manual-only (session.Options' own
+	// default).
+	srv.SetFlushEvery(flushEvery)
+	// Milestone 4 Task 6a: 0 (the default, -snapshot-every not given)
+	// means "let session.Open apply its own default" — see
+	// Server.SetSnapshotEvery's doc comment. Only set when the flag was
+	// actually given (snapshotEveryGiven), so a bare `offshoot serve`
+	// keeps behaving exactly as it did before this flag existed.
+	if snapshotEveryGiven {
+		srv.SetSnapshotEvery(snapshotEvery)
+	}
+	// Milestone 4 Task 5: 0 (the default, unset) means unlimited — the
+	// janitor still computes and reports checkouts-ro usage every pass,
+	// it just never evicts. See SetROCacheBudget's doc comment.
+	srv.SetROCacheBudget(roCacheBudget)
+	// 0 means unlimited (no budget pass); stranded descriptors are
+	// reclaimed either way. See SetFDBudget's doc comment.
+	srv.SetFDBudget(fdBudget)
+	if httpAddr != "" {
+		if err := srv.StartHTTP(daemon.HTTPConfig{
+			Addr:             httpAddr,
+			Token:            token,
+			AllowNonLoopback: allowNonLoopback,
+			AutoGenerated:    autoGenerated,
+		}); err != nil {
+			return err
+		}
+	}
+	fmt.Println("offshoot serving on", sock)
+	sigc := make(chan os.Signal, 1)
+	signal.Notify(sigc, os.Interrupt, syscall.SIGTERM)
+	errc := make(chan error, 1)
+	go func() { errc <- srv.Serve() }()
+	select {
+	case <-sigc:
+		fmt.Println("offshoot: shutting down, releasing leases")
+		ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
+		defer cancel()
+		return srv.Shutdown(ctx)
+	case err := <-errc:
+		if err != nil {
+			return err
+		}
+		// Serve returns nil only once a Shutdown has begun, which here
+		// means the shutdown op (socket or HTTP) started one on a
+		// goroutine of its own. Returning now would exit the process
+		// while that Shutdown is still closing sessions and releasing
+		// their leases, so wait for it, bounded like the signal path.
+		ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
+		defer cancel()
+		return srv.WaitShutdown(ctx)
+	}
+}
+
+// cmdSession implements `offshoot session`. w is the store run already opened,
+// spec its -store path, rest everything after the command word.
+func cmdSession(w *ops.Workspace, spec string, rest []string) error {
+	sock, rest, err := socketOverride(rest)
+	if err != nil {
+		return fmt.Errorf("usage: offshoot session open|flush|status|close|shutdown ... [-socket PATH]: %w", err)
+	}
+	if len(rest) == 0 {
+		return fmt.Errorf("usage: offshoot session open|flush|status|close|shutdown ... [-socket PATH]")
+	}
+	if sock == "" {
+		p, err := daemon.DefaultSocketPath(spec)
+		if err != nil {
+			return err
+		}
+		sock = p
+	}
+	sub, args := rest[0], rest[1:]
+	target := func() (string, string, error) {
+		if len(args) < 1 {
+			return "", "", fmt.Errorf("usage: offshoot session %s <db>[@branch]", sub)
+		}
+		return ops.ParseTarget(args[0])
+	}
+	switch sub {
+	case "open":
+		db, branch, err := target()
+		if err != nil {
+			return err
+		}
+		resp, err := daemon.Call(sock, daemon.Request{Op: "open", DB: db, Branch: branch})
+		if err != nil {
+			return err
+		}
+		fmt.Println(resp.Checkout)
+		return nil
+	case "flush":
+		db, branch, err := target()
+		if err != nil {
+			return err
+		}
+		name := ""
+		if len(args) == 2 {
+			name = args[1]
+		}
+		resp, err := daemon.Call(sock, daemon.Request{Op: "flush", DB: db, Branch: branch, Name: name})
+		if err != nil {
+			return err
+		}
+		fmt.Printf("durable through txid %d\n", resp.TXID)
+		return nil
+	case "status":
+		resp, err := daemon.Call(sock, daemon.Request{Op: "status"})
+		if err != nil {
+			return err
+		}
+		for _, in := range resp.Sessions {
+			fmt.Println(sessionStatusLine(in))
+		}
+		return nil
+	case "close":
+		db, branch, err := target()
+		if err != nil {
+			return err
+		}
+		_, err = daemon.Call(sock, daemon.Request{Op: "close", DB: db, Branch: branch})
+		return err
+	case "shutdown":
+		_, err := daemon.Call(sock, daemon.Request{Op: "shutdown"})
+		return err
+	case "dbs":
+		resp, err := daemon.Call(sock, daemon.Request{Op: "dbs"})
+		if err != nil {
+			return err
+		}
+		for _, db := range resp.Databases {
+			fmt.Println(db)
+		}
+		return nil
+	default:
+		return fmt.Errorf("unknown session subcommand %q", sub)
 	}
 }
 

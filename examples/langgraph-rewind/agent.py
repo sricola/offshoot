@@ -22,6 +22,7 @@ Usage (see README.md in this directory for the full copy-paste recipe):
     python3 agent.py
     python3 agent.py --real
 """
+
 from __future__ import annotations
 
 import argparse
@@ -49,20 +50,29 @@ class _TempDaemon:
     def __init__(self):
         self.dir = Path(tempfile.mkdtemp(prefix="offshoot-langgraph-demo-"))
         self.bin = self.dir / "offshoot"
-        subprocess.run(["go", "build", "-o", str(self.bin), "./cmd/offshoot"],
-                        cwd=REPO, check=True)
+        subprocess.run(
+            ["go", "build", "-o", str(self.bin), "./cmd/offshoot"], cwd=REPO, check=True
+        )
         self.store = self.dir / "store"
-        subprocess.run([str(self.bin), "-store", str(self.store), "init"],
-                        check=True, stdout=subprocess.DEVNULL, stderr=subprocess.PIPE)
+        subprocess.run(
+            [str(self.bin), "-store", str(self.store), "init"],
+            check=True,
+            stdout=subprocess.DEVNULL,
+            stderr=subprocess.PIPE,
+        )
         self.sock = str(self.dir / "d.sock")
         self.proc = subprocess.Popen(
             [str(self.bin), "-store", str(self.store), "serve", "-socket", self.sock],
-            stdout=subprocess.DEVNULL, stderr=subprocess.PIPE)
+            stdout=subprocess.DEVNULL,
+            stderr=subprocess.PIPE,
+        )
         deadline = time.time() + 10
         while not os.path.exists(self.sock):
             if time.time() > deadline:
-                raise RuntimeError("daemon did not start: " +
-                                    self.proc.stderr.peek().decode(errors="replace"))
+                raise RuntimeError(
+                    "daemon did not start: "
+                    + self.proc.stderr.peek().decode(errors="replace")
+                )
             if self.proc.poll() is not None:
                 raise RuntimeError(self.proc.stderr.read().decode(errors="replace"))
             time.sleep(0.05)
@@ -81,7 +91,8 @@ def write_order(db_path: str, item: str) -> None:
     conn = sqlite3.connect(db_path)
     try:
         conn.execute(
-            "CREATE TABLE IF NOT EXISTS orders (id INTEGER PRIMARY KEY, item TEXT)")
+            "CREATE TABLE IF NOT EXISTS orders (id INTEGER PRIMARY KEY, item TEXT)"
+        )
         conn.execute("INSERT INTO orders (item) VALUES (?)", (item,))
         conn.commit()
     finally:
@@ -102,16 +113,16 @@ def run_simulated(client, db: str) -> None:
     thread = f"conv-{uuid.uuid4()}"
     try:
         # --- turn 1 ---
-        path = forks.path(thread)                    # graph.stream(...) would run here
-        write_order(path, "widget")                   # the tool node's write
-        forks.checkpoint(thread, "turn-1")             # after the step: name the checkpoint
+        path = forks.path(thread)  # graph.stream(...) would run here
+        write_order(path, "widget")  # the tool node's write
+        forks.checkpoint(thread, "turn-1")  # after the step: name the checkpoint
 
         # --- turn 2 ---
-        write_order(path, "gadget")                    # graph.stream(...) would run here
+        write_order(path, "gadget")  # graph.stream(...) would run here
         forks.checkpoint(thread, "turn-2")
 
         # --- turn 3: a mistake the user wants to undo ---
-        write_order(path, "gizmo-oops")                 # graph.stream(...) would run here
+        write_order(path, "gizmo-oops")  # graph.stream(...) would run here
         forks.checkpoint(thread, "turn-3")
 
         print_world("original thread, after 3 turns", path)
@@ -119,7 +130,7 @@ def run_simulated(client, db: str) -> None:
         # --- the user rewinds to turn 1 and retries with a different action ---
         retry_thread = f"{thread}-retry"
         retry_path = forks.fork_thread(thread, "turn-1", retry_thread)
-        write_order(retry_path, "sprocket")             # graph.stream(...) would run here
+        write_order(retry_path, "sprocket")  # graph.stream(...) would run here
         forks.checkpoint(retry_thread, "turn-2")
 
         print_world("rewound thread, after retrying turn 2", retry_path)
@@ -129,7 +140,8 @@ def run_simulated(client, db: str) -> None:
 
 def run_real(client, db: str) -> None:
     from typing import TypedDict
-    from langgraph.graph import StateGraph, START, END
+
+    from langgraph.graph import END, START, StateGraph
 
     class State(TypedDict):
         db_path: str
@@ -172,18 +184,25 @@ def run_real(client, db: str) -> None:
 
 def main() -> int:
     parser = argparse.ArgumentParser(
-        description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
+        description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter
+    )
     parser.add_argument(
-        "--real", action="store_true",
+        "--real",
+        action="store_true",
         help="run the flow through an actual LangGraph StateGraph "
-             "(requires `pip install langgraph`)")
+        "(requires `pip install langgraph`)",
+    )
     parser.add_argument(
-        "--socket", default=None,
+        "--socket",
+        default=None,
         help="unix socket of an already-running offshoot daemon "
-             "(default: build offshoot and start a private one)")
+        "(default: build offshoot and start a private one)",
+    )
     parser.add_argument(
-        "--db", default=f"langgraph-demo-{uuid.uuid4().hex[:8]}",
-        help="database name to create for this run (default: a fresh random name)")
+        "--db",
+        default=f"langgraph-demo-{uuid.uuid4().hex[:8]}",
+        help="database name to create for this run (default: a fresh random name)",
+    )
     args = parser.parse_args()
 
     temp_daemon = None
