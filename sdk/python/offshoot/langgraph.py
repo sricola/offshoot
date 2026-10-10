@@ -63,12 +63,13 @@ constructing a :class:`ThreadForks` over it, the same way any other offshoot
 db is created. ``base_branch`` (default ``"main"``) must exist on it too;
 ``client.create`` makes that branch automatically.
 """
+
 from __future__ import annotations
 
 import hashlib
 import re
 
-from .client import Client, OffshootError, Session, _TTL
+from .client import _TTL, Client, OffshootError, Session
 
 __all__ = ["ThreadForks"]
 
@@ -106,8 +107,14 @@ class ThreadForks:
     See the module docstring for the design rules this class follows.
     """
 
-    def __init__(self, client: Client, db: str, base_branch: str = "main",
-                 ttl: _TTL = "24h", prefix: str = "thread-"):
+    def __init__(
+        self,
+        client: Client,
+        db: str,
+        base_branch: str = "main",
+        ttl: _TTL = "24h",
+        prefix: str = "thread-",
+    ):
         self._client = client
         self._db = db
         self._base_branch = base_branch
@@ -144,7 +151,9 @@ class ThreadForks:
         name = _sanitize(checkpoint_id)
         return self._session(thread_id).flush(name=name)
 
-    def fork_thread(self, from_thread: object, at_checkpoint: object, new_thread: object) -> str:
+    def fork_thread(
+        self, from_thread: object, at_checkpoint: object, new_thread: object
+    ) -> str:
         """Fork new_thread's database off from_thread's, at at_checkpoint.
 
         at_checkpoint must have previously been named via
@@ -166,12 +175,14 @@ class ThreadForks:
             raise OffshootError(
                 f"fork_thread: unknown thread {from_thread!r} (no branch "
                 f"{from_branch!r} on db {self._db!r}); call "
-                f"path({from_thread!r}) before forking from it")
+                f"path({from_thread!r}) before forking from it"
+            )
         if new_branch in info:
             raise OffshootError(
                 f"fork_thread: thread {new_thread!r} already has a branch "
                 f"({new_branch!r} on db {self._db!r}); close it and destroy "
-                f"the branch first, or pick a different new_thread id")
+                f"the branch first, or pick a different new_thread id"
+            )
         ckpt_name = _sanitize(at_checkpoint)
         if ckpt_name not in info[from_branch].checkpoints:
             raise OffshootError(
@@ -179,14 +190,16 @@ class ThreadForks:
                 f"recorded on thread {from_thread!r} (looked for checkpoint "
                 f"{ckpt_name!r} on branch {from_branch!r}); call "
                 f"checkpoint({from_thread!r}, {at_checkpoint!r}) before "
-                f"forking from it")
+                f"forking from it"
+            )
         # Anything client.fork() itself raises past this point (e.g. a
         # racing creator winning the compare-and-swap on new_branch between
         # the check above and here) passes through with the daemon's own
         # message intact, unembellished — this code has nothing more
         # specific to say about it.
-        self._client.fork(self._db, from_branch, new_branch,
-                           from_checkpoint=ckpt_name, ttl=self._ttl)
+        self._client.fork(
+            self._db, from_branch, new_branch, from_checkpoint=ckpt_name, ttl=self._ttl
+        )
         return self._session(new_thread).path
 
     def close(self, thread_id: object | None = None) -> None:

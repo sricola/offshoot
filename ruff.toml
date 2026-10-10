@@ -1,0 +1,31 @@
+# Ruff configuration for every Python file the repo tracks: the two SDKs
+# (sdk/python, sdk/python-langgraph), scripts/, examples/ and the pytest
+# plugin's tests. `make lint-python` and ci.yml's sdks job run
+# `ruff check .` and `ruff format --check .` from here.
+#
+# The rule set is explicit because ruff's defaults have widened between
+# releases (0.17 enables far more than the E/F core); a pinned list keeps
+# the gate meaning the same thing on every machine.
+
+target-version = "py310"   # the SDKs' requires-python floor
+line-length = 88
+
+extend-exclude = [
+    # ruff 0.17 formats the Python blocks inside Markdown; the docs align
+    # trailing comments by hand and are not linted here.
+    "*.md",
+    "sdk/typescript",
+    "site/docs",
+    "*.egg-info",
+    ".dry-run-venv",
+    ".venv-langgraph",
+]
+
+[lint]
+select = [
+    "E4", "E7", "E9", "F",  # pycodestyle errors + pyflakes (ruff's core)
+    "I",                    # isort
+    "UP",                   # pyupgrade: no 3.9-era syntax under py310
+    "B",                    # bugbear: likely bugs and footguns
+    "RUF100",               # unused `# noqa`
+]

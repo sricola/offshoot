@@ -41,20 +41,22 @@ Two construction modes were designed; ONE ships:
   at-rest mode would have to shell out to the ``offshoot`` binary. A thin
   correct adapter beats a broad fragile one; use ``session`` mode.
 """
+
 from __future__ import annotations
 
 import copy
 import sqlite3
 from collections.abc import AsyncIterator, Collection, Iterator, Mapping, Sequence
-from typing import Any, TYPE_CHECKING
+from typing import TYPE_CHECKING, Any
 
 from langgraph.checkpoint.base import BaseCheckpointSaver
 from langgraph.checkpoint.sqlite import SqliteSaver
-
-from offshoot.client import Client, OffshootError, Session, TTL
+from offshoot.client import TTL, Client, OffshootError, Session
 
 if TYPE_CHECKING:
     from contextlib import AbstractContextManager
+
+    from langchain_core.runnables import RunnableConfig
     from langgraph.checkpoint.base import (
         ChannelVersions,
         Checkpoint,
@@ -62,7 +64,6 @@ if TYPE_CHECKING:
         CheckpointTuple,
         DeltaChannelHistory,
     )
-    from langchain_core.runnables import RunnableConfig
 
 __all__ = ["OffshootSaver"]
 
@@ -87,8 +88,9 @@ class OffshootSaver(BaseCheckpointSaver):
     socket); call them from one thread at a time.
     """
 
-    def __init__(self, client: Client, session: Session, db: str, branch: str,
-                 socket_path: str) -> None:
+    def __init__(
+        self, client: Client, session: Session, db: str, branch: str, socket_path: str
+    ) -> None:
         # Private constructor — use OffshootSaver.session() / .at_rest().
         super().__init__()
         self._client = client
@@ -112,8 +114,9 @@ class OffshootSaver(BaseCheckpointSaver):
     # ------------------------------------------------------------------
 
     @classmethod
-    def session(cls, socket_path: str, db: str, branch: str = "main", *,
-                create: bool = True) -> "OffshootSaver":
+    def session(
+        cls, socket_path: str, db: str, branch: str = "main", *, create: bool = True
+    ) -> OffshootSaver:
         """Open a live daemon session on ``db@branch`` and return a saver on
         its checkout.
 
@@ -136,7 +139,7 @@ class OffshootSaver(BaseCheckpointSaver):
         return cls(client, session, db, branch, socket_path)
 
     @classmethod
-    def at_rest(cls, store: str, db: str, branch: str = "main") -> "OffshootSaver":
+    def at_rest(cls, store: str, db: str, branch: str = "main") -> OffshootSaver:
         """CLI-mode (at-rest checkout + explicit ``offshoot checkpoint``).
 
         **Not implemented.** The daemon wire protocol has no "commit an
@@ -149,7 +152,8 @@ class OffshootSaver(BaseCheckpointSaver):
             "OffshootSaver.at_rest is not implemented: persisting an "
             "at-rest checkout requires the `offshoot checkpoint` CLI (the "
             "daemon protocol's flush op is session-only). Use "
-            "OffshootSaver.session(socket_path, db, branch) instead.")
+            "OffshootSaver.session(socket_path, db, branch) instead."
+        )
 
     # ------------------------------------------------------------------
     # Offshoot value-add — each maps 1:1 to one offshoot op
@@ -178,9 +182,14 @@ class OffshootSaver(BaseCheckpointSaver):
         self._check_open()
         return self._session.flush(name, meta)
 
-    def fork_thread(self, new_branch: str, *, ttl: TTL = None,
-                    from_checkpoint: str | None = None,
-                    meta: dict[str, str] | None = None) -> "OffshootSaver":
+    def fork_thread(
+        self,
+        new_branch: str,
+        *,
+        ttl: TTL = None,
+        from_checkpoint: str | None = None,
+        meta: dict[str, str] | None = None,
+    ) -> OffshootSaver:
         """Fork this branch (``Client.fork``) and return a NEW saver on the
         fork's own checkout, leaving this saver untouched.
 
@@ -198,10 +207,17 @@ class OffshootSaver(BaseCheckpointSaver):
         branch) independently of this one.
         """
         self._check_open()
-        self._client.fork(self._db, self._branch, new_branch,
-                          from_checkpoint=from_checkpoint, ttl=ttl, meta=meta)
-        return OffshootSaver.session(self._socket_path, self._db, new_branch,
-                                     create=False)
+        self._client.fork(
+            self._db,
+            self._branch,
+            new_branch,
+            from_checkpoint=from_checkpoint,
+            ttl=ttl,
+            meta=meta,
+        )
+        return OffshootSaver.session(
+            self._socket_path, self._db, new_branch, create=False
+        )
 
     def rollback(self, to: str) -> None:
         """Repoint this branch at named checkpoint ``to``
@@ -276,7 +292,7 @@ class OffshootSaver(BaseCheckpointSaver):
             finally:
                 self._client.close()
 
-    def __enter__(self) -> "OffshootSaver":
+    def __enter__(self) -> OffshootSaver:
         return self
 
     def __exit__(self, *exc_info: object) -> None:
@@ -284,8 +300,7 @@ class OffshootSaver(BaseCheckpointSaver):
 
     def _check_open(self) -> None:
         if self._closed:
-            raise OffshootError(
-                f"OffshootSaver on {self._db}@{self._branch} is closed")
+            raise OffshootError(f"OffshootSaver on {self._db}@{self._branch} is closed")
 
     # ------------------------------------------------------------------
     # BaseCheckpointSaver: pure delegation to the inner SqliteSaver.
@@ -297,26 +312,38 @@ class OffshootSaver(BaseCheckpointSaver):
     def config_specs(self) -> list:  # type: ignore[override]
         return self._inner.config_specs
 
-    def get(self, config: "RunnableConfig") -> "Checkpoint | None":
+    def get(self, config: RunnableConfig) -> Checkpoint | None:
         return self._inner.get(config)
 
-    def get_tuple(self, config: "RunnableConfig") -> "CheckpointTuple | None":
+    def get_tuple(self, config: RunnableConfig) -> CheckpointTuple | None:
         return self._inner.get_tuple(config)
 
-    def list(self, config: "RunnableConfig | None", *,
-             filter: dict[str, Any] | None = None,
-             before: "RunnableConfig | None" = None,
-             limit: int | None = None) -> "Iterator[CheckpointTuple]":
+    def list(
+        self,
+        config: RunnableConfig | None,
+        *,
+        filter: dict[str, Any] | None = None,
+        before: RunnableConfig | None = None,
+        limit: int | None = None,
+    ) -> Iterator[CheckpointTuple]:
         return self._inner.list(config, filter=filter, before=before, limit=limit)
 
-    def put(self, config: "RunnableConfig", checkpoint: "Checkpoint",
-            metadata: "CheckpointMetadata",
-            new_versions: "ChannelVersions") -> "RunnableConfig":
+    def put(
+        self,
+        config: RunnableConfig,
+        checkpoint: Checkpoint,
+        metadata: CheckpointMetadata,
+        new_versions: ChannelVersions,
+    ) -> RunnableConfig:
         return self._inner.put(config, checkpoint, metadata, new_versions)
 
-    def put_writes(self, config: "RunnableConfig",
-                   writes: Sequence[tuple[str, Any]], task_id: str,
-                   task_path: str = "") -> None:
+    def put_writes(
+        self,
+        config: RunnableConfig,
+        writes: Sequence[tuple[str, Any]],
+        task_id: str,
+        task_path: str = "",
+    ) -> None:
         return self._inner.put_writes(config, writes, task_id, task_path)
 
     def delete_thread(self, thread_id: str) -> None:
@@ -328,20 +355,22 @@ class OffshootSaver(BaseCheckpointSaver):
     def copy_thread(self, source_thread_id: str, target_thread_id: str) -> None:
         return self._inner.copy_thread(source_thread_id, target_thread_id)
 
-    def prune(self, thread_ids: Sequence[str], *,
-              strategy: str = "keep_latest") -> None:
+    def prune(
+        self, thread_ids: Sequence[str], *, strategy: str = "keep_latest"
+    ) -> None:
         return self._inner.prune(thread_ids, strategy=strategy)
 
     def get_delta_channel_history(
-            self, *, config: "RunnableConfig",
-            channels: Sequence[str]) -> "Mapping[str, DeltaChannelHistory]":
+        self, *, config: RunnableConfig, channels: Sequence[str]
+    ) -> Mapping[str, DeltaChannelHistory]:
         return self._inner.get_delta_channel_history(config=config, channels=channels)
 
     def get_next_version(self, current: Any, channel: None = None) -> Any:
         return self._inner.get_next_version(current, channel)
 
     def with_allowlist(
-            self, extra_allowlist: Collection[tuple[str, ...]]) -> "OffshootSaver":
+        self, extra_allowlist: Collection[tuple[str, ...]]
+    ) -> OffshootSaver:
         # Base's with_allowlist would clone self but leave the INNER
         # saver's serde (the one that actually serializes) untouched;
         # instead derive a new inner and wrap it. The clone shares this
@@ -368,8 +397,9 @@ class OffshootSaver(BaseCheckpointSaver):
         return self._inner.setup()
 
     def cursor(
-            self, transaction: bool = True,
-    ) -> "AbstractContextManager[sqlite3.Cursor]":
+        self,
+        transaction: bool = True,
+    ) -> AbstractContextManager[sqlite3.Cursor]:
         return self._inner.cursor(transaction)
 
     # Async variants: delegated as-is. SqliteSaver's async methods raise
@@ -378,28 +408,41 @@ class OffshootSaver(BaseCheckpointSaver):
     # AsyncSqliteSaver) is future work, and silently running sync I/O on
     # the event loop would be worse than the honest error.
 
-    async def aget(self, config: "RunnableConfig") -> "Checkpoint | None":
+    async def aget(self, config: RunnableConfig) -> Checkpoint | None:
         return await self._inner.aget(config)
 
-    async def aget_tuple(self, config: "RunnableConfig") -> "CheckpointTuple | None":
+    async def aget_tuple(self, config: RunnableConfig) -> CheckpointTuple | None:
         return await self._inner.aget_tuple(config)
 
-    async def alist(self, config: "RunnableConfig | None", *,
-                    filter: dict[str, Any] | None = None,
-                    before: "RunnableConfig | None" = None,
-                    limit: int | None = None) -> "AsyncIterator[CheckpointTuple]":
-        async for item in self._inner.alist(config, filter=filter, before=before,
-                                            limit=limit):
+    async def alist(
+        self,
+        config: RunnableConfig | None,
+        *,
+        filter: dict[str, Any] | None = None,
+        before: RunnableConfig | None = None,
+        limit: int | None = None,
+    ) -> AsyncIterator[CheckpointTuple]:
+        async for item in self._inner.alist(
+            config, filter=filter, before=before, limit=limit
+        ):
             yield item
 
-    async def aput(self, config: "RunnableConfig", checkpoint: "Checkpoint",
-                   metadata: "CheckpointMetadata",
-                   new_versions: "ChannelVersions") -> "RunnableConfig":
+    async def aput(
+        self,
+        config: RunnableConfig,
+        checkpoint: Checkpoint,
+        metadata: CheckpointMetadata,
+        new_versions: ChannelVersions,
+    ) -> RunnableConfig:
         return await self._inner.aput(config, checkpoint, metadata, new_versions)
 
-    async def aput_writes(self, config: "RunnableConfig",
-                          writes: Sequence[tuple[str, Any]], task_id: str,
-                          task_path: str = "") -> None:
+    async def aput_writes(
+        self,
+        config: RunnableConfig,
+        writes: Sequence[tuple[str, Any]],
+        task_id: str,
+        task_path: str = "",
+    ) -> None:
         return await self._inner.aput_writes(config, writes, task_id, task_path)
 
     async def adelete_thread(self, thread_id: str) -> None:
@@ -408,16 +451,17 @@ class OffshootSaver(BaseCheckpointSaver):
     async def adelete_for_runs(self, run_ids: Sequence[str]) -> None:
         return await self._inner.adelete_for_runs(run_ids)
 
-    async def acopy_thread(self, source_thread_id: str,
-                           target_thread_id: str) -> None:
+    async def acopy_thread(self, source_thread_id: str, target_thread_id: str) -> None:
         return await self._inner.acopy_thread(source_thread_id, target_thread_id)
 
-    async def aprune(self, thread_ids: Sequence[str], *,
-                     strategy: str = "keep_latest") -> None:
+    async def aprune(
+        self, thread_ids: Sequence[str], *, strategy: str = "keep_latest"
+    ) -> None:
         return await self._inner.aprune(thread_ids, strategy=strategy)
 
     async def aget_delta_channel_history(
-            self, *, config: "RunnableConfig",
-            channels: Sequence[str]) -> "Mapping[str, DeltaChannelHistory]":
+        self, *, config: RunnableConfig, channels: Sequence[str]
+    ) -> Mapping[str, DeltaChannelHistory]:
         return await self._inner.aget_delta_channel_history(
-            config=config, channels=channels)
+            config=config, channels=channels
+        )

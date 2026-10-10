@@ -12,6 +12,7 @@ release name that shipped them.
 
 Usage: check_sdk_tag_version.py <tag>   e.g. check_sdk_tag_version.py sdk-v0.1.0
 """
+
 from __future__ import annotations
 
 import sys
@@ -30,7 +31,7 @@ def main(argv: list[str]) -> int:
         print(f"tag {tag!r} does not start with {TAG_PREFIX!r}", file=sys.stderr)
         return 1
 
-    tag_version = tag[len(TAG_PREFIX):]
+    tag_version = tag[len(TAG_PREFIX) :]
     truth = (REPO_ROOT / "sdk" / "VERSION").read_text().strip()
     if tag_version != truth:
         print(

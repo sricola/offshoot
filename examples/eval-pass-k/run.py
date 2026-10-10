@@ -30,6 +30,7 @@ eval loop's exit code into CI instead).
     OFFSHOOT_BIN=./bin/offshoot-bench PYTHONPATH=../../sdk/python \\
         python3 run.py --k 4 --tasks 5
 """
+
 from __future__ import annotations
 
 import argparse
@@ -43,9 +44,11 @@ import tempfile
 import time
 from pathlib import Path
 
-if sys.version_info < (3, 10):
-    sys.exit("examples/eval-pass-k needs Python 3.10+ (the SDK uses typing.TypeAlias); "
-             "run with PYTHON=python3.12 make example-pass-k")
+if sys.version_info < (3, 10):  # noqa: UP036 -- a plain message beats a SyntaxError on 3.9
+    sys.exit(
+        "examples/eval-pass-k needs Python 3.10+ (the SDK uses typing.TypeAlias); "
+        "run with PYTHON=python3.12 make example-pass-k"
+    )
 
 REPO = Path(__file__).resolve().parents[2]
 sys.path.insert(0, str(REPO / "sdk" / "python"))
@@ -79,11 +82,15 @@ def load_migrations() -> tuple[str, str, str]:
         raise RuntimeError(f"{GOLDEN_SQL}: missing the '-- === MIGRATION ===' marker")
     match = re.search(r"UPDATE\s+orders\s+SET\s+total\s*=.*?;", after, re.S | re.I)
     if not match:
-        raise RuntimeError(f"{GOLDEN_SQL}: no 'UPDATE orders SET total = ...;' after the marker")
+        raise RuntimeError(
+            f"{GOLDEN_SQL}: no 'UPDATE orders SET total = ...;' after the marker"
+        )
     correct = match.group(0)
     buggy = re.sub(r"ROUND\(\s*(.+?)\s*,\s*2\s*\)", r"\1", correct, count=1, flags=re.S)
     if buggy == correct:
-        raise RuntimeError(f"{GOLDEN_SQL}: could not derive a buggy (no-ROUND) migration from {correct!r}")
+        raise RuntimeError(
+            f"{GOLDEN_SQL}: could not derive a buggy (no-ROUND) migration from {correct!r}"
+        )
     return seed_sql, correct, buggy
 
 
@@ -96,8 +103,10 @@ def resolve_binary() -> Path:
     found = shutil.which("offshoot")
     if found:
         return Path(found)
-    print(f"error: no offshoot binary found (checked $OFFSHOOT_BIN, {DEFAULT_BIN}, PATH)",
-          file=sys.stderr)
+    print(
+        f"error: no offshoot binary found (checked $OFFSHOOT_BIN, {DEFAULT_BIN}, PATH)",
+        file=sys.stderr,
+    )
     print(f"build one with: go build -o {DEFAULT_BIN} ./cmd/offshoot", file=sys.stderr)
     sys.exit(1)
 
@@ -112,12 +121,18 @@ class Daemon:
         self.dir = work_dir
         self.bin = binpath
         self.store = self.dir / "store"
-        subprocess.run([str(self.bin), "-store", str(self.store), "init"],
-                        check=True, stdout=subprocess.DEVNULL, stderr=subprocess.PIPE)
+        subprocess.run(
+            [str(self.bin), "-store", str(self.store), "init"],
+            check=True,
+            stdout=subprocess.DEVNULL,
+            stderr=subprocess.PIPE,
+        )
         self.sock = str(self.dir / "d.sock")
         self.proc = subprocess.Popen(
             [str(self.bin), "-store", str(self.store), "serve", "-socket", self.sock],
-            stdout=subprocess.DEVNULL, stderr=subprocess.PIPE)
+            stdout=subprocess.DEVNULL,
+            stderr=subprocess.PIPE,
+        )
         deadline = time.time() + 10
         while not os.path.exists(self.sock):
             if time.time() > deadline:
@@ -133,8 +148,10 @@ class Daemon:
                     except subprocess.TimeoutExpired:
                         self.proc.kill()
                         self.proc.wait(timeout=10)
-                raise RuntimeError("daemon did not start: " +
-                                    self.proc.stderr.read().decode(errors="replace"))
+                raise RuntimeError(
+                    "daemon did not start: "
+                    + self.proc.stderr.read().decode(errors="replace")
+                )
             if self.proc.poll() is not None:
                 raise RuntimeError(self.proc.stderr.read().decode(errors="replace"))
             time.sleep(0.05)
@@ -176,14 +193,18 @@ def run_eval(sock: str, k: int, n_tasks: int) -> int:
         conn.executescript(seed_sql)
         conn.commit()
         tasks = conn.execute(
-            "SELECT id, order_id, description FROM tasks ORDER BY id").fetchall()
+            "SELECT id, order_id, description FROM tasks ORDER BY id"
+        ).fetchall()
         conn.close()
         main.flush(name="seed")
         main.close()
 
         if n_tasks > len(tasks):
-            print(f"warning: --tasks {n_tasks} > {len(tasks)} rows in golden.sql's "
-                  f"tasks table; using {len(tasks)}", file=sys.stderr)
+            print(
+                f"warning: --tasks {n_tasks} > {len(tasks)} rows in golden.sql's "
+                f"tasks table; using {len(tasks)}",
+                file=sys.stderr,
+            )
         tasks = tasks[:n_tasks]
 
         # Build the golden reference ONCE: fork "golden" from the seed
@@ -206,17 +227,25 @@ def run_eval(sock: str, k: int, n_tasks: int) -> int:
         print("-" * 92)
 
         results = []  # (task_id, pass_at_1, pass_at_k)
-        for task_id, order_id, description in tasks:
+        for task_id, _order_id, description in tasks:
             outcomes = []
             for trial in range(k):
                 branch = f"attempt-{task_id}-{trial}"
                 buggy = task_id == FLAKY_TASK_ID and trial % 3 == 2
-                client.fork(DB, "main", branch, from_checkpoint="seed",
-                            meta={"task": str(task_id), "trial": str(trial)})
+                client.fork(
+                    DB,
+                    "main",
+                    branch,
+                    from_checkpoint="seed",
+                    meta={"task": str(task_id), "trial": str(trial)},
+                )
                 try:
                     attempt = client.open(DB, branch)
                     try:
-                        apply_sql(attempt.path, buggy_migration if buggy else correct_migration)
+                        apply_sql(
+                            attempt.path,
+                            buggy_migration if buggy else correct_migration,
+                        )
                         attempt.flush()
                     finally:
                         attempt.close()
@@ -225,7 +254,9 @@ def run_eval(sock: str, k: int, n_tasks: int) -> int:
                     # bool(...) guards against the vacuous True that
                     # all(...) would return on an empty table list -- an
                     # empty diff must never read as "passed".
-                    passed = bool(diff.tables) and all(t.status == "same" for t in diff.tables)
+                    passed = bool(diff.tables) and all(
+                        t.status == "same" for t in diff.tables
+                    )
                     outcomes.append(passed)
                 finally:
                     # Destroy the fork even if apply_sql/flush/diff raised
@@ -236,8 +267,10 @@ def run_eval(sock: str, k: int, n_tasks: int) -> int:
             pass_at_1 = sum(outcomes) / len(outcomes)
             pass_at_k = all(outcomes)
             results.append((task_id, pass_at_1, pass_at_k))
-            print(f"{task_id:<6}{description[:60]:<62}{k:>3}  {pass_at_1:>7.2f}  "
-                  f"{'PASS' if pass_at_k else 'FAIL':>7}")
+            print(
+                f"{task_id:<6}{description[:60]:<62}{k:>3}  {pass_at_1:>7.2f}  "
+                f"{'PASS' if pass_at_k else 'FAIL':>7}"
+            )
 
         client.destroy(DB, "golden")
 
@@ -253,10 +286,18 @@ def run_eval(sock: str, k: int, n_tasks: int) -> int:
     if failing:
         t, p1 = failing[0]
         print()
-        print(f"Task {t}'s pass@1 of {p1:.2f} reads as \"mostly fine\" -- pass@1 only asks")
-        print("\"what fraction of trials passed?\" pass^k (\"would EVERY one of k independent")
-        print("attempts have passed?\") calls the same task a flat failure. That gap is the")
-        print("whole reason to measure pass^k, not just pass@1: an agent that's right most")
+        print(
+            f'Task {t}\'s pass@1 of {p1:.2f} reads as "mostly fine" -- pass@1 only asks'
+        )
+        print(
+            '"what fraction of trials passed?" pass^k ("would EVERY one of k independent'
+        )
+        print(
+            'attempts have passed?") calls the same task a flat failure. That gap is the'
+        )
+        print(
+            "whole reason to measure pass^k, not just pass@1: an agent that's right most"
+        )
         print("of the time is still wrong every time you'd actually ship it.")
     return 0
 
@@ -264,14 +305,20 @@ def run_eval(sock: str, k: int, n_tasks: int) -> int:
 def main() -> None:
     ap = argparse.ArgumentParser(
         description="Runnable pass^k eval loop over offshoot (tau2-bench style): "
-                    "seed once, fork per trial, grade with offshoot diff, throw away.")
+        "seed once, fork per trial, grade with offshoot diff, throw away."
+    )
     ap.add_argument("--k", type=int, default=4, help="trials per task (default: 4)")
-    ap.add_argument("--tasks", type=int, default=5, help="number of tasks to run (default: 5)")
+    ap.add_argument(
+        "--tasks", type=int, default=5, help="number of tasks to run (default: 5)"
+    )
     args = ap.parse_args()
 
     binpath = resolve_binary()
     if not (binpath.exists() and os.access(binpath, os.X_OK)):
-        print(f"error: offshoot binary not found or not executable: {binpath}", file=sys.stderr)
+        print(
+            f"error: offshoot binary not found or not executable: {binpath}",
+            file=sys.stderr,
+        )
         print(f"build it with: go build -o {binpath} ./cmd/offshoot", file=sys.stderr)
         sys.exit(1)
 

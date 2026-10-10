@@ -22,6 +22,7 @@ Run via `make test-pytest-plugin` (needs the `[pytest]` extra installed —
 see pyproject.toml — unlike test_client.py/test_langgraph.py, which run
 under plain `unittest` and must stay pytest-free).
 """
+
 import gc
 import json
 import shutil
@@ -37,24 +38,23 @@ import pytest
 
 sys.path.insert(0, str(Path(__file__).resolve().parent))
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
-from test_client import build_binary  # noqa: E402
-
-from offshoot.client import OffshootError  # noqa: E402
-from offshoot.pytest_plugin import (  # noqa: E402
+from offshoot.client import OffshootError
+from offshoot.pytest_plugin import (
     BinaryMisconfigured,
     ForkedSession,
     SeedHandle,
+    _branch_name,
     _connect,
+    _fingerprint_seed,
     _ForkFactory,
+    _locate_binary,
     _resolve_seed_path,
     _SeedFactory,
-    _branch_name,
-    _fingerprint_seed,
-    _locate_binary,
     _start_daemon,
     _worker_id,
     offshoot_dump,
 )
+from test_client import build_binary
 
 REPO = Path(__file__).resolve().parents[3]
 
@@ -62,6 +62,7 @@ REPO = Path(__file__).resolve().parents[3]
 # --------------------------------------------------------------------------
 # Tier 1: fixture logic against a directly started daemon.
 # --------------------------------------------------------------------------
+
 
 @pytest.fixture(scope="module")
 def bin_path(tmp_path_factory):
@@ -88,6 +89,7 @@ def daemon(bin_path):
 @pytest.fixture
 def client(daemon):
     from offshoot.client import connect
+
     c = connect(daemon.sock)
     try:
         yield c
@@ -96,6 +98,7 @@ def client(daemon):
 
 
 # --- _locate_binary: skip-when-no-binary vs fail-loud-when-misconfigured ---
+
 
 def test_locate_binary_prefers_offshoot_bin_env(tmp_path):
     fake = tmp_path / "offshoot"
@@ -135,6 +138,7 @@ def test_locate_binary_none_when_nothing_found():
 
 
 # --- _branch_name: worker-safe, sanitized, deterministic, bounded ---
+
 
 def test_branch_name_is_deterministic():
     a = _branch_name("gw0", "tests/test_x.py::test_one", 0)
@@ -182,6 +186,7 @@ def test_worker_id_reads_env(monkeypatch):
 
 # --- _resolve_seed_path: rootdir-relative, not cwd-relative (unit-level) ---
 
+
 def test_resolve_seed_path_absolute_passthrough(tmp_path):
     absolute = tmp_path / "seed.sql"
     resolved = _resolve_seed_path(str(absolute), rootpath=Path("/somewhere/unrelated"))
@@ -195,12 +200,17 @@ def test_resolve_seed_path_relative_resolves_against_rootpath(tmp_path):
 
 # --- _fingerprint_seed / same-name-different-seed mismatch detection ---
 
+
 def test_fingerprint_seed_is_stable_for_identical_sql():
-    assert _fingerprint_seed("CREATE TABLE t (v)") == _fingerprint_seed("CREATE TABLE t (v)")
+    assert _fingerprint_seed("CREATE TABLE t (v)") == _fingerprint_seed(
+        "CREATE TABLE t (v)"
+    )
 
 
 def test_fingerprint_seed_differs_for_different_sql():
-    assert _fingerprint_seed("CREATE TABLE t (v)") != _fingerprint_seed("CREATE TABLE u (v)")
+    assert _fingerprint_seed("CREATE TABLE t (v)") != _fingerprint_seed(
+        "CREATE TABLE u (v)"
+    )
 
 
 def test_fingerprint_seed_differs_for_different_callables():
@@ -221,6 +231,7 @@ def test_fingerprint_seed_stable_for_the_same_callable_object():
 
 
 # --- _SeedFactory: memoization, callable vs SQL seed, ini-default fallback ---
+
 
 def test_seed_factory_memoizes_by_name(client):
     factory = _SeedFactory(client, default_seed_path=None)
@@ -324,7 +335,9 @@ def test_seed_factory_retains_a_strong_reference_to_a_callable_seed(client):
 
 def test_seed_factory_runs_sql_string_seed(client):
     factory = _SeedFactory(client, default_seed_path=None)
-    handle = factory("sqlseed", seed="CREATE TABLE t (v); INSERT INTO t VALUES (1), (2);")
+    handle = factory(
+        "sqlseed", seed="CREATE TABLE t (v); INSERT INTO t VALUES (1), (2);"
+    )
     checkout = client.checkout_at(handle.db, "main", handle.checkpoint)
     conn = sqlite3.connect(checkout)
     assert conn.execute("SELECT count(*) FROM t").fetchone()[0] == 2
@@ -349,7 +362,8 @@ def test_seed_factory_wraps_multi_statement_seed_in_one_transaction(client):
     # — see _run_seed's docstring for why this matters for seed cost.
     factory = _SeedFactory(client, default_seed_path=None)
     sql = "CREATE TABLE t (v);\n" + "\n".join(
-        f"INSERT INTO t VALUES ({i});" for i in range(50))
+        f"INSERT INTO t VALUES ({i});" for i in range(50)
+    )
     handle = factory("multi-stmt", seed=sql)
     checkout = client.checkout_at(handle.db, "main", handle.checkpoint)
     conn = sqlite3.connect(checkout)
@@ -383,7 +397,9 @@ def test_seed_factory_runs_dump_shaped_seed(client, tmp_path):
     conn.commit()
     conn.close()
     dump_text = offshoot_dump(src)
-    assert dump_text.strip().upper().startswith("PRAGMA")  # sanity: reproduces the shape
+    assert (
+        dump_text.strip().upper().startswith("PRAGMA")
+    )  # sanity: reproduces the shape
     assert "BEGIN TRANSACTION" in dump_text.upper()
 
     factory = _SeedFactory(client, default_seed_path=None)
@@ -395,8 +411,10 @@ def test_seed_factory_runs_dump_shaped_seed(client, tmp_path):
 
 
 def test_seed_factory_handles_leading_comment_seed(client):
-    seed = ("-- seed data for the widget table\n"
-            "CREATE TABLE t (v);\nINSERT INTO t VALUES (1);")
+    seed = (
+        "-- seed data for the widget table\n"
+        "CREATE TABLE t (v);\nINSERT INTO t VALUES (1);"
+    )
     factory = _SeedFactory(client, default_seed_path=None)
     handle = factory("leading-comment", seed=seed)
     checkout = client.checkout_at(handle.db, "main", handle.checkpoint)
@@ -462,6 +480,7 @@ def test_seed_factory_raises_clear_error_with_no_seed_and_no_ini_default(client)
 
 
 # --- _SeedFactory: seeding from an existing SQLite database file ("db:" seeds) ---
+
 
 def _write_golden_db(path):
     conn = sqlite3.connect(path)
@@ -530,6 +549,7 @@ def test_db_file_seed_falls_back_to_ini_default_seed_path(client, tmp_path):
 
 # --- _connect: dead daemon raises OffshootError, not a bare OSError ---
 
+
 def test_connect_wraps_dead_daemon_connection_failure(bin_path):
     workdir = Path(tempfile.mkdtemp(prefix="offshoot-plugin-test-"))
     handle = _start_daemon(bin_path, workdir)
@@ -542,6 +562,7 @@ def test_connect_wraps_dead_daemon_connection_failure(bin_path):
 
 
 # --- _ForkFactory: TTL applied, teardown ordering, destroy failure warns ---
+
 
 def test_fork_factory_applies_configured_ttl(client):
     seeds = _SeedFactory(client, default_seed_path=None)
@@ -585,7 +606,9 @@ def test_fork_factory_accepts_seed_handle_as_string_name(client):
 def test_forked_session_flush_delegates_to_underlying_session(client):
     seeds = _SeedFactory(client, default_seed_path=None)
     handle = seeds("flush-test", seed="CREATE TABLE t (v)")
-    forks = _ForkFactory(client, seeds, worker="gw0", nodeid="test_flush_delegate", ttl="1h")
+    forks = _ForkFactory(
+        client, seeds, worker="gw0", nodeid="test_flush_delegate", ttl="1h"
+    )
     forked = forks(handle)
     assert isinstance(forked, ForkedSession)
     conn = sqlite3.connect(forked.path)
@@ -607,12 +630,16 @@ def test_fork_factory_teardown_closes_session_then_destroys_branch(client):
     forks = _ForkFactory(client, seeds, worker="gw0", nodeid="test_teardown", ttl="1h")
     forked = forks(handle)
     branch = forked.branch
-    assert any(st["db"] == handle.db and st["branch"] == branch for st in client.status())
+    assert any(
+        st["db"] == handle.db and st["branch"] == branch for st in client.status()
+    )
 
     forks.teardown()
 
     # Session closed (no longer in `status`) and branch destroyed.
-    assert not any(st["db"] == handle.db and st["branch"] == branch for st in client.status())
+    assert not any(
+        st["db"] == handle.db and st["branch"] == branch for st in client.status()
+    )
     assert branch not in {b.branch for b in client.branches(handle.db)}
 
 
@@ -648,7 +675,9 @@ def test_fork_factory_teardown_continues_past_one_forks_failure(client):
     # abort the loop and leak the rest of this test's forks.
     seeds = _SeedFactory(client, default_seed_path=None)
     handle = seeds("multi-teardown", seed="CREATE TABLE t (v)")
-    forks = _ForkFactory(client, seeds, worker="gw0", nodeid="test_multi_teardown", ttl="1h")
+    forks = _ForkFactory(
+        client, seeds, worker="gw0", nodeid="test_multi_teardown", ttl="1h"
+    )
     broken = forks(handle)
     healthy = forks(handle)
     # Sabotage only the first fork's branch.
@@ -666,7 +695,9 @@ def test_fork_factory_teardown_continues_past_one_forks_failure(client):
     # The second, healthy fork was still torn down properly despite the
     # first one's failure.
     assert not any(
-        st["db"] == handle.db and st["branch"] == healthy.branch for st in client.status())
+        st["db"] == handle.db and st["branch"] == healthy.branch
+        for st in client.status()
+    )
     assert healthy.branch not in {b.branch for b in client.branches(handle.db)}
 
 
@@ -676,7 +707,9 @@ def test_fork_factory_teardown_warnings_always_show_even_under_error_filter(clie
     # installs) turn its own best-effort notice into a raised exception.
     seeds = _SeedFactory(client, default_seed_path=None)
     handle = seeds("error-filter", seed="CREATE TABLE t (v)")
-    forks = _ForkFactory(client, seeds, worker="gw0", nodeid="test_error_filter", ttl="1h")
+    forks = _ForkFactory(
+        client, seeds, worker="gw0", nodeid="test_error_filter", ttl="1h"
+    )
     forked = forks(handle)
     forked._session.close()
     client.destroy(handle.db, forked.branch, force=True)
@@ -707,6 +740,7 @@ def test_fork_factory_defaults_to_default_seed_when_none_given(client):
 
 
 # --- offshoot_dump: plain function, fixture form, missing-CLI error ---
+
 
 def test_offshoot_dump_returns_sql_text(tmp_path):
     dbfile = tmp_path / "d.sqlite"
@@ -742,7 +776,9 @@ def test_offshoot_dump_is_the_right_comparison_not_bytes(tmp_path):
     assert offshoot_dump(a) == offshoot_dump(b)  # logically identical
 
 
-def test_offshoot_dump_raises_clear_error_when_sqlite3_cli_missing(tmp_path, monkeypatch):
+def test_offshoot_dump_raises_clear_error_when_sqlite3_cli_missing(
+    tmp_path, monkeypatch
+):
     dbfile = tmp_path / "d.sqlite"
     conn = sqlite3.connect(dbfile)
     conn.execute("CREATE TABLE t (v)")
@@ -770,6 +806,7 @@ def test_offshoot_dump_fixture_form_matches_the_plain_function(offshoot_dump, tm
 # Tier 2: pytester smoke scenarios.
 # --------------------------------------------------------------------------
 
+
 @pytest.fixture(scope="module")
 def offshoot_bin_str(bin_path):
     return str(bin_path)
@@ -792,7 +829,9 @@ def test_plugin_loads_via_entry_point(pytester, offshoot_bin_str, monkeypatch):
     result.assert_outcomes(passed=1)
 
 
-def test_fork_per_test_isolation_actually_isolates(pytester, offshoot_bin_str, monkeypatch):
+def test_fork_per_test_isolation_actually_isolates(
+    pytester, offshoot_bin_str, monkeypatch
+):
     monkeypatch.setenv("OFFSHOOT_BIN", offshoot_bin_str)
     pytester.makepyfile(
         """
@@ -865,7 +904,9 @@ def test_xdist_two_worker_run_passes_and_measures_seed_cost(
     for f in timing_dir.glob("*.json"):
         data = json.loads(f.read_text())
         timings[data["worker"]] = data["seed_seconds"]
-    assert len(timings) >= 1, "expected at least one xdist worker to record a seed timing"
+    assert len(timings) >= 1, (
+        "expected at least one xdist worker to record a seed timing"
+    )
     print(f"\nmeasured per-worker seed cost under -n2: {timings}")
 
 
@@ -878,7 +919,8 @@ def test_offshoot_seed_ini_resolves_relative_to_rootdir_not_cwd(
     monkeypatch.setenv("OFFSHOOT_BIN", offshoot_bin_str)
     pytester.makeini("[pytest]\noffshoot_seed = seed.sql\n")
     (pytester.path / "seed.sql").write_text(
-        "CREATE TABLE t (v);\nINSERT INTO t VALUES ('from-root-relative-seed');\n")
+        "CREATE TABLE t (v);\nINSERT INTO t VALUES ('from-root-relative-seed');\n"
+    )
     test_body = textwrap.dedent("""
         import sqlite3
 
@@ -906,7 +948,9 @@ def test_offshoot_seed_ini_resolves_relative_to_rootdir_not_cwd(
     result_sub.assert_outcomes(passed=1)
 
 
-def test_offshoot_bin_misconfigured_fails_loud_not_skip(pytester, tmp_path, monkeypatch):
+def test_offshoot_bin_misconfigured_fails_loud_not_skip(
+    pytester, tmp_path, monkeypatch
+):
     missing = tmp_path / "does-not-exist"
     monkeypatch.setenv("OFFSHOOT_BIN", str(missing))
     pytester.makepyfile(
@@ -919,7 +963,9 @@ def test_offshoot_bin_misconfigured_fails_loud_not_skip(pytester, tmp_path, monk
     result.assert_outcomes(errors=1)
 
 
-def test_offshoot_require_binary_ini_fails_loud_when_missing(pytester, monkeypatch, tmp_path):
+def test_offshoot_require_binary_ini_fails_loud_when_missing(
+    pytester, monkeypatch, tmp_path
+):
     monkeypatch.delenv("OFFSHOOT_BIN", raising=False)
     empty_path_dir = tmp_path / "empty-path"
     empty_path_dir.mkdir()

@@ -1,6 +1,6 @@
 .PHONY: test test-torture fuzz build test-s3 bench bench-cow bench-s3 check-python-version test-python-sdk test-ts-sdk test-sdks test-python-langgraph \
 	check-sdk-versions dry-run-python-sdk dry-run-ts-sdk dry-run-sdks test-pytest-plugin \
-	ci-local ci-local-host ci-local-linux ci-local-s3 ci-local-minio ci-local-sdks lint \
+	ci-local ci-local-host ci-local-linux ci-local-s3 ci-local-minio ci-local-sdks lint lint-python \
 	check-plugin bench-isolation bench-branchbench bench-ab example-pass-k
 
 # Override with `make PYTHON=python3.14 ...` when the platform's unversioned
@@ -15,14 +15,36 @@ test:
 
 # lint fails if any file is unformatted (gofmt -l prints offenders; the
 # `(! read)` trick makes any output a nonzero exit) or go vet finds a
-# problem; staticcheck runs best-effort last (`go run` fetches it, so it
+# problem. gofmt sees the Go files git tracks or would add — not ignored
+# scratch directories such as .superpowers/, which `gofmt -l .` walked and
+# which once failed the gate on a file that could never ship; staticcheck runs best-effort last (`go run` fetches it, so it
 # needs network — the || clause keeps an offline run from failing the two
 # gates that already passed). ci.yml runs the same gofmt/vet pair on every
 # PR so an unformatted non-test file can't ship silently again (audit §7).
+#
+# STATICCHECK pins a master commit, not a release: v0.8.1 (the latest
+# release as of 2026-10-10) cannot read the Go 1.27 export data the
+# toolchain in go.mod produces ("export data version 5 is greater than
+# maximum supported version 4"), and the || clause hid that for every run
+# since the 1.27 upgrade. Move the pin to the next tagged release once one
+# supports 1.27. lint-python is the same gate for the Python SDKs, scripts
+# and examples (ruff.toml at the repo root is the rule set).
+STATICCHECK ?= honnef.co/go/tools/cmd/staticcheck@v0.7.0-0.dev.0.20261009230814-452d5bb86b45
 lint:
-	gofmt -l . | tee /dev/stderr | (! read)
+	gofmt -l $$(git ls-files -co --exclude-standard '*.go') | tee /dev/stderr | (! read)
 	go vet ./...
-	go run honnef.co/go/tools/cmd/staticcheck@v0.8.1 ./... || echo "staticcheck failed or unavailable (non-blocking)"
+	go run $(STATICCHECK) ./... || echo "staticcheck failed or unavailable (non-blocking)"
+
+# lint-python runs ruff (lint + format check) over every Python file the
+# repo tracks, with the rules in ruff.toml. ci.yml's sdks job runs the same
+# two commands. RUFF defaults to the pinned-version uvx form so a machine
+# with uv needs nothing installed; override with RUFF=ruff for a global
+# install (pip install ruff==$(RUFF_VERSION)).
+RUFF_VERSION = 0.17.0
+RUFF ?= uvx ruff@$(RUFF_VERSION)
+lint-python:
+	$(RUFF) check .
+	$(RUFF) format --check .
 test-torture:
 	go test ./internal/capture -tags=torture -run TestTorture -count=1 -timeout 30m -v
 

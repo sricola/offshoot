@@ -15,6 +15,7 @@ that grows the surface fails HERE, loudly, instead of corrupting
 delegation silently. Same skip-locally/fail-under-CI discipline as the
 rest of the suite (see conftest).
 """
+
 from __future__ import annotations
 
 import pytest
@@ -25,10 +26,9 @@ import pytest
 pytest.importorskip("langgraph")
 pytest.importorskip("langgraph.checkpoint.sqlite")
 
-from langgraph.checkpoint.base import BaseCheckpointSaver  # noqa: E402
-from langgraph.checkpoint.sqlite import SqliteSaver  # noqa: E402
-
-from langgraph_checkpoint_offshoot import OffshootSaver  # noqa: E402
+from langgraph.checkpoint.base import BaseCheckpointSaver
+from langgraph.checkpoint.sqlite import SqliteSaver
+from langgraph_checkpoint_offshoot import OffshootSaver
 
 # Names deliberately NOT overridden on OffshootSaver, each with a reason.
 # Every entry must still exist on the introspected surface — a stale entry
@@ -54,7 +54,8 @@ def _public_surface(cls: type) -> set[str]:
             if name.startswith("_"):
                 continue
             if callable(value) or isinstance(
-                    value, (property, classmethod, staticmethod)):
+                value, (property, classmethod, staticmethod)
+            ):
                 names.add(name)
     return names
 
@@ -65,15 +66,17 @@ def test_every_public_method_is_explicitly_overridden():
     stale = EXPECTED_INHERITED - surface
     assert not stale, (
         "EXPECTED_INHERITED lists names no longer on the installed "
-        f"langgraph surface — prune them: {sorted(stale)}")
+        f"langgraph surface — prune them: {sorted(stale)}"
+    )
 
     missing = sorted(
-        name for name in surface - EXPECTED_INHERITED
-        if name not in vars(OffshootSaver))
+        name for name in surface - EXPECTED_INHERITED if name not in vars(OffshootSaver)
+    )
     assert not missing, (
         "OffshootSaver inherits these public methods instead of explicitly "
         f"delegating them to the inner SqliteSaver: {missing}. A newer "
         "langgraph-checkpoint(-sqlite) likely added them. Add explicit "
         "delegating overrides in saver.py's 'pure delegation' block (and "
         "update the pin comment/README), or — only if inheriting is "
-        "provably safe — add the name to EXPECTED_INHERITED with a reason.")
+        "provably safe — add the name to EXPECTED_INHERITED with a reason."
+    )

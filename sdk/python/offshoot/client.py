@@ -4,6 +4,7 @@ Wire protocol: newline-delimited JSON over a unix socket; one request, one
 response, no pipelining (matches internal/daemon/protocol.go).
 Stdlib only — no dependencies.
 """
+
 from __future__ import annotations
 
 import json
@@ -197,11 +198,12 @@ def _ttl_str(ttl: _TTL) -> str:
     if isinstance(ttl, int) and not isinstance(ttl, bool):
         raise TypeError(
             f"ttl={ttl!r}: a nonzero int is ambiguous; use a timedelta or a "
-            'Go duration string (e.g. "1h", "3600s")')
+            'Go duration string (e.g. "1h", "3600s")'
+        )
     return str(ttl)  # a Go duration string like "2h"
 
 
-def connect(socket_path: str) -> "Client":
+def connect(socket_path: str) -> Client:
     """Open a connection to the offshoot daemon listening on socket_path."""
     return Client(socket_path)
 
@@ -229,14 +231,17 @@ class Client:
             self._sock.close()
             raise
 
-    def __enter__(self) -> "Client":
+    def __enter__(self) -> Client:
         return self
 
     def __exit__(self, *exc_info: object) -> None:
         self.close()
 
     def _call(self, op: str, **fields: object) -> dict[str, Any]:
-        req = {"op": op, **{k: v for k, v in fields.items() if v not in ("", None, False)}}
+        req = {
+            "op": op,
+            **{k: v for k, v in fields.items() if v not in ("", None, False)},
+        }
         try:
             self._sock.sendall(json.dumps(req).encode() + b"\n")
             line = self._rfile.readline()
@@ -252,7 +257,7 @@ class Client:
             raise OffshootError(resp.get("error", "unknown daemon error"))
         return resp
 
-    def create(self, db: str, from_path: "str | os.PathLike[str] | None" = None) -> None:
+    def create(self, db: str, from_path: str | os.PathLike[str] | None = None) -> None:
         """Create a fresh db (branch main at txid 1), or, when from_path is
         given, import an existing SQLite file at that path instead.
 
@@ -270,7 +275,7 @@ class Client:
             return
         self._call("create", db=db, path=os.path.abspath(os.fspath(from_path)))
 
-    def open(self, db: str, branch: str = "main") -> "Session":
+    def open(self, db: str, branch: str = "main") -> Session:
         """Open a live session on db@branch; returns its Session.
 
         If a session on the branch is closing, the daemon waits up to 15 s
@@ -278,16 +283,26 @@ class Client:
         closing; retry".
         """
         resp = self._call("open", db=db, branch=branch)
-        return Session(self, resp["checkout"], db, branch, session_id=resp.get("session_id"))
+        return Session(
+            self, resp["checkout"], db, branch, session_id=resp.get("session_id")
+        )
 
     def checkout(self, db: str, branch: str) -> str:
         """Materialize db@branch's head snapshot at rest; returns its path."""
         resp = self._call("checkout", db=db, branch=branch)
         return cast(str, resp["checkout"])
 
-    def fork(self, db: str, source: str, new: str, from_checkpoint: str | None = None,
-              ttl: _TTL = None, meta: dict[str, str] | None = None, *,
-              at: str | None = None) -> int:
+    def fork(
+        self,
+        db: str,
+        source: str,
+        new: str,
+        from_checkpoint: str | None = None,
+        ttl: _TTL = None,
+        meta: dict[str, str] | None = None,
+        *,
+        at: str | None = None,
+    ) -> int:
         """Branch `new` off db@source (at from_checkpoint, or source's head).
 
         at is an alias for from_checkpoint, named like the CLI's `--at` and
@@ -302,20 +317,36 @@ class Client:
         """
         if at is not None:
             if from_checkpoint is not None and from_checkpoint != at:
-                raise ValueError(f"fork: from_checkpoint={from_checkpoint!r} and at={at!r} "
-                                 "name different checkpoints; pass one of them")
+                raise ValueError(
+                    f"fork: from_checkpoint={from_checkpoint!r} and at={at!r} "
+                    "name different checkpoints; pass one of them"
+                )
             from_checkpoint = at
-        resp = self._call("fork", db=db, branch=source, name=new, ttl=_ttl_str(ttl),
-                            meta=meta or None, **{"from": from_checkpoint or ""})
+        resp = self._call(
+            "fork",
+            db=db,
+            branch=source,
+            name=new,
+            ttl=_ttl_str(ttl),
+            meta=meta or None,
+            **{"from": from_checkpoint or ""},
+        )
         return cast(int, resp.get("txid", 0))
 
     def destroy(self, db: str, branch: str, force: bool = False) -> None:
         """Delete db@branch. force overrides the protected-branch refusal."""
         self._call("destroy", db=db, branch=branch, force=force)
 
-    def rollback(self, db: str, branch: str, to: str, *,
-                 backup: bool = True, backup_ttl: _TTL = None,
-                 materialize: bool = False) -> str:
+    def rollback(
+        self,
+        db: str,
+        branch: str,
+        to: str,
+        *,
+        backup: bool = True,
+        backup_ttl: _TTL = None,
+        materialize: bool = False,
+    ) -> str:
         """Repoint db@branch at checkpoint `to`; returns the refreshed checkout path.
 
         By default the branch's previous head is kept first as a shared
@@ -327,14 +358,27 @@ class Client:
         The branch points at the kept checkpoint's history instead of
         copying it; materialize=True copies it into a self-contained lineage.
         """
-        resp = self._call("rollback", db=db, branch=branch, name=to,
-                          no_backup=not backup, backup_ttl=_ttl_str(backup_ttl),
-                          materialize=materialize)
+        resp = self._call(
+            "rollback",
+            db=db,
+            branch=branch,
+            name=to,
+            no_backup=not backup,
+            backup_ttl=_ttl_str(backup_ttl),
+            materialize=materialize,
+        )
         return cast(str, resp.get("checkout", ""))
 
-    def promote(self, db: str, source: str, onto: str, force: bool = False,
-                backup: bool = True, backup_ttl: _TTL = None,
-                materialize: bool = False) -> int:
+    def promote(
+        self,
+        db: str,
+        source: str,
+        onto: str,
+        force: bool = False,
+        backup: bool = True,
+        backup_ttl: _TTL = None,
+        materialize: bool = False,
+    ) -> int:
         """Repoint db@onto at db@source's head; returns the promoted txid.
 
         By default the target's previous head is kept first as a shared
@@ -346,9 +390,16 @@ class Client:
         The target points at the source head's history instead of copying
         it; materialize=True copies it into a self-contained lineage.
         """
-        resp = self._call("promote", db=db, branch=source, name=onto, force=force,
-                          no_backup=not backup, backup_ttl=_ttl_str(backup_ttl),
-                          materialize=materialize)
+        resp = self._call(
+            "promote",
+            db=db,
+            branch=source,
+            name=onto,
+            force=force,
+            no_backup=not backup,
+            backup_ttl=_ttl_str(backup_ttl),
+            materialize=materialize,
+        )
         return cast(int, resp.get("txid", 0))
 
     def compact(self, db: str, branch: str = "main") -> int:
@@ -396,8 +447,14 @@ class Client:
         resp = self._call("dbs")
         return cast(list[str], resp.get("databases", []))
 
-    def export(self, db: str, branch: str, out_path: str,
-               checkpoint: str | None = None, force: bool = False) -> None:
+    def export(
+        self,
+        db: str,
+        branch: str,
+        out_path: str,
+        checkpoint: str | None = None,
+        force: bool = False,
+    ) -> None:
         """Materialize db@branch's state at checkpoint (None = head) to a
         plain SQLite file at out_path, server-side, on the daemon's own
         host/filesystem — out_path must be an ABSOLUTE path (same-host/
@@ -411,11 +468,24 @@ class Client:
         writes, they are NOT in the export. Flush (or checkpoint) first if
         you need them included.
         """
-        self._call("export", db=db, branch=branch, name=checkpoint or "",
-                    path=out_path, force=force)
+        self._call(
+            "export",
+            db=db,
+            branch=branch,
+            name=checkpoint or "",
+            path=out_path,
+            force=force,
+        )
 
-    def diff(self, left: str, right: str, *, table: str | None = None,
-             full: bool = False, max_bytes: int | None = None) -> DiffResult:
+    def diff(
+        self,
+        left: str,
+        right: str,
+        *,
+        table: str | None = None,
+        full: bool = False,
+        max_bytes: int | None = None,
+    ) -> DiffResult:
         """Compare two targets (db[@branch[@checkpoint]], same form as export)
         read-only and return a content-aware per-table summary: rows added,
         removed, and changed (by primary key, or rowid when none is declared)
@@ -425,22 +495,44 @@ class Client:
         1 MiB) with truncated=True when cut. Never touches a live checkout
         or takes a lease; a head-side target reads the last durable state.
         """
-        resp = self._call("diff", left=left, right=right, table=table or "",
-                          full=full, max_bytes=max_bytes or 0)
+        resp = self._call(
+            "diff",
+            left=left,
+            right=right,
+            table=table or "",
+            full=full,
+            max_bytes=max_bytes or 0,
+        )
         d = resp.get("diff") or {}
-        tables = [TableDiff(
-            table=t.get("table", ""), left_exists=t.get("left_exists", False),
-            right_exists=t.get("right_exists", False), left_rows=t.get("left_rows", 0),
-            right_rows=t.get("right_rows", 0), comparable=t.get("comparable", False),
-            added=t.get("added", 0), removed=t.get("removed", 0), changed=t.get("changed", 0),
-            schema_changed=t.get("schema_changed", False), status=t.get("status", ""),
-            key=t.get("key", ""),
-        ) for t in d.get("tables", [])]
-        return DiffResult(left=d.get("left", left), right=d.get("right", right), tables=tables,
-                          totals=dict(d.get("totals", {})), full=d.get("full", ""),
-                          truncated=bool(d.get("truncated", False)))
+        tables = [
+            TableDiff(
+                table=t.get("table", ""),
+                left_exists=t.get("left_exists", False),
+                right_exists=t.get("right_exists", False),
+                left_rows=t.get("left_rows", 0),
+                right_rows=t.get("right_rows", 0),
+                comparable=t.get("comparable", False),
+                added=t.get("added", 0),
+                removed=t.get("removed", 0),
+                changed=t.get("changed", 0),
+                schema_changed=t.get("schema_changed", False),
+                status=t.get("status", ""),
+                key=t.get("key", ""),
+            )
+            for t in d.get("tables", [])
+        ]
+        return DiffResult(
+            left=d.get("left", left),
+            right=d.get("right", right),
+            tables=tables,
+            totals=dict(d.get("totals", {})),
+            full=d.get("full", ""),
+            truncated=bool(d.get("truncated", False)),
+        )
 
-    def checkout_at(self, db: str, branch: str, checkpoint: str, force: bool = False) -> str:
+    def checkout_at(
+        self, db: str, branch: str, checkpoint: str, force: bool = False
+    ) -> str:
         """Materialize db@branch's state at checkpoint into a dedicated
         read-only cache file, distinct from (and never touching) the
         branch's writable checkout — safe to call alongside an open
@@ -450,7 +542,9 @@ class Client:
 
         Returns the read-only cache file's path.
         """
-        resp = self._call("checkout-at", db=db, branch=branch, name=checkpoint, force=force)
+        resp = self._call(
+            "checkout-at", db=db, branch=branch, name=checkpoint, force=force
+        )
         return cast(str, resp.get("checkout", ""))
 
     def events(self) -> Generator[Event, None, None]:
@@ -589,8 +683,14 @@ class Client:
 class Session:
     """A live daemon session: a lease plus a checkout under continuous capture."""
 
-    def __init__(self, client: Client, path: str, db: str, branch: str,
-                 session_id: str | None = None):
+    def __init__(
+        self,
+        client: Client,
+        path: str,
+        db: str,
+        branch: str,
+        session_id: str | None = None,
+    ):
         self._client, self.path, self._db, self._branch = client, path, db, branch
         # The id the daemon's open minted for this session (None from a
         # daemon too old to send one): close() sends it back so it can only
@@ -606,8 +706,9 @@ class Session:
         meta with an empty name is rejected by the daemon — there is no
         checkpoint for it to attach to.
         """
-        resp = self._client._call("flush", db=self._db, branch=self._branch, name=name,
-                                    meta=meta or None)
+        resp = self._client._call(
+            "flush", db=self._db, branch=self._branch, name=name, meta=meta or None
+        )
         return cast(int, resp.get("txid", 0))
 
     def checkpoint(self, name: str, meta: dict[str, str] | None = None) -> int:
@@ -627,5 +728,6 @@ class Session:
         the same. (A daemon too old to return the id closes whatever session
         is open on the branch.)
         """
-        self._client._call("close", db=self._db, branch=self._branch,
-                           session_id=self._session_id)
+        self._client._call(
+            "close", db=self._db, branch=self._branch, session_id=self._session_id
+        )
