@@ -200,6 +200,8 @@ func RunConformance(t *testing.T, keyPrefix string, newBackend func(t *testing.T
 				defer wg.Done()
 				if _, err := b.PutIf(k("refs/race"), []byte(fmt.Sprintf("w%d", idx)), etag); err == nil {
 					wins <- idx
+				} else if !errors.Is(err, store.ErrCAS) {
+					t.Errorf("loser %d: want ErrCAS, got %v", idx, err)
 				}
 			}(i)
 		}

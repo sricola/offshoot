@@ -8,6 +8,7 @@ import (
 	"os"
 	"path/filepath"
 	"sync"
+	"sync/atomic"
 	"testing"
 	"time"
 )
@@ -105,6 +106,8 @@ func TestLocalCASRace(t *testing.T) {
 			defer wg.Done()
 			if _, err := b.PutIf("refs/a/main", []byte(fmt.Sprint(n)), etag); err == nil {
 				wins <- n
+			} else if !errors.Is(err, ErrCAS) {
+				t.Errorf("loser %d: want ErrCAS, got %v", n, err)
 			}
 		}(i)
 	}
@@ -295,7 +298,11 @@ func TestStoreDeleteRefIfUsesConditionalDeleteOnLocal(t *testing.T) {
 	}
 }
 
-func TestLocalBreaksStaleLock(t *testing.T) {
+// TestLocalLeftoverLockFileDoesNotBlock: a lock file left behind by a
+// process that died inside PutIf holds no lock (flock dies with its
+// holder), so the next writer proceeds immediately — no stale-age
+// heuristic, no waiting out a deadline.
+func TestLocalLeftoverLockFileDoesNotBlock(t *testing.T) {
 	b, _ := NewLocal(t.TempDir())
 	p, err := b.path("refs/a/main")
 	if err != nil {
@@ -309,57 +316,119 @@ func TestLocalBreaksStaleLock(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	f.Close()
-
-	stale := time.Now().Add(-1 * time.Minute)
-	if err := os.Chtimes(lockPath, stale, stale); err != nil {
-		t.Fatal(err)
-	}
+	f.Close() // closed: whatever process made it is gone
 
 	start := time.Now()
 	if _, err := b.PutIf("refs/a/main", []byte("v1"), ""); err != nil {
-		t.Fatalf("PutIf should break the stale lock and succeed, got: %v", err)
+		t.Fatalf("PutIf must ignore a leftover lock file and succeed, got: %v", err)
 	}
 	if elapsed := time.Since(start); elapsed >= 2*time.Second {
-		t.Fatalf("PutIf took too long to break stale lock: %v", elapsed)
+		t.Fatalf("PutIf waited on a leftover lock file: %v", elapsed)
+	}
+	if _, err := os.Stat(lockPath); !os.IsNotExist(err) {
+		t.Fatalf("release must remove the lock file so emptied directories can go; stat err = %v", err)
 	}
 }
 
-func TestLocalFreshLockNotBroken(t *testing.T) {
+// TestLocalHeldLockBlocksUntilReleased: a lock actually held (an open
+// descriptor with the flock) blocks PutIf for as long as it is held, and
+// PutIf completes once the holder lets go.
+func TestLocalHeldLockBlocksUntilReleased(t *testing.T) {
 	b, _ := NewLocal(t.TempDir())
 	p, err := b.path("refs/a/main")
 	if err != nil {
 		t.Fatal(err)
 	}
-	if err := os.MkdirAll(filepath.Dir(p), 0o755); err != nil {
-		t.Fatal(err)
-	}
-	lockPath := p + ".lock"
-	f, err := os.OpenFile(lockPath, os.O_CREATE|os.O_EXCL|os.O_WRONLY, 0o644)
+	release, err := b.lock(p)
 	if err != nil {
 		t.Fatal(err)
 	}
-	f.Close() // freshly created: mtime is now
 
-	done := make(chan struct{})
+	done := make(chan error, 1)
 	go func() {
-		b.PutIf("refs/a/main", []byte("v1"), "")
-		close(done)
+		_, err := b.PutIf("refs/a/main", []byte("v1"), "")
+		done <- err
 	}()
 
 	select {
-	case <-done:
-		t.Fatal("PutIf must not succeed while a fresh lock is held")
+	case err := <-done:
+		t.Fatalf("PutIf must not complete while the lock is held (err=%v)", err)
 	case <-time.After(1 * time.Second):
 	}
 
-	if err := os.Remove(lockPath); err != nil {
+	release()
+	select {
+	case err := <-done:
+		if err != nil {
+			t.Fatalf("PutIf after release: %v", err)
+		}
+	case <-time.After(5 * time.Second):
+		t.Fatal("PutIf did not complete after the lock was released")
+	}
+}
+
+// TestLocalLockNeverAdmitsTwoHolders pins the property PutIf's
+// compare-and-swap rests on: at most one holder of a key's lock at any
+// instant, however the lock file's age looks. A backdating goroutine keeps
+// rewriting the live lock file's mtime to a minute ago — the shape an
+// existence-plus-mtime lock mistakes for "stale" and breaks, which once let
+// two writers inside the same CAS (each then saw the same etag and both
+// renames landed; one update was silently lost).
+func TestLocalLockNeverAdmitsTwoHolders(t *testing.T) {
+	b, _ := NewLocal(t.TempDir())
+	p, err := b.path("refs/a/main")
+	if err != nil {
 		t.Fatal(err)
 	}
-	select {
-	case <-done:
-	case <-time.After(5 * time.Second):
-		t.Fatal("PutIf did not complete after the lock was removed")
+	lockPath := p + ".lock"
+
+	stop := make(chan struct{})
+	var backdater sync.WaitGroup
+	backdater.Add(1)
+	go func() {
+		defer backdater.Done()
+		stale := time.Now().Add(-time.Minute)
+		for {
+			select {
+			case <-stop:
+				return
+			default:
+				os.Chtimes(lockPath, stale, stale) // ENOENT between holders is fine
+			}
+		}
+	}()
+
+	var holders, maxHolders atomic.Int32
+	var wg sync.WaitGroup
+	const workers, rounds = 8, 60
+	for w := 0; w < workers; w++ {
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			for i := 0; i < rounds; i++ {
+				release, err := b.lock(p)
+				if err != nil {
+					t.Errorf("lock: %v", err)
+					return
+				}
+				n := holders.Add(1)
+				for {
+					m := maxHolders.Load()
+					if n <= m || maxHolders.CompareAndSwap(m, n) {
+						break
+					}
+				}
+				time.Sleep(200 * time.Microsecond) // widen the window a breaker would exploit
+				holders.Add(-1)
+				release()
+			}
+		}()
+	}
+	wg.Wait()
+	close(stop)
+	backdater.Wait()
+	if got := maxHolders.Load(); got != 1 {
+		t.Fatalf("max simultaneous holders of the per-key lock: %d (must be 1)", got)
 	}
 }
 
@@ -540,5 +609,26 @@ func TestOnlyLocalSettlesItsWrites(t *testing.T) {
 	}
 	if _, ok := Backend((*S3)(nil)).(SettledWriter); ok {
 		t.Fatal("S3 says it settles its writes")
+	}
+}
+
+// TestLocalCopyObjectKeepsObjectsPrivate: CopyObject's result is 0600 like
+// every other object, whichever copy path reflink took (a clone inherits
+// the source mode; the plain-copy fallback used to create 0644).
+func TestLocalCopyObjectKeepsObjectsPrivate(t *testing.T) {
+	b, _ := NewLocal(t.TempDir())
+	if err := b.Put("data/lin/1/snap", []byte("x")); err != nil {
+		t.Fatal(err)
+	}
+	if err := b.CopyObject("data/lin/2/snap", "data/lin/1/snap"); err != nil {
+		t.Fatal(err)
+	}
+	p, _ := b.path("data/lin/2/snap")
+	fi, err := os.Stat(p)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if mode := fi.Mode().Perm(); mode != 0o600 {
+		t.Fatalf("copied object mode = %o, want 0600", mode)
 	}
 }
