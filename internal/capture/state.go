@@ -119,6 +119,5 @@ func SaveState(path string, s State) error {
 	if err := os.Rename(tmp, path); err != nil {
 		return err
 	}
-	fsutil.SyncDir(filepath.Dir(path))
-	return nil
+	return fsutil.SyncDir(filepath.Dir(path))
 }
