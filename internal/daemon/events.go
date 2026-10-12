@@ -382,9 +382,11 @@ func splitKey(k string) (db, branch string) {
 //
 // *** DEDICATED CONNECTION REQUIRED ***: once this function sends the ack,
 // this connection LEAVES request/response mode for good — see
-// streamEvents. Any request/response op sent on this same connection after
-// "subscribe" is never read (the streaming loop below never calls
-// dec.Decode again). SDKs and any other caller MUST open a fresh, dedicated
+// streamEvents. The streaming loop never decodes another request on this
+// connection: it reads one byte only to notice the client going away, so
+// ANY byte the client sends after the ack (a stray request, say) is taken
+// as a hang-up and ends the stream, with no error line and no
+// dropped_slow_consumer event. SDKs and any other caller MUST open a fresh, dedicated
 // connection for "subscribe" and keep using their original connection (or
 // another fresh one) for ordinary ops — exactly like this file's own
 // events_test.go tests do, dialing a second connection per test rather

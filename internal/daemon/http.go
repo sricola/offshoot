@@ -627,8 +627,10 @@ func (s *Server) handleMetrics(w http.ResponseWriter, r *http.Request) {
 		// bytes.Buffer.Write never itself errors, so this path is not
 		// expected to fire in practice with the buffer target used here —
 		// kept because WritePrometheus's signature is the general io.Writer
-		// one and a future collector/render change could still fail.
+		// one and a future collector/render change could still fail. A
+		// scraper must see that failure, not a 200 with an empty body.
 		s.logMetricsErr(err)
+		http.Error(w, "metrics: "+err.Error(), http.StatusInternalServerError)
 		return
 	}
 	// scrapeMu is released by now (WritePrometheus returned); everything

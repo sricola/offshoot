@@ -27,9 +27,10 @@ import (
 )
 
 type Server struct {
-	ws   *ops.Workspace
-	ln   net.Listener
-	sock string
+	ws       *ops.Workspace
+	ln       net.Listener
+	sock     string
+	sockInfo os.FileInfo // the socket file as created; Shutdown removes the path only while it is still this
 
 	mu sync.Mutex
 	// sessions maps "db@branch" to its slot. A slot is reserved while an
@@ -281,6 +282,14 @@ func waitClosed(done <-chan struct{}, deadline time.Time) bool {
 }
 
 func NewServer(ws *ops.Workspace, socketPath string) (*Server, error) {
+	// A path that answers is a live daemon, not a stale socket: refuse it
+	// rather than unlink it. Taking it over left the first daemon running
+	// with sessions nobody could reach, and its eventual Shutdown unlinked
+	// the second daemon's socket in turn.
+	if c, err := net.DialTimeout("unix", socketPath, time.Second); err == nil {
+		c.Close()
+		return nil, fmt.Errorf("daemon: a daemon is already serving at %s (stop it with 'offshoot session shutdown', or run this one with another -socket)", socketPath)
+	}
 	if err := os.Remove(socketPath); err != nil && !os.IsNotExist(err) {
 		return nil, err
 	}
@@ -302,6 +311,15 @@ func NewServer(ws *ops.Workspace, socketPath string) (*Server, error) {
 	if err != nil {
 		return nil, fmt.Errorf("daemon: listen %s: %w", socketPath, err)
 	}
+	// Shutdown removes the path itself, and only while the path is still
+	// this listener's socket (see there); the default unlink-on-close would
+	// remove whatever is at the path, including a successor daemon's socket.
+	ln.(*net.UnixListener).SetUnlinkOnClose(false)
+	sockInfo, err := os.Stat(socketPath)
+	if err != nil {
+		ln.Close()
+		return nil, err
+	}
 	// Belt-and-suspenders: the umask above already yields 0600 at creation;
 	// this pins the exact final mode regardless of platform quirks.
 	if err := os.Chmod(socketPath, 0o600); err != nil {
@@ -309,6 +327,7 @@ func NewServer(ws *ops.Workspace, socketPath string) (*Server, error) {
 		return nil, err
 	}
 	srv := &Server{ws: ws, ln: ln, sock: socketPath,
+		sockInfo:     sockInfo,
 		sessions:     map[string]*slot{},
 		orphaned:     map[string]string{},
 		conns:        map[net.Conn]struct{}{},
@@ -397,6 +416,7 @@ func (s *Server) SetSnapshotEvery(n int) {
 }
 
 func (s *Server) Serve() error {
+	backoff := 5 * time.Millisecond
 	for {
 		c, err := s.ln.Accept()
 		if err != nil {
@@ -406,17 +426,36 @@ func (s *Server) Serve() error {
 			if closing {
 				return nil
 			}
+			// EMFILE/ENFILE is a burst of connections against the
+			// descriptor ceiling (this daemon budgets descriptors for a
+			// reason), not a dead listener, and ECONNABORTED/EAGAIN are
+			// one connection's failure, not the listener's: back off and
+			// keep serving, as net/http does, instead of exiting with
+			// every lease held. (Not net.Error.Temporary: deprecated and
+			// ill-defined.)
+			if errors.Is(err, syscall.EMFILE) || errors.Is(err, syscall.ENFILE) || errors.Is(err, syscall.ECONNABORTED) || errors.Is(err, syscall.EAGAIN) {
+				fmt.Fprintf(os.Stderr, "offshoot: serve: accept: %v; retrying in %s\n", err, backoff)
+				time.Sleep(backoff)
+				if backoff < time.Second {
+					backoff *= 2
+				}
+				continue
+			}
 			return err
 		}
+		backoff = 5 * time.Millisecond
 		go s.handle(c)
 	}
 }
 
-// maxSocketConnBytes bounds the request bytes one unix-socket connection
-// may send over its lifetime. Clients open a connection per request (see
-// daemon.Call), and the largest legitimate request is a few KiB of JSON;
-// 16 MiB leaves room for any future batch shape while still bounding memory.
-const maxSocketConnBytes = 16 << 20
+// maxSocketRequestBytes bounds the bytes one request on a unix-socket
+// connection may occupy. The largest legitimate request is a few KiB of
+// JSON; 16 MiB leaves room for any future batch shape while still bounding
+// memory. It is a per-request cap, not a per-connection one: daemon.Call
+// opens a connection per request, but both SDKs keep one connection for
+// the client's life, and a lifetime cap answered their ~140k-th small
+// request with EOF.
+const maxSocketRequestBytes = 16 << 20
 
 func (s *Server) handle(c net.Conn) {
 	s.connMu.Lock()
@@ -431,13 +470,15 @@ func (s *Server) handle(c net.Conn) {
 	// Same-user callers only reach this socket, so the cap is against a
 	// runaway client, not an attacker; it mirrors HTTP's maxRPCBodyBytes
 	// so neither surface will buffer an unbounded request.
-	dec := json.NewDecoder(io.LimitReader(c, maxSocketConnBytes))
+	lim := &io.LimitedReader{R: c, N: maxSocketRequestBytes}
+	dec := json.NewDecoder(lim)
 	enc := json.NewEncoder(c)
 	for {
 		req, err := decodeRequest(dec)
 		if err != nil {
-			return // client hung up, sent garbage, or exceeded the connection cap
+			return // client hung up, sent garbage, or exceeded the request cap
 		}
+		lim.N = maxSocketRequestBytes // per request; the decoder may have read ahead up to its buffer (bounded by the cap), so memory stays within ~2x
 		// "subscribe" (Milestone 4 Task 4a) is handle()'s SECOND special-
 		// cased op, alongside "shutdown" below: like shutdown, it cannot be
 		// answered by dispatch()'s ordinary one-Request-in-one-Response-out
@@ -1672,11 +1713,16 @@ func (s *Server) shutdown(ctx context.Context) error {
 	// sequence that follows.
 	close(s.janitorStop)
 
-	// Closing the listener also removes the socket file: a UnixListener from
-	// net.Listen unlinks its path on Close. This is the only place Shutdown
-	// removes it, before any session starts closing; see the end of this
-	// function for why it must not be removed again later.
+	// Closing the listener and removing the socket file, before any
+	// session starts closing, so an operator can start the next `serve` on
+	// the path while this one finishes; see the end of this function for
+	// why it must not be removed again later. The path is removed only if
+	// it is still this listener's socket (unlink-on-close is off): if it
+	// was replaced while this daemon ran, it belongs to another daemon.
 	s.ln.Close()
+	if fi, err := os.Stat(s.sock); err == nil && os.SameFile(fi, s.sockInfo) {
+		os.Remove(s.sock)
+	}
 
 	// Close every live connection so a handle goroutine blocked in Decode
 	// (or about to Encode a response on a connection nobody will read again)
@@ -1718,17 +1764,27 @@ func (s *Server) shutdown(ctx context.Context) error {
 		httpSrv.Close()
 	}
 
+	// The janitor gets half of whatever budget remains, not all of it: a
+	// GC pass over a large store can outlast a 30 s SIGTERM budget, and
+	// spending the whole budget here meant exiting with zero sessions
+	// closed. Sessions and the janitor already run concurrently in steady
+	// state, so closing sessions while a pass finishes is the normal case.
+	var janitorErr error
 	janitorWait := make(chan struct{})
 	go func() {
 		s.janitorWG.Wait()
 		close(janitorWait)
 	}()
+	janitorCtx := ctx
+	if dl, ok := ctx.Deadline(); ok {
+		var cancel context.CancelFunc
+		janitorCtx, cancel = context.WithTimeout(ctx, time.Until(dl)/2)
+		defer cancel()
+	}
 	select {
 	case <-janitorWait:
-	case <-ctx.Done():
-		// Note: closing stays true, so a later call to Shutdown returns this
-		// same error rather than retry a stop that never completed.
-		return fmt.Errorf("daemon: shutdown: timed out waiting for the janitor: %w", ctx.Err())
+	case <-janitorCtx.Done():
+		janitorErr = fmt.Errorf("daemon: shutdown: janitor pass still running after half the budget; sessions closed without waiting for it")
 	}
 
 	openWait := make(chan struct{})
@@ -1762,11 +1818,13 @@ func (s *Server) shutdown(ctx context.Context) error {
 	}
 	s.mu.Unlock()
 
-	go func() {
-		for _, c := range mine {
-			s.closeSlot(c.key, c.m) // its result lands in c.m.err
-		}
-	}()
+	// Every close in flight at once: sessions are independent and each
+	// Session.Close is slow in proportion to its checkout (the engine's
+	// shutdown hashes it), so serial closes turned one budget into a
+	// timeout for the sessions that did not make the cut.
+	for _, c := range mine {
+		go s.closeSlot(c.key, c.m) // its result lands in c.m.err
+	}
 
 	allClosed := make(chan struct{})
 	go func() {
@@ -1785,7 +1843,7 @@ func (s *Server) shutdown(ctx context.Context) error {
 		return fmt.Errorf("daemon: shutdown: timed out closing sessions: %w", ctx.Err())
 	}
 
-	var firstErr error
+	firstErr := janitorErr
 	for _, c := range waits {
 		if c.m.err != nil && firstErr == nil {
 			firstErr = c.m.err
