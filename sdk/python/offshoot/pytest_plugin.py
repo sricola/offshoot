@@ -126,9 +126,8 @@ this a hard failure instead, e.g. in CI). If the daemon dies (crash,
 OOM-kill, a bug), the stderr tail is appended ONLY on the two paths that
 actually have a handle on it: the ``offshoot_db``/``offshoot_fork``
 fixtures' own initial connection (the module-private ``_connect``, which
-turns a dead/unreachable daemon's bare `ConnectionRefusedError`/
-`FileNotFoundError` into an :class:`~offshoot.client.OffshootError` with
-the tail appended), and ``offshoot_fork``'s per-call fork+open (inside
+turns a dead/unreachable daemon's connection failure into an
+:class:`~offshoot.client.OffshootError` with the tail appended), and ``offshoot_fork``'s per-call fork+open (inside
 ``_ForkFactory.__call__``, which catches `OffshootError` and re-raises with
 the tail appended). Everything ELSE that talks to the daemon —
 ``offshoot_db``'s seed-time `create`/`open` and the seed's own
@@ -402,15 +401,17 @@ def _worker_id() -> str:
 
 def _connect(sock: str, stderr_tail: Callable[[], str] = lambda: "") -> Client:
     """`offshoot.connect`, but a dead/unreachable daemon raises
-    `OffshootError` with the daemon's stderr tail appended instead of a
-    bare `OSError` (`ConnectionRefusedError`/`FileNotFoundError`/...) — see
-    the module docstring's "Honest failure modes" section.
+    `OffshootError` with the daemon's stderr tail appended — see the module
+    docstring's "Honest failure modes" section.
     `offshoot.client.Client._call` already does this for every request on
     an ALREADY-open connection; this closes the gap for the connection
     attempt itself, which every fixture here makes fresh."""
     try:
         return connect(sock)
-    except OSError as e:
+    except (OSError, OffshootError) as e:
+        # connect() raises OffshootError for a socket nobody serves (it
+        # used to let the bare OSError through); the stderr tail is this
+        # plugin's addition either way.
         tail = stderr_tail()
         msg = f"offshoot: could not connect to the daemon at {sock}: {e}"
         if tail:

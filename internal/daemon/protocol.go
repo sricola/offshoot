@@ -40,7 +40,9 @@ type Request struct {
 	// acked, the connection it was sent on PERMANENTLY LEAVES
 	// request/response mode and streams line-per-event JSON (one JSON
 	// value per line) until the client disconnects — no further Request
-	// can ever be sent on that same connection. Callers MUST use a fresh,
+	// can ever be sent on that same connection: any byte the client sends
+	// after the ack is read as a hang-up and silently ends the stream.
+	// Callers MUST use a fresh,
 	// DEDICATED connection for "subscribe", keeping their original
 	// connection (or another fresh one) for ordinary ops. See
 	// internal/daemon/events.go's handleSubscribeOp/streamEvents for the

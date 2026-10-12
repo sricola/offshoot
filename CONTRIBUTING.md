@@ -34,8 +34,11 @@ confirm your setup is complete.
 
 Optional, only needed for the SDK test tier:
 
-- Python 3.10+ as `python3` (Python SDK tests and tooling; macOS: `brew
-  install python@3.12`, Debian/Ubuntu: `apt-get install python3`)
+- Python 3.10+ (Python SDK tests and tooling; macOS: `brew install
+  python@3.12`, Debian/Ubuntu: `apt-get install python3`). The Makefile
+  runs `python3` by default and refuses an older one with a message; when
+  the platform's `python3` is older (macOS ships 3.9), pass the interpreter
+  explicitly: `make PYTHON=python3.12 test-sdks`.
 - Node 20+ (TypeScript SDK tests; macOS: `brew install node`, elsewhere
   via [nodejs.org](https://nodejs.org/) or your package manager)
 

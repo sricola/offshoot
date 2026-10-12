@@ -197,3 +197,57 @@ func TestServeTokenFile(t *testing.T) {
 		t.Fatalf("short token in file: got %v, want the 16-character refusal", err)
 	}
 }
+
+// TestEveryCommandParsesFlagsInAnyFormAndRejectsLeftovers: the
+// `--x=value` and single-dash spellings TestFlagsAcceptBothDashForms pins for
+// fork and -store hold for every command that takes a flag, and no command
+// silently ignores an argument it did not understand. gc once accepted
+// exactly `--grace VALUE` and ran with the one-hour default for any other
+// shape (`--grace=0`, `-grace 0`, a bare `--grace`, a stray word), exit 0.
+func TestEveryCommandParsesFlagsInAnyFormAndRejectsLeftovers(t *testing.T) {
+	dir := filepath.Join(t.TempDir(), "s")
+	call(t, dir, "init")
+	call(t, dir, "create", "app")
+	call(t, dir, "checkout", "app")
+	seed := strings.TrimSpace(call(t, dir, "path", "app"))
+
+	// Accepted spellings.
+	for _, args := range [][]string{
+		{"gc", "--grace=0s"},
+		{"gc", "-grace", "0s"},
+		{"create", "app2", "--from=" + seed},
+		{"create", "app3", "-from", seed},
+		{"fork", "app", "x"},
+		{"destroy", "app@x", "-force"},
+		{"rollback", "app", "--to=init", "--backup-ttl=2h", "-force"},
+		{"fork", "app", "y"},
+		{"promote", "app@y", "-onto", "main", "--force", "--no-backup"},
+		{"lease", "acquire", "app", "--ttl=1m"},
+	} {
+		if _, err := callErr(t, dir, args...); err != nil {
+			t.Errorf("offshoot %v: %v", args, err)
+		}
+	}
+
+	// Rejected shapes, each with a message that names the problem.
+	for _, c := range []struct {
+		args []string
+		want string
+	}{
+		{[]string{"gc", "--grace"}, "--grace requires a value"},
+		{[]string{"gc", "--grace", "banana"}, `--grace "banana": not a duration`},
+		{[]string{"gc", "stray"}, "usage: offshoot gc"},
+		{[]string{"init", "stray"}, "usage: offshoot init"},
+		{[]string{"create", "app4", "--from"}, "--from requires a value"},
+		{[]string{"destroy", "app@main", "stray", "--force"}, "usage: offshoot destroy"},
+		{[]string{"rollback", "app", "--to", "init", "--backup-ttl", "0s"}, "--backup-ttl must be positive"},
+		{[]string{"rollback", "app", "init"}, "usage: offshoot rollback"},
+		{[]string{"promote", "app@y", "--onto", "main", "--backup-ttl"}, "--backup-ttl requires a value"},
+		{[]string{"lease", "acquire", "app", "--ttl", "bad"}, `--ttl "bad": not a duration`},
+	} {
+		_, err := callErr(t, dir, c.args...)
+		if err == nil || !strings.Contains(err.Error(), c.want) {
+			t.Errorf("offshoot %v: got %v, want it to contain %q", c.args, err, c.want)
+		}
+	}
+}

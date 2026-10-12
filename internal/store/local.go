@@ -11,6 +11,7 @@ import (
 	"path/filepath"
 	"sort"
 	"strings"
+	"syscall"
 	"time"
 
 	"github.com/sricola/offshoot/internal/fsutil"
@@ -18,7 +19,7 @@ import (
 )
 
 // Local is a directory-backed Backend. CAS is implemented with a per-key
-// O_CREAT|O_EXCL lock file: acquire lock -> read+verify etag -> write temp,
+// flock(2) on a lock file: acquire lock -> read+verify etag -> write temp,
 // fsync, rename -> release lock. A bare rename alone is atomic REPLACE, not
 // compare-and-swap; the lock provides the compare step.
 type Local struct {
@@ -172,8 +173,22 @@ func (l *Local) write(p string, data []byte) (etag string, err error) {
 		os.Remove(tmp)
 		return "", err
 	}
-	fsutil.SyncDir(dir)
+	syncDirAfterRename(dir)
 	return etag, nil
+}
+
+// syncDirAfterRename runs the directory fsync that makes a landed rename
+// survive power loss and reports a failure on stderr instead of returning
+// it: the rename is already visible, and Local promises (WritesSettled)
+// that an error from a write means nothing landed — callers such as
+// ops.Destroy's claim handling and session flush decide what to re-read on
+// that promise. A directory fsync that fails with anything but the
+// "unsupported here" errnos is a failing disk; the next write will fail
+// outright, and this line says why.
+func syncDirAfterRename(dir string) {
+	if err := fsutil.SyncDir(dir); err != nil {
+		fmt.Fprintf(os.Stderr, "offshoot: store: directory sync after a landed write in %s failed: %v (the write is visible; its durability across power loss is not assured)\n", dir, err)
+	}
 }
 
 func (l *Local) Put(key string, data []byte) error {
@@ -210,9 +225,9 @@ func (l *Local) writeReader(p string, r io.Reader, size int64) (etag string, err
 // writeReaderTemp is writeReader's streaming half: the whole object is
 // streamed, hashed, stamped with its etag and fsynced into a uniquely named
 // temp file beside p, and the temp path is returned for commitTemp. Split
-// out so PutReaderIf can do the slow part (a multi-GB snapshot can take
-// longer than lock()'s 30 s stale-lock horizon) BEFORE it takes the
-// per-key lock, and hold the lock only around the compare and the rename.
+// out so PutReaderIf can do the slow part (a multi-GB snapshot) BEFORE it
+// takes the per-key lock, and hold the lock only around the compare and
+// the rename, so other writers to the key wait milliseconds, not minutes.
 func (l *Local) writeReaderTemp(p string, r io.Reader, size int64) (tmp, etag string, err error) {
 	f, err := createTempIn(filepath.Dir(p), filepath.Base(p)+".tmp-*")
 	if err != nil {
@@ -290,7 +305,7 @@ func commitTemp(tmp, p string) error {
 		os.Remove(tmp)
 		return err
 	}
-	fsutil.SyncDir(filepath.Dir(p))
+	syncDirAfterRename(filepath.Dir(p))
 	return nil
 }
 
@@ -325,11 +340,10 @@ func (l *Local) PutReaderIf(key string, r io.Reader, size int64, ifMatch string)
 	if err != nil {
 		return "", err
 	}
-	// Stream the object before taking the lock: lock() breaks a lock older
-	// than 30 s on the assumption its holder died, and a large snapshot
-	// can legitimately take longer than that to write. Holding the lock
-	// only for the compare and the rename keeps it in the millisecond
-	// range the stale-lock rule was designed for.
+	// Stream the object before taking the lock: a large snapshot can take
+	// minutes to write, and every other writer to this key waits on the
+	// lock (5 s before it gives up). Holding it only for the compare and
+	// the rename keeps the hold in the millisecond range.
 	tmp, etag, err := l.writeReaderTemp(p, r, size)
 	if err != nil {
 		return "", err
@@ -369,53 +383,81 @@ func (l *Local) PutReaderIf(key string, r io.Reader, size int64, ifMatch string)
 	return etag, nil
 }
 
+// lock takes the per-key lock PutIf, PutReaderIf and DeleteIf serialize
+// their read-compare-write under. The lock is an flock(2) on p+".lock", so
+// holding it means holding an open descriptor: a process that dies inside
+// the critical section releases it with its last descriptor, and a lock
+// file left on disk is just a file. There is deliberately no "stale file"
+// heuristic — the previous existence-plus-mtime design broke a lock by
+// path, and two breakers racing the same stale file could delete each
+// other's fresh locks and both enter the CAS (one update was then lost
+// silently). Release unlinks the file while still holding the flock, and
+// an acquirer re-checks that the inode it locked is still the one at
+// lockPath, so a waiter that locked an unlinked inode retries on the new
+// file rather than holding a lock nobody else can see. Unlinking on
+// release is what lets removeEmptyParents clear an emptied directory.
 func (l *Local) lock(p string) (release func(), err error) {
 	lockPath := p + ".lock"
 	deadline := time.Now().Add(5 * time.Second)
 	// vanished tracks whether the most recent failed attempt lost to a
-	// vanishing directory (fs.ErrNotExist) rather than a held lock file
-	// (os.IsExist), so a timeout can name which case occurred instead of
-	// always blaming a stale lock file.
+	// vanishing directory (fs.ErrNotExist) rather than a held lock, so a
+	// timeout can name which case occurred.
 	vanished := false
 	for {
-		// inDir: the directory can vanish between MkdirAll and the O_EXCL
-		// create when a delete elsewhere has just emptied it.
+		var f *os.File
+		// inDir: the directory can vanish between MkdirAll and the create
+		// when a delete elsewhere has just emptied it.
 		err := inDir(filepath.Dir(p), func() error {
-			f, err := os.OpenFile(lockPath, os.O_CREATE|os.O_EXCL|os.O_WRONLY, 0o644)
-			if err == nil {
-				f.Close()
-			}
+			var err error
+			f, err = os.OpenFile(lockPath, os.O_CREATE|os.O_RDWR, 0o600)
 			return err
 		})
-		if err == nil {
-			return func() { os.Remove(lockPath) }, nil
-		}
-		// A directory still vanishing after inDir's retries is waited out
-		// like a held lock, so lock's deadline (not inDir's cap) bounds it.
-		vanished = errors.Is(err, fs.ErrNotExist)
-		if !os.IsExist(err) && !vanished {
-			return nil, err
-		}
-		// A healthy CAS holds the lock for milliseconds. If it's been sitting
-		// here for a while, assume the process that created it was killed and
-		// break it. Stat/remove races are benign: the file may vanish between
-		// stat and remove (fine, someone else broke it), or another process
-		// may concurrently break the same stale lock (also fine — both then
-		// race O_EXCL normally).
-		if info, statErr := os.Stat(lockPath); statErr == nil {
-			if time.Since(info.ModTime()) > 30*time.Second {
-				os.Remove(lockPath)
+		switch {
+		case err == nil:
+			vanished = false
+			if err := syscall.Flock(int(f.Fd()), syscall.LOCK_EX|syscall.LOCK_NB); err == nil {
+				if sameFileAt(f, lockPath) {
+					return func() {
+						os.Remove(lockPath)
+						syscall.Flock(int(f.Fd()), syscall.LOCK_UN)
+						f.Close()
+					}, nil
+				}
+				// Locked an inode a releaser has already unlinked: the
+				// live lock is the new file at lockPath. Retry at once.
+				f.Close()
 				continue
+			} else if !errors.Is(err, syscall.EWOULDBLOCK) && !errors.Is(err, syscall.EAGAIN) {
+				f.Close()
+				return nil, err
 			}
+			f.Close()
+		case errors.Is(err, fs.ErrNotExist):
+			// A directory still vanishing after inDir's retries is waited
+			// out like a held lock, so lock's deadline (not inDir's cap)
+			// bounds it.
+			vanished = true
+		default:
+			return nil, err
 		}
 		if time.Now().After(deadline) {
 			if vanished {
-				return nil, fmt.Errorf("store: lock timeout on %s (its directory kept vanishing underneath the retry, not a stale lock file; nothing to delete)", lockPath)
+				return nil, fmt.Errorf("store: lock timeout on %s (its directory kept vanishing underneath the retry)", lockPath)
 			}
-			return nil, fmt.Errorf("store: lock timeout on %s (if no offshoot process is running, delete this file)", lockPath)
+			return nil, fmt.Errorf("store: lock timeout on %s (another offshoot process held this key's lock for over 5s)", lockPath)
 		}
 		time.Sleep(2 * time.Millisecond)
 	}
+}
+
+// sameFileAt reports whether f is the file currently at path.
+func sameFileAt(f *os.File, path string) bool {
+	fi, err := f.Stat()
+	if err != nil {
+		return false
+	}
+	pi, err := os.Stat(path)
+	return err == nil && os.SameFile(fi, pi)
 }
 
 func (l *Local) PutIf(key string, data []byte, ifMatch string) (string, error) {
@@ -586,6 +628,12 @@ func (l *Local) CopyObject(dst, src string) error {
 			}
 			return err
 		}
+		// A clone inherits the source's 0600; reflink's plain-copy fallback
+		// (ext4, most CI hosts) creates 0644. Every object is 0600.
+		if err := os.Chmod(tmp, 0o600); err != nil {
+			os.Remove(tmp)
+			return err
+		}
 		return nil
 	})
 	if err != nil {
@@ -595,7 +643,7 @@ func (l *Local) CopyObject(dst, src string) error {
 		os.Remove(tmp)
 		return err
 	}
-	fsutil.SyncDir(dir)
+	syncDirAfterRename(dir)
 	return nil
 }
 
@@ -692,8 +740,8 @@ func (l *Local) DeleteObjects(keys []string) (deleted []string, err error) {
 func (l *Local) WritesSettled() bool { return true }
 
 // DeleteIf implements store.ConditionalDeleter: a true compare-and-delete,
-// using the exact same per-key O_CREAT|O_EXCL lock file PutIf uses to
-// implement its own compare-and-swap (see the package doc comment on Local).
+// using the exact same per-key flock PutIf uses to implement its own
+// compare-and-swap (see the package doc comment on Local).
 // Absent (already deleted, or never existed) or content that no longer
 // hashes to ifMatch both fail with ErrCAS — a caller (ops.Destroy) that
 // raced this against a concurrent write to the same key sees exactly the

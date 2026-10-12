@@ -18,16 +18,22 @@ import (
 // This is fsync(2), deliberately not Go's (*os.File).Sync: on macOS that
 // issues F_FULLFSYNC, a full disk-cache flush that costs tens of
 // milliseconds per call, and a directory needs only its metadata ordered
-// behind the file's own sync. Best effort: platforms and filesystems that
-// reject fsync on a directory are not an error, since the rename itself
-// already happened and nothing more can be done for it there.
-func SyncDir(dir string) {
+// behind the file's own sync. A filesystem that rejects fsync on a
+// directory (EINVAL, ENOTSUP, ENOTTY) is not an error: the rename already
+// happened and nothing more can be done for it there. Any other failure
+// (EIO from a failing disk, say) is returned, because a caller that goes
+// on to report the write durable would otherwise be reporting a name the
+// disk may not hold after power loss.
+func SyncDir(dir string) error {
 	d, err := os.Open(dir)
 	if err != nil {
-		return
+		return err
 	}
-	_ = fsync(d)
-	d.Close()
+	defer d.Close()
+	if err := fsync(d); err != nil && !fsyncUnsupported(err) {
+		return err
+	}
+	return nil
 }
 
 // WriteFileAtomic writes data to path through a uniquely named temp file in
@@ -81,7 +87,7 @@ func writeAtomic(path string, data []byte, mode os.FileMode, durable bool) error
 		return err
 	}
 	if durable {
-		SyncDir(dir)
+		return SyncDir(dir)
 	}
 	return nil
 }

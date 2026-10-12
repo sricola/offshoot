@@ -962,7 +962,19 @@ const quiesceBusyTimeoutMS = 3000
 // Every caller stats the checkout first, so a path missing at the Hold, or
 // replaced or removed before Verify, lost a race with another operation:
 // all of those return errCheckoutReplaced.
-func quiesce(path string) error {
+func quiesce(path string) error { return quiesceWith(path, "TRUNCATE") }
+
+// quiesceWith is quiesce with the checkpoint mode chosen by the caller.
+// TRUNCATE (quiesce) is what a refresh needs: the WAL folded and emptied
+// before the file is replaced. PASSIVE is for a probe that only wants to
+// know whether the checkout diverges from its ref: it never takes the
+// writer lock to wait on readers, so against a capture engine's long read
+// transaction it returns at once with the backfill incomplete (reported
+// here as errQuiesceBusy via the frame counts) instead of stalling the
+// agent's commits for the whole busy timeout (fork and promote from a
+// branch with a live daemon session used to cost 3 s and freeze the agent
+// for as long, to print a warning).
+func quiesceWith(path, mode string) error {
 	release, ino, err := dbfile.Hold(path)
 	if err != nil {
 		if os.IsNotExist(err) {
@@ -990,10 +1002,13 @@ func quiesce(path string) error {
 		return fmt.Errorf("%w: %w", errCheckoutReplaced, err)
 	}
 	var busy, logN, ckptN int
-	if err := conn.QueryRowContext(ctx, "PRAGMA wal_checkpoint(TRUNCATE)").Scan(&busy, &logN, &ckptN); err != nil {
+	if err := conn.QueryRowContext(ctx, "PRAGMA wal_checkpoint("+mode+")").Scan(&busy, &logN, &ckptN); err != nil {
 		return fmt.Errorf("ops: checkpoint: %w", err)
 	}
-	if busy != 0 {
+	// PASSIVE never reports busy: when a reader blocks the backfill it
+	// returns OK with fewer frames checkpointed than the log holds. Either
+	// signal means the checkout could not be fully folded.
+	if busy != 0 || ckptN < logN {
 		return errQuiesceBusy
 	}
 	return nil
@@ -1011,7 +1026,12 @@ func (w *Workspace) warnIfUncheckpointed(db, branch string, ref store.Ref, actio
 	if _, err := os.Stat(path); err != nil {
 		return
 	}
-	if err := quiesce(path); err != nil {
+	// PASSIVE: this is a probe for a warning, and must not stall a live
+	// session's writers (see quiesceWith). A checkout a capture engine
+	// holds open comes back "busy" at once (incomplete backfill); its
+	// state is the session's to report, and the daemon flushes before it
+	// forks.
+	if err := quiesceWith(path, "PASSIVE"); err != nil {
 		if errors.Is(err, errCheckoutReplaced) {
 			fmt.Fprintf(os.Stderr, "offshoot: warning: checkout of %s@%s changed while it was being checked; %s (txid %d)\n", db, branch, action, ref.HeadTXID)
 			return

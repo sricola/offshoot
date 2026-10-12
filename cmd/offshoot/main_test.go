@@ -599,12 +599,12 @@ func TestMCPDefaultTTLUnparseableIsRejected(t *testing.T) {
 }
 
 // TestMCPDefaultTTLDisableSpellings and TestMCPDefaultTTLDefaultsTo24h
-// exercise parseDefaultTTLFlag directly rather than driving `mcp` through
+// exercise parseDisableableDurationFlag directly rather than driving `mcp` through
 // run(): a valid -default-ttl (unlike the rejected cases above) falls
 // through to srv.Serve(context.Background()), which blocks reading
 // os.Stdin until EOF or cancellation — not a daemon lifecycle exactly, but
 // still not something a unit test should spin up just to observe a flag's
-// parsed value. parseDefaultTTLFlag is the actual code the "mcp" case
+// parsed value. parseDisableableDurationFlag is the actual code the "mcp" case
 // calls, so this covers the real behavior, not a proxy for it.
 
 // TestMCPDefaultTTLDisableSpellings pins that "0" and "none" both parse to
@@ -612,7 +612,7 @@ func TestMCPDefaultTTLUnparseableIsRejected(t *testing.T) {
 // convention reused here.
 func TestMCPDefaultTTLDisableSpellings(t *testing.T) {
 	for _, spelling := range []string{"0", "0s", "none"} {
-		got, rest, err := parseDefaultTTLFlag([]string{"-default-ttl", spelling})
+		got, rest, err := parseDisableableDurationFlag([]string{"-default-ttl", spelling}, "-default-ttl", "24h")
 		if err != nil {
 			t.Fatalf("-default-ttl %q: %v", spelling, err)
 		}
@@ -629,9 +629,9 @@ func TestMCPDefaultTTLDisableSpellings(t *testing.T) {
 // docs/reference.md, the `offshoot mcp` usage line): omitting -default-ttl
 // entirely applies 24h, not 0/disabled.
 func TestMCPDefaultTTLDefaultsTo24h(t *testing.T) {
-	got, rest, err := parseDefaultTTLFlag(nil)
+	got, rest, err := parseDisableableDurationFlag(nil, "-default-ttl", "24h")
 	if err != nil {
-		t.Fatalf("parseDefaultTTLFlag(nil): %v", err)
+		t.Fatalf("parseDisableableDurationFlag(nil, -default-ttl, 24h): %v", err)
 	}
 	if got != 24*time.Hour {
 		t.Errorf("default TTL with no -default-ttl flag = %v, want 24h", got)
@@ -677,11 +677,11 @@ func TestMCPReapEveryUnparseableIsRejected(t *testing.T) {
 }
 
 // TestMCPReapEveryDisableSpellings and TestMCPReapEveryDefaultsTo60s
-// exercise parseReapEveryFlag directly rather than driving `mcp` through
+// exercise parseDisableableDurationFlag directly rather than driving `mcp` through
 // run(), for the same reason TestMCPDefaultTTLDisableSpellings/
 // TestMCPDefaultTTLDefaultsTo24h do: a valid -reap-every falls through to
 // srv.Serve(ctx), which blocks reading os.Stdin until EOF or cancellation.
-// parseReapEveryFlag is the actual code the "mcp" case calls, so this
+// parseDisableableDurationFlag is the actual code the "mcp" case calls, so this
 // covers the real behavior, not a proxy for it.
 
 // TestMCPReapEveryDisableSpellings pins that "0", "0s", and "none" all
@@ -689,7 +689,7 @@ func TestMCPReapEveryUnparseableIsRejected(t *testing.T) {
 // (and parseTTLFlag's touch/CLI convention) own disable spellings.
 func TestMCPReapEveryDisableSpellings(t *testing.T) {
 	for _, spelling := range []string{"0", "0s", "none"} {
-		got, rest, err := parseReapEveryFlag([]string{"-reap-every", spelling})
+		got, rest, err := parseDisableableDurationFlag([]string{"-reap-every", spelling}, "-reap-every", "60s")
 		if err != nil {
 			t.Fatalf("-reap-every %q: %v", spelling, err)
 		}
@@ -706,9 +706,9 @@ func TestMCPReapEveryDisableSpellings(t *testing.T) {
 // mcp` usage line): omitting -reap-every entirely applies 60s, not
 // 0/disabled.
 func TestMCPReapEveryDefaultsTo60s(t *testing.T) {
-	got, rest, err := parseReapEveryFlag(nil)
+	got, rest, err := parseDisableableDurationFlag(nil, "-reap-every", "60s")
 	if err != nil {
-		t.Fatalf("parseReapEveryFlag(nil): %v", err)
+		t.Fatalf("parseDisableableDurationFlag(nil, -reap-every, 60s): %v", err)
 	}
 	if got != 60*time.Second {
 		t.Errorf("default reap interval with no -reap-every flag = %v, want 60s", got)

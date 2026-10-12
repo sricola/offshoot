@@ -10,6 +10,7 @@ import sys
 import tempfile
 import threading
 import time
+import types
 import unittest
 from pathlib import Path
 
@@ -94,6 +95,42 @@ class TestBranchesWireCompat(unittest.TestCase):
         )
         branches = client.branches("app")
         self.assertEqual(branches[0].state, "active")
+
+    def test_shared_is_passed_through_and_defaults_false(self):
+        client = self._client_with_response(
+            {
+                "ok": True,
+                "branches": [
+                    {"branch": "main", "head_txid": 1},
+                    {"branch": "exp", "head_txid": 1, "shared": True},
+                ],
+            }
+        )
+        branches = client.branches("app")
+        self.assertFalse(branches[0].shared)
+        self.assertTrue(branches[1].shared)
+
+
+class TestClientErrorsAreOffshootErrors(unittest.TestCase):
+    """Every failure the client can produce is an OffshootError, including
+    the two that used to escape: a socket nobody serves, and a line that is
+    valid JSON but not an object."""
+
+    def test_connect_to_a_missing_socket_is_an_offshoot_error(self):
+        path = os.path.join(tempfile.mkdtemp(), "no-daemon.sock")
+        with self.assertRaises(offshoot.OffshootError) as cm:
+            offshoot.Client(path)
+        self.assertIn(path, str(cm.exception))
+        self.assertIn("offshoot serve", str(cm.exception))
+        self.assertIsInstance(cm.exception.__cause__, OSError)
+
+    def test_non_object_json_response_is_an_offshoot_error(self):
+        client = offshoot.Client.__new__(offshoot.Client)
+        client._sock = types.SimpleNamespace(sendall=lambda data: None)
+        client._rfile = types.SimpleNamespace(readline=lambda: b"[1, 2]\n")
+        with self.assertRaises(offshoot.OffshootError) as cm:
+            client.dbs()
+        self.assertIn("malformed", str(cm.exception))
 
 
 class TestDaemonStatusWireCompat(unittest.TestCase):

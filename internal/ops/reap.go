@@ -65,7 +65,7 @@ func (w *Workspace) reapOne(db, branch string, now time.Time) (bool, error) {
 	if ref.TTL == "" || ref.Protected {
 		return false, nil
 	}
-	if liveDeleteClaim(ref, time.Now()) {
+	if liveDeleteClaim(ref, now) {
 		// A destroy has claimed the branch and may still be on its way to
 		// its delete: it removes the branch, or unwinds its claim and a
 		// later cycle re-evaluates. Any write now, a reaping claim or the

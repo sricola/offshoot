@@ -377,9 +377,12 @@ milliseconds don't):
   deciding `dirty` requires a WAL checkpoint plus a full SHA-256 of each
   checked-out, unleased branch's content on every call — there is no
   cheap short-circuit ([details](reference.md#branch-states)).
-- **The read-only checkout cache can serve stale content** in one narrow
-  case: a branch destroyed and recreated with a same-named checkpoint;
-  `--force` or deleting `checkouts-ro` clears it
+- **The read-only checkout cache is keyed by name, not content:** a
+  `checkout --at` hit never reads the store, so a cache entry copied in by
+  hand, or one left by a process killed mid-materialize, is served as-is;
+  `--force` or deleting `checkouts-ro` clears it. `destroy` removes a
+  branch's own entries, so the destroy-and-refork-under-the-same-name loop
+  is not affected
   ([details](reference.md#read-only-historical-checkout---at-checkpoint---read-only---force)).
 - **Daemon tuning flags are never persisted** — a restarted daemon needs
   its flags passed again, and an at-rest CLI fork can't learn a daemon's
@@ -394,13 +397,15 @@ milliseconds don't):
   ([one daemon per store](#one-daemon-per-store)); placement, failover,
   and routing are deliberately out of scope
   ([non-goals](../ROADMAP.md#non-goals-v1)).
-- **The local store's per-key lock is time-broken.** A local store
-  serializes writes to one key on a `.lock` file, and a lock older than
-  30 s is broken on the assumption its holder died; since v0.2.14 the lock
-  is held only around the compare and the rename (the object is streamed
-  to a temp file first), so a legitimate hold is milliseconds — but a
-  process paused for over 30 s inside that window can have its lock
-  broken.
+- **The local store's per-key lock is an `flock(2)` with a 5 s wait.** A
+  local store serializes writes to one key on a `.lock` file held by
+  flock, which the kernel releases when its holder dies, so a lock file
+  left behind by a crash costs nothing and must not be deleted by hand
+  (deleting one under a live holder is the one way to let two writers
+  into the same compare-and-swap). The lock is held only around the
+  compare and the rename (the object is streamed to a temp file first),
+  so a legitimate hold is milliseconds; a writer that cannot get it
+  within 5 s fails with `store: lock timeout` rather than waiting longer.
 - **On S3, an unforced `destroy` cannot see a lease renewed after its
   claim.** S3 has no conditional delete, so a holder whose lease had
   lapsed and that renews in the moment between the destroy's claim and
