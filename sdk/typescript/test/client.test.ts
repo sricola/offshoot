@@ -399,6 +399,62 @@ test("branches: state is passed through when present", async () => {
   assert.equal(branches[0].state, "active");
 });
 
+test("branches: shared is passed through, and false from an older daemon", async () => {
+  const client = Object.create(Client.prototype) as Client;
+  (client as unknown as { _call: Client["_call"] })._call = async () => ({
+    ok: true,
+    branches: [
+      { branch: "main", head_txid: 1 },
+      { branch: "exp", head_txid: 1, shared: true },
+    ],
+  });
+  const branches = await client.branches("app");
+  assert.equal(branches[0].shared, false);
+  assert.equal(branches[1].shared, true);
+});
+
+test("connect to a socket nobody serves rejects with OffshootError, naming the path", async () => {
+  const dir = mkdtempSync(join(tmpdir(), "offshoot-no-daemon-"));
+  const sockPath = join(dir, "absent.sock");
+  try {
+    await assert.rejects(connect(sockPath), (e: unknown) => {
+      assert.ok(e instanceof OffshootError, `want OffshootError, got ${String(e)}`);
+      assert.match(e.message, /daemon connection failed/);
+      assert.ok(e.message.includes(sockPath), e.message);
+      assert.match(e.message, /offshoot serve/);
+      assert.ok((e as { cause?: unknown }).cause instanceof Error, "cause is the underlying socket error");
+      return true;
+    });
+  } finally {
+    rmSync(dir, { recursive: true, force: true });
+  }
+});
+
+test("a valid-JSON non-object response line is a malformed-response OffshootError", async () => {
+  const dir = mkdtempSync(join(tmpdir(), "offshoot-fake-daemon-"));
+  const sockPath = join(dir, "d.sock");
+  const srv: Server = createServer((conn) => {
+    conn.setEncoding("utf8");
+    conn.once("data", () => conn.write("[1, 2]\n"));
+  });
+  await new Promise<void>((res) => srv.listen(sockPath, res));
+  try {
+    const c = await connect(sockPath);
+    try {
+      await assert.rejects(c.dbs(), (e: unknown) => {
+        assert.ok(e instanceof OffshootError, `want OffshootError, got ${String(e)}`);
+        assert.match(e.message, /malformed response/);
+        return true;
+      });
+    } finally {
+      await c.close();
+    }
+  } finally {
+    await new Promise<void>((res) => srv.close(() => res()));
+    rmSync(dir, { recursive: true, force: true });
+  }
+});
+
 test("rollback and promote send the materialize wire field", async () => {
   const client = Object.create(Client.prototype) as Client;
   const sent: Array<[string, Record<string, unknown>]> = [];

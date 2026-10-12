@@ -66,6 +66,10 @@ class Branch:
     taxonomy and precedence. Defaults to ``""`` against a pre-Milestone-4
     daemon that never sends this field at all (wire-additive: an old daemon
     still answers every other field exactly as before).
+
+    ``shared`` is True for a copy-on-write fork that still reads through its
+    parent's storage (``compact`` turns it self-contained); False for a
+    self-contained branch, and against a daemon older than the field.
     """
 
     branch: str
@@ -78,6 +82,7 @@ class Branch:
     touched_at: str = ""
     checkpoints_v2: list[CheckpointInfo] = field(default_factory=list)
     state: str = ""
+    shared: bool = False
 
 
 @dataclass
@@ -227,9 +232,14 @@ class Client:
         try:
             self._sock.connect(socket_path)
             self._rfile = self._sock.makefile("rb")
-        except OSError:
+        except OSError as e:
             self._sock.close()
-            raise
+            # One error type for every failure, including this one: a
+            # missing or refused socket means no daemon is serving there.
+            raise OffshootError(
+                f"daemon connection failed at {socket_path}: {e} "
+                "(is a daemon running? start one with `offshoot serve`)"
+            ) from e
 
     def __enter__(self) -> Client:
         return self
@@ -253,6 +263,10 @@ class Client:
             resp: dict[str, Any] = json.loads(line)
         except json.JSONDecodeError as e:
             raise OffshootError(f"daemon sent a malformed response: {e}") from e
+        if not isinstance(resp, dict):
+            raise OffshootError(
+                f"daemon sent a malformed response: expected an object, got {type(resp).__name__}"
+            )
         if not resp.get("ok", False):
             raise OffshootError(resp.get("error", "unknown daemon error"))
         return resp
@@ -438,6 +452,7 @@ class Client:
                     for cp in b.get("checkpoints_v2", [])
                 ],
                 state=b.get("state", ""),
+                shared=bool(b.get("shared", False)),
             )
             for b in resp.get("branches", [])
         ]

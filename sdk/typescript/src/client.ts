@@ -57,6 +57,10 @@ export interface Branch {
   touched_at: string;
   checkpoints_v2: CheckpointInfo[];
   state: string;
+  /** True for a copy-on-write fork that still reads through its parent's
+   * storage (`compact` turns it self-contained); false for a self-contained
+   * branch, and against a daemon older than the field. */
+  shared: boolean;
 }
 
 /** One event from the daemon's event stream — see {@link Client.events}.
@@ -96,6 +100,16 @@ export interface SessionInfo {
    * daemon older than the field; read that as `"open"`. */
   state?: string;
   durable_txid: number;
+  /** How long ago the durable head was written, as a Go duration string;
+   * absent before the first flush. */
+  durable_age?: string;
+  /** RFC 3339 time of the last successful flush; absent before the first. */
+  last_flush_at?: string;
+  /** The last flush's error, when the most recent attempt failed. */
+  flush_error?: string;
+  /** Bytes of WAL the capture engine has not yet applied. Absent from a
+   * daemon older than the field. */
+  capture_lag_bytes?: number;
   error?: string;
 }
 
@@ -288,7 +302,16 @@ export async function connect(socketPath: string): Promise<Client> {
       sock.off("error", rej);
       res();
     });
-    sock.once("error", rej);
+    // One error type for every failure, including this one: a missing or
+    // refused socket means no daemon is serving there.
+    sock.once("error", (e) =>
+      rej(
+        new OffshootError(
+          `daemon connection failed at ${socketPath}: ${e.message} (is a daemon running? start one with \`offshoot serve\`)`,
+          { cause: e },
+        ),
+      ),
+    );
   });
   return new Client(sock, socketPath);
 }
@@ -327,6 +350,7 @@ interface RawBranchInfo {
   touched_at?: string;
   checkpoints_v2?: RawCheckpointInfo[];
   state?: string;
+  shared?: boolean;
 }
 
 /** @internal Wire shape of one entry in Response.Sessions — structurally
@@ -343,6 +367,16 @@ interface RawSessionInfo {
    * daemon older than the field; read that as `"open"`. */
   state?: string;
   durable_txid: number;
+  /** How long ago the durable head was written, as a Go duration string;
+   * absent before the first flush. */
+  durable_age?: string;
+  /** RFC 3339 time of the last successful flush; absent before the first. */
+  last_flush_at?: string;
+  /** The last flush's error, when the most recent attempt failed. */
+  flush_error?: string;
+  /** Bytes of WAL the capture engine has not yet applied. Absent from a
+   * daemon older than the field. */
+  capture_lag_bytes?: number;
   error?: string;
 }
 
@@ -430,6 +464,10 @@ export class Client {
           resp = JSON.parse(line);
         } catch (e) {
           waiter.rej(new OffshootError(`daemon sent a malformed response: ${(e as Error).message}`));
+          continue;
+        }
+        if (typeof resp !== "object" || resp === null || Array.isArray(resp)) {
+          waiter.rej(new OffshootError("daemon sent a malformed response: expected an object"));
           continue;
         }
         if (!resp.ok) waiter.rej(new OffshootError(resp.error ?? "unknown daemon error"));
@@ -596,6 +634,7 @@ export class Client {
         created_at: cp.created_at ?? "",
       })),
       state: b.state ?? "",
+      shared: b.shared ?? false,
     }));
   }
 
