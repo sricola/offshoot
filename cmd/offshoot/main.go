@@ -105,7 +105,7 @@ Usage:
                                      whatever the ref holds and prints the
                                      holder it freed
   offshoot serve [-socket PATH] [-reap-every d] [-gc-grace d] [-flush-every d]
-                 [-snapshot-every N] [-ro-cache-budget BYTES] [-fd-budget N] [-http ADDR] [-token TOKEN] [-http-allow-non-loopback]
+                 [-snapshot-every N] [-ro-cache-budget BYTES] [-fd-budget N] [-http ADDR] [-token TOKEN] [-token-file PATH] [-http-allow-non-loopback]
                                              run the daemon until SIGINT/SIGTERM;
                                              -flush-every ships every open session's
                                              work on a cadence even if it's never
@@ -427,51 +427,26 @@ func parseForkTTLFlag(raw string) (time.Duration, error) {
 	return d, nil
 }
 
-// parseDefaultTTLFlag extracts mcp's -default-ttl flag from args and parses
-// it, defaulting to 24h when the flag is absent. It reuses parseTTLFlag, so
-// "none" and a literal zero duration ("0", "0s", ...) both disable the
-// default identically; a negative duration is rejected as a usage error
-// (mirroring -flush-every's own non-positive-is-a-mistake rule) rather than
-// silently aliased to "disabled". Returns the parsed default TTL and the
-// remaining (flag-stripped) args, so the caller can still reject leftover
-// arguments itself.
-func parseDefaultTTLFlag(args []string) (time.Duration, []string, error) {
-	raw, rest, _, err := extractFlag(args, "-default-ttl")
+// parseDisableableDurationFlag extracts mcp's -default-ttl or -reap-every
+// flag from args and parses it like a TTL (parseTTLFlag: a Go duration or
+// "none"), substituting def when the flag is absent. Zero and "none" both
+// disable the feature; a negative value is refused. The remaining
+// (flag-stripped) args are returned so the caller can still reject leftover
+// arguments itself. See StartReaper for what a disabled reaper means.
+func parseDisableableDurationFlag(args []string, name, def string) (time.Duration, []string, error) {
+	raw, rest, _, err := extractFlag(args, name)
 	if err != nil {
 		return 0, nil, err
 	}
 	if raw == "" {
-		raw = "24h"
+		raw = def
 	}
 	d, err := parseTTLFlag(raw)
 	if err != nil {
-		return 0, nil, fmt.Errorf("-default-ttl: %w", err)
+		return 0, nil, fmt.Errorf("%s: %w", name, err)
 	}
 	if d < 0 {
-		return 0, nil, fmt.Errorf("-default-ttl %q must be zero, \"none\" (both disable it), or positive", raw)
-	}
-	return d, rest, nil
-}
-
-// parseReapEveryFlag extracts mcp's -reap-every flag from args and parses
-// it, defaulting to 60s when the flag is absent. Parsed exactly like
-// parseDefaultTTLFlag (same parseTTLFlag reuse, same "none"-or-zero-both-
-// disable rule, same non-negative rule) — see StartReaper for what a
-// disabled reaper means (every <= 0 starts no goroutine at all).
-func parseReapEveryFlag(args []string) (time.Duration, []string, error) {
-	raw, rest, _, err := extractFlag(args, "-reap-every")
-	if err != nil {
-		return 0, nil, err
-	}
-	if raw == "" {
-		raw = "60s"
-	}
-	d, err := parseTTLFlag(raw)
-	if err != nil {
-		return 0, nil, fmt.Errorf("-reap-every: %w", err)
-	}
-	if d < 0 {
-		return 0, nil, fmt.Errorf("-reap-every %q must be zero, \"none\" (both disable it), or positive", raw)
+		return 0, nil, fmt.Errorf("%s %q must be zero, \"none\" (both disable it), or positive", name, raw)
 	}
 	return d, rest, nil
 }
@@ -593,6 +568,9 @@ func run(args []string) error {
 	}
 
 	if cmd == "init" {
+		if len(rest) != 0 {
+			return fmt.Errorf("usage: offshoot init")
+		}
 		_, err := ops.Init(spec)
 		if err == nil {
 			fmt.Println("initialized store at", spec)
@@ -674,22 +652,25 @@ func run(args []string) error {
 // cmdCreate implements `offshoot create`. w is the store run already opened;
 // rest is everything after the command word.
 func cmdCreate(w *ops.Workspace, rest []string) error {
-	switch {
-	case len(rest) == 1:
+	from, rest, given, err := extractFlag(rest, "--from")
+	if err != nil {
+		return err
+	}
+	if len(rest) != 1 {
+		return fmt.Errorf("usage: offshoot create <db> [--from file]")
+	}
+	if !given {
 		if err := w.Create(rest[0]); err != nil {
 			return err
 		}
 		fmt.Printf("created %s (branch main)\n", rest[0])
 		return nil
-	case len(rest) == 3 && rest[1] == "--from":
-		if err := w.CreateFrom(rest[0], rest[2]); err != nil {
-			return err
-		}
-		fmt.Printf("created %s (branch main, imported from %s)\n", rest[0], rest[2])
-		return nil
-	default:
-		return fmt.Errorf("usage: offshoot create <db> [--from file]")
 	}
+	if err := w.CreateFrom(rest[0], from); err != nil {
+		return err
+	}
+	fmt.Printf("created %s (branch main, imported from %s)\n", rest[0], from)
+	return nil
 }
 
 // cmdCheckpoint implements `offshoot checkpoint`. w is the store run already opened;
@@ -827,47 +808,64 @@ func cmdUnprotect(w *ops.Workspace, rest []string) error {
 	return nil
 }
 
+// repointFlags is the flag set rollback and promote share: both repoint a
+// branch at a new lineage and keep the old head as a TTL'd safety fork.
+type repointFlags struct {
+	force, noBackup, materialize bool
+	backupTTL                    time.Duration // 0: ops.DefaultPromoteBackupTTL
+}
+
+// extractRepointFlags pulls --force, --no-backup, --materialize and
+// --backup-ttl out of args in any position and spelling, returning what is
+// left for the command's own positional parsing.
+func extractRepointFlags(args []string) (repointFlags, []string, error) {
+	var rf repointFlags
+	rf.force, args = extractBoolFlag(args, "--force")
+	rf.noBackup, args = extractBoolFlag(args, "--no-backup")
+	rf.materialize, args = extractBoolFlag(args, "--materialize")
+	raw, args, given, err := extractFlag(args, "--backup-ttl")
+	if err != nil {
+		return rf, nil, err
+	}
+	if given {
+		d, err := parseDurationFlag("--backup-ttl", raw)
+		if err != nil {
+			return rf, nil, err
+		}
+		if d <= 0 {
+			return rf, nil, fmt.Errorf("--backup-ttl must be positive, got %q", raw)
+		}
+		rf.backupTTL = d
+	}
+	return rf, args, nil
+}
+
 // cmdRollback implements `offshoot rollback`. w is the store run already opened;
 // rest is everything after the command word.
 func cmdRollback(w *ops.Workspace, rest []string) error {
 	const usage = "usage: offshoot rollback <db>[@branch] --to <checkpoint> [--force] [--no-backup] [--backup-ttl DUR] [--materialize]"
-	var opts ops.RollbackOptions
-	fs := rest[:0]
-	for i := 0; i < len(rest); i++ {
-		switch a := rest[i]; a {
-		case "--force":
-			opts.Force = true
-		case "--no-backup":
-			opts.NoBackup = true
-		case "--materialize":
-			opts.Materialize = true
-		case "--backup-ttl":
-			if i+1 >= len(rest) {
-				return fmt.Errorf("%s", usage)
-			}
-			i++
-			d, err := time.ParseDuration(rest[i])
-			if err != nil || d <= 0 {
-				return fmt.Errorf("--backup-ttl must be a positive Go duration (e.g. 2h), got %q", rest[i])
-			}
-			opts.BackupTTL = d
-		default:
-			fs = append(fs, a)
-		}
+	rf, fs, err := extractRepointFlags(rest)
+	if err != nil {
+		return err
 	}
-	if len(fs) != 3 || fs[1] != "--to" {
+	to, fs, given, err := extractFlag(fs, "--to")
+	if err != nil {
+		return err
+	}
+	if !given || len(fs) != 1 {
 		return fmt.Errorf("%s", usage)
 	}
+	opts := ops.RollbackOptions{Force: rf.force, NoBackup: rf.noBackup, Materialize: rf.materialize, BackupTTL: rf.backupTTL}
 	db, branch, err := ops.ParseTarget(fs[0])
 	if err != nil {
 		return err
 	}
-	res, err := w.RollbackWith(db, branch, fs[2], opts)
+	res, err := w.RollbackWith(db, branch, to, opts)
 	if err != nil {
 		return err
 	}
 	fmt.Println(res.Path)
-	fmt.Printf("rolled back %s@%s to %q %s\n", db, branch, fs[2], storageMode(res.Shared))
+	fmt.Printf("rolled back %s@%s to %q %s\n", db, branch, to, storageMode(res.Shared))
 	if res.Backup != "" {
 		ttl := opts.BackupTTL
 		if ttl <= 0 {
@@ -879,7 +877,7 @@ func cmdRollback(w *ops.Workspace, rest []string) error {
 			// this rollback changed is the checkout itself. Say so rather
 			// than offering an undo that would restore nothing.
 			fmt.Printf("kept the previous %s@%s head as %s@%s (expires in %s) — it is the same committed state as %q; only un-checkpointed edits to the checkout were discarded\n",
-				db, branch, db, res.Backup, ttl, fs[2])
+				db, branch, db, res.Backup, ttl, to)
 		} else {
 			fmt.Printf("kept the previous %s@%s head as %s@%s (expires in %s; undo with: offshoot promote %s@%s --onto %s --force)\n",
 				db, branch, db, res.Backup, ttl, db, res.Backup, branch)
@@ -892,49 +890,34 @@ func cmdRollback(w *ops.Workspace, rest []string) error {
 // rest is everything after the command word.
 func cmdPromote(w *ops.Workspace, rest []string) error {
 	const usage = "usage: offshoot promote <db>@<source> --onto <target> [--force] [--no-backup] [--backup-ttl DUR] [--materialize]"
-	var opts ops.PromoteOptions
-	fs := rest[:0]
-	for i := 0; i < len(rest); i++ {
-		switch a := rest[i]; a {
-		case "--force":
-			opts.Force = true
-		case "--materialize":
-			opts.Materialize = true
-		case "--no-backup":
-			opts.NoBackup = true
-		case "--backup-ttl":
-			if i+1 >= len(rest) {
-				return fmt.Errorf("%s", usage)
-			}
-			i++
-			d, err := time.ParseDuration(rest[i])
-			if err != nil || d <= 0 {
-				return fmt.Errorf("--backup-ttl must be a positive Go duration (e.g. 2h), got %q", rest[i])
-			}
-			opts.BackupTTL = d
-		default:
-			fs = append(fs, a)
-		}
+	rf, fs, err := extractRepointFlags(rest)
+	if err != nil {
+		return err
 	}
-	if len(fs) != 3 || fs[1] != "--onto" {
+	onto, fs, given, err := extractFlag(fs, "--onto")
+	if err != nil {
+		return err
+	}
+	if !given || len(fs) != 1 {
 		return fmt.Errorf("%s", usage)
 	}
+	opts := ops.PromoteOptions{Force: rf.force, NoBackup: rf.noBackup, Materialize: rf.materialize, BackupTTL: rf.backupTTL}
 	db, srcBranch, err := ops.ParseTarget(fs[0])
 	if err != nil {
 		return err
 	}
-	res, err := w.PromoteWith(db, srcBranch, fs[2], opts)
+	res, err := w.PromoteWith(db, srcBranch, onto, opts)
 	if err != nil {
 		return err
 	}
-	fmt.Printf("promoted %s@%s -> %s@%s at txid %d %s\n", db, srcBranch, db, fs[2], res.TXID, storageMode(res.Shared))
+	fmt.Printf("promoted %s@%s -> %s@%s at txid %d %s\n", db, srcBranch, db, onto, res.TXID, storageMode(res.Shared))
 	if res.Backup != "" {
 		ttl := opts.BackupTTL
 		if ttl <= 0 {
 			ttl = ops.DefaultPromoteBackupTTL
 		}
 		fmt.Printf("kept the previous %s@%s head as %s@%s (expires in %s; undo with: offshoot promote %s@%s --onto %s --force)\n",
-			db, fs[2], db, res.Backup, ttl, db, res.Backup, fs[2])
+			db, onto, db, res.Backup, ttl, db, res.Backup, onto)
 	}
 	return nil
 }
@@ -1047,15 +1030,7 @@ func cmdDiff(w *ops.Workspace, rest []string) error {
 // cmdDestroy implements `offshoot destroy`. w is the store run already opened;
 // rest is everything after the command word.
 func cmdDestroy(w *ops.Workspace, rest []string) error {
-	force := false
-	fs := rest[:0]
-	for _, a := range rest {
-		if a == "--force" {
-			force = true
-			continue
-		}
-		fs = append(fs, a)
-	}
+	force, fs := extractBoolFlag(rest, "--force")
 	if len(fs) != 1 {
 		return fmt.Errorf("usage: offshoot destroy <db>[@branch] [--force]")
 	}
@@ -1074,12 +1049,17 @@ func cmdDestroy(w *ops.Workspace, rest []string) error {
 // rest is everything after the command word.
 func cmdGc(w *ops.Workspace, rest []string) error {
 	grace := time.Hour
-	if len(rest) == 2 && rest[0] == "--grace" {
-		d, err := parseDurationFlag("--grace", rest[1])
-		if err != nil {
+	raw, rest, given, err := extractFlag(rest, "--grace")
+	if err != nil {
+		return err
+	}
+	if given {
+		if grace, err = parseDurationFlag("--grace", raw); err != nil {
 			return err
 		}
-		grace = d
+	}
+	if len(rest) != 0 {
+		return fmt.Errorf("usage: offshoot gc [--grace DUR]")
 	}
 	// A reap failure on one branch (e.g. its checkout has an open
 	// connection, "database is busy") must not stop GC from running:
@@ -1203,15 +1183,15 @@ func cmdLease(w *ops.Workspace, rest []string) error {
 		}
 		return nil
 	case "acquire":
-		args := rest[1:]
 		ttl := ops.DefaultLeaseTTL
-		if len(args) == 3 && args[1] == "--ttl" {
-			d, err := time.ParseDuration(args[2])
-			if err != nil {
+		raw, args, given, err := extractFlag(rest[1:], "--ttl")
+		if err != nil {
+			return err
+		}
+		if given {
+			if ttl, err = parseDurationFlag("--ttl", raw); err != nil {
 				return err
 			}
-			ttl = d
-			args = args[:1]
 		}
 		if len(args) != 1 {
 			return fmt.Errorf("usage: offshoot lease acquire <db>[@branch] [--ttl 30s]")
@@ -1283,12 +1263,12 @@ func cmdMcp(w *ops.Workspace, spec string, rest []string) error {
 	if err != nil {
 		return fmt.Errorf("%s: %w", mcpUsage, err)
 	}
-	defaultTTL, rest, err := parseDefaultTTLFlag(rest)
+	defaultTTL, rest, err := parseDisableableDurationFlag(rest, "-default-ttl", "24h")
 	if err != nil {
 		return fmt.Errorf("%s: %w", mcpUsage, err)
 	}
 	allowForce, rest := extractBoolFlag(rest, "-allow-force")
-	reapEvery, rest, err := parseReapEveryFlag(rest)
+	reapEvery, rest, err := parseDisableableDurationFlag(rest, "-reap-every", "60s")
 	if err != nil {
 		return fmt.Errorf("%s: %w", mcpUsage, err)
 	}
