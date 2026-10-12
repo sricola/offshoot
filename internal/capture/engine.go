@@ -364,6 +364,16 @@ var lagRaceHook func()
 // every subsequent test's engine shutdown in the same test binary run.
 var ShutdownRaceHook func()
 
+// copySrcMidHook, when non-nil, runs halfway through rebase's snapshot copy;
+// shutdownPreHashHook runs in shutdown between checkpoint(TRUNCATE) and the
+// read lock that guards the clean-state hash. Both are test-only (nil in
+// production) and land a foreign write deterministically inside the window
+// each guards. Same restore-to-nil discipline as ShutdownRaceHook.
+var (
+	copySrcMidHook      func()
+	shutdownPreHashHook func()
+)
+
 // armDeadTailBaseline stats the WAL file's current on-disk size and records
 // it as e.deadTail — see e.deadTail's doc comment for why this must run at
 // exactly the same two points e.consumed resets to 0 for a fresh generation
@@ -928,6 +938,12 @@ func (e *Engine) afterDrain(ctx context.Context, idle *time.Time, n int) error {
 // airtight: Plan 2's LTX sink closes it structurally, by comparing
 // cumulative checksums at shutdown and resume rather than reasoning about a
 // gap between two separate checkpoint calls at all.
+//
+// The second, wider window — between checkpoint(TRUNCATE) and the content
+// hash, during which a foreign autocheckpoint could fold a landed write
+// into the file before it was fingerprinted — is closed below: the hash
+// runs under a read transaction begun on the empty WAL, after re-checking
+// that the WAL is still empty (see the comment at that site).
 // ============================================================================
 //
 // It uses a fresh, short-lived context rather than the engine's own ctx
@@ -1022,6 +1038,30 @@ func (e *Engine) shutdown() {
 	// checkpoint that folded everything we've captured into it. This is
 	// tryResume's condition (2) — see its doc comment for why WAL-emptiness
 	// alone isn't sufficient proof that nothing happened while we were down.
+	if shutdownPreHashHook != nil {
+		shutdownPreHashHook() // test hook; nil (a no-op) in production
+	}
+	// Freeze the main file before hashing it: a read transaction begun on
+	// the empty WAL holds READ_LOCK(0), so no checkpoint can backfill while
+	// the hash runs. Then re-check that the WAL is still physically empty —
+	// a commit that landed since TRUNCATE left frames there that the lock
+	// now keeps from being folded, and the hash would otherwise describe
+	// content the replica never saw (the next start would compare it to the
+	// main file, find it matching, and resume over the missing write).
+	// TestShutdownRefusesCleanStateWhenAWriteLandsBeforeTheHash pins this.
+	// Residual: a foreign TRUNCATE-mode checkpoint that both folds a write
+	// and empties the WAL in the gap before BEGIN below is not detectable
+	// from the WAL's size; that needs a foreign connection issuing an
+	// explicit wal_checkpoint(TRUNCATE) in that window.
+	if err := e.beginRead(sctx); err != nil {
+		return
+	}
+	defer e.endRead(sctx)
+	if fi, err := os.Stat(e.o.DBPath + "-wal"); err == nil && fi.Size() >= int64(wal.HeaderSize) {
+		return
+	} else if err != nil && !os.IsNotExist(err) {
+		return
+	}
 	hash, err := e.hashSrc()
 	if err != nil {
 		// Can't fingerprint ⇒ can't offer a safe resume point. Same
@@ -1577,39 +1617,32 @@ func (e *Engine) rebase(ctx context.Context) error {
 		// that can never converge.
 		return fmt.Errorf("rebase: checkpoint TRUNCATE: %w", err)
 	}
-	// Copy-window note: from here until copySrc below returns, no read lock
-	// is held — endRead() already ran above, and beginRead() doesn't run
-	// again until after the copy. A foreign writer can commit in that
-	// window, and a passive checkpoint (its own, or SQLite's automatic one)
-	// can fold those new frames into the main DB file while copySrc is
-	// mid-read, so the snapshot produced here may include bytes this
-	// session's WAL reader never saw pass through Apply.
+	// Hold a read transaction across the snapshot copy. Begun while the WAL
+	// is empty (TRUNCATE just emptied it) this takes shared READ_LOCK(0),
+	// which every checkpoint must hold exclusively to backfill frames into
+	// the main file, and a WAL restart (new salts) needs a full backfill
+	// first. So until endRead, the main file is frozen and every foreign
+	// commit stays in the WAL generation the fresh reader below binds to.
 	//
-	// This is convergent, not a correctness gap. Folded frames stay
-	// physically present in the WAL regardless of whether they made it into
-	// the copied snapshot — the fresh reader bound just below picks up the
-	// new generation from its start, and Sink.Apply re-applies those same
-	// frames as full-page images at their original page numbers. Writing
-	// the same bytes to the same pgno a second time heals any torn or
-	// half-copied page the race could have produced, rather than
-	// compounding it. See the Sink interface doc comment above for the
-	// consequence this has for a sink's Apply/Rebase overlap contract.
+	// This used to copy with no lock held, on the reasoning that frames a
+	// foreign checkpoint folded mid-copy "stay physically present in the
+	// WAL" and would be re-applied by the fresh reader. That is true only
+	// until the WAL restarts: a foreign commit T1 large enough to trip the
+	// agent connection's autocheckpoint was folded into the pages the copy
+	// had already passed, the next commit T2 restarted the WAL under new
+	// salts, and the fresh reader bound to T2's generation never saw T1.
+	// The replica then diverged silently — rebased=1, no error, lag
+	// reporting a phantom — and every later flush shipped a self-consistent
+	// snapshot of the wrong content. TestRebaseCopyHoldsReadLockAgainst-
+	// FoldedTransaction reproduces that sequence against the unlocked copy.
 	//
-	// One further wrinkle now that the copy reads through an io.SectionReader
-	// (see srcReader): the section's length is the file's size as of the
-	// moment the reader is obtained, so a foreign writer that GROWS the main
-	// file mid-copy — a checkpoint folding frames that extend the database —
-	// has its extra pages truncated out of the snapshot rather than
-	// half-copied into it. That is strictly the safer of the two outcomes and
-	// needs no extra handling for the same reason the torn-page case above
-	// needs none: every frame in the current WAL generation is re-applied on
-	// top of this snapshot by the fresh reader bound just below, so pages the
-	// snapshot is missing or has stale are written again at their original
-	// pgno. A short snapshot heals; it does not diverge.
-	if err := e.copySrc(e.snapshotPath()); err != nil {
+	// One wrinkle survives: the copy reads through an io.SectionReader
+	// (srcReader) whose length is the file's size when obtained. Under the
+	// lock nothing grows the file, so the section is exact.
+	if err := e.beginRead(ctx); err != nil {
 		return err
 	}
-	if err := e.beginRead(ctx); err != nil {
+	if err := e.copySrc(e.snapshotPath()); err != nil {
 		return err
 	}
 	if err := e.o.Sink.Rebase(e.snapshotPath()); err != nil {
@@ -1829,6 +1862,15 @@ func (e *Engine) copySrc(to string) error {
 	out, err := os.Create(to)
 	if err != nil {
 		return err
+	}
+	if copySrcMidHook != nil {
+		// Test-only: copy the first half, let the hook land a foreign
+		// write, then finish — the window a mid-copy fold would exploit.
+		if _, err := io.CopyN(out, r, r.Size()/2); err != nil {
+			out.Close()
+			return err
+		}
+		copySrcMidHook()
 	}
 	if _, err := io.Copy(out, r); err != nil {
 		out.Close()
