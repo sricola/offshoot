@@ -80,6 +80,11 @@ Pin an exact version if you depend on format stability. The full contract:
 
 ### Changed
 
+- `cmd/offshoot`: `rollback` and `promote` share one flag parser
+  (`extractRepointFlags`); `mcp`'s `-default-ttl` and `-reap-every` share
+  `parseDisableableDurationFlag` (two copies of the same function with
+  different defaults). `internal/ops`: `reapOne` uses the `now` it is
+  passed for the delete-claim check instead of a second clock read.
 - `cmd/offshoot`'s `run` is now a dispatch table: each of the twenty
   commands (`create` … `session`) is its own `cmd<Name>(w, rest)`
   function (plus `spec` for the three — `mcp`, `serve`, `session` — that
@@ -113,6 +118,145 @@ Pin an exact version if you depend on format stability. The full contract:
 
 ### Fixed
 
+- **A capture-engine rebase could silently lose a committed transaction.**
+  `rebase` copied the snapshot of the main file with no read transaction
+  held, on the reasoning that frames a foreign checkpoint folded mid-copy
+  "stay physically present in the WAL" and would be re-applied. That holds
+  only until the WAL restarts: a foreign commit T1 large enough to trip the
+  agent connection's autocheckpoint was folded into pages the copy had
+  already passed, the next commit T2 restarted the WAL under new salts, and
+  the fresh reader bound to T2's generation never saw T1. The replica
+  diverged with `rebased=1`, no error, a phantom lag, and every later flush
+  shipped a self-consistent snapshot of the wrong content; a clean close
+  then stamped the checkout's hash next to the replica's checksum, so the
+  next open resumed over it. `rebase` now begins the read transaction right
+  after `checkpoint(TRUNCATE)`: on the empty WAL that holds `READ_LOCK(0)`,
+  which every checkpoint needs exclusively to backfill and which a WAL
+  restart requires first. `internal/capture`'s
+  `TestRebaseCopyHoldsReadLockAgainstFoldedTransaction` reproduces the
+  sequence through a mid-copy hook (1200 of 1200 updated rows missing on
+  the unfixed engine) and pins the fix.
+- **Shutdown could record a clean-resume baseline over a write it never
+  captured.** `shutdown` hashed the main file after `checkpoint(TRUNCATE)`
+  with no lock held, so a commit whose autocheckpoint folded it in between
+  entered `State{Clean:true, MainHash}` without ever passing through the
+  replica; once the agent's last connection closed (SQLite checkpoints and
+  unlinks the WAL), the next start found a matching hash and resumed over
+  the missing rows. The hash now runs under a read transaction begun on the
+  empty WAL, after re-checking the WAL is still empty; a write that landed
+  leaves frames the lock keeps from being folded, and the clean save is
+  refused (`TestShutdownRefusesCleanStateWhenAWriteLandsBeforeTheHash`).
+  Residual, documented at the site: a foreign TRUNCATE-mode checkpoint that
+  both folds a write and empties the WAL in the gap before BEGIN.
+- **The local store's per-key lock could admit two writers, losing a ref
+  update silently.** `lock()` broke a stale lock file by path
+  (`Stat`, age > 30 s, `Remove`); two breakers racing the same stale file
+  could each remove the other's fresh lock and both enter `PutIf`'s
+  read-compare-rename with the same etag, after which both renames landed
+  and one update vanished with no error (invariant 2). The lock is now an
+  `flock(2)` on the lock file: a process that dies inside the critical
+  section releases it with its last descriptor, a leftover file is just a
+  file (no stale-age heuristic), release unlinks the file while still
+  holding the lock, and an acquirer re-checks that the inode it locked is
+  the one at the path. `TestLocalLockNeverAdmitsTwoHolders` (eight
+  contenders under a goroutine that keeps backdating the lock file's
+  mtime) saw three simultaneous holders on the old lock. A lock file left
+  by a dead process no longer costs anything (it used to block up to the
+  5 s deadline when younger than 30 s). The conformance suite's
+  concurrent-CAS test now also asserts every loser gets `store.ErrCAS`.
+- **Directory fsync failures were swallowed.** `fsutil.SyncDir` ignored
+  every error, so an EIO from the directory sync after a ref rename left
+  `PutIf` reporting success and the session reporting the txid durable
+  (invariant 8). It returns the error now, except the errnos that mean
+  "this filesystem does not fsync directories" (EINVAL, ENOTSUP,
+  EOPNOTSUPP, ENOTTY). The capture state file, `ltxio.Materialize` and
+  `fsutil.WriteFileAtomic` propagate it. The local store does not: its
+  writes promise (`WritesSettled`) that an error means nothing landed, and
+  callers such as `ops.Destroy`'s claim handling re-read on that promise,
+  so a directory-sync failure after a landed rename is reported on stderr
+  (naming the directory and that durability across power loss is not
+  assured) and the write still returns success.
+- **`checkout --at` and `diff` could serve a destroyed branch's state.**
+  The read-only checkout cache is keyed by (db, branch, checkpoint name)
+  and a hit never reads the store; `destroy` left the entries in place and
+  every fork's auto checkpoint is named `fork`, so the destroy-and-refork-
+  under-the-same-name loop (pytest fixtures, eval harnesses) read the dead
+  branch's fork point with no store access. `destroy` (and TTL reaping)
+  now removes `checkouts-ro/<db>/<branch>@*.db` with the ref;
+  `TestCheckoutAtAfterDestroyAndReforkServesTheNewBranch` pins the loop,
+  and the old test that asserted the stale hit is flipped. docs/limitations
+  and docs/reference no longer describe this as an accepted tradeoff.
+- **`offshoot gc --grace` was honoured only as exactly `--grace VALUE`.**
+  `--grace=2h`, `-grace 2h`, a bare `--grace` or a stray positional all
+  ran GC silently with the one-hour default and exit 0. gc, create
+  (`--from`), destroy (`--force`), rollback and promote (`--to`/`--onto`,
+  `--force`, `--no-backup`, `--materialize`, `--backup-ttl`), `lease
+  acquire --ttl` and `init` now parse through the shared flag helpers:
+  both dash spellings and `--x=value` work everywhere, leftovers are a
+  usage error, a flag without a value says so, and every duration error
+  reads `--flag "x": not a duration` instead of Go's wording
+  (`TestEveryCommandParsesFlagsInAnyFormAndRejectsLeftovers`).
+- **A second `offshoot serve` on a live daemon's socket took it over.**
+  `NewServer` unlinked whatever was at the path; a supervisor restarting
+  `serve` while the old process was still closing left the first daemon
+  running with sessions nobody could reach, and its eventual Shutdown
+  (`UnixListener.Close` unlinks its path) removed the second daemon's
+  socket too. `NewServer` now dials the path first and refuses one that
+  answers ("a daemon is already serving at …"); unlink-on-close is off,
+  and Shutdown removes the path only while it is still its own socket.
+- **A transient `accept(2)` error (EMFILE/ENFILE) exited the daemon.**
+  `Serve` returned the first non-closing error, so a connection burst
+  against the descriptor ceiling turned into a crash with every lease held
+  and every checkout un-stamped. It backs off and keeps serving now
+  (`TestServeSurvivesATransientAcceptError`).
+- **Shutdown closed sessions one after another, on one budget.**
+  `Session.Close` is slow in proportion to its checkout (the engine's
+  shutdown hashes it), so with a handful of large checkouts a 30 s SIGTERM
+  degraded into a timeout for the sessions that did not make the cut; and
+  a janitor GC pass still running at SIGTERM spent the whole budget before
+  any session was closed. Closes run concurrently, and the janitor wait
+  gets half the remaining budget, after which sessions close anyway and
+  the overrun is reported (`TestShutdownClosesSessionsConcurrently`).
+- **The daemon's 16 MiB request cap was per connection, not per
+  request.** Both SDKs keep one socket for the client's life, so a
+  long-lived harness's ~140k-th small request was answered with EOF. The
+  cap resets after every decoded request
+  (`TestSocketConnectionCapIsPerRequest`).
+- **`fork` and `promote` from a branch with a live daemon session stalled
+  the agent for 3 s.** The un-checkpointed-changes warning probed the
+  checkout with a TRUNCATE checkpoint, which busy-waited the full 3 s
+  quiesce timeout against the capture engine's read transaction while
+  holding the WAL writer lock, so the agent's commits froze for as long —
+  to print a warning on the daemon's stderr. The probe is PASSIVE now, which
+  never waits on readers; since PASSIVE also never reports busy, the probe
+  reads the checkpoint's frame counts and treats an incomplete backfill
+  as busy, so the warning stays "busy" rather than becoming a misleading
+  "stale, run checkout" (refreshes still use TRUNCATE).
+  `TestForkFromLiveSessionSeesLatestWrite` went from 3.3 s to 0.2 s and
+  now bounds the latency; `TestQuiesceWithPassiveReportsAReaderAsBusy`
+  pins the frame-count rule.
+- `Local.CopyObject` chmods its result to 0600: reflink's plain-copy
+  fallback (ext4) created 0644 objects where every other object is 0600.
+- `/metrics` answers 500 on a render failure instead of 200 with an empty
+  body; the branch is unreachable with a `bytes.Buffer`, but a scraper
+  must never read a silent empty scrape as success.
+- Python and TypeScript SDKs: `connect()`/`Client()` against a socket
+  nobody serves raises `OffshootError` (naming the path and `offshoot
+  serve`) with the OS error as its cause, instead of a bare
+  `FileNotFoundError`/`ENOENT`; a response line that is valid JSON but not
+  an object is a malformed-response `OffshootError` instead of an
+  `AttributeError`; `Branch` carries `shared` (the daemon already sent it);
+  the TypeScript `SessionInfo` type declares `durable_age`,
+  `last_flush_at`, `flush_error` and `capture_lag_bytes`, which arrived at
+  runtime but were invisible to the type checker.
+- Docs: `offshoot_diff` is read-only too (reference said `offshoot_list`
+  was the only one); `rollback --force` is CLI-only (the parity table said
+  full parity); the `serve` heading and `--help` line list `-token-file`;
+  the subscribe-connection comments state the real contract (any byte the
+  client sends after the ack ends the stream silently); architecture's
+  invariant 5 says what "live connection" means for the refresh probe (an
+  idle open connection is not detected); CONTRIBUTING shows `make
+  PYTHON=python3.12 …` for a platform whose `python3` is older than 3.10.
 - Release binaries were built with go1.26.0. `go.mod` declared `go
   1.26.0` with no `toolchain` line, and `actions/setup-go` honours that
   literally, so every `release.yml` build since the 1.26 move (the

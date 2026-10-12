@@ -367,7 +367,13 @@ or capture path must preserve:
    is never rewritten out from under itself; any repoint (rollback,
    promote, a foreign checkout) that would change what a path means
    produces a *new* materialization rather than mutating the old one in
-   place.
+   place. "Live" is what the refresh's busy probe can see: a connection
+   holding a transaction, or a daemon session's capture engine. A
+   connection that is merely open and idle at that instant is not
+   detected; the refresh renames a new file over the path and the idle
+   connection's later commits land in the orphaned inode. Close your
+   connections before `rollback`, `promote` or a `checkout` refresh (the
+   MCP tools say to reopen afterwards for this reason).
 6. **Checksums are verified on every read path that touches the store.**
    Materialization and compaction verify LTX per-file and cumulative
    checksums; a torn or missing chain member is a loud failure, never a

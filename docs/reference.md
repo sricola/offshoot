@@ -222,11 +222,12 @@ it leaves **two** entries behind — the `~by-chain` entry and the
 `<branch>@<checkpoint>.db` file cloned from it. Removing either, or the
 whole tree, costs only a rebuild on the next call. A repeat call for the same
 `db@branch@checkpoint` is a cache hit (returned as-is, no store access at
-all) unless `--force` is given, which re-materializes unconditionally — see
-[docs/status.md](status.md) for the exact staleness caveat this cache
-convenience accepts (a branch destroyed and recreated with a
-same-named checkpoint can leave a stale cache entry; `--force` or deleting
-the cache file clears it).
+all) unless `--force` is given, which re-materializes unconditionally. A
+checkpoint's content is immutable, so the hit is always current for a live
+branch; `destroy` (and TTL reaping, which destroys) removes the branch's
+cache entries, so a branch destroyed and re-forked under the same name is
+materialized afresh at its new fork point rather than served the dead
+branch's state.
 
 **Errors:** `--at` without `--read-only` or vice versa; no such checkpoint on
 `db@branch`.
@@ -1204,7 +1205,7 @@ with `--holder`, the current holder does not match `H` exactly, or there
 is no lease (`nothing released`, nothing written); `--holder` with no
 value or an empty one.
 
-## `offshoot serve [-socket PATH] [-reap-every DURATION] [-gc-grace DURATION] [-flush-every DURATION] [-snapshot-every N] [-ro-cache-budget BYTES] [-fd-budget N] [-http ADDR] [-token TOKEN] [-http-allow-non-loopback]`
+## `offshoot serve [-socket PATH] [-reap-every DURATION] [-gc-grace DURATION] [-flush-every DURATION] [-snapshot-every N] [-ro-cache-budget BYTES] [-fd-budget N] [-http ADDR] [-token TOKEN] [-token-file PATH] [-http-allow-non-loopback]`
 
 ```
 offshoot serve
@@ -1706,7 +1707,7 @@ this process's descriptors on checkouts that were renamed over or removed
 **Annotations.** Every tool's `tools/list` entry carries an explicit
 `annotations` object — `readOnlyHint`, `destructiveHint`, `idempotentHint`,
 and `openWorldHint` (always `false`: every tool acts only on its own
-store). `offshoot_list` is the only read-only tool; `offshoot_checkout`,
+store). `offshoot_list` and `offshoot_diff` are the read-only tools; `offshoot_checkout`,
 `offshoot_fork`, `offshoot_checkpoint`, and `offshoot_touch` are
 non-destructive; `offshoot_rollback`, `offshoot_promote`, and
 `offshoot_destroy` are destructive, so a host that honors
@@ -2055,7 +2056,7 @@ Which operations exist on which surface today — verified against
 
 | Operation | CLI | Daemon op | Python/TS SDK | Notes |
 |---|---|---|---|---|
-| create / checkout / fork / destroy / rollback / promote / compact / touch / branches / dbs | yes | yes | yes | Full parity. `compact` through the daemon refuses while a session is open on the branch (see above). `rollback`/`promote`'s safety-fork backup (`--no-backup`/`--backup-ttl` on the CLI, `no_backup`/`backup_ttl` request fields and a `backup` response field on the daemon op, `backup`/`backup_ttl` kwargs on both SDKs) is full parity too, and so is their `--materialize` (`materialize` request field and `shared` response field on the daemon op; Python `materialize=False`, TypeScript `materialize?: boolean`). |
+| create / checkout / fork / destroy / rollback / promote / compact / touch / branches / dbs | yes | yes | yes | Full parity, with one exception: `rollback --force` (override a protected branch) is CLI-only; the daemon op and both SDKs' `rollback` have no `force`. `compact` through the daemon refuses while a session is open on the branch (see above). `rollback`/`promote`'s safety-fork backup (`--no-backup`/`--backup-ttl` on the CLI, `no_backup`/`backup_ttl` request fields and a `backup` response field on the daemon op, `backup`/`backup_ttl` kwargs on both SDKs) is full parity too, and so is their `--materialize` (`materialize` request field and `shared` response field on the daemon op; Python `materialize=False`, TypeScript `materialize?: boolean`). |
 | `protect` / `unprotect` | yes | no | no | **CLI-only, by design.** No daemon op or MCP tool sets the `protected` flag — only `offshoot_list`/the daemon's `branches` op reads it. Keeping the write side off every remote-callable surface means an agent (MCP) or a network client (daemon/HTTP) can observe protection but never grant or revoke it. |
 | open / flush / status / close (sessions) | `session ...` | yes | yes | SDK `flush(name, meta=...)` can attach checkpoint metadata; the CLI `session flush` subcommand has no `--meta` flag. The SDKs' `Session.close()` sends the `session_id` its `open` returned, so it closes only that session; the CLI `session close` sends none and closes whatever session is open on the branch. |
 | export / historical read-only checkout | yes | yes (`export`, `checkout-at`) | yes | No CLI `session` subcommand — the CLI's `export`/`checkout --at --read-only` are the at-rest equivalents (see the section above); `export` is unix-socket-only over the daemon. |
