@@ -6,6 +6,7 @@ import (
 	"errors"
 	"fmt"
 	"os"
+	"path/filepath"
 	"sort"
 	"strings"
 	"time"
@@ -151,6 +152,21 @@ func (w *Workspace) Destroy(db, branch string, force bool) error {
 	// The removed checkout's cached descriptor would otherwise keep the
 	// deleted database's disk until the process exits.
 	reclaimStranded(path)
+	// The read-only checkout cache is keyed by (db, branch, checkpoint
+	// name) and served on a bare Stat with no ref read. Every fork names
+	// its auto checkpoint "fork", so a branch destroyed and re-forked under
+	// the same name — the fixture-per-test loop — would be served the dead
+	// branch's state at that name. Drop this branch's entries with the ref.
+	// The by-chain area is content-addressed and stays correct.
+	if matches, _ := filepath.Glob(filepath.Join(w.roCacheRoot(), db, branch+"@*.db")); len(matches) > 0 {
+		for _, p := range matches {
+			for _, f := range []string{p, p + lastUsedSuffix} {
+				if err := os.Remove(f); err != nil && !os.IsNotExist(err) {
+					fmt.Fprintf(os.Stderr, "offshoot: destroy %s@%s: remove read-only checkout %s: %v\n", db, branch, f, err)
+				}
+			}
+		}
+	}
 	return nil
 }
 

@@ -961,9 +961,17 @@ func TestForkFromLiveSessionSeesLatestWrite(t *testing.T) {
 
 	// No flush here: the point is that opFork's flush-then-fork step, not an
 	// explicit flush from the caller, is what carries this write forward.
+	// The bound is the regression guard: fork's un-checkpointed-changes
+	// probe used to run a TRUNCATE checkpoint against the engine's read
+	// transaction, which busy-waited the full 3 s quiesce timeout and
+	// held the WAL writer lock the whole time.
+	start := time.Now()
 	fork := call(t, sock, Request{Op: "fork", DB: "app", Branch: "main", Name: "child"})
 	if !fork.OK {
 		t.Fatalf("fork from a live, unflushed session = %+v", fork)
+	}
+	if took := time.Since(start); took > 1500*time.Millisecond {
+		t.Fatalf("fork from a live session took %v: the checkout probe is stalling on the engine's read lock", took)
 	}
 
 	co := call(t, sock, Request{Op: "checkout", DB: "app", Branch: "child"})

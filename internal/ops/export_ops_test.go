@@ -367,11 +367,12 @@ func TestCheckoutAtErrorsOnMissingCheckpoint(t *testing.T) {
 	}
 }
 
-// TestCheckoutAtWithoutForceIsACacheHitWithNoStoreAccess proves the
+// TestCheckoutAtWithoutForceIsACacheHitUntilTheBranchIsDestroyed proves the
 // documented "cheap idempotence": once a ro-cache file exists, a repeat
-// call with force=false returns it without touching the store at all — even
-// once the underlying branch has been destroyed entirely.
-func TestCheckoutAtWithoutForceIsACacheHitWithNoStoreAccess(t *testing.T) {
+// call with force=false returns it without touching the store — and that
+// Destroy drops the branch's entries, so a destroyed branch is not served
+// from the cache (the store is consulted and reports the branch gone).
+func TestCheckoutAtWithoutForceIsACacheHitUntilTheBranchIsDestroyed(t *testing.T) {
 	testutil.RequireSQLite3(t)
 	w := newWS(t)
 	if err := w.Create("app"); err != nil {
@@ -386,18 +387,76 @@ func TestCheckoutAtWithoutForceIsACacheHitWithNoStoreAccess(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
+	second, err := w.CheckoutAt("app", "main", "v1", false)
+	if err != nil || second != first {
+		t.Fatalf("repeat call = %q, %v; want the cached %q", second, err, first)
+	}
 
-	// Destroy the branch entirely — a store-touching call would now fail.
 	if err := w.Destroy("app", "main", true); err != nil {
 		t.Fatal(err)
 	}
-
-	second, err := w.CheckoutAt("app", "main", "v1", false)
-	if err != nil {
-		t.Fatalf("cache hit must not touch the (now-gone) store: %v", err)
+	if _, err := os.Stat(first); !os.IsNotExist(err) {
+		t.Fatalf("destroy left the read-only cache entry %s (stat err %v)", first, err)
 	}
-	if second != first {
-		t.Fatalf("cache hit path = %q, want %q", second, first)
+	if _, err := w.CheckoutAt("app", "main", "v1", false); err == nil {
+		t.Fatal("checkout --at of a destroyed branch was served from the cache")
+	}
+}
+
+// TestCheckoutAtAfterDestroyAndReforkServesTheNewBranch is the headline
+// workload: fork, read the fork point, destroy, fork again under the same
+// name from a later head, read the fork point again. Every fork's auto
+// checkpoint is named "fork", so before Destroy purged the cache the second
+// read returned the dead branch's state with no store access at all.
+func TestCheckoutAtAfterDestroyAndReforkServesTheNewBranch(t *testing.T) {
+	testutil.RequireSQLite3(t)
+	w := newWS(t)
+	if err := w.Create("app"); err != nil {
+		t.Fatal(err)
+	}
+	path, _ := w.Checkout("app", "main")
+	if out, err := exec.Command("sqlite3", path, "CREATE TABLE t (v); INSERT INTO t VALUES (1);").CombinedOutput(); err != nil {
+		t.Fatalf("sqlite3: %v: %s", err, out)
+	}
+	if _, err := w.Checkpoint("app", "main", "v1", nil); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := w.Fork("app", "main", "exp", "", 0, nil); err != nil {
+		t.Fatal(err)
+	}
+	ro, err := w.CheckoutAt("app", "exp", "fork", false)
+	if err != nil {
+		t.Fatal(err)
+	}
+	rows := func(p string) string {
+		out, err := exec.Command("sqlite3", p, "SELECT count(*) FROM t;").CombinedOutput()
+		if err != nil {
+			t.Fatalf("sqlite3 %s: %v: %s", p, err, out)
+		}
+		return strings.TrimSpace(string(out))
+	}
+	if got := rows(ro); got != "1" {
+		t.Fatalf("first fork point has %s rows, want 1", got)
+	}
+
+	if err := w.Destroy("app", "exp", true); err != nil {
+		t.Fatal(err)
+	}
+	if out, err := exec.Command("sqlite3", path, "INSERT INTO t VALUES (2);").CombinedOutput(); err != nil {
+		t.Fatalf("sqlite3: %v: %s", err, out)
+	}
+	if _, err := w.Checkpoint("app", "main", "v2", nil); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := w.Fork("app", "main", "exp", "", 0, nil); err != nil {
+		t.Fatal(err)
+	}
+	ro2, err := w.CheckoutAt("app", "exp", "fork", false)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got := rows(ro2); got != "2" {
+		t.Fatalf("re-forked exp@fork served %s rows (the destroyed branch's state), want 2", got)
 	}
 }
 

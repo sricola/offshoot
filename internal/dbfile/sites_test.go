@@ -40,7 +40,7 @@ type siteKey struct{ dir, fn string }
 // scope their eviction to their own directory (dbfile.EvictUnder).
 var sqliteSites = map[siteKey]siteClass{
 	{"internal/capture", "Engine.Run"}:       pinned,
-	{"internal/ops", "quiesce"}:              pinned,
+	{"internal/ops", "quiesceWith"}:          pinned,
 	{"internal/ops", "vacuumImportSource"}:   pinned,
 	{"cmd/branchbench", "runner.stepSQL"}:    pinned,
 	{"cmd/branchbench", "sumOrderLines"}:     pinned,
