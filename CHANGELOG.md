@@ -17,6 +17,25 @@ Pin an exact version if you depend on format stability. The full contract:
 
 ## [Unreleased]
 
+Nothing yet.
+
+## [0.2.20] - 2026-10-12
+
+Two windows in which the capture engine could silently lose a committed
+transaction are closed: the rebase snapshot copy and the shutdown
+clean-resume hash both run under the read lock now, so a foreign
+checkpoint can neither fold a write past the copy nor into the hash
+baseline. The local store's per-key lock is an flock, so a crash can no
+longer let two writers into one compare-and-swap; destroy removes the
+branch's read-only cache entries; the daemon refuses a socket a live
+daemon serves, survives a descriptor-ceiling accept error, closes
+sessions concurrently and caps requests per request rather than per
+connection; forking from a live session no longer stalls the agent.
+Release binaries are built with the toolchain go.mod pins (go1.27.2):
+v0.2.19 and earlier shipped on go1.26.0, which carries 29 reachable
+standard-library fixes. Also new: a nightly govulncheck job, a ruff gate
+for every Python file, and cmd/bench-ab with the nightly perf-ab leg.
+
 ### Added
 
 - `cmd/bench-ab`, a tool that builds `cmd/branchbench` from a git ref
