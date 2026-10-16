@@ -40,6 +40,11 @@ func FuzzValidateName(f *testing.F) {
 		if name == "." || name == ".." || strings.Contains(name, "..") || strings.ContainsAny(name, "/\\~\x00") {
 			t.Fatalf("accepted unsafe name %q", name)
 		}
+		// The local backend's lock and temp file shapes (hidden by its
+		// List, unlinked by its lock release) are never a valid name.
+		if strings.HasSuffix(name, ".lock") || strings.Contains(name, ".tmp-") {
+			t.Fatalf("accepted name %q shaped like a local lock/temp file", name)
+		}
 		for i := 0; i < len(name); i++ {
 			c := name[i]
 			if !(c >= 'a' && c <= 'z' || c >= '0' && c <= '9' || c == '-' || c == '_' || c == '.') {
