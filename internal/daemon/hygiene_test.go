@@ -14,6 +14,7 @@ import (
 	"time"
 
 	"github.com/sricola/offshoot/internal/session"
+	"github.com/sricola/offshoot/internal/store"
 )
 
 // TestNewServerRefusesASocketALiveDaemonServes: a second `serve` on a path
@@ -194,5 +195,85 @@ func TestSocketConnectionCapIsPerRequest(t *testing.T) {
 		if !r.OK {
 			t.Fatalf("request %d: %+v", i, r)
 		}
+	}
+}
+
+// gateListBackend blocks every List("refs/") — the janitor's reap starts
+// with ListRefs — until release is closed, so a janitor pass can be held
+// mid-flight deterministically.
+type gateListBackend struct {
+	store.Backend
+	entered chan struct{}
+	release chan struct{}
+	once    sync.Once
+}
+
+func (b *gateListBackend) List(prefix string) ([]string, error) {
+	if prefix == "refs/" {
+		b.once.Do(func() { close(b.entered) })
+		<-b.release
+	}
+	return b.Backend.List(prefix)
+}
+
+// TestShutdownOpBoundsTheJanitorWait pins docs/status.md ("serve exits
+// after the shutdown op only once Shutdown has returned … with an error
+// if a janitor pass was still running after half the shutdown budget;
+// sessions are closed regardless"). A shutdown started by the `shutdown`
+// op used to run with no deadline, so a janitor pass that never returned
+// held every session open and every lease until the process was killed.
+// With the budget applied, the open session's lease is released while the
+// pass is still blocked. Verified against the pre-fix code (lease still
+// held after the budget elapsed).
+func TestShutdownOpBoundsTheJanitorWait(t *testing.T) {
+	prev := ShutdownBudget
+	ShutdownBudget = 2 * time.Second
+	t.Cleanup(func() { ShutdownBudget = prev })
+
+	srv, w := newServer(t)
+	gate := &gateListBackend{Backend: w.Store.B, entered: make(chan struct{}), release: make(chan struct{})}
+	w.Store.B = gate
+	// Let the blocked pass finish before the temp store is removed (it
+	// would otherwise write into a directory being deleted); registered
+	// after newServer's TempDir, so it runs first.
+	var released sync.Once
+	t.Cleanup(func() {
+		released.Do(func() { close(gate.release) })
+		srv.janitorWG.Wait()
+	})
+	sock := srv.SocketPath()
+	if r := call(t, sock, Request{Op: "open", DB: "app", Branch: "main"}); !r.OK {
+		t.Fatalf("open: %+v", r)
+	}
+	srv.StartJanitor(10*time.Millisecond, 0)
+	select {
+	case <-gate.entered:
+	case <-time.After(5 * time.Second):
+		t.Fatal("the janitor never reached its reap listing")
+	}
+	if r := call(t, sock, Request{Op: "shutdown"}); !r.OK {
+		t.Fatalf("shutdown: %+v", r)
+	}
+	// Half the budget is the janitor's; the session close must land inside
+	// the other half (plus slack for a loaded runner), not merely before
+	// the whole budget lapses.
+	deadline := time.Now().Add(ShutdownBudget/2 + 1500*time.Millisecond)
+	for {
+		ref, _, err := w.Store.GetRef("app", "main")
+		if err != nil {
+			t.Fatal(err)
+		}
+		if ref.LeaseHolder == "" {
+			break
+		}
+		if time.Now().After(deadline) {
+			t.Fatalf("app@main still leased by %q %s after the shutdown op while a janitor pass blocks; the budget never applied", ref.LeaseHolder, ShutdownBudget)
+		}
+		time.Sleep(20 * time.Millisecond)
+	}
+	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	defer cancel()
+	if err := srv.WaitShutdown(ctx); err == nil || !strings.Contains(err.Error(), "janitor pass still running") {
+		t.Fatalf("WaitShutdown = %v, want the janitor half-budget error", err)
 	}
 }
