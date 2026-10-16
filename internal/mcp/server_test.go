@@ -761,3 +761,46 @@ func TestModernPingWithUnsupportedVersionErrors(t *testing.T) {
 		t.Errorf("data.requested = %v", data["requested"])
 	}
 }
+
+// structuredFakeTools answers every call with StructuredResult, so the
+// envelope tests below can see whether structuredContent survives each
+// era's result wrapping.
+type structuredFakeTools struct{ fakeTools }
+
+func (f *structuredFakeTools) Call(ctx context.Context, name string, args json.RawMessage) (ToolResult, error) {
+	f.called = name
+	return StructuredResult(map[string]any{"txid": 7, "branch": "kid"}, "called %s", name), nil
+}
+
+// TestModernToolsCallCarriesStructuredContent pins docs/reference.md
+// "offshoot mcp" (structuredContent): "Every successful tool result
+// returns structuredContent … alongside the human-readable content". The
+// 2026-07-28 era wraps tools/call results in its own envelope; that
+// envelope must carry the field too, not only the legacy ToolResult.
+// Verified against the pre-fix code, whose modern envelope dropped it.
+func TestModernToolsCallCarriesStructuredContent(t *testing.T) {
+	for _, c := range []struct {
+		era, req string
+	}{
+		{"legacy", `{"jsonrpc":"2.0","id":1,"method":"tools/call","params":{"name":"ping_tool","arguments":{}}}`},
+		{"modern", `{"jsonrpc":"2.0","id":1,"method":"tools/call","params":{"name":"ping_tool","arguments":{},"_meta":{"io.modelcontextprotocol/protocolVersion":"2026-07-28","io.modelcontextprotocol/clientCapabilities":{}}}}`},
+	} {
+		var out bytes.Buffer
+		s := NewServer(strings.NewReader(c.req+"\n"), &out, &structuredFakeTools{})
+		if err := s.Serve(context.Background()); err != nil {
+			t.Fatalf("%s: Serve: %v", c.era, err)
+		}
+		var resp map[string]any
+		if err := json.Unmarshal(bytes.TrimSpace(out.Bytes()), &resp); err != nil {
+			t.Fatalf("%s: %v: %s", c.era, err, out.String())
+		}
+		res, _ := resp["result"].(map[string]any)
+		sc, ok := res["structuredContent"].(map[string]any)
+		if !ok {
+			t.Fatalf("%s tools/call result lacks structuredContent: %v", c.era, res)
+		}
+		if sc["txid"] != float64(7) || sc["branch"] != "kid" {
+			t.Fatalf("%s structuredContent = %v, want txid 7, branch kid", c.era, sc)
+		}
+	}
+}

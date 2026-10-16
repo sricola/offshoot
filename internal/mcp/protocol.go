@@ -296,10 +296,11 @@ type toolCallParams struct {
 // and tools/call's result never opted in. resultType alone is what every
 // modern result carries.
 type modernToolCallResult struct {
-	ResultType string       `json:"resultType"`
-	Content    []Content    `json:"content"`
-	IsError    bool         `json:"isError,omitempty"`
-	Meta       responseMeta `json:"_meta"`
+	ResultType        string       `json:"resultType"`
+	Content           []Content    `json:"content"`
+	IsError           bool         `json:"isError,omitempty"`
+	StructuredContent any          `json:"structuredContent,omitempty"`
+	Meta              responseMeta `json:"_meta"`
 }
 
 // modernPingResult is the result of a ping request made under the modern

@@ -3,7 +3,6 @@ package mcp
 import (
 	"context"
 	"os"
-	"os/exec"
 	"path/filepath"
 	"strconv"
 	"strings"
@@ -91,7 +90,7 @@ func openSession(t *testing.T, sock, db, branch string) string {
 // failing the test with the command's combined output on error.
 func sqliteExec(t *testing.T, path, sql string) {
 	t.Helper()
-	if out, err := exec.Command("sqlite3", path, sql).CombinedOutput(); err != nil {
+	if out, err := testutil.SQLite3CLI(path, sql).CombinedOutput(); err != nil {
 		t.Fatalf("%v: %s", err, out)
 	}
 }
@@ -101,7 +100,7 @@ func sqliteExec(t *testing.T, path, sql string) {
 // the command's combined output on error.
 func sqliteCount(t *testing.T, path, query string) int {
 	t.Helper()
-	out, err := exec.Command("sqlite3", path, query).CombinedOutput()
+	out, err := testutil.SQLite3CLI(path, query).CombinedOutput()
 	if err != nil {
 		t.Fatalf("%v: %s", err, out)
 	}
