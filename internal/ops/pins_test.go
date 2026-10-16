@@ -4,7 +4,6 @@ import (
 	"database/sql"
 	"errors"
 	"os"
-	"os/exec"
 	"path/filepath"
 	"strings"
 	"sync"
@@ -13,6 +12,20 @@ import (
 	"github.com/sricola/offshoot/internal/dbfile"
 	"github.com/sricola/offshoot/internal/testutil"
 )
+
+// newRollbackJournalFile is newWALFile for a source that must never have a
+// -wal (see TestCreateFromHoldsItsImportSource).
+func newRollbackJournalFile(t *testing.T, path string) {
+	t.Helper()
+	db, err := sql.Open("sqlite3", path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer db.Close()
+	if _, err := db.Exec("CREATE TABLE IF NOT EXISTS t (v)"); err != nil {
+		t.Fatal(err)
+	}
+}
 
 func newWALFile(t *testing.T, path string) {
 	t.Helper()
@@ -473,10 +486,14 @@ func TestQuiesceBusyErrorsSayRetryOnlyBeforeACommit(t *testing.T) {
 // TestCreateFromHoldsItsImportSource: the daemon's create op imports any
 // absolute path, including a checkout of this same daemon, so the source
 // read is pinned like any checkout open, for the connection's whole life.
+// The source is a rollback-journal file: the import opens its source
+// read-only, so a WAL-mode source keeps its -wal across the import by
+// design (TestCreateFromLeavesAWALModeSourceByteIdentical), which
+// watchHeldOpen's closed-connection probe would misread as a live one.
 func TestCreateFromHoldsItsImportSource(t *testing.T) {
 	w := newWS(t)
 	src := filepath.Join(t.TempDir(), "import.db")
-	newWALFile(t, src)
+	newRollbackJournalFile(t, src)
 	seen := watchHeldOpen(t, src)
 	if err := w.CreateFrom("imp", src); err != nil {
 		t.Fatal(err)
@@ -529,7 +546,7 @@ func strandedUnder(t *testing.T, root string) []dbfile.EntryInfo {
 
 func dirtyCheckout(t *testing.T, path string) {
 	t.Helper()
-	if out, err := exec.Command("sqlite3", path,
+	if out, err := testutil.SQLite3CLI(path,
 		"CREATE TABLE IF NOT EXISTS t (v); INSERT INTO t VALUES (1);").CombinedOutput(); err != nil {
 		t.Fatalf("%v: %s", err, out)
 	}

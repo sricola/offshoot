@@ -15,6 +15,7 @@ import (
 	"encoding/hex"
 	"errors"
 	"fmt"
+	"io"
 	"net/url"
 	"os"
 	"path/filepath"
@@ -342,6 +343,18 @@ func (w *Workspace) Create(db string) error {
 }
 
 func (w *Workspace) createFromQuiesced(db, quiescedPath string) error {
+	// Refuse an existing database before uploading a whole snapshot the
+	// ref CAS below would then orphan (reclaimable only by gc). "Exists"
+	// means any ref under the database — a database whose main was
+	// destroyed but whose other branches survive still exists, and a
+	// fresh main minted inside it would be a second, unrelated lineage
+	// under the same name. The CAS on main stays the guard that counts;
+	// this is the cheap pre-check.
+	if keys, err := w.Store.B.List(store.RefKey(db, "")); err != nil {
+		return fmt.Errorf("ops: create %s: %w", db, err)
+	} else if len(keys) > 0 {
+		return fmt.Errorf("ops: database %q already exists (offshoot status lists databases)", db)
+	}
 	lineage, err := w.snapshotTo(quiescedPath, 1)
 	if err != nil {
 		return err
@@ -413,12 +426,19 @@ func (w *Workspace) CreateFrom(db, srcPath string) error {
 // client names, which can be a checkout this same process caches and has a
 // capture engine on.
 func vacuumImportSource(srcPath, dst string) error {
+	if hot, err := hotRollbackJournal(srcPath); err != nil {
+		return fmt.Errorf("ops: import %s: %w", srcPath, err)
+	} else if hot {
+		// A read-only open cannot roll a hot journal back, and a read-write
+		// one would — modifying the source, which the import never does.
+		return fmt.Errorf("ops: import %s: the source has a hot rollback journal (%s-journal) from an interrupted write; recover it first by opening the database once with sqlite3 (which rolls the journal back), then import", srcPath, srcPath)
+	}
 	release, ino, err := dbfile.Hold(srcPath)
 	if err != nil {
 		return fmt.Errorf("ops: import %s: %w", srcPath, err)
 	}
 	defer release()
-	src, err := sql.Open("sqlite3", dbfile.NoCreateDSN(srcPath, "_busy_timeout=5000"))
+	src, err := sql.Open("sqlite3", dbfile.ReadOnlyDSN(srcPath, "_busy_timeout=5000"))
 	if err != nil {
 		return fmt.Errorf("ops: import %s: %w", srcPath, err)
 	}
@@ -441,6 +461,30 @@ func vacuumImportSource(srcPath, dst string) error {
 		return fmt.Errorf("ops: import %s: not a usable SQLite database: %w", srcPath, err)
 	}
 	return nil
+}
+
+// rollbackJournalMagic is the 8-byte header SQLite writes at the start of a
+// rollback journal that holds a transaction to roll back; a journal left
+// behind by journal_mode=PERSIST or TRUNCATE has a zeroed header instead.
+var rollbackJournalMagic = []byte{0xd9, 0xd5, 0x05, 0xf9, 0x20, 0xa1, 0x63, 0xd7}
+
+// hotRollbackJournal reports whether dbPath-journal exists and starts with
+// the rollback-journal magic, i.e. SQLite would roll it back on the next
+// read-write open.
+func hotRollbackJournal(dbPath string) (bool, error) {
+	f, err := os.Open(dbPath + "-journal")
+	if err != nil {
+		if errors.Is(err, os.ErrNotExist) {
+			return false, nil
+		}
+		return false, err
+	}
+	defer f.Close()
+	hdr := make([]byte, len(rollbackJournalMagic))
+	if _, err := io.ReadFull(f, hdr); err != nil {
+		return false, nil // empty or too short to be a hot journal
+	}
+	return bytes.Equal(hdr, rollbackJournalMagic), nil
 }
 
 // Checkout materializes db@branch's head snapshot to its fixed path. If a
@@ -1453,6 +1497,9 @@ func (w *Workspace) forkWith(db, srcBranch, newBranch, at string, ttl time.Durat
 	}
 	cp := headCheckpoint(src)
 	if at != "" {
+		if err := store.ValidateName(at); err != nil {
+			return 0, err
+		}
 		c, ok := src.Checkpoints[at]
 		if !ok {
 			return 0, errNoCheckpoint(db, srcBranch, at, src)
@@ -1656,6 +1703,11 @@ type RollbackResult struct {
 	// un-checkpointed edits in the checkout, and "undo" has nothing to
 	// restore. The CLI words its output accordingly.
 	BackupIsTarget bool
+	// AbandonedFrom/AbandonedTo is the inclusive txid range the branch gave
+	// up: everything above the target checkpoint up to the previous head.
+	// Both are 0 when the head already sat at the target (nothing was
+	// abandoned). The safety fork, when minted, still holds that range.
+	AbandonedFrom, AbandonedTo uint64
 }
 
 // Rollback is RollbackWith with defaults: safety fork on, default TTL. Kept
@@ -1713,6 +1765,10 @@ func (w *Workspace) RollbackWith(db, branch, to string, opts RollbackOptions) (R
 		return RollbackResult{}, errNoCheckpoint(db, branch, to, ref)
 	}
 	txid := cp.TXID
+	var abandonedFrom, abandonedTo uint64
+	if ref.HeadTXID > txid {
+		abandonedFrom, abandonedTo = txid+1, ref.HeadTXID
+	}
 	backupIsTarget := ref.HeadTXID == txid
 
 	// The safety fork comes after the checkpoint lookup (a bad `to` fails
@@ -1859,7 +1915,7 @@ func (w *Workspace) RollbackWith(db, branch, to string, opts RollbackOptions) (R
 		}
 		return RollbackResult{}, fmt.Errorf("ops: branch repointed to checkpoint %q (txid %d), but the checkout could not be refreshed (%s): %w", to, txid, next, err)
 	}
-	return RollbackResult{Path: path, Backup: backup, Shared: base != nil, BackupIsTarget: backupIsTarget}, nil
+	return RollbackResult{Path: path, Backup: backup, Shared: base != nil, BackupIsTarget: backupIsTarget, AbandonedFrom: abandonedFrom, AbandonedTo: abandonedTo}, nil
 }
 
 // Promote repoints db@target at a NEW lineage seeded from db@source's head
@@ -2032,8 +2088,12 @@ func (w *Workspace) PromoteWith(db, source, target string, opts PromoteOptions) 
 	// onto a protected target mints nothing) and before the repoint, so the
 	// target's current head is durably reachable from its own branch name
 	// before anything abandons it.
+	// The undo path (promoting the target's own safety fork back) skips
+	// minting a new one — keyed on the fork's marker, not its name, so a
+	// user's branch that merely shares the name goes through promoteBackup
+	// and meets the documented refusal there.
 	var backup string
-	if !opts.NoBackup && source != target+PromoteBackupSuffix {
+	if !opts.NoBackup && !(source == target+PromoteBackupSuffix && src.Meta[PromoteBackupMetaKey] == target) {
 		backup, err = w.promoteBackup(db, target, opts.BackupTTL)
 		if err != nil {
 			return PromoteResult{}, err
@@ -2237,7 +2297,17 @@ func (w *Workspace) CompactWith(db, branch string, opts CompactOptions) (uint64,
 		}
 		kept[name] = store.Checkpoint{TXID: c.TXID, Epoch: 1, CreatedAt: c.CreatedAt, Meta: c.Meta, Kind: "snapshot"}
 	}
-	kept["compact"] = store.Checkpoint{TXID: txid, Epoch: 1, CreatedAt: nowStamp(), Kind: "snapshot"}
+	// "compact" names the head this compaction materialized — only when
+	// the name is free. A branch compacted before, then checkpointed and
+	// rolled back to a shared state, already carries a "compact" entry at
+	// an older txid, and a user may have named a checkpoint "compact"
+	// themselves; either entry is history the user can address, so it is
+	// kept exactly as it was (nothing is dropped or renamed, CreatedAt and
+	// Meta included) and the new head simply goes unnamed — it is the
+	// branch head, addressable without a name.
+	if _, ok := kept["compact"]; !ok {
+		kept["compact"] = store.Checkpoint{TXID: txid, Epoch: 1, CreatedAt: nowStamp(), Kind: "snapshot"}
+	}
 
 	next := ref
 	next.Lineage, next.Epoch, next.HeadTXID, next.HeadEpoch = lineage, 1, txid, 1

@@ -2,7 +2,6 @@ package ops
 
 import (
 	"errors"
-	"os/exec"
 	"reflect"
 	"sort"
 	"strings"
@@ -238,13 +237,13 @@ func TestCompactNoOpAfterRollbackPreservesCheckpoints(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if out, err := exec.Command("sqlite3", path, "CREATE TABLE t (v); INSERT INTO t VALUES (1);").CombinedOutput(); err != nil {
+	if out, err := testutil.SQLite3CLI(path, "CREATE TABLE t (v); INSERT INTO t VALUES (1);").CombinedOutput(); err != nil {
 		t.Fatalf("seed: %v: %s", err, out)
 	}
 	if _, err := w.Checkpoint("app", "child", "cp1", nil); err != nil {
 		t.Fatal(err)
 	}
-	if out, err := exec.Command("sqlite3", path, "INSERT INTO t VALUES (2);").CombinedOutput(); err != nil {
+	if out, err := testutil.SQLite3CLI(path, "INSERT INTO t VALUES (2);").CombinedOutput(); err != nil {
 		t.Fatalf("insert: %v: %s", err, out)
 	}
 	if _, err := w.Checkpoint("app", "child", "cp2", nil); err != nil {
@@ -347,14 +346,14 @@ func TestCompactPreservesCheckpoints(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if out, err := exec.Command("sqlite3", path, "CREATE TABLE t (v); INSERT INTO t VALUES (1);").CombinedOutput(); err != nil {
+	if out, err := testutil.SQLite3CLI(path, "CREATE TABLE t (v); INSERT INTO t VALUES (1);").CombinedOutput(); err != nil {
 		t.Fatalf("seed: %v: %s", err, out)
 	}
 	if _, err := w.Checkpoint("app", "child", "v1", map[string]string{"k": "v"}); err != nil {
 		t.Fatal(err)
 	}
 	v1Rows := branchRows(t, w, "app", "child")
-	if out, err := exec.Command("sqlite3", path, "INSERT INTO t VALUES (2);").CombinedOutput(); err != nil {
+	if out, err := testutil.SQLite3CLI(path, "INSERT INTO t VALUES (2);").CombinedOutput(); err != nil {
 		t.Fatalf("insert: %v: %s", err, out)
 	}
 	if _, err := w.Checkpoint("app", "child", "v2", nil); err != nil {
@@ -408,5 +407,111 @@ func TestCompactPreservesCheckpoints(t *testing.T) {
 	}
 	if got := branchRows(t, w, "app", "child"); got != v1Rows {
 		t.Fatalf("post-compact rollback to v1 row count = %s, want %s", got, v1Rows)
+	}
+}
+
+// TestCompactKeepsAnExistingCompactCheckpoint pins docs/reference.md
+// "offshoot compact": "Nothing is dropped or renamed". A branch compacted
+// once, checkpointed further, rolled back (shared again) and compacted a
+// second time already has a checkpoint named "compact" at an older txid.
+// The second compact must leave that entry exactly where it was rather
+// than overwrite it with the new head; the kept entry still materializes.
+// Verified against the pre-fix code, which replaced the entry (txid moved).
+func TestCompactKeepsAnExistingCompactCheckpoint(t *testing.T) {
+	testutil.RequireSQLite3(t)
+	w := newWS(t)
+	if err := w.Create("app"); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := w.Fork("app", "main", "child", "", 0, nil); err != nil {
+		t.Fatal(err)
+	}
+	path := mustCheckout(t, w, "app", "child")
+	mustSQL(t, path, "CREATE TABLE t (v); INSERT INTO t VALUES (1);")
+	if _, err := w.Checkpoint("app", "child", "v1", nil); err != nil {
+		t.Fatal(err)
+	}
+	first, err := w.Compact("app", "child")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if cp := refOf(t, w, "app", "child").Checkpoints["compact"]; cp.TXID != first {
+		t.Fatalf("precondition: first compact recorded txid %d, want %d", cp.TXID, first)
+	}
+	mustSQL(t, path, "INSERT INTO t VALUES (2);")
+	if _, err := w.Checkpoint("app", "child", "v2", nil); err != nil {
+		t.Fatal(err)
+	}
+	mustSQL(t, path, "INSERT INTO t VALUES (3);")
+	if _, err := w.Checkpoint("app", "child", "v3", nil); err != nil {
+		t.Fatal(err)
+	}
+	res, err := w.RollbackWith("app", "child", "v2", RollbackOptions{NoBackup: true})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !res.Shared {
+		t.Fatal("precondition: rollback must share (base pointer) so the branch can compact again")
+	}
+	if cp := refOf(t, w, "app", "child").Checkpoints["compact"]; cp.TXID != first {
+		t.Fatalf("precondition: rollback kept \"compact\" at txid %d, want %d", cp.TXID, first)
+	}
+
+	head, err := w.Compact("app", "child")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if head == first {
+		t.Fatalf("precondition: second compact must land at a new head, got %d again", head)
+	}
+	got := refOf(t, w, "app", "child")
+	if got.Base != nil {
+		t.Fatal("second compact must clear Base")
+	}
+	if cp := got.Checkpoints["compact"]; cp.TXID != first {
+		t.Fatalf("second compact overwrote the existing \"compact\" checkpoint: txid %d -> %d (nothing may be dropped or renamed)", first, cp.TXID)
+	}
+	if len(got.Checkpoints) != 4 {
+		t.Fatalf("checkpoints after second compact = %v, want exactly fork, v1, v2 and the kept compact", got.Checkpoints)
+	}
+	at, err := w.CheckoutAt("app", "child", "compact", false)
+	if err != nil {
+		t.Fatalf("the kept \"compact\" checkpoint must still materialize: %v", err)
+	}
+	out, err := testutil.SQLite3CLI(at, "SELECT count(*) FROM t;").Output()
+	if err != nil || strings.TrimSpace(string(out)) != "1" {
+		t.Fatalf("kept \"compact\" rows = %q err=%v, want the first compact's 1 row", out, err)
+	}
+}
+
+// TestCompactKeepsAUserCheckpointNamedCompactAtHead: the same rule at the
+// same txid — a user checkpoint literally named "compact" at the head
+// keeps its CreatedAt/Meta/Kind; compact adds its own entry only when the
+// name is free. Verified against the pre-fix code (Meta map[] after).
+func TestCompactKeepsAUserCheckpointNamedCompactAtHead(t *testing.T) {
+	testutil.RequireSQLite3(t)
+	w := newWS(t)
+	if err := w.Create("app"); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := w.Fork("app", "main", "child", "", 0, nil); err != nil {
+		t.Fatal(err)
+	}
+	path := mustCheckout(t, w, "app", "child")
+	mustSQL(t, path, "CREATE TABLE t (v); INSERT INTO t VALUES (1);")
+	if _, err := w.Checkpoint("app", "child", "compact", map[string]string{"owner": "user"}); err != nil {
+		t.Fatal(err)
+	}
+	mine := refOf(t, w, "app", "child").Checkpoints["compact"]
+	head, err := w.Compact("app", "child")
+	if err != nil {
+		t.Fatal(err)
+	}
+	got := refOf(t, w, "app", "child").Checkpoints["compact"]
+	if got.TXID != head || got.TXID != mine.TXID {
+		t.Fatalf("compact txid = %d, want the head %d (= the user's %d)", got.TXID, head, mine.TXID)
+	}
+	if got.Meta["owner"] != "user" || got.CreatedAt != mine.CreatedAt {
+		t.Fatalf("compact overwrote the user's \"compact\" checkpoint: got %+v, want meta/created_at of %+v", got, mine)
 	}
 }
