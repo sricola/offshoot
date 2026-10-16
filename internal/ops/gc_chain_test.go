@@ -4,7 +4,6 @@ package ops_test
 
 import (
 	"context"
-	"os/exec"
 	"path/filepath"
 	"testing"
 
@@ -38,11 +37,11 @@ func TestReplayStaysBoundedAcrossManyFlushes(t *testing.T) {
 		t.Fatal(err)
 	}
 	defer s.Close()
-	if out, err := exec.Command("sqlite3", s.CheckoutPath(), "CREATE TABLE t (v);").CombinedOutput(); err != nil {
+	if out, err := testutil.SQLite3CLI(s.CheckoutPath(), "CREATE TABLE t (v);").CombinedOutput(); err != nil {
 		t.Fatalf("CREATE TABLE failed: %v: %s", err, out)
 	}
 	for i := 0; i < 20; i++ {
-		if out, err := exec.Command("sqlite3", s.CheckoutPath(), "INSERT INTO t VALUES ('x');").CombinedOutput(); err != nil {
+		if out, err := testutil.SQLite3CLI(s.CheckoutPath(), "INSERT INTO t VALUES ('x');").CombinedOutput(); err != nil {
 			t.Fatalf("INSERT %d failed: %v: %s", i, err, out)
 		}
 		if _, err := s.Flush("", nil); err != nil {
@@ -80,11 +79,11 @@ func TestGCSweepsSegmentsWithTheirLineage(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if out, err := exec.Command("sqlite3", s.CheckoutPath(), "CREATE TABLE t (v);").CombinedOutput(); err != nil {
+	if out, err := testutil.SQLite3CLI(s.CheckoutPath(), "CREATE TABLE t (v);").CombinedOutput(); err != nil {
 		t.Fatalf("CREATE TABLE failed: %v: %s", err, out)
 	}
 	for i := 0; i < 3; i++ {
-		if out, err := exec.Command("sqlite3", s.CheckoutPath(), "INSERT INTO t VALUES ('x');").CombinedOutput(); err != nil {
+		if out, err := testutil.SQLite3CLI(s.CheckoutPath(), "INSERT INTO t VALUES ('x');").CombinedOutput(); err != nil {
 			t.Fatalf("INSERT %d failed: %v: %s", i, err, out)
 		}
 		if _, err := s.Flush("", nil); err != nil {
@@ -150,7 +149,7 @@ func TestForkFastPathSkipsMultiMemberChains(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if out, err := exec.Command("sqlite3", s.CheckoutPath(), "CREATE TABLE t (v); INSERT INTO t VALUES (1);").CombinedOutput(); err != nil {
+	if out, err := testutil.SQLite3CLI(s.CheckoutPath(), "CREATE TABLE t (v); INSERT INTO t VALUES (1);").CombinedOutput(); err != nil {
 		t.Fatalf("seed: %v: %s", err, out)
 	}
 	// First flush after Open is always a forced full snapshot (the
@@ -159,7 +158,7 @@ func TestForkFastPathSkipsMultiMemberChains(t *testing.T) {
 	if _, err := s.Flush("", nil); err != nil {
 		t.Fatal(err)
 	}
-	if out, err := exec.Command("sqlite3", s.CheckoutPath(), "INSERT INTO t VALUES (2);").CombinedOutput(); err != nil {
+	if out, err := testutil.SQLite3CLI(s.CheckoutPath(), "INSERT INTO t VALUES (2);").CombinedOutput(); err != nil {
 		t.Fatalf("insert: %v: %s", err, out)
 	}
 	// Second flush, still short of the SnapshotEvery=4 cadence: a segment,
@@ -197,7 +196,7 @@ func TestForkFastPathSkipsMultiMemberChains(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	got, err := exec.Command("sqlite3", cpath, "SELECT v FROM t ORDER BY v;").Output()
+	got, err := testutil.SQLite3CLI(cpath, "SELECT v FROM t ORDER BY v;").Output()
 	if err != nil {
 		t.Fatal(err)
 	}

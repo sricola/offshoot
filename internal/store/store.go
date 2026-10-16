@@ -332,6 +332,15 @@ func ValidateName(name string) error {
 			return fmt.Errorf("store: invalid name %q (allowed: [a-z0-9-_.])", name)
 		}
 	}
+	// The local backend keeps its per-key lock file at "<key>.lock"
+	// (unlinked on every release) and its temp files at "<base>.tmp-*",
+	// and its List hides both shapes. A ref so named would be invisible
+	// to ListRefs — so GC would sweep its lineage — and unlinked by a
+	// sibling's CAS. Refused on every backend, so none disagree on which
+	// names exist.
+	if strings.HasSuffix(name, ".lock") || strings.Contains(name, ".tmp-") {
+		return fmt.Errorf("store: invalid name %q (must not end in \".lock\" or contain \".tmp-\")", name)
+	}
 	return nil
 }
 
@@ -1044,11 +1053,17 @@ func (s *Store) ListRefs() (map[string][]string, error) {
 		if len(parts) != 3 {
 			continue
 		}
-		// Defense in depth: every name offshoot writes passed ValidateName,
-		// so one that does not was put in the bucket by something else.
-		// Skip it rather than hand it to a path builder or a reaper.
-		if ValidateName(parts[1]) != nil || ValidateName(parts[2]) != nil {
-			continue
+		// Every name offshoot writes passed ValidateName; one that does not
+		// was written under an older rule or by something else. It is a
+		// ref all the same: skipping it would leave its lineage unmarked
+		// for GC to sweep while the ref still exists, so fail closed and
+		// name the key — nothing lists, reaps or collects until it is
+		// renamed or removed with the storage tool.
+		if err := ValidateName(parts[1]); err != nil {
+			return nil, fmt.Errorf("store: ref %s: %w; rename or remove the key with your storage tool (offshoot cannot address it)", k, err)
+		}
+		if err := ValidateName(parts[2]); err != nil {
+			return nil, fmt.Errorf("store: ref %s: %w; rename or remove the key with your storage tool (offshoot cannot address it)", k, err)
 		}
 		m[parts[1]] = append(m[parts[1]], parts[2])
 	}

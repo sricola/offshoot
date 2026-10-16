@@ -1,6 +1,7 @@
 package dbfile
 
 import (
+	"bytes"
 	"context"
 	"database/sql"
 	"errors"
@@ -183,4 +184,73 @@ func TestNoCreateDSN(t *testing.T) {
 			t.Fatalf("nothing was written to %s (size %v, err %v)", path, fi, err)
 		}
 	})
+}
+
+// TestReadOnlyDSNNeverCheckpointsTheWALOnClose: a read-only open of a
+// WAL-mode database sees every committed frame, refuses writes, and on
+// close leaves the main file and its -wal byte-identical — the property
+// ops.CreateFrom relies on to import a foreign database "never modified
+// or truncated". A read-write last connection would fold the WAL into the
+// main file and unlink it on its way out.
+func TestReadOnlyDSNNeverCheckpointsTheWALOnClose(t *testing.T) {
+	dir := t.TempDir()
+	path := filepath.Join(dir, "src.db")
+	db, err := sql.Open("sqlite3", NoCreateDSN(path, "")+"c")
+	if err != nil {
+		t.Fatal(err)
+	}
+	db.Close()
+	db, err = sql.Open("sqlite3", path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	conn, err := db.Conn(context.Background())
+	if err != nil {
+		t.Fatal(err)
+	}
+	for _, stmt := range []string{"PRAGMA journal_mode=WAL", "PRAGMA wal_autocheckpoint=0", "CREATE TABLE t (v)", "INSERT INTO t VALUES (7)"} {
+		if _, err := conn.ExecContext(context.Background(), stmt); err != nil {
+			t.Fatalf("%s: %v", stmt, err)
+		}
+	}
+	// Copy the pair while the writer is open so the copy's row lives only
+	// in its WAL, then let the writer go.
+	live := filepath.Join(dir, "live.db")
+	for _, suffix := range []string{"", "-wal"} {
+		data, err := os.ReadFile(path + suffix)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if err := os.WriteFile(live+suffix, data, 0o600); err != nil {
+			t.Fatal(err)
+		}
+	}
+	conn.Close()
+	db.Close()
+	before, _ := os.ReadFile(live)
+	beforeWAL, _ := os.ReadFile(live + "-wal")
+	if len(beforeWAL) <= 32 {
+		t.Fatalf("precondition: copied WAL has no frames (%d bytes)", len(beforeWAL))
+	}
+
+	ro, err := sql.Open("sqlite3", ReadOnlyDSN(live, "_busy_timeout=1000"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	var v int
+	if err := ro.QueryRow("SELECT v FROM t").Scan(&v); err != nil || v != 7 {
+		t.Fatalf("read-only open must see the WAL's committed row: v=%d err=%v", v, err)
+	}
+	if _, err := ro.Exec("INSERT INTO t VALUES (8)"); err == nil {
+		t.Fatal("mode=ro must refuse writes")
+	}
+	ro.Close()
+	after, _ := os.ReadFile(live)
+	afterWAL, err := os.ReadFile(live + "-wal")
+	if err != nil {
+		t.Fatalf("closing the read-only connection removed the -wal: %v", err)
+	}
+	if !bytes.Equal(before, after) || !bytes.Equal(beforeWAL, afterWAL) {
+		t.Fatal("closing the read-only connection rewrote the main file or its WAL")
+	}
 }

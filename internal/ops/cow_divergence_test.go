@@ -8,7 +8,6 @@ package ops_test
 import (
 	"context"
 	"fmt"
-	"os/exec"
 	"strings"
 	"testing"
 
@@ -23,7 +22,7 @@ func flushInserts(t *testing.T, s *session.Session, n int, val string) {
 	t.Helper()
 	for i := 0; i < n; i++ {
 		stmt := fmt.Sprintf("INSERT INTO t VALUES (%s);", val)
-		if out, err := exec.Command("sqlite3", s.CheckoutPath(), stmt).CombinedOutput(); err != nil {
+		if out, err := testutil.SQLite3CLI(s.CheckoutPath(), stmt).CombinedOutput(); err != nil {
 			t.Fatalf("INSERT %d of %q failed: %v: %s", i, val, err, out)
 		}
 		if _, err := s.Flush("", nil); err != nil {
@@ -93,7 +92,7 @@ func TestDeepForkChainStaysBounded(t *testing.T) {
 		}
 		defer s.Close()
 		if initSchema {
-			if out, err := exec.Command("sqlite3", s.CheckoutPath(), "CREATE TABLE t (lvl INTEGER);").CombinedOutput(); err != nil {
+			if out, err := testutil.SQLite3CLI(s.CheckoutPath(), "CREATE TABLE t (lvl INTEGER);").CombinedOutput(); err != nil {
 				t.Fatalf("CREATE TABLE failed: %v: %s", err, out)
 			}
 		}
@@ -166,7 +165,7 @@ func TestDeepForkChainStaysBounded(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	got, err := exec.Command("sqlite3", cpath, "SELECT lvl, COUNT(*) FROM t GROUP BY lvl ORDER BY lvl;").Output()
+	got, err := testutil.SQLite3CLI(cpath, "SELECT lvl, COUNT(*) FROM t GROUP BY lvl ORDER BY lvl;").Output()
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -197,7 +196,7 @@ func TestSharedChildSelfSnapshotsPastCadence(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if out, err := exec.Command("sqlite3", s.CheckoutPath(), "CREATE TABLE t (lvl INTEGER);").CombinedOutput(); err != nil {
+	if out, err := testutil.SQLite3CLI(s.CheckoutPath(), "CREATE TABLE t (lvl INTEGER);").CombinedOutput(); err != nil {
 		t.Fatalf("CREATE TABLE failed: %v: %s", err, out)
 	}
 	flushInserts(t, s, 1, "0")
@@ -303,7 +302,7 @@ func TestSharedChildShortSessionsStayBounded(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if out, err := exec.Command("sqlite3", s.CheckoutPath(), "CREATE TABLE t (lvl INTEGER);").CombinedOutput(); err != nil {
+	if out, err := testutil.SQLite3CLI(s.CheckoutPath(), "CREATE TABLE t (lvl INTEGER);").CombinedOutput(); err != nil {
 		t.Fatalf("CREATE TABLE failed: %v: %s", err, out)
 	}
 	flushInserts(t, s, 1, "0")
@@ -409,7 +408,7 @@ func TestSharedForkDivergenceIsolation(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if out, err := exec.Command("sqlite3", s.CheckoutPath(), "CREATE TABLE t (v TEXT); INSERT INTO t VALUES ('base');").CombinedOutput(); err != nil {
+	if out, err := testutil.SQLite3CLI(s.CheckoutPath(), "CREATE TABLE t (v TEXT); INSERT INTO t VALUES ('base');").CombinedOutput(); err != nil {
 		t.Fatalf("seed: %v: %s", err, out)
 	}
 	if _, err := s.Flush("", nil); err != nil {
@@ -437,7 +436,7 @@ func TestSharedForkDivergenceIsolation(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if out, err := exec.Command("sqlite3", ps.CheckoutPath(), "INSERT INTO t VALUES ('A');").CombinedOutput(); err != nil {
+	if out, err := testutil.SQLite3CLI(ps.CheckoutPath(), "INSERT INTO t VALUES ('A');").CombinedOutput(); err != nil {
 		t.Fatalf("parent insert: %v: %s", err, out)
 	}
 	if _, err := ps.Flush("", nil); err != nil {
@@ -454,7 +453,7 @@ func TestSharedForkDivergenceIsolation(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if out, err := exec.Command("sqlite3", csess.CheckoutPath(), "INSERT INTO t VALUES ('B');").CombinedOutput(); err != nil {
+	if out, err := testutil.SQLite3CLI(csess.CheckoutPath(), "INSERT INTO t VALUES ('B');").CombinedOutput(); err != nil {
 		t.Fatalf("child insert: %v: %s", err, out)
 	}
 	if _, err := csess.Flush("", nil); err != nil {
@@ -470,7 +469,7 @@ func TestSharedForkDivergenceIsolation(t *testing.T) {
 		if err != nil {
 			t.Fatalf("checkout %s: %v", branch, err)
 		}
-		out, err := exec.Command("sqlite3", p, "SELECT v FROM t ORDER BY v;").Output()
+		out, err := testutil.SQLite3CLI(p, "SELECT v FROM t ORDER BY v;").Output()
 		if err != nil {
 			t.Fatalf("dump %s: %v", branch, err)
 		}

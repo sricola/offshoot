@@ -115,7 +115,7 @@ func TestQuickstartTranscript(t *testing.T) {
 	call(t, store, "create", "app")
 	path := strings.TrimSpace(call(t, store, "checkout", "app"))
 
-	if out, err := exec.Command("sqlite3", path,
+	if out, err := testutil.SQLite3CLI(path,
 		"CREATE TABLE users (name); INSERT INTO users VALUES ('ada');").CombinedOutput(); err != nil {
 		t.Fatalf("%v: %s", err, out)
 	}
@@ -123,7 +123,7 @@ func TestQuickstartTranscript(t *testing.T) {
 	call(t, store, "fork", "app", "attempt-1")
 
 	apath := strings.TrimSpace(call(t, store, "checkout", "app@attempt-1"))
-	exec.Command("sqlite3", apath, "DELETE FROM users;").Run() // destructive attempt
+	testutil.SQLite3CLI(apath, "DELETE FROM users;").Run() // destructive attempt
 	call(t, store, "checkpoint", "app@attempt-1", "oops")
 	call(t, store, "rollback", "app@attempt-1", "--to", "fork")
 
@@ -134,7 +134,7 @@ func TestQuickstartTranscript(t *testing.T) {
 	}
 
 	// Winner path: modify attempt, promote onto main.
-	exec.Command("sqlite3", apath, "INSERT INTO users VALUES ('grace');").Run()
+	testutil.SQLite3CLI(apath, "INSERT INTO users VALUES ('grace');").Run()
 	call(t, store, "checkpoint", "app@attempt-1", "winner")
 	call(t, store, "promote", "app@attempt-1", "--onto", "main", "--force")
 	mgot, _ := exec.Command("sqlite3",
@@ -165,7 +165,7 @@ func TestCheckpointOutputNamesItsKind(t *testing.T) {
 	call(t, store, "init")
 	call(t, store, "create", "app")
 	path := strings.TrimSpace(call(t, store, "checkout", "app"))
-	if out, err := exec.Command("sqlite3", path, "CREATE TABLE t (v BLOB); "+
+	if out, err := testutil.SQLite3CLI(path, "CREATE TABLE t (v BLOB); "+
 		"WITH RECURSIVE n(i) AS (SELECT 1 UNION ALL SELECT i+1 FROM n WHERE i < 500) "+
 		"INSERT INTO t SELECT randomblob(1000) FROM n;").CombinedOutput(); err != nil {
 		t.Fatalf("%v: %s", err, out)
@@ -176,7 +176,7 @@ func TestCheckpointOutputNamesItsKind(t *testing.T) {
 		t.Fatalf("first checkpoint printed %q, want a snapshot line", out)
 	}
 	insert := func() {
-		if out, err := exec.Command("sqlite3", path, "INSERT INTO t VALUES (randomblob(10));").CombinedOutput(); err != nil {
+		if out, err := testutil.SQLite3CLI(path, "INSERT INTO t VALUES (randomblob(10));").CombinedOutput(); err != nil {
 			t.Fatalf("%v: %s", err, out)
 		}
 	}
@@ -847,7 +847,7 @@ func TestRollbackAndPromoteOutputNameTheirMode(t *testing.T) {
 	call(t, store, "init")
 	call(t, store, "create", "app")
 	path := strings.TrimSpace(call(t, store, "checkout", "app"))
-	if out, err := exec.Command("sqlite3", path, "CREATE TABLE t (v);").CombinedOutput(); err != nil {
+	if out, err := testutil.SQLite3CLI(path, "CREATE TABLE t (v);").CombinedOutput(); err != nil {
 		t.Fatalf("%v: %s", err, out)
 	}
 	call(t, store, "checkpoint", "app", "v1")
@@ -1001,5 +1001,76 @@ func TestLeaseReleaseWithoutHolderPrintsTheHolderItFreed(t *testing.T) {
 	}
 	if list := call(t, store, "lease", "list"); strings.Contains(list, "app@main") {
 		t.Fatalf("lease still listed after release: %q", list)
+	}
+}
+
+// TestServeNegativeReapEveryAndGCGraceAreRejected mirrors
+// TestServeNegativeFlushEveryIsRejected: docs/reference.md documents
+// `-reap-every 0` as the way to disable the janitor; a negative interval
+// (or a negative GC grace) is a typo that must not silently disable
+// reaping / shorten grace. Both are refused before any socket exists, and
+// each error names its flag.
+func TestServeNegativeReapEveryAndGCGraceAreRejected(t *testing.T) {
+	dir := filepath.Join(t.TempDir(), "s")
+	if err := run([]string{"-store", dir, "init"}); err != nil {
+		t.Fatal(err)
+	}
+	for _, flag := range []string{"-reap-every", "-gc-grace"} {
+		err := run([]string{"-store", dir, "serve", flag, "-1m"})
+		if err == nil || !strings.HasPrefix(err.Error(), flag) {
+			t.Fatalf("serve %s -1m = %v, want a %s error", flag, err, flag)
+		}
+	}
+}
+
+// TestServeShortTokenIsRejectedBeforeTheSocketExists: docs/operations.md
+// calls a short explicit token "a startup error". It must be refused
+// before the daemon binds its socket (and starts its janitor), so a
+// refused serve leaves no socket file behind for the next serve to find.
+// Verified against the pre-fix code, which bound the socket first.
+func TestServeShortTokenIsRejectedBeforeTheSocketExists(t *testing.T) {
+	dir := filepath.Join(t.TempDir(), "s")
+	if err := run([]string{"-store", dir, "init"}); err != nil {
+		t.Fatal(err)
+	}
+	sockDir, err := os.MkdirTemp("", "offshoot-cli-test-*")
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { os.RemoveAll(sockDir) })
+	sock := filepath.Join(sockDir, "sock")
+	err = run([]string{"-store", dir, "serve", "-socket", sock, "-http", "127.0.0.1:0", "-token", "short"})
+	if err == nil || !strings.Contains(err.Error(), "at least") {
+		t.Fatalf("serve with a short -token = %v, want the length refusal", err)
+	}
+	if _, err := os.Stat(sock); err == nil {
+		t.Fatalf("the refused serve left its socket behind at %s", sock)
+	}
+}
+
+// TestRollbackCLIReportsTheAbandonedRange: docs/architecture.md promises
+// that rollback "reports what transaction range was abandoned". The CLI
+// prints the inclusive txid range on its own line, and omits it when the
+// head already sat at the target.
+func TestRollbackCLIReportsTheAbandonedRange(t *testing.T) {
+	testutil.RequireSQLite3(t)
+	store := filepath.Join(t.TempDir(), "s")
+	call(t, store, "init")
+	call(t, store, "create", "app")
+	path := strings.TrimSpace(call(t, store, "checkout", "app"))
+	for _, name := range []string{"v1", "v2", "v3"} {
+		if out, err := testutil.SQLite3CLI(path, "CREATE TABLE IF NOT EXISTS t (v); INSERT INTO t VALUES (1);").CombinedOutput(); err != nil {
+			t.Fatalf("%v: %s", err, out)
+		}
+		call(t, store, "checkpoint", "app", name)
+	}
+	// create=1, v1=2, v2=3, v3=4: rolling back to v1 abandons txids 3..4.
+	out := call(t, store, "rollback", "app", "--to", "v1", "--no-backup")
+	if !strings.Contains(out, "abandoned txids 3..4\n") {
+		t.Fatalf("rollback output must report the abandoned range, got:\n%s", out)
+	}
+	out = call(t, store, "rollback", "app", "--to", "v1", "--no-backup")
+	if strings.Contains(out, "abandoned") {
+		t.Fatalf("a rollback to the current head abandons nothing, got:\n%s", out)
 	}
 }

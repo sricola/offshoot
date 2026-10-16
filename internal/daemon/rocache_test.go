@@ -2,10 +2,11 @@ package daemon
 
 import (
 	"os"
-	"os/exec"
 	"path/filepath"
 	"testing"
 	"time"
+
+	"github.com/sricola/offshoot/internal/testutil"
 )
 
 // mkCheckpointAt writes a row to path and checkpoints it under name — a
@@ -16,7 +17,7 @@ func mkCheckpointAt(t *testing.T, w interface {
 	Checkpoint(db, branch, name string, meta map[string]string) (uint64, error)
 }, path, name string) {
 	t.Helper()
-	if out, err := exec.Command("sqlite3", path,
+	if out, err := testutil.SQLite3CLI(path,
 		"CREATE TABLE IF NOT EXISTS t (v); INSERT INTO t VALUES ('x');").CombinedOutput(); err != nil {
 		t.Fatalf("%v: %s", err, out)
 	}
@@ -233,7 +234,7 @@ func TestJanitorROCacheEvictionNeverTouchesLeasedWritableCheckout(t *testing.T) 
 	if !open.OK || open.Checkout == "" {
 		t.Fatalf("open = %+v", open)
 	}
-	if out, err := exec.Command("sqlite3", open.Checkout,
+	if out, err := testutil.SQLite3CLI(open.Checkout,
 		"CREATE TABLE t (v); INSERT INTO t VALUES (1);").CombinedOutput(); err != nil {
 		t.Fatalf("%v: %s", err, out)
 	}

@@ -17,7 +17,106 @@ Pin an exact version if you depend on format stability. The full contract:
 
 ## [Unreleased]
 
-Nothing yet.
+A specification-conformance initiative: every documented requirement was
+traced to its implementation and a test, the gaps were closed with
+mutation-verified regression tests, and the defects that surfaced are
+fixed below. The traceability summary, coverage and mutation results are
+in [docs/testing.md](docs/testing.md#specification-conformance-2026-10-13).
+
+### Fixed
+
+- `create --from` opens its source read-only, so importing a WAL-mode
+  database whose last writer exited without a clean close no longer
+  checkpoints and unlinks that database's `-wal` on the way out; the
+  source is byte-identical before and after, as the docs promised
+  (`TestCreateFromLeavesAWALModeSourceByteIdentical`). A rollback-journal
+  source with a hot journal, which the old read-write import silently
+  rolled back (modifying the source), is now refused with the recovery
+  step named.
+- A ref named like the local backend's lock or temp files (`x.lock`,
+  `x.tmp-1`) was invisible to listings there (so GC would have swept its
+  lineage) and unlinked by a sibling's CAS release; `ValidateName` now
+  refuses those shapes on every backend. And a ref under `refs/` whose
+  name fails the current rule (written by an older binary or by something
+  else) now fails `ListRefs` loudly, naming the key, instead of being
+  skipped — a skipped ref's lineage was unmarked and swept by GC while the
+  ref still existed ([limitations](docs/limitations.md#a-ref-with-a-name-offshoot-would-not-write-stops-every-listing)).
+- `compact` overwrote an existing checkpoint named `compact` (one from an
+  earlier compact, or one you named yourself — its metadata was lost); the
+  entry is now kept as is and compact adds its own only when the name is
+  free.
+- `promote` skipped minting the target's safety fork whenever the source
+  was *named* `<target>-pre-promote`; the undo shortcut is now keyed on the
+  safety-fork marker, so a branch of your own at that name meets the
+  documented refusal instead.
+- A GC pass racing a checkpoint on a forked parent failed with a phantom
+  "no contiguous run reaches target": the mark now reads every ref before
+  listing any lineage, so a listing is never older than the ref it serves.
+- The daemon's `shutdown` op started a Shutdown with no deadline, so a
+  janitor pass that outlived `serve`'s 30 s wait left every session open
+  and every lease held; the op now applies the same 30 s budget as a
+  signal-driven shutdown (`daemon.ShutdownBudget`), and the janitor
+  half-budget rule holds on both paths.
+- `serve` refused a short explicit token only after binding its socket
+  and starting the janitor, leaving the socket file behind; the check now
+  runs with the other startup validation, before anything is created.
+  Negative `-reap-every` / `-gc-grace` values are refused instead of
+  silently disabling the janitor or shortening grace.
+- `diff --table T` in the default (sqldiff) mode printed nothing for a
+  table that exists on neither side; it is now the same error `--summary`
+  gives.
+- A refused `create`/`create --from` of an existing name no longer uploads
+  a whole snapshot first (an orphan per typo'd re-run, on S3 a full
+  database PUT); the name is checked before the upload and still by the
+  ref CAS. "Exists" now means any branch under the name: a database whose
+  `main` was destroyed while other branches survive no longer accepts a
+  fresh, unrelated `main` from `create`.
+- `fork --at` validates the checkpoint name like every other name.
+- MCP: the modern-era (2026-07-28) `tools/call` envelope dropped
+  `structuredContent`; it now carries it as the docs state. The fork
+  tool's TTL note described reaping as requiring a running `offshoot
+  serve` janitor; it now describes the server's own `-reap-every` timer.
+- Python SDK: an `ok` response missing a documented key (`checkout` for
+  open/checkout/rollback/checkout-at, `txid` for fork/flush/promote/
+  compact, `branch`/`name` in listings) raises `OffshootError` instead of
+  `KeyError` or a silent `0`/`""`;
+  `ttl=True`/`False` is a `TypeError` rather than `"True"`/`"none"`.
+  TypeScript SDK: the same keys throw `OffshootError` instead of yielding
+  an undefined path or a `0` txid; `fork` with conflicting `at`/`from`
+  throws `OffshootError`. Optional fields (`backup`, `shared`,
+  `session_id`, `dbfile_descriptors`, `state`) still default, so older
+  daemons keep working.
+- `scripts/check_sdk_versions.py` also checks the LangGraph companion's
+  `pyproject.toml` against `sdk/VERSION`.
+
+### Added
+
+- `rollback` reports the abandoned transaction range (`abandoned txids
+  N..M`; `RollbackResult.AbandonedFrom/To`), as the architecture doc had
+  promised.
+- `daemon.ValidateHTTPToken` (the explicit-token length rule, shared by
+  `serve` and `StartHTTP`) and `dbfile.ReadOnlyDSN`.
+- Seventy-six mutation-verified Go regression tests (plus 15 Python, 13 TypeScript) across every package for the
+  documented contracts that had none: claim-guarded checkpoint/protect
+  refusals, TTL-clock stamps on every repoint, the under-64-page segment
+  rule, safety-fork edge cases, the full event-type set with detail keys,
+  `-token-file` and `OFFSHOOT_TOKEN` handling, HTTP method/content-type
+  codes, the per-request socket cap, snapshot-cadence seeding on a shared
+  fork, equal-length wrong tokens, protected-branch refusals over every
+  surface, local key containment, exact 0600 checkout modes, GC
+  fail-closed on a mark error, truncated LTX objects, v1 layout
+  read-without-bump, lease clock skew, MCP tool schemas and refusals, and
+  SDK wire bytes and error contracts.
+
+### Changed
+
+- Docs now say what is built: the architecture and limitations pages no
+  longer describe a crashed daemon's un-flushed tail as "preserved as an
+  orphan fork" (it is discarded after a warning; the orphan fork is
+  designed, not built), a fork no longer "finds its fork point tombstoned"
+  (grace plus re-mark are the protection), the local CAS lock is described
+  as `flock(2)`, the property-test and fault-injection bullets name what
+  exists, and `-token-file` counts as an explicit token everywhere.
 
 ## [0.2.20] - 2026-10-12
 

@@ -2,7 +2,6 @@ package ops
 
 import (
 	"errors"
-	"os/exec"
 	"reflect"
 	"sort"
 	"strings"
@@ -18,7 +17,7 @@ func TestDestroyAndGC(t *testing.T) {
 	w := newWS(t)
 	w.Create("app")
 	path, _ := w.Checkout("app", "main")
-	exec.Command("sqlite3", path, "CREATE TABLE t (v); INSERT INTO t VALUES (1);").Run()
+	testutil.SQLite3CLI(path, "CREATE TABLE t (v); INSERT INTO t VALUES (1);").Run()
 	w.Checkpoint("app", "main", "v1", nil)
 	w.Fork("app", "main", "attempt-1", "", 0, nil)
 	aref, _, _ := w.Store.GetRef("app", "attempt-1")
@@ -108,7 +107,7 @@ func TestDestroyAndGCOnS3(t *testing.T) {
 	w := newWSOnFakeS3(t)
 	w.Create("app")
 	path, _ := w.Checkout("app", "main")
-	exec.Command("sqlite3", path, "CREATE TABLE t (v); INSERT INTO t VALUES (1);").Run()
+	testutil.SQLite3CLI(path, "CREATE TABLE t (v); INSERT INTO t VALUES (1);").Run()
 	w.Checkpoint("app", "main", "v1", nil)
 	w.Fork("app", "main", "attempt-1", "", 0, nil)
 	aref, _, _ := w.Store.GetRef("app", "attempt-1")
@@ -159,7 +158,7 @@ func TestGCSingleRunDoesNotSweepStonesMintedThisRun(t *testing.T) {
 	w := newWS(t)
 	w.Create("app")
 	path, _ := w.Checkout("app", "main")
-	exec.Command("sqlite3", path, "CREATE TABLE t (v); INSERT INTO t VALUES (1);").Run()
+	testutil.SQLite3CLI(path, "CREATE TABLE t (v); INSERT INTO t VALUES (1);").Run()
 	w.Checkpoint("app", "main", "v1", nil)
 	w.Fork("app", "main", "attempt-1", "", 0, nil)
 	aref, _, _ := w.Store.GetRef("app", "attempt-1")
@@ -230,7 +229,7 @@ func TestGCPrunesLegacyLineageKeyedStone(t *testing.T) {
 // mustSQL runs a sqlite3 CLI statement against path, failing the test loudly.
 func mustSQL(t *testing.T, path, stmt string) {
 	t.Helper()
-	if out, err := exec.Command("sqlite3", path, stmt).CombinedOutput(); err != nil {
+	if out, err := testutil.SQLite3CLI(path, stmt).CombinedOutput(); err != nil {
 		t.Fatalf("sqlite3 %q: %v: %s", stmt, err, out)
 	}
 }
@@ -238,7 +237,7 @@ func mustSQL(t *testing.T, path, stmt string) {
 // querySQL returns a sqlite3 CLI query's stdout.
 func querySQL(t *testing.T, path, stmt string) string {
 	t.Helper()
-	out, err := exec.Command("sqlite3", path, stmt).Output()
+	out, err := testutil.SQLite3CLI(path, stmt).Output()
 	if err != nil {
 		t.Fatalf("sqlite3 %q: %v", stmt, err)
 	}

@@ -486,8 +486,8 @@ directly.
 
 **Off by default.** `serve -http 127.0.0.1:PORT` binds loopback with no
 further acknowledgment needed. Any other address requires BOTH
-`-http-allow-non-loopback` (an explicit ack) AND an explicit
-`-token`/`OFFSHOOT_TOKEN` — the auto-generated, printed-once token is a
+`-http-allow-non-loopback` (an explicit ack) AND an explicit token
+(`-token`, `-token-file` or `OFFSHOOT_TOKEN`) — the auto-generated, printed-once token is a
 loopback-only convenience, refused outright for a non-loopback bind. Missing
 either is a distinct startup error; the daemon never starts under-
 acknowledged. An explicit token shorter than 16 characters is also a

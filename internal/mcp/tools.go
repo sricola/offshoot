@@ -956,13 +956,14 @@ type forkArgs struct {
 
 // forkTTLJanitorNote is appended to offshoot_fork's Description (and, in
 // spirit, its response text — see forkTTLSummaryFromFields) per the PM
-// amendment: a TTL alone does not reap anything. Reaping is a janitor's job
-// (`offshoot serve`'s background sweep); a daemonless MCP setup — the
-// common case, since `offshoot mcp` needs no daemon — only reaps expired
-// branches when `offshoot gc` is run by hand.
-const forkTTLJanitorNote = "TTL reaping only happens while a janitor is running " +
-	"(`offshoot serve`); a daemonless setup sweeps expired branches only when " +
-	"`offshoot gc` is run."
+// amendment: a TTL alone does not reap anything. An expired fork is reaped
+// by this server's own timer (`offshoot mcp -reap-every`, default 60s,
+// which defers to a running `offshoot serve` janitor when one is
+// reachable) or, with that timer disabled (-reap-every 0), only when
+// `offshoot gc` is run by hand — the same model offshoot_touch describes.
+const forkTTLJanitorNote = "Expired forks are reaped by this server's own timer " +
+	"(`offshoot mcp -reap-every`, default 60s) or by a running `offshoot serve` " +
+	"janitor; with the timer disabled (-reap-every 0), only `offshoot gc` sweeps them."
 
 // forkTTLDescription is the Description clause explaining fork's default TTL
 // behavior for the given defaultTTL, so the model can reason about what a

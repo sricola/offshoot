@@ -507,7 +507,7 @@ func (s *Server) handle(c net.Conn) {
 		// race Shutdown itself.
 		encErr := enc.Encode(resp)
 		if req.Op == "shutdown" {
-			go s.Shutdown(context.Background())
+			go s.shutdownFromOp()
 			return
 		}
 		if encErr != nil {
@@ -1666,6 +1666,23 @@ func (s *Server) opDiff(req Request) Response {
 //     WaitShutdown when the shutdown op ends Serve, and a second Shutdown
 //     (a signal racing the op) waits on it too, so the process exits only
 //     after every lease is released.
+//
+// ShutdownBudget bounds a Shutdown the `shutdown` op (socket or HTTP)
+// starts — the same budget `offshoot serve` gives a signal-driven one —
+// so the janitor wait inside Shutdown gets its half-budget deadline on
+// that path too. With no deadline, a GC pass that outlives the serve
+// loop's own WaitShutdown timeout left every session open and every
+// lease held when the process exited.
+var ShutdownBudget = 30 * time.Second
+
+// shutdownFromOp is the goroutine the shutdown op spawns: a Shutdown
+// bounded by ShutdownBudget.
+func (s *Server) shutdownFromOp() {
+	ctx, cancel := context.WithTimeout(context.Background(), ShutdownBudget)
+	defer cancel()
+	s.Shutdown(ctx)
+}
+
 func (s *Server) Shutdown(ctx context.Context) error {
 	s.mu.Lock()
 	if s.closing {

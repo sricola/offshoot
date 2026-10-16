@@ -32,6 +32,7 @@ import (
 
 	"github.com/sricola/offshoot/internal/ops"
 	"github.com/sricola/offshoot/internal/session"
+	"github.com/sricola/offshoot/internal/testutil"
 )
 
 // cowBenchSizes is the CoW sweep: small/medium/large. 12MB rather than a
@@ -274,7 +275,7 @@ func BenchmarkCoWDivergenceAddedBytes(b *testing.B) {
 				}
 				for j := 0; j < k; j++ {
 					stmt := fmt.Sprintf("INSERT INTO blobs (data) VALUES (x'%02x');", j)
-					if out, err := exec.Command("sqlite3", s.CheckoutPath(), stmt).CombinedOutput(); err != nil {
+					if out, err := testutil.SQLite3CLI(s.CheckoutPath(), stmt).CombinedOutput(); err != nil {
 						b.Fatalf("INSERT %d: %v: %s", j, err, out)
 					}
 					if _, err := s.Flush("", nil); err != nil {

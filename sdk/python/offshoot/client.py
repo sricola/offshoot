@@ -198,14 +198,34 @@ def _ttl_str(ttl: _TTL) -> str:
     # seconds, not "no TTL".
     if isinstance(ttl, timedelta):
         return "none" if ttl == timedelta(0) else f"{int(ttl.total_seconds())}s"
+    # bool is an int subclass: without this guard False == 0 would render
+    # "none" (clearing a TTL on touch) and True would render the string
+    # "True". Checked before the literal-zero test below for that reason.
+    if isinstance(ttl, bool):
+        raise TypeError(
+            f'ttl={ttl!r}: a bool is not a TTL; use None, 0, "none", a timedelta '
+            'or a Go duration string (e.g. "1h", "3600s")'
+        )
     if ttl == 0 or ttl == "none":
         return "none"
-    if isinstance(ttl, int) and not isinstance(ttl, bool):
+    if isinstance(ttl, int):
         raise TypeError(
             f"ttl={ttl!r}: a nonzero int is ambiguous; use a timedelta or a "
             'Go duration string (e.g. "1h", "3600s")'
         )
     return str(ttl)  # a Go duration string like "2h"
+
+
+def _field(resp: dict[str, Any], key: str, op: str) -> Any:
+    """resp[key], or an OffshootError when an ok:true reply omitted a key its
+    op documents as always present (internal/daemon/protocol.go) — the one
+    error type for every failure, never a bare KeyError."""
+    try:
+        return resp[key]
+    except KeyError:
+        raise OffshootError(
+            f"daemon sent a malformed {op} response: missing {key!r}"
+        ) from None
 
 
 def connect(socket_path: str) -> Client:
@@ -298,13 +318,17 @@ class Client:
         """
         resp = self._call("open", db=db, branch=branch)
         return Session(
-            self, resp["checkout"], db, branch, session_id=resp.get("session_id")
+            self,
+            _field(resp, "checkout", "open"),
+            db,
+            branch,
+            session_id=resp.get("session_id"),
         )
 
     def checkout(self, db: str, branch: str) -> str:
         """Materialize db@branch's head snapshot at rest; returns its path."""
         resp = self._call("checkout", db=db, branch=branch)
-        return cast(str, resp["checkout"])
+        return cast(str, _field(resp, "checkout", "checkout"))
 
     def fork(
         self,
@@ -345,7 +369,7 @@ class Client:
             meta=meta or None,
             **{"from": from_checkpoint or ""},
         )
-        return cast(int, resp.get("txid", 0))
+        return cast(int, _field(resp, "txid", "fork"))
 
     def destroy(self, db: str, branch: str, force: bool = False) -> None:
         """Delete db@branch. force overrides the protected-branch refusal."""
@@ -381,7 +405,7 @@ class Client:
             backup_ttl=_ttl_str(backup_ttl),
             materialize=materialize,
         )
-        return cast(str, resp.get("checkout", ""))
+        return cast(str, _field(resp, "checkout", "rollback"))
 
     def promote(
         self,
@@ -414,13 +438,13 @@ class Client:
             backup_ttl=_ttl_str(backup_ttl),
             materialize=materialize,
         )
-        return cast(int, resp.get("txid", 0))
+        return cast(int, _field(resp, "txid", "promote"))
 
     def compact(self, db: str, branch: str = "main") -> int:
         """Make db@branch self-contained (drop its shared-fork base pointer);
         returns the head txid. No-op on an already self-contained branch."""
         resp = self._call("compact", db=db, branch=branch)
-        return cast(int, resp.get("txid", 0))
+        return cast(int, _field(resp, "txid", "compact"))
 
     def touch(self, db: str, branch: str, ttl: _TTL = None) -> None:
         """Reset db@branch's activity clock, optionally setting/clearing its TTL.
@@ -435,7 +459,7 @@ class Client:
         resp = self._call("branches", db=db)
         return [
             Branch(
-                branch=b["branch"],
+                branch=_field(b, "branch", "branches"),
                 head_txid=b.get("head_txid", 0),
                 protected=b.get("protected", False),
                 ttl=b.get("ttl", ""),
@@ -445,7 +469,7 @@ class Client:
                 touched_at=b.get("touched_at", ""),
                 checkpoints_v2=[
                     CheckpointInfo(
-                        name=cp["name"],
+                        name=_field(cp, "name", "branches"),
                         txid=cp.get("txid", 0),
                         created_at=cp.get("created_at", ""),
                     )
@@ -560,7 +584,7 @@ class Client:
         resp = self._call(
             "checkout-at", db=db, branch=branch, name=checkpoint, force=force
         )
-        return cast(str, resp.get("checkout", ""))
+        return cast(str, _field(resp, "checkout", "checkout-at"))
 
     def events(self) -> Generator[Event, None, None]:
         """Stream the daemon's event feed, yielding one :class:`Event` per
@@ -724,7 +748,7 @@ class Session:
         resp = self._client._call(
             "flush", db=self._db, branch=self._branch, name=name, meta=meta or None
         )
-        return cast(int, resp.get("txid", 0))
+        return cast(int, _field(resp, "txid", "flush"))
 
     def checkpoint(self, name: str, meta: dict[str, str] | None = None) -> int:
         """Alias of :meth:`flush` with a required name: a named flush is

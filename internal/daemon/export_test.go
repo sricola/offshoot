@@ -2,11 +2,12 @@ package daemon
 
 import (
 	"os"
-	"os/exec"
 	"path/filepath"
 	"strconv"
 	"strings"
 	"testing"
+
+	"github.com/sricola/offshoot/internal/testutil"
 )
 
 // dRowCount runs a row-count query against a plain SQLite file via the
@@ -15,7 +16,7 @@ import (
 // require (newServer skips cleanly when sqlite3 isn't on PATH).
 func dRowCount(t *testing.T, dbPath string) int {
 	t.Helper()
-	out, err := exec.Command("sqlite3", dbPath, "SELECT count(*) FROM t;").Output()
+	out, err := testutil.SQLite3CLI(dbPath, "SELECT count(*) FROM t;").Output()
 	if err != nil {
 		t.Fatalf("sqlite3 %s: %v", dbPath, err)
 	}
@@ -53,7 +54,7 @@ func TestOpExportRefusesOverwriteWithoutForceThenForceSucceeds(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if out, err := exec.Command("sqlite3", path,
+	if out, err := testutil.SQLite3CLI(path,
 		"CREATE TABLE t (v); INSERT INTO t VALUES ('one');").CombinedOutput(); err != nil {
 		t.Fatalf("%v: %s", err, out)
 	}
@@ -97,7 +98,7 @@ func TestOpExportMissesUnflushedSessionWrites(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if out, err := exec.Command("sqlite3", path,
+	if out, err := testutil.SQLite3CLI(path,
 		"CREATE TABLE t (v); INSERT INTO t VALUES ('durable');").CombinedOutput(); err != nil {
 		t.Fatalf("%v: %s", err, out)
 	}
@@ -115,7 +116,7 @@ func TestOpExportMissesUnflushedSessionWrites(t *testing.T) {
 	// busy_timeout: the session's capture engine checkpoints the WAL at
 	// startup, and a CLI write landing inside that window gets SQLITE_BUSY
 	// immediately without one (seen once on a loaded runner).
-	if out, err := exec.Command("sqlite3", open.Checkout,
+	if out, err := testutil.SQLite3CLI(open.Checkout,
 		"PRAGMA busy_timeout=5000; INSERT INTO t VALUES ('unflushed');").CombinedOutput(); err != nil {
 		t.Fatalf("%v: %s", err, out)
 	}
@@ -159,14 +160,14 @@ func TestOpCheckoutAtMaterializesSeparateReadOnlyPath(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if out, err := exec.Command("sqlite3", path,
+	if out, err := testutil.SQLite3CLI(path,
 		"CREATE TABLE t (v); INSERT INTO t VALUES ('one');").CombinedOutput(); err != nil {
 		t.Fatalf("%v: %s", err, out)
 	}
 	if _, err := w.Checkpoint("app", "main", "v1", nil); err != nil {
 		t.Fatal(err)
 	}
-	if out, err := exec.Command("sqlite3", path,
+	if out, err := testutil.SQLite3CLI(path,
 		"INSERT INTO t VALUES ('two');").CombinedOutput(); err != nil {
 		t.Fatalf("%v: %s", err, out)
 	}
@@ -212,7 +213,7 @@ func TestOpCheckoutAtSafeAlongsideOpenSessionOnSameBranch(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if out, err := exec.Command("sqlite3", path,
+	if out, err := testutil.SQLite3CLI(path,
 		"CREATE TABLE t (v); INSERT INTO t VALUES ('one');").CombinedOutput(); err != nil {
 		t.Fatalf("%v: %s", err, out)
 	}
@@ -258,7 +259,7 @@ func TestOpCheckoutAtRejectsPathTraversalCheckpoint(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if out, err := exec.Command("sqlite3", path,
+	if out, err := testutil.SQLite3CLI(path,
 		"CREATE TABLE t (v); INSERT INTO t VALUES ('writable');").CombinedOutput(); err != nil {
 		t.Fatalf("%v: %s", err, out)
 	}

@@ -19,6 +19,7 @@ names the code or workflow that backs it.
 | Branch-heavy agent topologies hold up | `make bench-branchbench`, one pasted run | [benchmarks.md](benchmarks.md#branchbench-topologies-v0212) |
 | What you download is what CI built | keyless cosign + SLSA provenance + SBOM on every tag | `release.yml`; verify per [installation](installation.md#verify-what-you-downloaded) |
 | Regression tests fail on the bug they fix | mutation-verified against the pre-fix code | review policy, CONTRIBUTING.md |
+| Tests fail under the mutations they exist to catch | every test from the [2026-10-13 conformance pass](#specification-conformance-2026-10-13) mutation-verified; gremlins efficacy 84.7% (store), 90.1% (LTX) | on demand, not in CI |
 
 ## The kill -9 torture harness
 
@@ -219,6 +220,14 @@ From `.github/workflows/ci.yml` and the `Makefile`:
   `sqldiff` hard-fail in CI when the binary is missing
   (`testutil.RequireExec`, armed by `CI=true`) instead of skipping green —
   a broken install step turns the build red, not quietly smaller.
+- **CLI writes wait out the capture engine's locks.** A live session's
+  capture engine takes short write-side locks on its checkout (startup
+  checkpoint TRUNCATE, takeover checkpoint RESTART), so tests drive the
+  `sqlite3` CLI through `testutil.SQLite3CLI`, which preloads a 5 s busy
+  timeout, never a bare `exec.Command("sqlite3", …)`: a bare CLI write
+  that lands in one of those windows fails at once with `database is
+  locked (5)` on a loaded runner. `internal/session` keeps its own
+  `sqlite3CLI`/`mustExec` wrappers for the same reason.
 - **Metrics lint**: `promtool check metrics` (the Prometheus project's own
   linter, pinned version) runs against a real dump of the daemon's metric
   exposition as a separate hard-gated CI job (`metrics-lint`, armed by
@@ -245,6 +254,51 @@ assertion was verified against. [CONTRIBUTING.md](../CONTRIBUTING.md)
 makes the surrounding policy explicit: behavioral changes don't get
 reviewed without tests, and capture/flush changes don't merge without a
 torture run.
+
+## Specification conformance (2026-10-13)
+
+A specification-conformance pass traced every documented requirement on
+six surfaces (at-rest CLI; branch lifecycle; store, fencing, GC and LTX;
+daemon, session and capture; MCP and the SDKs; security boundaries) to its
+implementation and to a test that fails when the requirement breaks. The
+305 requirements started as 198 verified, 80 partially verified, 15 not
+verified, 9 contradictory (docs and code disagreed) and 3 blocked (need
+the nightly AWS bucket); after the pass they stand at 266 / 24 / 3 / 0 / 3,
+with the contradictions resolved in code where the docs were the
+contract (rollback reports its abandoned range; `create --from` never
+touches a WAL-mode source; `compact` never drops a checkpoint) and in
+the docs where the behaviour was designed but not built (a crashed
+daemon's un-flushed tail is discarded after a warning, not kept as an
+orphan fork; a fork does not read the tombstone list). The defects it
+found are in the [changelog](../CHANGELOG.md).
+
+Every test the pass added — 76 in Go, 15 in the Python SDK, 13 in the
+TypeScript SDK — was **mutation-verified**: the production change it
+exists to catch was applied, the test observed failing, and the change
+reverted. Two packages were also run through
+[gremlins](https://github.com/go-gremlins/gremlins) end to end, with
+the S3 client and the fake excluded:
+
+| Package | Mutants | Killed | Lived | Not covered | Efficacy |
+|---|---|---|---|---|---|
+| `internal/store` (store, local, lease, etag) | 276 | 227 | 41 | 8 | 84.7% |
+| `internal/ltxio` | 217 | 191 | 21 | 5 | 90.1% |
+
+Survivors were read one by one. Three sat on real decisions and got
+tests (`ValidateName`'s charset ends, a child lineage's segment at
+exactly its fork txid, the page-size bounds in the database header); the
+rest are error-logging branches (`syncDirAfterRename`), defensive sort
+comparators over already-sorted listings, lock-page arithmetic that only
+a database past 1 GiB reaches, and the xattr etag path that the local
+filesystem here cannot exercise. The run took 12 minutes for the store
+package and 2 for LTX on a laptop; it is not in CI.
+
+Statement coverage is a by-product, not a target: 77.0% before the pass
+and 77.4% after (`internal/daemon` 88.2 → 90.0, `internal/store` 81.9 →
+82.7, `internal/ops` 85.4 → 85.7, `internal/ltxio` 84.8 → 85.1), because
+most of the new tests pin branches that existing tests already executed
+without asserting on them. CI does not report coverage; `go test ./...
+-coverprofile=c.out && go tool cover -func=c.out` reproduces the number.
 
 ## Signed releases
 

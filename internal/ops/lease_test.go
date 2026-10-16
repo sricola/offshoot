@@ -3,7 +3,6 @@ package ops
 import (
 	"errors"
 	"fmt"
-	"os/exec"
 	"regexp"
 	"strings"
 	"testing"
@@ -269,7 +268,7 @@ func TestFencedHolderLeaseOpsFailAfterReclaim(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if out, err := exec.Command("sqlite3", path,
+	if out, err := testutil.SQLite3CLI(path,
 		"CREATE TABLE t (v); INSERT INTO t VALUES (1);").CombinedOutput(); err != nil {
 		t.Fatalf("%v: %s", err, out)
 	}

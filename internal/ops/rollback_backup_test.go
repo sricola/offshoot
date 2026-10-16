@@ -2,12 +2,12 @@ package ops
 
 import (
 	"errors"
-	"os/exec"
 	"strings"
 	"testing"
 	"time"
 
 	"github.com/sricola/offshoot/internal/store"
+	"github.com/sricola/offshoot/internal/testutil"
 )
 
 // TestRollbackKeepsSafetyFork: rollback main to v1 after a second
@@ -22,7 +22,7 @@ func TestRollbackKeepsSafetyFork(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if out, err := exec.Command("sqlite3", mp, "INSERT INTO t VALUES (2);").CombinedOutput(); err != nil {
+	if out, err := testutil.SQLite3CLI(mp, "INSERT INTO t VALUES (2);").CombinedOutput(); err != nil {
 		t.Fatalf("%v: %s", err, out)
 	}
 	if _, err := w.Checkpoint("app", "main", "v2", nil); err != nil {
@@ -79,13 +79,13 @@ func TestRollbackReplacesItsOwnSafetyFork(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if out, err := exec.Command("sqlite3", mp, "INSERT INTO t VALUES (2);").CombinedOutput(); err != nil {
+	if out, err := testutil.SQLite3CLI(mp, "INSERT INTO t VALUES (2);").CombinedOutput(); err != nil {
 		t.Fatalf("%v: %s", err, out)
 	}
 	if _, err := w.Checkpoint("app", "main", "v2", nil); err != nil {
 		t.Fatal(err)
 	}
-	if out, err := exec.Command("sqlite3", mp, "INSERT INTO t VALUES (3);").CombinedOutput(); err != nil {
+	if out, err := testutil.SQLite3CLI(mp, "INSERT INTO t VALUES (3);").CombinedOutput(); err != nil {
 		t.Fatalf("%v: %s", err, out)
 	}
 	if _, err := w.Checkpoint("app", "main", "v3", nil); err != nil {
@@ -134,7 +134,7 @@ func TestRollbackRefusesToReplaceAForeignBranch(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if out, err := exec.Command("sqlite3", mp, "INSERT INTO t VALUES (2);").CombinedOutput(); err != nil {
+	if out, err := testutil.SQLite3CLI(mp, "INSERT INTO t VALUES (2);").CombinedOutput(); err != nil {
 		t.Fatalf("%v: %s", err, out)
 	}
 	if _, err := w.Checkpoint("app", "main", "v2", nil); err != nil {
@@ -176,7 +176,7 @@ func TestRollbackCompatWrapperBacksUp(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if out, err := exec.Command("sqlite3", mp, "INSERT INTO t VALUES (2);").CombinedOutput(); err != nil {
+	if out, err := testutil.SQLite3CLI(mp, "INSERT INTO t VALUES (2);").CombinedOutput(); err != nil {
 		t.Fatalf("%v: %s", err, out)
 	}
 	if _, err := w.Checkpoint("app", "main", "v2", nil); err != nil {
@@ -198,7 +198,7 @@ func TestRollbackNoBackupAndTTL(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if out, err := exec.Command("sqlite3", mp, "INSERT INTO t VALUES (2);").CombinedOutput(); err != nil {
+	if out, err := testutil.SQLite3CLI(mp, "INSERT INTO t VALUES (2);").CombinedOutput(); err != nil {
 		t.Fatalf("%v: %s", err, out)
 	}
 	if _, err := w.Checkpoint("app", "main", "v2", nil); err != nil {
@@ -220,7 +220,7 @@ func TestRollbackNoBackupAndTTL(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if out, err := exec.Command("sqlite3", mp, "INSERT INTO t VALUES (3);").CombinedOutput(); err != nil {
+	if out, err := testutil.SQLite3CLI(mp, "INSERT INTO t VALUES (3);").CombinedOutput(); err != nil {
 		t.Fatalf("%v: %s", err, out)
 	}
 	if _, err := w.Checkpoint("app", "main", "v3", nil); err != nil {
@@ -249,7 +249,7 @@ func TestSafetyForkUnderACheckpointLeaseSaysRetry(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if out, err := exec.Command("sqlite3", mp, "INSERT INTO t VALUES (2);").CombinedOutput(); err != nil {
+	if out, err := testutil.SQLite3CLI(mp, "INSERT INTO t VALUES (2);").CombinedOutput(); err != nil {
 		t.Fatalf("%v: %s", err, out)
 	}
 	if _, err := w.Checkpoint("app", "main", "v2", nil); err != nil {
@@ -274,5 +274,67 @@ func TestSafetyForkUnderACheckpointLeaseSaysRetry(t *testing.T) {
 	}
 	if after := refOf(t, w, "app", "main"); after.Lineage != before.Lineage || after.HeadTXID != before.HeadTXID {
 		t.Fatalf("the refused rollback moved main: %+v -> %+v", before, after)
+	}
+}
+
+// TestRollbackReportsTheAbandonedTransactionRange pins docs/architecture.md
+// (Core model, "rollback reports what transaction range was abandoned";
+// error-handling table, "the abandoned transaction range is reported"):
+// RollbackResult carries the inclusive txid range the branch gave up, and
+// a rollback whose head already sits at the target abandons nothing.
+func TestRollbackReportsTheAbandonedTransactionRange(t *testing.T) {
+	w := seedPromotePair(t)
+	mp, err := w.Checkout("app", "main")
+	if err != nil {
+		t.Fatal(err)
+	}
+	for _, name := range []string{"v2", "v3"} {
+		if out, err := testutil.SQLite3CLI(mp, "INSERT INTO t VALUES (2);").CombinedOutput(); err != nil {
+			t.Fatalf("%v: %s", err, out)
+		}
+		if _, err := w.Checkpoint("app", "main", name, nil); err != nil {
+			t.Fatal(err)
+		}
+	}
+	before, _, err := w.Store.GetRef("app", "main")
+	if err != nil {
+		t.Fatal(err)
+	}
+	v1 := before.Checkpoints["v1"].TXID
+	if before.HeadTXID <= v1+1 {
+		t.Fatalf("precondition: head %d must be at least two txids past v1 %d", before.HeadTXID, v1)
+	}
+	res, err := w.RollbackWith("app", "main", "v1", RollbackOptions{})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if res.AbandonedFrom != v1+1 || res.AbandonedTo != before.HeadTXID {
+		t.Fatalf("abandoned range = [%d, %d], want [%d, %d]", res.AbandonedFrom, res.AbandonedTo, v1+1, before.HeadTXID)
+	}
+	again, err := w.RollbackWith("app", "main", "v1", RollbackOptions{NoBackup: true})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if again.AbandonedFrom != 0 || again.AbandonedTo != 0 {
+		t.Fatalf("rollback to the current head abandoned [%d, %d], want nothing", again.AbandonedFrom, again.AbandonedTo)
+	}
+	// Exactly one transaction above the target is a one-element range.
+	mp, err = w.Checkout("app", "main")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if out, err := testutil.SQLite3CLI(mp, "INSERT INTO t VALUES (3);").CombinedOutput(); err != nil {
+		t.Fatalf("%v: %s", err, out)
+	}
+	if _, err := w.Checkpoint("app", "main", "v4", nil); err != nil {
+		t.Fatal(err)
+	}
+	head := refOf(t, w, "app", "main").HeadTXID
+	one, err := w.RollbackWith("app", "main", "v1", RollbackOptions{NoBackup: true})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if one.AbandonedFrom != head || one.AbandonedTo != head {
+		t.Fatalf("one-txid rollback abandoned [%d, %d], want [%d, %d]", one.AbandonedFrom, one.AbandonedTo, head, head)
 	}
 }

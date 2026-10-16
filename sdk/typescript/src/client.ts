@@ -421,6 +421,22 @@ interface Waiter {
   rej: (e: Error) => void;
 }
 
+/** @internal `resp[key]`, or an OffshootError when an ok:true reply omitted
+ * a key its op documents as always present (internal/daemon/protocol.go) —
+ * the one error type for every failure, never an `undefined` that leaks
+ * into a Session's `path`. */
+function requireField<K extends keyof RawResponse>(
+  resp: RawResponse,
+  key: K,
+  op: string,
+): NonNullable<RawResponse[K]> {
+  const v = resp[key];
+  if (v === undefined || v === null) {
+    throw new OffshootError(`daemon sent a malformed ${op} response: missing ${JSON.stringify(key)}`);
+  }
+  return v;
+}
+
 /** A connection to one offshoot daemon.
  *
  * Correlation note: the daemon answers strictly in the order requests were
@@ -534,16 +550,15 @@ export class Client {
   async open(db: string, branch = "main"): Promise<Session> {
     const resp = await this._call("open", { db, branch });
     // "open" always populates checkout on an ok:true response — see
-    // protocol.go's Response.Checkout — same non-defaulted assumption this
-    // line always made back when resp was `any`, now spelled out as a
-    // non-null assertion instead of an implicit one.
-    return new Session(this, resp.checkout!, db, branch, resp.session_id);
+    // protocol.go's Response.Checkout; a reply without it is malformed and
+    // rejects as an OffshootError rather than minting a path-less Session.
+    return new Session(this, requireField(resp, "checkout", "open"), db, branch, resp.session_id);
   }
 
   /** Materialize db@branch's head snapshot at rest; returns its path. */
   async checkout(db: string, branch: string): Promise<string> {
     const resp = await this._call("checkout", { db, branch });
-    return resp.checkout!;
+    return requireField(resp, "checkout", "checkout");
   }
 
   /** Branch `newBranch` off db@source (at opts.from, or source's head).
@@ -552,7 +567,7 @@ export class Client {
    */
   async fork(db: string, source: string, newBranch: string, opts: ForkOptions = {}): Promise<number> {
     if (opts.at !== undefined && opts.from !== undefined && opts.at !== opts.from) {
-      throw new Error(`fork: from=${JSON.stringify(opts.from)} and at=${JSON.stringify(opts.at)} name different checkpoints; pass one of them`);
+      throw new OffshootError(`fork: from=${JSON.stringify(opts.from)} and at=${JSON.stringify(opts.at)} name different checkpoints; pass one of them`);
     }
     const resp = await this._call("fork", {
       db,
@@ -562,7 +577,7 @@ export class Client {
       ttl: opts.ttl ?? "",
       meta: opts.meta,
     });
-    return resp.txid ?? 0;
+    return requireField(resp, "txid", "fork");
   }
 
   /** Delete db@branch. opts.force overrides the protected-branch refusal. */
@@ -582,7 +597,7 @@ export class Client {
       no_backup: opts.noBackup ?? false, backup_ttl: opts.backupTtl ?? "",
       materialize: opts.materialize ?? false,
     });
-    return resp.checkout ?? "";
+    return requireField(resp, "checkout", "rollback");
   }
 
   /** Repoint db@onto at db@source's head; returns the promoted txid.
@@ -596,14 +611,14 @@ export class Client {
       no_backup: opts.noBackup ?? false, backup_ttl: opts.backupTtl ?? "",
       materialize: opts.materialize ?? false,
     });
-    return resp.txid ?? 0;
+    return requireField(resp, "txid", "promote");
   }
 
   /** Make db@branch self-contained (drop its shared-fork base pointer);
    * returns the head txid. No-op on an already self-contained branch. */
   async compact(db: string, branch: string): Promise<number> {
     const resp = await this._call("compact", { db, branch });
-    return resp.txid ?? 0;
+    return requireField(resp, "txid", "compact");
   }
 
   /** Reset db@branch's activity clock, optionally setting/clearing its TTL.
@@ -703,7 +718,7 @@ export class Client {
    * Returns the read-only cache file's path. */
   async checkoutAt(db: string, branch: string, checkpoint: string, opts: CheckoutAtOptions = {}): Promise<string> {
     const resp = await this._call("checkout-at", { db, branch, name: checkpoint, force: opts.force ?? false });
-    return resp.checkout ?? "";
+    return requireField(resp, "checkout", "checkout-at");
   }
 
   /** Stream the daemon's event feed as an async iterator, yielding one
@@ -874,7 +889,7 @@ export class Session {
   /** Flush the checkout to a durable snapshot; returns its txid. */
   async flush(name = "", opts: FlushOptions = {}): Promise<number> {
     const r = await this.client._call("flush", { db: this.db, branch: this.branch, name, meta: opts.meta });
-    return r.txid ?? 0;
+    return requireField(r, "txid", "flush");
   }
 
   /** Alias of {@link Session.flush} with a required name: a named flush is

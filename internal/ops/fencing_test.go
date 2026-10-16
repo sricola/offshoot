@@ -2,7 +2,6 @@ package ops
 
 import (
 	"errors"
-	"os/exec"
 	"testing"
 	"time"
 
@@ -23,7 +22,7 @@ func TestStaleWriterCannotCorruptLineage(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if out, err := exec.Command("sqlite3", path,
+	if out, err := testutil.SQLite3CLI(path,
 		"CREATE TABLE t (v); INSERT INTO t VALUES ('good');").CombinedOutput(); err != nil {
 		t.Fatalf("%v: %s", err, out)
 	}
@@ -58,7 +57,7 @@ func TestStaleWriterCannotCorruptLineage(t *testing.T) {
 	if err != nil {
 		t.Fatalf("fenced writer damaged the branch: %v", err)
 	}
-	got, _ := exec.Command("sqlite3", p2, "SELECT v FROM t;").Output()
+	got, _ := testutil.SQLite3CLI(p2, "SELECT v FROM t;").Output()
 	if string(got) != "good\n" {
 		t.Fatalf("content = %q, want good", got)
 	}

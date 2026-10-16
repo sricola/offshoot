@@ -7,7 +7,6 @@ import (
 	"fmt"
 	"net"
 	"os"
-	"os/exec"
 	"path/filepath"
 	"syscall"
 	"testing"
@@ -87,7 +86,7 @@ func TestServerOpenFlushStatusClose(t *testing.T) {
 	if !open.OK || open.Checkout == "" {
 		t.Fatalf("open = %+v", open)
 	}
-	if out, err := exec.Command("sqlite3", open.Checkout,
+	if out, err := testutil.SQLite3CLI(open.Checkout,
 		"CREATE TABLE t (v); INSERT INTO t VALUES (1);").CombinedOutput(); err != nil {
 		t.Fatalf("%v: %s", err, out)
 	}
@@ -426,7 +425,7 @@ func TestConcurrentFlushAndCloseIsSafe(t *testing.T) {
 	if !open.OK {
 		t.Fatalf("open = %+v", open)
 	}
-	if out, err := exec.Command("sqlite3", open.Checkout,
+	if out, err := testutil.SQLite3CLI(open.Checkout,
 		"CREATE TABLE t (v); INSERT INTO t VALUES (1);").CombinedOutput(); err != nil {
 		t.Fatalf("%v: %s", err, out)
 	}

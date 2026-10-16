@@ -2,7 +2,6 @@ package ops
 
 import (
 	"os"
-	"os/exec"
 	"testing"
 	"time"
 
@@ -14,7 +13,7 @@ import (
 // build up several distinct checkpoints on app@main quickly.
 func mkCheckpoint(t *testing.T, w *Workspace, path, name string) {
 	t.Helper()
-	if out, err := exec.Command("sqlite3", path,
+	if out, err := testutil.SQLite3CLI(path,
 		"CREATE TABLE IF NOT EXISTS t (v); INSERT INTO t VALUES ('x');").CombinedOutput(); err != nil {
 		t.Fatalf("%v: %s", err, out)
 	}

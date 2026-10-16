@@ -10,7 +10,6 @@ import (
 	"net/http"
 	"net/http/httptest"
 	"os"
-	"os/exec"
 	"path/filepath"
 	"reflect"
 	"regexp"
@@ -21,6 +20,7 @@ import (
 	"time"
 
 	"github.com/sricola/offshoot/internal/ops"
+	"github.com/sricola/offshoot/internal/testutil"
 )
 
 // testHTTPToken is a fixed, obviously-a-test-fixture token used by every
@@ -1064,7 +1064,7 @@ func TestHTTPExportRejectedSocketExportStillWorks(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if out, err := exec.Command("sqlite3", path,
+	if out, err := testutil.SQLite3CLI(path,
 		"CREATE TABLE t (v); INSERT INTO t VALUES ('one');").CombinedOutput(); err != nil {
 		t.Fatalf("%v: %s", err, out)
 	}
@@ -1114,7 +1114,7 @@ func TestHTTPCreateWithPathRejectedPlainCreateStillWorks(t *testing.T) {
 	sock := srv.SocketPath()
 
 	src := filepath.Join(t.TempDir(), "legacy.db")
-	if out, err := exec.Command("sqlite3", src,
+	if out, err := testutil.SQLite3CLI(src,
 		"CREATE TABLE t (v); INSERT INTO t VALUES ('one');").CombinedOutput(); err != nil {
 		t.Fatalf("%v: %s", err, out)
 	}
@@ -1162,7 +1162,7 @@ func TestHTTPDiffOpReturnsContentAwareSummary(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if out, err := exec.Command("sqlite3", path,
+	if out, err := testutil.SQLite3CLI(path,
 		"CREATE TABLE results (id INTEGER PRIMARY KEY, passed INT); "+
 			"INSERT INTO results VALUES (1,1),(2,1),(3,1);").CombinedOutput(); err != nil {
 		t.Fatalf("%v: %s", err, out)
@@ -1170,7 +1170,7 @@ func TestHTTPDiffOpReturnsContentAwareSummary(t *testing.T) {
 	if _, err := w.Checkpoint("app", "main", "v1", nil); err != nil {
 		t.Fatal(err)
 	}
-	if out, err := exec.Command("sqlite3", path,
+	if out, err := testutil.SQLite3CLI(path,
 		"UPDATE results SET passed=0 WHERE id=2;").CombinedOutput(); err != nil {
 		t.Fatalf("%v: %s", err, out)
 	}

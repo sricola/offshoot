@@ -2,7 +2,7 @@ package ops
 
 import (
 	"errors"
-	"os/exec"
+	"reflect"
 	"strings"
 	"testing"
 	"time"
@@ -24,7 +24,7 @@ func seedPromotePair(t *testing.T) *Workspace {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if out, err := exec.Command("sqlite3", path, "CREATE TABLE t (v); INSERT INTO t VALUES (1);").CombinedOutput(); err != nil {
+	if out, err := testutil.SQLite3CLI(path, "CREATE TABLE t (v); INSERT INTO t VALUES (1);").CombinedOutput(); err != nil {
 		t.Fatalf("%v: %s", err, out)
 	}
 	if _, err := w.Checkpoint("app", "main", "v1", nil); err != nil {
@@ -37,7 +37,7 @@ func seedPromotePair(t *testing.T) *Workspace {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if out, err := exec.Command("sqlite3", ap, "INSERT INTO t VALUES (99);").CombinedOutput(); err != nil {
+	if out, err := testutil.SQLite3CLI(ap, "INSERT INTO t VALUES (99);").CombinedOutput(); err != nil {
 		t.Fatalf("%v: %s", err, out)
 	}
 	if _, err := w.Checkpoint("app", "attempt-1", "winner", nil); err != nil {
@@ -52,7 +52,7 @@ func branchRows(t *testing.T, w *Workspace, db, branch string) string {
 	if err != nil {
 		t.Fatal(err)
 	}
-	out, err := exec.Command("sqlite3", p, "SELECT count(*) FROM t;").Output()
+	out, err := testutil.SQLite3CLI(p, "SELECT count(*) FROM t;").Output()
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -136,7 +136,7 @@ func TestPromoteReplacesItsOwnSafetyFork(t *testing.T) {
 		t.Fatal(err)
 	}
 	ap, _ := w.Checkout("app", "attempt-2")
-	if out, err := exec.Command("sqlite3", ap, "INSERT INTO t VALUES (100);").CombinedOutput(); err != nil {
+	if out, err := testutil.SQLite3CLI(ap, "INSERT INTO t VALUES (100);").CombinedOutput(); err != nil {
 		t.Fatalf("%v: %s", err, out)
 	}
 	if _, err := w.Checkpoint("app", "attempt-2", "winner", nil); err != nil {
@@ -232,5 +232,38 @@ func TestPromoteCompatWrapperBacksUp(t *testing.T) {
 	}
 	if _, _, err := w.Store.GetRef("app", "main"+PromoteBackupSuffix); err != nil {
 		t.Fatalf("Promote must mint the safety fork by default: %v", err)
+	}
+}
+
+// TestPromoteFromAnUnmarkedBranchAtTheSafetyForkNameRefuses pins
+// docs/reference.md "offshoot promote" (The safety fork): the safety fork
+// is "only ever replaced when the branch at that name carries the marker —
+// a branch of your own that merely shares the name makes promote refuse
+// (destroy or rename it, or pass --no-backup)". Promoting such a branch
+// onto its target is that case with the source itself at the name: the
+// undo shortcut (skip minting when the source IS the safety fork) must be
+// keyed on the marker, not the name, or the refusal is silently skipped
+// and the target's undo point is never kept. Verified against the pre-fix
+// code, which skipped by name and minted nothing.
+func TestPromoteFromAnUnmarkedBranchAtTheSafetyForkNameRefuses(t *testing.T) {
+	w := seedPromotePair(t)
+	name := "main" + PromoteBackupSuffix
+	if _, err := w.Fork("app", "main", name, "", 0, nil); err != nil {
+		t.Fatal(err)
+	}
+	before := refOf(t, w, "app", "main")
+	_, err := w.PromoteWith("app", name, "main", PromoteOptions{Force: true})
+	if err == nil || !strings.Contains(err.Error(), "not a promote safety fork") {
+		t.Fatalf("promote from an unmarked %s: err = %v, want the safety-fork name refusal", name, err)
+	}
+	if after := refOf(t, w, "app", "main"); !reflect.DeepEqual(before, after) {
+		t.Fatalf("refused promote touched main's ref:\n%+v\n%+v", before, after)
+	}
+	res, err := w.PromoteWith("app", name, "main", PromoteOptions{Force: true, NoBackup: true})
+	if err != nil {
+		t.Fatalf("--no-backup is the documented way past the refusal: %v", err)
+	}
+	if res.Backup != "" {
+		t.Fatalf("no-backup promote minted %q", res.Backup)
 	}
 }

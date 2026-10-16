@@ -1,11 +1,11 @@
 package daemon
 
 import (
-	"os/exec"
 	"testing"
 	"time"
 
 	"github.com/sricola/offshoot/internal/store"
+	"github.com/sricola/offshoot/internal/testutil"
 )
 
 // TestServeSnapshotEveryWiringDrivesCadence proves -snapshot-every's daemon
@@ -26,12 +26,12 @@ func TestServeSnapshotEveryWiringDrivesCadence(t *testing.T) {
 	if !open.OK || open.Checkout == "" {
 		t.Fatalf("open = %+v", open)
 	}
-	if out, err := exec.Command("sqlite3", open.Checkout, "CREATE TABLE t (v);").CombinedOutput(); err != nil {
+	if out, err := testutil.SQLite3CLI(open.Checkout, "CREATE TABLE t (v);").CombinedOutput(); err != nil {
 		t.Fatalf("CREATE TABLE failed: %v: %s", err, out)
 	}
 
 	for i := 0; i < 9; i++ {
-		if out, err := exec.Command("sqlite3", open.Checkout,
+		if out, err := testutil.SQLite3CLI(open.Checkout,
 			"INSERT INTO t VALUES ('x');").CombinedOutput(); err != nil {
 			t.Fatalf("INSERT %d failed: %v: %s", i, err, out)
 		}

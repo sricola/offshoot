@@ -101,7 +101,7 @@ func TestForkCheckpointRollbackThroughTools(t *testing.T) {
 		t.Fatalf("checkout: %s", text(co))
 	}
 	path := strings.TrimSpace(lastPath(text(co)))
-	if out, err := exec.Command("sqlite3", path,
+	if out, err := testutil.SQLite3CLI(path,
 		"CREATE TABLE t (v); INSERT INTO t VALUES ('original');").CombinedOutput(); err != nil {
 		t.Fatalf("%v: %s", err, out)
 	}
@@ -118,7 +118,7 @@ func TestForkCheckpointRollbackThroughTools(t *testing.T) {
 	aco := call(t, ts, "offshoot_checkout", map[string]any{
 		"database": "app", "branch": "attempt-1"})
 	apath := strings.TrimSpace(lastPath(text(aco)))
-	if out, err := exec.Command("sqlite3", apath, "DROP TABLE t;").CombinedOutput(); err != nil {
+	if out, err := testutil.SQLite3CLI(apath, "DROP TABLE t;").CombinedOutput(); err != nil {
 		t.Fatalf("%v: %s", err, out)
 	}
 	if r := call(t, ts, "offshoot_checkpoint", map[string]any{
@@ -131,7 +131,7 @@ func TestForkCheckpointRollbackThroughTools(t *testing.T) {
 		t.Fatalf("rollback: %s", text(rb))
 	}
 	rpath := strings.TrimSpace(lastPath(text(rb)))
-	got, err := exec.Command("sqlite3", rpath, "SELECT v FROM t;").Output()
+	got, err := testutil.SQLite3CLI(rpath, "SELECT v FROM t;").Output()
 	if err != nil || string(got) != "original\n" {
 		t.Fatalf("rollback did not restore: %q err=%v", got, err)
 	}
@@ -627,7 +627,7 @@ func TestToolResultNeverClaimsUndeliveredDurability(t *testing.T) {
 	ts, _ := newTools(t)
 	co := call(t, ts, "offshoot_checkout", map[string]any{"database": "app"})
 	path := strings.TrimSpace(lastPath(text(co)))
-	if out, err := exec.Command("sqlite3", path,
+	if out, err := testutil.SQLite3CLI(path,
 		"CREATE TABLE t (v); INSERT INTO t VALUES (1);").CombinedOutput(); err != nil {
 		t.Fatalf("%v: %s", err, out)
 	}
@@ -763,8 +763,8 @@ func TestForkSchemaAdvertisesTTL(t *testing.T) {
 		if !strings.Contains(strings.ToLower(tl.Description), "expire") {
 			t.Errorf("offshoot_fork: Description must state the default TTL behavior: %s", tl.Description)
 		}
-		if !strings.Contains(strings.ToLower(tl.Description), "janitor") {
-			t.Errorf("offshoot_fork: Description must note reaping requires a running janitor: %s", tl.Description)
+		if !strings.Contains(tl.Description, "-reap-every") {
+			t.Errorf("offshoot_fork: Description must name the reaping timer (-reap-every) that sweeps expired forks: %s", tl.Description)
 		}
 		return
 	}
@@ -802,8 +802,9 @@ func TestForkDescriptionStatesItsRealCost(t *testing.T) {
 // applied TTL and a computed expiry timestamp, so both land in the agent's
 // transcript and it can reason about them later without a separate
 // offshoot_list/offshoot_checkout round trip. It must also carry the same
-// "requires a running janitor" caveat as the Description, since a
-// daemonless MCP setup only reaps on `offshoot gc`.
+// reaping caveat as the Description (expired forks are swept by this
+// server's -reap-every timer or a serve janitor; with the timer off, only
+// `offshoot gc`).
 func TestForkResponseEchoesTTLAndExpiry(t *testing.T) {
 	ts, _ := newTools(t)
 	r := call(t, ts, "offshoot_fork", map[string]any{
@@ -825,8 +826,8 @@ func TestForkResponseEchoesTTLAndExpiry(t *testing.T) {
 	if !strings.Contains(msg, "expires_at=") {
 		t.Errorf("response must echo a computed expiry timestamp (expires_at=...): %s", msg)
 	}
-	if !strings.Contains(strings.ToLower(msg), "janitor") {
-		t.Errorf("response must note that reaping requires a running janitor: %s", msg)
+	if !strings.Contains(msg, "-reap-every") {
+		t.Errorf("response must carry the reaping caveat naming -reap-every: %s", msg)
 	}
 }
 
@@ -864,8 +865,8 @@ func TestForkTTLSummaryKeepsJanitorNoteWhenReReadFails(t *testing.T) {
 	if strings.Contains(msg, "expires_at=") {
 		t.Fatalf("expected the degraded (no re-read) path, but got an expiry anyway: %s", msg)
 	}
-	if !strings.Contains(strings.ToLower(msg), "janitor") {
-		t.Errorf("degraded path must still carry the janitor caveat — it doesn't depend on the re-read: %s", msg)
+	if !strings.Contains(msg, "-reap-every") {
+		t.Errorf("degraded path must still carry the reaping caveat — it doesn't depend on the re-read: %s", msg)
 	}
 	if !strings.Contains(msg, "1h0m0s") {
 		t.Errorf("degraded path must still echo the applied TTL: %s", msg)
@@ -946,13 +947,13 @@ func TestRollbackKeepsSafetyForkAndSaysSo(t *testing.T) {
 			if err != nil {
 				t.Fatal(err)
 			}
-			if out, err := exec.Command("sqlite3", p, "CREATE TABLE t (v); INSERT INTO t VALUES (1);").CombinedOutput(); err != nil {
+			if out, err := testutil.SQLite3CLI(p, "CREATE TABLE t (v); INSERT INTO t VALUES (1);").CombinedOutput(); err != nil {
 				t.Fatalf("%v: %s", err, out)
 			}
 			if _, err := w.Checkpoint("app", "attempt-1", "v1", nil); err != nil {
 				t.Fatal(err)
 			}
-			if out, err := exec.Command("sqlite3", p, "INSERT INTO t VALUES (2);").CombinedOutput(); err != nil {
+			if out, err := testutil.SQLite3CLI(p, "INSERT INTO t VALUES (2);").CombinedOutput(); err != nil {
 				t.Fatalf("%v: %s", err, out)
 			}
 			if _, err := w.Checkpoint("app", "attempt-1", "v2", nil); err != nil {
@@ -1087,7 +1088,7 @@ func TestGuardProtectedSafetyFork(t *testing.T) {
 		if err != nil {
 			t.Fatal(err)
 		}
-		if out, err := exec.Command("sqlite3", p, "CREATE TABLE t (v); INSERT INTO t VALUES (1);").CombinedOutput(); err != nil {
+		if out, err := testutil.SQLite3CLI(p, "CREATE TABLE t (v); INSERT INTO t VALUES (1);").CombinedOutput(); err != nil {
 			t.Fatalf("%v: %s", err, out)
 		}
 		if _, err := w.Checkpoint("app", "attempt-1", "v1", nil); err != nil {
@@ -1512,7 +1513,7 @@ func TestDiffToolComparesAttemptsContentAware(t *testing.T) {
 	}
 	sqlite := func(path, q string) {
 		t.Helper()
-		if out, err := exec.Command("sqlite3", path, q).CombinedOutput(); err != nil {
+		if out, err := testutil.SQLite3CLI(path, q).CombinedOutput(); err != nil {
 			t.Fatalf("%v: %s", err, out)
 		}
 	}

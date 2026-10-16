@@ -108,6 +108,24 @@ func runDiff(w *ops.Workspace, out io.Writer, leftTarget, rightTarget string, su
 		return ops.FormatDiffSummary(out, ops.DiffReportOf(rows), leftTarget, rightTarget)
 	}
 
+	if table != "" {
+		// sqldiff ignores a --table that exists on neither side and prints
+		// nothing, which would read as "no differences" for a typo; refuse
+		// it the way --summary does.
+		found := false
+		for _, path := range []string{left.Path, right.Path} {
+			counts, err := ops.TableRowCounts(path)
+			if err != nil {
+				return fmt.Errorf("offshoot diff: %w", err)
+			}
+			if _, ok := counts[table]; ok {
+				found = true
+			}
+		}
+		if !found {
+			return fmt.Errorf("offshoot diff: no table %q on either side", table)
+		}
+	}
 	if err := ops.Sqldiff(left.Path, right.Path, table, out); err != nil {
 		if errors.Is(err, ops.ErrSqldiffMissing) {
 			return sqldiffNotFoundError()

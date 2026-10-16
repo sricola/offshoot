@@ -12,6 +12,7 @@ import (
 	"fmt"
 	"reflect"
 	"strings"
+	"sync"
 	"sync/atomic"
 	"testing"
 	"time"
@@ -604,9 +605,33 @@ func TestCreateLandedWriteKeepsSnapshotAndIsReadable(t *testing.T) {
 	}
 }
 
+// hideRefOnce answers the first List of prefix (the database's refs,
+// create's existence pre-check) as empty while refs exist underneath: a
+// create whose pre-check runs just before a concurrent create of the same
+// name lands.
+type hideRefOnce struct {
+	store.Backend
+	prefix string
+	once   sync.Once
+}
+
+func (b *hideRefOnce) List(prefix string) ([]string, error) {
+	hidden := false
+	if prefix == b.prefix {
+		b.once.Do(func() { hidden = true })
+	}
+	if hidden {
+		return nil, nil
+	}
+	return b.Backend.List(prefix)
+}
+
 // TestCreateOntoTakenNameLeavesSnapshotForGC: a second create of the same
-// database returns the existing error, leaves the existing database
-// untouched, and leaves its own snapshot for GC, which reclaims it.
+// database that loses the ref CAS (its existence pre-check ran before the
+// first create landed) returns the existing error, leaves the existing
+// database untouched, and leaves its own snapshot for GC, which reclaims
+// it. A create that sees the name taken up front mints nothing at all
+// (TestRefusedCreateMintsNoObject).
 func TestCreateOntoTakenNameLeavesSnapshotForGC(t *testing.T) {
 	w := newWS(t)
 	if err := w.Create("app"); err != nil {
@@ -614,7 +639,10 @@ func TestCreateOntoTakenNameLeavesSnapshotForGC(t *testing.T) {
 	}
 	before := refOf(t, w, "app", "main")
 	keys := dataKeys(t, w)
+	real := w.Store.B
+	w.Store.B = &hideRefOnce{Backend: real, prefix: store.RefKey("app", "")}
 	err := w.Create("app")
+	w.Store.B = real
 	if err == nil || err.Error() != `ops: database "app" already exists (offshoot status lists databases)` {
 		t.Fatalf("second create: err = %v, want the already-exists error", err)
 	}

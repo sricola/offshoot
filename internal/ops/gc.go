@@ -681,6 +681,20 @@ func (w *Workspace) reachableObjectsAndHeads() (map[string]bool, map[string]live
 		dbs = append(dbs, db)
 	}
 	sort.Strings(dbs)
+	// Read every ref before listing any lineage. The mark cache memoizes
+	// each lineage listing for the whole pass, and a shared child resolves
+	// (and so lists) its parent's lineage before the parent's own ref is
+	// read; a checkpoint landing on the parent in between would make that
+	// ref's head unreachable in the cached listing and fail the pass as a
+	// phantom hole. Reading the refs first keeps every listing at least as
+	// new as every ref it serves: a ref's head always resolves, and
+	// objects written after a ref was read sit above a live head in the
+	// current epoch, which the compensating rule in sweep never deletes.
+	type liveRef struct {
+		db, branch string
+		ref        store.Ref
+	}
+	var live []liveRef
 	for _, db := range dbs {
 		for _, branch := range refs[db] {
 			r, _, err := w.Store.GetRef(db, branch)
@@ -690,6 +704,12 @@ func (w *Workspace) reachableObjectsAndHeads() (map[string]bool, map[string]live
 				}
 				return nil, nil, fmt.Errorf("ops: gc mark %s@%s: %w", db, branch, err)
 			}
+			live = append(live, liveRef{db, branch, r})
+		}
+	}
+	for _, lr := range live {
+		db, branch, r := lr.db, lr.branch, lr.ref
+		{
 			if h, ok := heads[r.Lineage]; !ok {
 				heads[r.Lineage] = liveHead{TXID: r.HeadTXID, Epoch: r.Epoch}
 			} else {

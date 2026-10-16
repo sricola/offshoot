@@ -571,7 +571,16 @@ func Verify(path string, ino Inode) error {
 // write-protected file still falls back to a read-only open). The path is
 // escaped so the URI names exactly that file: '?' and '#' would end it, '%'
 // would start an escape, and a leading "//" would read as an authority.
-func NoCreateDSN(path, params string) string {
+func NoCreateDSN(path, params string) string { return uriDSN(path, "rw", params) }
+
+// ReadOnlyDSN is NoCreateDSN with mode=ro: the connection can never write
+// the main file, and — the property an import of a foreign database
+// relies on — closing it never checkpoints the file's WAL into it or
+// unlinks the -wal/-shm, which a last read-write connection does on its
+// way out. Reads still see every committed frame in the WAL.
+func ReadOnlyDSN(path, params string) string { return uriDSN(path, "ro", params) }
+
+func uriDSN(path, mode, params string) string {
 	var b strings.Builder
 	b.WriteString("file:")
 	for i := 0; i < len(path); i++ {
@@ -582,7 +591,7 @@ func NoCreateDSN(path, params string) string {
 		}
 		b.WriteByte(c)
 	}
-	b.WriteString("?mode=rw")
+	b.WriteString("?mode=" + mode)
 	if params != "" {
 		b.WriteString("&" + params)
 	}

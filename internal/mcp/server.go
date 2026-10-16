@@ -281,10 +281,11 @@ func (s *Server) dispatch(ctx context.Context, req Request) (Response, bool) {
 		}
 		if meta != nil {
 			return reply(modernToolCallResult{
-				ResultType: "complete",
-				Content:    result.Content,
-				IsError:    result.IsError,
-				Meta:       newResponseMeta(),
+				ResultType:        "complete",
+				Content:           result.Content,
+				IsError:           result.IsError,
+				StructuredContent: result.StructuredContent,
+				Meta:              newResponseMeta(),
 			}, nil)
 		}
 		return reply(result, nil)

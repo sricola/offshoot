@@ -461,7 +461,7 @@ test("rollback and promote send the materialize wire field", async () => {
   (client as unknown as { _call: (op: string, fields: Record<string, unknown>) => Promise<unknown> })._call =
     async (op, fields) => {
       sent.push([op, fields]);
-      return { ok: true };
+      return { ok: true, checkout: "/c", txid: 1 };
     };
   await client.rollback("app", "main", "v1");
   await client.rollback("app", "main", "v1", { materialize: true });
@@ -1175,4 +1175,231 @@ test("daemon death mid-call raises OffshootError", async (t: TestContext) => {
   } finally {
     await d.stop();
   }
+});
+
+// --- ok:true replies missing a documented key, conflicting fork options ---
+// (pure client-contract tests, no daemon needed: Object.create(Client.prototype)
+// plus a per-instance `_call`, as the wire-compat tests above do).
+
+test("open: an ok:true reply without `checkout` rejects with OffshootError, not a Session with an undefined path", async () => {
+  // protocol.go's Response.Checkout is documented as always populated on an
+  // ok:true "open"; a reply that omits it must surface as the one error
+  // type this client promises (client.ts's OffshootError doc comment),
+  // never as a Session whose `path` is undefined.
+  const client = Object.create(Client.prototype) as Client;
+  (client as unknown as { _call: Client["_call"] })._call = async () => ({ ok: true, session_id: "x" });
+  await assert.rejects(client.open("app"), (e: unknown) => {
+    assert.ok(e instanceof OffshootError, `want OffshootError, got ${String(e)}`);
+    assert.match(e.message, /checkout/);
+    return true;
+  });
+});
+
+test("checkout: an ok:true reply without `checkout` rejects with OffshootError, not undefined", async () => {
+  const client = Object.create(Client.prototype) as Client;
+  (client as unknown as { _call: Client["_call"] })._call = async () => ({ ok: true });
+  await assert.rejects(client.checkout("app", "main"), (e: unknown) => {
+    assert.ok(e instanceof OffshootError, `want OffshootError, got ${String(e)}`);
+    assert.match(e.message, /checkout/);
+    return true;
+  });
+});
+
+test("fork: conflicting `at` and `from` reject with OffshootError (instanceof, not just the message) and never reach the wire", async () => {
+  const client = Object.create(Client.prototype) as Client;
+  let calls = 0;
+  (client as unknown as { _call: Client["_call"] })._call = async () => {
+    calls++;
+    return { ok: true, txid: 1 };
+  };
+  await assert.rejects(client.fork("app", "main", "nope", { from: "v1", at: "v2" }), (e: unknown) => {
+    assert.ok(e instanceof OffshootError, `want OffshootError, got ${String(e)}`);
+    assert.match(e.message, /pass one of them/);
+    return true;
+  });
+  assert.equal(calls, 0, "a conflicting at/from must be refused client-side, before any request");
+  // Agreeing values are not a conflict: the call goes out once.
+  assert.equal(await client.fork("app", "main", "ok", { from: "v1", at: "v1" }), 1);
+  assert.equal(calls, 1);
+});
+
+// --- exact wire bytes ------------------------------------------------------
+
+/** A scripted one-connection request/response daemon: records every raw
+ * request line it receives and answers each with `reply`. Pins the exact
+ * bytes a Client method puts on the wire, which a per-instance `_call`
+ * cannot see — `_call`'s own field-stripping rule is what is under test. */
+async function fakeRequestDaemon(
+  reply: Record<string, unknown>,
+): Promise<{ sockPath: string; received: string[]; close: () => Promise<void> }> {
+  const dir = mkdtempSync(join(tmpdir(), "offshoot-fake-daemon-"));
+  const sockPath = join(dir, "d.sock");
+  const received: string[] = [];
+  const srv: Server = createServer((conn) => {
+    conn.setEncoding("utf8");
+    let buf = "";
+    conn.on("data", (chunk: string) => {
+      buf += chunk;
+      let i: number;
+      while ((i = buf.indexOf("\n")) >= 0) {
+        received.push(buf.slice(0, i + 1));
+        buf = buf.slice(i + 1);
+        conn.write(JSON.stringify(reply) + "\n");
+      }
+    });
+  });
+  await new Promise<void>((res) => srv.listen(sockPath, res));
+  return {
+    sockPath,
+    received,
+    close: () =>
+      new Promise<void>((res) => {
+        srv.close(() => res());
+        rmSync(dir, { recursive: true, force: true });
+      }),
+  };
+}
+
+test("wire: fork with every option at its default and promote(force=false, backup) send only op/db/branch/name", async () => {
+  // protocol.go's Request omitempty fields stay absent — not "", false or
+  // {} — so fork({}) carries no ttl/meta/from and promote({}) carries no
+  // force/no_backup/backup_ttl/materialize. Byte-exact, JSON.stringify
+  // field order included.
+  const fake = await fakeRequestDaemon({ ok: true, txid: 7 });
+  try {
+    const c = await connect(fake.sockPath);
+    try {
+      assert.equal(await c.fork("app", "main", "new"), 7);
+      assert.equal(await c.promote("app", "src", "main"), 7);
+    } finally {
+      await c.close();
+    }
+    assert.deepEqual(fake.received, [
+      '{"op":"fork","db":"app","branch":"main","name":"new"}\n',
+      '{"op":"promote","db":"app","branch":"src","name":"main"}\n',
+    ]);
+  } finally {
+    await fake.close();
+  }
+});
+
+// --- compact against a real daemon -----------------------------------------
+
+test("compact: makes a shared fork self-contained and returns its head txid", async (t: TestContext) => {
+  if (!canRun) {
+    t.skip("go and/or sqlite3 not on PATH");
+    return;
+  }
+  const c = await connect(fixture!.sock);
+  try {
+    await c.create("compact-app");
+    const s = await c.open("compact-app");
+    sqlite3(s.path, "CREATE TABLE t (v); INSERT INTO t VALUES ('one');");
+    await s.flush("v1");
+    await s.close();
+    await c.fork("compact-app", "main", "cow");
+    let info = new Map((await c.branches("compact-app")).map((b) => [b.branch, b]));
+    assert.equal(info.get("cow")!.shared, true, "a fresh fork must be shared");
+    const headBefore = info.get("cow")!.head_txid;
+
+    const txid = await c.compact("compact-app", "cow");
+
+    assert.ok(txid > 0);
+    info = new Map((await c.branches("compact-app")).map((b) => [b.branch, b]));
+    assert.equal(info.get("cow")!.shared, false, "compact must make the fork self-contained");
+    assert.equal(txid, info.get("cow")!.head_txid);
+    assert.equal(info.get("cow")!.head_txid, headBefore);
+    assert.equal(sqlite3(await c.checkout("compact-app", "cow"), "SELECT count(*) FROM t;").trim(), "1");
+    // Idempotent: a second compact of a self-contained branch is a no-op.
+    assert.equal(await c.compact("compact-app", "cow"), txid);
+  } finally {
+    await c.close();
+  }
+});
+
+// --- ok:true replies missing a documented key, over a real socket ----------
+// Every op whose ok:true reply documents a key as always present
+// (internal/daemon/server.go: opFork/opFlush/opPromote/opCompact answer
+// `Response{OK: true, TXID: ...}`, opRollback/opCheckoutAt answer
+// `Response{OK: true, Checkout: ...}`) rejects with an OffshootError naming
+// the op and the key when a reply omits it — never a silent 0 or "". Goes
+// through fakeRequestDaemon (a real socket answering every request with one
+// fixed reply) so _call's own decode path is exercised, not a canned method.
+// A txid is never legitimately 0 (a db is created at txid 1), so
+// protocol.go's omitempty on TXID cannot drop a real answer; the optional
+// keys (backup, shared) keep defaulting.
+
+async function withFakeClient<T>(reply: Record<string, unknown>, fn: (c: Client) => Promise<T>): Promise<T> {
+  const fake = await fakeRequestDaemon(reply);
+  try {
+    const c = await connect(fake.sockPath);
+    try {
+      return await fn(c);
+    } finally {
+      await c.close();
+    }
+  } finally {
+    await fake.close();
+  }
+}
+
+function malformed(op: string, key: string): (e: unknown) => boolean {
+  return (e: unknown) => {
+    assert.ok(e instanceof OffshootError, `want OffshootError, got ${String(e)}`);
+    assert.equal(e.message, `daemon sent a malformed ${op} response: missing ${JSON.stringify(key)}`);
+    return true;
+  };
+}
+
+test("fork: an ok:true reply without `txid` rejects with OffshootError naming fork/txid", async () => {
+  await withFakeClient({ ok: true, checkout: "/c" }, async (c) => {
+    await assert.rejects(c.fork("app", "main", "new"), malformed("fork", "txid"));
+  });
+});
+
+test("flush: an ok:true reply without `txid` rejects with OffshootError naming flush/txid", async () => {
+  // The one reply serves open (checkout present) and starves flush.
+  await withFakeClient({ ok: true, checkout: "/c" }, async (c) => {
+    const s = await c.open("app");
+    assert.equal(s.path, "/c");
+    await assert.rejects(s.flush(), malformed("flush", "txid"));
+  });
+});
+
+test("checkpoint: an ok:true reply without `txid` rejects naming the wire op, flush", async () => {
+  await withFakeClient({ ok: true, checkout: "/c" }, async (c) => {
+    const s = await c.open("app");
+    await assert.rejects(s.checkpoint("v1"), malformed("flush", "txid"));
+  });
+});
+
+test("rollback: an ok:true reply without `checkout` rejects with OffshootError naming rollback/checkout", async () => {
+  await withFakeClient({ ok: true, txid: 7 }, async (c) => {
+    await assert.rejects(c.rollback("app", "main", "v1"), malformed("rollback", "checkout"));
+  });
+});
+
+test("promote: an ok:true reply without `txid` rejects with OffshootError naming promote/txid", async () => {
+  await withFakeClient({ ok: true, checkout: "/c" }, async (c) => {
+    await assert.rejects(c.promote("app", "attempt", "main"), malformed("promote", "txid"));
+  });
+});
+
+test("compact: an ok:true reply without `txid` rejects with OffshootError naming compact/txid", async () => {
+  await withFakeClient({ ok: true, checkout: "/c" }, async (c) => {
+    await assert.rejects(c.compact("app", "cow"), malformed("compact", "txid"));
+  });
+});
+
+test("checkoutAt: an ok:true reply without `checkout` rejects with OffshootError naming checkout-at/checkout", async () => {
+  await withFakeClient({ ok: true, txid: 7 }, async (c) => {
+    await assert.rejects(c.checkoutAt("app", "main", "v1"), malformed("checkout-at", "checkout"));
+  });
+});
+
+test("rollback and promote still accept a reply without `backup`/`shared` (omitempty by design)", async () => {
+  await withFakeClient({ ok: true, checkout: "/c", txid: 7 }, async (c) => {
+    assert.equal(await c.rollback("app", "main", "v1"), "/c");
+    assert.equal(await c.promote("app", "attempt", "main"), 7);
+  });
 });

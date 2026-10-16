@@ -2,7 +2,6 @@ package daemon
 
 import (
 	"context"
-	"os/exec"
 	"path/filepath"
 	"testing"
 	"time"
@@ -64,7 +63,7 @@ func TestFlushedDataSurvivesDaemonRestart(t *testing.T) {
 	if !open.OK {
 		t.Fatalf("open = %+v", open)
 	}
-	if out, err := exec.Command("sqlite3", open.Checkout,
+	if out, err := testutil.SQLite3CLI(open.Checkout,
 		"CREATE TABLE t (v); INSERT INTO t VALUES ('flushed');").CombinedOutput(); err != nil {
 		t.Fatalf("%v: %s", err, out)
 	}
@@ -108,7 +107,7 @@ func TestFlushedDataSurvivesDaemonRestart(t *testing.T) {
 	if !open2.OK {
 		t.Fatalf("reopen after restart = %+v", open2)
 	}
-	out, err := exec.Command("sqlite3", open2.Checkout, "SELECT v FROM t;").Output()
+	out, err := testutil.SQLite3CLI(open2.Checkout, "SELECT v FROM t;").Output()
 	if err != nil || string(out) != "flushed\n" {
 		t.Fatalf("flushed data lost across restart: %q err=%v", out, err)
 	}

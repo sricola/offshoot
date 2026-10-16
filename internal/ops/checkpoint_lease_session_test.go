@@ -4,7 +4,6 @@ import (
 	"context"
 	"errors"
 	"fmt"
-	"os/exec"
 	"strings"
 	"sync"
 	"sync/atomic"
@@ -38,7 +37,7 @@ func leaseSeededMain(t *testing.T, w *ops.Workspace) string {
 
 func leaseSQL(t *testing.T, path, stmt string) string {
 	t.Helper()
-	out, err := exec.Command("sqlite3", path, stmt).CombinedOutput()
+	out, err := testutil.SQLite3CLI(path, stmt).CombinedOutput()
 	if err != nil {
 		t.Fatalf("sqlite3 %q: %v: %s", stmt, err, out)
 	}

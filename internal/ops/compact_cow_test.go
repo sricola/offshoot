@@ -7,7 +7,6 @@ package ops_test
 import (
 	"context"
 	"errors"
-	"os/exec"
 	"testing"
 
 	"github.com/sricola/offshoot/internal/session"
@@ -30,13 +29,13 @@ func TestCompactMakesBranchSelfContained(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if out, err := exec.Command("sqlite3", s.CheckoutPath(), "CREATE TABLE t (v);").CombinedOutput(); err != nil {
+	if out, err := testutil.SQLite3CLI(s.CheckoutPath(), "CREATE TABLE t (v);").CombinedOutput(); err != nil {
 		t.Fatalf("CREATE TABLE: %v: %s", err, out)
 	}
 	if _, err := s.Flush("", nil); err != nil {
 		t.Fatal(err)
 	}
-	if out, err := exec.Command("sqlite3", s.CheckoutPath(), "INSERT INTO t VALUES (1);").CombinedOutput(); err != nil {
+	if out, err := testutil.SQLite3CLI(s.CheckoutPath(), "INSERT INTO t VALUES (1);").CombinedOutput(); err != nil {
 		t.Fatalf("INSERT: %v: %s", err, out)
 	}
 	// Segment past the settling snapshot: main's chain is multi-member.
@@ -66,7 +65,7 @@ func TestCompactMakesBranchSelfContained(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if out, err := exec.Command("sqlite3", cs.CheckoutPath(), "INSERT INTO t VALUES (2);").CombinedOutput(); err != nil {
+	if out, err := testutil.SQLite3CLI(cs.CheckoutPath(), "INSERT INTO t VALUES (2);").CombinedOutput(); err != nil {
 		t.Fatalf("INSERT: %v: %s", err, out)
 	}
 	if _, err := cs.Flush("", nil); err != nil {
@@ -143,7 +142,7 @@ func TestCompactAllowsAncestorReclaim(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if out, err := exec.Command("sqlite3", s.CheckoutPath(),
+	if out, err := testutil.SQLite3CLI(s.CheckoutPath(),
 		"CREATE TABLE t (v); INSERT INTO t VALUES (1);").CombinedOutput(); err != nil {
 		t.Fatalf("seed: %v: %s", err, out)
 	}
@@ -180,7 +179,7 @@ func TestCompactAllowsAncestorReclaim(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if got, err := exec.Command("sqlite3", cpath, "SELECT v FROM t;").Output(); err != nil || string(got) != "1\n" {
+	if got, err := testutil.SQLite3CLI(cpath, "SELECT v FROM t;").Output(); err != nil || string(got) != "1\n" {
 		t.Fatalf("compacted child content = %q (err %v), want \"1\\n\"", got, err)
 	}
 
@@ -236,14 +235,14 @@ func TestCompactPreservesContent(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if out, err := exec.Command("sqlite3", s.CheckoutPath(),
+	if out, err := testutil.SQLite3CLI(s.CheckoutPath(),
 		"CREATE TABLE t (a, b); INSERT INTO t VALUES (1, 'one');").CombinedOutput(); err != nil {
 		t.Fatalf("seed: %v: %s", err, out)
 	}
 	if _, err := s.Flush("", nil); err != nil {
 		t.Fatal(err)
 	}
-	if out, err := exec.Command("sqlite3", s.CheckoutPath(), "INSERT INTO t VALUES (2, 'two');").CombinedOutput(); err != nil {
+	if out, err := testutil.SQLite3CLI(s.CheckoutPath(), "INSERT INTO t VALUES (2, 'two');").CombinedOutput(); err != nil {
 		t.Fatalf("insert: %v: %s", err, out)
 	}
 	if _, err := s.Flush("", nil); err != nil {
@@ -264,7 +263,7 @@ func TestCompactPreservesContent(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if out, err := exec.Command("sqlite3", cs.CheckoutPath(), "INSERT INTO t VALUES (3, 'three');").CombinedOutput(); err != nil {
+	if out, err := testutil.SQLite3CLI(cs.CheckoutPath(), "INSERT INTO t VALUES (3, 'three');").CombinedOutput(); err != nil {
 		t.Fatalf("diverge: %v: %s", err, out)
 	}
 	if _, err := cs.Flush("", nil); err != nil {
@@ -278,7 +277,7 @@ func TestCompactPreservesContent(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	dumpBefore, err := exec.Command("sqlite3", cpath, ".dump").Output()
+	dumpBefore, err := testutil.SQLite3CLI(cpath, ".dump").Output()
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -288,7 +287,7 @@ func TestCompactPreservesContent(t *testing.T) {
 	}
 	// Compact refreshed the existing checkout itself (its best-effort
 	// tail); the dump at the same path must be byte-identical.
-	dumpAfter, err := exec.Command("sqlite3", cpath, ".dump").Output()
+	dumpAfter, err := testutil.SQLite3CLI(cpath, ".dump").Output()
 	if err != nil {
 		t.Fatal(err)
 	}
