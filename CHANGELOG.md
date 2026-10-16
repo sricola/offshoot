@@ -17,6 +17,10 @@ Pin an exact version if you depend on format stability. The full contract:
 
 ## [Unreleased]
 
+Nothing yet.
+
+## [0.2.21] - 2026-10-17
+
 A specification-conformance initiative: every documented requirement was
 traced to its implementation and a test, the gaps were closed with
 mutation-verified regression tests, and the defects that surfaced are
