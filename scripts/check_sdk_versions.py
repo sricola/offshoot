@@ -1,18 +1,20 @@
 #!/usr/bin/env python3
-"""Verify the two SDKs' versions agree with the single source of truth.
+"""Verify every SDK manifest's version agrees with the single source of truth.
 
 Version discipline (see CONTRIBUTING.md's "Release process"): `sdk/VERSION`
 is the one file a maintainer edits to bump the SDK version. Everything else
-that spells the version out literally (`sdk/python/pyproject.toml`'s
-`[project].version`, `sdk/typescript/package.json`'s `version`) must be kept
-in lockstep by hand and is checked against `sdk/VERSION` here, in CI, and
-again by `.github/workflows/publish.yml` against the pushed tag. This script
-is stdlib-only, matching the base SDKs' own dependency policy, and exits
+that spells the version out literally (`sdk/python/pyproject.toml`'s and
+`sdk/python-langgraph/pyproject.toml`'s `[project].version`,
+`sdk/typescript/package.json`'s `version`) must be kept in lockstep by hand
+and is checked against `sdk/VERSION` here, in CI, and again by
+`.github/workflows/publish.yml` against the pushed tag. This script is
+stdlib-only, matching the base SDKs' own dependency policy, and exits
 non-zero with every mismatch listed (not just the first) so a release bump
 that missed a spot fails loudly instead of silently drifting.
 
-Both SDKs are published in lockstep from one `sdk-v<version>` tag (see
-CONTRIBUTING.md) — there is deliberately one version number, not two.
+All three packages are published in lockstep from one `sdk-v<version>` tag
+(see CONTRIBUTING.md) — there is deliberately one version number, not
+three.
 """
 
 from __future__ import annotations
@@ -29,17 +31,16 @@ def read_source_of_truth() -> str:
     return (REPO_ROOT / "sdk" / "VERSION").read_text().strip()
 
 
-def read_pyproject_version() -> str:
-    text = (REPO_ROOT / "sdk" / "python" / "pyproject.toml").read_text()
+def read_pyproject_version(rel: str) -> str:
+    """The `[project].version` of the pyproject.toml at rel (repo-relative)."""
+    text = (REPO_ROOT / rel).read_text()
     # A plain, non-dynamic `version = "X"` under [project]. Deliberately not
     # a full TOML parse (tomllib is 3.11+; this repo's SDK floor is 3.10) —
     # this is a build-time/CI check script, not shipped SDK code, so stdlib
     # simplicity wins over TOML rigor for a single well-known key.
     m = re.search(r'(?m)^version\s*=\s*"([^"]+)"', text)
     if not m:
-        raise SystemExit(
-            'sdk/python/pyproject.toml: no top-level version = "..." line found'
-        )
+        raise SystemExit(f'{rel}: no top-level version = "..." line found')
     return m.group(1)
 
 
@@ -51,7 +52,12 @@ def read_package_json_version() -> str:
 def main() -> int:
     truth = read_source_of_truth()
     checks = {
-        "sdk/python/pyproject.toml": read_pyproject_version(),
+        "sdk/python/pyproject.toml": read_pyproject_version(
+            "sdk/python/pyproject.toml"
+        ),
+        "sdk/python-langgraph/pyproject.toml": read_pyproject_version(
+            "sdk/python-langgraph/pyproject.toml"
+        ),
         "sdk/typescript/package.json": read_package_json_version(),
     }
 
@@ -65,7 +71,8 @@ def main() -> int:
         for line in mismatches:
             print(line, file=sys.stderr)
         print(
-            "Bump sdk/VERSION, sdk/python/pyproject.toml's version, and "
+            "Bump sdk/VERSION, sdk/python/pyproject.toml's version, "
+            "sdk/python-langgraph/pyproject.toml's version, and "
             "sdk/typescript/package.json's version together — see "
             "CONTRIBUTING.md's Release process.",
             file=sys.stderr,

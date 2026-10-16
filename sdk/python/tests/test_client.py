@@ -212,7 +212,14 @@ class TestMaterializeWireField(unittest.TestCase):
     def _client_capturing_call(self):
         client = offshoot.Client.__new__(offshoot.Client)
         calls = []
-        client._call = lambda op, **fields: calls.append((op, fields)) or {"ok": True}
+        client._call = lambda op, **fields: (
+            calls.append((op, fields))
+            or {
+                "ok": True,
+                "checkout": "/c",
+                "txid": 1,
+            }
+        )
         return client, calls
 
     def test_rollback_and_promote_send_materialize(self):
@@ -1110,3 +1117,256 @@ class TestClient(unittest.TestCase):
                     c.status()
         finally:
             d.stop()
+
+
+class TestOkResponsesMissingDocumentedKeys(unittest.TestCase):
+    """An ok:true reply that lacks a key the op documents as always present
+    (internal/daemon/protocol.go: Response.Checkout for open/checkout,
+    BranchInfo.Branch and CheckpointInfo.Name for branches) is an
+    OffshootError, never a bare KeyError — client.py's "one error type for
+    every failure". No daemon needed; _call is canned as in
+    TestBranchesWireCompat."""
+
+    def _client_with_response(self, resp: dict) -> offshoot.Client:
+        client = offshoot.Client.__new__(offshoot.Client)
+        client._call = lambda op, **fields: resp
+        return client
+
+    def test_open_without_checkout_is_an_offshoot_error(self):
+        client = self._client_with_response({"ok": True, "session_id": "x"})
+        with self.assertRaises(OffshootError) as cm:
+            client.open("app")
+        self.assertIn("checkout", str(cm.exception))
+
+    def test_checkout_without_checkout_is_an_offshoot_error(self):
+        client = self._client_with_response({"ok": True})
+        with self.assertRaises(OffshootError) as cm:
+            client.checkout("app", "main")
+        self.assertIn("checkout", str(cm.exception))
+
+    def test_branches_entry_without_branch_is_an_offshoot_error(self):
+        client = self._client_with_response(
+            {"ok": True, "branches": [{"head_txid": 1}]}
+        )
+        with self.assertRaises(OffshootError) as cm:
+            client.branches("app")
+        self.assertIn("branch", str(cm.exception))
+
+    def test_checkpoint_entry_without_name_is_an_offshoot_error(self):
+        client = self._client_with_response(
+            {
+                "ok": True,
+                "branches": [
+                    {"branch": "main", "head_txid": 1, "checkpoints_v2": [{"txid": 1}]}
+                ],
+            }
+        )
+        with self.assertRaises(OffshootError) as cm:
+            client.branches("app")
+        self.assertIn("name", str(cm.exception))
+
+
+class TestTtlStrRejectsBools(unittest.TestCase):
+    """_ttl_str's docstring admits timedelta, 0/"none", or a Go duration
+    string. bool is an int subclass, so without an explicit guard False
+    renders "none" (silently clearing a TTL on touch) and True renders the
+    string "True"; both must be a TypeError like any other int."""
+
+    def test_true_and_false_are_rejected(self):
+        for b in (True, False):
+            with self.subTest(ttl=b), self.assertRaises(TypeError):
+                _ttl_str(b)
+
+
+@contextlib.contextmanager
+def fake_request_daemon(reply: dict):
+    """A scripted one-connection request/response daemon: records every raw
+    request line it receives (bytes, newline included) and answers each
+    with `reply`. Yields (socket path, received lines). Used to pin the
+    exact bytes a Client method puts on the wire, which a canned `_call`
+    (TestCreateFromPathResolution's technique) cannot see — `_call`'s own
+    field-stripping rule is what is under test here."""
+    tmpdir = tempfile.mkdtemp(prefix="offshoot-fake-daemon-")
+    sock_path = os.path.join(tmpdir, "d.sock")
+    srv = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
+    srv.bind(sock_path)
+    srv.listen(1)
+    received: list[bytes] = []
+
+    def serve():
+        try:
+            conn, _ = srv.accept()
+        except OSError:
+            return
+        rfile = conn.makefile("rb")
+        try:
+            while True:
+                line = rfile.readline()
+                if not line:
+                    return
+                received.append(line)
+                conn.sendall(json.dumps(reply).encode() + b"\n")
+        finally:
+            rfile.close()
+            conn.close()
+
+    th = threading.Thread(target=serve, daemon=True)
+    th.start()
+    try:
+        yield sock_path, received
+    finally:
+        srv.close()
+        th.join(timeout=5)
+        shutil.rmtree(tmpdir, ignore_errors=True)
+
+
+class TestExactWireBytes(unittest.TestCase):
+    """The exact request line for the two calls whose optional fields all
+    sit at their defaults: fork(ttl=None, meta=None, no from_checkpoint)
+    sends only op/db/branch/name (no ttl, meta or from), and
+    promote(force=False, backup=True) sends only op/db/branch/name (no
+    force, no_backup, backup_ttl or materialize) — protocol.go's Request
+    omitempty fields stay absent, not false/empty."""
+
+    def test_fork_and_promote_defaults_send_only_the_required_fields(self):
+        with fake_request_daemon({"ok": True, "txid": 7}) as (sock_path, received):
+            with offshoot.connect(sock_path) as c:
+                self.assertEqual(c.fork("app", "main", "new"), 7)
+                self.assertEqual(c.promote("app", "src", "main"), 7)
+        self.assertEqual(
+            received,
+            [
+                b'{"op": "fork", "db": "app", "branch": "main", "name": "new"}\n',
+                b'{"op": "promote", "db": "app", "branch": "src", "name": "main"}\n',
+            ],
+        )
+
+
+class TestCompact(unittest.TestCase):
+    """Client.compact against a real daemon: a fresh fork is a shared
+    (copy-on-write) branch; compact makes it self-contained, returns its
+    head txid, and keeps its data. Its own daemon fixture (unittest class
+    fixtures are per class; the binary build is cached)."""
+
+    @classmethod
+    def setUpClass(cls):
+        cls.d = DaemonFixture()
+
+    @classmethod
+    def tearDownClass(cls):
+        cls.d.stop()
+
+    def test_compact_makes_a_shared_fork_self_contained(self):
+        with offshoot.connect(self.d.sock) as c:
+            c.create("compact-app")
+            s = c.open("compact-app")
+            db = sqlite3.connect(s.path)
+            db.execute("CREATE TABLE t (v)")
+            db.execute("INSERT INTO t VALUES ('one')")
+            db.commit()
+            db.close()
+            s.flush("v1")
+            s.close()
+            c.fork("compact-app", "main", "cow")
+            info = {b.branch: b for b in c.branches("compact-app")}
+            self.assertTrue(info["cow"].shared, "a fresh fork must be shared")
+            head_before = info["cow"].head_txid
+
+            txid = c.compact("compact-app", "cow")
+
+            self.assertGreater(txid, 0)
+            info = {b.branch: b for b in c.branches("compact-app")}
+            self.assertFalse(
+                info["cow"].shared, "compact must make the fork self-contained"
+            )
+            self.assertEqual(txid, info["cow"].head_txid)
+            self.assertEqual(info["cow"].head_txid, head_before)
+            conn = sqlite3.connect(c.checkout("compact-app", "cow"))
+            self.assertEqual(conn.execute("SELECT count(*) FROM t").fetchone()[0], 1)
+            conn.close()
+            # Idempotent: a second compact of a self-contained branch is a no-op.
+            self.assertEqual(c.compact("compact-app", "cow"), txid)
+
+
+class TestOkResponsesMissingDocumentedKeysOverTheWire(unittest.TestCase):
+    """Every op whose ok:true reply documents a key as always present
+    (internal/daemon/server.go: opFork/opFlush/opPromote/opCompact answer
+    `Response{OK: true, TXID: ...}`, opRollback/opCheckoutAt answer
+    `Response{OK: true, Checkout: ...}`) raises an OffshootError naming the
+    op and the key when a reply omits it — never a silent 0 or "". Goes
+    through a real socket (fake_request_daemon, which answers every request
+    with one fixed reply) so _call's own decode path is what is exercised,
+    not a canned method. A txid is never legitimately 0 (a db is created at
+    txid 1), so protocol.go's omitempty on TXID cannot drop a real answer;
+    the optional keys (backup, shared) keep defaulting."""
+
+    def _assert_malformed(self, fn, op: str, key: str) -> None:
+        with self.assertRaises(OffshootError) as cm:
+            fn()
+        self.assertEqual(
+            str(cm.exception),
+            f"daemon sent a malformed {op} response: missing {key!r}",
+        )
+
+    def test_fork_without_txid(self):
+        with fake_request_daemon({"ok": True, "checkout": "/c"}) as (sock_path, _):
+            with offshoot.connect(sock_path) as c:
+                self._assert_malformed(
+                    lambda: c.fork("app", "main", "new"), "fork", "txid"
+                )
+
+    def test_flush_without_txid(self):
+        # The one reply serves open (checkout present) and starves flush.
+        with fake_request_daemon({"ok": True, "checkout": "/c"}) as (sock_path, _):
+            with offshoot.connect(sock_path) as c:
+                s = c.open("app")
+                self.assertEqual(s.path, "/c")
+                self._assert_malformed(lambda: s.flush(), "flush", "txid")
+
+    def test_checkpoint_without_txid(self):
+        # checkpoint is flush with a name: the wire op, and the message, is flush.
+        with fake_request_daemon({"ok": True, "checkout": "/c"}) as (sock_path, _):
+            with offshoot.connect(sock_path) as c:
+                s = c.open("app")
+                self._assert_malformed(lambda: s.checkpoint("v1"), "flush", "txid")
+
+    def test_rollback_without_checkout(self):
+        with fake_request_daemon({"ok": True, "txid": 7}) as (sock_path, _):
+            with offshoot.connect(sock_path) as c:
+                self._assert_malformed(
+                    lambda: c.rollback("app", "main", "v1"), "rollback", "checkout"
+                )
+
+    def test_promote_without_txid(self):
+        with fake_request_daemon({"ok": True, "checkout": "/c"}) as (sock_path, _):
+            with offshoot.connect(sock_path) as c:
+                self._assert_malformed(
+                    lambda: c.promote("app", "attempt", "main"), "promote", "txid"
+                )
+
+    def test_compact_without_txid(self):
+        with fake_request_daemon({"ok": True, "checkout": "/c"}) as (sock_path, _):
+            with offshoot.connect(sock_path) as c:
+                self._assert_malformed(
+                    lambda: c.compact("app", "cow"), "compact", "txid"
+                )
+
+    def test_checkout_at_without_checkout(self):
+        with fake_request_daemon({"ok": True, "txid": 7}) as (sock_path, _):
+            with offshoot.connect(sock_path) as c:
+                self._assert_malformed(
+                    lambda: c.checkout_at("app", "main", "v1"),
+                    "checkout-at",
+                    "checkout",
+                )
+
+    def test_rollback_and_promote_still_accept_a_reply_without_backup_or_shared(self):
+        # backup/shared are omitempty by design (no safety fork minted; a
+        # materialized copy): a reply carrying only the required key is fine.
+        with fake_request_daemon({"ok": True, "checkout": "/c", "txid": 7}) as (
+            sock_path,
+            _,
+        ):
+            with offshoot.connect(sock_path) as c:
+                self.assertEqual(c.rollback("app", "main", "v1"), "/c")
+                self.assertEqual(c.promote("app", "attempt", "main"), 7)
