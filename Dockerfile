@@ -11,7 +11,7 @@
 # rewrites); the tag stays in the reference so Dependabot's `docker`
 # ecosystem (.github/dependabot.yml) can bump tag and digest together.
 
-FROM golang:1.27-bookworm@sha256:69a7b9788769bec032d238959b61854e9ae87f57be9029ec04e9885fabf99195 AS build
+FROM golang:1.27-bookworm@sha256:5cf287a799e6b94384bad13d16b14904c531f51ba65792237e122ce42b392f61 AS build
 WORKDIR /src
 
 # Populate the module cache first so dependency downloads are cached
@@ -35,7 +35,7 @@ RUN go build -trimpath -ldflags "-s -w -X main.version=${VERSION}" \
 # differ and the SLSA provenance would name a base digest the image no
 # longer matches. If a base-image CVE needs to ship before Dependabot's
 # next run, bump the digest by hand and cut a release.
-FROM debian:bookworm-slim@sha256:3783cc01769c7b2b1b83a5c5ad96c815348e28ed7da68e2e3687004faa906251 AS runtime
+FROM debian:bookworm-slim@sha256:7c7b2c966bc9ee8cedfeef67e0e279108992c77681fa595db4a9d65c06ccc587 AS runtime
 
 # sqlite3-tools carries sqldiff, which `offshoot diff` shells out to —
 # Debian packages it separately from the sqlite3 CLI (see
