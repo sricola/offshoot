@@ -239,9 +239,11 @@ of these are verified against a real provider today versus expected-to-pass
 on the same code path.
 
 **Local backend:** a plain directory implements the same interface. CAS is
-implemented with an `O_CREAT|O_EXCL` lock file per ref: acquire lock → read
-→ verify expected version → atomic rename into place → release. (A bare
-`rename` is atomic *replace*, not CAS, and is not sufficient on its own.)
+implemented with a per-ref `flock(2)` lock file (since v0.2.20; the earlier
+`O_CREAT|O_EXCL` file could be broken by a second holder): acquire lock →
+read → verify expected version → atomic rename into place → release. (A
+bare `rename` is atomic *replace*, not CAS, and is not sufficient on its
+own.)
 This is the quickstart path and the eval-harness path — no bucket required.
 
 ## WAL capture and the connection contract
@@ -271,8 +273,13 @@ enforcement:
   binary). This too is an assumption the deployment must honor, not
   something a probe verifies.
 - On daemon restart, any WAL/txid mismatch (e.g. the agent's own
-  autocheckpoint ran while the daemon was down) marks the checkout dirty:
-  its tail becomes an orphan fork rather than pretending continuity.
+  autocheckpoint ran while the daemon was down) is detected rather than
+  assumed away. **Today's behaviour:** the daemon's `open` re-materializes
+  the checkout from the durable head and warns on stderr before
+  discarding the un-flushed local edits; preserving that tail as an
+  orphan fork is the designed end state and is not built yet (see
+  [docs/status.md](status.md)). The window is bounded by `-flush-every`
+  ([limitations](limitations.md#durability-advances-on-flush-and-the-window-is-explicit)).
 - Every materialization and compaction verifies LTX per-file and cumulative
   checksums.
 
@@ -309,9 +316,11 @@ hardenings worth naming: the sweep never deletes above a live branch's
 head in its own lineage *at or above the ref's current epoch* — a retrying
 flush can legitimately re-create exactly that key, while an orphan at a
 strictly older epoch is provably fenced and is swept once its tombstone
-clears grace — and a fork that finds its fork point tombstoned after
-writing its ref fails with a retryable error and deletes its own child
-ref. GC fails closed: an incomplete mark deletes nothing, and
+clears grace — and a fork racing a GC pass is protected by the grace
+period plus the re-mark before every delete (a fork does not consult the
+tombstone list itself; the designed "fail retryably and remove the child
+ref" check is not built — see [docs/status.md](status.md)). GC fails
+closed: an incomplete mark deletes nothing, and
 `offshoot_gc_errors_total` is the alertable signal for a stalled pass).
 
 **TTL semantics:** TTL is measured from the last durable write (last
@@ -399,9 +408,9 @@ or capture path must preserve:
 
 | Failure | Behavior |
 |---|---|
-| Contract violation (journal mode, exclusive locking) | Branch's session errors out; sync refused; loud diagnostics |
-| Daemon crash while agent writes | On restart, a WAL/txid mismatch is detected → checkout marked dirty → tail preserved as an orphan fork rather than assumed continuous |
-| Lease lost (pause/partition) | The branch remains fenced against the stale holder; the API offers fork-as-new-branch for any orphaned tail rather than a silent retry |
+| Contract violation (journal mode, exclusive locking) | Designed: branch's session errors out; sync refused; loud diagnostics. **Not enforced today** — a trusted assumption (see the connection contract above and [status.md](status.md)) |
+| Daemon crash while agent writes | On restart, a WAL/txid mismatch is detected; the checkout is re-materialized from the durable head after a stderr warning, and un-flushed writes since the last flush are lost. Preserving that tail as an orphan fork is designed, not built ([status.md](status.md)) |
+| Lease lost (pause/partition) | The branch remains fenced against the stale holder; no silent retry into a dead epoch. Offering fork-as-new-branch for the orphaned tail is designed, not built |
 | Branch repointed underneath (rollback/promote by another caller) | Any other active checkout is superseded; same recovery path as lease loss |
 | Rollback/promote discarding non-durable acknowledged writes | Old checkout state is abandoned; the abandoned transaction range is reported |
 | Destroy under an active lease | Refused without `--force`; with it, the checkout transitions to an error state |
@@ -421,11 +430,17 @@ or capture path must preserve:
   `CONTRIBUTING.md` for capture/flush changes. It does not exercise a
   `SIGKILL` of the capturer itself; [testing.md](testing.md#the-kill--9-torture-harness)
   is the canonical boundary.
-- Property tests: random workloads applied to (a) plain SQLite and (b)
-  offshoot's sync/restore/fork paths must yield byte-equivalent query
-  results.
-- Fault injection on the storage layer: torn uploads, CAS races, clock skew
-  on leases, GC racing forks.
+- Property tests (planned, not built): random workloads applied to (a)
+  plain SQLite and (b) offshoot's sync/restore/fork paths must yield
+  byte-equivalent query results. What exists today is the torture
+  harness's dump equivalence and the parser fuzz targets
+  ([testing.md](testing.md)).
+- Fault injection on the storage layer: torn and truncated objects (fail
+  closed, `internal/ltxio`), CAS races (`storetest.RunConformance`), a
+  skewed clock stealing a lease (fenced, never silent —
+  `TestLeaseClockSkewIsFencedNotSilent`), GC racing a mid-pass checkpoint
+  (`TestGCMarkToleratesACheckpointLandingMidPass`) and a failing mark
+  (`TestGCMarkErrorTombstonesNothing`).
 - Integration matrix: MinIO + (as they come online) real S3 probe
   conformance; the local backend runs everywhere in CI.
 

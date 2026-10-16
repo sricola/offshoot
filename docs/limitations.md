@@ -166,9 +166,11 @@ under that contract; POSIX lock semantics are what make it sound.
 enforcement — nothing polls `PRAGMA journal_mode` or watches for a
 rollback-journal file mid-session. What IS detected, and tested: on
 daemon restart/resume, a WAL-emptiness + main-file-hash continuity check
-refuses to pretend continuity after any divergence — the checkout goes
-dirty and its tail becomes an orphan fork instead
-([how resume decides](architecture.md#wal-capture-and-the-connection-contract)).
+refuses to pretend continuity after any divergence — the daemon's `open`
+re-materializes the checkout from the durable head after a stderr
+warning, discarding the un-flushed tail (keeping it as an orphan fork is
+designed, not built yet;
+[how resume decides](architecture.md#wal-capture-and-the-connection-contract)).
 
 **Instead:** across a VM or network-filesystem boundary, run offshoot
 *inside* the guest — it's one binary.
@@ -223,9 +225,11 @@ replica must converge to byte-identical dump output after every round. A
 300-second run is ~3,500 rounds with zero divergence, and it runs in CI
 on a nightly cadence ([the harness in full](testing.md#the-kill--9-torture-harness)).
 On daemon restart, a WAL/txid mismatch (e.g. the agent's autocheckpoint
-ran while the daemon was down) marks the checkout dirty and preserves the
-tail as an orphan fork rather than pretending continuity. "Crash-tested"
-in these docs means the *writer's* crash.
+ran while the daemon was down) is detected rather than assumed away: the
+checkout is re-materialized from the durable head after a stderr warning
+and the un-flushed tail is discarded (preserving it as an orphan fork is
+designed, not built yet). "Crash-tested" in these docs means the
+*writer's* crash.
 
 **The capturer's own crash is tested too** (since v0.2.15's harness,
 `TestTortureCapturerKill`): the capture engine runs in a child process
@@ -263,6 +267,18 @@ out (or an operator breaks it with `offshoot lease acquire`, which bumps
 the epoch and fences the old holder out) — but it can never corrupt the
 branch ([fencing in two paragraphs](testing.md#fencing-and-cas-in-two-paragraphs)).
 
+## A ref with a name offshoot would not write stops every listing
+
+**What:** every name offshoot writes passes its naming rule
+([reference](reference.md#global)); the rule has tightened over time (no
+leading `-` since v0.2.14, no `.lock` suffix or `.tmp-` since v0.2.21). A
+ref key under `refs/` that fails the current rule — written by an older
+binary, or by something other than offshoot — makes `ListRefs` fail with
+the key named, so `status`, the reaper and GC all stop until it is renamed
+or removed with the storage tool (offshoot itself cannot address such a
+name). Loud on purpose: the alternative, skipping it, left that ref's
+lineage unmarked for GC to sweep while the ref still existed.
+
 ## GC is deliberately slow to delete
 
 **What:** garbage collection is two-phase per object: unreachable objects
@@ -270,9 +286,11 @@ are tombstoned first, then actually deleted only once the tombstone is
 older than the grace period *and* still unreachable at sweep time
 (`offshoot gc --grace`, default `1h`; the daemon janitor's `-gc-grace`,
 default `15m`). An object re-referenced during grace — a fork racing GC —
-is left alone; a fork that finds its fork point tombstoned fails with a
-retryable error rather than proceeding. GC fails closed: an incomplete
-mark deletes nothing.
+is left alone, because every delete is preceded by a fresh re-mark (a
+fork does not itself consult the tombstone list; the grace period and the
+re-mark are the protection). GC fails closed: an incomplete mark deletes
+nothing, and a checkpoint landing on a forked parent mid-pass does not
+fail it.
 
 **And under copy-on-write, "destroyed" ≠ "reclaimed":** destroying a
 branch removes its ref instantly, but a destroyed parent's bytes linger

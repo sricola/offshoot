@@ -70,10 +70,11 @@ file, IAM role).
 
 **Naming rules**, enforced on every database name, branch name, and
 checkpoint name: 1–128 characters, charset `[a-z0-9-_.]`, never starting
-with `-` (it would read as a flag), and never exactly `.` or `..` or
+with `-` (it would read as a flag), never exactly `.` or `..` or
 containing `..` as a substring (those are directory-traversal segments once
-joined into a storage key). A bad name fails fast with `store: invalid name
-...`.
+joined into a storage key), and never ending in `.lock` or containing
+`.tmp-` (the local backend's lock and temp file shapes, which it hides
+from listings). A bad name fails fast with `store: invalid name ...`.
 
 ---
 
@@ -111,8 +112,17 @@ copy is quiesced with a full WAL checkpoint, and *that* becomes the root
 snapshot — the source file itself is never modified or truncated. There is
 no mode that overwrites an existing user file.
 
-**Errors:** refuses if `db` already exists (ref CAS conflict); `--from` with
-a source file that doesn't exist or isn't a valid SQLite file.
+**Errors:** refuses if `db` already exists — any branch under the name
+counts, including a database whose `main` was destroyed while other
+branches survive (checked before any snapshot is uploaded, and again by
+the ref CAS, so a refused create leaves no object behind); `--from` with a
+source file that doesn't exist or isn't a valid SQLite file. The import
+opens the source read-only, so a WAL-mode source keeps its `-wal`/`-shm`
+exactly as they were; a rollback-journal source with a **hot journal**
+(an interrupted write left `file-journal` behind) is refused with the
+recovery step named — open it once with `sqlite3`, which rolls the
+journal back, then import — because the import will neither roll it back
+itself (that modifies the source) nor read past it.
 
 **Daemon/SDK parity.** The daemon's `create` op takes an optional `path`
 request field: a server-side, absolute path (on the daemon's own host) to
@@ -280,7 +290,9 @@ diff; otherwise it over-reports changes, the safe direction for a promote
 decision), with schema changes flagged (the STATUS cell gets a trailing
 " (schema)"); a table whose column list differs between the two sides is
 reported, with row counts, but not compared. `--table` restricts either
-mode to one table. Each target uses the
+mode to one table; a table that exists on neither side is an error in
+both modes (`sqldiff` alone would print nothing for it, which reads as
+"no differences"). Each target uses the
 same triple-`@` form `export` does — `db` alone means `db@main` head,
 `db@branch` means that branch's head, `db@branch@checkpoint` means that named
 checkpoint. The two targets may name the same `db` or two different ones.
@@ -640,7 +652,10 @@ would. `offshoot compact` converts a shared result later.
 
 Output: the (re-materialized) checkout path on the first line, then
 `rolled back <db>@<branch> to "<checkpoint>" (shared)` — or
-`(materialized)` — on the second, then the safety-fork line below. **The
+`(materialized)` — on the second, then `abandoned txids N..M` (the
+inclusive range of committed transactions the branch gave up; omitted
+when the head already sat at the checkpoint), then the safety-fork line
+below. **The
 second line is new in v0.2.12**: a script that read the whole of
 `offshoot rollback`'s output as the path must now take the first line
 (`offshoot rollback ... | head -1`).
@@ -799,7 +814,12 @@ is *added* alongside them, since old checkpoints were anchored on the
 shared ancestor's storage and need their own copy to resolve once that
 ancestor's lineage is later reclaimed by GC. Checkpoints sharing a txid
 share one copy. Nothing is dropped or renamed; you don't need to `export`
-anything first to preserve history across a compact.
+anything first to preserve history across a compact. The `compact` entry
+is added only when that name is free: a branch that already carries one
+(compacted before, then rolled back to a shared state and compacted
+again, or a checkpoint you named `compact` yourself) keeps that entry
+exactly as it is, metadata included, and the new state is simply the
+head.
 
 Cost class: compact is a full materialize — one full copy of the branch's
 head state (~G bytes for a G-byte database) plus one additional snapshot
@@ -1233,7 +1253,9 @@ the CLI to discover a non-default socket.
 
 `-reap-every` sets the janitor's interval for both TTL reaping and the
 periodic GC sweep (default `1m`); `-reap-every 0` disables the janitor
-entirely (GC and reaping are still available on demand via `offshoot gc`).
+entirely (GC and reaping are still available on demand via `offshoot gc`),
+and a negative `-reap-every` or `-gc-grace` is refused as a usage error
+rather than silently disabling anything.
 `-gc-grace` is the tombstone grace period the janitor's GC pass uses
 (default `15m`) — see `offshoot gc` above for what grace means.
 
@@ -1472,7 +1494,8 @@ output.
 **Binding beyond localhost:** a loopback bind (`127.0.0.1`, `::1`,
 `localhost`) needs nothing further. Any other address requires BOTH
 `-http-allow-non-loopback` (an explicit acknowledgment) AND an explicit
-`-token`/`OFFSHOOT_TOKEN` — the auto-generated, printed-once token is a
+token (`-token`, `-token-file` or `OFFSHOOT_TOKEN`) — the auto-generated,
+printed-once token is a
 loopback-only convenience. Missing either is a distinct startup error (the
 daemon never starts, rather than starting under-acknowledged):
 
@@ -2056,7 +2079,7 @@ Which operations exist on which surface today — verified against
 
 | Operation | CLI | Daemon op | Python/TS SDK | Notes |
 |---|---|---|---|---|
-| create / checkout / fork / destroy / rollback / promote / compact / touch / branches / dbs | yes | yes | yes | Full parity, with one exception: `rollback --force` (override a protected branch) is CLI-only; the daemon op and both SDKs' `rollback` have no `force`. `compact` through the daemon refuses while a session is open on the branch (see above). `rollback`/`promote`'s safety-fork backup (`--no-backup`/`--backup-ttl` on the CLI, `no_backup`/`backup_ttl` request fields and a `backup` response field on the daemon op, `backup`/`backup_ttl` kwargs on both SDKs) is full parity too, and so is their `--materialize` (`materialize` request field and `shared` response field on the daemon op; Python `materialize=False`, TypeScript `materialize?: boolean`). |
+| create / checkout / fork / destroy / rollback / promote / compact / touch / branches / dbs | yes | yes | yes | Full parity, with one exception: `rollback --force` (override a live lease on the branch; rollback does not consult the protected flag) is CLI-only; the daemon op and both SDKs' `rollback` have no `force`. `compact` through the daemon refuses while a session is open on the branch (see above). `rollback`/`promote`'s safety-fork backup (`--no-backup`/`--backup-ttl` on the CLI, `no_backup`/`backup_ttl` request fields and a `backup` response field on the daemon op, `backup`/`backup_ttl` kwargs on both SDKs) is full parity too, and so is their `--materialize` (`materialize` request field and `shared` response field on the daemon op; Python `materialize=False`, TypeScript `materialize?: boolean`). |
 | `protect` / `unprotect` | yes | no | no | **CLI-only, by design.** No daemon op or MCP tool sets the `protected` flag — only `offshoot_list`/the daemon's `branches` op reads it. Keeping the write side off every remote-callable surface means an agent (MCP) or a network client (daemon/HTTP) can observe protection but never grant or revoke it. |
 | open / flush / status / close (sessions) | `session ...` | yes | yes | SDK `flush(name, meta=...)` can attach checkpoint metadata; the CLI `session flush` subcommand has no `--meta` flag. The SDKs' `Session.close()` sends the `session_id` its `open` returned, so it closes only that session; the CLI `session close` sends none and closes whatever session is open on the branch. |
 | export / historical read-only checkout | yes | yes (`export`, `checkout-at`) | yes | No CLI `session` subcommand — the CLI's `export`/`checkout --at --read-only` are the at-rest equivalents (see the section above); `export` is unix-socket-only over the daemon. |

@@ -44,7 +44,9 @@ The boundaries offshoot enforces today, and the ones it does not. Each
 claim names the code that implements it.
 
 **Local socket.** `offshoot serve` listens on a unix socket created `0600`
-under a `0700` cache directory (`internal/daemon/server.go`). Anyone who
+(`internal/daemon/server.go`) under the user cache directory, which
+offshoot creates `0700` (a pre-existing directory keeps its own mode, and
+`-socket PATH` puts the socket wherever you say). Anyone who
 can open that socket is trusted as the daemon's own user: there is no
 per-request authentication, and a socket client's `path` field (`export`'s
 destination, `create`'s import source) is used as an ordinary server-side
@@ -53,7 +55,7 @@ path that same-user caller could already read or write.
 **HTTP.** Off by default. `-http` binds loopback with no further
 acknowledgment; a non-loopback bind additionally requires
 `-http-allow-non-loopback` and an explicit operator token of at least 16
-characters (`-token`/`OFFSHOOT_TOKEN`). Every request but `GET /healthz`
+characters (`-token`, `-token-file` or `OFFSHOOT_TOKEN`). Every request but `GET /healthz`
 must carry `Authorization: Bearer <token>`, compared with
 `crypto/subtle.ConstantTimeCompare`; `export` and `create` with a path are
 refused over HTTP (`internal/daemon/http.go`). There is no TLS: a
