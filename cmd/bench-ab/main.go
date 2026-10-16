@@ -429,14 +429,19 @@ func gitArchive(dir, commit, dest string) error {
 	}
 	extractErr := extractTar(stdout, dest)
 	// Drain what is left so git does not block on a full pipe when the
-	// extraction stopped early.
-	_, _ = io.Copy(io.Discard, stdout)
+	// extraction stopped early. The drain's own error is kept: a read failure
+	// on the pipe with a clean extraction and a clean git exit would otherwise
+	// be the one failure this function swallowed.
+	_, drainErr := io.Copy(io.Discard, stdout)
 	waitErr := cmd.Wait()
 	if extractErr != nil {
 		return extractErr
 	}
 	if waitErr != nil {
 		return fmt.Errorf("git archive %s: %w: %s", commit, waitErr, strings.TrimSpace(stderr.String()))
+	}
+	if drainErr != nil {
+		return fmt.Errorf("git archive %s: reading output: %w", commit, drainErr)
 	}
 	return nil
 }

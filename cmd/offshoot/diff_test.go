@@ -1,7 +1,6 @@
 package main
 
 import (
-	"os/exec"
 	"path/filepath"
 	"strings"
 	"testing"
@@ -48,7 +47,7 @@ func seedTwoSidesForDiff(t *testing.T, store string) (leftTarget, rightTarget st
 	call(t, store, "init")
 	call(t, store, "create", "app")
 	leftPath := strings.TrimSpace(call(t, store, "checkout", "app"))
-	if out, err := exec.Command("sqlite3", leftPath,
+	if out, err := testutil.SQLite3CLI(leftPath,
 		"CREATE TABLE users (v); INSERT INTO users VALUES (1),(2),(3);"+
 			"CREATE TABLE gone (v); INSERT INTO gone VALUES (1),(2);",
 	).CombinedOutput(); err != nil {
@@ -58,7 +57,7 @@ func seedTwoSidesForDiff(t *testing.T, store string) (leftTarget, rightTarget st
 
 	call(t, store, "fork", "app", "attempt")
 	rightPath := strings.TrimSpace(call(t, store, "checkout", "app@attempt"))
-	if out, err := exec.Command("sqlite3", rightPath,
+	if out, err := testutil.SQLite3CLI(rightPath,
 		"DROP TABLE gone;"+
 			"INSERT INTO users VALUES (4),(5);"+
 			"CREATE TABLE arrivals (v); INSERT INTO arrivals VALUES (1),(2),(3),(4);",
@@ -128,12 +127,12 @@ func TestDiffSummaryCLIWorksAcrossTwoDifferentDatabases(t *testing.T) {
 
 	call(t, store, "create", "left-db")
 	lp := strings.TrimSpace(call(t, store, "checkout", "left-db"))
-	exec.Command("sqlite3", lp, "CREATE TABLE t (v); INSERT INTO t VALUES (1);").Run()
+	testutil.SQLite3CLI(lp, "CREATE TABLE t (v); INSERT INTO t VALUES (1);").Run()
 	call(t, store, "checkpoint", "left-db", "v1")
 
 	call(t, store, "create", "right-db")
 	rp := strings.TrimSpace(call(t, store, "checkout", "right-db"))
-	exec.Command("sqlite3", rp, "CREATE TABLE t (v); INSERT INTO t VALUES (1),(2);").Run()
+	testutil.SQLite3CLI(rp, "CREATE TABLE t (v); INSERT INTO t VALUES (1),(2);").Run()
 	call(t, store, "checkpoint", "right-db", "v1")
 
 	out := call(t, store, "diff", "left-db@main@v1", "right-db@main@v1", "--summary")
@@ -153,7 +152,7 @@ func TestDiffCLIHeadSideReflectsNewWriteNotStaleCache(t *testing.T) {
 	call(t, store, "init")
 	call(t, store, "create", "app")
 	path := strings.TrimSpace(call(t, store, "checkout", "app"))
-	exec.Command("sqlite3", path, "CREATE TABLE t (v); INSERT INTO t VALUES (1);").Run()
+	testutil.SQLite3CLI(path, "CREATE TABLE t (v); INSERT INTO t VALUES (1);").Run()
 	call(t, store, "checkpoint", "app", "base")
 
 	first := call(t, store, "diff", "app@main@base", "app@main", "--summary")
@@ -161,7 +160,7 @@ func TestDiffCLIHeadSideReflectsNewWriteNotStaleCache(t *testing.T) {
 		t.Fatalf("first diff (head == base) should show no differences; got:\n%s", first)
 	}
 
-	if out, err := exec.Command("sqlite3", path, "INSERT INTO t VALUES (2);").CombinedOutput(); err != nil {
+	if out, err := testutil.SQLite3CLI(path, "INSERT INTO t VALUES (2);").CombinedOutput(); err != nil {
 		t.Fatalf("%v: %s", err, out)
 	}
 	// No checkpoint here on purpose — MaterializeForDiff's head side reads
@@ -189,7 +188,7 @@ func TestDiffCLIErrorsClearlyWhenSqldiffMissing(t *testing.T) {
 	call(t, store, "init")
 	call(t, store, "create", "app")
 	path := strings.TrimSpace(call(t, store, "checkout", "app"))
-	exec.Command("sqlite3", path, "CREATE TABLE t (v);").Run()
+	testutil.SQLite3CLI(path, "CREATE TABLE t (v);").Run()
 	call(t, store, "checkpoint", "app", "v1")
 
 	t.Setenv("PATH", t.TempDir()) // an empty directory: no sqldiff, no sqlite3
@@ -217,9 +216,9 @@ func TestDiffCLISqldiffPresentStreamsOutput(t *testing.T) {
 	call(t, store, "init")
 	call(t, store, "create", "app")
 	path := strings.TrimSpace(call(t, store, "checkout", "app"))
-	exec.Command("sqlite3", path, "CREATE TABLE t (v); INSERT INTO t VALUES (1);").Run()
+	testutil.SQLite3CLI(path, "CREATE TABLE t (v); INSERT INTO t VALUES (1);").Run()
 	call(t, store, "checkpoint", "app", "left")
-	exec.Command("sqlite3", path, "INSERT INTO t VALUES (2);").Run()
+	testutil.SQLite3CLI(path, "INSERT INTO t VALUES (2);").Run()
 	call(t, store, "checkpoint", "app", "right")
 
 	out := call(t, store, "diff", "app@main@left", "app@main@right")
@@ -238,7 +237,7 @@ func TestDiffCLIIdenticalSidesProduceNoSqldiffOutput(t *testing.T) {
 	call(t, store, "init")
 	call(t, store, "create", "app")
 	path := strings.TrimSpace(call(t, store, "checkout", "app"))
-	exec.Command("sqlite3", path, "CREATE TABLE t (v); INSERT INTO t VALUES (1);").Run()
+	testutil.SQLite3CLI(path, "CREATE TABLE t (v); INSERT INTO t VALUES (1);").Run()
 	call(t, store, "checkpoint", "app", "v1")
 
 	out := call(t, store, "diff", "app@main@v1", "app@main@v1")
@@ -259,7 +258,7 @@ func TestDiffCLITableFlagRestrictsSummary(t *testing.T) {
 	call(t, store, "init")
 	call(t, store, "create", "app")
 	path := strings.TrimSpace(call(t, store, "checkout", "app"))
-	if out, err := exec.Command("sqlite3", path,
+	if out, err := testutil.SQLite3CLI(path,
 		"CREATE TABLE only (v); INSERT INTO only VALUES (1);"+
 			"CREATE TABLE other (v); INSERT INTO other VALUES (1);",
 	).CombinedOutput(); err != nil {
@@ -306,5 +305,37 @@ func TestDiffCLIPrintsLeftRightHeaderInBothModes(t *testing.T) {
 	sqldiffOut := call(t, store, "diff", left, right)
 	if !strings.Contains(sqldiffOut, "left:  "+left+" right: "+right) {
 		t.Fatalf("default (sqldiff) mode output missing the left/right header naming %q and %q; full output:\n%s", left, right, sqldiffOut)
+	}
+}
+
+// TestDiffCLITableFlagUnknownTableErrorsInBothModes: docs/reference.md
+// "offshoot diff" says --table "restricts either mode to one table". A
+// table that exists on neither side must be an error in the default
+// (sqldiff) mode exactly as it is in --summary; sqldiff itself ignores an
+// unknown --table and prints nothing, which would read as "no
+// differences" for a typo. Verified against the pre-fix code (exit 0,
+// header only).
+func TestDiffCLITableFlagUnknownTableErrorsInBothModes(t *testing.T) {
+	testutil.RequireSQLite3(t)
+	testutil.RequireSQLdiff(t)
+	store := filepath.Join(t.TempDir(), "s")
+	left, right := seedTwoSidesForDiff(t, store)
+	for _, mode := range [][]string{{}, {"--summary"}} {
+		args := append([]string{"diff", left, right, "--table", "nope"}, mode...)
+		_, err := callErr(t, store, args...)
+		if err == nil || !strings.Contains(err.Error(), `no table "nope" on either side`) {
+			t.Fatalf("%v: err = %v, want the no-such-table error", args, err)
+		}
+	}
+	// A table present on only one side is still a valid --table in both
+	// modes (it is a whole-table add/remove, which is a difference) —
+	// whichever side has it.
+	for _, table := range []string{"gone", "arrivals"} {
+		if out := call(t, store, "diff", left, right, "--table", table); !strings.Contains(out, table) {
+			t.Fatalf("--table %s (present on one side only) must diff, got:\n%s", table, out)
+		}
+		if out := call(t, store, "diff", left, right, "--table", table, "--summary"); !strings.Contains(out, table) {
+			t.Fatalf("--table %s --summary (present on one side only) must diff, got:\n%s", table, out)
+		}
 	}
 }
