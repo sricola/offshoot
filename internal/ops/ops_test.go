@@ -7,7 +7,6 @@ import (
 	"fmt"
 	"io"
 	"os"
-	"os/exec"
 	"path/filepath"
 	"reflect"
 	"strings"
@@ -114,7 +113,7 @@ func TestCreateAndCheckout(t *testing.T) {
 func TestCreateFromImportsWithoutTouchingSource(t *testing.T) {
 	testutil.RequireSQLite3(t)
 	src := filepath.Join(t.TempDir(), "legacy.db")
-	if out, err := exec.Command("sqlite3", src,
+	if out, err := testutil.SQLite3CLI(src,
 		"CREATE TABLE t (v); INSERT INTO t VALUES (42);").CombinedOutput(); err != nil {
 		t.Fatalf("%v: %s", err, out)
 	}
@@ -132,7 +131,7 @@ func TestCreateFromImportsWithoutTouchingSource(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	out, err := exec.Command("sqlite3", path, "SELECT v FROM t;").Output()
+	out, err := testutil.SQLite3CLI(path, "SELECT v FROM t;").Output()
 	if err != nil || string(out) != "42\n" {
 		t.Fatalf("imported content: %q err=%v", out, err)
 	}
@@ -192,7 +191,7 @@ func TestCheckpointAndRematerialize(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if out, err := exec.Command("sqlite3", path,
+	if out, err := testutil.SQLite3CLI(path,
 		"CREATE TABLE t (v); INSERT INTO t VALUES (1),(2),(3);").CombinedOutput(); err != nil {
 		t.Fatalf("%v: %s", err, out)
 	}
@@ -208,12 +207,12 @@ func TestCheckpointAndRematerialize(t *testing.T) {
 	}
 
 	// A fresh checkout must contain the checkpointed data.
-	want, _ := exec.Command("sqlite3", path, ".dump").Output()
+	want, _ := testutil.SQLite3CLI(path, ".dump").Output()
 	path2, err := w.Checkout("app", "main")
 	if err != nil {
 		t.Fatal(err)
 	}
-	got, _ := exec.Command("sqlite3", path2, ".dump").Output()
+	got, _ := testutil.SQLite3CLI(path2, ".dump").Output()
 	if string(want) != string(got) {
 		t.Fatal("re-checkout does not match checkpointed state")
 	}
@@ -235,7 +234,7 @@ func TestCheckpointRecoversFromOrphanedSnapshot(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if out, err := exec.Command("sqlite3", path,
+	if out, err := testutil.SQLite3CLI(path,
 		"CREATE TABLE t (v); INSERT INTO t VALUES (1),(2),(3);").CombinedOutput(); err != nil {
 		t.Fatalf("%v: %s", err, out)
 	}
@@ -261,12 +260,12 @@ func TestCheckpointRecoversFromOrphanedSnapshot(t *testing.T) {
 
 	// A fresh checkout must contain the real data, not the garbage that was
 	// squatting on the snapshot key.
-	want, _ := exec.Command("sqlite3", path, ".dump").Output()
+	want, _ := testutil.SQLite3CLI(path, ".dump").Output()
 	path2, err := w.Checkout("app", "main")
 	if err != nil {
 		t.Fatal(err)
 	}
-	got, _ := exec.Command("sqlite3", path2, ".dump").Output()
+	got, _ := testutil.SQLite3CLI(path2, ".dump").Output()
 	if string(want) != string(got) {
 		t.Fatal("checkout after recovered checkpoint does not match real data")
 	}
@@ -321,7 +320,7 @@ func TestObserveForkReportsStorageMode(t *testing.T) {
 		t.Fatal(err)
 	}
 	path, _ := w.Checkout("app", "main")
-	exec.Command("sqlite3", path, "CREATE TABLE t (v); INSERT INTO t VALUES (1);").Run()
+	testutil.SQLite3CLI(path, "CREATE TABLE t (v); INSERT INTO t VALUES (1);").Run()
 	if _, err := w.Checkpoint("app", "main", "v1", nil); err != nil {
 		t.Fatal(err)
 	}
@@ -359,7 +358,7 @@ func TestForkIsIndependentOfParent(t *testing.T) {
 		t.Fatal(err)
 	}
 	path, _ := w.Checkout("app", "main")
-	exec.Command("sqlite3", path, "CREATE TABLE t (v); INSERT INTO t VALUES (1);").Run()
+	testutil.SQLite3CLI(path, "CREATE TABLE t (v); INSERT INTO t VALUES (1);").Run()
 	if _, err := w.Checkpoint("app", "main", "v1", nil); err != nil {
 		t.Fatal(err)
 	}
@@ -373,7 +372,7 @@ func TestForkIsIndependentOfParent(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	got, _ := exec.Command("sqlite3", cpath, "SELECT v FROM t;").Output()
+	got, _ := testutil.SQLite3CLI(cpath, "SELECT v FROM t;").Output()
 	if string(got) != "1\n" {
 		t.Fatalf("child content: %q", got)
 	}
@@ -407,16 +406,16 @@ func TestForkAtCheckpoint(t *testing.T) {
 	w := newWS(t)
 	w.Create("app")
 	path, _ := w.Checkout("app", "main")
-	exec.Command("sqlite3", path, "CREATE TABLE t (v); INSERT INTO t VALUES (1);").Run()
+	testutil.SQLite3CLI(path, "CREATE TABLE t (v); INSERT INTO t VALUES (1);").Run()
 	w.Checkpoint("app", "main", "v1", nil)
-	exec.Command("sqlite3", path, "INSERT INTO t VALUES (2);").Run()
+	testutil.SQLite3CLI(path, "INSERT INTO t VALUES (2);").Run()
 	w.Checkpoint("app", "main", "v2", nil)
 
 	if _, err := w.Fork("app", "main", "old", "v1", 0, nil); err != nil {
 		t.Fatal(err)
 	}
 	p, _ := w.Checkout("app", "old")
-	got, _ := exec.Command("sqlite3", p, "SELECT count(*) FROM t;").Output()
+	got, _ := testutil.SQLite3CLI(p, "SELECT count(*) FROM t;").Output()
 	if string(got) != "1\n" {
 		t.Fatalf("fork --at v1 content: %q", got)
 	}
@@ -442,7 +441,7 @@ func TestForkWarnsOnUncheckpointedChanges(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if out, err := exec.Command("sqlite3", path,
+	if out, err := testutil.SQLite3CLI(path,
 		"CREATE TABLE t (v); INSERT INTO t VALUES (1);").CombinedOutput(); err != nil {
 		t.Fatalf("%v: %s", err, out)
 	}
@@ -462,7 +461,7 @@ func TestForkWarnsOnUncheckpointedChanges(t *testing.T) {
 	}
 
 	// Write MORE data without checkpointing.
-	if out, err := exec.Command("sqlite3", path, "INSERT INTO t VALUES (2);").CombinedOutput(); err != nil {
+	if out, err := testutil.SQLite3CLI(path, "INSERT INTO t VALUES (2);").CombinedOutput(); err != nil {
 		t.Fatalf("%v: %s", err, out)
 	}
 
@@ -489,7 +488,7 @@ func TestForkWarnsOnUncheckpointedChanges(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	got, _ := exec.Command("sqlite3", cpath, "SELECT v FROM t ORDER BY v;").Output()
+	got, _ := testutil.SQLite3CLI(cpath, "SELECT v FROM t ORDER BY v;").Output()
 	if string(got) != "1\n" {
 		t.Fatalf("fork content: %q, want only the checkpointed row", got)
 	}
@@ -516,7 +515,7 @@ func TestForkWarnsOnStaleCheckout(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if out, err := exec.Command("sqlite3", path,
+	if out, err := testutil.SQLite3CLI(path,
 		"CREATE TABLE t (v); INSERT INTO t VALUES (1);").CombinedOutput(); err != nil {
 		t.Fatalf("%v: %s", err, out)
 	}
@@ -533,7 +532,7 @@ func TestForkWarnsOnStaleCheckout(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if out, err := exec.Command("sqlite3", scratchPath, "INSERT INTO t VALUES (2);").CombinedOutput(); err != nil {
+	if out, err := testutil.SQLite3CLI(scratchPath, "INSERT INTO t VALUES (2);").CombinedOutput(); err != nil {
 		t.Fatalf("%v: %s", err, out)
 	}
 	newTXID, err := w.Checkpoint("app", "scratch", "v2", nil)
@@ -587,7 +586,7 @@ func TestForkWarnsOnStaleCheckout(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	got, _ := exec.Command("sqlite3", cpath, "SELECT v FROM t ORDER BY v;").Output()
+	got, _ := testutil.SQLite3CLI(cpath, "SELECT v FROM t ORDER BY v;").Output()
 	if string(got) != "1\n2\n" {
 		t.Fatalf("fork content: %q, want the new branch head content", got)
 	}
@@ -598,9 +597,9 @@ func TestRollback(t *testing.T) {
 	w := newWS(t)
 	w.Create("app")
 	path, _ := w.Checkout("app", "main")
-	exec.Command("sqlite3", path, "CREATE TABLE t (v); INSERT INTO t VALUES (1);").Run()
+	testutil.SQLite3CLI(path, "CREATE TABLE t (v); INSERT INTO t VALUES (1);").Run()
 	w.Checkpoint("app", "main", "good", nil)
-	exec.Command("sqlite3", path, "DROP TABLE t;").Run()
+	testutil.SQLite3CLI(path, "DROP TABLE t;").Run()
 	w.Checkpoint("app", "main", "bad", nil)
 
 	before, _, _ := w.Store.GetRef("app", "main")
@@ -608,7 +607,7 @@ func TestRollback(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	got, _ := exec.Command("sqlite3", p, "SELECT v FROM t;").Output()
+	got, _ := testutil.SQLite3CLI(p, "SELECT v FROM t;").Output()
 	if string(got) != "1\n" {
 		t.Fatalf("rolled-back content: %q", got)
 	}
@@ -640,11 +639,11 @@ func TestRollbackToEarlierCheckpointTwice(t *testing.T) {
 	w := newWS(t)
 	w.Create("app")
 	path, _ := w.Checkout("app", "main")
-	exec.Command("sqlite3", path, "CREATE TABLE t (v); INSERT INTO t VALUES (1);").Run()
+	testutil.SQLite3CLI(path, "CREATE TABLE t (v); INSERT INTO t VALUES (1);").Run()
 	if _, err := w.Checkpoint("app", "main", "v1", nil); err != nil {
 		t.Fatal(err)
 	}
-	exec.Command("sqlite3", path, "INSERT INTO t VALUES (2);").Run()
+	testutil.SQLite3CLI(path, "INSERT INTO t VALUES (2);").Run()
 	if _, err := w.Checkpoint("app", "main", "v2", nil); err != nil {
 		t.Fatal(err)
 	}
@@ -656,7 +655,7 @@ func TestRollbackToEarlierCheckpointTwice(t *testing.T) {
 	if err != nil {
 		t.Fatalf("rollback --to v1 after rollback --to v2: %v", err)
 	}
-	got, _ := exec.Command("sqlite3", p, "SELECT v FROM t;").Output()
+	got, _ := testutil.SQLite3CLI(p, "SELECT v FROM t;").Output()
 	if string(got) != "1\n" {
 		t.Fatalf("content after second rollback: %q, want just the v1 row", got)
 	}
@@ -671,11 +670,11 @@ func TestForkAtCheckpointAfterRollback(t *testing.T) {
 	w := newWS(t)
 	w.Create("app")
 	path, _ := w.Checkout("app", "main")
-	exec.Command("sqlite3", path, "CREATE TABLE t (v); INSERT INTO t VALUES (1);").Run()
+	testutil.SQLite3CLI(path, "CREATE TABLE t (v); INSERT INTO t VALUES (1);").Run()
 	if _, err := w.Checkpoint("app", "main", "v1", nil); err != nil {
 		t.Fatal(err)
 	}
-	exec.Command("sqlite3", path, "INSERT INTO t VALUES (2);").Run()
+	testutil.SQLite3CLI(path, "INSERT INTO t VALUES (2);").Run()
 	if _, err := w.Checkpoint("app", "main", "v2", nil); err != nil {
 		t.Fatal(err)
 	}
@@ -690,7 +689,7 @@ func TestForkAtCheckpointAfterRollback(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	got, _ := exec.Command("sqlite3", p, "SELECT v FROM t;").Output()
+	got, _ := testutil.SQLite3CLI(p, "SELECT v FROM t;").Output()
 	if string(got) != "1\n" {
 		t.Fatalf("fork --at v1 content: %q, want just the v1 row", got)
 	}
@@ -718,7 +717,7 @@ func TestForkFastPathMatchesSlowPath(t *testing.T) {
 		t.Fatal(err)
 	}
 	path, _ := w.Checkout("app", "main")
-	if out, err := exec.Command("sqlite3", path,
+	if out, err := testutil.SQLite3CLI(path,
 		"CREATE TABLE t (v); INSERT INTO t VALUES (1),(2),(3);").CombinedOutput(); err != nil {
 		t.Fatalf("seed: %v: %s", err, out)
 	}
@@ -761,11 +760,11 @@ func TestForkFastPathMatchesSlowPath(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	fastDump, err := exec.Command("sqlite3", fastPath, ".dump").Output()
+	fastDump, err := testutil.SQLite3CLI(fastPath, ".dump").Output()
 	if err != nil {
 		t.Fatalf("dump fast-path child: %v", err)
 	}
-	slowDump, err := exec.Command("sqlite3", slowPath, ".dump").Output()
+	slowDump, err := testutil.SQLite3CLI(slowPath, ".dump").Output()
 	if err != nil {
 		t.Fatalf("dump slow-path child: %v", err)
 	}
@@ -835,7 +834,7 @@ func TestForkFastPathFiresOnS3WithinSizeLimit(t *testing.T) {
 		t.Fatal(err)
 	}
 	path, _ := w.Checkout("app", "main")
-	if out, err := exec.Command("sqlite3", path,
+	if out, err := testutil.SQLite3CLI(path,
 		"CREATE TABLE t (v); INSERT INTO t VALUES (1),(2);").CombinedOutput(); err != nil {
 		t.Fatalf("seed: %v: %s", err, out)
 	}
@@ -852,7 +851,7 @@ func TestForkFastPathFiresOnS3WithinSizeLimit(t *testing.T) {
 		t.Fatalf("fork fast path hits = %d, want %d (S3's server-side CopyObject should fire the fast path for a single-snapshot chain within the size limit)", got, before+1)
 	}
 
-	srcDump, err := exec.Command("sqlite3", path, ".dump").Output()
+	srcDump, err := testutil.SQLite3CLI(path, ".dump").Output()
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -860,7 +859,7 @@ func TestForkFastPathFiresOnS3WithinSizeLimit(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	childDump, err := exec.Command("sqlite3", cpath, ".dump").Output()
+	childDump, err := testutil.SQLite3CLI(cpath, ".dump").Output()
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -881,7 +880,7 @@ func TestSharedForkWritesZeroDataObjects(t *testing.T) {
 		t.Fatal(err)
 	}
 	path, _ := w.Checkout("app", "main")
-	if out, err := exec.Command("sqlite3", path,
+	if out, err := testutil.SQLite3CLI(path,
 		"CREATE TABLE t (v); INSERT INTO t VALUES (1),(2);").CombinedOutput(); err != nil {
 		t.Fatalf("seed: %v: %s", err, out)
 	}
@@ -951,14 +950,14 @@ func TestSharedForkReadsResolveAtForkPoint(t *testing.T) {
 		t.Fatal(err)
 	}
 	path, _ := w.Checkout("app", "main")
-	if out, err := exec.Command("sqlite3", path,
+	if out, err := testutil.SQLite3CLI(path,
 		"CREATE TABLE t (v); INSERT INTO t VALUES ('a'),('b'),('c');").CombinedOutput(); err != nil {
 		t.Fatalf("seed: %v: %s", err, out)
 	}
 	if _, err := w.Checkpoint("app", "main", "v1", nil); err != nil {
 		t.Fatal(err)
 	}
-	parentDump, err := exec.Command("sqlite3", path, ".dump").Output()
+	parentDump, err := testutil.SQLite3CLI(path, ".dump").Output()
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -970,7 +969,7 @@ func TestSharedForkReadsResolveAtForkPoint(t *testing.T) {
 	if err != nil {
 		t.Fatalf("checkout of a shared fork must resolve through the base: %v", err)
 	}
-	childDump, err := exec.Command("sqlite3", cpath, ".dump").Output()
+	childDump, err := testutil.SQLite3CLI(cpath, ".dump").Output()
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -990,7 +989,7 @@ func TestSharedForkMatchesMaterializedFork(t *testing.T) {
 		t.Fatal(err)
 	}
 	path, _ := w.Checkout("app", "main")
-	if out, err := exec.Command("sqlite3", path,
+	if out, err := testutil.SQLite3CLI(path,
 		"CREATE TABLE t (v); INSERT INTO t VALUES (1),(2),(3);").CombinedOutput(); err != nil {
 		t.Fatalf("seed: %v: %s", err, out)
 	}
@@ -1036,11 +1035,11 @@ func TestSharedForkMatchesMaterializedFork(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	sharedDump, err := exec.Command("sqlite3", spath, ".dump").Output()
+	sharedDump, err := testutil.SQLite3CLI(spath, ".dump").Output()
 	if err != nil {
 		t.Fatal(err)
 	}
-	matDump, err := exec.Command("sqlite3", mpath, ".dump").Output()
+	matDump, err := testutil.SQLite3CLI(mpath, ".dump").Output()
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -1065,7 +1064,7 @@ func TestCheckoutQuiescesAndWarnsOnDirtyOverwrite(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if out, err := exec.Command("sqlite3", path,
+	if out, err := testutil.SQLite3CLI(path,
 		"CREATE TABLE t (v); INSERT INTO t VALUES (1);").CombinedOutput(); err != nil {
 		t.Fatalf("%v: %s", err, out)
 	}
@@ -1085,7 +1084,7 @@ func TestCheckoutQuiescesAndWarnsOnDirtyOverwrite(t *testing.T) {
 	}
 
 	// Modify the checkout WITHOUT checkpointing.
-	if out, err := exec.Command("sqlite3", path, "INSERT INTO t VALUES (2);").CombinedOutput(); err != nil {
+	if out, err := testutil.SQLite3CLI(path, "INSERT INTO t VALUES (2);").CombinedOutput(); err != nil {
 		t.Fatalf("%v: %s", err, out)
 	}
 
@@ -1103,7 +1102,7 @@ func TestCheckoutQuiescesAndWarnsOnDirtyOverwrite(t *testing.T) {
 		t.Fatalf("warning does not name the checkout: %q", stderr)
 	}
 
-	got, _ := exec.Command("sqlite3", newPath, "SELECT v FROM t ORDER BY v;").Output()
+	got, _ := testutil.SQLite3CLI(newPath, "SELECT v FROM t ORDER BY v;").Output()
 	if string(got) != "1\n" {
 		t.Fatalf("checkout content = %q, want reset to head (just the checkpointed row)", got)
 	}
@@ -1123,7 +1122,7 @@ func TestPromoteWarnsOnUncheckpointedSourceChanges(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if out, err := exec.Command("sqlite3", path,
+	if out, err := testutil.SQLite3CLI(path,
 		"CREATE TABLE t (v); INSERT INTO t VALUES (1);").CombinedOutput(); err != nil {
 		t.Fatalf("%v: %s", err, out)
 	}
@@ -1137,7 +1136,7 @@ func TestPromoteWarnsOnUncheckpointedSourceChanges(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if out, err := exec.Command("sqlite3", ap, "INSERT INTO t VALUES (99);").CombinedOutput(); err != nil {
+	if out, err := testutil.SQLite3CLI(ap, "INSERT INTO t VALUES (99);").CombinedOutput(); err != nil {
 		t.Fatalf("%v: %s", err, out)
 	}
 	if _, err := w.Checkpoint("app", "attempt-1", "winner", nil); err != nil {
@@ -1145,7 +1144,7 @@ func TestPromoteWarnsOnUncheckpointedSourceChanges(t *testing.T) {
 	}
 	// Dirty edit on the SOURCE after its last checkpoint, without
 	// checkpointing it.
-	if out, err := exec.Command("sqlite3", ap, "INSERT INTO t VALUES (100);").CombinedOutput(); err != nil {
+	if out, err := testutil.SQLite3CLI(ap, "INSERT INTO t VALUES (100);").CombinedOutput(); err != nil {
 		t.Fatalf("%v: %s", err, out)
 	}
 
@@ -1165,7 +1164,7 @@ func TestPromoteWarnsOnUncheckpointedSourceChanges(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	got, _ := exec.Command("sqlite3", mp, "SELECT count(*) FROM t;").Output()
+	got, _ := testutil.SQLite3CLI(mp, "SELECT count(*) FROM t;").Output()
 	if string(got) != "2\n" {
 		t.Fatalf("promoted content = %q, want the checkpointed count only (2 rows)", got)
 	}
@@ -1176,12 +1175,12 @@ func TestPromote(t *testing.T) {
 	w := newWS(t)
 	w.Create("app")
 	path, _ := w.Checkout("app", "main")
-	exec.Command("sqlite3", path, "CREATE TABLE t (v); INSERT INTO t VALUES (1);").Run()
+	testutil.SQLite3CLI(path, "CREATE TABLE t (v); INSERT INTO t VALUES (1);").Run()
 	w.Checkpoint("app", "main", "v1", nil)
 	w.Fork("app", "main", "attempt-1", "", 0, nil)
 
 	ap, _ := w.Checkout("app", "attempt-1")
-	exec.Command("sqlite3", ap, "INSERT INTO t VALUES (99);").Run()
+	testutil.SQLite3CLI(ap, "INSERT INTO t VALUES (99);").Run()
 	w.Checkpoint("app", "attempt-1", "winner", nil)
 
 	// Protected target requires force.
@@ -1193,7 +1192,7 @@ func TestPromote(t *testing.T) {
 		t.Fatal(err)
 	}
 	mp, _ := w.Checkout("app", "main")
-	got, _ := exec.Command("sqlite3", mp, "SELECT count(*) FROM t;").Output()
+	got, _ := testutil.SQLite3CLI(mp, "SELECT count(*) FROM t;").Output()
 	if string(got) != "2\n" {
 		t.Fatalf("promoted main content: %q", got)
 	}
@@ -1256,14 +1255,14 @@ func TestRollbackReportsRepointOnRefreshFailure(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if out, err := exec.Command("sqlite3", path,
+	if out, err := testutil.SQLite3CLI(path,
 		"CREATE TABLE t (v); INSERT INTO t VALUES (1);").CombinedOutput(); err != nil {
 		t.Fatalf("%v: %s", err, out)
 	}
 	if _, err := w.Checkpoint("app", "main", "good", nil); err != nil {
 		t.Fatal(err)
 	}
-	if out, err := exec.Command("sqlite3", path, "DROP TABLE t;").CombinedOutput(); err != nil {
+	if out, err := testutil.SQLite3CLI(path, "DROP TABLE t;").CombinedOutput(); err != nil {
 		t.Fatalf("%v: %s", err, out)
 	}
 	if _, err := w.Checkpoint("app", "main", "bad", nil); err != nil {
@@ -1317,7 +1316,7 @@ func TestConcurrentForksFromSameParent(t *testing.T) {
 	w := newWS(t)
 	w.Create("app")
 	path, _ := w.Checkout("app", "main")
-	exec.Command("sqlite3", path, "CREATE TABLE t (v); INSERT INTO t VALUES (1);").Run()
+	testutil.SQLite3CLI(path, "CREATE TABLE t (v); INSERT INTO t VALUES (1);").Run()
 	w.Checkpoint("app", "main", "v1", nil)
 
 	var wg sync.WaitGroup
@@ -1354,7 +1353,7 @@ func TestConcurrentCheckpointsOnlyOneWins(t *testing.T) {
 	w := newWS(t)
 	w.Create("app")
 	path, _ := w.Checkout("app", "main")
-	exec.Command("sqlite3", path, "CREATE TABLE t (v);").Run()
+	testutil.SQLite3CLI(path, "CREATE TABLE t (v);").Run()
 
 	var wg sync.WaitGroup
 	okCount := 0
@@ -1453,7 +1452,7 @@ func TestConcurrentCheckpointsOnlyOneWinsOnS3(t *testing.T) {
 	w := newWSOnFakeS3(t)
 	w.Create("app")
 	path, _ := w.Checkout("app", "main")
-	exec.Command("sqlite3", path, "CREATE TABLE t (v);").Run()
+	testutil.SQLite3CLI(path, "CREATE TABLE t (v);").Run()
 
 	var wg sync.WaitGroup
 	okCount := 0
@@ -1606,7 +1605,7 @@ func TestMaterializeUsesCheckpointEpochNotRefEpoch(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if out, err := exec.Command("sqlite3", path,
+	if out, err := testutil.SQLite3CLI(path,
 		"CREATE TABLE t (v); INSERT INTO t VALUES (1);").CombinedOutput(); err != nil {
 		t.Fatalf("%v: %s", err, out)
 	}
@@ -1630,7 +1629,7 @@ func TestMaterializeUsesCheckpointEpochNotRefEpoch(t *testing.T) {
 	if err != nil {
 		t.Fatalf("checkout after epoch bump: %v", err)
 	}
-	got, _ := exec.Command("sqlite3", p2, "SELECT v FROM t;").Output()
+	got, _ := testutil.SQLite3CLI(p2, "SELECT v FROM t;").Output()
 	if string(got) != "1\n" {
 		t.Fatalf("content after epoch bump: %q", got)
 	}
@@ -1656,7 +1655,7 @@ func TestCheckpointAfterEpochBumpIsMaterializable(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if out, err := exec.Command("sqlite3", path,
+	if out, err := testutil.SQLite3CLI(path,
 		"CREATE TABLE t (v); INSERT INTO t VALUES (1);").CombinedOutput(); err != nil {
 		t.Fatalf("%v: %s", err, out)
 	}
@@ -1677,7 +1676,7 @@ func TestCheckpointAfterEpochBumpIsMaterializable(t *testing.T) {
 	}
 
 	// Write more data under the new epoch and take a second checkpoint.
-	if out, err := exec.Command("sqlite3", path, "INSERT INTO t VALUES (2);").CombinedOutput(); err != nil {
+	if out, err := testutil.SQLite3CLI(path, "INSERT INTO t VALUES (2);").CombinedOutput(); err != nil {
 		t.Fatalf("%v: %s", err, out)
 	}
 	if _, err := w.Checkpoint("app", "main", "v2", nil); err != nil {
@@ -1690,7 +1689,7 @@ func TestCheckpointAfterEpochBumpIsMaterializable(t *testing.T) {
 	if err != nil {
 		t.Fatalf("checkout after checkpoint following epoch bump: %v", err)
 	}
-	got, err := exec.Command("sqlite3", p2, "SELECT v FROM t ORDER BY v;").Output()
+	got, err := testutil.SQLite3CLI(p2, "SELECT v FROM t ORDER BY v;").Output()
 	if err != nil {
 		t.Fatalf("%v", err)
 	}

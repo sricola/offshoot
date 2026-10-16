@@ -6,7 +6,6 @@ import (
 	"fmt"
 	"io"
 	"os"
-	"os/exec"
 	"path/filepath"
 	"sync"
 	"testing"
@@ -28,7 +27,7 @@ func TestCheckoutReadsASnapshotPlusSegments(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if out, err := exec.Command("sqlite3", path,
+	if out, err := testutil.SQLite3CLI(path,
 		"CREATE TABLE t (v); INSERT INTO t VALUES ('base');").CombinedOutput(); err != nil {
 		t.Fatalf("%v: %s", err, out)
 	}
@@ -45,7 +44,7 @@ func TestCheckoutReadsASnapshotPlusSegments(t *testing.T) {
 	if err := copyFile(path, next); err != nil {
 		t.Fatal(err)
 	}
-	if out, err := exec.Command("sqlite3", next,
+	if out, err := testutil.SQLite3CLI(next,
 		"INSERT INTO t VALUES ('from-segment');").CombinedOutput(); err != nil {
 		t.Fatalf("%v: %s", err, out)
 	}
@@ -77,7 +76,7 @@ func TestCheckoutReadsASnapshotPlusSegments(t *testing.T) {
 	if err != nil {
 		t.Fatalf("checkout across a chain: %v", err)
 	}
-	out, err := exec.Command("sqlite3", got, "SELECT count(*) FROM t;").Output()
+	out, err := testutil.SQLite3CLI(got, "SELECT count(*) FROM t;").Output()
 	if err != nil || string(out) != "2\n" {
 		t.Fatalf("rows = %q err=%v (segment not applied)", out, err)
 	}
@@ -98,7 +97,7 @@ func TestForkFromAChainProducesASingleSnapshot(t *testing.T) {
 		t.Fatal(err)
 	}
 	path, _ := w.Checkout("app", "main")
-	exec.Command("sqlite3", path, "CREATE TABLE t (v); INSERT INTO t VALUES ('base');").Run()
+	testutil.SQLite3CLI(path, "CREATE TABLE t (v); INSERT INTO t VALUES ('base');").Run()
 	if _, err := w.Checkpoint("app", "main", "base", nil); err != nil {
 		t.Fatal(err)
 	}
@@ -139,7 +138,7 @@ func TestForkAtHeadAfterASegmentProducesASingleSnapshot(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	exec.Command("sqlite3", path, "CREATE TABLE t (v); INSERT INTO t VALUES ('base');").Run()
+	testutil.SQLite3CLI(path, "CREATE TABLE t (v); INSERT INTO t VALUES ('base');").Run()
 	if _, err := w.Checkpoint("app", "main", "base", nil); err != nil {
 		t.Fatal(err)
 	}
@@ -152,7 +151,7 @@ func TestForkAtHeadAfterASegmentProducesASingleSnapshot(t *testing.T) {
 	if err := copyFile(path, next); err != nil {
 		t.Fatal(err)
 	}
-	if out, err := exec.Command("sqlite3", next,
+	if out, err := testutil.SQLite3CLI(next,
 		"INSERT INTO t VALUES ('from-segment');").CombinedOutput(); err != nil {
 		t.Fatalf("%v: %s", err, out)
 	}
@@ -202,7 +201,7 @@ func TestForkAtHeadAfterASegmentProducesASingleSnapshot(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	out, err := exec.Command("sqlite3", cpath, "SELECT count(*) FROM t;").Output()
+	out, err := testutil.SQLite3CLI(cpath, "SELECT count(*) FROM t;").Output()
 	if err != nil || string(out) != "2\n" {
 		t.Fatalf("child rows = %q err=%v (fork did not include the segment's data)", out, err)
 	}
@@ -269,7 +268,7 @@ func TestCheckoutIgnoresAFencedWritersObject(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if out, err := exec.Command("sqlite3", path,
+	if out, err := testutil.SQLite3CLI(path,
 		"CREATE TABLE t (v); INSERT INTO t VALUES ('live');").CombinedOutput(); err != nil {
 		t.Fatalf("%v: %s", err, out)
 	}
@@ -285,7 +284,7 @@ func TestCheckoutIgnoresAFencedWritersObject(t *testing.T) {
 	// Build what a fenced writer would have left: a valid snapshot with
 	// different content, at the SAME txid, under a LOWER epoch.
 	orphan := filepath.Join(t.TempDir(), "orphan.db")
-	if out, err := exec.Command("sqlite3", orphan,
+	if out, err := testutil.SQLite3CLI(orphan,
 		"CREATE TABLE t (v); INSERT INTO t VALUES ('fenced');").CombinedOutput(); err != nil {
 		t.Fatalf("%v: %s", err, out)
 	}
@@ -318,7 +317,7 @@ func TestCheckoutIgnoresAFencedWritersObject(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	out, err := exec.Command("sqlite3", got, "SELECT v FROM t;").Output()
+	out, err := testutil.SQLite3CLI(got, "SELECT v FROM t;").Output()
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -587,7 +586,7 @@ func TestMaterializeFallsBackWithoutReaderGetter(t *testing.T) {
 		t.Fatal("fallback materialize returned a zero checksum")
 	}
 
-	out, err := exec.Command("sqlite3", dst, "SELECT count(*) FROM t;").Output()
+	out, err := testutil.SQLite3CLI(dst, "SELECT count(*) FROM t;").Output()
 	if err != nil {
 		t.Fatal(err)
 	}

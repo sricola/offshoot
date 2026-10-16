@@ -63,7 +63,7 @@ func TestMetricsSmokeOpenWriteFlushFork(t *testing.T) {
 		t.Fatalf("expected a capture_lag_bytes sample for the open session:\n%s", duringOpen)
 	}
 
-	if out, err := exec.Command("sqlite3", open.Checkout,
+	if out, err := testutil.SQLite3CLI(open.Checkout,
 		"CREATE TABLE t (v); INSERT INTO t VALUES (1);").CombinedOutput(); err != nil {
 		t.Fatalf("%v: %s", err, out)
 	}

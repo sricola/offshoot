@@ -3,7 +3,6 @@ package ops
 import (
 	"database/sql"
 	"os"
-	"os/exec"
 	"sync"
 	"testing"
 	"time"
@@ -66,7 +65,7 @@ func TestBranchStateDirtyAfterUncheckpointedEdit(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if out, err := exec.Command("sqlite3", path,
+	if out, err := testutil.SQLite3CLI(path,
 		"CREATE TABLE t (v); INSERT INTO t VALUES (1);").CombinedOutput(); err != nil {
 		t.Fatalf("%v: %s", err, out)
 	}
@@ -268,7 +267,7 @@ func TestBranchStateDetachedAfterPromoteRefreshFailure(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if out, err := exec.Command("sqlite3", srcPath,
+	if out, err := testutil.SQLite3CLI(srcPath,
 		"CREATE TABLE t (v); INSERT INTO t VALUES (1);").CombinedOutput(); err != nil {
 		t.Fatalf("%v: %s", err, out)
 	}
@@ -355,7 +354,7 @@ func TestBranchStatePrecedenceActiveOverDirty(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if out, err := exec.Command("sqlite3", path,
+	if out, err := testutil.SQLite3CLI(path,
 		"CREATE TABLE t (v); INSERT INTO t VALUES (1);").CombinedOutput(); err != nil {
 		t.Fatalf("%v: %s", err, out)
 	}
@@ -425,7 +424,7 @@ func TestStatusReportsExactlyOneStateAcrossAMatrixOfBranches(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if out, err := exec.Command("sqlite3", dirtyPath,
+	if out, err := testutil.SQLite3CLI(dirtyPath,
 		"CREATE TABLE t (v); INSERT INTO t VALUES (1);").CombinedOutput(); err != nil {
 		t.Fatalf("%v: %s", err, out)
 	}
@@ -444,7 +443,7 @@ func TestStatusReportsExactlyOneStateAcrossAMatrixOfBranches(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if out, err := exec.Command("sqlite3", detSrcPath,
+	if out, err := testutil.SQLite3CLI(detSrcPath,
 		"CREATE TABLE t (v); INSERT INTO t VALUES (1);").CombinedOutput(); err != nil {
 		t.Fatalf("%v: %s", err, out)
 	}

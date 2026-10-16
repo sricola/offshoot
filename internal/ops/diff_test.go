@@ -18,7 +18,7 @@ import (
 func TestTableRowCountsCountsEveryOrdinaryTableExcludingSqliteInternal(t *testing.T) {
 	testutil.RequireSQLite3(t)
 	path := filepath.Join(t.TempDir(), "x.db")
-	if out, err := exec.Command("sqlite3", path,
+	if out, err := testutil.SQLite3CLI(path,
 		"CREATE TABLE a (v); INSERT INTO a VALUES (1),(2),(3);"+
 			"CREATE TABLE b (v);"+
 			"CREATE TABLE c (v INTEGER PRIMARY KEY AUTOINCREMENT); INSERT INTO c VALUES (1);",
@@ -47,7 +47,7 @@ func TestTableRowCountsCountsEveryOrdinaryTableExcludingSqliteInternal(t *testin
 func TestTableRowCountsOpensReadOnlyEvenOnA0444File(t *testing.T) {
 	testutil.RequireSQLite3(t)
 	path := filepath.Join(t.TempDir(), "x.db")
-	if out, err := exec.Command("sqlite3", path, "CREATE TABLE t (v);").CombinedOutput(); err != nil {
+	if out, err := testutil.SQLite3CLI(path, "CREATE TABLE t (v);").CombinedOutput(); err != nil {
 		t.Fatalf("%v: %s", err, out)
 	}
 	if err := os.Chmod(path, 0o444); err != nil {
@@ -64,14 +64,14 @@ func TestDiffSummaryReportsAddedRemovedAndChangedTables(t *testing.T) {
 	right := filepath.Join(t.TempDir(), "right.db")
 
 	// left: users(3 rows), gone(2 rows)
-	if out, err := exec.Command("sqlite3", left,
+	if out, err := testutil.SQLite3CLI(left,
 		"CREATE TABLE users (v); INSERT INTO users VALUES (1),(2),(3);"+
 			"CREATE TABLE gone (v); INSERT INTO gone VALUES (1),(2);",
 	).CombinedOutput(); err != nil {
 		t.Fatalf("%v: %s", err, out)
 	}
 	// right: users(5 rows, +2), new_table(4 rows) — no `gone`.
-	if out, err := exec.Command("sqlite3", right,
+	if out, err := testutil.SQLite3CLI(right,
 		"CREATE TABLE users (v); INSERT INTO users VALUES (1),(2),(3),(4),(5);"+
 			"CREATE TABLE new_table (v); INSERT INTO new_table VALUES (1),(2),(3),(4);",
 	).CombinedOutput(); err != nil {
@@ -128,8 +128,8 @@ func TestDiffSummaryAcrossTwoEntirelyDifferentDatabasesIsLegit(t *testing.T) {
 	testutil.RequireSQLite3(t)
 	a := filepath.Join(t.TempDir(), "a.db")
 	b := filepath.Join(t.TempDir(), "b.db")
-	exec.Command("sqlite3", a, "CREATE TABLE only_a (v); INSERT INTO only_a VALUES (1);").Run()
-	exec.Command("sqlite3", b, "CREATE TABLE only_b (v);").Run()
+	testutil.SQLite3CLI(a, "CREATE TABLE only_a (v); INSERT INTO only_a VALUES (1);").Run()
+	testutil.SQLite3CLI(b, "CREATE TABLE only_b (v);").Run()
 
 	got, err := DiffSummary(a, b)
 	if err != nil {
@@ -149,13 +149,13 @@ func TestDiffSummaryIsContentAware(t *testing.T) {
 	testutil.RequireSQLite3(t)
 	left := filepath.Join(t.TempDir(), "left.db")
 	right := filepath.Join(t.TempDir(), "right.db")
-	if out, err := exec.Command("sqlite3", left,
+	if out, err := testutil.SQLite3CLI(left,
 		"CREATE TABLE results (id INTEGER PRIMARY KEY, passed INT);"+
 			"INSERT INTO results VALUES (1,1),(2,1),(3,1);",
 	).CombinedOutput(); err != nil {
 		t.Fatalf("%v: %s", err, out)
 	}
-	if out, err := exec.Command("sqlite3", right,
+	if out, err := testutil.SQLite3CLI(right,
 		"CREATE TABLE results (id INTEGER PRIMARY KEY, passed INT);"+
 			"INSERT INTO results VALUES (1,1),(2,0),(4,1);", // 2 changed, 3 removed, 4 added
 	).CombinedOutput(); err != nil {
@@ -190,8 +190,8 @@ func TestDiffSummaryRowidTablesUseRowidAsKey(t *testing.T) {
 	testutil.RequireSQLite3(t)
 	left := filepath.Join(t.TempDir(), "left.db")
 	right := filepath.Join(t.TempDir(), "right.db")
-	exec.Command("sqlite3", left, "CREATE TABLE t (v); INSERT INTO t VALUES ('a'),('b');").Run()
-	exec.Command("sqlite3", right, "CREATE TABLE t (v); INSERT INTO t VALUES ('a'),('B');").Run()
+	testutil.SQLite3CLI(left, "CREATE TABLE t (v); INSERT INTO t VALUES ('a'),('b');").Run()
+	testutil.SQLite3CLI(right, "CREATE TABLE t (v); INSERT INTO t VALUES ('a'),('B');").Run()
 	got, err := DiffSummary(left, right)
 	if err != nil {
 		t.Fatal(err)
@@ -216,13 +216,13 @@ func TestDiffSummaryNonUniqueDeclaredPKFallsBackToRowid(t *testing.T) {
 	testutil.RequireSQLite3(t)
 	left := filepath.Join(t.TempDir(), "left.db")
 	right := filepath.Join(t.TempDir(), "right.db")
-	if out, err := exec.Command("sqlite3", left,
+	if out, err := testutil.SQLite3CLI(left,
 		"CREATE TABLE t (a, b, v, PRIMARY KEY (a, b));"+
 			"INSERT INTO t (a,b,v) VALUES (1,NULL,'x'),(1,NULL,'y');",
 	).CombinedOutput(); err != nil {
 		t.Fatalf("%v: %s", err, out)
 	}
-	if out, err := exec.Command("sqlite3", right,
+	if out, err := testutil.SQLite3CLI(right,
 		"CREATE TABLE t (a, b, v, PRIMARY KEY (a, b));"+
 			"INSERT INTO t (a,b,v) VALUES (1,NULL,'x');",
 	).CombinedOutput(); err != nil {
@@ -250,12 +250,12 @@ func TestDiffSummaryKeylessTableWithShadowedRowidNameFallsBackToOid(t *testing.T
 	testutil.RequireSQLite3(t)
 	left := filepath.Join(t.TempDir(), "left.db")
 	right := filepath.Join(t.TempDir(), "right.db")
-	if out, err := exec.Command("sqlite3", left,
+	if out, err := testutil.SQLite3CLI(left,
 		`CREATE TABLE t ("rowid", v); INSERT INTO t VALUES ('dup','a'),('dup','b');`,
 	).CombinedOutput(); err != nil {
 		t.Fatalf("%v: %s", err, out)
 	}
-	if out, err := exec.Command("sqlite3", right,
+	if out, err := testutil.SQLite3CLI(right,
 		`CREATE TABLE t ("rowid", v); INSERT INTO t VALUES ('dup','a');`,
 	).CombinedOutput(); err != nil {
 		t.Fatalf("%v: %s", err, out)
@@ -281,8 +281,8 @@ func TestDiffSummarySchemaMismatchIsReportedNotCompared(t *testing.T) {
 	testutil.RequireSQLite3(t)
 	left := filepath.Join(t.TempDir(), "left.db")
 	right := filepath.Join(t.TempDir(), "right.db")
-	exec.Command("sqlite3", left, "CREATE TABLE t (a); INSERT INTO t VALUES (1);").Run()
-	exec.Command("sqlite3", right, "CREATE TABLE t (a, b); INSERT INTO t VALUES (1, 2);").Run()
+	testutil.SQLite3CLI(left, "CREATE TABLE t (a); INSERT INTO t VALUES (1);").Run()
+	testutil.SQLite3CLI(right, "CREATE TABLE t (a, b); INSERT INTO t VALUES (1, 2);").Run()
 	got, err := DiffSummary(left, right)
 	if err != nil {
 		t.Fatal(err)
@@ -309,12 +309,12 @@ func TestDiffSummaryGeneratedColumnOnOneSideStillCompares(t *testing.T) {
 	// the stored column's value doesn't, so Changed must be 0.
 	left := filepath.Join(t.TempDir(), "left.db")
 	right := filepath.Join(t.TempDir(), "right.db")
-	if out, err := exec.Command("sqlite3", left,
+	if out, err := testutil.SQLite3CLI(left,
 		"CREATE TABLE g (a INT); INSERT INTO g VALUES (1);",
 	).CombinedOutput(); err != nil {
 		t.Fatalf("%v: %s", err, out)
 	}
-	if out, err := exec.Command("sqlite3", right,
+	if out, err := testutil.SQLite3CLI(right,
 		"CREATE TABLE g (a INT, b INT GENERATED ALWAYS AS (a*2) VIRTUAL); INSERT INTO g (a) VALUES (1);",
 	).CombinedOutput(); err != nil {
 		t.Fatalf("%v: %s", err, out)
@@ -344,12 +344,12 @@ func TestDiffSummaryGeneratedColumnOnOneSideStillCompares(t *testing.T) {
 	// show up as one Changed row via the explicit column list, not error.
 	left2 := filepath.Join(t.TempDir(), "left2.db")
 	right2 := filepath.Join(t.TempDir(), "right2.db")
-	if out, err := exec.Command("sqlite3", left2,
+	if out, err := testutil.SQLite3CLI(left2,
 		"CREATE TABLE g (a INT); INSERT INTO g VALUES (1);",
 	).CombinedOutput(); err != nil {
 		t.Fatalf("%v: %s", err, out)
 	}
-	if out, err := exec.Command("sqlite3", right2,
+	if out, err := testutil.SQLite3CLI(right2,
 		"CREATE TABLE g (a INT, b INT GENERATED ALWAYS AS (a*2) VIRTUAL); INSERT INTO g (a) VALUES (2);",
 	).CombinedOutput(); err != nil {
 		t.Fatalf("%v: %s", err, out)
@@ -369,13 +369,13 @@ func TestDiffSummaryGeneratedColumnOnOneSideStillCompares(t *testing.T) {
 	// confirm it still compares correctly under the explicit list too.
 	left3 := filepath.Join(t.TempDir(), "left3.db")
 	right3 := filepath.Join(t.TempDir(), "right3.db")
-	if out, err := exec.Command("sqlite3", left3,
+	if out, err := testutil.SQLite3CLI(left3,
 		"CREATE TABLE g (a INT); INSERT INTO g VALUES (1);"+
 			"ALTER TABLE g ADD COLUMN b INT GENERATED ALWAYS AS (a*2) VIRTUAL;",
 	).CombinedOutput(); err != nil {
 		t.Fatalf("%v: %s", err, out)
 	}
-	if out, err := exec.Command("sqlite3", right3,
+	if out, err := testutil.SQLite3CLI(right3,
 		"CREATE TABLE g (a INT); INSERT INTO g VALUES (2);"+
 			"ALTER TABLE g ADD COLUMN b INT GENERATED ALWAYS AS (a*2) VIRTUAL;",
 	).CombinedOutput(); err != nil {
@@ -397,7 +397,7 @@ func TestDiffSummaryIdenticalSidesAreSame(t *testing.T) {
 	left := filepath.Join(t.TempDir(), "left.db")
 	right := filepath.Join(t.TempDir(), "right.db")
 	for _, p := range []string{left, right} {
-		exec.Command("sqlite3", p, "CREATE TABLE t (id INTEGER PRIMARY KEY, v); INSERT INTO t VALUES (1,'x');").Run()
+		testutil.SQLite3CLI(p, "CREATE TABLE t (id INTEGER PRIMARY KEY, v); INSERT INTO t VALUES (1,'x');").Run()
 	}
 	got, err := DiffSummary(left, right)
 	if err != nil {
@@ -415,7 +415,7 @@ func TestDiffSummaryOpensBothSidesReadOnlyEvenOn0444Files(t *testing.T) {
 	left := filepath.Join(t.TempDir(), "left.db")
 	right := filepath.Join(t.TempDir(), "right.db")
 	for _, p := range []string{left, right} {
-		exec.Command("sqlite3", p, "CREATE TABLE t (id INTEGER PRIMARY KEY, v); INSERT INTO t VALUES (1,'x');").Run()
+		testutil.SQLite3CLI(p, "CREATE TABLE t (id INTEGER PRIMARY KEY, v); INSERT INTO t VALUES (1,'x');").Run()
 		if err := os.Chmod(p, 0o444); err != nil {
 			t.Fatal(err)
 		}
@@ -458,7 +458,7 @@ func TestMaterializeForDiffCheckpointSideUsesTheReadOnlyCache(t *testing.T) {
 		t.Fatal(err)
 	}
 	path, _ := w.Checkout("app", "main")
-	exec.Command("sqlite3", path, "CREATE TABLE t (v); INSERT INTO t VALUES (1);").Run()
+	testutil.SQLite3CLI(path, "CREATE TABLE t (v); INSERT INTO t VALUES (1);").Run()
 	if _, err := w.Checkpoint("app", "main", "v1", nil); err != nil {
 		t.Fatal(err)
 	}
@@ -503,7 +503,7 @@ func TestMaterializeForDiffHeadSideAlwaysReflectsANewWrite(t *testing.T) {
 		t.Fatal(err)
 	}
 	path, _ := w.Checkout("app", "main")
-	exec.Command("sqlite3", path, "CREATE TABLE t (v); INSERT INTO t VALUES (1);").Run()
+	testutil.SQLite3CLI(path, "CREATE TABLE t (v); INSERT INTO t VALUES (1);").Run()
 	if _, err := w.Checkpoint("app", "main", "v1", nil); err != nil {
 		t.Fatal(err)
 	}
@@ -529,7 +529,7 @@ func TestMaterializeForDiffHeadSideAlwaysReflectsANewWrite(t *testing.T) {
 	// Advance head with a new write + checkpoint (so the durable head really
 	// moves — MaterializeForDiff's head side reads durable state, matching
 	// Export's own semantics).
-	exec.Command("sqlite3", path, "INSERT INTO t VALUES (2);").Run()
+	testutil.SQLite3CLI(path, "INSERT INTO t VALUES (2);").Run()
 	if _, err := w.Checkpoint("app", "main", "v2", nil); err != nil {
 		t.Fatal(err)
 	}
@@ -598,8 +598,8 @@ func TestSqldiffCappedTruncatesAndFlags(t *testing.T) {
 	}
 	left := filepath.Join(t.TempDir(), "left.db")
 	right := filepath.Join(t.TempDir(), "right.db")
-	exec.Command("sqlite3", left, "CREATE TABLE t (id INTEGER PRIMARY KEY, v);").Run()
-	exec.Command("sqlite3", right, "CREATE TABLE t (id INTEGER PRIMARY KEY, v); INSERT INTO t VALUES (1,'aaaaaaaaaa'),(2,'bbbbbbbbbb'),(3,'cccccccccc');").Run()
+	testutil.SQLite3CLI(left, "CREATE TABLE t (id INTEGER PRIMARY KEY, v);").Run()
+	testutil.SQLite3CLI(right, "CREATE TABLE t (id INTEGER PRIMARY KEY, v); INSERT INTO t VALUES (1,'aaaaaaaaaa'),(2,'bbbbbbbbbb'),(3,'cccccccccc');").Run()
 	full, trunc, err := SqldiffCapped(left, right, "", 0)
 	if err != nil {
 		t.Fatal(err)

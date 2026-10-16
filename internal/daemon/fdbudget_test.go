@@ -5,7 +5,6 @@ import (
 	"encoding/json"
 	"fmt"
 	"os"
-	"os/exec"
 	"path/filepath"
 	"reflect"
 	"slices"
@@ -16,6 +15,7 @@ import (
 	"time"
 
 	"github.com/sricola/offshoot/internal/dbfile"
+	"github.com/sricola/offshoot/internal/testutil"
 )
 
 // cachedUnder lists dbfile's live (non-orphan) descriptors under dir.
@@ -181,7 +181,7 @@ func TestJanitorEvictsUnderFDBudget(t *testing.T) {
 	}
 
 	// The pinned session kept capturing: a write still becomes durable.
-	if out, err := exec.Command("sqlite3", open.Checkout,
+	if out, err := testutil.SQLite3CLI(open.Checkout,
 		"CREATE TABLE t (v); INSERT INTO t VALUES (1);").CombinedOutput(); err != nil {
 		t.Fatalf("%v: %s", err, out)
 	}

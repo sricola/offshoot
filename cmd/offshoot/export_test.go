@@ -2,7 +2,6 @@ package main
 
 import (
 	"os"
-	"os/exec"
 	"path/filepath"
 	"strings"
 	"testing"
@@ -12,7 +11,7 @@ import (
 
 func sqliteRows(t *testing.T, dbPath string) string {
 	t.Helper()
-	out, err := exec.Command("sqlite3", dbPath, "SELECT count(*) FROM users;").Output()
+	out, err := testutil.SQLite3CLI(dbPath, "SELECT count(*) FROM users;").Output()
 	if err != nil {
 		t.Fatalf("sqlite3 %s: %v", dbPath, err)
 	}
@@ -28,12 +27,12 @@ func TestExportCLIParsesTripleAtFormAndExportsHistoricalCheckpoint(t *testing.T)
 	call(t, store, "init")
 	call(t, store, "create", "app")
 	path := strings.TrimSpace(call(t, store, "checkout", "app"))
-	if out, err := exec.Command("sqlite3", path,
+	if out, err := testutil.SQLite3CLI(path,
 		"CREATE TABLE users (name); INSERT INTO users VALUES ('ada');").CombinedOutput(); err != nil {
 		t.Fatalf("%v: %s", err, out)
 	}
 	call(t, store, "checkpoint", "app", "v1")
-	if out, err := exec.Command("sqlite3", path, "INSERT INTO users VALUES ('grace');").CombinedOutput(); err != nil {
+	if out, err := testutil.SQLite3CLI(path, "INSERT INTO users VALUES ('grace');").CombinedOutput(); err != nil {
 		t.Fatalf("%v: %s", err, out)
 	}
 	call(t, store, "checkpoint", "app", "v2")
@@ -63,7 +62,7 @@ func TestExportCLIRefusesOverwriteWithoutForce(t *testing.T) {
 	call(t, store, "init")
 	call(t, store, "create", "app")
 	path := strings.TrimSpace(call(t, store, "checkout", "app"))
-	exec.Command("sqlite3", path, "CREATE TABLE users (name);").Run()
+	testutil.SQLite3CLI(path, "CREATE TABLE users (name);").Run()
 	call(t, store, "checkpoint", "app", "v1")
 
 	dst := filepath.Join(t.TempDir(), "out.db")
@@ -119,7 +118,7 @@ func TestCheckoutAtCLIMaterializesSeparateReadOnlyPath(t *testing.T) {
 	call(t, store, "init")
 	call(t, store, "create", "app")
 	path := strings.TrimSpace(call(t, store, "checkout", "app"))
-	if out, err := exec.Command("sqlite3", path,
+	if out, err := testutil.SQLite3CLI(path,
 		"CREATE TABLE users (name); INSERT INTO users VALUES ('ada');").CombinedOutput(); err != nil {
 		t.Fatalf("%v: %s", err, out)
 	}
@@ -162,7 +161,7 @@ func TestCheckoutAtCLIRejectsPathTraversalCheckpoint(t *testing.T) {
 	call(t, store, "init")
 	call(t, store, "create", "app")
 	path := strings.TrimSpace(call(t, store, "checkout", "app"))
-	if out, err := exec.Command("sqlite3", path,
+	if out, err := testutil.SQLite3CLI(path,
 		"CREATE TABLE users (name); INSERT INTO users VALUES ('writable');").CombinedOutput(); err != nil {
 		t.Fatalf("%v: %s", err, out)
 	}

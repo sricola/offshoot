@@ -1,7 +1,6 @@
 package ops
 
 import (
-	"os/exec"
 	"testing"
 	"time"
 
@@ -12,7 +11,7 @@ import (
 // combined output on error.
 func mustExecSQL(t *testing.T, path, sql string) {
 	t.Helper()
-	if out, err := exec.Command("sqlite3", path, sql).CombinedOutput(); err != nil {
+	if out, err := testutil.SQLite3CLI(path, sql).CombinedOutput(); err != nil {
 		t.Fatalf("sqlite3 %s: %v: %s", sql, err, out)
 	}
 }

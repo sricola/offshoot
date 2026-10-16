@@ -3,7 +3,6 @@ package ops
 import (
 	"bytes"
 	"os"
-	"os/exec"
 	"path/filepath"
 	"strconv"
 	"strings"
@@ -16,7 +15,7 @@ import (
 
 func rowCount(t *testing.T, dbPath string) int {
 	t.Helper()
-	out, err := exec.Command("sqlite3", dbPath, "SELECT count(*) FROM t;").Output()
+	out, err := testutil.SQLite3CLI(dbPath, "SELECT count(*) FROM t;").Output()
 	if err != nil {
 		t.Fatalf("sqlite3 %s: %v", dbPath, err)
 	}
@@ -37,7 +36,7 @@ func TestExportHeadWritesAPlainFileWithNoSidecar(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if out, err := exec.Command("sqlite3", path,
+	if out, err := testutil.SQLite3CLI(path,
 		"CREATE TABLE t (v); INSERT INTO t VALUES ('one');").CombinedOutput(); err != nil {
 		t.Fatalf("%v: %s", err, out)
 	}
@@ -67,14 +66,14 @@ func TestExportNamedCheckpointExportsHistoricalContentNotHead(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if out, err := exec.Command("sqlite3", path,
+	if out, err := testutil.SQLite3CLI(path,
 		"CREATE TABLE t (v); INSERT INTO t VALUES ('one');").CombinedOutput(); err != nil {
 		t.Fatalf("%v: %s", err, out)
 	}
 	if _, err := w.Checkpoint("app", "main", "v1", nil); err != nil {
 		t.Fatal(err)
 	}
-	if out, err := exec.Command("sqlite3", path,
+	if out, err := testutil.SQLite3CLI(path,
 		"INSERT INTO t VALUES ('two');").CombinedOutput(); err != nil {
 		t.Fatalf("%v: %s", err, out)
 	}
@@ -106,7 +105,7 @@ func TestExportRefusesToOverwriteWithoutForce(t *testing.T) {
 		t.Fatal(err)
 	}
 	path, _ := w.Checkout("app", "main")
-	exec.Command("sqlite3", path, "CREATE TABLE t (v); INSERT INTO t VALUES ('one');").Run()
+	testutil.SQLite3CLI(path, "CREATE TABLE t (v); INSERT INTO t VALUES ('one');").Run()
 	if _, err := w.Checkpoint("app", "main", "v1", nil); err != nil {
 		t.Fatal(err)
 	}
@@ -121,7 +120,7 @@ func TestExportRefusesToOverwriteWithoutForce(t *testing.T) {
 	}
 
 	// Advance head so a silent overwrite would be observable.
-	exec.Command("sqlite3", path, "INSERT INTO t VALUES ('two');").Run()
+	testutil.SQLite3CLI(path, "INSERT INTO t VALUES ('two');").Run()
 	if _, err := w.Checkpoint("app", "main", "v2", nil); err != nil {
 		t.Fatal(err)
 	}
@@ -175,7 +174,7 @@ func TestExportCreatesDestinationDirectory(t *testing.T) {
 		t.Fatal(err)
 	}
 	path, _ := w.Checkout("app", "main")
-	exec.Command("sqlite3", path, "CREATE TABLE t (v);").Run()
+	testutil.SQLite3CLI(path, "CREATE TABLE t (v);").Run()
 	if _, err := w.Checkpoint("app", "main", "v1", nil); err != nil {
 		t.Fatal(err)
 	}
@@ -209,7 +208,7 @@ func TestExportAtomicOnMidWriteFailureLeavesNoTempOrPartialFile(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if out, err := exec.Command("sqlite3", path,
+	if out, err := testutil.SQLite3CLI(path,
 		"CREATE TABLE t (v); INSERT INTO t VALUES ('base');").CombinedOutput(); err != nil {
 		t.Fatalf("%v: %s", err, out)
 	}
@@ -229,7 +228,7 @@ func TestExportAtomicOnMidWriteFailureLeavesNoTempOrPartialFile(t *testing.T) {
 	if err := copyFile(path, next); err != nil {
 		t.Fatal(err)
 	}
-	if out, err := exec.Command("sqlite3", next,
+	if out, err := testutil.SQLite3CLI(next,
 		"INSERT INTO t VALUES ('from-segment');").CombinedOutput(); err != nil {
 		t.Fatalf("%v: %s", err, out)
 	}
@@ -282,7 +281,7 @@ func TestExportDiscardsChecksumRegardlessOfChainLength(t *testing.T) {
 		t.Fatal(err)
 	}
 	path, _ := w.Checkout("app", "main")
-	exec.Command("sqlite3", path, "CREATE TABLE t (v);").Run()
+	testutil.SQLite3CLI(path, "CREATE TABLE t (v);").Run()
 	if _, err := w.Checkpoint("app", "main", "v1", nil); err != nil {
 		t.Fatal(err)
 	}
@@ -307,11 +306,11 @@ func TestCheckoutAtMaterializesHistoricalCheckpointReadOnly(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	exec.Command("sqlite3", path, "CREATE TABLE t (v); INSERT INTO t VALUES ('one');").Run()
+	testutil.SQLite3CLI(path, "CREATE TABLE t (v); INSERT INTO t VALUES ('one');").Run()
 	if _, err := w.Checkpoint("app", "main", "v1", nil); err != nil {
 		t.Fatal(err)
 	}
-	exec.Command("sqlite3", path, "INSERT INTO t VALUES ('two');").Run()
+	testutil.SQLite3CLI(path, "INSERT INTO t VALUES ('two');").Run()
 	if _, err := w.Checkpoint("app", "main", "v2", nil); err != nil {
 		t.Fatal(err)
 	}
@@ -379,7 +378,7 @@ func TestCheckoutAtWithoutForceIsACacheHitUntilTheBranchIsDestroyed(t *testing.T
 		t.Fatal(err)
 	}
 	path, _ := w.Checkout("app", "main")
-	exec.Command("sqlite3", path, "CREATE TABLE t (v);").Run()
+	testutil.SQLite3CLI(path, "CREATE TABLE t (v);").Run()
 	if _, err := w.Checkpoint("app", "main", "v1", nil); err != nil {
 		t.Fatal(err)
 	}
@@ -415,7 +414,7 @@ func TestCheckoutAtAfterDestroyAndReforkServesTheNewBranch(t *testing.T) {
 		t.Fatal(err)
 	}
 	path, _ := w.Checkout("app", "main")
-	if out, err := exec.Command("sqlite3", path, "CREATE TABLE t (v); INSERT INTO t VALUES (1);").CombinedOutput(); err != nil {
+	if out, err := testutil.SQLite3CLI(path, "CREATE TABLE t (v); INSERT INTO t VALUES (1);").CombinedOutput(); err != nil {
 		t.Fatalf("sqlite3: %v: %s", err, out)
 	}
 	if _, err := w.Checkpoint("app", "main", "v1", nil); err != nil {
@@ -429,7 +428,7 @@ func TestCheckoutAtAfterDestroyAndReforkServesTheNewBranch(t *testing.T) {
 		t.Fatal(err)
 	}
 	rows := func(p string) string {
-		out, err := exec.Command("sqlite3", p, "SELECT count(*) FROM t;").CombinedOutput()
+		out, err := testutil.SQLite3CLI(p, "SELECT count(*) FROM t;").CombinedOutput()
 		if err != nil {
 			t.Fatalf("sqlite3 %s: %v: %s", p, err, out)
 		}
@@ -442,7 +441,7 @@ func TestCheckoutAtAfterDestroyAndReforkServesTheNewBranch(t *testing.T) {
 	if err := w.Destroy("app", "exp", true); err != nil {
 		t.Fatal(err)
 	}
-	if out, err := exec.Command("sqlite3", path, "INSERT INTO t VALUES (2);").CombinedOutput(); err != nil {
+	if out, err := testutil.SQLite3CLI(path, "INSERT INTO t VALUES (2);").CombinedOutput(); err != nil {
 		t.Fatalf("sqlite3: %v: %s", err, out)
 	}
 	if _, err := w.Checkpoint("app", "main", "v2", nil); err != nil {
@@ -471,7 +470,7 @@ func TestCheckoutAtForceRematerializesAndCanFail(t *testing.T) {
 		t.Fatal(err)
 	}
 	path, _ := w.Checkout("app", "main")
-	exec.Command("sqlite3", path, "CREATE TABLE t (v);").Run()
+	testutil.SQLite3CLI(path, "CREATE TABLE t (v);").Run()
 	if _, err := w.Checkpoint("app", "main", "v1", nil); err != nil {
 		t.Fatal(err)
 	}
@@ -507,7 +506,7 @@ func TestCheckoutAtRejectsPathTraversalCheckpoint(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if out, err := exec.Command("sqlite3", path,
+	if out, err := testutil.SQLite3CLI(path,
 		"CREATE TABLE t (v); INSERT INTO t VALUES ('writable-checkout');").CombinedOutput(); err != nil {
 		t.Fatalf("%v: %s", err, out)
 	}
@@ -563,7 +562,7 @@ func TestCheckoutAtChmodFailureRemovesFileSoLaterCallsRematerialize(t *testing.T
 		t.Fatal(err)
 	}
 	path, _ := w.Checkout("app", "main")
-	exec.Command("sqlite3", path, "CREATE TABLE t (v);").Run()
+	testutil.SQLite3CLI(path, "CREATE TABLE t (v);").Run()
 	if _, err := w.Checkpoint("app", "main", "v1", nil); err != nil {
 		t.Fatal(err)
 	}

@@ -7,10 +7,11 @@ import (
 	"fmt"
 	"net"
 	"net/http"
-	"os/exec"
 	"strings"
 	"testing"
 	"time"
+
+	"github.com/sricola/offshoot/internal/testutil"
 )
 
 // ---- pure eventBus unit tests (no daemon) --------------------------------
@@ -184,7 +185,7 @@ func TestSubscribeSocketSeesSessionLifecycle(t *testing.T) {
 		t.Fatalf("session_opened ts %q not RFC3339: %v", openedEv.TS, err)
 	}
 
-	if out, err := exec.Command("sqlite3", open.Checkout,
+	if out, err := testutil.SQLite3CLI(open.Checkout,
 		"CREATE TABLE t (v); INSERT INTO t VALUES (1);").CombinedOutput(); err != nil {
 		t.Fatalf("%v: %s", err, out)
 	}
@@ -296,7 +297,7 @@ func TestSlowSubscriberDroppedSessionKeepsFlushing(t *testing.T) {
 	if !open.OK {
 		t.Fatalf("open = %+v", open)
 	}
-	if out, err := exec.Command("sqlite3", open.Checkout, "CREATE TABLE t (v);").CombinedOutput(); err != nil {
+	if out, err := testutil.SQLite3CLI(open.Checkout, "CREATE TABLE t (v);").CombinedOutput(); err != nil {
 		t.Fatalf("%v: %s", err, out)
 	}
 
@@ -305,7 +306,7 @@ func TestSlowSubscriberDroppedSessionKeepsFlushing(t *testing.T) {
 	const n = 25
 	var lastTXID uint64
 	for i := 0; i < n; i++ {
-		if out, err := exec.Command("sqlite3", open.Checkout,
+		if out, err := testutil.SQLite3CLI(open.Checkout,
 			fmt.Sprintf("INSERT INTO t VALUES (%d);", i)).CombinedOutput(); err != nil {
 			t.Fatalf("insert %d: %v: %s", i, err, out)
 		}

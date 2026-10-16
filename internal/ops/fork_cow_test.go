@@ -8,7 +8,6 @@ import (
 	"context"
 	"errors"
 	"fmt"
-	"os/exec"
 	"testing"
 
 	"github.com/sricola/offshoot/internal/ops"
@@ -38,7 +37,7 @@ func TestForkTimeFloorMaterializesDeepChain(t *testing.T) {
 		t.Fatal(err)
 	}
 	defer s.Close()
-	if out, err := exec.Command("sqlite3", s.CheckoutPath(), "CREATE TABLE t (v);").CombinedOutput(); err != nil {
+	if out, err := testutil.SQLite3CLI(s.CheckoutPath(), "CREATE TABLE t (v);").CombinedOutput(); err != nil {
 		t.Fatalf("CREATE TABLE: %v: %s", err, out)
 	}
 	// Settling flush: the chain's one snapshot.
@@ -60,7 +59,7 @@ func TestForkTimeFloorMaterializesDeepChain(t *testing.T) {
 
 	// Grow the chain to >= ForkShareMaxDepth members (snapshot + segments).
 	for i := 0; i < ops.ForkShareMaxDepth; i++ {
-		if out, err := exec.Command("sqlite3", s.CheckoutPath(),
+		if out, err := testutil.SQLite3CLI(s.CheckoutPath(),
 			fmt.Sprintf("INSERT INTO t VALUES (%d);", i)).CombinedOutput(); err != nil {
 			t.Fatalf("INSERT %d: %v: %s", i, err, out)
 		}
@@ -126,7 +125,7 @@ func TestForkTimeFloorMaterializesDeepChain(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	got, err := exec.Command("sqlite3", cpath, "SELECT count(*) FROM t;").Output()
+	got, err := testutil.SQLite3CLI(cpath, "SELECT count(*) FROM t;").Output()
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -158,14 +157,14 @@ func TestForkFloorTracksConfiguredSnapshotEvery(t *testing.T) {
 		t.Fatal(err)
 	}
 	defer s.Close()
-	if out, err := exec.Command("sqlite3", s.CheckoutPath(), "CREATE TABLE t (v);").CombinedOutput(); err != nil {
+	if out, err := testutil.SQLite3CLI(s.CheckoutPath(), "CREATE TABLE t (v);").CombinedOutput(); err != nil {
 		t.Fatalf("CREATE TABLE: %v: %s", err, out)
 	}
 	if _, err := s.Flush("", nil); err != nil {
 		t.Fatal(err)
 	}
 	for i := 0; i < cadence; i++ {
-		if out, err := exec.Command("sqlite3", s.CheckoutPath(),
+		if out, err := testutil.SQLite3CLI(s.CheckoutPath(),
 			fmt.Sprintf("INSERT INTO t VALUES (%d);", i)).CombinedOutput(); err != nil {
 			t.Fatalf("INSERT %d: %v: %s", i, err, out)
 		}
@@ -231,7 +230,7 @@ func TestForkFloorTracksConfiguredSnapshotEvery(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	got, err := exec.Command("sqlite3", cpath, "SELECT count(*) FROM t;").Output()
+	got, err := testutil.SQLite3CLI(cpath, "SELECT count(*) FROM t;").Output()
 	if err != nil {
 		t.Fatal(err)
 	}
