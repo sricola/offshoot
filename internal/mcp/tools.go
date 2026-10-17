@@ -472,6 +472,11 @@ func optBool(name string) prop { return prop{name: name, jsonType: "boolean"} }
 // optInt builds an optional integer property (e.g. `max_bytes`).
 func optInt(name string) prop { return prop{name: name, jsonType: "integer"} }
 
+// optStrList builds an optional array-of-strings property.
+func optStrList(name string) prop {
+	return prop{name: name, jsonType: "array", extra: map[string]any{"items": map[string]any{"type": "string"}}}
+}
+
 // optMeta builds the optional `meta` property: a small string->string map
 // stored on the new branch (fork) or the named checkpoint (checkpoint),
 // capped by ops.ValidateMeta. Advertised as an object of strings so a
@@ -665,6 +670,23 @@ func (t *OffshootTools) Tools() []Tool {
 			Annotations: annotate("Destroy a branch", false, true, false),
 		},
 		{
+			Name: "offshoot_prune_checkpoints",
+			Description: "Delete named checkpoints from a branch — never the branch itself, its " +
+				"head, or its data. Call this when a long-running branch has piled up " +
+				"checkpoints you no longer need to roll back or fork to: every checkpoint " +
+				"rewrites the branch's checkpoint list, so a short list keeps checkpoints " +
+				"fast, and storage only those checkpoints kept alive is reclaimed by gc. " +
+				"Pass `names` to delete exactly those (an unknown name refuses the whole " +
+				"call, deleting nothing), or `keep` to delete all but the N newest by txid. " +
+				"A deleted checkpoint can no longer be rolled back, forked or exported " +
+				"from. Protected branches (main by default) refuse this; force is refused " +
+				"unless the server was started with -allow-force, so never retry with " +
+				"force — ask the human. Safe while a session is open on the branch.",
+			InputSchema: schema(reqStr("database"), optStrDefault("branch", "main"),
+				optStrList("names"), optInt("keep"), optBool("force")),
+			Annotations: annotate("Delete checkpoints from a branch", false, true, true),
+		},
+		{
 			Name: "offshoot_touch",
 			Description: "Reset a branch's activity clock so its TTL does not expire mid-task, and " +
 				"optionally change the TTL. Call this when an attempt on a TTL'd fork is taking " +
@@ -763,6 +785,8 @@ func (t *OffshootTools) Call(ctx context.Context, name string, args json.RawMess
 		return t.promote(args)
 	case "offshoot_destroy":
 		return t.destroy(args)
+	case "offshoot_prune_checkpoints":
+		return t.pruneCheckpoints(args)
 	case "offshoot_touch":
 		return t.touch(args)
 	case "offshoot_diff":
@@ -1363,6 +1387,54 @@ func (t *OffshootTools) destroy(args json.RawMessage) (ToolResult, error) {
 	return StructuredResult(map[string]any{
 		"database": a.Database, "branch": a.Branch,
 	}, "destroyed %s@%s", a.Database, a.Branch), nil
+}
+
+type pruneCheckpointsArgs struct {
+	Database string   `json:"database"`
+	Branch   string   `json:"branch"`
+	Names    []string `json:"names"`
+	// Keep is a pointer so that 0 (keep none) is told apart from omitted.
+	Keep  *int `json:"keep"`
+	Force bool `json:"force"`
+}
+
+// pruneCheckpoints deletes checkpoints from db@branch (ops.PruneCheckpoints).
+// force is gated like destroy's (refuseForceOnProtected), but there is no
+// open-session refusal: a prune writes only checkpoint metadata, which a
+// session's flushes re-read rather than overwrite.
+func (t *OffshootTools) pruneCheckpoints(args json.RawMessage) (ToolResult, error) {
+	var a pruneCheckpointsArgs
+	if err := json.Unmarshal(args, &a); err != nil {
+		return ErrorResult("invalid arguments: %v", err), nil
+	}
+	if a.Database == "" {
+		return ErrorResult("database is required"), nil
+	}
+	branch := branchOr(a.Branch)
+	if r, bad := validateNames(namedArg("database", a.Database), namedArg("branch", branch)); bad {
+		return r, nil
+	}
+	cliCmd := fmt.Sprintf("offshoot prune %s@%s %s --force", a.Database, branch, strings.Join(a.Names, " "))
+	if a.Keep != nil {
+		cliCmd = fmt.Sprintf("offshoot prune %s@%s --keep %d --force", a.Database, branch, *a.Keep)
+	}
+	r, refused, eff := t.refuseForceOnProtected(a.Database, branch, a.Force, cliCmd)
+	if refused {
+		return r, nil
+	}
+	opts := ops.PruneOptions{Names: a.Names, Force: eff}
+	if a.Keep != nil {
+		opts.Keep, opts.KeepSet = *a.Keep, true
+	}
+	res, err := t.ws.PruneCheckpoints(a.Database, branch, opts)
+	if err != nil {
+		return ErrorResult("%v", agentNextStep(t.rewrapForceRefusal(err, a.Database, branch, cliCmd), a.Database)), nil
+	}
+	data := map[string]any{"database": a.Database, "branch": branch, "pruned": res.Deleted, "kept": res.Kept}
+	if len(res.Deleted) == 0 {
+		return StructuredResult(data, "nothing to prune on %s@%s (%d kept)", a.Database, branch, res.Kept), nil
+	}
+	return StructuredResult(data, "pruned %s from %s@%s (%d kept)", strings.Join(res.Deleted, ", "), a.Database, branch, res.Kept), nil
 }
 
 type touchArgs struct {

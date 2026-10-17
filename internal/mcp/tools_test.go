@@ -409,15 +409,16 @@ func TestToolsRejectEscapingNames(t *testing.T) {
 // against what the handler actually accepts without hardcoding per-field
 // checks.
 var toolArgStructs = map[string]any{
-	"offshoot_list":       nil,
-	"offshoot_checkout":   checkoutArgs{},
-	"offshoot_checkpoint": checkpointArgs{},
-	"offshoot_fork":       forkArgs{},
-	"offshoot_rollback":   rollbackArgs{},
-	"offshoot_promote":    promoteArgs{},
-	"offshoot_destroy":    destroyArgs{},
-	"offshoot_touch":      touchArgs{},
-	"offshoot_diff":       diffArgs{},
+	"offshoot_list":              nil,
+	"offshoot_checkout":          checkoutArgs{},
+	"offshoot_checkpoint":        checkpointArgs{},
+	"offshoot_fork":              forkArgs{},
+	"offshoot_rollback":          rollbackArgs{},
+	"offshoot_promote":           promoteArgs{},
+	"offshoot_destroy":           destroyArgs{},
+	"offshoot_prune_checkpoints": pruneCheckpointsArgs{},
+	"offshoot_touch":             touchArgs{},
+	"offshoot_diff":              diffArgs{},
 }
 
 // jsonSchemaTypeForKind maps a Go reflect.Kind to the JSON Schema "type"
@@ -435,6 +436,8 @@ func jsonSchemaTypeForKind(k reflect.Kind) string {
 		return "number"
 	case reflect.Map:
 		return "object"
+	case reflect.Slice:
+		return "array"
 	default:
 		return "unsupported:" + k.String()
 	}
@@ -485,7 +488,13 @@ func TestToolSchemaTypesMatchArgStructs(t *testing.T) {
 			if name == "" || name == "-" {
 				continue
 			}
-			fieldKindByJSONName[name] = f.Type.Kind()
+			// A pointer field is its element type made optional (e.g. a
+			// *int keep, where 0 differs from omitted).
+			ft := f.Type
+			if ft.Kind() == reflect.Pointer {
+				ft = ft.Elem()
+			}
+			fieldKindByJSONName[name] = ft.Kind()
 		}
 
 		for propName, propSchemaAny := range props {

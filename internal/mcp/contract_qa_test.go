@@ -271,8 +271,8 @@ func TestPromoteForceFailsClosedOnTransientGetRefError(t *testing.T) {
 	}
 }
 
-// TestToolSurfaceIsExactlyNineWithPinnedRequiredAndDefaults pins
-// docs/reference.md's "offshoot mcp" tool list (nine tools, no protect or
+// TestToolSurfaceIsExactlyTenWithPinnedRequiredAndDefaults pins
+// docs/reference.md's "offshoot mcp" tool list (ten tools, no protect or
 // export tool) and, per tool, the schema's `required` list and the
 // documented `branch` default ("`branch` defaults to \"main\" if omitted"
 // on checkout, checkpoint, fork, rollback and touch; destroy's `branch` is
@@ -287,23 +287,24 @@ func TestToolSurfaceIsExactlyNineWithPinnedRequiredAndDefaults(t *testing.T) {
 		required      []string
 		branchDefault string // "" means: no `branch` default advertised
 	}{
-		"offshoot_list":       {nil, ""},
-		"offshoot_checkout":   {[]string{"database"}, "main"},
-		"offshoot_checkpoint": {[]string{"database", "name"}, "main"},
-		"offshoot_fork":       {[]string{"database", "new_branch"}, "main"},
-		"offshoot_rollback":   {[]string{"database", "to"}, "main"},
-		"offshoot_promote":    {[]string{"database", "source", "target"}, ""},
-		"offshoot_destroy":    {[]string{"database", "branch"}, ""},
-		"offshoot_touch":      {[]string{"database"}, "main"},
-		"offshoot_diff":       {[]string{"database", "left", "right"}, ""},
+		"offshoot_list":              {nil, ""},
+		"offshoot_checkout":          {[]string{"database"}, "main"},
+		"offshoot_checkpoint":        {[]string{"database", "name"}, "main"},
+		"offshoot_fork":              {[]string{"database", "new_branch"}, "main"},
+		"offshoot_rollback":          {[]string{"database", "to"}, "main"},
+		"offshoot_promote":           {[]string{"database", "source", "target"}, ""},
+		"offshoot_destroy":           {[]string{"database", "branch"}, ""},
+		"offshoot_prune_checkpoints": {[]string{"database"}, "main"},
+		"offshoot_touch":             {[]string{"database"}, "main"},
+		"offshoot_diff":              {[]string{"database", "left", "right"}, ""},
 	}
 	tools := ts.Tools()
-	if len(tools) != 9 {
+	if len(tools) != 10 {
 		names := make([]string, 0, len(tools))
 		for _, tl := range tools {
 			names = append(names, tl.Name)
 		}
-		t.Fatalf("Tools() = %d tools %v, want exactly 9", len(tools), names)
+		t.Fatalf("Tools() = %d tools %v, want exactly 10", len(tools), names)
 	}
 	type wireTool struct {
 		Name        string `json:"name"`

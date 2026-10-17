@@ -10,9 +10,9 @@ import (
 )
 
 // documentedMCPTools is the exact set reference.md "#offshoot-mcp" lists:
-// "nine tools (offshoot_list, offshoot_checkout, offshoot_checkpoint,
+// "ten tools (offshoot_list, offshoot_checkout, offshoot_checkpoint,
 // offshoot_fork, offshoot_rollback, offshoot_promote, offshoot_destroy,
-// offshoot_touch, offshoot_diff)".
+// offshoot_prune_checkpoints, offshoot_touch, offshoot_diff)".
 var documentedMCPTools = []string{
 	"offshoot_checkout",
 	"offshoot_checkpoint",
@@ -21,12 +21,13 @@ var documentedMCPTools = []string{
 	"offshoot_fork",
 	"offshoot_list",
 	"offshoot_promote",
+	"offshoot_prune_checkpoints",
 	"offshoot_rollback",
 	"offshoot_touch",
 }
 
-// TestMCPToolsListIsExactlyTheNineDocumentedNoProtect pins reference.md
-// "#offshoot-mcp": the server advertises exactly the nine documented tools
+// TestMCPToolsListIsExactlyTheDocumentedNoProtect pins reference.md
+// "#offshoot-mcp": the server advertises exactly the ten documented tools
 // and "There is no offshoot_protect/offshoot_unprotect tool; flipping a
 // branch's protected flag is CLI-only by design". Both the ToolSet's Tools()
 // and the wire-level tools/list answer of a real Server built on it are
