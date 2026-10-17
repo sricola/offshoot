@@ -527,6 +527,47 @@ class TestClient(unittest.TestCase):
             c.destroy("app", "try")
             self.assertNotIn("try", {b.branch for b in c.branches("app")})
 
+    def test_prune(self):
+        with offshoot.connect(self.d.sock) as c:
+            c.create("prunedb")
+            s = c.open("prunedb")
+            db = sqlite3.connect(s.path)
+            db.execute("CREATE TABLE t (v TEXT)")
+            for name in ("v1", "v2", "v3"):
+                db.execute("INSERT INTO t VALUES (?)", (name,))
+                db.commit()
+                s.flush(name)
+            # main is protected by default; prune needs force there, and is
+            # allowed while the session is open.
+            with self.assertRaises(OffshootError):
+                c.prune("prunedb", "main", ["v1"])
+            res = c.prune("prunedb", "main", ["v2", "v1"], force=True)
+            self.assertEqual(res.pruned, ["v1", "v2"])
+            self.assertEqual(res.kept, 2)  # v3 and init
+            with self.assertRaises(OffshootError):
+                c.prune("prunedb", "main", ["nope"], force=True)
+            res = c.prune("prunedb", "main", keep=5, force=True)
+            self.assertEqual((res.pruned, res.kept), ([], 2))
+            # keep=0 must reach the daemon, not be dropped as falsy.
+            res = c.prune("prunedb", "main", keep=0, force=True)
+            self.assertEqual((res.pruned, res.kept), (["init", "v3"], 0))
+            info = {b.branch: b for b in c.branches("prunedb")}
+            self.assertEqual(info["main"].checkpoints, [])
+            self.assertGreater(s.flush("after"), 0)
+            db.close()
+            s.close()
+
+    def test_prune_argument_checks(self):
+        with offshoot.connect(self.d.sock) as c:
+            with self.assertRaises(ValueError):
+                c.prune("app", "main")
+            with self.assertRaises(ValueError):
+                c.prune("app", "main", ["a"], keep=1)
+            with self.assertRaises(TypeError):
+                c.prune("app", "main", keep=True)
+            with self.assertRaises(TypeError):
+                c.prune("app", "main", "v1")  # a str, not a list of names
+
     def test_errors_are_loud(self):
         with offshoot.connect(self.d.sock) as c:
             with self.assertRaises(OffshootError) as cm:

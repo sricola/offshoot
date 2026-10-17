@@ -48,8 +48,11 @@ function buildBinary(dir: string): string {
   return out;
 }
 
+// A 5s busy timeout, as testutil.SQLite3CLI preloads for the Go tests: a
+// live session's capture engine takes short write locks on its checkout,
+// and a CLI write landing in one would otherwise fail at once.
 function sqlite3(dbPath: string, sql: string): string {
-  return execFileSync("sqlite3", [dbPath, sql]).toString();
+  return execFileSync("sqlite3", ["-cmd", ".timeout 5000", dbPath, sql]).toString();
 }
 
 /** A daemon on a temp store+socket.
@@ -453,6 +456,50 @@ test("a valid-JSON non-object response line is a malformed-response OffshootErro
     await new Promise<void>((res) => srv.close(() => res()));
     rmSync(dir, { recursive: true, force: true });
   }
+});
+
+test("prune: by name and by keep (0 included), protected gate, unknown name, beside an open session", async (t: TestContext) => {
+  if (!canRun) {
+    t.skip("go and/or sqlite3 not on PATH");
+    return;
+  }
+  const c: Client = await connect(fixture!.sock);
+  try {
+    await c.create("prunedb");
+    const s = await c.open("prunedb");
+    sqlite3(s.path, "CREATE TABLE t (v TEXT);");
+    for (const name of ["v1", "v2", "v3"]) {
+      sqlite3(s.path, `INSERT INTO t VALUES ('${name}');`);
+      await s.flush(name);
+    }
+    // main is protected by default; force is needed, an open session is not a refusal.
+    await assert.rejects(c.prune("prunedb", "main", { names: ["v1"] }), /protected/);
+    assert.deepEqual(await c.prune("prunedb", "main", { names: ["v2", "v1"], force: true }), { pruned: ["v1", "v2"], kept: 2 });
+    await assert.rejects(c.prune("prunedb", "main", { names: ["nope"], force: true }), /"nope"/);
+    assert.deepEqual(await c.prune("prunedb", "main", { keep: 5, force: true }), { pruned: [], kept: 2 });
+    assert.deepEqual(await c.prune("prunedb", "main", { keep: 0, force: true }), { pruned: ["init", "v3"], kept: 0 });
+    const info = new Map((await c.branches("prunedb")).map((b) => [b.branch, b]));
+    assert.deepEqual(info.get("main")!.checkpoints, []);
+    assert.ok((await s.flush("after")) > 0);
+    await s.close();
+  } finally {
+    c.close();
+  }
+});
+
+test("prune: names and keep are exactly-one, keep a non-negative integer, and never reach the wire otherwise", async () => {
+  const client = Object.create(Client.prototype) as Client;
+  const sent: string[] = [];
+  (client as unknown as { _call: (op: string) => Promise<unknown> })._call = async (op) => {
+    sent.push(op);
+    return { ok: true, kept: 0 };
+  };
+  for (const opts of [{}, { names: [] }, { names: ["a"], keep: 1 }, { keep: -1 }, { keep: 1.5 }]) {
+    await assert.rejects(client.prune("app", "main", opts), OffshootError, JSON.stringify(opts));
+  }
+  assert.deepEqual(sent, []);
+  // The daemon omits an empty `pruned` (omitempty); that still yields [].
+  assert.deepEqual(await client.prune("app", "main", { keep: 3 }), { pruned: [], kept: 0 });
 });
 
 test("rollback and promote send the materialize wire field", async () => {

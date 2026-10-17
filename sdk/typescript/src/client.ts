@@ -180,6 +180,24 @@ export interface PromoteOptions {
   materialize?: boolean;
 }
 
+/** Options for {@link Client.prune}: exactly one of `names` and `keep`. */
+export interface PruneOptions {
+  /** Delete exactly these checkpoints; an unknown name refuses the whole call. */
+  names?: string[];
+  /** Delete all but the `keep` newest checkpoints (by txid); 0 deletes all. */
+  keep?: number;
+  /** Override the protected-branch refusal. */
+  force?: boolean;
+}
+
+/** What {@link Client.prune} removed. */
+export interface PruneResult {
+  /** The deleted checkpoint names, sorted. */
+  pruned: string[];
+  /** How many checkpoints the branch still has. */
+  kept: number;
+}
+
 /** Options for {@link Client.touch}. */
 export interface TouchOptions {
   /** A Go duration string to set the TTL, "none" to clear it, or omitted to
@@ -398,6 +416,8 @@ interface RawResponse {
   databases?: string[];
   diff?: DiffResult;
   dbfile_descriptors?: number;
+  pruned?: string[];
+  kept?: number;
 }
 
 /** @internal The subscribe op's one-line ack, read off the socket before
@@ -619,6 +639,26 @@ export class Client {
   async compact(db: string, branch: string): Promise<number> {
     const resp = await this._call("compact", { db, branch });
     return requireField(resp, "txid", "compact");
+  }
+
+  /** Delete checkpoints from db@branch: exactly `opts.names`, or all but the
+   * `opts.keep` newest. Only checkpoint metadata changes; the head and data
+   * are untouched, and storage only those checkpoints kept alive is
+   * reclaimed by gc. A protected branch (main by default) refuses unless
+   * `opts.force`. Safe while a session is open on the branch. */
+  async prune(db: string, branch: string, opts: PruneOptions): Promise<PruneResult> {
+    const hasNames = (opts.names?.length ?? 0) > 0;
+    if (hasNames === (opts.keep !== undefined)) {
+      throw new OffshootError("prune takes checkpoint names or keep, exactly one");
+    }
+    if (opts.keep !== undefined && !(Number.isInteger(opts.keep) && opts.keep >= 0)) {
+      throw new OffshootError(`prune keep must be a non-negative integer, got ${opts.keep}`);
+    }
+    const resp = await this._call("prune", {
+      db, branch, names: hasNames ? opts.names : undefined, keep: opts.keep,
+      force: opts.force ?? false,
+    });
+    return { pruned: resp.pruned ?? [], kept: requireField(resp, "kept", "prune") };
   }
 
   /** Reset db@branch's activity clock, optionally setting/clearing its TTL.

@@ -10,7 +10,7 @@ from __future__ import annotations
 import json
 import os
 import socket
-from collections.abc import Generator
+from collections.abc import Generator, Sequence
 from dataclasses import dataclass, field
 from datetime import timedelta
 from typing import Any, TypeAlias, cast
@@ -83,6 +83,15 @@ class Branch:
     checkpoints_v2: list[CheckpointInfo] = field(default_factory=list)
     state: str = ""
     shared: bool = False
+
+
+@dataclass
+class PruneResult:
+    """What :meth:`Client.prune` removed: the deleted checkpoint names,
+    sorted, and how many checkpoints the branch still has."""
+
+    pruned: list[str]
+    kept: int
 
 
 @dataclass
@@ -228,6 +237,13 @@ def _field(resp: dict[str, Any], key: str, op: str) -> Any:
         ) from None
 
 
+def _omitted(v: object) -> bool:
+    """Whether a request field is left off the wire: None, False and "" are
+    the unset values of the daemon's omitempty fields. Compared by identity,
+    not ==, so an int 0 (prune's keep=0) is sent: 0 == False in Python."""
+    return v is None or v is False or (isinstance(v, str) and v == "")
+
+
 def connect(socket_path: str) -> Client:
     """Open a connection to the offshoot daemon listening on socket_path."""
     return Client(socket_path)
@@ -270,7 +286,7 @@ class Client:
     def _call(self, op: str, **fields: object) -> dict[str, Any]:
         req = {
             "op": op,
-            **{k: v for k, v in fields.items() if v not in ("", None, False)},
+            **{k: v for k, v in fields.items() if not _omitted(v)},
         }
         try:
             self._sock.sendall(json.dumps(req).encode() + b"\n")
@@ -445,6 +461,43 @@ class Client:
         returns the head txid. No-op on an already self-contained branch."""
         resp = self._call("compact", db=db, branch=branch)
         return cast(int, _field(resp, "txid", "compact"))
+
+    def prune(
+        self,
+        db: str,
+        branch: str = "main",
+        names: Sequence[str] | None = None,
+        *,
+        keep: int | None = None,
+        force: bool = False,
+    ) -> PruneResult:
+        """Delete checkpoints from db@branch: exactly ``names``, or all but the
+        ``keep`` newest (by txid). Exactly one of the two must be given.
+
+        Only checkpoint metadata changes; the head and data are untouched, and
+        storage only those checkpoints kept alive is reclaimed by gc. An
+        unknown name refuses the whole call, deleting nothing. A protected
+        branch (main by default) refuses unless force=True. Safe while a
+        session is open on the branch.
+        """
+        if isinstance(names, str):
+            raise TypeError("names must be a list of checkpoint names, not a str")
+        if isinstance(keep, bool):
+            raise TypeError("keep must be an int, not a bool")
+        if (names is None or len(names) == 0) == (keep is None):
+            raise ValueError("prune takes checkpoint names or keep, exactly one")
+        resp = self._call(
+            "prune",
+            db=db,
+            branch=branch,
+            names=list(names) if names else None,
+            keep=keep,
+            force=force,
+        )
+        return PruneResult(
+            pruned=list(resp.get("pruned") or []),
+            kept=cast(int, _field(resp, "kept", "prune")),
+        )
 
     def touch(self, db: str, branch: str, ttl: _TTL = None) -> None:
         """Reset db@branch's activity clock, optionally setting/clearing its TTL.

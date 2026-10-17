@@ -83,6 +83,11 @@ Usage:
                                      make a shared fork self-contained (its
                                      ancestor's storage becomes reclaimable
                                      by gc); no-op if already self-contained
+  offshoot prune <db>[@branch] (<cp>... | --keep N) [--force]
+                                     delete named checkpoints, or all but the
+                                     N newest; the head is untouched and gc
+                                     reclaims what only they kept (requires
+                                     --force for protected)
   offshoot destroy <db>[@branch] [--force]   delete a branch (requires --force for protected)
   offshoot gc [--grace duration]     garbage collect unreachable objects (default grace: 1h)
   offshoot path <db>[@branch]        print the checkout path
@@ -622,6 +627,8 @@ func run(args []string) error {
 		return cmdPromote(w, rest)
 	case "compact":
 		return cmdCompact(w, rest)
+	case "prune":
+		return cmdPrune(w, rest)
 	case "path":
 		return cmdPath(w, rest)
 	case "checkout":
@@ -788,6 +795,45 @@ func cmdProtect(w *ops.Workspace, rest []string) error {
 		return err
 	}
 	fmt.Printf("protected %s@%s\n", db, branch)
+	return nil
+}
+
+// cmdPrune implements `offshoot prune`. w is the store run already opened;
+// rest is everything after the command word.
+func cmdPrune(w *ops.Workspace, rest []string) error {
+	const usage = "usage: offshoot prune <db>[@branch] (<checkpoint>... | --keep N) [--force]"
+	force, rest := extractBoolFlag(rest, "--force")
+	keepRaw, rest, keepSet, err := extractFlag(rest, "--keep")
+	if err != nil {
+		return fmt.Errorf("%s: %w", usage, err)
+	}
+	if len(rest) < 1 {
+		return errors.New(usage)
+	}
+	opts := ops.PruneOptions{Names: rest[1:], KeepSet: keepSet, Force: force}
+	if keepSet {
+		if opts.Keep, err = strconv.Atoi(keepRaw); err != nil {
+			return fmt.Errorf("prune --keep %q: want a count of checkpoints to keep", keepRaw)
+		}
+	}
+	db, branch, err := ops.ParseTarget(rest[0])
+	if err != nil {
+		return err
+	}
+	res, err := w.PruneCheckpoints(db, branch, opts)
+	if err != nil {
+		return err
+	}
+	switch n := len(res.Deleted); n {
+	case 0:
+		fmt.Printf("nothing to prune on %s@%s (%d kept)\n", db, branch, res.Kept)
+	default:
+		noun := "checkpoints"
+		if n == 1 {
+			noun = "checkpoint"
+		}
+		fmt.Printf("pruned %d %s from %s@%s: %s (%d kept)\n", n, noun, db, branch, strings.Join(res.Deleted, ", "), res.Kept)
+	}
 	return nil
 }
 

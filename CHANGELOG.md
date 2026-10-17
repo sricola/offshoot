@@ -17,7 +17,30 @@ Pin an exact version if you depend on format stability. The full contract:
 
 ## [Unreleased]
 
-Nothing yet.
+### Added
+
+- `offshoot prune <db>[@branch] (<checkpoint>... | --keep N) [--force]`
+  deletes named checkpoints, or all but the N newest, from a branch, on
+  every surface: the daemon's `prune` op (`names`/`keep` request fields,
+  `pruned`/`kept` in the response), the MCP tool
+  `offshoot_prune_checkpoints` (force gated by `-allow-force` like
+  destroy's), and `prune` in both SDKs. Until now a checkpoint could not
+  be removed at all, and every checkpoint reads and rewrites the branch's
+  whole checkpoint list, so a branch that named one per step paid more
+  for each new one (about 3.5 ms after 1,000). Only checkpoint metadata
+  changes: the head and data are untouched, gc reclaims what only the
+  pruned checkpoints kept, and the ref format is unchanged. An unknown
+  name refuses the whole call; a protected branch needs `--force`; it is
+  safe beside a live session ([reference](docs/reference.md#offshoot-prune-dbbranch-checkpoint----keep-n---force)).
+
+### Changed
+
+- Python SDK: request fields are left off the wire only when `None`,
+  `False` or `""`, compared by identity, so an integer `0` is sent (it
+  used to be dropped, since `0 == False`; `diff`'s `max_bytes=0` now
+  reaches the daemon, which reads it as the default, as before).
+- Tests drive the `sqlite3` CLI with a 5 s busy timeout in the TypeScript
+  SDK suite too, as `testutil.SQLite3CLI` does for the Go tests.
 
 ## [0.2.21] - 2026-10-17
 

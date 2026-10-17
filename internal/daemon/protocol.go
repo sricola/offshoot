@@ -107,6 +107,13 @@ type Request struct {
 	// to before.
 	Meta map[string]string `json:"meta,omitempty"`
 
+	// Names and Keep (prune only) pick which of the branch's checkpoints
+	// to delete: exactly Names, or all but the Keep newest; exactly one of
+	// the two is given. Keep is a pointer so that 0 (keep none) is a real
+	// request rather than an omitted field.
+	Names []string `json:"names,omitempty"`
+	Keep  *int     `json:"keep,omitempty"`
+
 	// Left/Right (diff only) are db[@branch[@checkpoint]] targets, the same
 	// form export takes; Table (diff only) restricts both modes to one
 	// table; Full (diff only) also runs sqldiff and returns its SQL capped
@@ -165,6 +172,11 @@ type Response struct {
 	// offshoot_dbfile_descriptors gauge. A pointer so that 0 is still
 	// present on a status response, while every other op omits the key.
 	DBFileDescriptors *int `json:"dbfile_descriptors,omitempty"`
+	// Pruned and Kept ("prune" only): the checkpoint names deleted, sorted,
+	// and how many the branch still has. Kept is a pointer for the same
+	// reason as DBFileDescriptors.
+	Pruned []string `json:"pruned,omitempty"`
+	Kept   *int     `json:"kept,omitempty"`
 }
 
 // DiffResult is the "diff" op's wire result: a content-aware per-table
