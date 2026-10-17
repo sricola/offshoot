@@ -7,7 +7,7 @@ description: Use when working on a project that has an offshoot store (a .offsho
 
 offshoot gives every attempt its own real SQLite database — a copy-on-write
 fork, not a mock and not a re-seed. Every checkout is a stock `.db` file any
-SQLite client opens. You have nine tools; the loop is four calls.
+SQLite client opens. You have ten tools; the loop is four calls.
 
 ## The loop
 
@@ -55,6 +55,10 @@ SQLite client opens. You have nine tools; the loop is four calls.
    progress (a lease holder starting `checkpoint:`) is the exception: that
    lease ends on its own within seconds, so wait and retry the same call
    rather than asking the human.
+   On a long-running branch where you name a checkpoint every step,
+   `offshoot_prune_checkpoints {database, branch, keep: 20}` (or `names`)
+   drops checkpoints you will not roll back to; it never touches the
+   branch's data, and each new checkpoint stays fast.
 
 ## Rules
 

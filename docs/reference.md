@@ -412,7 +412,7 @@ resolve, `checkout`, `fork`) slows as checkpoints accumulate on one
 lineage: about 1.6 ms after 100 checkpoints and 16 ms after 1,000,
 against well under a millisecond for one; `compact` starts a fresh
 lineage and resets it. See [benchmarks](benchmarks.md). A head write
-that loses its compare-and-swap to a `touch`, `protect` or TTL change is
+that loses its compare-and-swap to a `touch`, `protect`, `prune` or TTL change is
 retried, up to three attempts.
 
 **Refusals, and `--force`.** A checkpoint is refused when the branch has
@@ -846,6 +846,47 @@ that is busy, or that another operation replaced or removed during the
 refresh, is not refreshed; the compact stands and reports it (close the
 checkout's connections if it was busy, then run `offshoot checkout
 <db>@<branch>`).
+
+## `offshoot prune <db>[@branch] (<checkpoint>... | --keep N) [--force]`
+
+```
+offshoot prune app@attempt-1 before-migration scratch
+offshoot prune app@attempt-1 --keep 10
+offshoot prune app --keep 50 --force
+```
+
+Deletes named checkpoints from the branch: exactly the names given, or
+with `--keep N` all but the N newest (newest by txid, then creation time,
+then name; `--keep 0` deletes them all, and keeping at least as many as
+exist is a no-op). Prints one line, `pruned 2 checkpoints from
+app@attempt-1: before-migration, scratch (8 kept)`, or `nothing to prune
+on app@attempt-1 (8 kept)`.
+
+Only the checkpoint entries go. The branch's head, data and lease are
+untouched, and so is its activity clock: pruning does not extend a TTL.
+A pruned checkpoint can no longer be rolled back to, forked or exported
+from, and its name is free to reuse. Prune never deletes storage itself:
+what only the pruned checkpoints kept reachable is reclaimed by the next
+`gc` (or the daemon's janitor) after its grace period, and everything the
+head, the remaining checkpoints or a fork still reads stays.
+
+A name the branch does not have refuses the whole call and deletes
+nothing, with the branch's checkpoints listed, so a typo never half-applies.
+A protected branch (`main` by default) refuses unless `--force`, as
+`destroy` does: its checkpoints are restore points someone chose to keep.
+A branch being destroyed or reaped refuses. Prune is safe while a session
+or an at-rest checkpoint holds the branch: both rebuild their head write
+from a fresh read of the ref after losing a compare-and-swap, so neither
+puts a pruned entry back, and a prune landing mid-flush does not fail the
+flush.
+
+Why it matters beyond tidiness: every checkpoint reads and rewrites the
+branch's checkpoint list, so a branch that has collected hundreds of named
+checkpoints pays for them on each new one (about 3.5 ms of a checkpoint
+after 1,000 earlier ones, in
+[benchmarks](benchmarks.md#measured-changes-and-context)). A long-lived agent branch that names a
+checkpoint per step can run `prune --keep N` to hold that cost flat.
+Prune does not shorten the branch's segment chain; `compact` does that.
 
 ## `offshoot destroy <db>[@branch] [--force]`
 
@@ -1669,10 +1710,10 @@ offshoot mcp [-default-ttl DURATION|none] [-socket PATH] [-allow-force] [-reap-e
 claude mcp add offshoot -- offshoot -store ./.offshoot mcp
 ```
 
-Serves the Model Context Protocol on stdio: nine tools (`offshoot_list`,
+Serves the Model Context Protocol on stdio: ten tools (`offshoot_list`,
 `offshoot_checkout`, `offshoot_checkpoint`, `offshoot_fork`,
 `offshoot_rollback`, `offshoot_promote`, `offshoot_destroy`,
-`offshoot_touch`, `offshoot_diff`), each described so a model knows not just what it does
+`offshoot_prune_checkpoints`, `offshoot_touch`, `offshoot_diff`), each described so a model knows not just what it does
 but *when* to reach for it (fork before risky work, checkpoint when tests
 pass, roll back when they fail, promote the attempt that worked). Besides
 `claude mcp add`, the Claude Code plugin (`claude plugin marketplace add
@@ -1680,15 +1721,16 @@ sricola/offshoot && claude plugin install offshoot@offshoot`) installs the
 same server plus a skill that teaches the loop and advisory hooks; see
 [docs/agents.md](agents.md#wire-it-into-your-agent). Destructive tools
 honor the same protected-branch rules as the CLI — an unforced
-`offshoot_promote --onto main` or `offshoot_destroy` on `main` is refused,
+`offshoot_promote --onto main`, `offshoot_destroy` or
+`offshoot_prune_checkpoints` on `main` is refused,
 and the refusal is returned to the agent as the tool result, not a
 transport-level error. There is no `offshoot_protect`/`offshoot_unprotect`
 tool; flipping a branch's protected flag is CLI-only by design (see
 [`offshoot protect`](#offshoot-protect-dbbranch--offshoot-unprotect-dbbranch)
 above) — an agent can see the flag via `offshoot_list` but never change it.
 
-**`-allow-force` (off by default): the force gate.** `offshoot_promote`'s
-and `offshoot_destroy`'s `force` argument is honored exactly as before this
+**`-allow-force` (off by default): the force gate.** `offshoot_promote`'s,
+`offshoot_destroy`'s and `offshoot_prune_checkpoints`'s `force` argument is honored exactly as before this
 flag existed *only* when the server was started with `-allow-force`.
 Without it — the default — a call carrying `force: true` against a
 protected branch is refused *before any mutation*, with a tool-result
@@ -2073,13 +2115,13 @@ Which operations exist on which surface today — verified against
 `cmd/offshoot/main.go`'s dispatch, the daemon protocol's op list
 (`internal/daemon/protocol.go`: `open`, `flush`, `status`, `close`,
 `shutdown`, `create`, `checkout`, `fork`, `destroy`, `rollback`,
-`promote`, `compact`, `touch`, `branches`, `dbs`, `export`, `checkout-at`,
-`subscribe`, `diff`), and both SDK clients (`sdk/python/offshoot/client.py`,
+`promote`, `compact`, `touch`, `prune`, `branches`, `dbs`, `export`,
+`checkout-at`, `subscribe`, `diff`), and both SDK clients (`sdk/python/offshoot/client.py`,
 `sdk/typescript/src/client.ts`).
 
 | Operation | CLI | Daemon op | Python/TS SDK | Notes |
 |---|---|---|---|---|
-| create / checkout / fork / destroy / rollback / promote / compact / touch / branches / dbs | yes | yes | yes | Full parity, with one exception: `rollback --force` (override a live lease on the branch; rollback does not consult the protected flag) is CLI-only; the daemon op and both SDKs' `rollback` have no `force`. `compact` through the daemon refuses while a session is open on the branch (see above). `rollback`/`promote`'s safety-fork backup (`--no-backup`/`--backup-ttl` on the CLI, `no_backup`/`backup_ttl` request fields and a `backup` response field on the daemon op, `backup`/`backup_ttl` kwargs on both SDKs) is full parity too, and so is their `--materialize` (`materialize` request field and `shared` response field on the daemon op; Python `materialize=False`, TypeScript `materialize?: boolean`). |
+| create / checkout / fork / destroy / rollback / promote / compact / touch / prune / branches / dbs | yes | yes | yes | Full parity, with one exception: `rollback --force` (override a live lease on the branch; rollback does not consult the protected flag) is CLI-only; the daemon op and both SDKs' `rollback` have no `force`. `compact` through the daemon refuses while a session is open on the branch (see above). `rollback`/`promote`'s safety-fork backup (`--no-backup`/`--backup-ttl` on the CLI, `no_backup`/`backup_ttl` request fields and a `backup` response field on the daemon op, `backup`/`backup_ttl` kwargs on both SDKs) is full parity too, and so is their `--materialize` (`materialize` request field and `shared` response field on the daemon op; Python `materialize=False`, TypeScript `materialize?: boolean`). |
 | `protect` / `unprotect` | yes | no | no | **CLI-only, by design.** No daemon op or MCP tool sets the `protected` flag — only `offshoot_list`/the daemon's `branches` op reads it. Keeping the write side off every remote-callable surface means an agent (MCP) or a network client (daemon/HTTP) can observe protection but never grant or revoke it. |
 | open / flush / status / close (sessions) | `session ...` | yes | yes | SDK `flush(name, meta=...)` can attach checkpoint metadata; the CLI `session flush` subcommand has no `--meta` flag. The SDKs' `Session.close()` sends the `session_id` its `open` returned, so it closes only that session; the CLI `session close` sends none and closes whatever session is open on the branch. |
 | export / historical read-only checkout | yes | yes (`export`, `checkout-at`) | yes | No CLI `session` subcommand — the CLI's `export`/`checkout --at --read-only` are the at-rest equivalents (see the section above); `export` is unix-socket-only over the daemon. |

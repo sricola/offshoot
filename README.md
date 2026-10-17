@@ -182,8 +182,8 @@ Claude Code plugin (MCP server, a skill that teaches the loop, advisory hooks):
 
 Cursor: [![Install in Cursor](https://cursor.com/deeplink/mcp-install-dark.svg)](https://cursor.com/en/install-mcp?name=offshoot&config=eyJjb21tYW5kIjoib2Zmc2hvb3QiLCJhcmdzIjpbIm1jcCJdfQ==)
 
-The agent gets nine tools — list, checkout, checkpoint, fork, rollback,
-promote, destroy, touch, diff — described so it knows *when* to use them:
+The agent gets ten tools — list, checkout, checkpoint, fork, rollback,
+promote, destroy, prune checkpoints, touch, diff — described so it knows *when* to use them:
 fork before a risky migration, checkpoint when tests pass, roll back when
 they don't, diff two attempts, promote the one that worked. The loop it
 is taught:

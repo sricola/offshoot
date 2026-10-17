@@ -32,7 +32,7 @@ required for the baseline. The plugin's skill includes the
 rules it's drawn from; its hooks only add context (they never block a
 command), and they stay silent when `offshoot` is not installed.
 
-The agent gets nine tools, each described so the model knows *when* to
+The agent gets ten tools, each described so the model knows *when* to
 reach for it: fork before a risky migration, checkpoint when tests pass,
 roll back when they don't, diff two attempts to see what actually changed,
 promote the attempt that worked. See it work end to end in a real captured
@@ -55,7 +55,7 @@ This is the same text the Claude Code plugin's skill teaches automatically;
 an agent that indexes docs instead of reading a rules file can pull the same
 loop from <https://sricola.github.io/offshoot/llms.txt>.
 
-## The nine tools
+## The ten tools
 
 Verified against `internal/mcp/tools.go`; `branch` defaults to `"main"`
 wherever it's optional.
@@ -69,6 +69,7 @@ wherever it's optional.
 | `offshoot_rollback` | `database`, `to`, `branch?` | Return a branch to a named checkpoint, discarding everything since. The branch's previous head is kept first as a TTL'd safety fork `<branch>-pre-rollback` (one per branch, replaced by the next rollback), named in the result's `backup` field — undo by promoting it back onto the branch |
 | `offshoot_promote` | `database`, `source`, `target`, `force?` | Repoint `target` at `source`'s head — ship the winning attempt. `target`'s previous head is kept as a safety fork named `<target>-pre-promote` — the undo handle the result names — but that fork always carries a TTL (24h by default) and is one rolling slot per target, replaced by the next promote onto that target, so the undo window closes when either happens |
 | `offshoot_destroy` | `database`, `branch`, `force?` | Permanently discard a branch and its checkout |
+| `offshoot_prune_checkpoints` | `database`, `branch?`, `names?`, `keep?`, `force?` | Delete named checkpoints (exactly `names`, or all but the `keep` newest) — never the branch, its head or its data. Keeps a long-lived branch's checkpoint list, and so each new checkpoint, short; gc reclaims what only those checkpoints kept. Safe while a session is open |
 | `offshoot_touch` | `database`, `branch?`, `ttl?` | Reset a fork's activity clock so its TTL does not expire mid-task; `ttl` sets or (`"none"`) clears it |
 | `offshoot_diff` | `database`, `left`, `right`, `table?`, `full?`, `max_bytes?` | Per-table rows added/removed/changed (and schema changes) between two branches or checkpoints — decide which attempt to promote; `full` adds capped sqldiff SQL |
 
@@ -130,15 +131,15 @@ branch's storage still needs `offshoot gc` (by hand) or a running
 ## The safety posture
 
 Destructive tools honor the same protected-branch rules as the CLI:
-`main` is protected by default, so an unforced `offshoot_promote` onto it
-or `offshoot_destroy` of it is **refused**, and the refusal comes back to
+`main` is protected by default, so an unforced `offshoot_promote` onto it,
+or `offshoot_destroy` or `offshoot_prune_checkpoints` of it, is **refused**, and the refusal comes back to
 the agent as the tool result rather than a transport error, naming
 `-allow-force` as the way past it. The agent forks and experiments
 freely; touching the branch of record is a human/harness decision by
 default, not an argument the agent can supply its own way past.
 
-Concretely: `force: true` in an `offshoot_promote` or `offshoot_destroy`
-call is honored only when the MCP server itself was started with
+Concretely: `force: true` in an `offshoot_promote`, `offshoot_destroy` or
+`offshoot_prune_checkpoints` call is honored only when the MCP server itself was started with
 `-allow-force` (off by default). Without it, a call against a protected
 target is refused *before any mutation*, no matter what the agent passes —
 `refuseForceOnProtected` fails closed even on a transient error reading

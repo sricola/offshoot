@@ -442,7 +442,9 @@ open wart (its own spec said "N materialized forks cost up to N×G").
   `Checkpoints` map holds one entry per named checkpoint a branch has
   ever taken and is read, json-decoded, mutated and written back twice
   per at-rest checkpoint (the lease acquire, then the head write); it
-  never shrinks on its own (there is no "delete a checkpoint" op).
+  never shrinks on its own; `offshoot prune` (shipped after v0.2.21)
+  removes entries by name or keeps the N newest, so a branch that names a
+  checkpoint per step can hold the map small without any format change.
   `BenchmarkSegmentCheckpointRefGrowth` measured this as a real,
   separate cost: in that diagnostic run, one more checkpoint after
   1,000 prior checkpoints costs about 7.3 ms more than after 1, and
@@ -456,6 +458,8 @@ open wart (its own spec said "N materialized forks cost up to N×G").
   decoded whole on every checkpoint; or a bound on how many named
   checkpoints `Checkpoints` keeps, with older ones falling back to a
   slower listing) would close this, at the cost of a format change.
+  Prune covers the branch that can let old checkpoints go; this item is
+  what remains for one that must keep hundreds by name.
 - ✅ **Extend the recorded-chain cache to shared child lineages —
   shipped.** A lineage that still resolves through a base pointer (a
   fresh fork, or a promote or rollback that kept the base spine) records
