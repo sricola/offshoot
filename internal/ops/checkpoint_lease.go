@@ -471,7 +471,7 @@ func (c checkpointCommit) mayHaveCommitted(why string, err error) error {
 
 // checkpointCommitAttempts bounds the head write. With the premise intact,
 // a lost compare-and-swap can only be a writer that left our lease, lineage
-// and head alone (touch, protect, a TTL change); each lands once, so three
+// and head alone (touch, protect, a TTL change, a prune); each lands once, so three
 // attempts ride out a burst of them.
 const checkpointCommitAttempts = 3
 
