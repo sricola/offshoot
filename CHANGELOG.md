@@ -17,6 +17,15 @@ Pin an exact version if you depend on format stability. The full contract:
 
 ## [Unreleased]
 
+Nothing yet.
+
+## [0.2.22] - 2026-10-17
+
+Checkpoints can now be deleted: `offshoot prune` removes them by name or
+keeps the N newest, on the CLI, the daemon, MCP and both SDKs, so a
+long-lived branch that names a checkpoint per step keeps each new
+checkpoint fast without any change to the storage format.
+
 ### Added
 
 - `offshoot prune <db>[@branch] (<checkpoint>... | --keep N) [--force]`
