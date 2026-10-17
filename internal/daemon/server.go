@@ -579,6 +579,8 @@ func (s *Server) dispatch(req Request) Response {
 		return s.opCompact(req)
 	case "touch":
 		return s.opTouch(req)
+	case "prune":
+		return s.opPrune(req)
 	case "branches":
 		return s.opBranches(req)
 	case "dbs":
@@ -1409,6 +1411,28 @@ func (s *Server) opTouch(req Request) Response {
 		return errResp(err)
 	}
 	return Response{OK: true}
+}
+
+// opPrune deletes checkpoints from db@branch (ops.PruneCheckpoints;
+// req.Force overrides the protected-branch refusal). Unlike opDestroy and
+// opRollback it does not refuse a branch this daemon has a session open
+// on: a prune writes only checkpoint metadata, and the session's flushes
+// rebuild their head write from a fresh read of the ref, so neither undoes
+// the other.
+func (s *Server) opPrune(req Request) Response {
+	branch := req.Branch
+	if branch == "" {
+		branch = "main"
+	}
+	opts := ops.PruneOptions{Names: req.Names, Force: req.Force}
+	if req.Keep != nil {
+		opts.Keep, opts.KeepSet = *req.Keep, true
+	}
+	res, err := s.ws.PruneCheckpoints(req.DB, branch, opts)
+	if err != nil {
+		return errResp(err)
+	}
+	return Response{OK: true, Pruned: res.Deleted, Kept: &res.Kept}
 }
 
 // opBranches lists every branch of req.DB as BranchInfo, sorted by branch
