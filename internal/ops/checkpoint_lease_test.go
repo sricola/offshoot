@@ -1046,9 +1046,13 @@ func TestRenewErrorClassification(t *testing.T) {
 // TestCheckpointRenewerKeepsTheLeaseLive: renewals keep a lease live well
 // past its TTL, and once stop returns no renewal runs.
 func TestCheckpointRenewerKeepsTheLeaseLive(t *testing.T) {
-	w, l := leasedBranch(t, newCheckpointHolder(), 200*time.Millisecond)
-	r := w.startCheckpointRenewer(l, 200*time.Millisecond, 20*time.Millisecond)
-	time.Sleep(500 * time.Millisecond)
+	// Observed for 2.5 TTLs, so the lease is live at the end only because
+	// the renewer ran; the 1s TTL leaves headroom for a loaded -race CI
+	// runner stalling a renewal (a 200ms TTL lapsed on one, run
+	// 38987622706).
+	w, l := leasedBranch(t, newCheckpointHolder(), time.Second)
+	r := w.startCheckpointRenewer(l, time.Second, 50*time.Millisecond)
+	time.Sleep(2500 * time.Millisecond)
 	if !store.LeaseLive(refOf(t, w, "app", "main"), time.Now()) {
 		t.Fatal("the lease lapsed while the renewer ran")
 	}
