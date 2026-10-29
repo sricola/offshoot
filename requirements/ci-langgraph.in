@@ -10,6 +10,6 @@
 #     -o requirements/ci-langgraph.txt requirements/ci-langgraph.in
 # See CONTRIBUTING.md "Refreshing the hash-pinned CI requirements".
 langgraph-checkpoint>=4.2,<5
-langgraph-checkpoint-sqlite>=3.1,<4
+langgraph-checkpoint-sqlite>=3.1.2,<4
 langgraph>=1.2.14,<2
 pytest>=7
