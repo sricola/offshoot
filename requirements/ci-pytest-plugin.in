@@ -8,5 +8,5 @@
 #   uv pip compile --python-version 3.12 --generate-hashes --universal \
 #     -o requirements/ci-pytest-plugin.txt requirements/ci-pytest-plugin.in
 # See CONTRIBUTING.md "Refreshing the hash-pinned CI requirements".
-pytest>=7
+pytest>=9.2.0
 pytest-xdist
