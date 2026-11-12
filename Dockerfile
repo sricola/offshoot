@@ -35,7 +35,7 @@ RUN go build -trimpath -ldflags "-s -w -X main.version=${VERSION}" \
 # differ and the SLSA provenance would name a base digest the image no
 # longer matches. If a base-image CVE needs to ship before Dependabot's
 # next run, bump the digest by hand and cut a release.
-FROM debian:bookworm-slim@sha256:7c7b2c966bc9ee8cedfeef67e0e279108992c77681fa595db4a9d65c06ccc587 AS runtime
+FROM debian:bookworm-slim@sha256:734a72b3d6142a71993b4bc580ca01d8ca687f77a2c422d96a961d3376b179bc AS runtime
 
 # sqlite3-tools carries sqldiff, which `offshoot diff` shells out to —
 # Debian packages it separately from the sqlite3 CLI (see
